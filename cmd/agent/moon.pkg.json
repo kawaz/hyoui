@@ -1,0 +1,14 @@
+{
+  "is-main": true,
+  "supported-targets": ["native"],
+  "import": [
+    { "path": "kawaz/hyoui/lib/agent", "alias": "hyoui_agent" },
+    "kawaz/hyoui/lib/observer",
+    "kawaz/hyoui/lib/ffi"
+  ],
+  "link": {
+    "native": {
+      "cc-link-flags": "-Lffi/target/release -lhyoui_ffi"
+    }
+  }
+}
