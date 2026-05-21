@@ -27,10 +27,11 @@ hyoui は任意コマンドを PTY 内で実行する。子プロセスは `POSI
    誰も `fg` できず永久ハングする。poc3 時代（poc3 は `$SHELL` 固定起動だった）、
    その PTY 内のシェルで `exec claude` すると PTY 内にシェルが居なくなり、
    claude が自分を suspend した時に復帰も終了も不能になる問題があった。当時の
-   shimux はこれを **独立した standalone ツール `nosuspend`**
-   （`cmd/nosuspend/`、自前 `main` を持つ別バイナリ。`waitpid(WUNTRACED)` →
-   即 `SIGCONT`）で対処していた。hyoui ではこの挙動を別ツールとして移植せず、
-   軸 1 の `auto-resume`（後述）として **本体に統合** した。
+   shimux はこれを、その小問題専用に作った **内製の別 cmd `nosuspend`**
+   （`shimux/cmd/nosuspend/`、自前 `main` を持つ別バイナリ。外部 OSS ではなく
+   shimux リポ内の別 PoC 的な小ツール。`waitpid(WUNTRACED)` → 即 `SIGCONT`）で
+   対処していた。hyoui ではこの挙動を別 cmd としては移植せず、軸 1 の
+   `auto-resume`（後述）として **本体に統合** した。
 2. **hyoui 自身が外部から suspend されたとき** — 子は独立セッションなので連動せず、
    走り続ける（PTY バッファ満杯で結果的に詰まる）。透過的でない。
 
