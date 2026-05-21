@@ -1,4 +1,5 @@
 {
+  "_comment": "Design rationale: the native link block is kept here (not consolidated into cmd/agent only) because MoonBit links each whitebox-test executable using the test package's own link config. lib/ffi's tests call the Rust FFI directly, so the staticlib flags must be on this package or `moon test` fails to link. The known tradeoff is that `moon build` (no package) then tries to MakeExecutable for this non-main package and fails with `undefined _main`; use `moon build --package kawaz/hyoui/cmd/agent` instead.",
   "supported-targets": ["native"],
   "import": ["moonbitlang/core/encoding/utf8"],
   "link": {

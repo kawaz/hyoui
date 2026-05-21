@@ -1,4 +1,5 @@
 {
+  "_comment": "Design rationale: see lib/ffi/moon.pkg.json. The native link block is required so this package's whitebox tests (which spawn PTYs via the Rust FFI) can link. `moon build` without a package will fail here; use `moon build --package kawaz/hyoui/cmd/agent`.",
   "supported-targets": ["native"],
   "import": [
     "moonbitlang/core/builtin",
