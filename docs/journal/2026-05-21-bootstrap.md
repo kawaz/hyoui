@@ -4,36 +4,33 @@ shimux の PTY プロキシ PoC（poc3）をベースに、`kawaz/hyoui` を新�
 
 ## 経緯
 
-poc3 は `$SHELL` 固定起動の PTY プロキシだった。これを次の性格のツールに作り直した:
+poc3 は `$SHELL` 固定起動の PTY プロキシだった。「SHELL 固定でなく
+`hyoui -- cmd [args...]` で任意コマンドを実行したい」「外部から stdin を与えたい」
+「tty を元の tty に反映しない headless 動作」という要望から再設計を始めた。
 
-- `hyoui -- cmd [args...]` で任意コマンドを PTY 内実行
-- interactive（実 tty 透過プロキシ）/ headless（実 tty なし・仮想サイズ）の 2 モード
-- 「子に憑依して一体で動く」= 親子が一蓮托生で生き死にする
+長い設計議論を経て、ツールの性格と主要な判断が固まった:
 
-## 設計判断（要点）
+- **2 モード** — interactive（実 tty 透過プロキシ、既定）/ headless（実 tty なし・
+  仮想スクリーンサイズ）
+- **bg/fg ジョブ制御の 2 軸設計** — 「子が自分を suspend」「親が外部から suspend」を
+  独立した軸とし、invariant「親が走行中なら子も走行中」で整理。→ **DR-0001** に詳述
+- **プロジェクト名 "hyoui"（憑依）** — 命名は多くの候補を経て決定。→ **DR-0002** に詳述
 
-### bg/fg ジョブ制御 — invariant「親 fg ⇒ 子 fg」
+実装は機能ごとにサブエージェントへ委譲して進めた:
+1. リポ作成（jj bare 方式）
+2. poc3 のコード取り込み（FFI シンボル `shimux_*` → `hyoui_*` リネーム）
+3. コア実装（argv 渡し / モード / CLI パーサ / stdin EOF→^D / bg-fg シグナル / 停止条件）
+4. canonical Taskfile.pkl（pkfire 0.10 / pkf-tasks 3.0.3）整備
+5. ビルド・動作確認・初回 push
 
-子は `POSIX_SPAWN_SETSID` で独立セッションのリーダー（PTY を制御端末に持つため必須）。
-よってジョブ制御は「外側（hyoui 自身）」「内側（PTY 内の子）」の 2 層に分かれる。
+## 設計判断
 
-不変条件を **「親 hyoui が走行中なら子も走行中」** と定義すると、設定軸が 2 本に整理できる:
+設計判断は DR に記録した:
 
-- `--on-child-suspend=follow|auto-resume` — 子が自分を suspend したとき
-  - `auto-resume`: 親が即 SIGCONT（poc3 時代の `nosuspend` 相当。headless 既定）
-  - `follow`: 親も自分に SIGSTOP を raise（外側シェルに制御が戻る。interactive 既定）
-- `--on-parent-suspend=transparent|decouple` — 親が suspend されたとき
-  - `transparent`: 子 pgrp にも SIGSTOP（interactive 既定）
-  - `decouple`: 子はそのまま（headless 既定）
-
-invariant 回復は SIGCONT ハンドラに集約: 親再開時に子が STOPPED なら必ず SIGCONT。
-これで「親 fg・子 stopped」の禁則状態が論理的に発生しない。
-
-### nosuspend の教訓
-
-poc3 時代、`exec claude` で PTY 内にシェルがいないと、claude が自分を suspend したとき
-誰も fg できず詰む問題があり、別ツール `nosuspend`（`waitpid(WUNTRACED)` → 即 SIGCONT）で
-対処していた。hyoui ではこれを `on-child-suspend=auto-resume` として内蔵。
+- **DR-0001** — bg/fg ジョブ制御の 2 軸設計と invariant「親 fg ⇒ 子 fg」。
+  軸 1 `--on-child-suspend=follow|auto-resume`、軸 2 `--on-parent-suspend=transparent|decouple`、
+  モード別デフォルトとその根拠、poc3 時代の `nosuspend` の教訓の取り込み。
+- **DR-0002** — プロジェクト名 "hyoui" の決定。命名議論で検討した多数の不採用候補と理由。
 
 ## ハマり所 → 解決策
 
@@ -43,6 +40,8 @@ poc3 時代、`exec claude` で PTY 内にシェルがいないと、claude が�
 | poll が EINTR でループ即抜け（シグナルで即終了） | `io_poll` が EINTR を -2 で区別、ループ側で非致命扱い |
 | `--socket /tmp/foo.sock` が `sock_listen failed` | 仕様。`hyoui_sock_listen` は親ディレクトリが 0700 かつ自分所有を要求（W15 セキュリティチェック）。/tmp（1777）は不可。0700 ディレクトリを使う |
 | `moon build`（パッケージ指定なし）が `undefined _main` | lib パッケージの `link` ブロックを moon が単独実行ファイル化しようとする。lib のテストが FFI をリンクするため link 設定は残さざるを得ず、`moon build --package kawaz/hyoui/cmd/agent` で運用。各 moon.pkg.json に `_comment` で理由を記録 |
+| 初回 push で `semver:check-version-bumped` が落ちる | pkf-tasks の `kawaz.semver.checkBumped` が `main@origin` 不在（初回 push リポ）+ `set -e` + 複合コマンドの command substitution で落ちる。ローカル task に差し替えて回避。pkf-tasks 側に issue 起票済み |
+| `moon fmt` と `moon check` の `moon.pkg` スキーマ不一致 | `moon fmt` が新形式へマイグレートする `supported_targets` を `moon check` が拒否。lint から `moon fmt` を外し `moon check` のみに。moon 最新化で解消するか要確認（issue 起票済み） |
 
 ## 仕様の限界
 
@@ -55,8 +54,15 @@ poc3 時代、`exec claude` で PTY 内にシェルがいないと、claude が�
 (cd ffi && cargo build --release)
 moon build --target native --package kawaz/hyoui/cmd/agent
 moon test --target native   # 64/64 passed
+pkf run ci                  # lint + test + build
 ```
 
 動作確認済み: echo / headless cat（パイプ stdin・EOF→^D）/ --timeout 124 / --idle-timeout 124 /
 --until 0 / socket 注入 / on-child-suspend=auto-resume / on-parent-suspend=transparent（TSTP で
 子も停止・CONT で再開）。ゾンビ残存なし。
+
+## 残課題
+
+`docs/issue/` に起票済み:
+- CI / release ワークフロー整備
+- lint に `moon fmt` を復活（moon toolchain 最新化）
