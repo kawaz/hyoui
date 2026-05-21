@@ -1,0 +1,9 @@
+{
+  "supported-targets": ["native"],
+  "import": ["moonbitlang/core/encoding/utf8"],
+  "link": {
+    "native": {
+      "cc-link-flags": "-Lffi/target/release -lhyoui_ffi"
+    }
+  }
+}

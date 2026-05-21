@@ -1,0 +1,13 @@
+{
+  "supported-targets": ["native"],
+  "import": [
+    "moonbitlang/core/builtin",
+    "kawaz/hyoui/lib/ffi",
+    "kawaz/hyoui/lib/observer"
+  ],
+  "link": {
+    "native": {
+      "cc-link-flags": "-Lffi/target/release -lhyoui_ffi"
+    }
+  }
+}
