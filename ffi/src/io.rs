@@ -85,6 +85,12 @@ pub extern "C" fn hyoui_io_set_nonblocking(fd: i32) -> i32 {
     if ret == -1 { -1 } else { 0 }
 }
 
+/// Sentinel returned by hyoui_io_poll when poll() is interrupted by a signal
+/// (EINTR). The caller (event loop) must treat this as non-fatal and re-poll;
+/// when the self-pipe trick is in use, the pending signal byte will then be
+/// observed as a readable fd.
+pub const HYOUI_POLL_EINTR: i32 = -2;
+
 /// Poll multiple file descriptors for I/O readiness.
 ///
 /// `fds` is a packed pollfd buffer: 8 bytes per entry (fd:i32 + events:i16 + revents:i16).
@@ -92,8 +98,10 @@ pub extern "C" fn hyoui_io_set_nonblocking(fd: i32) -> i32 {
 /// `nfds` is the number of entries.
 /// `timeout_ms` is the timeout in milliseconds (-1 for infinite).
 ///
-/// Automatically retries on EINTR.
-/// Returns the number of ready fds, 0 on timeout, -1 on error.
+/// Design rationale: poll() is NOT retried internally on EINTR. Instead EINTR
+/// is reported distinctly as HYOUI_POLL_EINTR (-2) so the event loop can
+/// re-poll while still processing self-pipe signal bytes. Returns the number
+/// of ready fds, 0 on timeout, -2 on EINTR, -1 on other errors.
 #[unsafe(no_mangle)]
 pub extern "C" fn hyoui_io_poll(fds: *mut u8, nfds: i32, timeout_ms: i32) -> i32 {
     if nfds < 0 {
@@ -103,15 +111,13 @@ pub extern "C" fn hyoui_io_poll(fds: *mut u8, nfds: i32, timeout_ms: i32) -> i32
         return -1;
     }
     let pollfds = fds as *mut libc::pollfd;
-    loop {
-        let ret = unsafe { libc::poll(pollfds, nfds as libc::nfds_t, timeout_ms) };
-        if ret < 0 {
-            let errno = get_errno();
-            if errno == libc::EINTR {
-                continue;
-            }
-            return -1;
+    let ret = unsafe { libc::poll(pollfds, nfds as libc::nfds_t, timeout_ms) };
+    if ret < 0 {
+        let errno = get_errno();
+        if errno == libc::EINTR {
+            return HYOUI_POLL_EINTR;
         }
-        return ret;
+        return -1;
     }
+    ret
 }

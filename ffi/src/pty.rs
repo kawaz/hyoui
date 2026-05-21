@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
-use crate::bytes_to_cstring;
+use crate::bytes_length;
 use crate::sig::WINCH_MASTER_FD;
 
 struct PtyState {
@@ -79,22 +79,43 @@ fn cleanup_spawn_resources(
     }
 }
 
-/// Spawn a child process on the PTY using posix_spawn.
-/// `cmd` is a MoonBit Bytes (UTF-8, not null-terminated).
+/// Spawn a child process on the PTY using posix_spawnp (execvp-style).
+///
+/// `argv_blob` is a MoonBit Bytes containing the argv as NUL-separated UTF-8
+/// strings (e.g. `["echo","hi"]` -> `b"echo\0hi\0"`). `argc` is the number of
+/// arguments. argv[0] is the program name; PATH resolution is performed by
+/// posix_spawnp.
+///
 /// Returns the child PID on success, -1 on failure.
 ///
-/// Design rationale: Uses openpty + posix_spawn instead of forkpty + exec.
+/// Design rationale: Uses openpty + posix_spawnp instead of forkpty + exec.
 /// MoonBit's runtime (GC, etc.) makes fork unsafe because the child inherits
-/// a copy of the runtime state and crashes during GC. posix_spawn avoids
+/// a copy of the runtime state and crashes during GC. posix_spawnp avoids
 /// this by creating the child process without running any code in the forked
-/// address space.
+/// address space, and performs PATH lookup like execvp.
 #[unsafe(no_mangle)]
-pub extern "C" fn hyoui_pty_spawn(handle: i32, cmd: *const u8) -> i32 {
-    // W10: use bytes_to_cstring helper
-    let cmd_cstr = match bytes_to_cstring(cmd) {
-        Some(c) => c,
-        None => return -1,
-    };
+pub extern "C" fn hyoui_pty_spawnv(handle: i32, argv_blob: *const u8, argc: i32) -> i32 {
+    if argc <= 0 {
+        return -1;
+    }
+    // Split the NUL-separated blob into individual CStrings.
+    let blob_len = bytes_length(argv_blob);
+    if argv_blob.is_null() || blob_len <= 0 {
+        return -1;
+    }
+    let blob = unsafe { std::slice::from_raw_parts(argv_blob, blob_len as usize) };
+    // The blob is `arg0\0arg1\0...\0`; splitting on NUL yields argc chunks
+    // followed by one trailing empty chunk. Take exactly `argc` chunks.
+    let mut arg_cstrings: Vec<std::ffi::CString> = Vec::with_capacity(argc as usize);
+    for chunk in blob.split(|&b| b == 0).take(argc as usize) {
+        match std::ffi::CString::new(chunk) {
+            Ok(c) => arg_cstrings.push(c),
+            Err(_) => return -1, // chunk contained an interior NUL (impossible) or alloc fail
+        }
+    }
+    if arg_cstrings.len() != argc as usize {
+        return -1; // blob had fewer chunks than argc
+    }
 
     let (master_fd, slave_fd) = {
         let mut table = match PTY_TABLE.lock() {
@@ -189,15 +210,12 @@ pub extern "C" fn hyoui_pty_spawn(handle: i32, cmd: *const u8) -> i32 {
         return -1;
     }
 
-    // Build argv: ["/bin/sh", "-c", cmd, NULL]
-    let sh_path = b"/bin/sh\0";
-    let dash_c = b"-c\0";
-    let argv: [*mut libc::c_char; 4] = [
-        sh_path.as_ptr() as *mut libc::c_char,
-        dash_c.as_ptr() as *mut libc::c_char,
-        cmd_cstr.as_ptr() as *mut libc::c_char,
-        std::ptr::null_mut(),
-    ];
+    // Build NULL-terminated argv from the parsed CStrings.
+    let mut argv: Vec<*mut libc::c_char> = arg_cstrings
+        .iter()
+        .map(|c| c.as_ptr() as *mut libc::c_char)
+        .collect();
+    argv.push(std::ptr::null_mut());
 
     // Get current environment
     unsafe extern "C" {
@@ -205,10 +223,11 @@ pub extern "C" fn hyoui_pty_spawn(handle: i32, cmd: *const u8) -> i32 {
     }
 
     let mut child_pid: libc::pid_t = 0;
+    // posix_spawnp performs PATH resolution like execvp; argv[0] is the program.
     let spawn_ret = unsafe {
-        libc::posix_spawn(
+        libc::posix_spawnp(
             &mut child_pid,
-            sh_path.as_ptr() as *const libc::c_char,
+            arg_cstrings[0].as_ptr(),
             &file_actions,
             &attr,
             argv.as_ptr(),

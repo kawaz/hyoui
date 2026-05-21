@@ -57,10 +57,20 @@ test "socket message roundtrip" {
 }
 
 ///|
+/// Build a minimal headless Config running `command` for tests.
+/// Headless mode avoids touching the real tty in CI.
+fn test_config(command : Array[String]) -> Config {
+  match parse_args(["--mode=headless", "--", ..command]) {
+    Run(cfg) => cfg
+    _ => abort("test_config: parse failed")
+  }
+}
+
+///|
 test "Agent new and cleanup" {
   let obs : @observer.NullObserver = @observer.NullObserver::new()
-  // Use /bin/echo to create a short-lived process
-  let agent = Agent::new(obs, shell="/bin/echo")
+  // Use echo to create a short-lived process (PATH-resolved).
+  let agent = Agent::new(obs, test_config(["echo", "hi"]))
   assert_true(agent.master_fd >= 0)
   assert_true(agent.child_pid > 0)
   assert_true(agent.socket_path.length() > 0)
@@ -70,7 +80,33 @@ test "Agent new and cleanup" {
 ///|
 test "Agent run with echo exits cleanly" {
   let obs : @observer.NullObserver = @observer.NullObserver::new()
-  let agent = Agent::new(obs, shell="/bin/echo")
+  let agent = Agent::new(obs, test_config(["echo", "hello"]))
   let status = agent.run()
   assert_eq(status, 0)
+}
+
+///|
+test "Agent run with false returns nonzero exit status" {
+  let obs : @observer.NullObserver = @observer.NullObserver::new()
+  let agent = Agent::new(obs, test_config(["false"]))
+  let status = agent.run()
+  assert_eq(status, 1)
+}
+
+///|
+test "decode_wait_status: normal exit and signalled" {
+  // exited with code 0
+  assert_eq(decode_wait_status(0), 0)
+  // exited with code 1 (status bits 8..15)
+  assert_eq(decode_wait_status(1 << 8), 1)
+  // killed by signal 9
+  assert_eq(decode_wait_status(9), 128 + 9)
+}
+
+///|
+test "bytes_contains: substring matching" {
+  assert_true(bytes_contains(b"hello world", b"o w"))
+  assert_true(bytes_contains(b"abc", b""))
+  assert_false(bytes_contains(b"abc", b"abcd"))
+  assert_false(bytes_contains(b"abc", b"xyz"))
 }

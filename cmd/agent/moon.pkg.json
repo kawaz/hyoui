@@ -4,7 +4,8 @@
   "import": [
     { "path": "kawaz/hyoui/lib/agent", "alias": "hyoui_agent" },
     "kawaz/hyoui/lib/observer",
-    "kawaz/hyoui/lib/ffi"
+    "kawaz/hyoui/lib/ffi",
+    "moonbitlang/core/env"
   ],
   "link": {
     "native": {

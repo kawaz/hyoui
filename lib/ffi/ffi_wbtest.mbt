@@ -34,9 +34,9 @@ test "pty_close: succeeds" {
 }
 
 ///|
-test "pty_spawn: empty command returns None" {
+test "pty_spawnv: empty argv returns None" {
   let handle = pty_open(80, 24).unwrap()
-  let pid = pty_spawn(handle, b"")
+  let pid = pty_spawnv(handle, [])
   inspect(pid, content="None")
   let _ = pty_close(handle)
 }
@@ -48,11 +48,12 @@ test "pty_resize: succeeds on valid handle" {
   let _ = pty_close(handle)
 }
 
-// W4: pty_spawn normal case
+// W4: pty_spawnv normal case
 ///|
-test "pty_spawn: echo hello returns valid pid and waitpid succeeds" {
+test "pty_spawnv: echo hello returns valid pid and waitpid succeeds" {
   let handle = pty_open(80, 24).unwrap()
-  let pid = pty_spawn(handle, to_utf8("echo hello"))
+  // execvp-style: argv[0] resolved against $PATH
+  let pid = pty_spawnv(handle, ["echo", "hello"])
   inspect(not(pid is None), content="true")
   let child_pid = pid.unwrap()
   inspect(child_pid > 0, content="true")
@@ -296,6 +297,33 @@ test "proc_waitpid: pid -1 with nohang returns None" {
 test "proc_kill: pid 0 with signal 0 checks process group" {
   // signal 0 は kill のエラーチェック用。pid 0 は自プロセスグループ → 成功するはず
   inspect(proc_kill(0, 0), content="true")
+}
+
+///|
+test "clock_monotonic_ms: monotonic and positive" {
+  let t1 = clock_monotonic_ms()
+  inspect(t1 > 0L, content="true")
+  let t2 = clock_monotonic_ms()
+  // monotonic clock never goes backwards
+  inspect(t2 >= t1, content="true")
+}
+
+///|
+test "sig_selfpipe_init and sig_drain: roundtrip via raise" {
+  match sig_selfpipe_init() {
+    None => inspect(false, content="true") // init must succeed
+    Some((read_fd, _write_fd)) => {
+      // Register SIGUSR1 (30 on macOS / Linux) to the self-pipe, then raise it.
+      let sigusr1 = 30
+      inspect(sig_register_selfpipe(sigusr1), content="true")
+      inspect(sig_raise(sigusr1), content="true")
+      let signals = sig_drain(read_fd)
+      inspect(signals.length() >= 1, content="true")
+      inspect(signals[0], content="30")
+      let _ = io_close(read_fd)
+
+    }
+  }
 }
 
 // ===== helpers: getenv, getpid, getuid, ensure_dir =====
