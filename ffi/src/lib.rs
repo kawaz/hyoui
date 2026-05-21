@@ -1,9 +1,9 @@
-mod pty;
-mod tty;
 mod io;
-mod sock;
-mod sig;
 mod proc;
+mod pty;
+mod sig;
+mod sock;
+mod tty;
 
 // MoonBit runtime functions
 unsafe extern "C" {
@@ -60,7 +60,7 @@ pub extern "C" fn hyoui_getenv(name: *const u8) -> *mut u8 {
             return ptr;
         }
     };
-    let key = match std::str::from_utf8(&cstr[..cstr.len()-1]) {
+    let key = match std::str::from_utf8(&cstr[..cstr.len() - 1]) {
         Ok(s) => s,
         Err(_) => {
             return unsafe { moonbit_make_bytes_raw(0) };
@@ -100,7 +100,7 @@ pub extern "C" fn hyoui_ensure_dir(path: *const u8) -> i32 {
         Some(c) => c,
         None => return -1,
     };
-    let path_str = match std::str::from_utf8(&cstr[..cstr.len()-1]) {
+    let path_str = match std::str::from_utf8(&cstr[..cstr.len() - 1]) {
         Ok(s) => s,
         Err(_) => return -1,
     };

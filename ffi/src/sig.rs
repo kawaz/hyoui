@@ -79,7 +79,8 @@ pub extern "C" fn hyoui_sig_selfpipe_init() -> i64 {
             return -1;
         }
         let fd_fl = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if fd_fl == -1 || unsafe { libc::fcntl(fd, libc::F_SETFD, fd_fl | libc::FD_CLOEXEC) } == -1 {
+        if fd_fl == -1 || unsafe { libc::fcntl(fd, libc::F_SETFD, fd_fl | libc::FD_CLOEXEC) } == -1
+        {
             unsafe {
                 libc::close(fds[0]);
                 libc::close(fds[1]);

@@ -8,6 +8,7 @@ extern "C" fn hyoui_proc_waitpid_stopped(pid : Int) -> Int64 = "hyoui_proc_waitp
 extern "C" fn hyoui_proc_exit(status : Int) = "hyoui_proc_exit"
 
 // proc_waitpid_stopped の kind 値
+
 ///|
 pub const WAIT_NONE : Int = 0
 
@@ -33,7 +34,9 @@ extern "C" fn hyoui_clock_monotonic_ms() -> Int64 = "hyoui_clock_monotonic_ms"
 pub fn proc_waitpid(pid : Int, nohang : Bool) -> (Int, Int)? {
   let result = hyoui_proc_waitpid(pid, if nohang { 1 } else { 0 })
   let result_pid = (result & 0xFFFFFFFF_L).to_int()
-  if result_pid == -1 { return None }
+  if result_pid == -1 {
+    return None
+  }
   let status = (result >> 32).to_int()
   Some((result_pid, status))
 }

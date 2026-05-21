@@ -1,3 +1,4 @@
+///|
 /// Convert a MoonBit String to UTF-8 encoded Bytes.
 /// Design rationale: String.to_bytes() produces UTF-16 LE, but the Rust FFI
 /// functions expect UTF-8. Using @utf8.encode() produces correct UTF-8 Bytes.

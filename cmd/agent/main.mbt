@@ -21,9 +21,7 @@ fn main {
     }
     Run(config) => {
       let observer = @observer.NullObserver::new()
-      let agent = try {
-        @hyoui_agent.Agent::new(observer, config)
-      } catch {
+      let agent = @hyoui_agent.Agent::new(observer, config) catch {
         err => {
           println("hyoui: failed to start: " + err.to_string())
           @ffi.proc_exit(1)

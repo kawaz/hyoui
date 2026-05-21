@@ -14,9 +14,7 @@ pub extern "C" fn hyoui_io_read(fd: i32, buf: *mut u8, max_len: i32) -> i32 {
         return -1;
     }
     loop {
-        let n = unsafe {
-            libc::read(fd, buf as *mut libc::c_void, max_len as usize)
-        };
+        let n = unsafe { libc::read(fd, buf as *mut libc::c_void, max_len as usize) };
         if n < 0 {
             let errno = get_errno();
             if errno == libc::EINTR {

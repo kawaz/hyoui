@@ -1,10 +1,12 @@
-///| Operating mode for the agent.
+///|
+/// Operating mode for the agent.
 pub enum Mode {
   Interactive
   Headless
 } derive(Eq, Show)
 
-///| Behavior when the child process is suspended (STOPPED).
+///|
+/// Behavior when the child process is suspended (STOPPED).
 pub enum OnChildSuspend {
   /// Follow the child: the parent also stops (SIGSTOP raised on self).
   Follow
@@ -12,7 +14,8 @@ pub enum OnChildSuspend {
   AutoResume
 } derive(Eq, Show)
 
-///| Behavior when the parent process is suspended (receives SIGTSTP).
+///|
+/// Behavior when the parent process is suspended (receives SIGTSTP).
 pub enum OnParentSuspend {
   /// Stop the child group first, then stop the parent.
   Transparent
@@ -20,7 +23,8 @@ pub enum OnParentSuspend {
   Decouple
 } derive(Eq, Show)
 
-///| Parsed CLI configuration.
+///|
+/// Parsed CLI configuration.
 pub struct Config {
   mode : Mode
   cols : Int
@@ -39,7 +43,8 @@ pub struct Config {
   command : Array[String]
 }
 
-///| Result of parsing argv.
+///|
+/// Result of parsing argv.
 pub enum ParseResult {
   /// Successfully parsed; run with this config.
   Run(Config)
@@ -49,40 +54,44 @@ pub enum ParseResult {
   Error(String)
 }
 
-///| The usage text shown for --help / no args / errors.
+///|
+/// The usage text shown for --help / no args / errors.
 pub fn usage() -> String {
-  #|hyoui — run a command inside a PTY as a transparent proxy
-  #|
-  #|USAGE:
-  #|    hyoui [options] -- cmd [args...]
-  #|
-  #|SUBCOMMANDS:
-  #|    (none)
-  #|
-  #|OPTIONS:
-  #|    --mode=interactive|headless   Operating mode (default: interactive)
-  #|    --size COLSxROWS              Virtual screen size, e.g. 80x24 (headless)
-  #|    --cols N                      Virtual screen columns (headless)
-  #|    --rows M                      Virtual screen rows (headless)
-  #|    --timeout SEC                 Overall timeout in seconds
-  #|    --idle-timeout SEC            Output idle timeout in seconds
-  #|    --until PATTERN               Terminate when PATTERN appears in output
-  #|    --socket PATH                 Unix socket path for input injection
-  #|    --on-child-suspend=follow|auto-resume
-  #|                                  Action when the child is stopped
-  #|                                  (default: follow; headless: auto-resume)
-  #|    --on-parent-suspend=transparent|decouple
-  #|                                  Action when the parent is stopped
-  #|                                  (default: transparent; headless: decouple)
-  #|    --help                        Show this help and exit
-  #|
-  #|ENVIRONMENT:
-  #|    SHELL            Fallback command when none is given (legacy)
-  #|    XDG_RUNTIME_DIR  Base directory for the auto-generated socket path
-  #|    TMPDIR           Socket path base when XDG_RUNTIME_DIR is unset
+  (
+    #|hyoui — run a command inside a PTY as a transparent proxy
+    #|
+    #|USAGE:
+    #|    hyoui [options] -- cmd [args...]
+    #|
+    #|SUBCOMMANDS:
+    #|    (none)
+    #|
+    #|OPTIONS:
+    #|    --mode=interactive|headless   Operating mode (default: interactive)
+    #|    --size COLSxROWS              Virtual screen size, e.g. 80x24 (headless)
+    #|    --cols N                      Virtual screen columns (headless)
+    #|    --rows M                      Virtual screen rows (headless)
+    #|    --timeout SEC                 Overall timeout in seconds
+    #|    --idle-timeout SEC            Output idle timeout in seconds
+    #|    --until PATTERN               Terminate when PATTERN appears in output
+    #|    --socket PATH                 Unix socket path for input injection
+    #|    --on-child-suspend=follow|auto-resume
+    #|                                  Action when the child is stopped
+    #|                                  (default: follow; headless: auto-resume)
+    #|    --on-parent-suspend=transparent|decouple
+    #|                                  Action when the parent is stopped
+    #|                                  (default: transparent; headless: decouple)
+    #|    --help                        Show this help and exit
+    #|
+    #|ENVIRONMENT:
+    #|    SHELL            Fallback command when none is given (legacy)
+    #|    XDG_RUNTIME_DIR  Base directory for the auto-generated socket path
+    #|    TMPDIR           Socket path base when XDG_RUNTIME_DIR is unset
+  )
 }
 
-///| Parse a seconds string (integer or decimal) into milliseconds.
+///|
+/// Parse a seconds string (integer or decimal) into milliseconds.
 /// Returns None on invalid input or negative values.
 fn parse_seconds_ms(s : String) -> Int? {
   if s.is_empty() {
@@ -124,7 +133,8 @@ fn parse_seconds_ms(s : String) -> Int? {
   Some(int_part * 1000 + frac_part)
 }
 
-///| Parse a non-negative integer string. Returns None on invalid input.
+///|
+/// Parse a non-negative integer string. Returns None on invalid input.
 fn parse_int(s : String) -> Int? {
   if s.is_empty() {
     return None
@@ -141,7 +151,8 @@ fn parse_int(s : String) -> Int? {
   Some(value)
 }
 
-///| Parse a "COLSxROWS" size string. Returns (cols, rows) or None.
+///|
+/// Parse a "COLSxROWS" size string. Returns (cols, rows) or None.
 fn parse_size(s : String) -> (Int, Int)? {
   let mut x_index = -1
   for i = 0; i < s.length(); i = i + 1 {
@@ -161,7 +172,8 @@ fn parse_size(s : String) -> (Int, Int)? {
   }
 }
 
-///| Split an argument of the form "--name=value" into (name, Some(value)),
+///|
+/// Split an argument of the form "--name=value" into (name, Some(value)),
 /// or "--name" into (name, None).
 fn split_eq(arg : String) -> (String, String?) {
   for i = 0; i < arg.length(); i = i + 1 {
@@ -175,7 +187,8 @@ fn split_eq(arg : String) -> (String, String?) {
   (arg, None)
 }
 
-///| Parse the agent CLI arguments.
+///|
+/// Parse the agent CLI arguments.
 ///
 /// `args` is the argument vector excluding argv[0] (the hyoui executable).
 /// `--` separates hyoui options from the child command.
@@ -220,7 +233,7 @@ pub fn parse_args(args : Array[String]) -> ParseResult {
     let take_value : () -> String? = fn() {
       match inline_value {
         Some(v) => Some(v)
-        None => {
+        None =>
           if i + 1 < args.length() {
             let v = args[i + 1]
             i = i + 1
@@ -228,7 +241,6 @@ pub fn parse_args(args : Array[String]) -> ParseResult {
           } else {
             None
           }
-        }
       }
     }
     match name {
@@ -247,7 +259,8 @@ pub fn parse_args(args : Array[String]) -> ParseResult {
                 explicit_cols = Some(c)
                 explicit_rows = Some(r)
               }
-              None => return Error("invalid --size value (expected COLSxROWS): " + v)
+              None =>
+                return Error("invalid --size value (expected COLSxROWS): " + v)
             }
           None => return Error("--size requires a value")
         }

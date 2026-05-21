@@ -24,7 +24,9 @@ pub fn tty_is_tty(fd : Int) -> Bool {
 ///|
 pub fn tty_size(fd : Int) -> (Int, Int)? {
   let result = hyoui_tty_size(fd)
-  if result < 0L { return None }
+  if result < 0L {
+    return None
+  }
   let rows = ((result >> 16) & 0xFFFF_L).to_int()
   let cols = (result & 0xFFFF_L).to_int()
   Some((rows, cols))
@@ -33,7 +35,11 @@ pub fn tty_size(fd : Int) -> (Int, Int)? {
 ///|
 pub fn tty_save(fd : Int) -> TtyHandle? {
   let h = hyoui_tty_save(fd)
-  if h < 0 { None } else { Some(TtyHandle(h)) }
+  if h < 0 {
+    None
+  } else {
+    Some(TtyHandle(h))
+  }
 }
 
 ///|

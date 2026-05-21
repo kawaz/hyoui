@@ -44,9 +44,7 @@ pub extern "C" fn hyoui_proc_waitpid(pid: i32, nohang: i32) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn hyoui_proc_waitpid_stopped(pid: i32) -> i64 {
     let mut status: libc::c_int = 0;
-    let result = unsafe {
-        libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED)
-    };
+    let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
     if result <= 0 {
         // <= 0 : error (-1) or no state change (0). Report "no change".
         return 0xFFFF_FFFF_i64;

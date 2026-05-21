@@ -62,8 +62,8 @@ test "parse_args: headless preset flips suspend defaults" {
 test "parse_args: explicit suspend flags override headless preset" {
   match
     parse_args([
-      "--mode=headless", "--on-child-suspend=follow",
-      "--on-parent-suspend=transparent", "--", "cat",
+      "--mode=headless", "--on-child-suspend=follow", "--on-parent-suspend=transparent",
+      "--", "cat",
     ]) {
     Run(cfg) => {
       assert_eq(cfg.on_child_suspend, Follow)

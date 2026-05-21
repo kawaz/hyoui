@@ -43,10 +43,12 @@ pub fn io_poll(fds : Bytes, nfds : Int, timeout_ms : Int) -> Int {
 
 // io_poll が EINTR で割り込まれたときに返す番兵値。
 // 呼び出し側はこれを致命エラーとせず再 poll する。
+
 ///|
 pub const POLL_EINTR : Int = -2
 
 // poll イベント定数
+
 ///|
 pub const POLLIN : Int = 0x0001
 
