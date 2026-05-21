@@ -49,6 +49,7 @@ test "pty_resize: succeeds on valid handle" {
 }
 
 // W4: pty_spawnv normal case
+
 ///|
 test "pty_spawnv: echo hello returns valid pid and waitpid succeeds" {
   let handle = pty_open(80, 24).unwrap()
@@ -71,6 +72,7 @@ test "pty_spawnv: echo hello returns valid pid and waitpid succeeds" {
 // ===== tty =====
 
 // W6: Fix tautological test - use meaningful assertions
+
 ///|
 test "tty_is_tty: invalid fd returns false" {
   inspect(tty_is_tty(-1), content="false")
@@ -83,6 +85,7 @@ test "tty_is_tty: does not crash on stdin" {
 }
 
 // W5: tty_set_raw + tty_restore on pty fd
+
 ///|
 test "tty_set_raw and tty_restore: works on pty master fd" {
   let handle = pty_open(80, 24).unwrap()
@@ -140,6 +143,7 @@ test "io_close: invalid fd returns false" {
 }
 
 // W5: io_set_nonblocking on pty master_fd
+
 ///|
 test "io_set_nonblocking: works on pty master fd" {
   let handle = pty_open(80, 24).unwrap()
@@ -149,6 +153,7 @@ test "io_set_nonblocking: works on pty master fd" {
 }
 
 // W5: io_poll with pty master_fd
+
 ///|
 test "io_poll: timeout 0 on pty master_fd returns without error" {
   let handle = pty_open(80, 24).unwrap()
@@ -234,6 +239,7 @@ test "sock_listen: creates socket and cleanup" {
 }
 
 // W5: sock_connect + sock_accept roundtrip
+
 ///|
 test "sock_connect and sock_accept: roundtrip" {
   let dir = to_utf8("/tmp/hyoui_test_rt")
@@ -277,6 +283,7 @@ test "sig_ignore: SIGPIPE succeeds" {
 }
 
 // W5: sig_setup_winch on pty master_fd
+
 ///|
 test "sig_setup_winch: succeeds on pty master fd" {
   let handle = pty_open(80, 24).unwrap()
@@ -321,7 +328,6 @@ test "sig_selfpipe_init and sig_drain: roundtrip via raise" {
       inspect(signals.length() >= 1, content="true")
       inspect(signals[0], content="30")
       let _ = io_close(read_fd)
-
     }
   }
 }

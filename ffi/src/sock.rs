@@ -93,7 +93,11 @@ pub extern "C" fn hyoui_sock_listen(path: *const u8) -> i32 {
 
     let addr_len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
     let bind_ret = unsafe {
-        libc::bind(fd, &addr as *const libc::sockaddr_un as *const libc::sockaddr, addr_len)
+        libc::bind(
+            fd,
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            addr_len,
+        )
     };
 
     // Restore umask
@@ -117,9 +121,7 @@ pub extern "C" fn hyoui_sock_listen(path: *const u8) -> i32 {
 /// Returns the client fd on success, -1 on failure (including EAGAIN).
 #[unsafe(no_mangle)]
 pub extern "C" fn hyoui_sock_accept(fd: i32) -> i32 {
-    let client_fd = unsafe {
-        libc::accept(fd, std::ptr::null_mut(), std::ptr::null_mut())
-    };
+    let client_fd = unsafe { libc::accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
     if client_fd < 0 {
         return -1;
     }
@@ -152,7 +154,11 @@ pub extern "C" fn hyoui_sock_connect(path: *const u8) -> i32 {
 
     let addr_len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
     let ret = unsafe {
-        libc::connect(fd, &addr as *const libc::sockaddr_un as *const libc::sockaddr, addr_len)
+        libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            addr_len,
+        )
     };
     if ret != 0 {
         unsafe { libc::close(fd) };

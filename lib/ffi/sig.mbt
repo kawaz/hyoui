@@ -1,4 +1,5 @@
 // シグナル番号（macOS / Linux 共通）
+
 ///|
 pub const SIGHUP : Int = 1
 

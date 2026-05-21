@@ -46,7 +46,10 @@ pub extern "C" fn hyoui_pty_open(cols: i32, rows: i32) -> i32 {
         return -1;
     }
 
-    let state = PtyState { master_fd, slave_fd };
+    let state = PtyState {
+        master_fd,
+        slave_fd,
+    };
 
     let mut table = match PTY_TABLE.lock() {
         Ok(t) => t,
@@ -308,12 +311,9 @@ pub extern "C" fn hyoui_pty_close(handle: i32) -> i32 {
     let ret = unsafe { libc::close(entry.master_fd) };
 
     // Reset WINCH_MASTER_FD if it was pointing to this master_fd
-    WINCH_MASTER_FD.compare_exchange(
-        entry.master_fd,
-        -1,
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-    ).ok();
+    WINCH_MASTER_FD
+        .compare_exchange(entry.master_fd, -1, Ordering::Relaxed, Ordering::Relaxed)
+        .ok();
 
     if ret == -1 { -1 } else { 0 }
 }

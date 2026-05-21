@@ -1,0 +1,243 @@
+/// hyoui Taskfile (pkfire).
+///
+/// VCS 抽象 / 翻訳ペア / migrate / semver gate は [kawaz/pkf-tasks](https://github.com/kawaz/pkf-tasks) 由来。
+/// 本ファイルは MoonBit native + Rust FFI 系の lint/test/build と hyoui 固有の release flow だけ持つ。
+amends "package://pkg.pkl-lang.org/github.com/mizchi/pkfire/pkfire@0.10.0#/Taskfile.pkl"
+
+import "package://pkg.pkl-lang.org/github.com/kawaz/pkf-tasks/pkf-tasks@3.0.3#/all.pkl" as kawaz
+
+// ---------- shared ----------
+
+local moonSources: Listing<String> = new {
+  "cmd/**/*.mbt"
+  "lib/**/*.mbt"
+  "**/moon.pkg.json"
+  "moon.mod.json"
+}
+
+local rustSources: Listing<String> = new {
+  "ffi/src/**/*.rs"
+  "ffi/Cargo.toml"
+  "ffi/Cargo.lock"
+}
+
+// ---------- atomic (lint / test / build) ----------
+
+// MoonBit: native check
+//
+// Design rationale: `moon fmt` is intentionally NOT run here. moon
+// 0.1.20260509 (rr_moon_pkg feature flag) makes `moon fmt` migrate
+// `moon.pkg.json` -> the new `moon.pkg` format as a side effect, but the
+// emitted `supported_targets = [ "native" ]` line is then rejected by
+// `moon check` ("Invalid configuration `supported_targets`"). `moon fmt`
+// and `moon check` disagree on the `moon.pkg` schema in this transitional
+// toolchain. `moon fmt --check` has the same problem (always reports the
+// pkg-format migration as a diff). Re-add `moon fmt` once moon stabilizes
+// the `moon.pkg` format. `moon check` is the real correctness gate.
+local lintMoon: Task = new {
+  name = "lint:moon"
+  description = "moon check --target native"
+  visibility = "internal"
+  inputs = moonSources
+  cmd = "moon check --target native"
+}
+
+// Rust FFI (ffi/ 配下): fmt + clippy
+local lintRust: Task = new {
+  name = "lint:rust"
+  description = "cargo fmt + cargo clippy (ffi/)"
+  visibility = "internal"
+  inputs = rustSources
+  cmd =
+    """
+    set -euo pipefail
+    (cd ffi && cargo fmt && cargo clippy --release)
+    """
+}
+
+// pkf-tasks v2.0.0 で library export から外れたので inline (DR-0008 of pkf-tasks)
+local lintPkl: Task = new {
+  name = "lint:pkl"
+  description = "pkl format -w"
+  visibility = "internal"
+  inputs {
+    "**/*.pkl"
+    "**/PklProject"
+    "**/PklProject.deps.json"
+  }
+  cmd =
+    """
+    set -euo pipefail
+    pkl format -w . >/dev/null
+    """
+}
+
+local lint: Task = new {
+  name = "lint"
+  description = "lint:moon + lint:rust + lint:pkl"
+  cache = false
+  deps { lintMoon; lintRust; lintPkl }
+}
+
+local test: Task = new {
+  name = "test"
+  description = "moon test --target native"
+  inputs {
+    ...moonSources
+    ...rustSources
+  }
+  deps { lint }
+  cmd = "moon test --target native"
+}
+
+// Rust staticlib を先に build してから MoonBit native build。
+// `moon build` (パッケージ指定なし) は lib パッケージの link ブロックの都合で
+// 失敗するため必ず --package kawaz/hyoui/cmd/agent を付ける。
+local build: Task = new {
+  name = "build"
+  description = "build agent (native target)"
+  inputs {
+    ...moonSources
+    ...rustSources
+  }
+  outputs { "_build/native/release/build/cmd/agent/agent.exe" }
+  deps { lint }
+  cmd =
+    """
+    set -euo pipefail
+    (cd ffi && cargo build --release)
+    moon build --target native --package kawaz/hyoui/cmd/agent
+    """
+}
+
+local ci: Task = new {
+  name = "ci"
+  description = "lint + test + build"
+  cache = false
+  deps { lint; test; build }
+}
+
+// ---------- gates (push 内部、利用者が直接叩くことほぼなし) ----------
+
+// main@origin と比較、cmd/ lib/ ffi/ 変更があれば moon.mod.json bump 必須。
+//
+// Design rationale: 本来は pkf-tasks の `kawaz.semver.checkBumped` を使うが、
+// それは内部で `jj diff -r "main@origin..@"` を実行する。compareRef
+// (`main@origin`) が存在しない初回 push 前のリポでは `jj diff` が exit 1 で
+// 失敗し、しかも pkf-tasks 側の cmd が `diff_out=$(if ...; fi)` という
+// compound command を command substitution に入れているため、`set -e` 下では
+// 代入そのものが abort して gate が落ちる (= 初回 push が通らない)。
+// そこで本タスクは compareRef の存在を先に確認し、無ければ skip、あれば
+// bump-semver に委譲する。仕様 (triggerPaths / versionFiles の比較) は
+// kawaz.semver.checkBumped と等価。pkf-tasks 側が初回 push を吸収する形に
+// 直れば、この local 実装は消して `(kawaz.semver.checkBumped) { ... }.check`
+// に戻してよい。
+local checkVersionBumped: Task = new {
+  name = "semver:check-version-bumped"
+  description = "ensure moon.mod.json bumped when cmd/ lib/ ffi/ change"
+  cache = false
+  cmd =
+    #"""
+    set -euo pipefail
+    compare_ref='main@origin'
+
+    # compareRef が存在しなければ skip (初回 push 前: main@origin が無い)
+    if ! jj log -r "$compare_ref" --no-graph -T '""' >/dev/null 2>&1; then
+      echo "skip: '$compare_ref' does not exist yet (initial push)" >&2
+      exit 0
+    fi
+
+    # trigger paths が変更されていなければ skip
+    diff_out=$(jj diff -r "${compare_ref}..@" --summary -- cmd/ lib/ ffi/)
+    [ -z "$diff_out" ] && exit 0
+
+    if ! command -v bump-semver >/dev/null 2>&1; then
+      echo 'ERROR: bump-semver not installed.' >&2
+      echo '       Install: brew install kawaz/tap/bump-semver' >&2
+      exit 1
+    fi
+
+    if ! bump-semver compare gt moon.mod.json "vcs:${compare_ref}:moon.mod.json" --no-hint; then
+      echo "ERROR: moon.mod.json not bumped since $compare_ref" >&2
+      echo "       run: pkf run bump-version" >&2
+      exit 1
+    fi
+    """#
+}
+
+// ---------- release flow ----------
+
+local bumpVersion: Task = new {
+  name = "bump-version"
+  description = "bump version file(s) for Release"
+  cache = false
+  deps { kawaz.vcs.ensureClean }
+  params {
+    new Param {
+      name = "level"
+      type = "enum"
+      choices { "patch"; "minor"; "major" }
+      default = "patch"
+      description = "semver bump level"
+    }
+  }
+  cmd =
+    #"""
+    new_version=$(bump-semver "$LEVEL" moon.mod.json --write --no-hint) \
+      && jj commit -m "Release v${new_version}"
+    """#
+}
+
+local push: Task = (kawaz.vcs.push) {
+  name = "push"
+  description = "push with some checks"
+  deps {
+    ci
+    kawaz.docs.checkTranslations
+    checkVersionBumped
+    kawaz.migrate.checkPkfTasks
+    kawaz.migrate.checkPkfire
+  }
+}
+
+// ---------- main entries (利用者が直接叩く、宣言順 = 利用頻度の高い順) ----------
+
+local default: Task = new {
+  name = "default"
+  description = "default is run"
+  cache = false
+  deps { build }
+  acceptsArgs = true
+  quiet = true
+  cmd = #"./_build/native/release/build/cmd/agent/agent.exe "$@""#
+}
+
+local list: Task = new {
+  name = "list"
+  description = "list recipes (order matters)"
+  cache = false
+  quiet = true
+  cmd = "pkf list --unsorted --color=always"
+}
+
+// ---------- task registry (宣言順が pkf list --unsorted の表示順) ----------
+
+tasks {
+  default
+  list
+  test
+  push
+  bumpVersion
+  ci
+  build
+  lint
+  lintMoon
+  lintRust
+  lintPkl
+  // push 内部 gate (visibility は pkf-tasks 側で設定済 or 本リポ local の internal 設定)
+  ...kawaz.vcs.tasks
+  ...kawaz.docs.tasks
+  checkVersionBumped
+  kawaz.semver.compare
+  ...kawaz.migrate.tasks
+}

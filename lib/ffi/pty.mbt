@@ -24,7 +24,11 @@ extern "C" fn hyoui_pty_close(handle : Int) -> Int = "hyoui_pty_close"
 ///|
 pub fn pty_open(cols : Int, rows : Int) -> PtyHandle? {
   let h = hyoui_pty_open(cols, rows)
-  if h < 0 { None } else { Some(PtyHandle(h)) }
+  if h < 0 {
+    None
+  } else {
+    Some(PtyHandle(h))
+  }
 }
 
 ///|

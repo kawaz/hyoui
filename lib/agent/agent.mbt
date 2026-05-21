@@ -111,12 +111,17 @@ pub fn Agent::new(
   // so they are handled synchronously in the poll loop.
   let sig_read_fd = match @ffi.sig_selfpipe_init() {
     Some((r, _w)) => {
-      for s in [
-        @ffi.SIGCHLD, @ffi.SIGTSTP, @ffi.SIGCONT, @ffi.SIGINT, @ffi.SIGTERM,
-        @ffi.SIGQUIT, @ffi.SIGHUP,
-      ] {
+      for
+        s in [
+          @ffi.SIGCHLD,
+          @ffi.SIGTSTP,
+          @ffi.SIGCONT,
+          @ffi.SIGINT,
+          @ffi.SIGTERM,
+          @ffi.SIGQUIT,
+          @ffi.SIGHUP,
+        ] {
         let _ = @ffi.sig_register_selfpipe(s)
-
       }
       r
     }
@@ -167,7 +172,6 @@ pub fn Agent::cleanup(self : Agent) -> Unit {
   match self.tty_handle {
     Some(handle) => {
       let _ = @ffi.tty_restore(handle)
-
     }
     None => ()
   }
@@ -175,7 +179,6 @@ pub fn Agent::cleanup(self : Agent) -> Unit {
   let _ = @ffi.sock_unlink(self.socket_path)
   let _ = @ffi.sock_close(self.socket_fd)
   let _ = @ffi.pty_close(self.pty_handle)
-
 }
 
 ///|
@@ -295,16 +298,18 @@ fn Agent::check_deadlines(self : Agent) -> Unit {
   }
   let now = @ffi.clock_monotonic_ms()
   match self.config.timeout_ms {
-    Some(t) => if now - self.start_ms >= t.to_int64() {
-      self.exit_reason = Some(TimedOut)
-      return
-    }
+    Some(t) =>
+      if now - self.start_ms >= t.to_int64() {
+        self.exit_reason = Some(TimedOut)
+        return
+      }
     None => ()
   }
   match self.config.idle_timeout_ms {
-    Some(t) => if now - self.last_output_ms >= t.to_int64() {
-      self.exit_reason = Some(TimedOut)
-    }
+    Some(t) =>
+      if now - self.last_output_ms >= t.to_int64() {
+        self.exit_reason = Some(TimedOut)
+      }
     None => ()
   }
 }
@@ -323,10 +328,8 @@ fn Agent::terminate_child(self : Agent) -> Unit {
     }
     // sleep 100ms via poll on no fds
     let _ = @ffi.io_poll(b"", 0, 100)
-
   }
   let _ = @ffi.proc_killpg(self.child_pid, @ffi.SIGKILL)
-
 }
 
 ///|
@@ -346,12 +349,10 @@ fn Agent::handle_signal(self : Agent, sig : Int) -> Bool {
             match self.config.on_child_suspend {
               AutoResume => {
                 let _ = @ffi.proc_killpg(self.child_pid, @ffi.SIGCONT)
-
               }
               Follow => {
                 // Parent stops too; both stopped keeps the invariant intact.
                 let _ = @ffi.sig_raise(@ffi.SIGSTOP)
-
               }
             }
           }
@@ -364,12 +365,10 @@ fn Agent::handle_signal(self : Agent, sig : Int) -> Bool {
         // Stop the child group first, then stop the parent.
         let _ = @ffi.proc_killpg(self.child_pid, @ffi.SIGSTOP)
         let _ = @ffi.sig_raise(@ffi.SIGSTOP)
-
       }
       Decouple => {
         // Stop only the parent; the child keeps running.
         let _ = @ffi.sig_raise(@ffi.SIGSTOP)
-
       }
     }
   } else if sig == @ffi.SIGCONT {
@@ -378,7 +377,6 @@ fn Agent::handle_signal(self : Agent, sig : Int) -> Bool {
       Some((pid, _status, kind)) =>
         if pid == self.child_pid && kind == @ffi.WAIT_STOPPED {
           let _ = @ffi.proc_killpg(self.child_pid, @ffi.SIGCONT)
-
         }
       None => ()
     }
@@ -388,7 +386,6 @@ fn Agent::handle_signal(self : Agent, sig : Int) -> Bool {
     sig == @ffi.SIGHUP {
     // Relay termination-class signals to the child group.
     let _ = @ffi.proc_killpg(self.child_pid, sig)
-
   }
   // SIGWINCH is handled directly by the FFI handler, not via the self-pipe.
   true
@@ -450,7 +447,6 @@ pub fn Agent::poll_once(self : Agent) -> Bool {
       if n > 0 {
         let data = self.observer.on_input(bytes_take(buf, n))
         let _ = @ffi.io_write(self.master_fd, data)
-
       } else {
         eof = true
       }
@@ -500,12 +496,10 @@ pub fn Agent::poll_once(self : Agent) -> Bool {
           Some(data) => {
             let processed = self.observer.on_input(data)
             let _ = @ffi.io_write(self.master_fd, processed)
-
           }
           None => ()
         }
         let _ = @ffi.io_close(client_raw)
-
       }
       None => ()
     }
