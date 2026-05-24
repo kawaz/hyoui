@@ -1,0 +1,219 @@
+/// hyoui Taskfile (pkfire).
+///
+/// VCS 抽象 / 翻訳ペア / migrate / semver gate は [kawaz/pkf-tasks](https://github.com/kawaz/pkf-tasks) 由来。
+/// 本ファイルは Rust workspace 用の lint/test/build + unsafe 封じ込め gate を持つ。
+amends "package://pkg.pkl-lang.org/github.com/mizchi/pkfire/pkfire@0.10.0#/Taskfile.pkl"
+
+import "package://pkg.pkl-lang.org/github.com/kawaz/pkf-tasks/pkf-tasks@3.0.3#/all.pkl" as kawaz
+
+// ---------- shared ----------
+
+local rustSources: Listing<String> = new {
+  "crates/**/*.rs"
+  "**/Cargo.toml"
+  "Cargo.lock"
+}
+
+// ---------- atomic (lint / test / build) ----------
+
+local lintRust: Task = new {
+  name = "lint:rust"
+  description = "cargo fmt --check + cargo clippy"
+  visibility = "internal"
+  inputs = rustSources
+  cmd =
+    """
+    set -euo pipefail
+    cargo fmt --check
+    cargo clippy --workspace --all-targets -- -D warnings
+    """
+}
+
+// unsafe 封じ込め gate: unsafe { ... } / unsafe fn 等は sys/raw.rs と sys/signal.rs に限定。
+// 他に漏れたら fail。grep が何もマッチしなければ exit 1 を返すので、マッチ無しを成功とする。
+local lintUnsafe: Task = new {
+  name = "lint:unsafe"
+  description = "verify unsafe is confined to sys/raw.rs and sys/signal.rs"
+  visibility = "internal"
+  inputs {
+    "crates/hyoui/src/**/*.rs"
+  }
+  cmd =
+    #"""
+    set -uo pipefail
+    leaked=$(grep -rnE '\bunsafe[[:space:]]+(fn|impl|trait|extern|\{)' crates/hyoui/src --include='*.rs' \
+      | grep -v 'src/sys/raw.rs\|src/sys/signal.rs' || true)
+    if [ -n "$leaked" ]; then
+      echo "ERROR: unsafe leaked outside whitelisted files (sys/raw.rs, sys/signal.rs):" >&2
+      echo "$leaked" >&2
+      exit 1
+    fi
+    """#
+}
+
+// pkf-tasks v2.0.0 で library export から外れたので inline (DR-0008 of pkf-tasks)
+local lintPkl: Task = new {
+  name = "lint:pkl"
+  description = "pkl format -w"
+  visibility = "internal"
+  inputs {
+    "**/*.pkl"
+    "**/PklProject"
+    "**/PklProject.deps.json"
+  }
+  cmd =
+    """
+    set -euo pipefail
+    pkl format -w . >/dev/null
+    """
+}
+
+local lint: Task = new {
+  name = "lint"
+  description = "lint:rust + lint:unsafe + lint:pkl"
+  cache = false
+  deps { lintRust; lintUnsafe; lintPkl }
+}
+
+local test: Task = new {
+  name = "test"
+  description = "cargo test --workspace"
+  inputs = rustSources
+  deps { lint }
+  cmd = "cargo test --workspace"
+}
+
+local build: Task = new {
+  name = "build"
+  description = "cargo build --release --workspace"
+  inputs {
+    ...rustSources
+    "VERSION"
+  }
+  outputs { "target/release/hyoui" }
+  deps { lint }
+  cmd = "cargo build --release --workspace"
+}
+
+local ci: Task = new {
+  name = "ci"
+  description = "lint + test + build"
+  cache = false
+  deps { lint; test; build }
+}
+
+// ---------- gates (push 内部) ----------
+
+// main@origin と比較、crates/ 変更があれば VERSION bump 必須
+local checkVersionBumped: Task =
+  (kawaz.semver.checkBumped) {
+    compareRef = "main@origin"
+    triggerPaths = List("crates/")
+    versionFiles = List("VERSION")
+    taskName = "semver:check-version-bumped"
+  }.check
+
+// latest semver tag と比較 (release 前の local 確認用、push deps には含めない)
+local checkAgainstLatestRelease: Task =
+  (kawaz.semver.checkBumped) {
+    compareRef = "vcs:latest-tag()"
+    triggerPaths = List("crates/")
+    versionFiles = List("VERSION")
+    taskName = "semver:check-against-latest-release"
+    needsFetchTags = true
+  }.check
+
+// VERSION と Cargo.toml の workspace.package.version (cmd 経由で抽出) と
+// build 済 binary の --version を横断比較する gate。
+local versions = (kawaz.semver.versions) {
+  versionFiles = List("VERSION")
+  cmdSources = List(#"cmd:grep -E '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/'"#)
+}
+local versionDisplay: Task = versions.version
+local checkVersionsAligned: Task = versions.checkAligned
+
+// ---------- release flow ----------
+
+local bumpVersion: Task = new {
+  name = "bump-version"
+  description = "bump VERSION + sync workspace.package.version in Cargo.toml"
+  cache = false
+  deps { kawaz.vcs.ensureClean }
+  params {
+    new Param {
+      name = "level"
+      type = "enum"
+      choices { "patch"; "minor"; "major" }
+      default = "patch"
+      description = "semver bump level"
+    }
+  }
+  cmd =
+    #"""
+    set -euo pipefail
+    new_version=$(bump-semver "$LEVEL" VERSION --write --no-hint)
+    # workspace.package.version は bump-semver が直接扱えないため sed で同期 (DR-0003)
+    perl -i -pe 'BEGIN{$v=shift @ARGV} s/^version\s*=\s*"[^"]*"/version = "$v"/ if !$done++' \
+      "$new_version" Cargo.toml
+    # cargo check で Cargo.lock を再生成 (workspace 全体)
+    cargo check --workspace --offline >/dev/null 2>&1 || cargo check --workspace >/dev/null
+    jj commit -m "Release v${new_version}"
+    """#
+}
+
+local push: Task = (kawaz.vcs.push) {
+  name = "push"
+  description = "push with some checks"
+  deps {
+    ci
+    kawaz.docs.checkTranslations
+    checkVersionBumped
+    kawaz.migrate.checkPkfTasks
+    kawaz.migrate.checkPkfire
+  }
+}
+
+// ---------- main entries (利用者が直接叩く、宣言順 = 利用頻度の高い順) ----------
+
+local default: Task = new {
+  name = "default"
+  description = "default is run (build then exec)"
+  cache = false
+  deps { build }
+  acceptsArgs = true
+  quiet = true
+  cmd = #"./target/release/hyoui "$@""#
+}
+
+local list: Task = new {
+  name = "list"
+  description = "list recipes (order matters)"
+  cache = false
+  quiet = true
+  cmd = "pkf list --unsorted --color=always"
+}
+
+// ---------- task registry (宣言順が pkf list --unsorted の表示順) ----------
+
+tasks {
+  default
+  list
+  test
+  push
+  bumpVersion
+  ci
+  build
+  lint
+  lintRust
+  lintUnsafe
+  lintPkl
+  // push 内部 gate
+  ...kawaz.vcs.tasks
+  ...kawaz.docs.tasks
+  checkVersionBumped
+  checkAgainstLatestRelease
+  versionDisplay
+  checkVersionsAligned
+  kawaz.semver.compare
+  ...kawaz.migrate.tasks
+}
