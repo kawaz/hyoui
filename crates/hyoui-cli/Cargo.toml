@@ -1,0 +1,19 @@
+[package]
+name = "hyoui-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "hyoui command-line interface"
+
+[[bin]]
+name = "hyoui"
+path = "src/main.rs"
+
+[dependencies]
+hyoui = { path = "../hyoui" }
+
+[lints.rust]
+unsafe_code = "forbid"
