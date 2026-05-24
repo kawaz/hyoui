@@ -20,6 +20,14 @@
 
 pub mod sys;
 
+// Stage 3 modules (filled in by parallel workers).
+#[allow(missing_docs)]
+pub mod cli;
+#[allow(missing_docs)]
+pub mod observer;
+#[allow(missing_docs)]
+pub mod protocol;
+
 /// Library version (matches `Cargo.toml`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
