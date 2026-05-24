@@ -20,13 +20,14 @@
 
 pub mod sys;
 
-// Stage 3 modules (filled in by parallel workers).
-#[allow(missing_docs)]
+// Stage 3 modules (doc-complete; lints enabled).
 pub mod cli;
-#[allow(missing_docs)]
 pub mod observer;
-#[allow(missing_docs)]
 pub mod protocol;
+
+// Stage 4: agent — the PTY-proxy event loop wired together from the
+// `sys`, `observer`, `protocol`, and `cli` modules above.
+pub mod agent;
 
 /// Library version (matches `Cargo.toml`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
