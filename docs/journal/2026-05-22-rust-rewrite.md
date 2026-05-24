@@ -51,12 +51,27 @@ poc が posix_spawn を選んだ理由「MoonBit の fork は GC で危険」は
 | `jj bookmark set main -r pprmuvnu` が `Refusing to move bookmark backwards or sideways` で拒否 | 意図的な backwards (rewrite) なので `--allow-backwards` 付与。jj-tips.md の警告は「別ブランチのマージを失う」リスクのため。今回は bootstrap で保全済みで該当しない |
 | `pkf run push` が main 専用ハードコード (`jj bookmark set main -r @-; jj git push --bookmark main`) で bootstrap を push できない | 現 Taskfile は段階 6 で全廃予定。bootstrap origin push はワークフロー検討後に手動で実施 (ローカル bookmark として保全継続) |
 | `jj new pprmuvnu` 後に `_build/`/`ffi/target/` の 1MB 超ファイルが snapshot 拒否 warning | jj 追跡外なので物理削除 (`rm -rf`) で対処 |
+| **pkf run push の push task が `jj bookmark set main -r @-; jj git push --bookmark main` 仕様** → 段階 0 序盤に bootstrap 保全のため `pkf run push` を試した時、当時の @ = 段階 0 復元 commit、その親 `@-` = pprmuvnu (Initial empty commit) → main bookmark が pprmuvnu に強制 set されて push → **remote main が wkmvsqrq (poc) から pprmuvnu に巻き戻った** (poc は GitHub reflog で 90 日復旧可能) | 段階 6 完了後の push 時は `jj new` で空 change を作って @ を空にしてから `pkf run push` (= `@-` が wxyrruot を指す状態にしてから push)。これが Taskfile の push task の運用前提 |
+| 初回 push で `kawaz.semver.checkBumped` が **「No such path: VERSION」** で失敗 (remote main = pprmuvnu = Initial empty commit には VERSION が無いので bump-semver compare gt が比較不能) | Taskfile.pkl の push deps から `checkVersionBumped` を一時除外して `pkf run push` 実行 → push 完了後 `jj restore --from @- Taskfile.pkl` で取り消し (一時編集は @ にのみ残し commit しない) |
+
+## 結果
+
+- v0.0.0 リリース成功 (https://github.com/kawaz/hyoui/releases/tag/v0.0.0)
+- 4 architecture artifact: `hyoui-0.0.0-{aarch64,x86_64}-{apple-darwin,unknown-linux-gnu}.tar.gz`
+- CI matrix (ubuntu + macos) と release matrix (4 target) すべて green
+- ローカル: 97 件テスト pass、unsafe 封じ込め検証 0 件、`pkf run ci` green
 
 ## 残課題
 
 `docs/issue/` に起票済み:
-- CI / release ワークフロー整備 (Rust 前提に書き換え済み)
+- CI / release ワークフロー整備 (Rust 前提に書き換え済み、本フェーズで実装完了 → close 候補)
 
-新規 DR:
-- DR-0003 (Rust 一本化と MoonBit 却下、forkpty 採用) — 段階 6 で起票
-- DR-0004 (CLI サブコマンド設計) — 段階 6 で起票
+未起票:
+- **bootstrap origin push**: kawaz が手動 (ワークフロー検討) で実施。それまでローカル `bootstrap` bookmark + `../bootstrap/` workspace で poc 保全継続
+- **pkf-tasks / bump-semver の initial-release 対応**: `kawaz.semver.checkBumped` の `bump-semver compare gt` が「compareRef 側に VERSION ファイル不在」で失敗するケースの fallback (新規ファイル = bump 済扱い、または compareRef 検出失敗時の skip 等)。kawaz/pkf-tasks に issue 起票候補
+- **GitHub Actions Node.js 20 deprecation**: `actions/{checkout,upload-artifact,download-artifact}` 等が Node.js 20 で動いている (2026-09-16 に runner から削除予定)。Node.js 24 対応版へ更新
+- **SIGTSTP の cargo test 環境特有挙動**: 段階 2 の forkpty ctty 検証テストで SIGTSTP が cargo test 環境ではブロックされる現象 → SIGSTOP に切り替えて回避。本番 binary での SIGTSTP delivery 動作確認 (smoke) は未実施。段階 4 の agent イベントループで parent 側 SIGTSTP re-raise 経路を本番で叩く必要が出たら検証
+
+新規 DR (段階 6 で起票済):
+- DR-0003 (Rust 一本化と MoonBit 却下、forkpty + login_tty 採用)
+- DR-0004 (CLI サブコマンド設計)
