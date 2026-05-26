@@ -1643,7 +1643,32 @@ fn usage_completion() -> String {
         "hyoui completion — print a shell completion script\n\
         \n\
         USAGE:\n    \
-            hyoui completion <bash|zsh|fish>\n",
+            hyoui completion <shell>\n\
+        \n\
+        OPTIONS:\n    \
+            -h, --help      Show this help and exit\n\
+        \n\
+        SHELLS:\n    \
+            bash    Bourne-Again SHell。`source <(hyoui completion bash)` 等で読み込む\n    \
+            zsh     Z Shell。`fpath` に置く or `eval` 経由で読み込む\n    \
+            fish    Friendly Interactive SHell。`~/.config/fish/completions/` 配下に置く\n\
+        \n\
+        EXAMPLES:\n    \
+            # bash: 現在の shell に直接読ませる\n    \
+            source <(hyoui completion bash)\n\
+        \n    \
+            # zsh: fpath 配下に保存して再起動で有効化\n    \
+            hyoui completion zsh > ~/.zsh/completions/_hyoui\n\
+        \n    \
+            # fish: 自動読み込みディレクトリへ配置\n    \
+            hyoui completion fish > ~/.config/fish/completions/hyoui.fish\n\
+        \n\
+        EXIT CODE:\n    \
+            0   script を stdout に出力して正常終了\n    \
+            2   shell 名未指定 / 未知 shell / 引数過多\n\
+        \n\
+        RELATED:\n    \
+            hyoui --help        全 subcommand 一覧\n",
     )
 }
 
@@ -2110,6 +2135,48 @@ mod tests {
                 topic: HelpTopic::Completion
             }
         ));
+    }
+
+    /// R5-FB6: `hyoui completion --help` の usage 出力が completion 専用 topic を
+    /// 含んでいること (= R4-H1 で list/kill の help 配線を直したのと同じパターン
+    /// を completion にも適用)。旧版は `usage_completion()` が骨組み 1 行だけで
+    /// SHELLS / EXAMPLES / RELATED が欠落していた。
+    #[test]
+    fn completion_help_routes_to_completion_topic() {
+        // -h でも --help でも completion topic に飛ぶ
+        for flag in ["--help", "-h"] {
+            match parse_args(&args(&["completion", flag])) {
+                Command::Help {
+                    topic: HelpTopic::Completion,
+                } => {}
+                other => {
+                    panic!("expected HelpTopic::Completion for `completion {flag}`, got {other:?}")
+                }
+            }
+        }
+        // 中身は usage_completion() 由来 (= 上の usage_subcommand_help_routes_to_topic
+        // と機能重複だが、SHELLS / EXAMPLES / RELATED 節の存在を明示確認する
+        // regression guard)
+        let text = usage(&HelpTopic::Completion);
+        for needle in [
+            "hyoui completion",
+            "SHELLS:",
+            "EXAMPLES:",
+            "RELATED:",
+            "bash",
+            "zsh",
+            "fish",
+        ] {
+            assert!(
+                text.contains(needle),
+                "usage_completion() must contain `{needle}`; got:\n{text}"
+            );
+        }
+        // top-level help と混同していないこと (= R4-H1 regression guard)
+        assert!(
+            !text.contains("SUBCOMMANDS:\n"),
+            "usage_completion() must not contain top-level SUBCOMMANDS; got:\n{text}"
+        );
     }
 
     #[test]
@@ -2589,7 +2656,11 @@ mod tests {
             (HelpTopic::Status, "hyoui status", &["OUTPUT", "child-pid"]),
             (HelpTopic::Tail, "hyoui tail", &["--follow", "--since"]),
             (HelpTopic::Wait, "hyoui wait", &["PREDICATES", "wait-idle"]),
-            (HelpTopic::Completion, "hyoui completion", &["bash"]),
+            (
+                HelpTopic::Completion,
+                "hyoui completion",
+                &["bash", "zsh", "fish", "EXAMPLES", "SHELLS"],
+            ),
         ];
         for (topic, head, must_have) in cases {
             let text = usage(topic);
