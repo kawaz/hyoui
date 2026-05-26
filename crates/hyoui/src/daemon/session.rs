@@ -4021,8 +4021,11 @@ mod tests {
         // client 1: rw、handshake のみ。socket を読まずに放置 → backpressure 対象
         let mut slow = client_connect_with_retry(&sock_path);
         let _ = do_client_handshake(&mut slow);
-        // handshake response 直後の leader.notify 1 つだけ読んで、その後は何も読まない
-        let _ = Frame::decode_from(&mut slow).expect("slow leader.notify");
+        // 注: leader.notify は来るはずだが、CI Linux 等で yes 出力が先に queue を
+        // 埋めて daemon が即 backpressure disconnect する場合、leader.notify を
+        // 受信する前に shutdown される race がある。本 test の意図は「backpressure で
+        // disconnect されること」なので leader.notify 受信は optional 扱い。
+        let _ = Frame::decode_from(&mut slow);
 
         // client 2: rw、こちらも attach するが「ちゃんと recv する側」として機能
         // させたい。試験安定化のためここでも何も読まない (= daemon は data を broadcast
