@@ -108,7 +108,7 @@ local ci: Task = new {
 local checkVersionBumped: Task =
   (kawaz.semver.checkBumped) {
     compareRef = "main@origin"
-    triggerPaths = List("crates/")
+    triggerPaths = List("crates/hyoui/src/", "crates/hyoui-cli/src/")
     versionFiles = List("VERSION")
     taskName = "semver:check-version-bumped"
   }.check
@@ -117,7 +117,7 @@ local checkVersionBumped: Task =
 local checkAgainstLatestRelease: Task =
   (kawaz.semver.checkBumped) {
     compareRef = "vcs:latest-tag()"
-    triggerPaths = List("crates/")
+    triggerPaths = List("crates/hyoui/src/", "crates/hyoui-cli/src/")
     versionFiles = List("VERSION")
     taskName = "semver:check-against-latest-release"
     needsFetchTags = true
