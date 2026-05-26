@@ -332,9 +332,10 @@ Wild debugger / Competitive 分析 / Rust API 設計
 - [ ] **R5-M13** socket parent dir 検査が symlink-follow (TOCTOU + symlink すり替え)
   - 出典: POSIX+Audit (R5-POSIX-H3, R5-AUD-M5) / 該当: `sys/socket.rs:66-87`, `socket_path.rs:95-125`
   - 提案: `openat(O_NOFOLLOW | O_DIRECTORY)` で dir fd 握ってから `fstat`、または最低 `symlink_metadata` で symlink reject
-- [ ] **R5-M14** forkpty (BSD 拡張) / login_tty / WCONTINUED (WSL1) の portability gap 明文化不在
+- [done] **R5-M14** forkpty (BSD 拡張) / login_tty / WCONTINUED (WSL1) の portability gap 明文化不在
   - 出典: POSIX (R5-POSIX-H1, R5-POSIX-H2) / R4-M29 と統合
   - 提案: README + `docs/DESIGN-ja.md` §portability で「Linux/macOS 範囲、WSL2 のみ、Solaris/illumos 別途検証要」明記、DR-0003 補強
+  - 解消: `docs/DESIGN-ja.md` / `docs/DESIGN.md` に §5 「ポータビリティ」/「Portability」を新設、Tier 1/2/非サポート OS 一覧 + forkpty/login_tty・WCONTINUED・IUTF8・SO_PEERCRED・CLOCK_MONOTONIC・pipe2(O_CLOEXEC) の OS 差を一覧化。後段 §は番号 +1 リナンバ。
 - [ ] **R5-M15** Scrollback `since` / `last_n_bytes` の O(N) / O(K²) 計算量
   - 出典: Perf (R5-PERF-M1) / 該当: `crates/hyoui/src/scrollback.rs:117-130, :140-156`
   - 提案: `since` を `partition_point` で二分探索 → O(log K)、`last_n_bytes` を逆算 1-pass O(n) に

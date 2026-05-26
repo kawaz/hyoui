@@ -224,14 +224,45 @@ queued_bytes は `Arc<AtomicUsize>`、ClientHandle drop 時に減算。
 - 暗号化なし（同 UID 領域、別 UID は perm で完全遮断）
 - TCP / WebSocket transport を追加する v0.2.0+ では別途 token-based auth or TLS を DR 化
 
-## 5. リリース管理
+## 5. ポータビリティ
+
+hyoui は POSIX 風 PTY/シグナル/Unix ドメインソケットを前提とした PTY 寄生ツール。
+動作確認/サポート方針は以下:
+
+| 区分 | OS | 状況 |
+|---|---|---|
+| Tier 1 (CI で常時検証) | Linux x86_64 / aarch64、macOS Intel / Apple Silicon | release blocking、`cargo test` 通過必須 |
+| Tier 2 (互換性は意図、未自動検証) | WSL2 (Linux 互換 kernel) | best-effort、kawaz 手元で sanity 確認 |
+| 非サポート | WSL1、Solaris/illumos、各種 BSD、Cygwin/MSYS、Windows native | 動かないか別 issue 化が必要 |
+
+OS 機能に対する依存と既知のポータビリティギャップ:
+
+- **`forkpty(3)` + `login_tty(3)` は POSIX ではなく BSD 拡張**。Linux (glibc/musl)、
+  macOS、各種 BSD には存在する。Solaris/illumos には存在しない (`posix_openpt` +
+  手動 controlling terminal setup の自作 wrapper が必要)。本プロジェクトは Solaris
+  系を非サポートとする ([[DR-0003]] 補強)。
+- **`waitpid(WCONTINUED)` は WSL1 で未実装** (`WCONTINUED` flag が ENOSYS 相当で
+  失敗するケース)。WSL2 = 通常 Linux kernel なので問題なし。
+- **`IUTF8` (termios input flag) は Linux/Android/Apple のみ**。それ以外の OS では
+  cfg ガードで no-op。R5-M9 参照。
+- **`SO_PEERCRED` (Linux) と `getpeereid(3)` (BSD/macOS) は名前と取得方法が違う**。
+  defense-in-depth の uid 一致 assert を入れる場合は OS 別 path が必要 (R5-M11)。
+- **`CLOCK_MONOTONIC` の suspend 中挙動は OS 依存**。Linux/macOS は止まる、FreeBSD
+  は進む。`wait` の timeout は OS の挙動に依存する (R5-M21)。
+- **`pipe2(O_CLOEXEC)` は Linux/FreeBSD のみ**。macOS は `pipe(2)` + `fcntl(F_SETFD,
+  FD_CLOEXEC)` が必要。`nix::unistd::pipe` の将来の API 変更で挙動が変わる可能性が
+  あるため、CLOEXEC 状態の暗黙依存を避けて明示制御することを推奨 (R5-M4)。
+
+新規 OS 対応は DR-0003 を起点に検討する。
+
+## 6. リリース管理
 
 - VERSION file 1 つ + Cargo.toml workspace.package.version を `pkf run bump-version` で同期
 - `main` への push が release.yml の trigger（VERSION 変更を検知）
 - workflow が tag + GH Release を自動作成（[release-flow-awareness](../../) ルール参照）
 - v0.1.0 = 2026-05-27 release 済、208 tests pass
 
-## 6. 関連文書
+## 7. 関連文書
 
 | カテゴリ | 場所 | 内容 |
 |---|---|---|

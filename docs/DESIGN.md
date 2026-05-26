@@ -252,7 +252,41 @@ dropped.
 - TCP / WebSocket transports added in v0.2.0+ will require token-based auth or
   TLS via a separate DR
 
-## 5. Release management
+## 5. Portability
+
+hyoui is a PTY-piggyback tool that assumes POSIX-style PTYs, signals, and Unix
+domain sockets. Support tiers and known gaps:
+
+| Tier | OS | Status |
+|---|---|---|
+| Tier 1 (CI-verified) | Linux x86_64 / aarch64, macOS Intel / Apple Silicon | Release-blocking; `cargo test` must pass |
+| Tier 2 (intended but not auto-verified) | WSL2 (Linux-compatible kernel) | Best-effort; sanity-checked by kawaz |
+| Unsupported | WSL1, Solaris/illumos, the BSDs, Cygwin/MSYS, native Windows | Does not work or requires a separate issue |
+
+Dependencies on OS features and known portability gaps:
+
+- **`forkpty(3)` + `login_tty(3)` are BSD extensions, not POSIX.** They exist
+  on Linux (glibc/musl), macOS, and the BSDs; they do not exist on
+  Solaris/illumos (which would need a hand-rolled wrapper using `posix_openpt`
+  plus manual controlling-terminal setup). Solaris-family systems are out of
+  scope ([[DR-0003]] reinforcement).
+- **`waitpid(WCONTINUED)` is not implemented on WSL1** (the `WCONTINUED` flag
+  fails with an ENOSYS-equivalent). WSL2 uses a real Linux kernel and is fine.
+- **`IUTF8` (termios input flag) only exists on Linux/Android and Apple
+  targets.** Other OSes get a cfg-gated no-op (see R5-M9).
+- **`SO_PEERCRED` (Linux) and `getpeereid(3)` (BSD/macOS) differ in name and
+  retrieval path.** A defense-in-depth UID-match assert needs per-OS branches
+  (R5-M11).
+- **`CLOCK_MONOTONIC` behavior across suspend is OS-dependent.** Linux/macOS
+  pause it; FreeBSD advances. `wait` timeouts inherit the OS behavior (R5-M21).
+- **`pipe2(O_CLOEXEC)` only exists on Linux/FreeBSD.** macOS needs `pipe(2)`
+  plus `fcntl(F_SETFD, FD_CLOEXEC)`. Since `nix::unistd::pipe`'s CLOEXEC
+  semantics could change in a future version, prefer explicit control over
+  implicit dependence on the default (R5-M4).
+
+Adding a new OS starts from a fresh DR-0003-style decision record.
+
+## 6. Release management
 
 - The single VERSION file plus `Cargo.toml [workspace.package].version` are kept
   in sync by `pkf run bump-version`
@@ -261,7 +295,7 @@ dropped.
   `release-flow-awareness` rule)
 - v0.1.0 was released on 2026-05-27 with 208 tests passing
 
-## 6. Related documents
+## 7. Related documents
 
 | Category | Location | Content |
 |---|---|---|
