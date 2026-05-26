@@ -13,6 +13,7 @@
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{SyncSender, TrySendError};
+use std::time::Instant;
 
 use nix::poll::{PollFd, PollTimeout};
 use nix::sys::signal::{Signal, kill};
@@ -21,12 +22,14 @@ use nix::unistd::Pid;
 
 use crate::Error;
 use crate::protocol::messages::{
-    ErrorMessage, LeaderNotify, LockResponse, LockResult, ModeChange, SessionMode,
+    ClientInfo, ErrorMessage, LeaderNotify, LockResponse, LockResult, ModeChange, SessionMode,
+    StatusResponse, TailData, TailEnd, TailEndReason, TailRequest,
 };
 use crate::protocol::{
     ControlMessage, Frame, FrameError, HandshakeResponse, MVP_CAPS, Mode, ProtocolError,
     TYPE_CBOR_CONTROL, TYPE_RAW_DATA, Transport, UnixStreamTransport, intersect_caps,
 };
+use crate::scrollback::Scrollback;
 use crate::sys::{
     FdExt, Pty, UnixSock, poll::PollFlags, poll::PollOutcome, poll::poll, pty::Spawned,
 };
@@ -224,6 +227,7 @@ impl Session {
         let mut clients: Vec<ClientHandle> = Vec::new();
         let mut next_client_id: u64 = 0;
         let mut state = SessionState::default();
+        let mut scrollback = Scrollback::new(config.scrollback_bytes);
         let outcome = serve_loop(
             &pty,
             child,
@@ -233,6 +237,7 @@ impl Session {
             &config,
             client_buffer_cap,
             &mut state,
+            &mut scrollback,
         );
 
         // cleanup: 各 client の writer thread を terminate (= channel drop で recv 終わる)
@@ -258,12 +263,26 @@ struct ClientHandle {
     mode: Mode,
     /// leader 取得状態 (= rw mode の最初の client が true)。
     leader: bool,
+    /// 受信 subscription (= broadcast の encoding 種類を切り替える)。
+    subscription: Subscription,
     /// daemon → client への frame enqueue 用 mpsc。
     writer_tx: SyncSender<Vec<u8>>,
     /// writer thread のハンドル。drop の前に join される。
     writer_thread: Option<std::thread::JoinHandle<()>>,
     /// daemon が client → daemon を decode するときに使う socket reader。
     reader: UnixStream,
+}
+
+/// client の出力 subscription (Phase 11)。
+///
+/// - `Raw`: 通常 attach (= `hyoui run` / `hyoui attach`)、子 PTY 出力を
+///   `TYPE_RAW_DATA` frame で受け取る。
+/// - `TailFollow`: `tail.request { follow: true }` 後、子 PTY 出力を
+///   `tail.data` CBOR frame で受け取る (strip_ansi 適用は per-chunk best-effort)。
+#[derive(Debug, Clone, Copy)]
+enum Subscription {
+    Raw,
+    TailFollow { strip_ansi: bool },
 }
 
 /// session 全体の状態 (Phase 10)。lock 周りの state machine を保持する。
@@ -368,6 +387,159 @@ fn send_control(ch: &ClientHandle, msg: ControlMessage) -> bool {
     ch.writer_tx.try_send(frame_bytes).is_ok()
 }
 
+/// `Instant` (monotonic) を Unix epoch millis に近似変換する。
+///
+/// `now_inst - ts` で elapsed を求め、`SystemTime::now() - elapsed` を取る。
+/// SystemTime と Instant が線形に対応していない場合 (= clock jump) に誤差は
+/// 出るが、tail.data の timestamp_ms は debug / 表示用なので実用上問題ない。
+fn instant_to_epoch_ms(ts: Instant) -> i64 {
+    let now_inst = Instant::now();
+    let elapsed = now_inst.saturating_duration_since(ts);
+    let now_sys = std::time::SystemTime::now();
+    let then = now_sys.checked_sub(elapsed).unwrap_or(now_sys);
+    then.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// 子 PTY 出力 `bytes` を全 client に broadcast する。subscription 種類に応じて
+/// raw_data frame (= Raw) or tail.data CBOR frame (= TailFollow) を送る。
+fn broadcast_master_bytes(clients: &mut [ClientHandle], bytes: &[u8], ts: Instant) {
+    // Raw 用の frame bytes は 1 度だけ encode してから全 Raw subscriber に clone enqueue
+    let raw_frame_bytes: Option<Vec<u8>> = if clients
+        .iter()
+        .any(|c| matches!(c.subscription, Subscription::Raw))
+    {
+        let mut buf = Vec::new();
+        if Frame::raw_data(bytes.to_vec()).encode_to(&mut buf).is_ok() {
+            Some(buf)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Tail 用は strip_ansi の値ごとに 1 度だけ encode してキャッシュ
+    let ts_ms = instant_to_epoch_ms(ts);
+    let mut tail_cache: [Option<Vec<u8>>; 2] = [None, None]; // [strip=false, strip=true]
+    let encode_tail = |strip: bool, cache: &mut [Option<Vec<u8>>; 2]| -> Option<Vec<u8>> {
+        let key = if strip { 1 } else { 0 };
+        if let Some(ref cached) = cache[key] {
+            return Some(cached.clone());
+        }
+        let payload = if strip {
+            crate::strip::strip_ansi(bytes)
+        } else {
+            bytes.to_vec()
+        };
+        let msg = ControlMessage::TailData(TailData {
+            bytes: payload,
+            timestamp_ms: ts_ms,
+        });
+        let body = msg.encode_to_vec().ok()?;
+        let mut frame_bytes = Vec::new();
+        Frame::cbor_control(body).encode_to(&mut frame_bytes).ok()?;
+        cache[key] = Some(frame_bytes.clone());
+        Some(frame_bytes)
+    };
+
+    for ch in clients.iter() {
+        let fb = match ch.subscription {
+            Subscription::Raw => raw_frame_bytes.clone(),
+            Subscription::TailFollow { strip_ansi } => encode_tail(strip_ansi, &mut tail_cache),
+        };
+        if let Some(fb) = fb {
+            match ch.writer_tx.try_send(fb) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                    // backpressure / disconnect: 後段の broadcast_bytes と同じ
+                    // silently skip (= MVP は到達しない 8 MiB)。Phase 12 で厳密化。
+                }
+            }
+        }
+    }
+}
+
+/// `tail.request` を処理する (Phase 11)。
+///
+/// 流れ:
+/// 1. since_ms / last_bytes でフィルタした bytes を scrollback から取り出す
+/// 2. strip_ansi が true なら ANSI escape を strip (per-snapshot で 1 回だけ)
+/// 3. 取り出した bytes を 1 個の `TailData` として送信 (= chunk 境界は失う、
+///    timestamp_ms = now)
+/// 4. follow=false なら即 `TailEnd(Eof)`、follow=true なら subscription を
+///    `TailFollow` に切り替えて以降の master 出力も `TailData` で送り続ける
+///
+/// since_strict=true で since 範囲が ring buffer から押し出されていれば
+/// `TailEnd(BufferTruncated)` を返して subscription は変更しない。
+fn handle_tail_request(
+    idx: usize,
+    req: TailRequest,
+    clients: &mut [ClientHandle],
+    scrollback: &Scrollback,
+) {
+    let now = Instant::now();
+    let bytes_opt: Option<Vec<u8>> = if let Some(since_ms) = req.since_ms {
+        let dur = std::time::Duration::from_millis(since_ms);
+        if req.since_strict {
+            match scrollback.since_strict(now, dur) {
+                Ok(b) => Some(b),
+                Err(_) => {
+                    // since 範囲が buffer から evict 済 → BufferTruncated で即終了
+                    let _ = send_control(
+                        &clients[idx],
+                        ControlMessage::TailEnd(TailEnd {
+                            reason: TailEndReason::BufferTruncated,
+                        }),
+                    );
+                    return;
+                }
+            }
+        } else {
+            Some(scrollback.since(now, dur))
+        }
+    } else if let Some(last_bytes) = req.last_bytes {
+        Some(scrollback.last_n_bytes(last_bytes as usize))
+    } else {
+        Some(scrollback.last_n_bytes(scrollback.total_bytes()))
+    };
+
+    let mut snapshot = bytes_opt.unwrap_or_default();
+    if let Some(last_bytes) = req.last_bytes {
+        let lb = last_bytes as usize;
+        if snapshot.len() > lb {
+            snapshot = snapshot[snapshot.len() - lb..].to_vec();
+        }
+    }
+    if req.strip_ansi {
+        snapshot = crate::strip::strip_ansi(&snapshot);
+    }
+
+    if !snapshot.is_empty() {
+        let _ = send_control(
+            &clients[idx],
+            ControlMessage::TailData(TailData {
+                bytes: snapshot,
+                timestamp_ms: instant_to_epoch_ms(now),
+            }),
+        );
+    }
+
+    if req.follow {
+        clients[idx].subscription = Subscription::TailFollow {
+            strip_ansi: req.strip_ansi,
+        };
+    } else {
+        let _ = send_control(
+            &clients[idx],
+            ControlMessage::TailEnd(TailEnd {
+                reason: TailEndReason::Eof,
+            }),
+        );
+    }
+}
+
 /// CBOR control message を全 client に broadcast。
 fn broadcast_control(clients: &mut [ClientHandle], msg: &ControlMessage) {
     let body = match msg.encode_to_vec() {
@@ -417,6 +589,7 @@ fn serve_loop(
     config: &DaemonConfig,
     client_buffer_cap: usize,
     state: &mut SessionState,
+    scrollback: &mut Scrollback,
 ) -> RelayOutcome {
     loop {
         // poll fd 構築: listener + master + 各 client reader
@@ -501,16 +674,10 @@ fn serve_loop(
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 Ok(n) => {
-                    // Frame::raw_data を 1 度 encode して bytes を作り、各 client に enqueue
-                    let frame = Frame::raw_data(buf[..n].to_vec());
-                    let mut frame_bytes = Vec::new();
-                    if let Err(e) = frame.encode_to(&mut frame_bytes) {
-                        return RelayOutcome::Error(match e {
-                            FrameError::Io(io) => Error::Io(io),
-                            FrameError::Protocol(_) => Error::Invalid("frame encode failed"),
-                        });
-                    }
-                    broadcast_bytes(clients, frame_bytes);
+                    // scrollback に push してから broadcast (subscription 種類で encoding 分岐)
+                    let now = Instant::now();
+                    scrollback.push(now, buf[..n].to_vec());
+                    broadcast_master_bytes(clients, &buf[..n], now);
                 }
                 Err(Error::Errno(nix::errno::Errno::EIO)) => {
                     if let Some(code) = child_actually_exited(child) {
@@ -549,7 +716,9 @@ fn serve_loop(
             }
             match fre {
                 FrameOrError::Frame(frame) => {
-                    match handle_client_frame(pty, child, idx, frame, clients, state) {
+                    match handle_client_frame(
+                        pty, child, idx, frame, clients, state, scrollback, config,
+                    ) {
                         ClientFrameOutcome::Continue => {}
                         ClientFrameOutcome::DropClient => indices_to_drop.push(idx),
                         ClientFrameOutcome::TerminateSession(o) => should_return = Some(o),
@@ -687,6 +856,7 @@ fn accept_new_client(
             id: client_id,
             mode: req.mode,
             leader: became_leader,
+            subscription: Subscription::Raw,
             writer_tx: tx,
             writer_thread: Some(writer_thread),
             reader,
@@ -728,6 +898,7 @@ enum ClientFrameOutcome {
     TerminateSession(RelayOutcome),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_client_frame(
     pty: &Pty,
     child: Pid,
@@ -735,6 +906,8 @@ fn handle_client_frame(
     frame: Frame,
     clients: &mut [ClientHandle],
     state: &mut SessionState,
+    scrollback: &Scrollback,
+    config: &DaemonConfig,
 ) -> ClientFrameOutcome {
     match frame.ty {
         TYPE_RAW_DATA => {
@@ -761,14 +934,15 @@ fn handle_client_frame(
                 Ok(m) => m,
                 Err(_) => return ClientFrameOutcome::Continue,
             };
-            handle_control_message(pty, child, idx, msg, clients, state)
+            handle_control_message(pty, child, idx, msg, clients, state, scrollback, config)
         }
         _ => ClientFrameOutcome::DropClient,
     }
 }
 
-/// CBOR control message のディスパッチ。lock / leader / mode 系の state 更新と
-/// broadcast を担う (Phase 10)。
+/// CBOR control message のディスパッチ。lock / leader / mode / status 系の state 更新と
+/// broadcast を担う (Phase 10-11)。
+#[allow(clippy::too_many_arguments)]
 fn handle_control_message(
     pty: &Pty,
     child: Pid,
@@ -776,6 +950,8 @@ fn handle_control_message(
     msg: ControlMessage,
     clients: &mut [ClientHandle],
     state: &mut SessionState,
+    scrollback: &Scrollback,
+    config: &DaemonConfig,
 ) -> ClientFrameOutcome {
     let ch_id = clients[idx].id;
     let ch_leader = clients[idx].leader;
@@ -845,6 +1021,34 @@ fn handle_control_message(
                     client_mode: None,
                 }),
             );
+            ClientFrameOutcome::Continue
+        }
+        ControlMessage::TailRequest(req) => {
+            handle_tail_request(idx, req, clients, scrollback);
+            ClientFrameOutcome::Continue
+        }
+        ControlMessage::StatusQuery(_) => {
+            // 子 pid の生死は waitpid(WNOHANG) で確認 (= reap せず存在チェックのみ)
+            let child_pid = match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::StillAlive) => Some(child.as_raw() as u32),
+                _ => None,
+            };
+            let clients_info: Vec<ClientInfo> = clients
+                .iter()
+                .map(|c| ClientInfo {
+                    client_id: c.id,
+                    mode: c.mode,
+                    leader: c.leader,
+                })
+                .collect();
+            let resp = StatusResponse {
+                session_id: config.session_id.clone(),
+                child_pid,
+                clients: clients_info,
+                scrollback_bytes: scrollback.total_bytes() as u64,
+                lock_holder: state.lock_holder,
+            };
+            let _ = send_control(&clients[idx], ControlMessage::StatusResponse(resp));
             ClientFrameOutcome::Continue
         }
         ControlMessage::LockRelease(rel) => {
@@ -1881,6 +2085,234 @@ mod tests {
                 assert_eq!(e.code, "mode.not-leader");
             }
             o => panic!("expected Error, got {o:?}"),
+        }
+
+        // cleanup
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    // ---- Phase 11: status.query ----
+
+    /// Phase 11: status.query は session 状態 (clients/leader/lock) を返す。
+    #[test]
+    fn serve_status_query_returns_current_state() {
+        use crate::protocol::messages::StatusQuery;
+
+        let (sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let r1 = do_client_handshake(&mut s1);
+        let _ = Frame::decode_from(&mut s1).expect("s1 leader.notify"); // 捨て
+
+        // s1 が status.query
+        Frame::cbor_control(
+            ControlMessage::StatusQuery(StatusQuery {})
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+
+        let resp_frame = Frame::decode_from(&mut s1).expect("status response");
+        match ControlMessage::decode_from(resp_frame.body.as_slice()).expect("decode") {
+            ControlMessage::StatusResponse(sr) => {
+                assert_eq!(sr.session_id, sid);
+                assert!(sr.child_pid.is_some(), "child must still be alive");
+                assert_eq!(sr.clients.len(), 1);
+                assert_eq!(sr.clients[0].client_id, r1.client_id);
+                assert!(sr.clients[0].leader);
+                assert!(sr.lock_holder.is_none());
+            }
+            o => panic!("expected StatusResponse, got {o:?}"),
+        }
+
+        // cleanup
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    // ---- Phase 11b: tail.request ----
+
+    /// 次の control message frame を待ち、raw_data frame は skip して返す。
+    fn next_control(s: &mut UnixStream) -> ControlMessage {
+        loop {
+            let f = Frame::decode_from(s).expect("frame");
+            if f.ty == TYPE_CBOR_CONTROL {
+                return ControlMessage::decode_from(f.body.as_slice()).expect("decode");
+            }
+            // raw_data は skip
+        }
+    }
+
+    /// 子 PTY 出力 (= raw_data) を `target` 含むまで読み込む。
+    fn read_until_contains(s: &mut UnixStream, target: &[u8]) {
+        let mut got = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !got.windows(target.len()).any(|w| w == target) {
+            if std::time::Instant::now() > deadline {
+                panic!("read_until_contains: timed out waiting for {target:?}");
+            }
+            let f = Frame::decode_from(s).expect("frame");
+            if f.ty == TYPE_RAW_DATA {
+                got.extend(f.body);
+            }
+        }
+    }
+
+    /// Phase 11b: tail.request(follow=false) は scrollback を 1 個の TailData +
+    /// TailEnd(Eof) で返す。
+    #[test]
+    fn serve_tail_request_no_follow_dumps_buffer() {
+        use crate::protocol::messages::TailRequest;
+
+        let cmd = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf hello; sleep 30".into(),
+        ];
+        let (_, sock_path, _dir, handle) = {
+            let dir = make_temp_socket_dir();
+            let session_id = "demo".to_string();
+            let sock_path = dir.path().join("test.sock");
+            let cfg = DaemonConfig::new(session_id.clone(), sock_path.clone(), cmd);
+            let session = Session::start(cfg).expect("start");
+            let h = std::thread::spawn(move || session.serve());
+            (session_id, sock_path, dir, h)
+        };
+
+        let mut s = client_connect_with_retry(&sock_path);
+        let _r = do_client_handshake(&mut s);
+        let _ = Frame::decode_from(&mut s).expect("leader.notify");
+
+        // 子の "hello" が到着するまで raw_data を読む
+        read_until_contains(&mut s, b"hello");
+
+        // tail.request (follow=false)
+        Frame::cbor_control(
+            ControlMessage::TailRequest(TailRequest {
+                since_ms: None,
+                since_strict: false,
+                follow: false,
+                strip_ansi: false,
+                last_bytes: None,
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s)
+        .expect("send");
+        s.flush().expect("flush");
+
+        match next_control(&mut s) {
+            ControlMessage::TailData(td) => {
+                assert!(
+                    td.bytes.windows(5).any(|w| w == b"hello"),
+                    "TailData should contain 'hello', got {:?}",
+                    String::from_utf8_lossy(&td.bytes)
+                );
+            }
+            o => panic!("expected TailData, got {o:?}"),
+        }
+        match next_control(&mut s) {
+            ControlMessage::TailEnd(te) => {
+                assert_eq!(te.reason, TailEndReason::Eof);
+            }
+            o => panic!("expected TailEnd, got {o:?}"),
+        }
+
+        // cleanup
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s)
+        .expect("send");
+        s.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// Phase 11b: tail.request(follow=true) は subscription を TailFollow に
+    /// 切り替え、以降の master 出力は TailData として届く。
+    #[test]
+    fn serve_tail_request_follow_switches_subscription() {
+        use crate::protocol::messages::TailRequest;
+
+        // s1 = Rw (input 送信用)、s2 = Rw → TailFollow (受信検証用)
+        let cmd = vec!["/bin/sh".into(), "-c".into(), "cat".into()]; // stdin → stdout echo
+        let (_, sock_path, _dir, handle) = {
+            let dir = make_temp_socket_dir();
+            let session_id = "demo".to_string();
+            let sock_path = dir.path().join("test.sock");
+            let cfg = DaemonConfig::new(session_id.clone(), sock_path.clone(), cmd);
+            let session = Session::start(cfg).expect("start");
+            let h = std::thread::spawn(move || session.serve());
+            (session_id, sock_path, dir, h)
+        };
+
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut s1);
+        let _ = Frame::decode_from(&mut s1).expect("s1 leader.notify");
+
+        let mut s2 = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut s2);
+
+        // s2 が tail.request(follow=true)
+        Frame::cbor_control(
+            ControlMessage::TailRequest(TailRequest {
+                since_ms: None,
+                since_strict: false,
+                follow: true,
+                strip_ansi: false,
+                last_bytes: None,
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s2)
+        .expect("send");
+        s2.flush().expect("flush");
+
+        // s1 が "hi\n" を送る → cat が echo → master 出力 → s2 へ TailData
+        // (s1 自体は terminal echo + cat echo の二重で見るが、test では s2 のみ確認)
+        Frame::raw_data(b"hi\n".to_vec())
+            .encode_to(&mut s1)
+            .expect("write s1");
+        s1.flush().expect("flush");
+
+        // s2 が TailData (含 "hi") を受信
+        let mut got = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::time::Instant::now() > deadline {
+                panic!("timed out waiting for TailData with 'hi'");
+            }
+            match next_control(&mut s2) {
+                ControlMessage::TailData(td) => {
+                    got.extend(td.bytes);
+                    if got.windows(2).any(|w| w == b"hi") {
+                        break;
+                    }
+                }
+                ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+                o => panic!("unexpected: {o:?}"),
+            }
         }
 
         // cleanup
