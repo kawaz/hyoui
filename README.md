@@ -206,6 +206,7 @@ Roadmap details: [`docs/ROADMAP.md`](./docs/ROADMAP.md).
 ## Documentation
 
 - [`docs/DESIGN.md`](./docs/DESIGN.md) — Current implementation (domain + architecture)
+- [`docs/MANUAL.md`](./docs/MANUAL.md) — End-user recipe book
 - [`docs/ROADMAP.md`](./docs/ROADMAP.md) — Future work
 - [`docs/decisions/INDEX.md`](./docs/decisions/INDEX.md) — Decision Records (DR)
 - [`docs/journal/`](./docs/journal/) — Development journal

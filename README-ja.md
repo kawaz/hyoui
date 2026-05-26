@@ -190,6 +190,7 @@ protocol cap negotiation までが安定動作。
 ## ドキュメント
 
 - [`docs/DESIGN.md`](./docs/DESIGN.md) — 現実装の説明（ドメイン + アーキテクチャ）
+- [`docs/MANUAL-ja.md`](./docs/MANUAL-ja.md) — エンドユーザ向けレシピ集
 - [`docs/ROADMAP.md`](./docs/ROADMAP.md) — 将来検討項目
 - [`docs/decisions/INDEX.md`](./docs/decisions/INDEX.md) — 設計判断記録 (DR)
 - [`docs/journal/`](./docs/journal/) — 開発ジャーナル

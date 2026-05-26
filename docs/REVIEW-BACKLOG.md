@@ -396,9 +396,10 @@ Wild debugger / Competitive 分析 / Rust API 設計
   - 出典: Sales (R5-SAL-M3)
   - 提案: bug_report.md + feature_request.md 最小追加、README に "Questions / Issues" セクション 1 行
   - 解消: `.github/ISSUE_TEMPLATE/{bug_report.md,feature_request.md,config.yml}` を追加 (config.yml で Discussion に誘導)。README.md / README-ja.md に「Questions / Issues」セクションを追加。
-- [ ] **R5-M33** エンドユーザ向け MANUAL.md / MANUAL-ja.md 不在 = docs 棲み分け曖昧
+- [done] **R5-M33** エンドユーザ向け MANUAL.md / MANUAL-ja.md 不在 = docs 棲み分け曖昧
   - 出典: Sales (R5-SAL-M4) / docs-structure.md 規約準拠
   - 提案: `docs/MANUAL{-ja}.md` 骨組み追加 (ユースケース recipe 集)、README/DESIGN との棲み分け明示。v0.2.0 API 完成時に本格化
+  - 解消: `docs/MANUAL-ja.md` / `docs/MANUAL.md` を新設 (相互リンク `>` blockquote 付き、v0.1 系で動くレシピ + troubleshooting 表 + 関連リンク)。README の Documentation セクションから MANUAL を案内。本格化は v0.2.0 API 確定時。
 - [ ] **R5-M34** GitHub repo Topics タグ未設定 (SEO)
   - 出典: Sales (R5-SAL-M7)
   - 提案: `pty`/`terminal`/`automation`/`cli`/`rust`/`daemon`/`tmux`/`expect`/`claude`/`repl`/`interactive`/`session-manager`
