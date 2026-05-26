@@ -1,0 +1,42 @@
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+version = 2
+# RUSTSEC advisories: deny by default. yanked crates also denied.
+yanked = "deny"
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Disallow specific crates here if needed.
+deny = []
+skip = []
+skip-tree = []
+
+[licenses]
+version = 2
+# Permissive licenses that pair well with MIT (project license).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "0BSD",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
