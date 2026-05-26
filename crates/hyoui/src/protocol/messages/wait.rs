@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 /// 待ち条件 (DR-0006 §5 の predicate)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum WaitPredicate {
     /// 部分文字列マッチ (`text:<string>`)。
     Text {
@@ -67,6 +68,7 @@ pub struct WaitRequest {
 /// wait の outcome。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum WaitOutcome {
     /// 条件成立。
     Matched,

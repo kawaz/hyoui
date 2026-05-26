@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 /// detach 対象 (DR-0006 §3-4)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum DetachTarget {
     /// 自分のみ切断 (default)。
     #[serde(rename = "self")]

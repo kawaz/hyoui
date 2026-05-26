@@ -43,6 +43,7 @@ pub use wait::{WaitMatchOptions, WaitOutcome, WaitPredicate, WaitRequest, WaitRe
 /// discriminator になる。各 variant の rename は DR-0008 §2.2 の kind 一覧に対応。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
+#[non_exhaustive]
 pub enum ControlMessage {
     /// `kind = "handshake.request"` — client → daemon、cap negotiation + 認証。
     #[serde(rename = "handshake.request")]
@@ -123,6 +124,7 @@ pub enum ControlMessage {
 
 /// CBOR control message の encode/decode error。
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ControlMessageError {
     /// CBOR encode 失敗 (ciborium が ser を拒否)。
     #[error("cbor encode: {0}")]

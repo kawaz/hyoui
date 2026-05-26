@@ -8,6 +8,7 @@ use super::error::{Error, Result};
 
 /// Categorized outcome of `waitpid(WUNTRACED | flags)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WaitOutcome {
     /// No state change pending (only possible with `WNOHANG`).
     NoChange,

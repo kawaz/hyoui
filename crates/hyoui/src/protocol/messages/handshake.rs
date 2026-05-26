@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 /// client / daemon の動作 mode (DR-0006)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum Mode {
     /// read/write、子 pty への入力可。
     Rw,

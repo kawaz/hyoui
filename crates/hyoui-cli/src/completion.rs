@@ -15,6 +15,8 @@ pub fn script(shell: Shell) -> String {
         Shell::Bash => bash().to_string(),
         Shell::Zsh => zsh().to_string(),
         Shell::Fish => fish().to_string(),
+        // `Shell` is `#[non_exhaustive]`; a future variant will surface here.
+        _ => format!("# hyoui: completion: unsupported shell variant ({shell})"),
     }
 }
 

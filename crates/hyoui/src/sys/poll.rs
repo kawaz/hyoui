@@ -10,6 +10,7 @@ pub use nix::poll::PollFlags;
 
 /// Result of a single `poll(2)` call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PollOutcome {
     /// `n` fds are ready.
     Ready(usize),

@@ -17,6 +17,7 @@ pub const TYPE_CBOR_CONTROL: u8 = 0x01;
 
 /// Protocol-level violation (recoverable: 通常は当該 peer を disconnect)。
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ProtocolError {
     /// `size` が `MAX_FRAME_SIZE` を超過。
     #[error("frame size {0} exceeds MAX_FRAME_SIZE ({MAX_FRAME_SIZE})")]
@@ -37,6 +38,7 @@ pub enum ProtocolError {
 
 /// I/O error と protocol violation を束ねる frame layer の error 型。
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum FrameError {
     /// 下位の I/O syscall 失敗。
     #[error("io: {0}")]

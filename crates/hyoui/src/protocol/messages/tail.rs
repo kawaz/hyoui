@@ -36,6 +36,7 @@ pub struct TailData {
 /// `tail.end` の終了理由。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum TailEndReason {
     /// follow=false で buffer flush 完了。
     Eof,

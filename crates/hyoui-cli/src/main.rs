@@ -129,6 +129,13 @@ fn main() -> ExitCode {
             eprintln!("Run `hyoui --help` for usage.");
             ExitCode::from(2)
         }
+
+        // `Command` is `#[non_exhaustive]`; a newer hyoui library may add
+        // variants not yet handled by this binary version.
+        _ => {
+            eprintln!("hyoui: unsupported command variant (binary/library version skew)");
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -542,6 +549,9 @@ fn status_command(cfg: StatusConfig) -> ExitCode {
                 match cfg.format {
                     hyoui::cli::StatusFormat::Plain => print_status_plain(&sr),
                     hyoui::cli::StatusFormat::Json => print_status_json(&sr),
+                    // `StatusFormat` is `#[non_exhaustive]`; fall back to plain
+                    // for unknown future variants.
+                    _ => print_status_plain(&sr),
                 }
                 return ExitCode::SUCCESS;
             }
@@ -599,6 +609,9 @@ fn print_status_json(sr: &hyoui::protocol::messages::StatusResponse) {
             hyoui::protocol::Mode::Rw => "rw",
             hyoui::protocol::Mode::Ro => "ro",
             hyoui::protocol::Mode::RwNoLeader => "rw-no-leader",
+            // `Mode` is `#[non_exhaustive]`; surface unknown variants as
+            // "unknown" so JSON output stays well-formed for older clients.
+            _ => "unknown",
         };
         write!(
             &mut out,
@@ -696,6 +709,10 @@ fn tail_command(cfg: TailConfig) -> ExitCode {
                             }
                             TailEndReason::ClientCancel => "client-cancel",
                             TailEndReason::ChildExited => "child-exited",
+                            // `TailEndReason` is `#[non_exhaustive]`; future
+                            // variants surface as "unknown" so logging stays
+                            // readable on version skew.
+                            _ => "unknown",
                         };
                         eprintln!("hyoui: tail: stream ended ({reason_str})");
                         return ExitCode::SUCCESS;
@@ -742,6 +759,13 @@ fn wait_command(cfg: WaitConfig) -> ExitCode {
         WaitCliPredicate::Text(s) => WaitPredicate::Text { value: s },
         WaitCliPredicate::Pattern(r) => WaitPredicate::Pattern { regex: r },
         WaitCliPredicate::Idle(ms) => WaitPredicate::Idle { ms },
+        // `WaitCliPredicate` is `#[non_exhaustive]`; the parser only emits
+        // known variants today, so an unknown one indicates a library/binary
+        // version skew.
+        _ => {
+            eprintln!("hyoui: wait: unsupported predicate variant (binary/library version skew)");
+            return ExitCode::from(2);
+        }
     };
     let req = WaitRequest {
         predicate,
@@ -770,6 +794,14 @@ fn wait_command(cfg: WaitConfig) -> ExitCode {
                     WaitOutcome::Timeout => ExitCode::from(1),
                     WaitOutcome::Cancelled => ExitCode::from(2),
                     WaitOutcome::ChildExited => ExitCode::from(3),
+                    // `WaitOutcome` is `#[non_exhaustive]`; treat unknown
+                    // future variants as a generic failure.
+                    _ => {
+                        eprintln!(
+                            "hyoui: wait: unknown outcome variant (binary/library version skew)"
+                        );
+                        ExitCode::from(1)
+                    }
                 };
             }
             ControlMessage::Error(e) => {

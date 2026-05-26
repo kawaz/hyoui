@@ -28,6 +28,7 @@ pub struct LockAcquire {
 /// `lock.response` の result discriminator。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum LockResult {
     /// lock を取得した (token が同梱)。
     Acquired,
@@ -103,6 +104,7 @@ pub struct LeaderNotify {
 /// 「session 全体の現在 mode」(rw 可能 / ro 強制 / lock 中) を通知する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum SessionMode {
     /// rw clients が入力可能。
     Rw,

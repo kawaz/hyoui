@@ -8,6 +8,7 @@ use thiserror::Error;
 
 /// `sys`-layer error.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     /// A raw `errno` from a syscall.
     #[error("syscall failed: {0}")]

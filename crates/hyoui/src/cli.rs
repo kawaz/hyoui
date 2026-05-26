@@ -29,6 +29,7 @@ use std::fmt;
 
 /// Operating mode for the `run` subcommand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Mode {
     /// Pass the parent terminal through (default).
     Interactive,
@@ -38,6 +39,7 @@ pub enum Mode {
 
 /// Behavior when the child process is suspended (STOPPED).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OnChildSuspend {
     /// Follow the child: the parent also stops (SIGSTOP raised on self).
     Follow,
@@ -47,6 +49,7 @@ pub enum OnChildSuspend {
 
 /// Behavior when the parent process is suspended (receives SIGTSTP).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OnParentSuspend {
     /// Stop the child group first, then stop the parent.
     Transparent,
@@ -56,6 +59,7 @@ pub enum OnParentSuspend {
 
 /// Shell whose completion script is being requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Shell {
     /// Bourne-Again SHell.
     Bash,
@@ -77,6 +81,7 @@ impl fmt::Display for Shell {
 
 /// Topic for which to render help text.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HelpTopic {
     /// Help for the top-level invocation (subcommand list + global options).
     Top,
@@ -160,6 +165,7 @@ pub struct KillConfig {
 
 /// `status` subcommand の出力形式 (= `--format=plain|json`)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum StatusFormat {
     /// Plain text (= human readable、default)。`key: value` 1 行ごと
     #[default]
@@ -199,6 +205,7 @@ pub struct TailConfig {
 /// `wait` subcommand の predicate (Phase 11)。CLI 表記から daemon protocol の
 /// `WaitPredicate` に対応する。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WaitCliPredicate {
     /// `text:<str>` (= 部分文字列マッチ)。
     Text(String),
@@ -227,6 +234,7 @@ pub struct WaitConfig {
 
 /// Result of parsing argv (excluding argv[0]).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Command {
     /// Display usage text and exit 0.
     Help {
