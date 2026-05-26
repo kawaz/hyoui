@@ -40,10 +40,7 @@ use crate::protocol::{
 use crate::sys::UnixSock;
 
 use super::DaemonConfig;
-use super::broadcast::{
-    ClientHandle, MAX_CLIENTS_PER_DAEMON, Subscription, broadcast_control, send_control,
-    writer_pump,
-};
+use super::broadcast::{ClientHandle, Subscription, broadcast_control, send_control, writer_pump};
 use super::lock::{SessionState, should_assign_leader};
 
 /// R4-C3: handshake (= 1 client の HandshakeRequest 受信 + token 検証) を完了
@@ -56,9 +53,19 @@ use super::lock::{SessionState, should_assign_leader};
 pub(super) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// daemon が同時に走らせて良い pending handshake worker 数の上限。
-/// MAX_CLIENTS_PER_DAEMON と同じ値にし、accept 段階で頭打ちする。これを超える
-/// `listener.accept()` は即 socket close で reject (= 接続段階の集合 DoS 防止)。
-pub(super) const MAX_PENDING_HANDSHAKES: usize = MAX_CLIENTS_PER_DAEMON;
+///
+/// R5-H2: 旧実装は `MAX_CLIENTS_PER_DAEMON` (= 64) と同じ値で **合算頭打ち**
+/// していたため、正常 attach 64 client が居る状態では新規接続が無条件に reject
+/// されていた (= 「64 client 占有しただけで以降の attach 不能」運用事故)。
+/// 現実装では pending と attached を **独立 cap** にし、handshake 中の slow-loris
+/// 攻撃面 (= pending) と legit client 数 (= attached) を別々に制御する:
+///
+/// - `MAX_CLIENTS_PER_DAEMON = 64`: 確立済 attach の上限
+/// - `MAX_PENDING_HANDSHAKES = 16`: handshake 中 (= 確立前) の上限
+///
+/// 「64 client + 16 pending」が許容される設計。pending は worker thread + socket fd
+/// の cost なので clients より小さく設定 (≈ 1/4) し、DoS 攻撃面を抑える。
+pub(super) const MAX_PENDING_HANDSHAKES: usize = 16;
 
 /// 2 つの byte slice を constant-time で比較 (= timing attack 耐性)。
 ///

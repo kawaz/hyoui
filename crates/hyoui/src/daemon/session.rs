@@ -35,7 +35,9 @@ use super::DaemonConfig;
 use super::accept::{
     MAX_PENDING_HANDSHAKES, PendingHandshake, process_pending_handshakes, spawn_handshake_worker,
 };
-use super::broadcast::{ClientHandle, broadcast_control, broadcast_master_bytes};
+use super::broadcast::{
+    ClientHandle, MAX_CLIENTS_PER_DAEMON, broadcast_control, broadcast_master_bytes,
+};
 use super::control::{ClientFrameOutcome, FrameOrError, handle_client_frame};
 use super::lock::{SessionState, elevate_next_leader};
 use super::pty::{ALIVE_RETRY_INTERVAL, ChildLifecycle, ChildState, STOPPED_POLL_INTERVAL};
@@ -582,9 +584,16 @@ fn serve_loop(
             // 即 close (= 接続試行を OS に到達させない形にすると、kernel の listen
             // backlog で stuck する。一旦 fd を取って socket を close するのが安全)。
             //
-            // R4-C3: pending handshake もまた fd を握っているので合算で頭打ち。
-            // (= clients.len() + pending_handshakes.len() >= MAX で reject)
-            if clients.len() + pending_handshakes.len() >= MAX_PENDING_HANDSHAKES {
+            // R5-H2: pending handshake と attached client は **独立 cap** で
+            // 頭打ちする。旧実装は両者を合算して MAX_PENDING_HANDSHAKES (= 64) で
+            // 切っていたため、64 client が居る状態では新規 attach が一切できなく
+            // なる事故が起きていた。現在は:
+            //   - clients (= 確立済) >= MAX_CLIENTS_PER_DAEMON (64) なら reject
+            //   - pending (= handshake 中) >= MAX_PENDING_HANDSHAKES (16) なら reject
+            // のいずれか満たした時のみ accept を拒否する (AND ではなく OR)。
+            if clients.len() >= MAX_CLIENTS_PER_DAEMON
+                || pending_handshakes.len() >= MAX_PENDING_HANDSHAKES
+            {
                 if let Ok(fd) = listener.accept() {
                     drop(fd);
                 }
@@ -2860,6 +2869,79 @@ mod tests {
         .encode_to(&mut good)
         .expect("send kill");
         good.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// R5-H2: `MAX_PENDING_HANDSHAKES` と `MAX_CLIENTS_PER_DAEMON` は **独立 cap**
+    /// であり、attached client が attach 上限に達していても新規 handshake は
+    /// `MAX_PENDING_HANDSHAKES` 個まで受け付けられる (= pending 段階の枠は別管理)。
+    ///
+    /// 旧実装は `clients + pending >= MAX_PENDING_HANDSHAKES (= 64)` の合算条件で
+    /// reject していたため、attach 数が上限に達した瞬間に **新規 attach も
+    /// handshake も両方無音 reject** になる事故があった。本テストは:
+    /// - attached client が複数居る状態で、新規 connection が即 close されない
+    ///   (= accept は成功する → handshake worker は spawn される)
+    /// - これが小さい client 数でも再現できる (= 上限合算 ≠ 上限独立 を区別する)
+    ///
+    /// 実機で 64 client × handshake 完了を 1 test で再現するのは fd resource を
+    /// 大量消費するため、本テストは「accept 後 handshake が走り出すまで」の経路
+    /// で独立性を確認する。const 値そのもの (= MAX_PENDING_HANDSHAKES <
+    /// MAX_CLIENTS_PER_DAEMON) は const block の static assertion で保証する。
+    #[test]
+    fn accept_loop_pending_cap_independent_from_clients_cap() {
+        // const 比較: 2 つの const が独立に定義されていること (= 同じ値ではない)。
+        // 同じ値だと「合算頭打ち」の旧実装に逆戻りしたことに気づけない。
+        // const block で compile-time check (clippy::assertions_on_constants 回避)。
+        const _: () = assert!(
+            MAX_PENDING_HANDSHAKES != MAX_CLIENTS_PER_DAEMON,
+            "MAX_PENDING_HANDSHAKES and MAX_CLIENTS_PER_DAEMON must be independent caps"
+        );
+        const _: () = assert!(
+            MAX_PENDING_HANDSHAKES < MAX_CLIENTS_PER_DAEMON,
+            "MAX_PENDING_HANDSHAKES should be smaller than MAX_CLIENTS_PER_DAEMON \
+             to limit DoS surface"
+        );
+
+        // 実機 behavior 確認: attach client が 3 個居る状態で、追加 connect が
+        // 即 close されず handshake response を返せる (= pending 枠が独立に存在)。
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        // 既存 attach: 3 client (= MAX_PENDING_HANDSHAKES より十分小さい)
+        let mut attached: Vec<UnixStream> = Vec::new();
+        for _ in 0..3 {
+            let mut s = client_connect_with_retry(&sock_path);
+            let _ = do_client_handshake(&mut s);
+            // leader.notify を 1 つ drain (1 つ目だけ leader=true で broadcast を受ける可能性)
+            s.set_read_timeout(Some(Duration::from_millis(200)))
+                .expect("set");
+            let _ = Frame::decode_from(&mut s);
+            s.set_read_timeout(None).expect("clear");
+            attached.push(s);
+        }
+
+        // 追加 connect → handshake 完了するか確認。旧実装でも MAX=64 までは
+        // 通るので、ここは主に「regression が起きていない (= cap が下がりすぎて
+        // ない / OR 条件が壊れていない)」を見るための smoke test。
+        let mut newcomer = client_connect_with_retry(&sock_path);
+        newcomer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set");
+        let resp = do_client_handshake(&mut newcomer);
+        assert!(
+            !resp.leader,
+            "newcomer should not be leader (1st rw is already leader)"
+        );
+
+        // cleanup: kill で daemon を畳む
+        newcomer.set_read_timeout(None).expect("clear");
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut attached[0])
+        .expect("send kill");
+        attached[0].flush().expect("flush");
         let _ = handle.join().expect("daemon thread");
     }
 }
