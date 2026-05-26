@@ -374,6 +374,20 @@ const MAX_WAITS_PER_CLIENT: usize = 16;
 /// 場合、64 clients × 8 MiB = 最大 512 MiB の queue 占有が理論上限。
 const MAX_CLIENTS_PER_DAEMON: usize = 64;
 
+/// R4-C3: handshake (= 1 client の HandshakeRequest 受信 + token 検証) を完了
+/// させるまでの上限時間。これを超過した pending handshake は socket close して
+/// 当該 worker thread の流れを中断する (= slow-loris DoS 防止)。
+///
+/// 旧実装は accept 後 `Frame::decode_from` を同期 blocking で呼び、悪意 client が
+/// 1 byte ずつ送って handshake を遅延させると `serve_loop` 全体が止まっていた。
+/// 現実装では handshake を別 thread に切り出し、本 timeout で個別に頭打ちする。
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// daemon が同時に走らせて良い pending handshake worker 数の上限。
+/// MAX_CLIENTS_PER_DAEMON と同じ値にし、accept 段階で頭打ちする。これを超える
+/// `listener.accept()` は即 socket close で reject (= 接続段階の集合 DoS 防止)。
+const MAX_PENDING_HANDSHAKES: usize = MAX_CLIENTS_PER_DAEMON;
+
 /// session 全体の状態 (Phase 10)。lock 周りの state machine を保持する。
 ///
 /// 現状の field:
@@ -1103,6 +1117,10 @@ fn serve_loop(
     scrollback: &mut Scrollback,
     pending_waits: &mut Vec<PendingWait>,
 ) -> RelayOutcome {
+    // R4-C3: 別 thread で進行中の handshake worker 群。worker が `do_handshake_stage`
+    // を完了すると `rx` に Ok/Err が流れる。本 vector は serve_loop が所有し、各
+    // iteration で try_recv で完了したものを引き取って `clients` に integrate する。
+    let mut pending_handshakes: Vec<PendingHandshake> = Vec::new();
     loop {
         // poll fd 構築: listener + master + 各 client reader
         let listener_fd = listener.as_fd();
@@ -1117,69 +1135,114 @@ fn serve_loop(
         // backpressure overflow / writer dead で disconnect が必要な client_id を集める
         let mut overflow_ids: Vec<u64> = Vec::new();
 
-        let poll_timeout = compute_wait_poll_timeout(pending_waits);
-        match poll(&mut poll_fds, poll_timeout) {
-            Ok(PollOutcome::Ready(_)) => {}
-            Ok(PollOutcome::Interrupted) => continue,
-            Ok(PollOutcome::Timeout) => {
-                // wait deadline / idle 経過チェック
-                check_wait_timeouts(pending_waits, clients);
+        // R4-C3: pending handshake がある間は poll timeout を 50ms 以下に抑える。
+        // 完了通知 (mpsc) は fd-poll では検出できないため、短い周期で try_recv する
+        // 必要がある。timeout だけ走る無駄サイクルを避けるため、pending が無い場合は
+        // 通常通り wait のスケジュールで眠る。
+        let mut poll_timeout = compute_wait_poll_timeout(pending_waits);
+        if !pending_handshakes.is_empty() {
+            const HANDSHAKE_POLL_CAP_MS: u16 = 50;
+            let cap = PollTimeout::from(HANDSHAKE_POLL_CAP_MS);
+            // 既存 timeout が NONE か cap より大きいなら cap で頭打ちする。
+            // ※ nix 0.31 の `PollTimeout::as_millis` は NONE 時に内部 unwrap で
+            //   panic するため、先に `is_none()` で分岐してから ms を取り出す。
+            if poll_timeout.is_none() {
+                poll_timeout = cap;
+            } else if let Some(ms) = poll_timeout.as_millis() {
+                if ms > HANDSHAKE_POLL_CAP_MS as u32 {
+                    poll_timeout = cap;
+                }
+            }
+        }
+        // R4-C3: Timeout 経路では poll_fds の revents は使わないので、まず borrows を
+        // 解いてから check_wait_timeouts / process_pending_handshakes を呼ぶ。
+        // Ready 経路では revents を集めてから drop する (= 通常処理に進む)。
+        let outcome_kind = poll(&mut poll_fds, poll_timeout);
+        let (listener_revents, master_revents, client_revents) = match outcome_kind {
+            Ok(PollOutcome::Ready(_)) => {
+                let lrev = poll_fds[0].revents().unwrap_or(PollFlags::empty());
+                let mrev = poll_fds[1].revents().unwrap_or(PollFlags::empty());
+                let crev: Vec<PollFlags> = clients
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| poll_fds[2 + i].revents().unwrap_or(PollFlags::empty()))
+                    .collect();
+                drop(poll_fds);
+                (lrev, mrev, crev)
+            }
+            Ok(PollOutcome::Interrupted) => {
+                drop(poll_fds);
                 continue;
             }
-            Err(e) => return RelayOutcome::Error(e),
-        }
+            Ok(PollOutcome::Timeout) => {
+                drop(poll_fds);
+                // wait deadline / idle 経過チェック
+                check_wait_timeouts(pending_waits, clients);
+                process_pending_handshakes(
+                    &mut pending_handshakes,
+                    config,
+                    next_client_id,
+                    clients,
+                    state,
+                    &mut overflow_ids,
+                );
+                // 後段の drop 処理 (overflow / dead) を共通化するため
+                let mut indices_to_drop: Vec<usize> = Vec::new();
+                for id in overflow_ids.drain(..) {
+                    if let Some(i) = clients.iter().position(|c| c.id == id) {
+                        indices_to_drop.push(i);
+                    }
+                }
+                indices_to_drop.sort_unstable();
+                indices_to_drop.dedup();
+                for idx in indices_to_drop.into_iter().rev() {
+                    let ch = clients.remove(idx);
+                    pending_waits.retain(|w| w.client_id != ch.id);
+                    drop(ch.writer_tx);
+                    let _ = ch.reader.shutdown(std::net::Shutdown::Both);
+                    if let Some(t) = ch.writer_thread {
+                        let _ = t.join();
+                    }
+                }
+                continue;
+            }
+            Err(e) => {
+                drop(poll_fds);
+                return RelayOutcome::Error(e);
+            }
+        };
 
-        let listener_revents = poll_fds[0].revents().unwrap_or(PollFlags::empty());
-        let master_revents = poll_fds[1].revents().unwrap_or(PollFlags::empty());
-        let client_revents: Vec<PollFlags> = clients
-            .iter()
-            .enumerate()
-            .map(|(i, _)| poll_fds[2 + i].revents().unwrap_or(PollFlags::empty()))
-            .collect();
-        drop(poll_fds);
+        // R4-C3: 完了済 pending handshake を取り込む (= 子 client として登録、
+        // または timeout で破棄)。new client 登録による leader 昇格 + mode.change
+        // broadcast 等も `process_pending_handshakes` 内で処理する。
+        process_pending_handshakes(
+            &mut pending_handshakes,
+            config,
+            next_client_id,
+            clients,
+            state,
+            &mut overflow_ids,
+        );
 
-        // 1. listener: 新規 client accept
+        // 1. listener: 新規 client accept (= handshake worker を spawn するだけ。
+        //    handshake 自体は別 thread で動くので serve_loop は blocking しない)
         if listener_revents.contains(PollFlags::POLLIN) {
             // D6: 集合 DoS 対策で attach 数を上限化。超過なら fd だけ accept して
             // 即 close (= 接続試行を OS に到達させない形にすると、kernel の listen
             // backlog で stuck する。一旦 fd を取って socket を close するのが安全)。
-            if clients.len() >= MAX_CLIENTS_PER_DAEMON {
+            //
+            // R4-C3: pending handshake もまた fd を握っているので合算で頭打ち。
+            // (= clients.len() + pending_handshakes.len() >= MAX で reject)
+            if clients.len() + pending_handshakes.len() >= MAX_PENDING_HANDSHAKES {
                 if let Ok(fd) = listener.accept() {
                     drop(fd);
                 }
-                // accept_new_client は呼ばない。次の poll 待ちへ
                 continue;
             }
-            match accept_new_client(listener, config, *next_client_id, clients) {
-                Ok(accepted) => {
-                    *next_client_id += 1;
-                    let new_id = accepted.handle.id;
-                    let became_leader = accepted.became_leader;
-                    let mode_change_for_locked = state.lock_holder.map(|holder| ModeChange {
-                        session_mode: SessionMode::Locked,
-                        lock_holder: Some(holder),
-                        client_mode: None,
-                    });
-                    let new_handle_writer_ref = &accepted.handle;
-                    if let Some(mc) = mode_change_for_locked.as_ref() {
-                        // accept した client に「現在 lock 中」を通知
-                        let _ =
-                            send_control(new_handle_writer_ref, ControlMessage::ModeChange(*mc));
-                    }
-                    clients.push(accepted.handle);
-                    if became_leader {
-                        // 他 client に新 leader を通知 (= 新 client 自身は handshake.response
-                        // で leader=true を受け取り済みだが、broadcast でも届く)
-                        overflow_ids.extend(broadcast_control(
-                            clients,
-                            &ControlMessage::LeaderNotify(LeaderNotify {
-                                client_id: Some(new_id),
-                            }),
-                        ));
-                    }
-                }
+            match spawn_handshake_worker(listener, config) {
+                Ok(pending) => pending_handshakes.push(pending),
                 Err(_) => {
-                    // handshake 失敗等: 個別の client を弾くだけで loop 継続
+                    // accept 失敗 (= EBADF / ENFILE 等): loop 継続
                 }
             }
         }
@@ -1341,6 +1404,90 @@ enum FrameOrError {
     Error,
 }
 
+/// R4-C3: pending handshake worker の状態を更新する。
+///
+/// 各 entry に対し:
+/// - `try_recv` で完了通知が来ていれば、`Ok` なら `finalize_accepted_client` →
+///   `clients` に push + leader/mode.change broadcast。`Err` なら drop で完了。
+/// - `started_at + HANDSHAKE_TIMEOUT` を超過していたら強制 drop (= 残った socket は
+///   worker thread が `set_read_timeout` で抜け次第 close する)。
+///
+/// drop すべきものは即除去するため `Vec::retain_mut` で in-place 更新する。
+fn process_pending_handshakes(
+    pending_handshakes: &mut Vec<PendingHandshake>,
+    config: &DaemonConfig,
+    next_client_id: &mut u64,
+    clients: &mut Vec<ClientHandle>,
+    state: &mut SessionState,
+    overflow_ids: &mut Vec<u64>,
+) {
+    // 完了 / 失敗 / timeout の 3 状態に分岐して 1 つずつ処理する。
+    let mut i = 0;
+    while i < pending_handshakes.len() {
+        // try_recv で完了確認
+        match pending_handshakes[i].rx.try_recv() {
+            Ok(Ok(stage)) => {
+                let _entry = pending_handshakes.remove(i);
+                // finalize: leader 判定 + response 送信 + ClientHandle 構築
+                match finalize_accepted_client(stage, config, *next_client_id, clients) {
+                    Ok(accepted) => {
+                        *next_client_id += 1;
+                        let new_id = accepted.handle.id;
+                        let became_leader = accepted.became_leader;
+                        let mode_change_for_locked = state.lock_holder.map(|holder| ModeChange {
+                            session_mode: SessionMode::Locked,
+                            lock_holder: Some(holder),
+                            client_mode: None,
+                        });
+                        if let Some(mc) = mode_change_for_locked.as_ref() {
+                            // accept した client に「現在 lock 中」を通知
+                            let _ = send_control(
+                                &accepted.handle,
+                                ControlMessage::ModeChange(*mc),
+                            );
+                        }
+                        clients.push(accepted.handle);
+                        if became_leader {
+                            // 他 client に新 leader を通知 (= 新 client 自身は handshake.response
+                            // で leader=true を受け取り済みだが、broadcast でも届く)
+                            overflow_ids.extend(broadcast_control(
+                                clients,
+                                &ControlMessage::LeaderNotify(LeaderNotify {
+                                    client_id: Some(new_id),
+                                }),
+                            ));
+                        }
+                    }
+                    Err(_) => {
+                        // response 送信失敗等。drop で client は弾く。
+                    }
+                }
+                // remove したので i は変えない
+            }
+            Ok(Err(_)) => {
+                // worker 側で error frame 送信済 → ここで drop で完了
+                pending_handshakes.remove(i);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // 未完了。timeout 判定だけする
+                if pending_handshakes[i].started_at.elapsed() >= HANDSHAKE_TIMEOUT {
+                    // R4-C3: 5s 経過しても完了しない = slow-loris の可能性が高い。
+                    // PendingHandshake を drop する (= rx を drop する)。worker は
+                    // socket の read/write timeout (= 同じく HANDSHAKE_TIMEOUT) で
+                    // ほぼ同時に抜けるため、deadlock せず thread は自然終了する。
+                    pending_handshakes.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // worker thread が panic 等で消えた。drop で完了。
+                pending_handshakes.remove(i);
+            }
+        }
+    }
+}
+
 /// 新規 client の accept 結果。
 struct AcceptedClient {
     handle: ClientHandle,
@@ -1348,26 +1495,97 @@ struct AcceptedClient {
     became_leader: bool,
 }
 
-/// listener から 1 client を accept、handshake を完了して `ClientHandle` を作る。
+/// R4-C3: handshake worker thread が完了時に返す中間結果。
 ///
-/// Phase 10:
-/// - 既存 clients を見て leader 取得可否を判定 (= `should_assign_leader`)
-/// - session 中の lock 状態は handshake.response に乗らない (= schema 拡張なし)
-///   ので、accept 完了直後の caller 側で必要なら `mode.change` を当該 client に
-///   1 発送る (Phase 10 では caller が handle する)。
-fn accept_new_client(
+/// 成功時は (reader, writer_main, req, intersect) を main thread (= serve_loop) に
+/// 渡し、main thread 側で leader 判定 + response 送信 + `ClientHandle` 構築を行う。
+/// 失敗時 (= protocol error / token mismatch) は worker が socket に error frame を
+/// 送ってから socket を drop し、本構造体は `Err` で main thread に届く。
+type HandshakeStageOk = (UnixStream, UnixStream, crate::protocol::HandshakeRequest, Vec<String>);
+
+/// R4-C3: pending handshake (= worker thread が走っている in-flight な handshake)。
+///
+/// `rx` に worker が完了結果を流す。`started_at` から `HANDSHAKE_TIMEOUT` を超えても
+/// 完了しない場合は serve_loop が drop する (= socket を drop することで worker の
+/// pending read が EBADF / read error で抜け、thread が自然終了する)。
+///
+/// **slow-loris 対策の本体**: worker thread は accepted UnixStream に
+/// `set_read_timeout` / `set_write_timeout` を設定してから handshake を decode する。
+/// 悪意 client が byte をだらだら送っても、socket の read/write が timeout で
+/// 失敗するので thread は HANDSHAKE_TIMEOUT 以内に必ず終わる。
+struct PendingHandshake {
+    rx: std::sync::mpsc::Receiver<Result<HandshakeStageOk, Error>>,
+    started_at: Instant,
+    /// 完了通知前に accept したことが分かる「socket を握っている worker」の
+    /// JoinHandle。timeout 時に main thread から socket を切る経路は無いが、
+    /// worker 自身が `set_*_timeout` で抜けるため放置で OK。drop で detached する
+    /// (= join しない)。
+    _worker: std::thread::JoinHandle<()>,
+}
+
+/// R4-C3: listener から 1 client を accept し、handshake を別 thread で進める。
+///
+/// 戻り値の [`PendingHandshake`] の `rx` が `Ok((reader, writer, req, intersect))` を
+/// 通知してきたら、`finalize_accepted_client` で `ClientHandle` 構築 + response 送信
+/// + leader 判定をする。`Err` なら worker が既に error frame 送信済 → drop で完了。
+///
+/// **同期 blocking 部分は `listener.accept()` のみ** (= kernel level)。handshake
+/// frame 受信は worker thread に切り出すため、悪意 client が serve_loop を止める
+/// ことはできない。
+fn spawn_handshake_worker(
     listener: &UnixSock,
     config: &DaemonConfig,
-    client_id: u64,
-    clients: &[ClientHandle],
-) -> Result<AcceptedClient, Error> {
+) -> Result<PendingHandshake, Error> {
     let fd: OwnedFd = listener.accept()?;
     let stream = unix_stream_from_owned_fd(fd);
+
+    // R4-C3: handshake 用の read/write を時間で頭打ち。slow-loris client が
+    // byte をだらだら送っても、socket I/O が EWOULDBLOCK で error 化して worker が
+    // HANDSHAKE_TIMEOUT 以内に必ず終わる。
+    let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
+
     let transport = UnixStreamTransport::new(stream);
     let (mut reader, mut writer_main) = transport.split().map_err(Error::from)?;
 
-    // handshake (= request 受信 + response 送信)
-    let frame = Frame::decode_from(&mut reader)
+    let expected_token = config.expected_token.clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<HandshakeStageOk, Error>>(1);
+
+    let worker = std::thread::Builder::new()
+        .name("hyoui-handshake".into())
+        .spawn(move || {
+            let result = do_handshake_stage(&mut reader, &mut writer_main, expected_token.as_deref());
+            match result {
+                Ok((req, intersect)) => {
+                    let _ = tx.send(Ok((reader, writer_main, req, intersect)));
+                }
+                Err(e) => {
+                    // worker は error frame 送信済 (do_handshake_stage 内)。
+                    // socket は ここで drop → close される。
+                    let _ = tx.send(Err(e));
+                }
+            }
+        })
+        .map_err(|_| Error::Invalid("failed to spawn handshake worker"))?;
+
+    Ok(PendingHandshake {
+        rx,
+        started_at: Instant::now(),
+        _worker: worker,
+    })
+}
+
+/// R4-C3: worker thread 側で実行する handshake 受信 + token 検証 stage。
+///
+/// 成功時: (req, intersect) を返す。**response はまだ送らない** (= leader 判定が
+/// 必要なので main thread に任せる)。
+/// 失敗時: 可能なら socket に error frame を送ってから `Err` を返す。
+fn do_handshake_stage(
+    reader: &mut UnixStream,
+    writer_main: &mut UnixStream,
+    expected_token: Option<&str>,
+) -> Result<(crate::protocol::HandshakeRequest, Vec<String>), Error> {
+    let frame = Frame::decode_from(reader)
         .map_err(|_| Error::Invalid("failed to decode handshake frame"))?;
     if frame.ty != TYPE_CBOR_CONTROL {
         return Err(Error::Invalid("handshake frame must be CBOR control"));
@@ -1387,7 +1605,7 @@ fn accept_new_client(
     // を運用ミスで設定すると全 client が free pass で通過する欠陥があった。
     // → `req.token` が `None` の場合は明示的に mismatch 扱い、`Some(s)` の場合のみ
     // constant_time_eq で比較する。
-    if let Some(expected) = config.expected_token.as_deref() {
+    if let Some(expected) = expected_token {
         let token_ok = match req.token.as_deref() {
             Some(provided) => constant_time_eq(expected.as_bytes(), provided.as_bytes()),
             None => false,
@@ -1400,13 +1618,40 @@ fn accept_new_client(
             })
             .encode_to_vec()
             .map_err(|_| Error::Invalid("auth error encode failed"))?;
-            let _ = Frame::cbor_control(body).encode_to(&mut writer_main);
+            let _ = Frame::cbor_control(body).encode_to(writer_main);
             return Err(Error::Invalid("handshake token mismatch"));
         }
     }
 
     let mvp: Vec<String> = MVP_CAPS.iter().map(|s| (*s).to_string()).collect();
     let intersect = intersect_caps(&req.caps, &mvp);
+
+    Ok((req, intersect))
+}
+
+/// R4-C3: handshake worker から届いた中間結果を `AcceptedClient` に整える。
+///
+/// このタイミングで main thread の `clients` 列を見て leader 判定 + response を
+/// 送信する (= leader 判定の snapshot を「handshake 完了時点」に揃えるため、
+/// 並列 handshake 同士でも leader 重複は発生しない)。
+///
+/// Response 送信後、socket の read/write timeout は **解除** (= None) する。
+/// serve_loop は poll 駆動なので blocking read は無いが、broadcast の write は
+/// blocking write で行う。handshake 用 5s timeout のままだと正常 attach 中の
+/// client への大量 broadcast で意図しない切断が起きうるため。
+fn finalize_accepted_client(
+    stage: HandshakeStageOk,
+    config: &DaemonConfig,
+    client_id: u64,
+    clients: &[ClientHandle],
+) -> Result<AcceptedClient, Error> {
+    let (reader, mut writer_main, req, intersect) = stage;
+
+    // R4-C3: 通常運用 (= broadcast write を含む) は timeout 無しに戻す。
+    let _ = reader.set_read_timeout(None);
+    let _ = reader.set_write_timeout(None);
+    let _ = writer_main.set_read_timeout(None);
+    let _ = writer_main.set_write_timeout(None);
 
     let became_leader = should_assign_leader(clients, req.mode);
 
@@ -3955,5 +4200,51 @@ mod tests {
         // pending_waits に残り続ける。
         check_wait_timeouts(&mut waits, &mut clients);
         assert_eq!(waits.len(), 1, "overflow Idle should not match");
+    }
+
+    /// R4-C3: slow-loris client (= handshake.request を送らずに socket を開きっぱなし
+    /// にする悪意 client) が居ても、他の正規 client は handshake を完了できる。
+    ///
+    /// 旧実装 (`accept_new_client` を `serve_loop` 内で同期 blocking) ではこの
+    /// シナリオで serve_loop 全体が止まり、後続の正規 client は handshake すら
+    /// 走らなかった。新実装は handshake worker thread に切り出しているため、
+    /// 正規 client は slow-loris と並列に handshake を完了できる。
+    #[test]
+    fn serve_slow_loris_does_not_block_other_clients() {
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        // 悪意 client: connect だけして handshake.request は送らない (socket 開きっぱ)。
+        let _slow = client_connect_with_retry(&sock_path);
+
+        // 正規 client: 直後に attach → handshake が成功するはず。
+        // 旧実装ではここで serve_loop が止まっているので connect は出来ても
+        // handshake response が永遠に来ず Frame::decode が EOF / timeout する。
+        // 新実装では HANDSHAKE_TIMEOUT (= 5s) 内に response が返る。
+        let start = std::time::Instant::now();
+        let mut good = client_connect_with_retry(&sock_path);
+        // 念のため read timeout を 10s にして「永遠に block」を検知できるようにする
+        good.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set read_timeout");
+        let resp = do_client_handshake(&mut good);
+        let elapsed = start.elapsed();
+        // 正規 handshake は本来 ms オーダーで終わる。slow-loris の HANDSHAKE_TIMEOUT (= 5s)
+        // を待たされていない (= 並列処理されている) ことを確認する。
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "good client handshake took too long ({elapsed:?}), serve_loop may be blocked by slow-loris"
+        );
+        assert!(resp.leader, "good client (1st rw) should be leader");
+
+        // cleanup
+        good.set_read_timeout(None).expect("clear timeout");
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut good)
+        .expect("send kill");
+        good.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
     }
 }
