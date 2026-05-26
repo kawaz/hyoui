@@ -113,6 +113,21 @@ pub struct RunConfig {
     pub command: Vec<String>,
 }
 
+/// `attach` subcommand configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachConfig {
+    /// Target socket path. `Some(p)` で explicit、`None` なら session_id から resolve。
+    pub socket: Option<String>,
+    /// Target session id (= socket path resolver の入力)。`socket` 指定時は無視。
+    pub session_id: Option<String>,
+    /// 動作 mode (rw / ro)。MVP は文字列のみ受理。
+    pub mode_str: Option<String>,
+    /// `--exclusive` (= 起動時占有要求)。
+    pub exclusive: bool,
+    /// `--detach-others` (= attach 時に他 client を奪取)。
+    pub detach_others: bool,
+}
+
 /// Result of parsing argv (excluding argv[0]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -125,6 +140,8 @@ pub enum Command {
     Version,
     /// Execute `run` with the given configuration.
     Run(RunConfig),
+    /// Attach to an existing daemon session.
+    Attach(AttachConfig),
     /// Print a completion script for the given shell.
     Completion {
         /// Target shell.
@@ -163,16 +180,94 @@ pub fn parse_args(args: &[String]) -> Command {
     let rest = &args[1..];
     match head {
         "run" => parse_run(rest),
+        "attach" => parse_attach(rest),
         "completion" => parse_completion(rest),
-        // Reserved for future stages — listed here so the user sees a helpful
-        // message instead of "unknown subcommand".
-        "send" | "attach" | "status" => Command::Error(format!(
+        // Reserved for future stages.
+        "send" | "status" | "list" | "kill" | "detach" => Command::Error(format!(
             "subcommand `{head}` is reserved but not yet implemented"
         )),
         other => Command::Help {
             topic: HelpTopic::UnknownSubcommand(other.to_string()),
         },
     }
+}
+
+fn parse_attach(args: &[String]) -> Command {
+    let mut cfg = AttachConfig {
+        socket: None,
+        session_id: None,
+        mode_str: None,
+        exclusive: false,
+        detach_others: false,
+    };
+
+    let mut positionals: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (name, inline_value) = split_eq(arg);
+        let mut consumed_extra = false;
+        let value: Option<String> = match inline_value {
+            Some(v) => Some(v),
+            None => {
+                if i + 1 < args.len() {
+                    consumed_extra = true;
+                    Some(args[i + 1].clone())
+                } else {
+                    None
+                }
+            }
+        };
+        match name.as_str() {
+            "--help" | "-h" => {
+                return Command::Help {
+                    topic: HelpTopic::Top, // attach 専用 help は v0.2.0 で
+                };
+            }
+            "--socket" => match value {
+                Some(v) => cfg.socket = Some(v),
+                None => return Command::Error("--socket requires a value".into()),
+            },
+            "--mode" => match value {
+                Some(v) => cfg.mode_str = Some(v),
+                None => return Command::Error("--mode requires a value".into()),
+            },
+            "--exclusive" => {
+                cfg.exclusive = true;
+                consumed_extra = false; // bool flag は次 arg 食わない
+            }
+            "--detach-others" => {
+                cfg.detach_others = true;
+                consumed_extra = false;
+            }
+            other if other.starts_with('-') => {
+                return Command::Error(format!("unknown attach option: {other}"));
+            }
+            _ => {
+                // positional (= session id)
+                consumed_extra = false;
+                positionals.push(args[i].clone());
+            }
+        }
+        i += 1;
+        if consumed_extra {
+            i += 1;
+        }
+    }
+
+    match positionals.len() {
+        0 => {
+            if cfg.socket.is_none() {
+                return Command::Error(
+                    "attach: session id (positional) or --socket required".into(),
+                );
+            }
+        }
+        1 => cfg.session_id = Some(positionals.into_iter().next().unwrap()),
+        _ => return Command::Error("attach: too many positional arguments".into()),
+    }
+
+    Command::Attach(cfg)
 }
 
 /// Render the usage text for the given help topic.
@@ -923,11 +1018,82 @@ mod tests {
 
     #[test]
     fn reserved_subcommands_return_error() {
-        for name in ["send", "attach", "status"] {
+        // attach は実装済 (= 別 test)。`send` / `status` / `list` / `kill` / `detach` は
+        // まだ reserved (Phase A4+ で実装)。
+        for name in ["send", "status", "list", "kill", "detach"] {
             match parse_args(&args(&[name])) {
                 Command::Error(msg) => assert!(msg.contains(name), "msg = {msg}"),
                 other => panic!("expected Error for `{name}`, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn attach_with_session_id() {
+        match parse_args(&args(&["attach", "demo"])) {
+            Command::Attach(cfg) => {
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.socket, None);
+                assert!(!cfg.exclusive);
+                assert!(!cfg.detach_others);
+                assert_eq!(cfg.mode_str, None);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_with_socket_option() {
+        match parse_args(&args(&["attach", "--socket", "/tmp/x.sock"])) {
+            Command::Attach(cfg) => {
+                assert_eq!(cfg.socket.as_deref(), Some("/tmp/x.sock"));
+                assert_eq!(cfg.session_id, None);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_with_mode_and_flags() {
+        match parse_args(&args(&[
+            "attach",
+            "demo",
+            "--mode",
+            "ro",
+            "--exclusive",
+            "--detach-others",
+        ])) {
+            Command::Attach(cfg) => {
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.mode_str.as_deref(), Some("ro"));
+                assert!(cfg.exclusive);
+                assert!(cfg.detach_others);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_with_no_args_errors() {
+        match parse_args(&args(&["attach"])) {
+            Command::Error(msg) => assert!(msg.contains("attach")),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_with_too_many_positionals_errors() {
+        match parse_args(&args(&["attach", "a", "b"])) {
+            Command::Error(msg) => assert!(msg.contains("attach")),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_unknown_option_errors() {
+        match parse_args(&args(&["attach", "demo", "--bogus"])) {
+            Command::Error(msg) => assert!(msg.contains("bogus") || msg.contains("attach")),
+            other => panic!("got {other:?}"),
         }
     }
 

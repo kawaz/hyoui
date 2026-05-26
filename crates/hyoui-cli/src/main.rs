@@ -16,9 +16,10 @@ use std::io::Write;
 use std::os::fd::AsFd;
 use std::process::ExitCode;
 
-use hyoui::cli::{Command, HelpTopic, parse_args, usage};
+use hyoui::cli::{AttachConfig, Command, HelpTopic, parse_args, usage};
 use hyoui::client::{AttachOptions, ClientConnection};
 use hyoui::daemon::{DaemonConfig, Session};
+use hyoui::protocol::Mode;
 use hyoui::sys::{enter_raw, is_tty};
 
 mod completion;
@@ -51,6 +52,8 @@ fn main() -> ExitCode {
         }
 
         Command::Run(cfg) => run_command(cfg),
+
+        Command::Attach(cfg) => attach_command(cfg),
 
         Command::Completion { shell } => {
             print!("{}", completion::script(shell));
@@ -161,6 +164,99 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
         }
         Err(_) => {
             eprintln!("hyoui: daemon thread panic");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `hyoui attach <session>` の主要ロジック。
+///
+/// 既存 daemon に socket connect し、stdin/stdout を中継する。
+/// daemon は別 process / 別 hyoui run --detached 等で起動済みの想定。
+fn attach_command(cfg: AttachConfig) -> ExitCode {
+    let sock = if let Some(p) = cfg.socket.clone() {
+        std::path::PathBuf::from(p)
+    } else {
+        let sid = match cfg.session_id.as_deref() {
+            Some(s) => s,
+            None => {
+                eprintln!("hyoui: attach: session id or --socket required");
+                return ExitCode::from(2);
+            }
+        };
+        match socket_path::resolve(None, sid) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("hyoui: attach: socket path 解決失敗: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    };
+
+    let mode = match cfg.mode_str.as_deref() {
+        None | Some("rw") => Mode::Rw,
+        Some("ro") => Mode::Ro,
+        Some("rw-no-leader") => Mode::RwNoLeader,
+        Some(other) => {
+            eprintln!("hyoui: attach: invalid --mode value: {other}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let token = std::env::var("HYOUI_LOCK_TOKEN").ok();
+    let opts = AttachOptions {
+        mode,
+        caps: hyoui::protocol::MVP_CAPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        token,
+        exclusive: cfg.exclusive,
+        detach_others: cfg.detach_others,
+    };
+
+    let conn = match ClientConnection::connect(&sock, opts) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hyoui: attach: connect 失敗: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    let stdin_is_tty = is_tty(stdin.as_fd());
+    let _raw_guard = if stdin_is_tty {
+        match nix::unistd::dup(stdin.as_fd()) {
+            Ok(dup_for_guard) => match enter_raw(dup_for_guard) {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    eprintln!("hyoui: raw mode 失敗: {e} (続行)");
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!("hyoui: stdin dup 失敗: {e} (raw mode skip)");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut stdin_file = match nix::unistd::dup(stdin.as_fd()) {
+        Ok(fd) => std::fs::File::from(fd),
+        Err(e) => {
+            eprintln!("hyoui: stdin dup 失敗: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let _ = stdout.flush();
+    match conn.run(&mut stdin_file, &mut stdout) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("hyoui: attach 実行エラー: {e}");
             ExitCode::from(1)
         }
     }
