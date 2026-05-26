@@ -241,14 +241,118 @@ Bracketed paste (`--bracketed-paste=auto|on|off`, default `auto`、alias `--no-b
 ### 11. wait L0 (MVP)
 
 ```bash
-hyoui wait <name> [--idle DUR | --text S | --pattern R | --then-idle DUR] [--timeout DUR]
+hyoui wait <name> [match] [scope] [--timeout DUR] [--print=none|match|line|json] [--raw] [--lock-token T]
 ```
 
-- L0 = 出力 stream に対する text/regex match + idle 待ち
-- L1 (画面 rect 指定 + pty screen emulator)、L2 (named area + JSON 述語) は後付け
-- `--then-idle DUR` (pattern 出現後の安定待ち) は TUI 自動化の主用途
+match 条件 (排他):
 
-詳細仕様 (match スコープ・buffer・stdout 印字) は MVP 実装フェーズで詰める (本 DR の射程外、journal 残論点参照)。
+| flag | 意味 |
+|---|---|
+| `--idle DUR` | 出力が DUR 止まる |
+| `--text S` | substring match |
+| `--pattern R` | regex match |
+| `--text S --then-idle DUR` | match 後さらに idle (TUI 安定待ち、主用途) |
+| `--pattern R --then-idle DUR` | 同上 |
+
+MVP は単一条件 or `--then-idle` 組み合わせのみ。`--idle` と `--text/--pattern` の AND/OR は禁止 (= error)、`--logic and|or` は L2 で opt-in 検討。
+`--text` と `--pattern` は排他 (OR したいなら regex で書く)。
+
+scope:
+
+| flag | 意味 |
+|---|---|
+| `--from=now` (default) | wait 起動後の新規出力のみ |
+| `--from=history` | scrollback ring buffer 全体 + 新規 |
+
+装飾 (escape sequence) 取扱:
+
+- **default: ANSI escape (CSI/OSC/DCS 等) を strip した text に対して match**
+- `--raw`: raw bytes (escape 含む) に match (debug 用)
+- L0 の装飾除去は ANSI regex strip。cursor 移動による「同じ cell 上書き」は扱えない (= bytes 順と実画面の差は L1 emulator が完全版)
+
+timeout:
+
+- `--timeout DUR` (default infinite、明示必須)
+- exit code: `0` match、`1` timeout、`2` 子 process exit (= 紐付け先消滅)、`3+` error
+- `--process-bound` 動作は default 有効 (子 exit で wait も exit)、3 種 timeout フル装備 (`--timeout-absolute/--timeout-idle/--process-bound`) は MVP 未採用
+
+print:
+
+- `--print=none` (default、exit code のみ)
+- `--print=match`: マッチした text (substring/regex match 部分)
+- `--print=line`: マッチを含む行
+- `--print=json`: 全情報 (content/position/captures/timing)
+
+L1/L2 (後付け、CLI 拡張可能性):
+
+```bash
+hyoui wait <name> --rect X,Y,W,H --pattern R     # L1: 画面 rect 指定 (v0.2.0)
+hyoui wait <name> --cursor X,Y                    # L1: cursor 位置確認
+hyoui wait <name> --screen=primary|alternate ...  # L1: screen 別検査
+hyoui wait <name> --area NAME --predicate-file PATH  # L2: named area + JSON 述語 (v0.3.0)
+```
+
+MVP API は破壊変更なしで上記拡張に乗る形 (= `--text/--pattern/--idle/--then-idle` は L1 で `--rect` 等と組み合わせる形に拡張、`--cursor/--area/--predicate` は新規追加のみ)。
+
+### 11.5. tail (ad-hoc bytes stream client)
+
+```bash
+hyoui tail <name> [--follow|--no-follow] [--since DUR [--since-strict]] [--last N] [--strip] [--lock-token T]
+```
+
+- daemon の ring buffer から bytes stream を取得、stdout に出力
+- `--follow` (default): live stream (`tail -f` 相当)
+- `--no-follow`: 現 buffer dump して exit
+- `--since DUR`: 過去 DUR 秒以内の出力 (ring buffer 内フィルタ、取れた分だけ)
+- `--since-strict`: buffer 不足 (= since 範囲の一部が押し出されてた) を検知して exit 非 0
+- `--last N`: 末尾 N bytes
+- `--strip`: ANSI escape 除去 (script で grep する用、default は装飾あり)
+
+**用途は log/script モニタ**。`grep`/`less -R`/`awk` 等で処理する想定。
+
+**画面 mirror 用途には使えない** (= alternate screen 切替・resize 不一致・cursor 移動再演で描画崩壊)。画面 mirror が欲しいときは `hyoui attach --read-only`。
+
+実装は ad-hoc client (= CLI プロセスが daemon に「broadcast を私に流して」と要求、CLI exit で stream 停止)。daemon 内に永続保持される sink (= dump/record の v0.3.0+ 案) とは別物。
+
+### 11.6. scrollback ring buffer (daemon 側)
+
+daemon は子 pty bytes を **timestamped chunks の ring buffer** として常時保持:
+
+```rust
+struct OutputChunk { timestamp: Instant, bytes: Vec<u8> }
+VecDeque<OutputChunk>  // ring buffer
+last_evicted_ts: Option<Instant>  // 厳密判定用
+```
+
+- size 上限を超えると古い chunk から削除 (`pop_front`)、削除時に `last_evicted_ts` 更新
+- `--since DUR` は ring buffer 内フィルタ、`last_evicted_ts >= since_start` なら不完全 (= `--since-strict` で exit 非 0)
+- chunk overhead は微小 (40 bytes/chunk、1MB buffer で ~40KB overhead = 4%)
+
+`hyoui run` 起動時に size 指定:
+
+```bash
+hyoui run --scrollback-size=4MB --name X -- cmd   # default 4MB (claude/TUI 主用途想定)
+hyoui run --scrollback-size=0 ...                  # 無効化 (tail --since が常に空、--idle のみ動作)
+```
+
+`hyoui status` の出力に buffer 情報を含める:
+
+```
+scrollback:
+  size: 4.0 MB (used: 894 KB)
+  oldest_age: 11.3s              # buffer 最古 chunk
+  last_evicted_age: 47.2s        # 最後に押し出されたデータの古さ ("never evicted" もあり)
+  chunks: 924
+```
+
+**alternate screen の限界 (L0)**:
+- daemon は単一 ring buffer に bytes 全部 (primary/alternate 混在) を積む
+- alternate モード中の動的更新 (vim/claude code) で primary 履歴が瞬時に押し出される
+- `tail --since` の出力は escape 混じり、人間可読じゃない
+- 救済: `--scrollback-size` を大きめに (claude 用途は 4MB〜16MB)
+- 本筋: L1 (v0.2.0) で primary/alternate を別 grid 管理、`tail --screen=primary` で分離
+
+詳細仕様 (`--print=json` schema、regex captures の表現、装飾除去の正規表現セット) は MVP 実装フェーズで詰める。
 
 ### 12. 環境変数
 

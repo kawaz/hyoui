@@ -65,6 +65,50 @@ hyoui play <name> --file PATH [--speed 1.0] [--input-only] [--output-only]
 
 両者共存して別 subcommand の方が UX 明快。
 
+## 統合設計: sink 概念 (2026-05-26 追記)
+
+dump/record/play は本質的に近い (= daemon の I/O を file に書く/file から戻す)。
+更に tail (ad-hoc bytes stream client) とも「出力先の違いだけ」に見える。整理:
+
+| | tail | dump (= sink) |
+|---|---|---|
+| 誰が動かす? | CLI client プロセス (別プロセス) | daemon 内の sink (daemon プロセス内) |
+| ライフサイクル | ad-hoc、CLI 終了で止まる | 永続、CLI client と独立 |
+| 複数持てる? | プロセス起動分だけ複数 | daemon 内に複数 sink |
+| 出力先 | stdout / `--output FILE` | file |
+| format | raw bytes | raw / cast |
+| client 切断耐性 | 切断で止まる | 切断しても継続 |
+
+**sink 概念で dump/record/play を統合**する設計案 (v0.3.0):
+
+```bash
+# daemon 内永続 sink (= dump 相当、daemon の寿命と一致)
+hyoui sink add <name> --output FILE [--format=raw|cast] [--rotate=size:10MB,age:1h]
+hyoui sink remove <name> <sink-id>
+hyoui sink list <name>
+
+# record = sink add の cast format alias
+hyoui record <name> --output FILE         # = hyoui sink add <name> --output FILE --format=cast
+
+# play は別物 (sink ではなく source、file → daemon に注入)
+hyoui play <name> --input FILE [--speed 1.0] [--input-only|--output-only]
+```
+
+tail との関係:
+- tail = ad-hoc、CLI client が daemon に「broadcast を私に流して」と要求、stdout 出力
+- sink = daemon 内、client 独立、file 出力 (record は cast format)
+- `hyoui tail --output FILE` (v0.2.0 後付け候補) は **ad-hoc 簡易 sink** に位置付け (tail プロセス生きてる間だけ file に書く)
+
+## 段階整理
+
+| 機能 | 段階 |
+|---|---|
+| tail (ad-hoc stdout) | v0.1.0 MVP |
+| tail --output FILE | v0.2.0 後付け (実装は client 側完結、protocol 変更なし) |
+| sink concept (永続) | v0.3.0+ |
+| record (cast format sink) | v0.3.0+ |
+| play (file → daemon 注入) | v0.3.0+ |
+
 ## 実装上の検討点
 
 - daemon は既に pty 出力を全 attach client に broadcast している → dump/record は client の一種 (= file sink)

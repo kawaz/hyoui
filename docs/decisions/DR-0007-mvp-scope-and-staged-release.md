@@ -66,7 +66,7 @@ hyoui wait <name> --cursor X,Y                    # cursor 位置確認
 
 ### v0.3.0
 
-**高度な自動化 + pair-programming**:
+**高度な自動化 + pair-programming + 永続記録**:
 
 ```
 hyoui wait <name> --area input-line --pattern R   # L2: named area
@@ -75,12 +75,24 @@ hyoui leader take <name>
 hyoui leader give <name> <client-id>
 hyoui attach <name> --as-leader
 hyoui tx <name> --buffered                          # 他 client の入力を蓄積、tx 後 flush
+
+# sink 概念 (dump/record/play 統合)
+hyoui sink add <name> --output FILE [--format=raw|cast] [--rotate=size:10MB,age:1h]
+hyoui sink remove <name> <sink-id>
+hyoui sink list <name>
+hyoui record <name> --output FILE                  # sink add の cast format alias
+hyoui play <name> --input FILE [--speed] [--input-only|--output-only]
 ```
 
 実装:
 - config-driven area alias (`input-line`, `status-bar` 等の semantic 名)
 - leader CLI 露出 (v0.1.0 で内部実装済、解放するだけ)
 - tx buffered mode (他 client の入力ロストを防ぐ、複雑度高)
+- sink: daemon 内永続出力先、tail (ad-hoc) と区別。詳細は `docs/issue/2026-05-26-feature-recording-and-dump.md`
+
+### v0.2.0 後付け候補 (CLI 拡張、protocol 変更不要)
+
+- `hyoui tail <name> --output FILE`: tail プロセスが file に書く ad-hoc 永続化 (= sink の簡易版、tail プロセス生きてる間だけ)。実装は client 側で完結、protocol 変更ゼロ
 
 ## Rejected alternatives
 

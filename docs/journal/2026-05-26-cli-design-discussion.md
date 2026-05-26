@@ -151,18 +151,42 @@ paste の CLI で「入力源 / spool / size / その他」のカテゴリ分け
 [[kawaz/kuu.mbt の docs/issue/2026-05-26-help-option-sections.md]] に提案として起票
 (kuu-cli が既に merge 済み、その API に乗せる形が筋)。
 
+### Phase 11: wait L0 + tail + scrollback 詳細議論
+
+DR-0005/0006/0007 + paste API 用語整理 commit 後、実装着手前の最後の wait 議論。
+論点 14 個を順次解消、[[DR-0006]] Section 11 (wait L0)、11.5 (tail)、11.6 (scrollback) として具体化:
+
+1. match 条件: 排他 (`--text`/`--pattern` 排他、`--idle` と `--text/--pattern` の AND/OR は MVP で禁止、`--then-idle` のみ組み合わせ可)
+2. scope: `--from=now` (default) vs `--from=history` (scrollback 全体検査)
+3. timeout: 3 種フル装備は wait には過剰、`--timeout DUR` 1 つに簡素化、`--process-bound` 動作は default 有効
+4. print: default `none` (exit code のみ)、`--print=match|line|json` で詳細
+5. ユーザ例 (claude プロンプト待ち、`❯ <cursor>` + サジェスト graytext + アイドル 5 秒) は **L0 では不可、L1/L2 必要**。L1 emulator は v0.2.0 に維持、MVP は `--idle 5s` 等で半分動作
+6. Brewed/Sautéed (`✻ \w+ for`) completion pattern は L0 regex で確実拾える = MVP で claude 自動化の足場
+7. A (考え中) / B (完全 idle) / C (入力中) 判定の 3 状態は L1 (cursor 位置・cell attribute) 必須、MVP では B のみ確実、A/C は妥協
+8. `tail --since DUR` 採用、ring buffer 内フィルタ
+9. **`--since-strict`** は最初「判定根拠が曖昧」(ring buffer 押し出し後の data の有無は不明) で却下したが、**`last_evicted_ts` を daemon に持てば厳密判定可能** とユーザ指摘で復活
+10. scrollback ring buffer: timestamped chunks (40 bytes/chunk overhead)、default size **4MB** (claude/TUI 主用途想定)、`hyoui status` で `oldest_age`/`last_evicted_age` 表示
+11. **alternate screen 問題**: L0 単一 ring buffer は primary/alternate 混在、alternate 中の動的更新で primary 履歴が押し出される。L1 で screen 別 grid 管理 (`tail --screen=primary` 等) で本格対応。MVP は限界として doc 明示
+12. **装飾除去**: wait/match は **default で ANSI escape strip**、`--raw` で opt-out (escape 混じり bytes は誤未検出の温床)。L0 の strip は ANSI regex のみ、cursor 移動上書きは扱えない (L1 で完全版)
+13. tail は **装飾あり default、`--strip` で除去**。装飾あり = `less -R` で人間が読む用、`--strip` = grep/script 用
+14. **tail vs dump の本質**: 「ad-hoc client (tail プロセス生きてる間)」と「daemon 内永続 sink (daemon と同じ寿命)」の違い。出力先 (stdout vs file) は副次的。dump/record/play は **sink 概念で v0.3.0 統合** ([[DR-0007]] 更新)
+
+ターミナルサイズ実測共有 (kawaz の環境): mbp+cmux 254x90 〜 LG モニタ+小フォント 856x167 = ~143K cells。4MB buffer で claude 思考中の `✶✳✷` 系アニメ (~30KB/分推定) なら 2 時間程度保持の目安。
+
+新規アイデア起票:
+- `docs/issue/2026-05-26-feature-claude-tui-automation.md` — A/B/C 判定、Brewed/Sautéed completion、L1/L2 要件、alternate screen `--screen=` 対応 (実現は v0.2.0+v0.3.0)
+- `docs/issue/2026-05-26-feature-recording-and-dump.md` 更新 — sink 概念で dump/record/play 統合、tail との関係 (ad-hoc vs 永続) を明示
+
 ## 残論点 (MVP 実装フェーズで詰める)
 
 [[DR-0006]] Consequences 「未確定事項」セクションに集約済み:
 
-### wait L0 詳細
+### wait L0 詳細 (Phase 11 で大方解消)
 
-- match スコープ: 新規出力のみ vs scrollback buffer 過去分
-- daemon の scrollback buffer サイズ default
-- `--text` vs `--pattern` 両方持つか
-- `--idle` / `--then-idle` の組み合わせ semantics
-- マッチ結果の stdout 印字 (regex captures)
-- timeout 3 種共通フラグの wait での意味
+残りの細部 (MVP 実装で詰める):
+- `--print=json` の schema (capture group, position, timing の表現)
+- `--from=history` の semantics 確認 (scrollback の何 bytes から検査、cap?)
+- daemon → client への protocol message (match notification, idle event 等)
 
 ### A 系 (コア動作) 残り
 
