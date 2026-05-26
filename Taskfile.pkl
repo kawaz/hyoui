@@ -29,11 +29,14 @@ local lintRust: Task = new {
     """
 }
 
-// unsafe 封じ込め gate: unsafe { ... } / unsafe fn 等は sys/raw.rs と sys/signal.rs に限定。
-// 他に漏れたら fail。grep が何もマッチしなければ exit 1 を返すので、マッチ無しを成功とする。
+// unsafe 封じ込め gate: unsafe は sys/raw.rs / sys/signal.rs / daemon/session.rs (= R4-H4
+// で追加された Session::into_parts の ManuallyDrop+ptr::read 1 箇所のみ) に限定。
+// daemon/session.rs の例外は R4-H6 (session.rs 責務分割) で Option-based cleanup に書き
+// 換えて消す予定。他に漏れたら fail。grep が何もマッチしなければ exit 1 を返すので、
+// マッチ無しを成功とする。
 local lintUnsafe: Task = new {
   name = "lint:unsafe"
-  description = "verify unsafe is confined to sys/raw.rs and sys/signal.rs"
+  description = "verify unsafe is confined to sys/raw.rs, sys/signal.rs, daemon/session.rs"
   visibility = "internal"
   inputs {
     "crates/hyoui/src/**/*.rs"
@@ -42,9 +45,9 @@ local lintUnsafe: Task = new {
     #"""
     set -uo pipefail
     leaked=$(grep -rnE '\bunsafe[[:space:]]+(fn|impl|trait|extern|\{)' crates/hyoui/src --include='*.rs' \
-      | grep -v 'src/sys/raw.rs\|src/sys/signal.rs' || true)
+      | grep -v 'src/sys/raw.rs\|src/sys/signal.rs\|src/daemon/session.rs' || true)
     if [ -n "$leaked" ]; then
-      echo "ERROR: unsafe leaked outside whitelisted files (sys/raw.rs, sys/signal.rs):" >&2
+      echo "ERROR: unsafe leaked outside whitelisted files (sys/raw.rs, sys/signal.rs, daemon/session.rs):" >&2
       echo "$leaked" >&2
       exit 1
     fi
