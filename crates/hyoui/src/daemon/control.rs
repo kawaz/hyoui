@@ -311,14 +311,23 @@ fn ensure_leader(ch: &ClientHandle, message: &str) -> Result<(), ()> {
 
 // === kind 別 handler 群 ===
 
-/// 整数 signum から nix `Signal` を返す。POSIX `kill(pid, 0)` semantic に従い
-/// `signum == 0` も範囲外として扱う (= "existence probe" は wire protocol で
-/// サポートしない、必要なら別 message を新設)。範囲外なら `None`。
-pub(super) fn nix_signal_from_signum(signum: u8) -> Option<Signal> {
-    if signum == 0 {
-        return None;
-    }
-    Signal::try_from(signum as i32).ok()
+/// signal name string から nix `Signal` を返す (DR-0012)。
+///
+/// wire protocol は signal 数値ではなく **signal name** (`"SIGTERM"` / `"SIGINT"` 等)
+/// を送るため、daemon 側で OS native 値に解決する。
+///
+/// - 受理する name は SIG-prefix 大文字 (正規表記)。`"sigterm"` / `"TERM"` / `"15"`
+///   等は **reject** (= 大文字小文字緩和や省略・数値表現を入れると spec が曖昧化)
+/// - daemon の OS で `nix::Signal` variant が定義されていない signal name
+///   (例: Linux 上で `"SIGINFO"` = macOS 専用) は自動的に `None` → `signal.invalid`
+/// - POSIX `kill(pid, 0)` semantic の existence probe (= signum=0) は wire protocol
+///   ではサポートしない (必要なら別 message を新設)
+pub(super) fn signal_name_to_nix_signal(name: &str) -> Option<Signal> {
+    // nix::Signal の Display は `Signal::SIGTERM.as_str() -> "SIGTERM"` 形式を返す。
+    // FromStr は dotted text を受け取る形ではなく、`"SIGTERM"` / `"SIGINT"` 等
+    // 正規表記文字列で variant を返す。daemon の running OS で定義されている
+    // signal variant のみが対象。
+    name.parse::<Signal>().ok()
 }
 
 /// `detach` message の target に応じて drop 対象を決める。
@@ -374,21 +383,23 @@ fn handle_kill(
     if ensure_rw_mode(&clients[idx], "kill requires rw mode (= leader-eligible)").is_err() {
         return ClientFrameOutcome::Continue;
     }
-    // signum 解釈: None なら SIGTERM、invalid 値 (0 や 範囲外) は error。
-    let signum = k.signum.unwrap_or(libc::SIGTERM as u8);
-    let sig = match nix_signal_from_signum(signum) {
-        Some(s) => s,
-        None => {
-            let _ = send_control(
-                &clients[idx],
-                ControlMessage::Error(ErrorMessage {
-                    code: ErrorCode::SignalInvalid,
-                    message: format!("invalid signum: {signum}"),
-                    details: None,
-                }),
-            );
-            return ClientFrameOutcome::Continue;
-        }
+    // DR-0012: signal name 解釈。None なら SIGTERM (default)、未知 name は error。
+    let sig = match k.signal.as_deref() {
+        None => Signal::SIGTERM,
+        Some(name) => match signal_name_to_nix_signal(name) {
+            Some(s) => s,
+            None => {
+                let _ = send_control(
+                    &clients[idx],
+                    ControlMessage::Error(ErrorMessage {
+                        code: ErrorCode::SignalInvalid,
+                        message: format!("invalid signal name: {name}"),
+                        details: None,
+                    }),
+                );
+                return ClientFrameOutcome::Continue;
+            }
+        },
     };
     let _ = kill(child, sig);
     ClientFrameOutcome::TerminateSession(RelayOutcome::ClientDetachedOrKilled)
@@ -407,14 +418,15 @@ fn handle_signal(
     if ensure_not_ro(&clients[idx], "signal requires rw mode").is_err() {
         return ClientFrameOutcome::Continue;
     }
-    let sig = match nix_signal_from_signum(s.signum) {
-        Some(s) => s,
+    // DR-0012: signal name 解釈。未知 name は error。
+    let sig = match signal_name_to_nix_signal(&s.signal) {
+        Some(sig) => sig,
         None => {
             let _ = send_control(
                 &clients[idx],
                 ControlMessage::Error(ErrorMessage {
                     code: ErrorCode::SignalInvalid,
-                    message: format!("invalid signum: {}", s.signum),
+                    message: format!("invalid signal name: {}", s.signal),
                     details: None,
                 }),
             );

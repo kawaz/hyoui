@@ -900,7 +900,7 @@ fn finalize_child(child: Pid, outcome: &RelayOutcome) -> Result<i32, Error> {
 #[cfg(test)]
 mod tests {
     use super::super::accept::constant_time_eq;
-    use super::super::control::nix_signal_from_signum;
+    use super::super::control::signal_name_to_nix_signal;
     use super::super::lock::{generate_lock_token, should_assign_leader};
     use super::*;
     use crate::protocol::messages::{
@@ -1355,7 +1355,7 @@ mod tests {
         let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
         let mut stream = client_connect_with_retry(&sock_path);
         let _resp = do_client_handshake(&mut stream);
-        let kill_msg = ControlMessage::Kill(Kill { signum: None });
+        let kill_msg = ControlMessage::Kill(Kill { signal: None });
         let body = kill_msg.encode_to_vec().expect("encode kill");
         Frame::cbor_control(body)
             .encode_to(&mut stream)
@@ -1391,7 +1391,7 @@ mod tests {
         {
             let mut s = client_connect_with_retry(&sock_path);
             let _r = do_client_handshake(&mut s);
-            let body = ControlMessage::Kill(Kill { signum: None })
+            let body = ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode");
             Frame::cbor_control(body).encode_to(&mut s).expect("send");
@@ -1417,7 +1417,7 @@ mod tests {
         assert_ne!(r2.client_id, 0);
 
         // s1 が kill 送信
-        let body = ControlMessage::Kill(Kill { signum: None })
+        let body = ControlMessage::Kill(Kill { signal: None })
             .encode_to_vec()
             .expect("encode");
         Frame::cbor_control(body).encode_to(&mut s1).expect("send");
@@ -1537,7 +1537,7 @@ mod tests {
         assert_ne!(r1.client_id, r2.client_id);
 
         // cleanup: kill
-        let body = ControlMessage::Kill(Kill { signum: None })
+        let body = ControlMessage::Kill(Kill { signal: None })
             .encode_to_vec()
             .expect("encode");
         Frame::cbor_control(body).encode_to(&mut s1).expect("send");
@@ -1597,7 +1597,7 @@ mod tests {
         }
 
         // cleanup
-        let body = ControlMessage::Kill(Kill { signum: None })
+        let body = ControlMessage::Kill(Kill { signal: None })
             .encode_to_vec()
             .expect("encode");
         Frame::cbor_control(body).encode_to(&mut s1).expect("send");
@@ -1662,7 +1662,7 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -1728,7 +1728,7 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -1782,7 +1782,7 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -1830,7 +1830,7 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -1878,7 +1878,7 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -1979,7 +1979,7 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -2101,7 +2101,7 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -2157,7 +2157,7 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -2211,7 +2211,7 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -2272,7 +2272,7 @@ mod tests {
         }
 
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -2351,7 +2351,7 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -2447,7 +2447,7 @@ mod tests {
         let mut k = client_connect_with_retry(&sock_path);
         let _ = do_client_handshake(&mut k);
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -2468,15 +2468,58 @@ mod tests {
         assert!(constant_time_eq(b"", b""));
     }
 
+    /// DR-0012: signal name string から nix `Signal` を解決する helper の挙動。
+    /// 正規 SIG-prefix 大文字を受理、未知 name / 小文字 / 略名 / 数値は reject。
     #[test]
-    fn nix_signal_from_signum_rejects_zero_and_invalid() {
-        assert!(nix_signal_from_signum(0).is_none(), "signum=0 = probe");
+    fn signal_name_to_nix_signal_accepts_canonical_names() {
+        // 正規表記 (SIG-prefix 大文字) は受理
         assert!(
-            nix_signal_from_signum(255).is_none(),
-            "signum=255 out of range"
+            signal_name_to_nix_signal("SIGTERM").is_some(),
+            "SIGTERM is canonical"
         );
-        assert!(nix_signal_from_signum(2).is_some(), "SIGINT");
-        assert!(nix_signal_from_signum(15).is_some(), "SIGTERM");
+        assert!(
+            signal_name_to_nix_signal("SIGINT").is_some(),
+            "SIGINT is canonical"
+        );
+        assert!(
+            signal_name_to_nix_signal("SIGKILL").is_some(),
+            "SIGKILL is canonical"
+        );
+        assert!(
+            signal_name_to_nix_signal("SIGUSR1").is_some(),
+            "SIGUSR1 portable"
+        );
+        // 略名・小文字・数値は reject
+        assert!(
+            signal_name_to_nix_signal("TERM").is_none(),
+            "略名 TERM は reject"
+        );
+        assert!(
+            signal_name_to_nix_signal("sigterm").is_none(),
+            "小文字 sigterm は reject"
+        );
+        assert!(
+            signal_name_to_nix_signal("15").is_none(),
+            "数値 15 は reject"
+        );
+        assert!(
+            signal_name_to_nix_signal("SIGBOGUS").is_none(),
+            "未知 name は reject"
+        );
+    }
+
+    /// DR-0012: BSD-specific signal (SIGINFO 等) は Linux daemon では nix の
+    /// `Signal::SIGINFO` variant が未定義のため自動 reject される。
+    /// (= name-based wire の cross-OS フォールバック挙動の sanity check)
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn signal_name_to_nix_signal_rejects_bsd_specific_on_linux() {
+        // SIGINFO は macOS / *BSD 専用。Linux では nix が variant を出さないので
+        // None になる (= signal.invalid で reject される)。
+        assert!(
+            signal_name_to_nix_signal("SIGINFO").is_none(),
+            "SIGINFO on Linux must be rejected"
+        );
     }
 
     /// Round1 A1: Ro client が Kill を送ると mode.not-allowed エラーが返り、
@@ -2504,7 +2547,7 @@ mod tests {
         s2.flush().expect("flush");
         let _ = Frame::decode_from(&mut s2).expect("handshake response"); // discard
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -2523,7 +2566,7 @@ mod tests {
 
         // s1 から正規 Kill で session 終了
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -2533,9 +2576,10 @@ mod tests {
         let _ = handle.join().expect("daemon thread");
     }
 
-    /// Round1 A3: signum=0 (POSIX probe) を Kill / Signal で送ると signal.invalid を返す。
+    /// DR-0012: 未知 signal name を Kill / Signal で送ると signal.invalid を返す。
+    /// (= 旧 Round1 A3 "signum=0 (POSIX probe) reject" を name-based に置換)
     #[test]
-    fn serve_signal_zero_rejected() {
+    fn serve_signal_unknown_name_rejected() {
         use crate::protocol::messages::Signal as ProtoSignal;
         let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
         let mut s = client_connect_with_retry(&sock_path);
@@ -2543,9 +2587,11 @@ mod tests {
         let _ = Frame::decode_from(&mut s).expect("leader.notify");
 
         Frame::cbor_control(
-            ControlMessage::Signal(ProtoSignal { signum: 0 })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Signal(ProtoSignal {
+                signal: "SIGBOGUS".into(),
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s)
         .expect("send");
@@ -2558,7 +2604,7 @@ mod tests {
         }
 
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -2617,7 +2663,7 @@ mod tests {
         // cleanup: leader.notify を捨てて kill
         let _ = Frame::decode_from(&mut s2);
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -2681,7 +2727,7 @@ mod tests {
         assert!(got_error, "expected wait.invalid-text error");
 
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -2751,7 +2797,7 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -2787,7 +2833,7 @@ mod tests {
 
         // s2 (RwNoLeader) が Kill 試行 → mode.not-allowed
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -2803,7 +2849,7 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -2902,7 +2948,7 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -2979,7 +3025,7 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -3025,7 +3071,7 @@ mod tests {
         // cleanup
         good.set_read_timeout(None).expect("clear timeout");
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )
@@ -3098,7 +3144,7 @@ mod tests {
         // cleanup: kill で daemon を畳む
         newcomer.set_read_timeout(None).expect("clear");
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signum: None })
+            ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
                 .expect("encode"),
         )

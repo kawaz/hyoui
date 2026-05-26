@@ -668,9 +668,9 @@ mod tests {
         assert!(conn.response.leader);
         assert_eq!(conn.response.mode, Mode::Rw);
 
-        // kill して daemon 終了させる
+        // kill して daemon 終了させる (DR-0012: signal: None = SIGTERM default)
         conn.send_control(&ControlMessage::Kill(crate::protocol::messages::Kill {
-            signum: None,
+            signal: None,
         }))
         .expect("send kill");
         let exit = handle.join().expect("daemon thread").expect("daemon run");

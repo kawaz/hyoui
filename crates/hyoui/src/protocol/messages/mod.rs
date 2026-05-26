@@ -296,7 +296,10 @@ mod tests {
 
     #[test]
     fn signal_roundtrip() {
-        let msg = ControlMessage::Signal(Signal { signum: 2 }); // SIGINT
+        // DR-0012: wire は signal name string
+        let msg = ControlMessage::Signal(Signal {
+            signal: "SIGINT".into(),
+        });
         assert_eq!(roundtrip(&msg), msg);
     }
 
@@ -506,12 +509,13 @@ mod tests {
 
     #[test]
     fn kill_roundtrip() {
+        // DR-0012: wire は signal name string
         let msg = ControlMessage::Kill(Kill {
-            signum: Some(15), // SIGTERM
+            signal: Some("SIGTERM".into()),
         });
         assert_eq!(roundtrip(&msg), msg);
 
-        let default_kill = ControlMessage::Kill(Kill { signum: None });
+        let default_kill = ControlMessage::Kill(Kill { signal: None });
         assert_eq!(roundtrip(&default_kill), default_kill);
     }
 

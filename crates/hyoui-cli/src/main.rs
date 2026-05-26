@@ -594,7 +594,13 @@ fn kill_command(cfg: KillConfig) -> ExitCode {
         }
     };
 
-    let kill = hyoui::protocol::messages::Kill { signum: cfg.signum };
+    // DR-0012: wire は signal name string。CLI 入口の `--signum N` は本 commit
+    // 時点ではまだ u8 を受けるので、ここで信号番号を name に変換する暫定 bridge
+    // (= 次 commit で CLI 入口を `--signal NAME` に置き換えてこの bridge は消す)。
+    let signal_name = cfg.signum.map(signum_to_name_bridge);
+    let kill = hyoui::protocol::messages::Kill {
+        signal: signal_name,
+    };
     if let Err(e) = conn.send_control(&hyoui::protocol::ControlMessage::Kill(kill)) {
         eprintln!("hyoui: kill: send 失敗: {e}");
         return ExitCode::from(1);
@@ -607,6 +613,28 @@ fn kill_command(cfg: KillConfig) -> ExitCode {
 
     println!("hyoui: kill 送信完了: {}", sock.display());
     ExitCode::SUCCESS
+}
+
+/// DR-0012 移行用 bridge: 旧 `--signum N` (= u8) を新 wire field `signal: NAME` に
+/// 変換する暫定 helper。本 commit は protocol breaking を入れる commit なので CLI
+/// 入口 (`--signum`) はまだ u8 のまま、ここで daemon 側の OS 値解決前に名前に
+/// 戻す。次 commit で CLI 入口を `--signal NAME` に置き換えてこの helper は除去
+/// される (= 寿命が短い意図的 dead end)。
+///
+/// 範囲外 / 不明な signum は便宜的に 1〜31 の "SIG<n>" 風 fallback ではなく、
+/// 標準の低位 1-15 (= cross-OS で de facto portable) のみ name に解決し、それ以外は
+/// "SIG_UNKNOWN_<n>" 文字列を送って daemon 側で signal.invalid を出させる。
+fn signum_to_name_bridge(signum: u8) -> String {
+    match signum {
+        1 => "SIGHUP".to_string(),
+        2 => "SIGINT".to_string(),
+        3 => "SIGQUIT".to_string(),
+        6 => "SIGABRT".to_string(),
+        9 => "SIGKILL".to_string(),
+        14 => "SIGALRM".to_string(),
+        15 => "SIGTERM".to_string(),
+        other => format!("SIG_UNKNOWN_{other}"),
+    }
 }
 
 /// session_id / socket オプションから target socket path を resolve するヘルパ。
@@ -1117,7 +1145,7 @@ mod tests {
             ..AttachOptions::default()
         };
         if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
-            let kill = hyoui::protocol::messages::Kill { signum: None };
+            let kill = hyoui::protocol::messages::Kill { signal: None };
             let _ = conn.send_control(&ControlMessage::Kill(kill));
             drop(conn);
         }

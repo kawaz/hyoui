@@ -24,11 +24,12 @@ pub struct Detach {
     pub target: DetachTarget,
 }
 
-/// `kill` payload。daemon は子 PTY に signal を送って自身も exit する。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// `kill` payload (DR-0012)。daemon は子 PTY に signal を送って自身も exit する。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Kill {
-    /// 子に送る signal (= null なら SIGTERM)。
+    /// 子に送る signal 名 (= null なら SIGTERM、正規表記は SIG-prefix 大文字)。
+    /// 未知 name は daemon 側で `signal.invalid` で reject される。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signum: Option<u8>,
+    pub signal: Option<String>,
 }
