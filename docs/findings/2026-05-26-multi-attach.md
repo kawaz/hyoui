@@ -48,19 +48,80 @@ PoC では write 失敗 client を drop。本実装では:
 - 部分書き込み (= TCP buffer full 相当) は backoff + retry (= client buffer に貯める)
 - 完全失敗 (= EPIPE 等) は client を drop + 通知 (`connection lost`)
 
-### ONLCR 等の tty flag 設定
+### ONLCR の主体 (= kernel tty driver、nix も hyoui --line-ending も無関係)
 
-子 pty の default tty flags は `ONLCR | OPOST | ECHO | ICANON | ISIG | ...`。
-hyoui の主用途 (= TUI app の pty 中継) では:
-- shell/TUI app は自分で tty を raw mode にする (`tcsetattr` で ECHO/ICANON 等 disable)
-- なので daemon は default flags のまま起動して OK (= 子が必要に応じて変更)
-- ただし `cat` のような単純コマンドだと cooked mode のまま、改行変換が起きる
+PoC 02 で観察した `\n → \r\n` 変換は **POSIX の tty/pty 仕様、kernel の tty driver が自動変換**。
+hyoui の `--line-ending` (= hyoui のアプリレイヤで paste 入力を変換) とは別レイヤ。
 
-wait の text/pattern match で改行は `\r\n` で来る可能性を考慮:
-- regex は `\r?\n` で書く慣習を doc 推奨、または
-- 装飾除去 ([[DR-0006]] §11) で CRLF → LF 正規化を含める
+#### レイヤ図
 
-CRLF 変換は ANSI escape ではないが、wait の text match のノイズになるので **装飾除去の一部として CRLF → LF も含める**のが筋。doc 明示。
+```
+[hyoui]
+  ├ paste/keys 入力                  ← --line-ending/--trailing-newline (hyoui レイヤ、optional)
+  └ master fd へ write
+        ↓
+  [kernel tty driver]
+        ├ c_iflag (input modes)      ← 子の stdin 側 (ICRNL 等)
+  [子の slave fd で read]
+  [子 process (cat / shell / TUI app)]
+  [子の slave fd へ write "hello\n"]
+        ↓
+  [kernel tty driver]
+        ├ c_oflag (output modes)     ← ★ ONLCR がここ
+        │   ONLCR | OPOST → "\n" を "\r\n" に変換
+[hyoui master fd で read] → "hello\r\n"
+```
+
+#### default termios
+
+`forkpty(3)` / `openpty(3)` が作る pty の default termios は「対話的端末 (cooked mode)」相当:
+
+```c
+c_iflag = BRKINT | ICRNL | IXON | ...
+c_oflag = OPOST | ONLCR | ...      // ← \n → \r\n 変換
+c_cflag = CS8 | CREAD | ...
+c_lflag = ISIG | ICANON | ECHO | ...
+```
+
+歴史的経緯: pty はリモートログイン (telnet/ssh) のため設計、ssh で接続した人間が shell を対話的に使う前提の cooked mode が default。
+hyoui のようなデータチャネル用途は後発、必要に応じて子の termios を変える or hyoui レイヤで吸収する。
+
+#### nix の役割
+
+nix の `Pty::spawn` は forkpty を呼ぶだけ、変換は kernel 内で起こる。**nix は無関係**、ライブラリの問題ではなく POSIX 仕様。
+
+#### TUI app は自分で disable
+
+vim / claude code 等の TUI は起動時に termios を raw mode に変える:
+
+```c
+struct termios t;
+tcgetattr(STDIN_FILENO, &t);
+t.c_oflag &= ~OPOST;      // ← ONLCR 含む output 変換 OFF
+t.c_lflag &= ~(ECHO | ICANON | ISIG);
+tcsetattr(STDIN_FILENO, TCSANOW, &t);
+```
+
+これで TUI app が `write(stdout, "\n")` しても master 側は `\n` のまま。
+
+一方 `cat` のような termios いじらないシンプルプログラムは default cooked mode のまま → `\n → \r\n` 変換される (= PoC 02 で観察)。
+
+#### hyoui の対応 (3 案)
+
+| 案 | 動作 | 評価 |
+|---|---|---|
+| **A. 子に任せる** | TUI app は \n、cooked モード子は \r\n のまま | ⭕ 子の意図尊重、wait/match で `\r?\n` 規約 |
+| **B. daemon が ONLCR 無効化** (起動時 master の termios で `c_oflag &= ~ONLCR`) | 全 case で \n、cooked モード子の表示が崩れる可能性 | △ 強制干渉、副作用大 |
+| **C. wait/match レイヤで CRLF→LF 正規化** | hyoui のアプリ層で吸収 | ⭕ 子に干渉せず、match 安定 |
+
+**推奨: 案 A + C の組合せ**:
+
+- daemon は子の termios に干渉しない (= bytes 透過)
+- wait/match で **CRLF → LF 正規化 option** (= `--newline-convert=preserve|lf` 等の別 flag、装飾除去とは責務分離)
+
+これで「子が cooked モードで `\r\n` 吐く」「子が raw モードで `\n` 吐く」のどちらにも対応、wait/match の text match が `\r?\n` regex 書かなくても安定する。
+
+詳細は本 finding 末尾 + [[DR-0006]] §11 微修正で確定 (= [[2026-05-26-ansi-strip]] でも CRLF→LF を装飾除去から分離すべきと判明)。
 
 ## 検証の詳細
 
