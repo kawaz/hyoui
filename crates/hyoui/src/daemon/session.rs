@@ -1039,8 +1039,8 @@ mod tests {
 
     #[test]
     fn generate_lock_token_unique_and_hex32() {
-        let a = generate_lock_token();
-        let b = generate_lock_token();
+        let a = generate_lock_token().expect("urandom open");
+        let b = generate_lock_token().expect("urandom open");
         assert_eq!(a.len(), 32, "token must be 32 hex chars (16 bytes)");
         assert_eq!(b.len(), 32);
         assert_ne!(a, b, "two tokens must differ");

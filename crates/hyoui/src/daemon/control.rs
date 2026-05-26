@@ -518,7 +518,36 @@ fn handle_lock_acquire(
         );
         return ClientFrameOutcome::Continue;
     }
-    let token = generate_lock_token();
+    // R5-H11: 旧実装は `generate_lock_token()` 内で urandom 失敗時 `.expect()`
+    // panic していたため、`panic = "abort"` 設定下では daemon 全体が abort して
+    // 全 client が巻き添え切断される (= 同 UID の攻撃者が EMFILE/ENFILE を
+    // 作り出せれば session DoS が成立)。Result 化して I/O 失敗時は
+    // `LockResponse(Denied)` + `ErrorCode::InternalError` notify で当該 client
+    // にだけ返し、session 自体は継続する。
+    let token = match generate_lock_token() {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = send_control(
+                &clients[idx],
+                ControlMessage::LockResponse(LockResponse {
+                    result: LockResult::Denied,
+                    token: None,
+                    queue_position: None,
+                }),
+            );
+            let _ = send_control(
+                &clients[idx],
+                ControlMessage::Error(ErrorMessage {
+                    code: ErrorCode::InternalError,
+                    message: format!(
+                        "lock token generation failed (urandom unavailable): {e}; retry later"
+                    ),
+                    details: None,
+                }),
+            );
+            return ClientFrameOutcome::Continue;
+        }
+    };
     state.lock_holder = Some(ch_id);
     state.lock_token = Some(token.clone());
     let _ = send_control(

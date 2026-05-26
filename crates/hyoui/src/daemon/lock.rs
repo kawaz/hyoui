@@ -46,26 +46,39 @@ impl SessionState {
 /// 128-bit (32 hex char) の lock token を生成する。
 ///
 /// 同 UID 信頼領域なので CSPRNG 強度は厳格には不要だが、token が予測可能だと
-/// 同 UID の悪意あるプロセスが推測で lock を奪取しうるため、最低限の対策として:
+/// 同 UID の悪意あるプロセスが推測で lock を奪取しうるため、最低限の対策として
+/// `/dev/urandom` から **16 byte** を `read_exact` で取り切る (= 全 128 bit
+/// 分の entropy を確実に得る)。
 ///
-/// 1. `/dev/urandom` から **16 byte** を `read_exact` で取り切る (= 全 128 bit
-///    分の entropy を確実に得る)
-/// 2. もし urandom open / read が失敗した場合は `panic` して daemon を止める
-///    (= 弱い token で運用継続するより落ちる方が安全)
-pub(super) fn generate_lock_token() -> String {
-    use std::io::Read;
+/// # Errors (R5-H11)
+///
+/// urandom の open / read が失敗した場合は [`std::io::Error`] を返す。
+/// 旧実装は `.expect()` で panic していたが、`panic = "abort"` 設定下では
+/// daemon process 全体が abort して **全 client が巻き添えに切断される**。
+/// 攻撃者が EMFILE / ENFILE 等を作り出せれば session DoS が成立しうるため、
+/// caller (= [`super::control::handle_lock_acquire`]) は本 error を
+/// `LockResponse(Denied)` + `ErrorCode::InternalError` notify で client に
+/// 返し、session 自体は継続する。
+pub(super) fn generate_lock_token() -> std::io::Result<String> {
+    let f = std::fs::File::open("/dev/urandom")?;
+    generate_lock_token_from(f)
+}
 
+/// `generate_lock_token` の本体 (= reader 抽象化版)。
+///
+/// 任意の [`std::io::Read`] から 16 byte を取って 32-char hex string を返す。
+/// 本 module の `generate_lock_token` は `/dev/urandom` を渡す薄い wrapper で、
+/// テストは failing reader を渡して `read_exact` 失敗 path を検証する。
+pub(super) fn generate_lock_token_from<R: std::io::Read>(mut r: R) -> std::io::Result<String> {
     let mut buf = [0u8; 16];
-    let mut f = std::fs::File::open("/dev/urandom")
-        .expect("hyoui: cannot open /dev/urandom for lock token");
-    f.read_exact(&mut buf)
-        .expect("hyoui: short read from /dev/urandom for lock token");
+    r.read_exact(&mut buf)?;
     let mut out = String::with_capacity(32);
     for b in &buf {
         use std::fmt::Write;
+        // String への write! は infallible だが文法上 Result を返す。
         let _ = write!(out, "{b:02x}");
     }
-    out
+    Ok(out)
 }
 
 /// 新規 rw client が leader 取得すべきかを判定する (= 既存に leader が居ないか)。
@@ -89,4 +102,54 @@ pub(super) fn elevate_next_leader(clients: &mut [ClientHandle]) -> Option<u64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R5-H11: `generate_lock_token_from` の正常 path (= 16 byte 供給) では
+    /// 32-char hex string を返す。
+    #[test]
+    fn generate_lock_token_from_returns_hex32_on_success() {
+        let bytes: &[u8] = &[
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+            0x32, 0x10,
+        ];
+        let tok = generate_lock_token_from(bytes).expect("must succeed with 16 bytes");
+        assert_eq!(tok, "0123456789abcdeffedcba9876543210");
+    }
+
+    /// R5-H11: reader が 16 byte を満たさず短く返してきたら `read_exact` が
+    /// `UnexpectedEof` を返し、`generate_lock_token_from` は Err を返す
+    /// (= panic しない)。旧実装は `.expect()` で daemon を abort させていた。
+    #[test]
+    fn generate_lock_token_returns_error_on_io_failure() {
+        // 8 byte (= 16 未満) しか供給しない reader → `read_exact` が UnexpectedEof
+        let short: &[u8] = &[0u8; 8];
+        let err = generate_lock_token_from(short).expect_err("must error on short read");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "expected UnexpectedEof, got {:?}",
+            err.kind()
+        );
+    }
+
+    /// R5-H11: reader が即 I/O error を返してきたら、その error が
+    /// そのまま伝播する (= panic しない)。
+    #[test]
+    fn generate_lock_token_propagates_read_error() {
+        struct FailingReader;
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "simulated EACCES",
+                ))
+            }
+        }
+        let err = generate_lock_token_from(FailingReader).expect_err("must propagate error");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
 }

@@ -80,6 +80,10 @@ pub enum ErrorCode {
     /// daemon は当該 client を disconnect する (= 子に届かなかった bytes は
     /// drop)。R5-C3 で導入。
     MasterWriteTimeout,
+    /// `internal.error` — daemon 側の予期しない内部 error (= 通常は OS resource
+    /// 不足等)。client が retry すれば成功する余地がある回復可能 error として
+    /// 通知し、daemon 自身は panic せず session を継続する。R5-H11 で導入。
+    InternalError,
     /// 未知の error code。wire 上の dotted text を保持する。
     ///
     /// 前方互換のため、新しい daemon / client が将来追加した code を
@@ -108,6 +112,7 @@ impl ErrorCode {
             ErrorCode::WaitInvalidPattern => "wait.invalid-pattern",
             ErrorCode::DetachTargetPartial => "detach.target-partial",
             ErrorCode::MasterWriteTimeout => "master.write-timeout",
+            ErrorCode::InternalError => "internal.error",
             ErrorCode::Unknown(s) => s.as_str(),
         }
     }
@@ -132,6 +137,7 @@ impl ErrorCode {
             "wait.invalid-pattern" => ErrorCode::WaitInvalidPattern,
             "detach.target-partial" => ErrorCode::DetachTargetPartial,
             "master.write-timeout" => ErrorCode::MasterWriteTimeout,
+            "internal.error" => ErrorCode::InternalError,
             other => ErrorCode::Unknown(other.to_string()),
         }
     }
@@ -201,6 +207,7 @@ mod tests {
             (ErrorCode::WaitInvalidPattern, "wait.invalid-pattern"),
             (ErrorCode::DetachTargetPartial, "detach.target-partial"),
             (ErrorCode::MasterWriteTimeout, "master.write-timeout"),
+            (ErrorCode::InternalError, "internal.error"),
         ];
 
         for (variant, wire) in known {
