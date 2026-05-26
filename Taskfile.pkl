@@ -175,14 +175,21 @@ local push: Task = (kawaz.vcs.push) {
 
 // ---------- main entries (利用者が直接叩く、宣言順 = 利用頻度の高い順) ----------
 
-local default: Task = new {
-  name = "default"
-  description = "default is run (build then exec)"
+local run: Task = new {
+  name = "run"
+  description = "build then exec hyoui"
   cache = false
   deps { build }
   acceptsArgs = true
   quiet = true
   cmd = #"./target/release/hyoui "$@""#
+}
+
+// default は run のエイリアス (pkl オブジェクト合成で全フィールド継承、name/description のみ override)。
+// pkf run / pkf run -- / pkf run run / pkf run run -- すべて等価。
+local default: Task = (run) {
+  name = "default"
+  description = "alias of run"
 }
 
 local list: Task = new {
@@ -197,6 +204,7 @@ local list: Task = new {
 
 tasks {
   default
+  run
   list
   test
   push
