@@ -356,9 +356,10 @@ Wild debugger / Competitive 分析 / Rust API 設計
 - [ ] **R5-M20** `XDG_RUNTIME_DIR` の mode 0700 + 所有者検証無し、stale dir で TMPDIR fallback が silent
   - 出典: POSIX (R5-POSIX-M1) / 該当: `hyoui-cli/src/socket_path.rs:73-89`
   - 提案: `pick_socket_dir` 内で mode 0700 + 所有者検証、NG なら fatal error
-- [ ] **R5-M21** suspend 中の CLOCK_MONOTONIC 挙動 (Linux/macOS: 止まる、FreeBSD: 進む) が docs と実装で曖昧
+- [done] **R5-M21** suspend 中の CLOCK_MONOTONIC 挙動 (Linux/macOS: 止まる、FreeBSD: 進む) が docs と実装で曖昧
   - 出典: POSIX (R5-POSIX-M4) / 該当: `sys/clock.rs:10-13`
   - 提案: docs/DESIGN-ja に「wait の timeout は OS の CLOCK_MONOTONIC 挙動に準拠 (suspend 取扱は OS 依存)」明記
+  - 解消: `sys/clock.rs::clock_monotonic` の rustdoc に「Suspend behavior (OS-dependent)」節を追加 (Linux/macOS は止まる、FreeBSD は進む、`wait` timeout への影響を明示)。DESIGN §5 Portability から相互参照。元の説明 (macOS が suspend-inclusive 等) は誤りだったので訂正。
 - [ ] **R5-M22** shell completion 未実装 (kawaz/* CLI 慣習との乖離)
   - 出典: POSIX (R5-POSIX-M6) / 該当: completions/ や `*.plugin.zsh` 不在
   - 提案: `hyoui completion {bash,zsh,fish,elvish,nushell}` を 1 個追加。ROADMAP v0.2.0 と同期
