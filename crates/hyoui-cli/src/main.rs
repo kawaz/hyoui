@@ -16,10 +16,16 @@ use std::io::Write;
 use std::os::fd::AsFd;
 use std::process::ExitCode;
 
-use hyoui::cli::{AttachConfig, Command, HelpTopic, KillConfig, parse_args, usage};
+use hyoui::cli::{
+    AttachConfig, Command, HelpTopic, KillConfig, StatusConfig, TailConfig, WaitCliPredicate,
+    WaitConfig, parse_args, usage,
+};
 use hyoui::client::{AttachOptions, ClientConnection};
 use hyoui::daemon::{DaemonConfig, Session};
-use hyoui::protocol::Mode;
+use hyoui::protocol::messages::{
+    StatusQuery, TailRequest, WaitMatchOptions, WaitOutcome, WaitPredicate, WaitRequest,
+};
+use hyoui::protocol::{ControlMessage, Mode};
 use hyoui::sys::{enter_raw, is_tty};
 
 mod completion;
@@ -67,6 +73,12 @@ fn main() -> ExitCode {
         Command::List => list_command(),
 
         Command::Kill(cfg) => kill_command(cfg),
+
+        Command::Status(cfg) => status_command(cfg),
+
+        Command::Tail(cfg) => tail_command(cfg),
+
+        Command::Wait(cfg) => wait_command(cfg),
 
         Command::Completion { shell } => {
             print!("{}", completion::script(shell));
@@ -400,4 +412,226 @@ fn kill_command(cfg: KillConfig) -> ExitCode {
 
     println!("hyoui: kill 送信完了: {}", sock.display());
     ExitCode::SUCCESS
+}
+
+/// session_id / socket オプションから target socket path を resolve するヘルパ。
+fn resolve_target_socket(
+    cmd: &str,
+    socket: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<std::path::PathBuf, ExitCode> {
+    if let Some(p) = socket {
+        return Ok(std::path::PathBuf::from(p));
+    }
+    let sid = match session_id {
+        Some(s) => s,
+        None => {
+            eprintln!("hyoui: {cmd}: session id or --socket required");
+            return Err(ExitCode::from(2));
+        }
+    };
+    socket_path::resolve(None, sid).map_err(|e| {
+        eprintln!("hyoui: {cmd}: socket path 解決失敗: {e}");
+        ExitCode::from(1)
+    })
+}
+
+/// `status` subcommand: connect → handshake → status.query → print response。
+fn status_command(cfg: StatusConfig) -> ExitCode {
+    let sock =
+        match resolve_target_socket("status", cfg.socket.as_deref(), cfg.session_id.as_deref()) {
+            Ok(p) => p,
+            Err(code) => return code,
+        };
+    let opts = AttachOptions {
+        mode: Mode::Ro,
+        ..AttachOptions::default()
+    };
+    let mut conn = match ClientConnection::connect(&sock, opts) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hyoui: status: connect 失敗: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(e) = conn.send_control(&ControlMessage::StatusQuery(StatusQuery {})) {
+        eprintln!("hyoui: status: send 失敗: {e}");
+        return ExitCode::from(1);
+    }
+    loop {
+        let msg = match conn.recv_control(None) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("hyoui: status: recv 失敗: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        match msg {
+            ControlMessage::StatusResponse(sr) => {
+                print_status_response(&sr);
+                return ExitCode::SUCCESS;
+            }
+            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+            other => {
+                eprintln!("hyoui: status: unexpected response: {other:?}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+}
+
+fn print_status_response(sr: &hyoui::protocol::messages::StatusResponse) {
+    println!("session-id: {}", sr.session_id);
+    if let Some(pid) = sr.child_pid {
+        println!("child-pid: {pid}");
+    } else {
+        println!("child-pid: (exited)");
+    }
+    println!("scrollback-bytes: {}", sr.scrollback_bytes);
+    if let Some(holder) = sr.lock_holder {
+        println!("lock-holder: client {holder}");
+    } else {
+        println!("lock-holder: (none)");
+    }
+    println!("clients:");
+    for c in &sr.clients {
+        let leader = if c.leader { " leader" } else { "" };
+        println!("  - id={} mode={:?}{leader}", c.client_id, c.mode);
+    }
+}
+
+/// `tail` subcommand: connect → handshake (ro) → tail.request → stdout に書き出す。
+fn tail_command(cfg: TailConfig) -> ExitCode {
+    let sock = match resolve_target_socket("tail", cfg.socket.as_deref(), cfg.session_id.as_deref())
+    {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let opts = AttachOptions {
+        mode: Mode::Ro,
+        ..AttachOptions::default()
+    };
+    let mut conn = match ClientConnection::connect(&sock, opts) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hyoui: tail: connect 失敗: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let req = TailRequest {
+        since_ms: cfg.since_ms,
+        since_strict: false,
+        follow: cfg.follow,
+        strip_ansi: cfg.strip_ansi,
+        last_bytes: cfg.last_bytes,
+    };
+    if let Err(e) = conn.send_control(&ControlMessage::TailRequest(req)) {
+        eprintln!("hyoui: tail: send 失敗: {e}");
+        return ExitCode::from(1);
+    }
+    let mut stdout = std::io::stdout().lock();
+    loop {
+        let frame = match conn.recv_frame() {
+            Ok(f) => f,
+            Err(_) => return ExitCode::SUCCESS, // EOF → socket close → 正常終了
+        };
+        match frame.ty {
+            hyoui::protocol::TYPE_RAW_DATA => {
+                // tail subscription 切替前の lingering raw_data。bytes は同じ
+                // 内容なので stdout にそのまま流す。
+                let _ = stdout.write_all(&frame.body);
+                let _ = stdout.flush();
+            }
+            hyoui::protocol::TYPE_CBOR_CONTROL => {
+                let msg = match ControlMessage::decode_from(frame.body.as_slice()) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                match msg {
+                    ControlMessage::TailData(td) => {
+                        let _ = stdout.write_all(&td.bytes);
+                        let _ = stdout.flush();
+                    }
+                    ControlMessage::TailEnd(_) => return ExitCode::SUCCESS,
+                    ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+                    _ => continue,
+                }
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// `wait` subcommand: connect → handshake (ro) → wait.request → outcome に応じた exit。
+///
+/// exit code:
+/// - 0: Matched
+/// - 1: Timeout
+/// - 2: Cancelled (= client detach 等)
+/// - 130: ChildExited (= 子 PTY が exit、shell convention)
+fn wait_command(cfg: WaitConfig) -> ExitCode {
+    let sock = match resolve_target_socket("wait", cfg.socket.as_deref(), cfg.session_id.as_deref())
+    {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let opts = AttachOptions {
+        mode: Mode::Ro,
+        ..AttachOptions::default()
+    };
+    let mut conn = match ClientConnection::connect(&sock, opts) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hyoui: wait: connect 失敗: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let predicate = match cfg.predicate {
+        WaitCliPredicate::Text(s) => WaitPredicate::Text { value: s },
+        WaitCliPredicate::Pattern(r) => WaitPredicate::Pattern { regex: r },
+        WaitCliPredicate::Idle(ms) => WaitPredicate::Idle { ms },
+    };
+    let req = WaitRequest {
+        predicate,
+        timeout_ms: cfg.timeout_ms,
+        options: WaitMatchOptions {
+            strip_escapes: cfg.strip_escapes,
+            newline_convert_lf: cfg.newline_convert_lf,
+        },
+    };
+    if let Err(e) = conn.send_control(&ControlMessage::WaitRequest(req)) {
+        eprintln!("hyoui: wait: send 失敗: {e}");
+        return ExitCode::from(1);
+    }
+    loop {
+        let msg = match conn.recv_control(None) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("hyoui: wait: recv 失敗: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        match msg {
+            ControlMessage::WaitResult(wr) => {
+                return match wr.outcome {
+                    WaitOutcome::Matched => ExitCode::SUCCESS,
+                    WaitOutcome::Timeout => ExitCode::from(1),
+                    WaitOutcome::Cancelled => ExitCode::from(2),
+                    WaitOutcome::ChildExited => ExitCode::from(130),
+                };
+            }
+            ControlMessage::Error(e) => {
+                eprintln!(
+                    "hyoui: wait: daemon error: code={} message={}",
+                    e.code, e.message
+                );
+                return ExitCode::from(1);
+            }
+            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+            other => {
+                eprintln!("hyoui: wait: unexpected response: {other:?}");
+                return ExitCode::from(1);
+            }
+        }
+    }
 }

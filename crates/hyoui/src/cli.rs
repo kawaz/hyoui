@@ -145,6 +145,61 @@ pub struct KillConfig {
     pub signum: Option<u8>,
 }
 
+/// `status` subcommand configuration (Phase 11)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusConfig {
+    /// Target socket path (explicit) または session_id から resolve。
+    pub socket: Option<String>,
+    /// Target session id。
+    pub session_id: Option<String>,
+}
+
+/// `tail` subcommand configuration (Phase 11)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailConfig {
+    /// Target socket path (explicit) または session_id から resolve。
+    pub socket: Option<String>,
+    /// Target session id。
+    pub session_id: Option<String>,
+    /// `--follow` で daemon が live stream を継続送信。
+    pub follow: bool,
+    /// `--strip-ansi` で daemon 側で escape を strip 済の TailData を流す。
+    pub strip_ansi: bool,
+    /// `--since=<ms>` (= 過去 ms 以内の chunk を bundle)、`None` なら全体。
+    pub since_ms: Option<u64>,
+    /// `--last-bytes=<n>` (= 末尾 n bytes に絞る)、`None` なら制限なし。
+    pub last_bytes: Option<u64>,
+}
+
+/// `wait` subcommand の predicate (Phase 11)。CLI 表記から daemon protocol の
+/// `WaitPredicate` に対応する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitCliPredicate {
+    /// `text:<str>` (= 部分文字列マッチ)。
+    Text(String),
+    /// `pattern:<regex>`。
+    Pattern(String),
+    /// `wait-idle:<ms>` or `wait:<ms>` (= 静寂 ms)。
+    Idle(u64),
+}
+
+/// `wait` subcommand configuration (Phase 11)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitConfig {
+    /// Target socket path (explicit) または session_id から resolve。
+    pub socket: Option<String>,
+    /// Target session id。
+    pub session_id: Option<String>,
+    /// 待ち条件 (= `text:` / `pattern:` / `wait[-idle]:`)。
+    pub predicate: WaitCliPredicate,
+    /// `--timeout=<ms>` (絶対 timeout)、`None` なら無限。
+    pub timeout_ms: Option<u64>,
+    /// `--no-strip-escapes` で options.strip_escapes = false (default true)。
+    pub strip_escapes: bool,
+    /// `--newline-convert-lf` で CRLF → LF 正規化。
+    pub newline_convert_lf: bool,
+}
+
 /// Result of parsing argv (excluding argv[0]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -163,6 +218,12 @@ pub enum Command {
     List,
     /// Kill (= SIGTERM 等を子に送る) a daemon session by session id / socket。
     Kill(KillConfig),
+    /// Print session status (clients/leader/lock/scrollback) and exit。
+    Status(StatusConfig),
+    /// Tail scrollback (optional --follow for live stream)。
+    Tail(TailConfig),
+    /// Wait until predicate (text/pattern/idle) matches, then exit。
+    Wait(WaitConfig),
     /// Print a completion script for the given shell.
     Completion {
         /// Target shell.
@@ -204,9 +265,12 @@ pub fn parse_args(args: &[String]) -> Command {
         "attach" => parse_attach(rest),
         "list" => parse_list(rest),
         "kill" => parse_kill(rest),
+        "status" => parse_status(rest),
+        "tail" => parse_tail(rest),
+        "wait" => parse_wait(rest),
         "completion" => parse_completion(rest),
         // Reserved for future stages.
-        "send" | "status" | "detach" => Command::Error(format!(
+        "send" | "detach" => Command::Error(format!(
             "subcommand `{head}` is reserved but not yet implemented"
         )),
         other => Command::Help {
@@ -292,6 +356,279 @@ fn parse_kill(args: &[String]) -> Command {
         _ => return Command::Error("kill: too many positional arguments".into()),
     }
     Command::Kill(cfg)
+}
+
+/// shared helper: --socket / --help / positional session_id を抜き出す。
+/// 残ったオプションは caller がコールバックで処理する。
+#[allow(clippy::result_large_err)] // Command 内 String/Vec の Err サイズは parse path のみで許容
+fn parse_session_targeted<F>(
+    name: &str,
+    args: &[String],
+    mut on_option: F,
+) -> Result<(Option<String>, Option<String>), Command>
+where
+    F: FnMut(&str, Option<String>) -> Result<bool, Command>,
+{
+    let mut socket: Option<String> = None;
+    let mut positionals: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (opt_name, inline_value) = split_eq(arg);
+        let mut consumed_extra = false;
+        let value: Option<String> = match inline_value {
+            Some(v) => Some(v),
+            None => {
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    consumed_extra = true;
+                    Some(args[i + 1].clone())
+                } else {
+                    None
+                }
+            }
+        };
+        match opt_name.as_str() {
+            "--help" | "-h" => {
+                return Err(Command::Help {
+                    topic: HelpTopic::Top,
+                });
+            }
+            "--socket" => match value {
+                Some(v) => socket = Some(v),
+                None => return Err(Command::Error(format!("{name}: --socket requires a value"))),
+            },
+            other if other.starts_with("--") => {
+                let cb_consumed = on_option(other, value)?;
+                if !cb_consumed {
+                    consumed_extra = false;
+                }
+            }
+            other if other.starts_with('-') => {
+                return Err(Command::Error(format!("{name}: unknown option: {other}")));
+            }
+            _ => {
+                consumed_extra = false;
+                positionals.push(args[i].clone());
+            }
+        }
+        i += 1;
+        if consumed_extra {
+            i += 1;
+        }
+    }
+    let session_id = match positionals.len() {
+        0 => {
+            if socket.is_none() {
+                return Err(Command::Error(format!(
+                    "{name}: session id (positional) or --socket required"
+                )));
+            }
+            None
+        }
+        1 => Some(positionals.into_iter().next().unwrap()),
+        _ => {
+            return Err(Command::Error(format!(
+                "{name}: too many positional arguments"
+            )));
+        }
+    };
+    Ok((socket, session_id))
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_status(args: &[String]) -> Command {
+    let res = parse_session_targeted("status", args, |opt, _value| {
+        Err(Command::Error(format!("status: unknown option: {opt}")))
+    });
+    match res {
+        Ok((socket, session_id)) => Command::Status(StatusConfig { socket, session_id }),
+        Err(c) => c,
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_tail(args: &[String]) -> Command {
+    let mut follow = false;
+    let mut strip_ansi = false;
+    let mut since_ms: Option<u64> = None;
+    let mut last_bytes: Option<u64> = None;
+    let res = parse_session_targeted("tail", args, |opt, value| match opt {
+        "--follow" => {
+            follow = true;
+            Ok(false)
+        }
+        "--strip-ansi" => {
+            strip_ansi = true;
+            Ok(false)
+        }
+        "--since" => {
+            let v = value.ok_or_else(|| Command::Error("tail: --since requires a value".into()))?;
+            let ms =
+                parse_duration_ms(&v).map_err(|e| Command::Error(format!("tail: --since: {e}")))?;
+            since_ms = Some(ms);
+            Ok(true)
+        }
+        "--last-bytes" => {
+            let v = value
+                .ok_or_else(|| Command::Error("tail: --last-bytes requires a value".into()))?;
+            let n = v
+                .parse::<u64>()
+                .map_err(|_| Command::Error(format!("tail: --last-bytes: bad number: {v}")))?;
+            last_bytes = Some(n);
+            Ok(true)
+        }
+        other => Err(Command::Error(format!("tail: unknown option: {other}"))),
+    });
+    match res {
+        Ok((socket, session_id)) => Command::Tail(TailConfig {
+            socket,
+            session_id,
+            follow,
+            strip_ansi,
+            since_ms,
+            last_bytes,
+        }),
+        Err(c) => c,
+    }
+}
+
+fn parse_wait(args: &[String]) -> Command {
+    let mut predicate: Option<WaitCliPredicate> = None;
+    let mut timeout_ms: Option<u64> = None;
+    let mut strip_escapes = true;
+    let mut newline_convert_lf = false;
+    let mut socket: Option<String> = None;
+    let mut positionals: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (opt_name, inline_value) = split_eq(arg);
+        let mut consumed_extra = false;
+        let value: Option<String> = match inline_value {
+            Some(v) => Some(v),
+            None => {
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    consumed_extra = true;
+                    Some(args[i + 1].clone())
+                } else {
+                    None
+                }
+            }
+        };
+        match opt_name.as_str() {
+            "--help" | "-h" => {
+                return Command::Help {
+                    topic: HelpTopic::Top,
+                };
+            }
+            "--socket" => match value {
+                Some(v) => socket = Some(v),
+                None => return Command::Error("wait: --socket requires a value".into()),
+            },
+            "--timeout" => match value {
+                Some(v) => match parse_duration_ms(&v) {
+                    Ok(ms) => timeout_ms = Some(ms),
+                    Err(e) => return Command::Error(format!("wait: --timeout: {e}")),
+                },
+                None => return Command::Error("wait: --timeout requires a value".into()),
+            },
+            "--no-strip-escapes" => {
+                strip_escapes = false;
+                consumed_extra = false;
+            }
+            "--newline-convert-lf" => {
+                newline_convert_lf = true;
+                consumed_extra = false;
+            }
+            other if other.starts_with('-') => {
+                return Command::Error(format!("wait: unknown option: {other}"));
+            }
+            _ => {
+                consumed_extra = false;
+                positionals.push(args[i].clone());
+            }
+        }
+        i += 1;
+        if consumed_extra {
+            i += 1;
+        }
+    }
+    // positionals: 1 つは session_id、もう 1 つ (or 1 つだけ) が predicate。
+    // 順序は session_id → predicate / predicate (--socket 使うとき) のいずれか。
+    // predicate は "text:" / "pattern:" / "wait:" / "wait-idle:" prefix で識別。
+    let mut session_id: Option<String> = None;
+    for p in positionals {
+        if let Some(pred) = parse_wait_predicate(&p) {
+            if predicate.is_some() {
+                return Command::Error("wait: predicate specified more than once".into());
+            }
+            predicate = Some(pred);
+        } else {
+            if session_id.is_some() {
+                return Command::Error(format!("wait: unexpected argument: {p}"));
+            }
+            session_id = Some(p);
+        }
+    }
+    let predicate = match predicate {
+        Some(p) => p,
+        None => {
+            return Command::Error(
+                "wait: predicate (text:.. / pattern:.. / wait[-idle]:..) required".into(),
+            );
+        }
+    };
+    if session_id.is_none() && socket.is_none() {
+        return Command::Error("wait: session id (positional) or --socket required".into());
+    }
+    Command::Wait(WaitConfig {
+        socket,
+        session_id,
+        predicate,
+        timeout_ms,
+        strip_escapes,
+        newline_convert_lf,
+    })
+}
+
+/// `text:<str>` / `pattern:<regex>` / `wait:<dur>` / `wait-idle:<dur>` の
+/// CLI prefix を [`WaitCliPredicate`] に変換。該当 prefix が無ければ `None`。
+fn parse_wait_predicate(s: &str) -> Option<WaitCliPredicate> {
+    if let Some(rest) = s.strip_prefix("text:") {
+        Some(WaitCliPredicate::Text(rest.to_string()))
+    } else if let Some(rest) = s.strip_prefix("pattern:") {
+        Some(WaitCliPredicate::Pattern(rest.to_string()))
+    } else if let Some(rest) = s.strip_prefix("wait-idle:") {
+        parse_duration_ms(rest).ok().map(WaitCliPredicate::Idle)
+    } else if let Some(rest) = s.strip_prefix("wait:") {
+        parse_duration_ms(rest).ok().map(WaitCliPredicate::Idle)
+    } else {
+        None
+    }
+}
+
+/// `500`, `500ms`, `2s`, `1m` を ms に変換。bare 数値は ms 扱い (DR-0006 §5)。
+fn parse_duration_ms(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty duration".into());
+    }
+    if let Some(num) = s.strip_suffix("ms") {
+        num.parse::<u64>()
+            .map_err(|_| format!("bad ms value: {num}"))
+    } else if let Some(num) = s.strip_suffix('s') {
+        let n = num
+            .parse::<u64>()
+            .map_err(|_| format!("bad s value: {num}"))?;
+        Ok(n.saturating_mul(1_000))
+    } else if let Some(num) = s.strip_suffix('m') {
+        let n = num
+            .parse::<u64>()
+            .map_err(|_| format!("bad m value: {num}"))?;
+        Ok(n.saturating_mul(60_000))
+    } else {
+        s.parse::<u64>().map_err(|_| format!("bad duration: {s}"))
+    }
 }
 
 fn parse_attach(args: &[String]) -> Command {
@@ -1132,13 +1469,84 @@ mod tests {
 
     #[test]
     fn reserved_subcommands_return_error() {
-        // attach / list / kill は実装済 (= 別 test)。`send` / `status` / `detach`
-        // はまだ reserved。
-        for name in ["send", "status", "detach"] {
+        // attach / list / kill / status / tail / wait は実装済 (= 別 test)。
+        // `send` / `detach` はまだ reserved。
+        for name in ["send", "detach"] {
             match parse_args(&args(&[name])) {
                 Command::Error(msg) => assert!(msg.contains(name), "msg = {msg}"),
                 other => panic!("expected Error for `{name}`, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn parse_status_with_session_id() {
+        match parse_args(&args(&["status", "demo"])) {
+            Command::Status(cfg) => {
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert!(cfg.socket.is_none());
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_status_requires_session_or_socket() {
+        match parse_args(&args(&["status"])) {
+            Command::Error(msg) => assert!(msg.contains("session id") || msg.contains("socket")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_tail_with_follow_and_since() {
+        match parse_args(&args(&["tail", "demo", "--follow", "--since=1s"])) {
+            Command::Tail(cfg) => {
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert!(cfg.follow);
+                assert_eq!(cfg.since_ms, Some(1_000));
+            }
+            other => panic!("expected Tail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_wait_text_predicate() {
+        match parse_args(&args(&["wait", "demo", "text:READY", "--timeout=5s"])) {
+            Command::Wait(cfg) => {
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.predicate, WaitCliPredicate::Text("READY".into()));
+                assert_eq!(cfg.timeout_ms, Some(5_000));
+            }
+            other => panic!("expected Wait, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_wait_idle_predicate() {
+        match parse_args(&args(&["wait", "demo", "wait-idle:500ms"])) {
+            Command::Wait(cfg) => {
+                assert_eq!(cfg.predicate, WaitCliPredicate::Idle(500));
+            }
+            other => panic!("expected Wait, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_wait_pattern_predicate() {
+        match parse_args(&args(&["wait", "demo", "pattern:ITEM-\\d+"])) {
+            Command::Wait(cfg) => {
+                assert_eq!(cfg.predicate, WaitCliPredicate::Pattern("ITEM-\\d+".into()));
+            }
+            other => panic!("expected Wait, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_wait_missing_predicate_errors() {
+        match parse_args(&args(&["wait", "demo"])) {
+            Command::Error(msg) => assert!(msg.contains("predicate")),
+            other => panic!("expected Error, got {other:?}"),
         }
     }
 

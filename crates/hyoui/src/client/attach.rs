@@ -199,6 +199,51 @@ impl ClientConnection {
         }
     }
 
+    /// daemon → client への次の frame を 1 つ受信して返す。
+    ///
+    /// 主に `status` / `tail` / `wait` のような 1-shot CLI で使う。`run` を
+    /// 呼ぶ前提の attach は内部 poll loop で frame を消費するので本 method は
+    /// 不要。
+    ///
+    /// # Errors
+    ///
+    /// frame decode 失敗 (= protocol violation or socket EOF) は [`Error::Invalid`]。
+    pub fn recv_frame(&mut self) -> Result<Frame, Error> {
+        Frame::decode_from(&mut self.reader).map_err(|e| match e {
+            FrameError::Io(io) => Error::Io(io),
+            FrameError::Protocol(_) => Error::Invalid("frame decode failed"),
+        })
+    }
+
+    /// daemon → client への次の **CBOR control** message を受信。raw_data frame
+    /// は skip して次の CBOR frame を待つ (= attach 切替前の旧 raw_data を捨てる
+    /// 用途で便利)。`buffer_raw_data` が Some なら skip した raw_data の body を
+    /// そこに append (= tail follow で過渡的に raw_data を取りこぼさない)。
+    ///
+    /// # Errors
+    ///
+    /// frame decode 失敗 (= protocol violation or socket EOF) は [`Error::Invalid`]。
+    /// CBOR control body の decode 失敗も同上。
+    pub fn recv_control(
+        &mut self,
+        mut buffer_raw_data: Option<&mut Vec<u8>>,
+    ) -> Result<ControlMessage, Error> {
+        loop {
+            let frame = self.recv_frame()?;
+            if frame.ty == TYPE_CBOR_CONTROL {
+                return ControlMessage::decode_from(frame.body.as_slice())
+                    .map_err(|_| Error::Invalid("control message decode failed"));
+            }
+            if frame.ty == TYPE_RAW_DATA {
+                if let Some(buf) = buffer_raw_data.as_mut() {
+                    buf.extend_from_slice(&frame.body);
+                }
+                continue;
+            }
+            return Err(Error::Invalid("unexpected frame type"));
+        }
+    }
+
     /// 任意の `ControlMessage` を daemon に送る (= Resize / Signal / Kill / Detach 等)。
     ///
     /// `run` の外から (= signal handler や別 thread から) 呼ぶ用途。MVP では同期
