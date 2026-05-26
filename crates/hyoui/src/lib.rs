@@ -29,6 +29,15 @@ pub mod protocol;
 // `sys`, `observer`, `protocol`, and `cli` modules above.
 pub mod agent;
 
+// v0.1.0 modules (PoC 07/08 から正規実装に取り込み):
+//
+//   * `scrollback` — daemon が子 pty 出力を timestamped chunks の ring buffer に蓄積
+//                    (DR-0006 §11.6, finding 2026-05-26-scrollback-ring-buffer.md)
+//   * `strip`      — ANSI escape (CSI/OSC/DCS/single char) を strip して raw text を返す
+//                    (DR-0006 §11 装飾除去 default, finding 2026-05-26-ansi-strip.md)
+pub mod scrollback;
+pub mod strip;
+
 /// Library version (matches `Cargo.toml`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
