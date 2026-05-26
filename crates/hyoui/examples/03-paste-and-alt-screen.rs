@@ -13,7 +13,7 @@
 //!   cargo run --example 03-paste-and-alt-screen -- claude 5000      # 手動: claude 観測 (timeout 5s)
 
 use hyoui::sys::Pty;
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
@@ -59,7 +59,10 @@ fn main() {
         }
         thread::sleep(Duration::from_millis(10));
     }
-    eprintln!("  read counts: data={}, EOF={zero_read_count}, EAGAIN/errs={neg_read_count}", chunk_log.len());
+    eprintln!(
+        "  read counts: data={}, EOF={zero_read_count}, EAGAIN/errs={neg_read_count}",
+        chunk_log.len()
+    );
     let elapsed = start.elapsed();
     let total = buf.len();
 
@@ -71,7 +74,10 @@ fn main() {
 
     eprintln!("=== observed {total} bytes in {elapsed:?} ===");
     if elapsed.as_secs_f64() > 0.0 {
-        eprintln!("  byte rate: {:.1} B/s", total as f64 / elapsed.as_secs_f64());
+        eprintln!(
+            "  byte rate: {:.1} B/s",
+            total as f64 / elapsed.as_secs_f64()
+        );
     }
     eprintln!("  chunks: {}", chunk_log.len());
     if !chunk_log.is_empty() {
@@ -108,12 +114,16 @@ fn main() {
 
     // escape sequence の一覧 (簡易 parser)
     let escapes = extract_escapes(&buf);
-    eprintln!("=== escape sequences ({} total, unique {}) ===", escapes.len(), {
-        let mut s: Vec<&String> = escapes.iter().collect();
-        s.sort();
-        s.dedup();
-        s.len()
-    });
+    eprintln!(
+        "=== escape sequences ({} total, unique {}) ===",
+        escapes.len(),
+        {
+            let mut s: Vec<&String> = escapes.iter().collect();
+            s.sort();
+            s.dedup();
+            s.len()
+        }
+    );
     let mut unique: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for s in &escapes {
         *unique.entry(s.clone()).or_default() += 1;

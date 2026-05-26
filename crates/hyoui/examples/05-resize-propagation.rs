@@ -12,7 +12,7 @@
 //!   cargo run --example 05-resize-propagation -- daemon [sock_path]
 
 use hyoui::sys::{Pty, UnixSock};
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::poll::{PollFd, PollFlags, PollTimeout};
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
@@ -24,7 +24,9 @@ use std::time::{Duration, Instant};
 const DEFAULT_SOCK: &str = "/tmp/hyoui-poc-05.sock";
 
 fn main() {
-    let role = std::env::args().nth(1).unwrap_or_else(|| "test".to_string());
+    let role = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "test".to_string());
     let path = std::env::args()
         .nth(2)
         .unwrap_or_else(|| DEFAULT_SOCK.to_string());
@@ -112,11 +114,7 @@ fn daemon_role(sock_path: &str) {
             } else if buf[0] == 0x02 && n > 1 {
                 // SAFETY: master_raw is owned by spawned.pty
                 unsafe {
-                    libc::write(
-                        master_raw,
-                        buf.as_ptr().add(1) as *const _,
-                        n - 1,
-                    );
+                    libc::write(master_raw, buf.as_ptr().add(1) as *const _, n - 1);
                 }
             }
         }

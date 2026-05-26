@@ -83,7 +83,8 @@ fn analyze(path: &Path) {
     let stripped = strip_ansi(&raw);
     eprintln!("=== {} ===", path.display());
     eprintln!("  raw size:      {}", raw.len());
-    eprintln!("  stripped size: {} ({:.1}% retained)",
+    eprintln!(
+        "  stripped size: {} ({:.1}% retained)",
         stripped.len(),
         100.0 * stripped.len() as f64 / raw.len().max(1) as f64
     );
@@ -91,18 +92,32 @@ fn analyze(path: &Path) {
     let esc_remain = stripped.iter().filter(|&&b| b == 0x1b).count();
     eprintln!("  ESC remaining in stripped: {esc_remain}");
     // 非印字文字の頻度
-    let visible = stripped.iter().filter(|&&b| (0x20..0x7f).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t').count();
-    eprintln!("  visible/text chars: {visible} ({:.1}%)",
+    let visible = stripped
+        .iter()
+        .filter(|&&b| (0x20..0x7f).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t')
+        .count();
+    eprintln!(
+        "  visible/text chars: {visible} ({:.1}%)",
         100.0 * visible as f64 / stripped.len().max(1) as f64
     );
     // 先頭 200 bytes プレビュー
-    let preview: String = stripped.iter().take(300).map(|&b| {
-        if b == b'\n' { '⏎' }
-        else if b == b'\r' { '↩' }
-        else if b == b'\t' { '⇥' }
-        else if (0x20..0x7f).contains(&b) { b as char }
-        else { '·' }
-    }).collect();
+    let preview: String = stripped
+        .iter()
+        .take(300)
+        .map(|&b| {
+            if b == b'\n' {
+                '⏎'
+            } else if b == b'\r' {
+                '↩'
+            } else if b == b'\t' {
+                '⇥'
+            } else if (0x20..0x7f).contains(&b) {
+                b as char
+            } else {
+                '·'
+            }
+        })
+        .collect();
     eprintln!("  preview (first 300 bytes): {preview}");
     eprintln!();
 }
@@ -139,8 +154,16 @@ fn main() {
         (b"\x1b]0;title\x1b\\ok", b"ok", "OSC title (ST terminated)"),
         (b"\x1bP1$rdcs\x1b\\post", b"post", "DCS"),
         (b"\x1b=ok", b"ok", "single char (keypad app mode)"),
-        (b"\x1b[?2004hpaste\x1b[?2004l", b"paste", "bracketed paste enable/disable"),
-        (b"\x1b[?1049hAlt\x1b[?1049l", b"Alt", "alternate screen enable/disable"),
+        (
+            b"\x1b[?2004hpaste\x1b[?2004l",
+            b"paste",
+            "bracketed paste enable/disable",
+        ),
+        (
+            b"\x1b[?1049hAlt\x1b[?1049l",
+            b"Alt",
+            "alternate screen enable/disable",
+        ),
         (b"\x1b[12;34Hcursor", b"cursor", "cursor positioning"),
         (b"\x1b[1;31;47mfancy\x1b[0m", b"fancy", "multi-param SGR"),
     ];

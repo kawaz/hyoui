@@ -11,8 +11,8 @@
 //!   cat /tmp/hyoui-poc-01-daemon.log     # daemon の動作ログ確認
 //!   ps -p <daemon_pid> -o pid,ppid,stat,command  # 生存と PPID 確認
 
-use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::{fork, getppid, setsid, ForkResult};
+use nix::sys::wait::{WaitStatus, waitpid};
+use nix::unistd::{ForkResult, fork, getppid, setsid};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::thread;

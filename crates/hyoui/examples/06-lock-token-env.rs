@@ -43,15 +43,18 @@ fn main() {
         .expect("spawn child 2");
     let s2 = String::from_utf8_lossy(&out2.stdout);
     eprintln!("[parent] child 2 stdout: {s2:?}");
-    let case2 = s2.contains(&format!("child={token}"))
-        && s2.contains(&format!("grandchild={token}"));
+    let case2 =
+        s2.contains(&format!("child={token}")) && s2.contains(&format!("grandchild={token}"));
 
     // Case 3: env を明示しない子は env を持たない (= env クリア相当)
     let out3 = Command::new("sh")
         .args(["-c", r#"echo "no_env=${HYOUI_LOCK_TOKEN:-EMPTY}""#])
         .env_clear()
         // sh が動くために最低限の env (PATH/HOME など)
-        .env("PATH", std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()))
+        .env(
+            "PATH",
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+        )
         .output()
         .expect("spawn child 3");
     let s3 = String::from_utf8_lossy(&out3.stdout).trim().to_string();

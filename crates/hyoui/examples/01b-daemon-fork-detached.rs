@@ -4,7 +4,7 @@
 //! parent shell の pipe が即解放されるか確認 (= cargo run | tail が 30 秒待たない)
 
 use nix::sys::wait::waitpid;
-use nix::unistd::{fork, getppid, setsid, ForkResult};
+use nix::unistd::{ForkResult, fork, getppid, setsid};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::fd::AsRawFd;

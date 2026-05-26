@@ -12,7 +12,7 @@
 //!   # daemon 単独起動 (手動で client 接続するとき)
 
 use hyoui::sys::{Pty, UnixSock};
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::poll::{PollFd, PollFlags, PollTimeout};
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -26,7 +26,10 @@ const DEFAULT_SOCK: &str = "/tmp/hyoui-poc-02.sock";
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let role = args.get(1).cloned().unwrap_or_else(|| "test".to_string());
-    let path = args.get(2).cloned().unwrap_or_else(|| DEFAULT_SOCK.to_string());
+    let path = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_SOCK.to_string());
 
     match role.as_str() {
         "daemon" => daemon_role(&path),
@@ -50,7 +53,10 @@ fn daemon_role(sock_path: &str) {
     let master = spawned.pty.into_master();
     set_nonblocking(&master);
     let master_raw = master.as_raw_fd();
-    eprintln!("[daemon] listening {sock_path}, child pid {}", spawned.child);
+    eprintln!(
+        "[daemon] listening {sock_path}, child pid {}",
+        spawned.child
+    );
 
     let mut clients: Vec<OwnedFd> = Vec::new();
     let mut loop_count = 0u64;
@@ -179,7 +185,10 @@ fn test_role(_default_path: &str) {
     let sock_path = format!("{dir}/sock");
 
     let exe = std::env::current_exe().expect("current_exe");
-    eprintln!("[test] starting daemon: {} daemon {sock_path}", exe.display());
+    eprintln!(
+        "[test] starting daemon: {} daemon {sock_path}",
+        exe.display()
+    );
     let mut daemon = std::process::Command::new(&exe)
         .args(["daemon", &sock_path])
         .spawn()
@@ -242,8 +251,14 @@ fn test_role(_default_path: &str) {
     let nb2 = client_b.read(&mut buf_b).unwrap_or(0);
     let recv_a2 = String::from_utf8_lossy(&buf_a[..na2]).into_owned();
     let recv_b2 = String::from_utf8_lossy(&buf_b[..nb2]).into_owned();
-    eprintln!("[test] (after B write) A received ({} bytes): {recv_a2:?}", na2);
-    eprintln!("[test] (after B write) B received ({} bytes): {recv_b2:?}", nb2);
+    eprintln!(
+        "[test] (after B write) A received ({} bytes): {recv_a2:?}",
+        na2
+    );
+    eprintln!(
+        "[test] (after B write) B received ({} bytes): {recv_b2:?}",
+        nb2
+    );
     let a2_ok = recv_a2.contains("world");
     let b2_ok = recv_b2.contains("world");
 

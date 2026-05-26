@@ -66,11 +66,7 @@ impl Scrollback {
         out
     }
 
-    fn since_strict(
-        &self,
-        now: Instant,
-        dur: Duration,
-    ) -> Result<Vec<u8>, BufferInsufficient> {
+    fn since_strict(&self, now: Instant, dur: Duration) -> Result<Vec<u8>, BufferInsufficient> {
         let since_start = now - dur;
         if let Some(last_evict) = self.last_evicted_ts {
             if last_evict >= since_start {
@@ -139,11 +135,20 @@ fn main() {
         sb.push(t0, vec![b'A'; 10]); // 10 bytes
         sb.push(t0 + Duration::from_millis(100), vec![b'B'; 10]); // 20 total OK
         check!("evict 前: total=20", sb.total_bytes == 20);
-        check!("evict 前: last_evicted_ts is None", sb.last_evicted_ts.is_none());
+        check!(
+            "evict 前: last_evicted_ts is None",
+            sb.last_evicted_ts.is_none()
+        );
         sb.push(t0 + Duration::from_millis(200), vec![b'C'; 5]); // 25 → A を evict、total=15
         check!("evict 後: total=15", sb.total_bytes == 15);
-        check!("evict 後: last_evicted_ts is Some", sb.last_evicted_ts.is_some());
-        check!("evict された chunk の ts は t0", sb.last_evicted_ts == Some(t0));
+        check!(
+            "evict 後: last_evicted_ts is Some",
+            sb.last_evicted_ts.is_some()
+        );
+        check!(
+            "evict された chunk の ts は t0",
+            sb.last_evicted_ts == Some(t0)
+        );
     }
 
     // === Test 3: since DUR フィルタ ===
@@ -158,10 +163,7 @@ fn main() {
         let now = t0 + Duration::from_millis(1000);
         let bytes = sb.since(now, Duration::from_millis(500));
         // chunk ts: 0,100,200,...,900。cutoff=500、>=500 のものは 500,600,700,800,900 = 5 chunks
-        check!(
-            "since 500ms で 5 chunks = '56789'",
-            bytes == b"56789"
-        );
+        check!("since 500ms で 5 chunks = '56789'", bytes == b"56789");
     }
 
     // === Test 4: since-strict OK (last_evicted_ts < since_start) ===
@@ -220,7 +222,10 @@ fn main() {
             "last_evicted_ts = t0 (= 900KB chunk)",
             sb.last_evicted_ts == Some(t0)
         );
-        check!("oldest = t0+1s", sb.oldest_ts() == Some(t0 + Duration::from_secs(1)));
+        check!(
+            "oldest = t0+1s",
+            sb.oldest_ts() == Some(t0 + Duration::from_secs(1))
+        );
 
         // now=t0+60s、since 70s → since_start = t0 - 10s
         // last_evicted_ts (t0) >= since_start (t0-10s) → NG

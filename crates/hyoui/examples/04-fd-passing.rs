@@ -10,9 +10,9 @@
 //! 結果: parent が target file を open → fd を child に SCM_RIGHTS で送る → child が
 //! その fd に文字列 write → parent が target file の中身を確認、で PASS。
 
-use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
+use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
 use nix::sys::wait::waitpid;
-use nix::unistd::{fork, ForkResult};
+use nix::unistd::{ForkResult, fork};
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
