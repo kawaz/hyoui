@@ -568,7 +568,12 @@ fn tail_command(cfg: TailConfig) -> ExitCode {
 /// - 0: Matched
 /// - 1: Timeout
 /// - 2: Cancelled (= client detach 等)
-/// - 130: ChildExited (= 子 PTY が exit、shell convention)
+/// - 3: ChildExited (= 子 PTY が exit、condition 未達のまま session 終了)
+///
+/// 注: 旧版は 130 (= 128 + SIGINT) を ChildExited に割り当てていたが、shell
+/// 慣例で 130 は「Ctrl-C で中断」を意味するため scripting で `$? -eq 130` を
+/// 「interrupt」と読む既存パターンと衝突する。3 は POSIX application-defined
+/// 範囲なので副作用なし。
 fn wait_command(cfg: WaitConfig) -> ExitCode {
     let sock = match resolve_target_socket("wait", cfg.socket.as_deref(), cfg.session_id.as_deref())
     {
@@ -617,7 +622,7 @@ fn wait_command(cfg: WaitConfig) -> ExitCode {
                     WaitOutcome::Matched => ExitCode::SUCCESS,
                     WaitOutcome::Timeout => ExitCode::from(1),
                     WaitOutcome::Cancelled => ExitCode::from(2),
-                    WaitOutcome::ChildExited => ExitCode::from(130),
+                    WaitOutcome::ChildExited => ExitCode::from(3),
                 };
             }
             ControlMessage::Error(e) => {

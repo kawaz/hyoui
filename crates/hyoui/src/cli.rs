@@ -84,6 +84,12 @@ pub enum HelpTopic {
     Run,
     /// Help for the `attach` subcommand (detach key bindings, modes 等)。
     Attach,
+    /// Help for the `status` subcommand.
+    Status,
+    /// Help for the `tail` subcommand.
+    Tail,
+    /// Help for the `wait` subcommand (predicate / timeout / exit code 一覧)。
+    Wait,
     /// Help for the `completion` subcommand.
     Completion,
     /// User invoked an unknown subcommand; render top-level help with note.
@@ -366,6 +372,7 @@ fn parse_kill(args: &[String]) -> Command {
 fn parse_session_targeted<F>(
     name: &str,
     args: &[String],
+    help_topic: HelpTopic,
     mut on_option: F,
 ) -> Result<(Option<String>, Option<String>), Command>
 where
@@ -391,9 +398,7 @@ where
         };
         match opt_name.as_str() {
             "--help" | "-h" => {
-                return Err(Command::Help {
-                    topic: HelpTopic::Top,
-                });
+                return Err(Command::Help { topic: help_topic });
             }
             "--socket" => match value {
                 Some(v) => socket = Some(v),
@@ -439,7 +444,7 @@ where
 
 #[allow(clippy::result_large_err)]
 fn parse_status(args: &[String]) -> Command {
-    let res = parse_session_targeted("status", args, |opt, _value| {
+    let res = parse_session_targeted("status", args, HelpTopic::Status, |opt, _value| {
         Err(Command::Error(format!("status: unknown option: {opt}")))
     });
     match res {
@@ -454,7 +459,7 @@ fn parse_tail(args: &[String]) -> Command {
     let mut strip_ansi = false;
     let mut since_ms: Option<u64> = None;
     let mut last_bytes: Option<u64> = None;
-    let res = parse_session_targeted("tail", args, |opt, value| match opt {
+    let res = parse_session_targeted("tail", args, HelpTopic::Tail, |opt, value| match opt {
         "--follow" => {
             follow = true;
             Ok(false)
@@ -520,7 +525,7 @@ fn parse_wait(args: &[String]) -> Command {
         match opt_name.as_str() {
             "--help" | "-h" => {
                 return Command::Help {
-                    topic: HelpTopic::Top,
+                    topic: HelpTopic::Wait,
                 };
             }
             "--socket" => match value {
@@ -609,28 +614,43 @@ fn parse_wait_predicate(s: &str) -> Option<WaitCliPredicate> {
     }
 }
 
-/// `500`, `500ms`, `2s`, `1m` を ms に変換。bare 数値は ms 扱い (DR-0006 §5)。
+/// 期間文字列を ms に変換する。
+///
+/// 受理する形式:
+/// - `500ms` / `2s` / `1m` (= 単位必須が推奨形)
+/// - `0` (= ゼロは bare で OK、両単位とも 0 で同じ)
+///
+/// **bare 数値 (= 単位なし) は error**。旧版は ms 扱いだったが `run --timeout`
+/// (= 秒扱い) との非対称が UX 罠だったため、新規 CLI (= `wait` / `tail`) では
+/// 単位必須にした (= レビュー指摘 A9)。
 fn parse_duration_ms(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty duration".into());
     }
     if let Some(num) = s.strip_suffix("ms") {
-        num.parse::<u64>()
-            .map_err(|_| format!("bad ms value: {num}"))
-    } else if let Some(num) = s.strip_suffix('s') {
+        return num
+            .parse::<u64>()
+            .map_err(|_| format!("bad ms value: {num}"));
+    }
+    if let Some(num) = s.strip_suffix('s') {
         let n = num
             .parse::<u64>()
             .map_err(|_| format!("bad s value: {num}"))?;
-        Ok(n.saturating_mul(1_000))
-    } else if let Some(num) = s.strip_suffix('m') {
+        return Ok(n.saturating_mul(1_000));
+    }
+    if let Some(num) = s.strip_suffix('m') {
         let n = num
             .parse::<u64>()
             .map_err(|_| format!("bad m value: {num}"))?;
-        Ok(n.saturating_mul(60_000))
-    } else {
-        s.parse::<u64>().map_err(|_| format!("bad duration: {s}"))
+        return Ok(n.saturating_mul(60_000));
     }
+    if s == "0" {
+        return Ok(0);
+    }
+    Err(format!(
+        "duration unit required (ms/s/m): {s} (例: 500ms, 2s, 1m)"
+    ))
 }
 
 fn parse_attach(args: &[String]) -> Command {
@@ -718,6 +738,9 @@ pub fn usage(topic: &HelpTopic) -> String {
         HelpTopic::UnknownSubcommand(name) => usage_top(Some(name.as_str())),
         HelpTopic::Run => usage_run(),
         HelpTopic::Attach => usage_attach(),
+        HelpTopic::Status => usage_status(),
+        HelpTopic::Tail => usage_tail(),
+        HelpTopic::Wait => usage_wait(),
         HelpTopic::Completion => usage_completion(),
     }
 }
@@ -956,10 +979,16 @@ fn usage_top(unknown: Option<&str>) -> String {
         \n\
         SUBCOMMANDS:\n    \
             run         Run a command inside a PTY as a transparent proxy\n    \
+            attach      Attach to an existing daemon session\n    \
+            list        List daemon sessions (= socket dir scan)\n    \
+            kill        Send signal to a daemon session and terminate it\n    \
+            status      Print session status (clients/leader/lock/scrollback)\n    \
+            tail        Stream scrollback / live output (--follow で継続)\n    \
+            wait        Wait until predicate (text/pattern/idle) matches\n    \
             completion  Print a shell completion script (bash|zsh|fish)\n\
         \n\
         RESERVED (not yet implemented):\n    \
-            send, attach, status   Socket-based remote control\n\
+            send, detach   将来 protocol 拡張用に予約\n\
         \n\
         GLOBAL OPTIONS:\n    \
             -h, --help     Show this help and exit\n    \
@@ -1045,6 +1074,108 @@ fn usage_attach() -> String {
             hyoui tail <id>         scrollback / live stream を流す\n    \
             hyoui wait <id> ...     条件達成まで block する\n    \
             hyoui kill <id>         daemon に SIGTERM を送って終了\n",
+    )
+}
+
+fn usage_status() -> String {
+    String::from(
+        "hyoui status — print session status and exit\n\
+        \n\
+        USAGE:\n    \
+            hyoui status <session-id>\n    \
+            hyoui status --socket=<path>\n\
+        \n\
+        OPTIONS:\n    \
+            --socket PATH   Explicit socket path (alternative to session-id)\n    \
+            -h, --help      Show this help and exit\n\
+        \n\
+        OUTPUT (plaintext key:value 1 行ごと):\n    \
+            session-id: <name>\n    \
+            child-pid: <pid>  または  child-pid: (exited)\n    \
+            scrollback-bytes: <N>\n    \
+            lock-holder: client <id>  または  lock-holder: (none)\n    \
+            clients:\n              \
+                - id=<n> mode=<Rw|Ro|RwNoLeader>[ leader]\n\
+        \n\
+        EXIT CODE:\n    \
+            0   正常終了\n    \
+            1   connect / I/O 失敗\n    \
+            2   引数不足 (session-id も --socket も無し)\n",
+    )
+}
+
+fn usage_tail() -> String {
+    String::from(
+        "hyoui tail — stream scrollback / live output\n\
+        \n\
+        USAGE:\n    \
+            hyoui tail <session-id> [options]\n    \
+            hyoui tail --socket=<path> [options]\n\
+        \n\
+        OPTIONS:\n    \
+            --socket PATH        Explicit socket path (alternative to session-id)\n    \
+            --follow             子 PTY exit / TailEnd まで stream を継続する\n    \
+            --strip-ansi         ANSI escape を strip 済の bytes を受け取る (best-effort)\n    \
+            --since DUR          過去 DUR 以内の chunk のみ流す。単位必須 (例: 500ms / 2s / 1m)\n    \
+            --last-bytes N       末尾 N bytes に絞る\n    \
+            -h, --help           Show this help and exit\n\
+        \n\
+        DURATION FORMAT:\n    \
+            500ms / 2s / 1m のいずれか。bare 数字 (= 単位なし) は **error**。\n    \
+            run --timeout (= 秒扱い) との非対称を避けるため統一していない。\n\
+        \n\
+        EXIT CODE:\n    \
+            0   正常終了 (= TailEnd 受信 or socket close)\n    \
+            1   connect / I/O 失敗\n\
+        \n\
+        EXAMPLES:\n    \
+            hyoui tail demo                       # 全 scrollback 1 度だけ流して exit\n    \
+            hyoui tail demo --follow              # live stream を継続\n    \
+            hyoui tail demo --since=10s           # 過去 10 秒分\n    \
+            hyoui tail demo --last-bytes=8192     # 末尾 8 KiB\n\
+        \n\
+        RELATED:\n    \
+            hyoui wait <id> ...       条件達成まで block (= polling 代替)\n    \
+            hyoui status <id>         clients / lock 状態を 1 度取得\n",
+    )
+}
+
+fn usage_wait() -> String {
+    String::from(
+        "hyoui wait — wait until predicate matches\n\
+        \n\
+        USAGE:\n    \
+            hyoui wait <session-id> <predicate> [options]\n    \
+            hyoui wait --socket=<path> <predicate> [options]\n\
+        \n\
+        PREDICATES:\n    \
+            text:<str>          substring 一致 (literal match)\n    \
+            pattern:<regex>     regex 一致 (regex crate、unicode-perl features)\n    \
+            wait-idle:<dur>     <dur> 静寂で成立 (= 子の master 出力が無い時間)\n    \
+            wait:<dur>          wait-idle のエイリアス\n\
+        \n\
+        OPTIONS:\n    \
+            --socket PATH         Explicit socket path (alternative to session-id)\n    \
+            --timeout DUR         絶対 timeout。**指定なしは無限 wait**\n    \
+            --no-strip-escapes    マッチ前に ANSI escape を strip しない (default は strip)\n    \
+            --newline-convert-lf  CRLF → LF 正規化\n    \
+            -h, --help            Show this help and exit\n\
+        \n\
+        DURATION FORMAT:\n    \
+            500ms / 2s / 1m のいずれか。bare 数字は **error**。\n\
+        \n\
+        EXIT CODE:\n    \
+            0   Matched\n    \
+            1   Timeout\n    \
+            2   Cancelled (= client detach / connection lost)\n    \
+            3   ChildExited (= 子 PTY が条件未達のまま exit)\n    \
+            ※ 旧版は ChildExited を 130 にしていたが、慣例 (128+SIGINT) と衝突\n      \
+            するため 3 に変更\n\
+        \n\
+        EXAMPLES:\n    \
+            hyoui wait demo text:READY --timeout=5s\n    \
+            hyoui wait demo pattern:'ITEM-\\d+' --timeout=30s\n    \
+            hyoui wait demo wait-idle:500ms\n",
     )
 }
 
@@ -1570,6 +1701,44 @@ mod tests {
             }
             other => panic!("expected Wait, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_duration_ms_requires_unit() {
+        assert_eq!(parse_duration_ms("500ms"), Ok(500));
+        assert_eq!(parse_duration_ms("2s"), Ok(2_000));
+        assert_eq!(parse_duration_ms("1m"), Ok(60_000));
+        assert_eq!(parse_duration_ms("0"), Ok(0)); // bare 0 だけ許容
+        // bare 数字 (= 単位なし) は error (= レビュー指摘 A9)
+        assert!(parse_duration_ms("500").is_err());
+        assert!(parse_duration_ms("1000").is_err());
+        // 異常入力
+        assert!(parse_duration_ms("").is_err());
+        assert!(parse_duration_ms("xs").is_err());
+    }
+
+    #[test]
+    fn status_tail_wait_help_routes_to_topic() {
+        for (sub, expected) in [
+            ("status", HelpTopic::Status),
+            ("tail", HelpTopic::Tail),
+            ("wait", HelpTopic::Wait),
+        ] {
+            let cmd = parse_args(&args(&[sub, "--help"]));
+            match cmd {
+                Command::Help { ref topic } if *topic == expected => {}
+                other => panic!("expected Help({expected:?}) for {sub}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn top_help_lists_new_subcommands() {
+        let text = usage(&HelpTopic::Top);
+        for sub in ["run", "attach", "list", "kill", "status", "tail", "wait"] {
+            assert!(text.contains(sub), "top help should list `{sub}`");
+        }
+        assert!(!text.contains("attach, status   Socket-based"));
     }
 
     #[test]

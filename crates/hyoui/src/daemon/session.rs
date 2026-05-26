@@ -173,7 +173,7 @@ impl Session {
     /// なので、最後の client が消えたら session を畳む)。
     pub fn run(self) -> Result<i32, Error> {
         let Self {
-            config: _,
+            config,
             pty,
             child,
             listener,
@@ -186,7 +186,12 @@ impl Session {
         let (mut client_reader, mut client_writer) = transport.split().map_err(Error::from)?;
 
         // 2. handshake (= accept_handshake_once と同じロジックだが connection 維持)
-        do_handshake(&pty, &mut client_reader, &mut client_writer)?;
+        do_handshake(
+            &pty,
+            &mut client_reader,
+            &mut client_writer,
+            &config.session_id,
+        )?;
 
         // 3. relay loop
         let outcome = relay_loop(&pty, child, &mut client_reader, &mut client_writer);
@@ -243,10 +248,13 @@ impl Session {
         );
 
         // tail follow subscriber へ TailEnd を 1 発投げてから cleanup する。
-        // 終了理由は outcome に応じて分岐 (child exit / kill による client cancel)。
+        // 終了理由は outcome に応じて分岐:
+        // - 子が exit した (= ChildExited) → ChildExited
+        // - client detach / Kill による session 終了 → ClientCancel
+        // - 致命 error → 送らない (= cleanup で socket close する方が誠実)
         let tail_end_reason = match &outcome {
             RelayOutcome::ChildExited(_) => Some(TailEndReason::ChildExited),
-            RelayOutcome::ClientDetachedOrKilled => Some(TailEndReason::ChildExited),
+            RelayOutcome::ClientDetachedOrKilled => Some(TailEndReason::ClientCancel),
             RelayOutcome::Error(_) => None,
         };
         if let Some(reason) = tail_end_reason {
@@ -259,17 +267,19 @@ impl Session {
 
         // cleanup:
         // 1. writer_tx を drop → writer_pump は残り frame を drain してから recv 終了
-        // 2. queued_bytes が 0 になる (or 短い timeout) を待つ
+        // 2. **per-client** で queued_bytes==0 を最大 200ms 待つ (= 1 client の hang
+        //    が他 client の drain budget を食い潰さないように、deadline を共有せず
+        //    client ごとに 200ms ずつ振る)
         // 3. socket shutdown (= まだ write_all で block 中なら強制解除)
         // 4. join
         //
         // ※ writer_tx drop だけだと、writer_pump が write_all で block 中の場合
         //   recv に戻らず join hang する。そのため drain wait + shutdown を入れる。
-        let drain_deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        const DRAIN_BUDGET_PER_CLIENT: std::time::Duration = std::time::Duration::from_millis(200);
         for ch in clients.iter() {
-            // socket が正常 (= client が読んでる) なら 200ms 以内に drain 完了する
+            let deadline = std::time::Instant::now() + DRAIN_BUDGET_PER_CLIENT;
             while ch.queued_bytes.load(Ordering::Acquire) > 0
-                && std::time::Instant::now() < drain_deadline
+                && std::time::Instant::now() < deadline
             {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
@@ -350,6 +360,10 @@ struct PendingWait {
 /// `accumulated` の上限 (= memory bound)。超過すると古い byte から truncate。
 const WAIT_ACCUMULATED_LIMIT: usize = 1024 * 1024;
 
+/// 1 client が同時に持てる pending wait の上限。超過すると新規 `wait.request` は
+/// error code=`wait.too-many` で reject (= N × WAIT_ACCUMULATED_LIMIT の OOM 防止)。
+const MAX_WAITS_PER_CLIENT: usize = 16;
+
 /// session 全体の状態 (Phase 10)。lock 周りの state machine を保持する。
 ///
 /// 現状の field:
@@ -378,30 +392,79 @@ impl SessionState {
     }
 }
 
-/// 256-bit (32 hex char) の lock token を生成する。
+/// 2 つの byte slice を constant-time で比較 (= timing attack 耐性)。
 ///
-/// 同 UID 信頼領域なので crypto 強度は厳格に必要ではないが、`/dev/urandom` を
-/// 使えば実質予測不能。読めない (= テスト環境等) 場合は timestamp + pid +
-/// counter を fallback として混ぜる。
+/// 同 UID 信頼境界では timing leak の悪用余地は薄いが、token 比較に使う
+/// 値は副作用ゼロの簡易実装。長さ違いは即 `false` で抜けるため厳密 constant
+/// time ではないが、長さ自体を秘匿する必要はない。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// 整数 signum から nix `Signal` を返す。POSIX `kill(pid, 0)` semantic に従い
+/// `signum == 0` も範囲外として扱う (= "existence probe" は wire protocol で
+/// サポートしない、必要なら別 message を新設)。範囲外なら `None`。
+fn nix_signal_from_signum(signum: u8) -> Option<Signal> {
+    if signum == 0 {
+        return None;
+    }
+    Signal::try_from(signum as i32).ok()
+}
+
+/// `detach` message の target に応じて drop 対象を決める。
+///
+/// - `Myself`: 自分 1 client のみ drop (= DropClient)
+/// - `Others`: 自分以外の全 client を drop (= caller が複数 drop できる API が
+///   無いため、本実装では `error: not-implemented` を返して継続)
+/// - `All`: 全 client + session 終了 (= 同様に `error: not-implemented` で継続)
+fn handle_detach_target(
+    idx: usize,
+    detach: crate::protocol::messages::Detach,
+    clients: &mut [ClientHandle],
+) -> ClientFrameOutcome {
+    use crate::protocol::messages::DetachTarget;
+    match detach.target {
+        DetachTarget::Myself => ClientFrameOutcome::DropClient,
+        DetachTarget::Others | DetachTarget::All => {
+            let _ = send_control(
+                &clients[idx],
+                ControlMessage::Error(ErrorMessage {
+                    code: "detach.target-not-implemented".into(),
+                    message: "detach target=others/all is not implemented yet (Phase 11 MVP \
+                              は Myself のみ対応、v0.2.0+ で追加予定)"
+                        .into(),
+                    details: None,
+                }),
+            );
+            ClientFrameOutcome::Continue
+        }
+    }
+}
+
+/// 128-bit (32 hex char) の lock token を生成する。
+///
+/// 同 UID 信頼領域なので CSPRNG 強度は厳格には不要だが、token が予測可能だと
+/// 同 UID の悪意あるプロセスが推測で lock を奪取しうるため、最低限の対策として:
+///
+/// 1. `/dev/urandom` から **16 byte** を `read_exact` で取り切る (= 全 128 bit
+///    分の entropy を確実に得る)
+/// 2. もし urandom open / read が失敗した場合は `panic` して daemon を止める
+///    (= 弱い token で運用継続するより落ちる方が安全)
 fn generate_lock_token() -> String {
     use std::io::Read;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     let mut buf = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut buf);
-    }
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let pid = std::process::id() as u64;
-    let extra = ts ^ pid ^ counter;
-    for (i, byte) in buf.iter_mut().enumerate().take(8) {
-        *byte ^= ((extra >> (56 - i * 8)) & 0xff) as u8;
-    }
+    let mut f = std::fs::File::open("/dev/urandom")
+        .expect("hyoui: cannot open /dev/urandom for lock token");
+    f.read_exact(&mut buf)
+        .expect("hyoui: short read from /dev/urandom for lock token");
     let mut out = String::with_capacity(32);
     for b in &buf {
         use std::fmt::Write;
@@ -611,29 +674,70 @@ fn handle_wait_request(
     pending_waits: &mut Vec<PendingWait>,
 ) {
     let client_id = clients[idx].id;
+    // per-client pending wait count cap (= memory DoS 対策)
+    let existing = pending_waits
+        .iter()
+        .filter(|w| w.client_id == client_id)
+        .count();
+    if existing >= MAX_WAITS_PER_CLIENT {
+        let _ = send_control(
+            &clients[idx],
+            ControlMessage::Error(ErrorMessage {
+                code: "wait.too-many".into(),
+                message: format!(
+                    "too many pending waits for this client (limit {MAX_WAITS_PER_CLIENT})"
+                ),
+                details: None,
+            }),
+        );
+        return;
+    }
     let now = Instant::now();
     let deadline = req
         .timeout_ms
         .and_then(|ms| now.checked_add(std::time::Duration::from_millis(ms)));
 
     let compiled_regex = match &req.predicate {
-        WaitPredicate::Pattern { regex: r } => match regex::bytes::Regex::new(r) {
-            Ok(re) => Some(re),
-            Err(_) => {
-                // invalid regex → wait.result(Cancelled) で即終了 (= 致命でないが
-                // semantic error)。詳細は error code でなく separate Error 帰す手も
-                // あるが、MVP は WaitResult(Cancelled) で一本化。
+        WaitPredicate::Pattern { regex: r } => {
+            // regex compile DoS 対策: 巨大 alternation / 深い nest で daemon の
+            // event loop を block しないように size_limit / dfa_size_limit を絞る。
+            // 既定 (10 MB / 2 MB) → 64 KB / 64 KB に削減 (= 通常用途で十分)。
+            // pattern 文字列長も上限を設けて短時間で reject する。
+            const PATTERN_MAX_LEN: usize = 1024;
+            const REGEX_SIZE_LIMIT: usize = 64 * 1024;
+            if r.len() > PATTERN_MAX_LEN {
                 let _ = send_control(
                     &clients[idx],
                     ControlMessage::Error(ErrorMessage {
                         code: "wait.invalid-pattern".into(),
-                        message: "regex failed to compile".into(),
+                        message: format!(
+                            "regex too long: {} bytes (limit {PATTERN_MAX_LEN})",
+                            r.len()
+                        ),
                         details: None,
                     }),
                 );
                 return;
             }
-        },
+            match regex::bytes::RegexBuilder::new(r)
+                .size_limit(REGEX_SIZE_LIMIT)
+                .dfa_size_limit(REGEX_SIZE_LIMIT)
+                .build()
+            {
+                Ok(re) => Some(re),
+                Err(_) => {
+                    let _ = send_control(
+                        &clients[idx],
+                        ControlMessage::Error(ErrorMessage {
+                            code: "wait.invalid-pattern".into(),
+                            message: "regex failed to compile (syntax or size limit)".into(),
+                            details: None,
+                        }),
+                    );
+                    return;
+                }
+            }
+        }
         _ => None,
     };
 
@@ -1184,6 +1288,24 @@ fn accept_new_client(
         _ => return Err(Error::Invalid("first message must be handshake.request")),
     };
 
+    // token validation (Phase 13 / Round1 修正): `config.expected_token` が
+    // Some なら client が同一 token を提示する必要あり。不一致なら handshake を
+    // 拒否して接続を切る。constant-time 比較で timing leak を避ける。
+    if let Some(expected) = config.expected_token.as_deref() {
+        let provided = req.token.as_deref().unwrap_or("");
+        if !constant_time_eq(expected.as_bytes(), provided.as_bytes()) {
+            let body = ControlMessage::Error(ErrorMessage {
+                code: "auth.token-mismatch".into(),
+                message: "handshake token does not match daemon configuration".into(),
+                details: None,
+            })
+            .encode_to_vec()
+            .map_err(|_| Error::Invalid("auth error encode failed"))?;
+            let _ = Frame::cbor_control(body).encode_to(&mut writer_main);
+            return Err(Error::Invalid("handshake token mismatch"));
+        }
+    }
+
     let mvp: Vec<String> = MVP_CAPS.iter().map(|s| (*s).to_string()).collect();
     let intersect = intersect_caps(&req.caps, &mvp);
 
@@ -1329,18 +1451,70 @@ fn handle_control_message(
     let ch_id = clients[idx].id;
     let ch_leader = clients[idx].leader;
 
+    let ch_mode = clients[idx].mode;
     match msg {
-        ControlMessage::Detach(_) => ClientFrameOutcome::DropClient,
+        ControlMessage::Detach(d) => handle_detach_target(idx, d, clients),
         ControlMessage::Kill(k) => {
+            // Kill は session 全体 terminate なので Rw client のみ許可。
+            // Ro は session を畳む権限なし (Ro = 観察者)。
+            if matches!(ch_mode, Mode::Ro) {
+                let _ = send_control(
+                    &clients[idx],
+                    ControlMessage::Error(ErrorMessage {
+                        code: "mode.not-allowed".into(),
+                        message: "kill requires rw mode".into(),
+                        details: None,
+                    }),
+                );
+                return ClientFrameOutcome::Continue;
+            }
+            // signum 解釈: None なら SIGTERM、invalid 値 (0 や 範囲外) は error。
             let signum = k.signum.unwrap_or(libc::SIGTERM as u8);
-            let sig = Signal::try_from(signum as i32).unwrap_or(Signal::SIGTERM);
+            let sig = match nix_signal_from_signum(signum) {
+                Some(s) => s,
+                None => {
+                    let _ = send_control(
+                        &clients[idx],
+                        ControlMessage::Error(ErrorMessage {
+                            code: "signal.invalid".into(),
+                            message: format!("invalid signum: {signum}"),
+                            details: None,
+                        }),
+                    );
+                    return ClientFrameOutcome::Continue;
+                }
+            };
             let _ = kill(child, sig);
             ClientFrameOutcome::TerminateSession(RelayOutcome::ClientDetachedOrKilled)
         }
         ControlMessage::Signal(s) => {
-            // signal は client 自由 (= lock 中でも認める)。raw mode 中の SIGINT
-            // 送信路として使うため、leader / lock 制約は掛けない。
-            let sig = Signal::try_from(s.signum as i32).unwrap_or(Signal::SIGINT);
+            // Ro 観察者は signal 送信不可 (= 子を SIGKILL できると Ro の前提が壊れる)。
+            // Rw / RwNoLeader は raw mode 中の Ctrl-C 等を CBOR 経由でも送れる必要があるので OK。
+            if matches!(ch_mode, Mode::Ro) {
+                let _ = send_control(
+                    &clients[idx],
+                    ControlMessage::Error(ErrorMessage {
+                        code: "mode.not-allowed".into(),
+                        message: "signal requires rw mode".into(),
+                        details: None,
+                    }),
+                );
+                return ClientFrameOutcome::Continue;
+            }
+            let sig = match nix_signal_from_signum(s.signum) {
+                Some(s) => s,
+                None => {
+                    let _ = send_control(
+                        &clients[idx],
+                        ControlMessage::Error(ErrorMessage {
+                            code: "signal.invalid".into(),
+                            message: format!("invalid signum: {}", s.signum),
+                            details: None,
+                        }),
+                    );
+                    return ClientFrameOutcome::Continue;
+                }
+            };
             let _ = kill(child, sig);
             ClientFrameOutcome::Continue
         }
@@ -1357,13 +1531,36 @@ fn handle_control_message(
                 );
                 return ClientFrameOutcome::Continue;
             }
-            let _ = pty.resize(r.cols, r.rows);
+            // sanitize: 0×0 や巨大値で curses 系子が壊れることがあるので clamp。
+            // 上限 4096 (= 一般 terminal で見ない値) で十分、下限 1 で 0 を排除。
+            const COLS_MIN: u16 = 1;
+            const COLS_MAX: u16 = 4096;
+            const ROWS_MIN: u16 = 1;
+            const ROWS_MAX: u16 = 4096;
+            let cols = r.cols.clamp(COLS_MIN, COLS_MAX);
+            let rows = r.rows.clamp(ROWS_MIN, ROWS_MAX);
+            let _ = pty.resize(cols, rows);
             ClientFrameOutcome::Continue
         }
         ControlMessage::LockAcquire(req) => {
-            // MVP: queue 未実装。`wait=true` でも grant か Denied のいずれか
-            // (= 既存 holder が居れば即 Denied)。
             if state.lock_holder.is_some() {
+                // 既存 holder あり: MVP では wait queue 未実装なので wait=true でも
+                // Queued を返さず error で「queue 未対応」を明示する。client は
+                // `LockResult::Denied` で raw な失敗を受け取ることもできるが、
+                // wait=true 期待時に Denied だけだと「実装が縮退している」のが
+                // 見えないため `error` code=`lock.wait-queue-unsupported` で明示。
+                if req.wait {
+                    let _ = send_control(
+                        &clients[idx],
+                        ControlMessage::Error(ErrorMessage {
+                            code: "lock.wait-queue-unsupported".into(),
+                            message: "lock wait queue is not implemented (v0.2.0+); \
+                                      use wait=false to receive Denied without blocking"
+                                .into(),
+                            details: None,
+                        }),
+                    );
+                }
                 let _ = send_control(
                     &clients[idx],
                     ControlMessage::LockResponse(LockResponse {
@@ -1455,7 +1652,31 @@ fn handle_control_message(
             );
             ClientFrameOutcome::Continue
         }
-        _ => ClientFrameOutcome::Continue,
+        // daemon → client 方向のはずの message が client → daemon に来た or 未実装 kind。
+        // DR-0008 §3.2 「未知 kind は decode error」だが、ここに来るのは serde で既知
+        // variant なので decode 段階では catch されない。protocol violation として
+        // 明示 error を返す (= silent skip しない)。
+        ControlMessage::HandshakeRequest(_)
+        | ControlMessage::HandshakeResponse(_)
+        | ControlMessage::Error(_)
+        | ControlMessage::LockResponse(_)
+        | ControlMessage::LeaderNotify(_)
+        | ControlMessage::ModeChange(_)
+        | ControlMessage::StatusResponse(_)
+        | ControlMessage::TailData(_)
+        | ControlMessage::TailEnd(_)
+        | ControlMessage::WaitResult(_) => {
+            let _ = send_control(
+                &clients[idx],
+                ControlMessage::Error(ErrorMessage {
+                    code: "protocol.unexpected-kind".into(),
+                    message: "this kind is daemon→client only or not accepted in this direction"
+                        .into(),
+                    details: None,
+                }),
+            );
+            ClientFrameOutcome::Continue
+        }
     }
 }
 
@@ -1478,6 +1699,7 @@ fn do_handshake<R: std::io::Read, W: std::io::Write>(
     _pty: &Pty,
     reader: &mut R,
     writer: &mut W,
+    session_id: &str,
 ) -> Result<HandshakeResponse, Error> {
     let frame = Frame::decode_from(reader)
         .map_err(|_| Error::Invalid("failed to decode handshake frame"))?;
@@ -1496,7 +1718,7 @@ fn do_handshake<R: std::io::Read, W: std::io::Write>(
 
     let response = HandshakeResponse {
         caps: intersect,
-        session_id: String::new(), // 呼び出し側で埋めない (Session::run は config を持たないため)。実 daemon API では session_id を入れるべきだが Phase 8 では client_writer に出すだけ。
+        session_id: session_id.to_string(),
         client_id: 0,
         leader: matches!(req.mode, Mode::Rw),
         mode: req.mode,
@@ -3114,5 +3336,175 @@ mod tests {
         );
         // queued_bytes は変化なし (= Overflow 時は加算前に reject)
         assert_eq!(ch.queued_bytes.load(Ordering::Acquire), 100);
+    }
+
+    // ---- Round1 fixes: authorization / token / signal / silent skip ----
+
+    #[test]
+    fn constant_time_eq_basics() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn nix_signal_from_signum_rejects_zero_and_invalid() {
+        assert!(nix_signal_from_signum(0).is_none(), "signum=0 = probe");
+        assert!(
+            nix_signal_from_signum(255).is_none(),
+            "signum=255 out of range"
+        );
+        assert!(nix_signal_from_signum(2).is_some(), "SIGINT");
+        assert!(nix_signal_from_signum(15).is_some(), "SIGTERM");
+    }
+
+    /// Round1 A1: Ro client が Kill を送ると mode.not-allowed エラーが返り、
+    /// session は継続する。
+    #[test]
+    fn serve_ro_client_kill_rejected() {
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        // s1 = Rw (session 維持用)
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut s1);
+        let _ = Frame::decode_from(&mut s1).expect("leader.notify");
+
+        // s2 = Ro (Kill 試行)
+        let mut s2 = client_connect_with_retry(&sock_path);
+        let req = ControlMessage::HandshakeRequest(HandshakeRequest {
+            caps: MVP_CAPS.iter().map(|s| s.to_string()).collect(),
+            mode: Mode::Ro,
+            exclusive: false,
+            detach_others: false,
+            token: None,
+        });
+        let body = req.encode_to_vec().expect("encode");
+        Frame::cbor_control(body).encode_to(&mut s2).expect("send");
+        s2.flush().expect("flush");
+        let _ = Frame::decode_from(&mut s2).expect("handshake response"); // discard
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s2)
+        .expect("send kill");
+        s2.flush().expect("flush");
+
+        // s2 が error を受信
+        let ef = Frame::decode_from(&mut s2).expect("error response");
+        match ControlMessage::decode_from(ef.body.as_slice()).expect("decode") {
+            ControlMessage::Error(e) => {
+                assert_eq!(e.code, "mode.not-allowed");
+            }
+            o => panic!("expected Error, got {o:?}"),
+        }
+
+        // s1 から正規 Kill で session 終了
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// Round1 A3: signum=0 (POSIX probe) を Kill / Signal で送ると signal.invalid を返す。
+    #[test]
+    fn serve_signal_zero_rejected() {
+        use crate::protocol::messages::Signal as ProtoSignal;
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+        let mut s = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut s);
+        let _ = Frame::decode_from(&mut s).expect("leader.notify");
+
+        Frame::cbor_control(
+            ControlMessage::Signal(ProtoSignal { signum: 0 })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s)
+        .expect("send");
+        s.flush().expect("flush");
+
+        let ef = Frame::decode_from(&mut s).expect("error");
+        match ControlMessage::decode_from(ef.body.as_slice()).expect("decode") {
+            ControlMessage::Error(e) => assert_eq!(e.code, "signal.invalid"),
+            o => panic!("expected Error, got {o:?}"),
+        }
+
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s)
+        .expect("send");
+        s.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// Round1 A2: `expected_token` 設定時に token mismatch で handshake が拒否される。
+    #[test]
+    fn serve_handshake_token_mismatch_rejected() {
+        let dir = make_temp_socket_dir();
+        let sock_path = dir.path().join("test.sock");
+        let mut cfg = DaemonConfig::new("demo", sock_path.clone(), long_running_cmd());
+        cfg.expected_token = Some("secret-xyz".into());
+        let session = Session::start(cfg).expect("start");
+        let handle = std::thread::spawn(move || session.serve());
+
+        let mut s = client_connect_with_retry(&sock_path);
+        let req = ControlMessage::HandshakeRequest(HandshakeRequest {
+            caps: MVP_CAPS.iter().map(|s| s.to_string()).collect(),
+            mode: Mode::Rw,
+            exclusive: false,
+            detach_others: false,
+            token: Some("wrong-token".into()),
+        });
+        let body = req.encode_to_vec().expect("encode");
+        Frame::cbor_control(body).encode_to(&mut s).expect("send");
+        s.flush().expect("flush");
+
+        // daemon は auth.token-mismatch error を返し、socket を切る
+        let ef = Frame::decode_from(&mut s).expect("error");
+        match ControlMessage::decode_from(ef.body.as_slice()).expect("decode") {
+            ControlMessage::Error(e) => assert_eq!(e.code, "auth.token-mismatch"),
+            o => panic!("expected Error, got {o:?}"),
+        }
+
+        // 正しい token で接続できることも確認
+        let mut s2 = client_connect_with_retry(&sock_path);
+        let req2 = ControlMessage::HandshakeRequest(HandshakeRequest {
+            caps: MVP_CAPS.iter().map(|s| s.to_string()).collect(),
+            mode: Mode::Rw,
+            exclusive: false,
+            detach_others: false,
+            token: Some("secret-xyz".into()),
+        });
+        let body2 = req2.encode_to_vec().expect("encode");
+        Frame::cbor_control(body2).encode_to(&mut s2).expect("send");
+        s2.flush().expect("flush");
+        let resp = Frame::decode_from(&mut s2).expect("response");
+        match ControlMessage::decode_from(resp.body.as_slice()).expect("decode") {
+            ControlMessage::HandshakeResponse(_) => {} // OK
+            o => panic!("expected HandshakeResponse, got {o:?}"),
+        }
+        // cleanup: leader.notify を捨てて kill
+        let _ = Frame::decode_from(&mut s2);
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s2)
+        .expect("send");
+        s2.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
     }
 }

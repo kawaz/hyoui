@@ -30,6 +30,17 @@ pub struct DaemonConfig {
     /// 既定 8 MiB。超過時はその client を `error` kind=`backpressure.disconnect` で
     /// notify → close する。
     pub client_buffer_bytes: usize,
+
+    /// handshake 時に client が提示する必須 token (= `HandshakeRequest.token`)。
+    ///
+    /// - `None`: 認可 token は要求しない (= default、同 UID 信頼境界のみ)
+    /// - `Some(s)`: client は handshake で同一 token を提示する必要あり。不一致 /
+    ///   未提示なら daemon は `error` kind=`auth.token-mismatch` で reject して
+    ///   接続を切る (DR-0006 §6 lock token、`HYOUI_LOCK_TOKEN` 経路)
+    ///
+    /// MVP では `None` 既定で運用 (= 同 UID + socket perm 0600 で十分とする)。
+    /// 将来 TCP / WebSocket transport を加えるときに必須化する想定。
+    pub expected_token: Option<String>,
 }
 
 impl DaemonConfig {
@@ -45,6 +56,7 @@ impl DaemonConfig {
             rows: 24,
             scrollback_bytes: 1024 * 1024,
             client_buffer_bytes: 8 * 1024 * 1024,
+            expected_token: None,
         }
     }
 }
