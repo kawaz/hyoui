@@ -1020,14 +1020,23 @@ fn usage_attach() -> String {
         DETACH KEY (= session を生かしたまま client だけ抜ける):\n    \
             Ctrl-A d              detach (session 維持 + 自分だけ Detach 送って終了)\n    \
             Ctrl-A Ctrl-A         escape — literal Ctrl-A を子 PTY に送る\n    \
-            Ctrl-A <other>        prefix と当該キー両方を捨てる (= screen 慣例)\n    \
-            ※ prefix のカスタマイズは将来 --detach-prefix で対応予定\n\
+            Ctrl-A <other>        prefix と当該キー両方を捨てる (= screen 慣例)\n\
+        \n\
+        ENVIRONMENT:\n    \
+            HYOUI_DETACH_PREFIX   detach prefix byte をカスタマイズ。値の形式:\n                                  \
+                * `Ctrl-B` / `^B` (= 0x02)\n                                  \
+                * `0x02` (hex)\n                                  \
+                * `2` (decimal 0..=255)\n                                  \
+                * `none` / `off` / `disable` (= detach key 無効化)\n                                  \
+                未設定なら Ctrl-A (0x01)\n    \
+            HYOUI_LOCK_TOKEN      lock token を env で渡す (= handshake.token)\n\
         \n\
         EXAMPLES:\n    \
             hyoui attach demo                       # session_id=demo に attach\n    \
             hyoui attach --socket=/tmp/x.sock       # 直接 socket 指定\n    \
             hyoui attach demo --mode=ro             # 読み取り専用 attach\n    \
-            hyoui attach demo --detach-others       # 他 client を蹴って奪う\n\
+            hyoui attach demo --detach-others       # 他 client を蹴って奪う\n    \
+            HYOUI_DETACH_PREFIX=Ctrl-B hyoui attach demo  # prefix を Ctrl-B に変更\n\
         \n\
         RELATED:\n    \
             hyoui run --detached    daemon を background 起動\n    \
