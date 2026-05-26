@@ -17,26 +17,108 @@ use std::io::{Read, Write};
 
 use serde::{Deserialize, Serialize};
 
+mod control;
+mod error;
 mod handshake;
+mod lifecycle;
+mod lock;
+mod status;
+mod tail;
+mod wait;
 
+pub use control::{Resize, Signal};
+pub use error::ErrorMessage;
 pub use handshake::{HandshakeRequest, HandshakeResponse, Mode};
+pub use lifecycle::{Detach, DetachTarget, Kill};
+pub use lock::{
+    LeaderNotify, LockAcquire, LockRelease, LockResponse, LockResult, ModeChange, SessionMode,
+};
+pub use status::{ClientInfo, StatusQuery, StatusResponse};
+pub use tail::{TailData, TailEnd, TailEndReason, TailRequest};
+pub use wait::{WaitMatchOptions, WaitOutcome, WaitPredicate, WaitRequest, WaitResult};
 
 /// CBOR control message の全 kind を包む tagged enum。
 ///
 /// serde の `tag = "kind"` で CBOR map 上の `"kind"` field が variant
-/// discriminator になる。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// discriminator になる。各 variant の rename は DR-0008 §2.2 の kind 一覧に対応。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum ControlMessage {
-    /// `kind = "handshake.request"`、client → daemon、cap negotiation + 認証。
+    /// `kind = "handshake.request"` — client → daemon、cap negotiation + 認証。
     #[serde(rename = "handshake.request")]
     HandshakeRequest(HandshakeRequest),
 
-    /// `kind = "handshake.response"`、daemon → client、cap 確定 + session 情報。
+    /// `kind = "handshake.response"` — daemon → client、cap 確定 + session 情報。
     #[serde(rename = "handshake.response")]
     HandshakeResponse(HandshakeResponse),
-    // 残りの kind は順次追加 (error, resize, signal, lock.*, status.*, tail.*,
-    // wait.*, detach, kill, leader.notify, mode.change ...)
+
+    /// `kind = "error"` — 双方向、回復可能 / 致命的 error 通知。
+    #[serde(rename = "error")]
+    Error(ErrorMessage),
+
+    /// `kind = "resize"` — leader → daemon、TIOCSWINSZ。
+    #[serde(rename = "resize")]
+    Resize(Resize),
+
+    /// `kind = "signal"` — client → daemon → 子、明示 signal 送信。
+    #[serde(rename = "signal")]
+    Signal(Signal),
+
+    /// `kind = "lock.acquire"` — client → daemon、lock 取得要求。
+    #[serde(rename = "lock.acquire")]
+    LockAcquire(LockAcquire),
+
+    /// `kind = "lock.response"` — daemon → client、lock 取得結果。
+    #[serde(rename = "lock.response")]
+    LockResponse(LockResponse),
+
+    /// `kind = "lock.release"` — client → daemon、lock 解放。
+    #[serde(rename = "lock.release")]
+    LockRelease(LockRelease),
+
+    /// `kind = "leader.notify"` — daemon → all clients、leader 変更通知。
+    #[serde(rename = "leader.notify")]
+    LeaderNotify(LeaderNotify),
+
+    /// `kind = "mode.change"` — daemon → all clients、rw/ro/locked 変更通知。
+    #[serde(rename = "mode.change")]
+    ModeChange(ModeChange),
+
+    /// `kind = "status.query"` — client → daemon、session 状態問い合わせ。
+    #[serde(rename = "status.query")]
+    StatusQuery(StatusQuery),
+
+    /// `kind = "status.response"` — daemon → client、status 返却。
+    #[serde(rename = "status.response")]
+    StatusResponse(StatusResponse),
+
+    /// `kind = "tail.request"` — client → daemon、scrollback の流し読み開始。
+    #[serde(rename = "tail.request")]
+    TailRequest(TailRequest),
+
+    /// `kind = "tail.data"` — daemon → client、tail chunk。
+    #[serde(rename = "tail.data")]
+    TailData(TailData),
+
+    /// `kind = "tail.end"` — daemon → client、tail 終了通知。
+    #[serde(rename = "tail.end")]
+    TailEnd(TailEnd),
+
+    /// `kind = "wait.request"` — client → daemon、出力条件待ち。
+    #[serde(rename = "wait.request")]
+    WaitRequest(WaitRequest),
+
+    /// `kind = "wait.result"` — daemon → client、条件成立 / timeout / cancel。
+    #[serde(rename = "wait.result")]
+    WaitResult(WaitResult),
+
+    /// `kind = "detach"` — client → daemon、自身 (or `others`/`all`) を detach。
+    #[serde(rename = "detach")]
+    Detach(Detach),
+
+    /// `kind = "kill"` — client → daemon、子に signal → daemon exit。
+    #[serde(rename = "kill")]
+    Kill(Kill),
 }
 
 /// CBOR control message の encode/decode error。
@@ -146,6 +228,248 @@ mod tests {
             ControlMessageError::Decode(_) => {} // OK: serde が unknown variant で error
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn error_roundtrip() {
+        let msg = ControlMessage::Error(ErrorMessage {
+            code: "lock.denied".into(),
+            message: "held by client 7".into(),
+            details: None,
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn error_with_details_roundtrip() {
+        let msg = ControlMessage::Error(ErrorMessage {
+            code: "backpressure.disconnect".into(),
+            message: "client buffer full".into(),
+            details: Some(ciborium::Value::Map(vec![
+                (
+                    ciborium::Value::Text("queued_bytes".into()),
+                    ciborium::Value::Integer(8_000_000i64.into()),
+                ),
+                (
+                    ciborium::Value::Text("limit".into()),
+                    ciborium::Value::Integer(8_388_608i64.into()),
+                ),
+            ])),
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn resize_roundtrip() {
+        let msg = ControlMessage::Resize(Resize {
+            cols: 132,
+            rows: 50,
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn signal_roundtrip() {
+        let msg = ControlMessage::Signal(Signal { signum: 2 }); // SIGINT
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn lock_acquire_full_roundtrip() {
+        let msg = ControlMessage::LockAcquire(LockAcquire {
+            wait: true,
+            timeout_abs_ms: Some(30_000),
+            timeout_idle_ms: Some(5_000),
+            process_bound: true,
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn lock_response_acquired_roundtrip() {
+        let msg = ControlMessage::LockResponse(LockResponse {
+            result: LockResult::Acquired,
+            token: Some("tok-xyz".into()),
+            queue_position: None,
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn lock_response_queued_roundtrip() {
+        let msg = ControlMessage::LockResponse(LockResponse {
+            result: LockResult::Queued,
+            token: None,
+            queue_position: Some(2),
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn lock_release_roundtrip() {
+        let msg = ControlMessage::LockRelease(LockRelease {
+            token: "tok-xyz".into(),
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn leader_notify_roundtrip() {
+        let msg = ControlMessage::LeaderNotify(LeaderNotify { client_id: Some(7) });
+        assert_eq!(roundtrip(&msg), msg);
+
+        let none = ControlMessage::LeaderNotify(LeaderNotify { client_id: None });
+        assert_eq!(roundtrip(&none), none);
+    }
+
+    #[test]
+    fn mode_change_locked_roundtrip() {
+        let msg = ControlMessage::ModeChange(ModeChange {
+            session_mode: SessionMode::Locked,
+            lock_holder: Some(7),
+            client_mode: Some(Mode::Ro),
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn status_query_roundtrip() {
+        let msg = ControlMessage::StatusQuery(StatusQuery {});
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn status_response_roundtrip() {
+        let msg = ControlMessage::StatusResponse(StatusResponse {
+            session_id: "demo".into(),
+            child_pid: Some(12345),
+            clients: vec![
+                ClientInfo {
+                    client_id: 0,
+                    mode: Mode::Rw,
+                    leader: true,
+                },
+                ClientInfo {
+                    client_id: 1,
+                    mode: Mode::Ro,
+                    leader: false,
+                },
+            ],
+            scrollback_bytes: 65536,
+            lock_holder: None,
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn tail_request_roundtrip() {
+        let msg = ControlMessage::TailRequest(TailRequest {
+            since_ms: Some(5_000),
+            since_strict: true,
+            follow: true,
+            strip_ansi: false,
+            last_bytes: None,
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn tail_data_roundtrip_preserves_bytes() {
+        // ANSI escape + binary bytes 透過の確認
+        let raw: Vec<u8> = vec![
+            0x1b, b'[', b'3', b'1', b'm', b'h', b'i', 0x00, 0xff, 0x1b, b'[', b'0', b'm',
+        ];
+        let msg = ControlMessage::TailData(TailData {
+            bytes: raw.clone(),
+            timestamp_ms: 1_700_000_000_000,
+        });
+        let got = roundtrip(&msg);
+        assert_eq!(got, msg);
+        if let ControlMessage::TailData(d) = got {
+            assert_eq!(d.bytes, raw);
+        }
+    }
+
+    #[test]
+    fn tail_end_roundtrip() {
+        for reason in [
+            TailEndReason::Eof,
+            TailEndReason::BufferTruncated,
+            TailEndReason::ClientCancel,
+            TailEndReason::ChildExited,
+        ] {
+            let msg = ControlMessage::TailEnd(TailEnd { reason });
+            assert_eq!(roundtrip(&msg), msg);
+        }
+    }
+
+    #[test]
+    fn wait_request_text_roundtrip() {
+        let msg = ControlMessage::WaitRequest(WaitRequest {
+            predicate: WaitPredicate::Text {
+                value: "ready>".into(),
+            },
+            timeout_ms: Some(10_000),
+            options: WaitMatchOptions {
+                strip_escapes: true,
+                newline_convert_lf: false,
+            },
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn wait_request_pattern_roundtrip() {
+        let msg = ControlMessage::WaitRequest(WaitRequest {
+            predicate: WaitPredicate::Pattern {
+                regex: r"^\$\s+$".into(),
+            },
+            timeout_ms: None,
+            options: WaitMatchOptions::default(),
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn wait_request_idle_roundtrip() {
+        let msg = ControlMessage::WaitRequest(WaitRequest {
+            predicate: WaitPredicate::Idle { ms: 500 },
+            timeout_ms: Some(30_000),
+            options: WaitMatchOptions::default(),
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn wait_result_roundtrip() {
+        let msg = ControlMessage::WaitResult(WaitResult {
+            outcome: WaitOutcome::Matched,
+            matched_offset: Some(42),
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn detach_roundtrip() {
+        for target in [
+            DetachTarget::Myself,
+            DetachTarget::Others,
+            DetachTarget::All,
+        ] {
+            let msg = ControlMessage::Detach(Detach { target });
+            assert_eq!(roundtrip(&msg), msg);
+        }
+    }
+
+    #[test]
+    fn kill_roundtrip() {
+        let msg = ControlMessage::Kill(Kill {
+            signum: Some(15), // SIGTERM
+        });
+        assert_eq!(roundtrip(&msg), msg);
+
+        let default_kill = ControlMessage::Kill(Kill { signum: None });
+        assert_eq!(roundtrip(&default_kill), default_kill);
     }
 
     #[test]
