@@ -1,386 +1,450 @@
-# DR-0008: protocol 設計 — wire format / message kinds / handshake / transport 抽象化
+# DR-0008: protocol 設計 — CBOR ハイブリッド framing、cap flags ベースの schema evolution
 
 - Status: Active
 - Date: 2026-05-26
-- Related: DR-0005 (思想)、DR-0006 (CLI ground rules)、DR-0007 (MVP scope)、PoC 01-08 findings (特に [[2026-05-26-fd-passing-vs-stream]])
+- Related: DR-0005 (思想)、DR-0006 (CLI ground rules)、DR-0007 (MVP scope)、PoC 01-08 findings (特に [[2026-05-26-fd-passing-vs-stream]]、[[2026-05-26-multi-attach]]、[[2026-05-26-lock-token-env]])
 
 ## Context
 
-[[DR-0006]] で「protocol は transport (Unix socket / TCP / WebSocket) から独立」と宣言、PoC 04 で SCM_RIGHTS 不採用 = stream 中継一本化を確定。本 DR で具体的な **wire format / message kinds / handshake / transport trait** を設計。
+[[DR-0006]] で「protocol は transport (Unix socket / TCP / WebSocket) から独立」と宣言。PoC 04 ([[2026-05-26-fd-passing-vs-stream]]) で SCM_RIGHTS 不採用 = stream 中継一本化を確定。本 DR は **wire format / 制御メッセージのモデル / handshake / capability negotiation / transport 抽象** をゼロベースで設計する。
 
-PoC 知見 ([[2026-05-26-poc-summary]]) を反映:
-- daemon は子 pty 出力を broadcast、各 client stdin を multiplex (PoC 02)
-- bracketed paste / alternate screen 自動検出は daemon の internal state (PoC 03)
-- HYOUI_LOCK_TOKEN env 継承で client が自動 token 提示 (PoC 06)
-- scrollback ring buffer + last_evicted_ts (PoC 07)
-- 装飾除去 ANSI strip (PoC 08)
+### 要件 (思想・PoC 知見から導出)
+
+| # | 要件 | 出所 |
+|---|------|------|
+| R1 | daemon は子 PTY を 1 つ持ち、複数 client が同時 attach できる (broadcast + multiplex) | DR-0005, PoC 02 |
+| R2 | 子 PTY との data 流路は **raw bytes 透過** (ANSI escape / binary 含む)、変換しない | DR-0006, [[2026-05-26-ansi-strip]] |
+| R3 | 制御メッセージ (handshake, resize, signal, lock, leader, mode change, status, tail, wait, detach, kill, error) が存在 | DR-0006 §3-8 |
+| R4 | transport は Unix socket (MVP)、将来 TCP / WebSocket / SSH stdio。**stream 系のみ** | DR-0006, [[2026-05-26-fd-passing-vs-stream]] |
+| R5 | 信頼境界は **同 UID** (socket perm 0600 + dir 0700 + lock token)、暗号化なし | [[2026-05-26-lock-token-env]] |
+| R6 | client は env (`HYOUI_LOCK_TOKEN`) から token 自動継承、handshake で提示 | [[2026-05-26-lock-token-env]] |
+| R7 | scrollback / status / wait は将来「画面 dump (cell grid)」「regex captures」等の rich payload を扱う | DR-0007 v0.2.0+ |
+| R8 | 依存量は「正当な依存追加は受け入れる」(scrollback/strip は純 Rust だが、cross-lang/schema-evolution の価値がある依存は OK) | ユーザ確認 2026-05-26 |
+| R9 | WebSocket 経由のブラウザ client (xterm.js / JS) を v0.2.0 で本気で目指す | DR-0007 v0.2.0、ユーザ確認 2026-05-26 |
+
+### 別解の検討経緯
+
+並行で外部議論 (artifact 3 件、2026-05-26) でも検証。要点:
+
+- **bincode は RUSTSEC-2025-0141 で unmaintained**、wire format 候補から脱落
+- **msgpack vs CBOR**: 機能はほぼ同等だが、CBOR は IETF RFC 8949 + 標準化された Diagnostic Notation (EDN) + Wireshark 標準 dissector + CBOR Sequences (RFC 8742) + indefinite-length encoding を持つ。debug tooling と standards-track な安定性で msgpack を上回る
+- **protobuf / Cap'n Proto** は IDL toolchain (codegen + build.rs) が重く、terminal IPC には overkill
+- **postcard** は Rust 専用 (R9 と矛盾)
+- **JSON** は binary に base64 = 3x overhead (R2 の hot path で致命)
+- **PtyMux Protocol** (Wez Furlong 提案、2024) は 2025-10 時点で stalled。仕様未公開、標準化挫折。互換は core で握りに行かず gateway 戦略 (後述)
 
 ## Decision
 
-### 1. Wire format: length-prefixed binary frame
+### 1. Wire format = CBOR ハイブリッド framing
+
+#### 1.1 frame layout
 
 ```
-Frame layout:
-  +---------+--------+--------+--------------------+
-  | u32 LE  | u8     | u8     | payload bytes      |
-  | size    | type   | flags  |    ...             |
-  +---------+--------+--------+--------------------+
-  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  size = type(1) + flags(1) + payload (含 type/flags)
++---------+--------+----------------+
+| u32 LE  | u8     | body bytes     |
+| size    | type   |                |
++---------+--------+----------------+
+size = 1 (type byte) + body_len
 ```
 
-- **size**: u32 LE、`type` 以降の総 byte 数 (`type` と `flags` 含む)。1-byte type + 1-byte flags + payload = `size`
-- **type**: u8、`MessageKind` enum (下記参照)
-- **flags**: u8、拡張用 (現状全 message で 0)
-- **payload**: type ごとに format 定義 (length-prefixed strings、u32/u16 LE 数値、binary bytes)
+- **size**: u32 LE、`type` byte + body の総 byte 数 (= `body_len + 1`)
+- **type**: u8 demux tag、下記参照
+- **body**: type に応じて raw bytes か CBOR item
 
-Max frame size: 16 MiB (`size < 16 * 1024 * 1024`)、超過は protocol error。
+最大 frame サイズ: **`size ≤ 16 MiB`** (= 16 * 1024 * 1024)。超過は protocol error → disconnect。
+
+**wire 外枠 (= `u32 size` + `u8 type` + `body`) は永久固定**。breaking 変更はしない。理由は §3 schema evolution と一致 (= 「cap で wire 変更を交渉」が成立しないため、外枠は固定にする)。frame layout 自体が変わるレベルの将来要件が発生した場合は **別 protocol = 別 socket path** を使う (例: `~/.hyoui/sock/<name>.v2.sock`)。
 
 理由:
-- 既存 `crates/hyoui/src/protocol.rs` の length-prefixed (u32 LE size + bytes) を拡張、後方互換
-- 自前 encode/decode で軽量、依存追加なし
-- bincode/msgpack/protobuf は将来 schema 安定化で乗り換え可能 (wire format は変えない)
-- WebSocket binary frame でもそのまま流せる
+- `size` 先頭で「あと何 byte 読めば 1 frame 取れるか」が即決定 = length-prefixed protocol の伝統、実装簡素
+- hexdump で frame 境界が読みやすい (debug 性)
+- 単一 frame layout (= type ごとに layout が変わらない) で decoder が綺麗
 
-### 2. Protocol version
+#### 1.2 type tag
 
+| value | 意味 | body |
+|-------|------|------|
+| `0x00` | raw PTY data | `body` = 生 bytes (= ANSI escape 含む、透過)。length-prefix のみ |
+| `0x01` | CBOR control message | `body` = 1 個の CBOR encoded item (典型は CBOR map) |
+| `0x02..0xff` | **予約** | MVP では受信時 protocol error で disconnect |
+
+理由 (ハイブリッド framing):
+- raw PTY data は per-byte の hot path → CBOR で包むと overhead (map header / key / type) が無視できない
+- 制御メッセージは秒に数回レベル → CBOR overhead は誤差、schema evolution / cross-lang / debug 性のメリットが大きい
+- 「type byte → 残り body の解釈」だけの単純 demux で済む
+- 将来 `0x02..` で ping/pong heartbeat、圧縮 data frame (例: LZ4)、CBOR Sequences ストリーム frame 等を追加余地
+
+### 2. Control message vocabulary (= type `0x01` の body)
+
+#### 2.1 形式: CBOR map with `kind` text key
+
+```cbor
+{
+  "kind": "<dotted.kind>",
+  ...payload fields...
+}
 ```
-PROTOCOL_VERSION = 1   // MVP
+
+- `kind` は text string、dotted naming (例: `"handshake.request"`, `"lock.acquire"`)
+- payload は同じ map の他 key
+
+理由:
+- text key は debug 性最強 (`cbor-diag` でそのまま読める)
+- enum 整数 tag (= DR-0008 旧案 0x00..) より cross-lang 親和性高い
+- size 誤差は制御メッセージ頻度では無視できる
+- dotted naming で sub-namespace を表現 (tmux/zellij 等の慣習に合う)
+
+#### 2.2 kind 一覧 (MVP / v0.1.0)
+
+| kind | 方向 | 用途 |
+|------|------|------|
+| `handshake.request` | client → daemon | 接続初回、cap negotiation + 認証 |
+| `handshake.response` | daemon → client | cap 確定、session 情報返却 |
+| `error` | 双方向 | 回復可能 error 通知 (protocol error 等) |
+| `resize` | leader → daemon | TIOCSWINSZ |
+| `signal` | client → daemon → 子 | 明示 signal (raw mode 中の Ctrl-C 代替等) |
+| `lock.acquire` | client → daemon | lock 取得要求 |
+| `lock.response` | daemon → client | lock 取得結果 |
+| `lock.release` | client → daemon | lock 解放 |
+| `leader.notify` | daemon → all clients | leader 変更通知 (broadcast) |
+| `mode.change` | daemon → all clients | rw/ro/locked 状態変化 (broadcast) |
+| `status.query` | client → daemon | session 状態問い合わせ |
+| `status.response` | daemon → client | status 返却 |
+| `tail.request` | client → daemon | scrollback の流し読み開始 |
+| `tail.data` | daemon → client | tail chunk |
+| `tail.end` | daemon → client | tail 終了 |
+| `wait.request` | client → daemon | 出力条件待ち |
+| `wait.result` | daemon → client | 条件成立 (or timeout) |
+| `detach` | client → daemon | client 自身 (or `--all`/`--others`) を detach |
+| `kill` | client → daemon | 子に SIGTERM → daemon exit |
+
+v0.2.0+ 予約:
+- `snapshot.request` / `snapshot.response` (画面 dump)
+- `leader.request` (leader CLI 解放)
+- `record.start` / `record.stop` / `play.start` (record/play)
+- `sink.attach` / `sink.detach` (永続出力先)
+
+#### 2.3 payload schema (主要)
+
+**`handshake.request`**:
+```cbor
+{
+  "kind": "handshake.request",
+  "caps": ["data", "lock", "tail-v1", "wait-l0", ...],  // client が話せる capability の集合
+  "mode": "rw" | "ro" | "rw-no-leader",
+  "exclusive": <bool>,        // 起動時占有要求
+  "detach-others": <bool>,    // attach 時に他を奪取
+  "token": <text> | null      // HYOUI_LOCK_TOKEN env 由来、null なら未提示
+}
 ```
 
-HANDSHAKE で交換、不一致なら ERROR で disconnect。
+**`handshake.response`**:
+```cbor
+{
+  "kind": "handshake.response",
+  "caps": ["data", "lock", "tail-v1", ...],  // daemon が話せる capability
+  "session-id": "<name>",                    // session 名 (DR-0006 規定)
+  "client-id": <uint>,                       // daemon が割り当てた client 番号
+  "leader": <bool>,                          // leader 取得結果
+  "mode": "rw" | "ro" | "rw-no-leader"       // 認証後の実 mode
+}
+```
 
-後方互換性ある変更 (= 新 message kind 追加、optional field 追加) は version 据え置き。breaking change (既存 message の format 変更、required field 追加) は version up。
+cap negotiation: daemon は client の caps と自身の caps の intersection を「有効 capability」として扱う。client が unsupported feature を呼ぼうとしたら client 側で reject、daemon が unsupported request を受けたら `error` で kind=`"unsupported-capability"` を返す。
 
-### 3. Message kinds
+**`error`**:
+```cbor
+{
+  "kind": "error",
+  "code": "<error-code-string>",   // 例: "protocol.malformed", "lock.denied", "mode.not-leader"
+  "message": "<human readable>",
+  "details": { ... } | null        // 追加情報 (optional)
+}
+```
+
+error code は dotted text string で人間可読性優先 (= 数値 enum よりデバッグしやすい)。code 体系は実装フェーズで一覧化。
+
+**`resize`**:
+```cbor
+{
+  "kind": "resize",
+  "cols": <uint>,
+  "rows": <uint>
+}
+```
+
+leader 以外が送ると daemon は `error` で kind=`"mode.not-leader"` を返す。
+
+**`signal`**:
+```cbor
+{
+  "kind": "signal",
+  "signum": <uint>     // POSIX signal number (SIGINT=2, SIGTERM=15, etc.)
+}
+```
+
+通常は raw PTY data の `0x00` frame に Ctrl-C (0x03) を含めれば pty の line discipline (ISIG flag 有効時) で SIGINT 発火する。`signal` は raw mode 中や明示送信ケース用。
+
+**`lock.acquire`**:
+```cbor
+{
+  "kind": "lock.acquire",
+  "wait": <bool>,              // true = wait queue 参加 / false = fail mode
+  "timeout-abs-ms": <uint> | null,  // 絶対 timeout (ms)、null なら無限
+  "timeout-idle-ms": <uint> | null, // idle timeout (ms)、null なら無効
+  "process-bound": <bool>      // process と寿命を紐付ける
+}
+```
+
+**`lock.response`**:
+```cbor
+{
+  "kind": "lock.response",
+  "result": "acquired" | "queued" | "denied" | "timeout",
+  "token": "<text>" | null,    // result="acquired" のみ token を返す
+  "queue-position": <uint> | null  // result="queued" 時の順位
+}
+```
+
+**`status.response`** / **`tail.request`** / **`wait.request`** の細部 schema は実装フェーズで詰める (cap flags で互換性は確保される)。
+
+### 3. Schema evolution = cap flags 一本
+
+#### 3.1 PROTOCOL_VERSION は廃止
+
+CBOR map の self-describing 性 + cap flags の組み合わせで schema evolution を表現する。固定 version field は持たない。
+
+#### 3.2 未知 field policy = ignore unknown
+
+control message を decode する側は **未知 key を黙って無視する** (forward-compatible)。送信側は CBOR map に新 field を後付け追加できる。
+
+ただし cap negotiation で「相手が話せない」と分かれば必須 field 欠落・format 不一致は `error` で notify する道筋を作る。
+
+#### 3.3 wire 外枠は永久固定、extension は type tag 追加で forward-compat
+
+frame layout 自体 (`u32 size` + `u8 type` + `body`) の変更は、handshake を decode する前段で起きるため cap flags では交渉不可能 (= cap を読むには CBOR control frame を decode する必要があり、それは frame 外枠が正しいことが前提)。これは設計上の循環なので **wire 外枠を永久固定** する方針 (§1.1) で解消する。
+
+機能追加は以下の forward-compatible 経路のみ:
+
+- **新 type tag 追加** (例: `0x02` = LZ4 圧縮 data frame、`0x03` = ping)。MVP は未知 type を protocol error で disconnect するが、cap 経由で「unknown type を ignore する」モードを将来追加できる (= 旧 daemon が新 client の `0x02` frame を黙って skip 可能になる)
+- **新 control message kind 追加** (= CBOR map の `kind` 値)。未知 kind は decode 側で ignore (forward-compat)
+- **既存 message の field 追加**。未知 field は ignore (§3.2)
+
+これらは全て cap flags で「相手が話せるか」を確認した上で送る。
+
+frame 外枠 (size + type + body) の変更が必要になった場合は **別 protocol = 別 socket path** で扱う (例: `~/.hyoui/sock/<name>.v2.sock`)。これは forward-compat ではなく fork (= 旧 v1 と新 v2 が同居)、運用負荷は大きいが circular dependency に陥らない。
+
+#### 3.4 cap 命名規約
+
+- 機能名は `noun-verb` or `noun-vN` (例: `"lock"`, `"tail-v1"`, `"snapshot-v1"`, `"wire-v1"`)
+- 新 capability 追加は forward-compatible (= 未知 cap は ignore で良い)
+- 既存 cap の semantics 変更は新 cap 名で表現 (= 旧名を残しつつ新名追加)
+
+### 4. 用語 (industry 標準採用)
+
+abduco/shpool に最も近い (= "minimal abduco + control infrastructure" 位置づけ) ので、語彙は industry 標準を採用:
+
+| 用語 | 意味 (本 protocol 内) |
+|------|---------------------|
+| session | daemon + 子 PTY + scrollback の集合体 (= name で識別) |
+| client | session に attach する process (CLI 単発、長期 attach、WS 等) |
+| attach | client が session に接続して入出力を中継開始する操作 |
+| detach | client が session から切断する操作 |
+| leader | session 内で TIOCSWINSZ 計算対象になる代表 client (rw mode の 1 つに自動付与) |
+| lock | 排他取得状態、token で識別 |
+| mode | client の動作 mode (rw / ro / rw-no-leader) |
+| scrollback | 過去出力の ring buffer (PoC 07 / src/scrollback.rs) |
+
+`pane` は hyoui MVP では使わない (= 1 session = 1 PTY、pane 概念なし)。将来複数 pane を持つ session 形式を入れる場合は別 DR で扱う。
+
+### 5. Transport 抽象 = 薄い Read + Write
 
 ```rust
-#[repr(u8)]
-pub enum MessageKind {
-    // === Handshake (0x00..) ===
-    HandshakeRequest  = 0x00,
-    HandshakeResponse = 0x01,
-    Error             = 0x02,
-
-    // === Data stream (0x10..) ===
-    DataFromChild     = 0x10,   // daemon → client (broadcast)、子 pty stdout
-    DataFromClient    = 0x11,   // client → daemon (multiplex)、子 pty stdin
-
-    // === Terminal control (0x20..) ===
-    Resize            = 0x20,   // leader → daemon (TIOCSWINSZ)
-    Signal            = 0x21,   // client → daemon → 子 (送信 sig 番号、文字コード代替)
-
-    // === Lock / leader (0x30..) ===
-    LockAcquire       = 0x30,
-    LockResponse      = 0x31,
-    LockRelease       = 0x32,
-    LeaderRequest     = 0x33,   // v0.3.0 で解放
-    LeaderNotify      = 0x34,   // daemon → client broadcast (leader 変更通知)
-    ModeChange        = 0x35,   // daemon → client broadcast (rw/ro/locked 状態変更)
-
-    // === Status / discovery (0x40..) ===
-    StatusQuery       = 0x40,
-    StatusResponse    = 0x41,
-
-    // === Tail / wait (0x50..) ===
-    TailRequest       = 0x50,
-    TailData          = 0x51,
-    TailEnd           = 0x52,
-    WaitRequest       = 0x53,
-    WaitResult        = 0x54,
-
-    // === Lifecycle (0x60..) ===
-    Detach            = 0x60,   // client が自分を detach (or --all/--others)
-    Kill              = 0x61,   // daemon に kill 要求 (= 子に SIGTERM → daemon exit)
-
-    // === 予約 (0x70..) ===
-    // 将来追加用、未使用
-}
-```
-
-### 4. Payload format (主要 message)
-
-#### `HandshakeRequest` (0x00)
-
-```
-+-------------------+-----+-----+----------------+--------------------+
-| protocol_version  | mode| ... | u16 LE token_len | token bytes (UTF8) |
-| u16 LE            | u8  |     |                  |                    |
-+-------------------+-----+-----+----------------+--------------------+
-  mode:
-    0 = rw (default)
-    1 = ro (read-only、winsize 計算除外)
-    2 = rw_no_leader (= rw だが leader 取らない)
-  flags (byte after mode):
-    bit 0: exclusive (= 起動時占有要求)
-    bit 1: detach_others (= attach 時奪取)
-  token_len: 0 なら token 無し
-```
-
-#### `HandshakeResponse` (0x01)
-
-```
-+-------------------+----------+---------+-----+-----+----------------+
-| protocol_version  | client_id| leader  | mode| ... | server_caps    |
-| u16 LE            | u32 LE   | u8 bool | u8  |     | u32 LE         |
-+-------------------+----------+---------+-----+-----+----------------+
-  client_id: daemon が割り当て
-  leader:    true なら leader 取れた
-  mode:      daemon が認証した実 mode (リクエスト時から変更されうる)
-  server_caps: bit 0 = supports lock, bit 1 = supports snapshot, ...
-```
-
-#### `DataFromChild` / `DataFromClient` (0x10, 0x11)
-
-payload = bytes (生)。length は frame の `size - 2` (= type + flags 除く)。
-
-#### `Resize` (0x20)
-
-```
-+--------+--------+
-| u16 LE | u16 LE |
-| cols   | rows   |
-+--------+--------+
-```
-
-leader 以外が送信した場合 daemon は無視 (or `Error` で notify)。
-
-#### `Signal` (0x21)
-
-```
-+----+
-| u8 |
-| sig|
-+----+
-  sig: POSIX signal number (SIGINT=2, SIGTERM=15, SIGTSTP=20, etc.)
-```
-
-daemon が `kill(child_pgid, sig)` で子に送る。
-通常は `DataFromClient` に Ctrl-C (0x03) 等を含めれば pty の line discipline が ISIG flag 有効 (cooked mode) なら SIGINT 発火する。
-このメッセージは raw mode 中 (= ISIG disable) や明示的に signal を送りたいケース用。
-
-#### `LockAcquire` (0x30)
-
-```
-+--------------+-----+-----+------------+------------+------------+
-| timeout_abs  | ... | bit | abs DUR ms | idle DUR ms| bool process|
-| flags u8     |     |     | u32 LE     | u32 LE     | u8         |
-+--------------+-----+-----+------------+------------+------------+
-  flags: bit 0 = wait mode (= 0 なら fail mode)
-         bit 1 = absolute timeout set
-         bit 2 = idle timeout set
-         bit 3 = process bound
-```
-
-#### `LockResponse` (0x31)
-
-```
-+------+----------------+--------------+
-| u8   | u16 LE token_len| token bytes  |
-| ok   |                 |              |
-+------+----------------+--------------+
-  ok: 0 = success, 1 = wait queue full, 2 = held by other, 3+ = error
-```
-
-#### `StatusResponse` (0x41) / `TailRequest` (0x50) / `WaitRequest` (0x53)
-
-詳細は MVP 実装フェーズで詰める。本 DR では「枠」のみ確定、payload format は実装段階で最終確定。
-
-#### `Error` (0x02)
-
-```
-+------------+-------------+--------------+
-| u16 LE code| u16 LE msglen| msg UTF8     |
-+------------+-------------+--------------+
-  code:
-    0x0001 = unknown message kind
-    0x0002 = protocol version mismatch
-    0x0003 = malformed payload
-    0x0004 = lock denied
-    0x0005 = not leader (= Resize sent by non-leader)
-    0x0006 = name conflict
-    0xffff = generic
-```
-
-### 5. Transport trait
-
-```rust
-pub trait Transport: Send {
-    fn send_frame(&mut self, frame: &Frame) -> Result<()>;
-    fn recv_frame(&mut self) -> Result<Frame>;
-    fn close(self: Box<Self>);
+// 概略 (確定形は実装時)
+pub trait Transport: std::io::Read + std::io::Write + Send + 'static {
+    fn close(self: Box<Self>) -> Result<()>;
 }
 
-pub struct Frame {
-    pub kind: MessageKind,
-    pub flags: u8,
-    pub payload: Vec<u8>,
-}
+pub struct FrameReader<T: Transport> { inner: T, ... }
+pub struct FrameWriter<T: Transport> { inner: T, ... }
 ```
 
-実装:
-- **MVP**: `UnixStreamTransport` (= `UnixStream` on top of `UnixSock`)
-- v0.2.0: `TcpStreamTransport` (= `TcpStream`、`hyoui serve` 内部)
-- v0.2.0: `WebSocketTransport` (= `tokio-tungstenite` 等、xterm.js 経由)
+MVP: **`UnixStreamTransport`** (= `UnixStream` を `Transport` で wrap)
 
-各 Transport は length-prefixed 同じ wire format を流す、上層は kind/payload で抽象的に扱う。
+将来:
+- `TcpStreamTransport` (= `hyoui serve` 内部)
+- `WebSocketTransport` (= `tokio-tungstenite` 等、xterm.js 経由、binary frame で wire 透過)
+- `StdioTransport` (= SSH stdio 経由、gateway 戦略の receiver)
 
-### 6. Encode / Decode
+全 transport は同じ frame layout (`[u32 size][u8 type][body]`) を流す。上層は `Frame { kind, body }` 単位で扱う。
 
-MVP は手書き encode/decode (= 各 MessageKind ごとの serialize/deserialize 関数)。
+### 6. PtyMux 互換 = gateway 戦略
 
-```rust
-impl Frame {
-    pub fn encode(&self, out: &mut Vec<u8>) {
-        let total_size = 2 + self.payload.len();  // type + flags + payload
-        out.extend_from_slice(&(total_size as u32).to_le_bytes());
-        out.push(self.kind as u8);
-        out.push(self.flags);
-        out.extend_from_slice(&self.payload);
-    }
+PtyMux Protocol (stalled) との将来互換は以下の方針:
 
-    pub fn decode<R: Read>(r: &mut R) -> Result<Frame> {
-        let mut size_buf = [0u8; 4];
-        r.read_exact(&mut size_buf)?;
-        let size = u32::from_le_bytes(size_buf) as usize;
-        if size < 2 || size > MAX_FRAME_SIZE { return Err(...); }
-        let mut frame_buf = vec![0u8; size];
-        r.read_exact(&mut frame_buf)?;
-        let kind = MessageKind::try_from(frame_buf[0])?;
-        let flags = frame_buf[1];
-        let payload = frame_buf[2..].to_vec();
-        Ok(Frame { kind, flags, payload })
-    }
-}
-```
+- **hyoui daemon 自身は独自 wire (本 DR の CBOR hybrid) のみ喋る**。マルチプロトコル化しない
+- 将来 PtyMux 仕様が固まったら、**別 process (= `hyoui-ptymux-gateway` 等) を間に挟む**。hyoui daemon ⇔ gateway は hyoui wire、gateway ⇔ external client は PtyMux wire
+- これによって core を複雑化せずに将来互換余地を残す
+- 現時点 (2026-05-26) では PtyMux 仕様が公開されていないので、DR では「互換手段としての gateway を future-work として明記」のみ
 
-各 payload は専用 struct (`HandshakeRequest`, `LockAcquire` etc.) で encode/decode 関数 を提供。
+### 7. 認証 / Authorization
 
-### 7. Authentication
+- 信頼境界: **同 UID** (socket perm 0600 + parent dir 0700 = sys/socket.rs 既存実装)
+- `handshake.request.token` で lock token 提示、daemon が照合 (= HYOUI_LOCK_TOKEN env 経由、[[2026-05-26-lock-token-env]])
+- 暗号化なし (= 同 UID 信頼領域、別 UID は socket perm で完全遮断)
+- TCP / WebSocket transport を追加する v0.2.0+ では別途 token-based authentication or TLS を DR 化
 
-- **Socket permission 0600 + parent dir 0700** で同 UID 限定 (= sys/socket.rs 既存実装)
-- **Lock token** (HYOUI_LOCK_TOKEN env から client 自動取得) で daemon が照合
-- 同 UID = 信頼領域、別 UID は socket permission で完全遮断
-- 詳細は [[2026-05-26-lock-token-env]] の "Security 注意点"
+### 8. Concurrency / Ordering / Backpressure
 
-### 8. Capability negotiation
+#### 8.1 順序保証
 
-`server_caps` / `client_caps` で feature flag を相互通知:
+- 1 client connection 内: send/recv は順序保証 (= TCP/Unix socket stream の性質)
+- daemon が複数 client に broadcast: client 間で順序保証なし
+- raw PTY data (= type `0x00`) の bytes は順序保証 (= 子の出力 bytes 順を維持)
+- 複数 client の `0x00` frame (= stdin) は **client 間で interleave 可能**。lock/tx で防ぐのはユーザの責務
 
-| bit | feature | MVP | v0.2.0 | v0.3.0 |
-|---|---|---|---|---|
-| 0 | basic data stream (handshake/data/resize/signal) | ⭕ | ⭕ | ⭕ |
-| 1 | lock/tx | ⭕ | ⭕ | ⭕ |
-| 2 | tail (--since/--follow) | ⭕ | ⭕ | ⭕ |
-| 3 | wait L0 (--idle/--text/--pattern) | ⭕ | ⭕ | ⭕ |
-| 4 | snapshot (画面 dump) | ❌ | ⭕ | ⭕ |
-| 5 | wait L1 (--rect/--cursor) | ❌ | ⭕ | ⭕ |
-| 6 | wait L2 (--area/--predicate) | ❌ | ❌ | ⭕ |
-| 7 | leader CLI 操作 | ❌ | ❌ | ⭕ |
-| 8 | sink (永続出力先) | ❌ | ❌ | ⭕ |
-| 9 | record/play | ❌ | ❌ | ⭕ |
+#### 8.2 Backpressure (= slow client 対策)
 
-client は不足 capability を見て「未対応機能」とエラーを返せる。
+multi-attach broadcast の core 要件として、遅い client が全 session を止める事態を防ぐ必要がある。drop は terminal stream を破壊する (= ANSI escape 中断で画面崩壊)、無制限 buffer は OOM のリスク。よって以下の戦略を採用:
 
-### 9. Lifecycle / Error handling
+- **daemon は client ごとに bounded output queue を持つ**
+  - 既定: `8 MiB` (= scrollback buffer の典型サイズと同程度)、daemon 起動時オプションで上書き可能 (= 実装フェーズで `--client-buffer-bytes` 等)
+  - queue の単位は frame ではなく byte 数 (= 大 frame 1 個でも上限到達するため)
+- **queue 超過時はその client を切る**
+  1. daemon は当該 client に `error` (kind=`"backpressure.disconnect"`、`details = { "queued_bytes": ..., "limit": ... }`) を送る (queue 末尾に enqueue できる場合のみ、できなければ送らず即 close)
+  2. 接続を close (= TCP RST / Unix socket close)
+  3. 該当 client の `broadcast list` から除外、leader だった場合は cascade で次の rw client に移譲 (= leader 選出ロジックの一部)
+- **drop はしない**: stream 破壊を避ける + 「黙って消える」より「明示的に disconnect」が運用上 debug しやすい
+- **他 client は影響を受けない**: 遅い client を切ったあと、残りの client への broadcast は通常通り継続
 
-#### Connection lifecycle
+実装上のヒント:
+- daemon の broadcast 側は per-client mpsc channel (bounded、N bytes) + 専用 writer task で実装。enqueue 失敗 (= channel full) でその client を切る
+- bound のサイズはユーザ要件次第 (= 一瞬の遅延を許容したいなら大きく、即切断したいなら小さく) なので runtime 設定可能にする
 
-```
-1. client が Unix socket connect (or TCP/WebSocket)
-2. client が HandshakeRequest 送信
-3. daemon が HandshakeResponse or Error 返信
-4. 以降 Frame の交換 (双方向)
-5. client が detach (Detach Frame) or 切断 (EOF / connection error)
-6. daemon が cleanup (broadcast list から除外、leader cascade)
-```
+#### 8.3 client 側の対称ルール
 
-#### Error の流れ
+client から daemon への送信側も同様の bound が daemon の receive 側にあると想定して、client は flush 失敗で abort する。実装は OS の socket buffer に任せる (= 明示 buffer は持たない) ことから始める。問題が出たら別途検討。
 
-- daemon が malformed frame を受信 → Error frame で返信 → 接続維持 (回復可能)
-- protocol version mismatch → Error → 即 disconnect
-- daemon の内部 error → Error frame で notify、状況により disconnect
-- client 側で Error 受信 → 出力 + 適切な exit code
+### 9. Encode / Decode の実装スタイル
 
-### 10. Concurrency / Ordering
+- frame encode/decode は手書き (`Frame::encode_to<W: Write>` / `Frame::decode_from<R: Read>`)、依存ゼロ
+- control message (= type `0x01` の body) は `#[derive(serde::Serialize, serde::Deserialize)]` + `ciborium::from_reader` / `ciborium::into_writer`
+- 各 control message は struct で表現、`kind` field は struct の `kind: &'static str` (encode 時固定値) or enum 経由で処理
+- ciborium は serde 経由なので derive で書ける → 手書き repetition なし、type safety 確保
 
-- 1 client connection 内では **send/recv は順序保証** (= TCP/Unix socket の stream 性質)
-- daemon が複数 client に broadcast する時 **client 間で順序保証なし** (= ある client が他より先に出力を受け取る可能性)
-- DataFromChild の bytes は順序保証 (= 子の出力 bytes order を維持)
-- DataFromClient の bytes は **client 間で interleave 可能** (= 多 client 同時入力時、bytes が混ざる)。lock/tx で防ぐのがユーザの責務
+### 10. テスト戦略
+
+- **frame layer**: round-trip (encode → decode → 比較)、malformed input (= size 過大、未知 type tag、CBOR parse error) の error handling
+- **control message**: 各 struct の round-trip、cap negotiation の組み合わせテスト
+- **golden test fixtures**: 既知 message を CBOR encode した hex dump を `tests/fixtures/*.cbor.hex` に保存、wire 互換性 regression check
+- **e2e**: client → daemon の handshake → data 中継 → detach フロー (= integration test)
+- **mock transport**: `Transport` trait の in-memory 実装で daemon ロジックを単体 test
 
 ## Rejected alternatives
 
-### bincode / msgpack を MVP から採用
+### bincode
+RUSTSEC-2025-0141 unmaintained。主要 Rust プロジェクト (cargo, rustls 等) も移行進行中。wire format 候補としては排除。
 
-- bincode は schema 安定性が version 依存 (= bincode 2.0 で breaking change あり)、wire format 互換性管理が複雑
-- msgpack は cross-language 互換性高いが overhead あり (= タグ + length 各 field 毎)
-- MVP では手書き、後で乗り換え可能 (= wire format = length-prefixed binary frame は変えない)
+### MessagePack (rmp-serde 等)
+CBOR と機能ほぼ同等だが、debug tooling が劣る (annotated hex / web visualization / Wireshark dissector の差)。標準化観点で CBOR (IETF RFC 8949) が上。差は僅かだが CBOR を採用。
 
-### JSON wire format
+### protobuf / Cap'n Proto
+IDL toolchain + codegen + build.rs が必要、binary size と build time の負担大。terminal IPC には overkill。schema evolution の堅さは魅力だが代償が大きい。
 
-- text なので debug は容易
-- size が binary より 2-3 倍、bytes 透過 (DataFromChild) で escape 必要
-- 性能 (parse cost) も binary より遅い
-- → 不採用
+### postcard
+Rust 専用 (= R9 cross-lang と矛盾)。serde 互換で軽量だが、ブラウザ client 想定が消える。
 
-### gRPC / protobuf
+### JSON (serde_json)
+debug 性は最高だが、raw PTY bytes を base64 化すると約 3x size overhead (R2 hot path で致命的)。text なのに binary を扱うミスマッチ。
 
-- schema 定義の厳密性、cross-language、コードジェネレータ
-- 重い (依存大、ビルド時間増、binary サイズ)
-- hyoui の MVP には overkill
-- 将来検討余地はあるが、今は不要
+### 自前 binary 手書き (= 議論初期 DR-0008 旧案)
+依存ゼロは魅力だが:
+- 各 message struct ごとに encode/decode 関数を手書き = メンテコスト
+- cross-lang client (R9) で再実装する場合の負担大
+- schema evolution の自由度が低い (= field 追加に各 message でロジック書き換え必要)
+- bincode と比較する文脈で「wire format 完全制御」を理由にしていたが、CBOR でも wire layout は完全に決定論的 (= 同じ struct → 同じ bytes)、その利点はほぼ等価
 
-### 1 メッセージ = 1 socket message (= datagram 型)
+### PROTOCOL_VERSION field
+CBOR map の self-describing 性 + cap flags で表現力が足りる。固定 version は冗長。frame 外枠の breaking 変更は §3.3 のとおり別 socket path で fork する (= cap で交渉は循環するため不採用)。
 
-- Unix datagram socket で frame 境界が自然
-- ただし TCP / WebSocket では使えない (stream のみ)
-- transport 統一のため stream + length-prefix を採用
+### 先頭 magic + wire major version の prelude
+案: socket connect 直後に `b"HYOUI\0"` + `u8 wire_major` を交換し、wire 外枠を将来 breaking 変更可能にする。これは frame layout 変更を許容する場合の正攻法。
+
+不採用の理由: hyoui の MVP/v0.1.0 段階で wire 外枠を変える必要性が見えない (= type tag 追加 + control message field 追加で機能拡張は概ね足りる)。prelude を入れると最初の handshake までに 1 往復増える、エラーパス (= 古い client) で接続を切る判定箇所が増える。**「将来 wire を変えなければならなくなったら別 socket path に逃げる」** の方が外枠固定で済んで simple。
+prelude の道を残すコストはあとから払うより、必要になってから初版 (= 別 socket path or 別 protocol) で導入する方が筋。
+
+### MessageKind を enum 整数 tag で表現
+DR 旧案では `MessageKind = 0x00..` の u8 enum を使っていた。CBOR では text string (例: `"handshake.request"`) の方が debug 性高く、size 差は誤差。整数 enum は採用しない。
+
+### CBOR Tag (RFC 8949 §3.4) で kind 表現
+CBOR Tag は user-defined range もあるが、汎用 tooling (cbor-diag / Wireshark) が tag 番号を見せても意味が分からない (= map key の方が読みやすい)。tag の overhead/可読性両面で中途半端、不採用。
+
+### CBOR map で short key 採用 (= "k" 等で size 節約)
+control message は秒に数回レベル、size 節約の必要性低い。debug 性 (`cbor-diag` でそのまま読める) が優先。
+
+### CBOR Sequences (RFC 8742) を MVP で活用
+scrollback の large dump や tail (--follow) で「区切りなしの CBOR item 連鎖」を使うと streaming に向く。ただし frame layer (= type `0x01` + length-prefix) と二重化、MVP では frame 単位で 1 CBOR item に統一。Sequences は v0.2.0+ の snapshot/tail-bulk で再評価。
+
+### CBOR の crate 選定: serde_cbor / minicbor
+- `serde_cbor` は unmaintained (= bincode と同じ運命)
+- `minicbor` は no_std + serde 非依存、軽量だが独自 derive macro 必須、ecosystem 親和性が劣る
+- **`ciborium` を採用** (active maintenance、serde 経由、ergonomic)
+
+### hyoui daemon の PtyMux マルチプロトコル化
+PtyMux 仕様自体が stalled (2025-10 時点で未公開 / 進展停止)。stalled な仕様への core 統合は本末転倒。gateway 戦略 (§6) で代用。
+
+### data 流路と control 流路を別 socket
+2 connection 構成は Unix socket では可能だが、WebSocket transport で multi-stream 化が必要 (subprotocol or stream multiplexing)。複雑化に対する利得 (= demux 簡素化) は frame 内の type byte demux で代用可能。**1 connection 内で frame type demux** を採用。
 
 ## Consequences
 
 ### 実装への波及
 
-- **新 module**: `crates/hyoui/src/protocol/` (mod.rs + message kind ごとの sub-module)
-  - `mod.rs`: `Frame`, `MessageKind`, `Transport` trait
-  - `messages/handshake.rs`, `messages/data.rs`, `messages/lock.rs`, `messages/tail.rs`, `messages/wait.rs`, etc.
-  - `transports/unix.rs` (MVP)、将来 `transports/tcp.rs`, `transports/websocket.rs`
-- 既存 `crates/hyoui/src/protocol.rs` (= 単純 length-prefixed) は本 DR の `Frame::decode` のベース、`messages/` で kind 毎の payload encode/decode を追加
+- **新 module**: `crates/hyoui/src/protocol/`
+  - `mod.rs`: re-export
+  - `frame.rs`: `Frame { type, body }`, `encode_to`, `decode_from`, type tag 定数, MAX_FRAME_SIZE
+  - `messages/`: 各 control message struct (`handshake.rs`, `lock.rs`, `tail.rs`, `wait.rs`, `status.rs`, `lifecycle.rs`, `error.rs`, `control.rs` etc.) + serde derive
+  - `transports/unix.rs`: `UnixStreamTransport` (MVP)
 - **新 module**: `crates/hyoui/src/daemon/` (socket bind + multi-attach + 永続 PTY 管理)
-  - 既存 `crates/hyoui/src/agent.rs` (v0.0.0 の単純 PTY ラッパー、697 行) は意味的に別物 (daemon = socket bind + 永続、agent = 単発 fork + 中継) なので**廃止**
-  - ただし参考実装として残す価値はあるので `crates/hyoui/examples/00-pty-wrapper.rs` に移植 (依存を解消した standalone 版に書き換え)。PoC 01-08 と並ぶ「PoC 00」扱い
+  - 既存 `crates/hyoui/src/agent.rs` (v0.0.0 PoC、697 行) は本 DR の対象外、`crates/hyoui/examples/00-pty-wrapper.rs` に保全して削除 (PoC 00 扱い)
   - `cli.rs::run` は新 daemon module を呼ぶ形に置換
-- daemon の event loop は Frame 単位で dispatch (= 既存 PoC 02 の bytes 中継から拡張)
+- **依存追加**: `ciborium`, `serde`, `serde_derive` (= `serde = { version = "1", features = ["derive"] }` + `ciborium`)
 
 ### Release タイミング (v0.0.x → v0.1.0)
 
-- **中間 v0.0.x release は打たない**。protocol module だけ release しても client/daemon が無く動作しないため
-- run / attach / detach / list / status / kill が全動作する状態で初めて **v0.1.0** を打つ (= DR-0007 の MVP scope と整合)
-- それまでは main は green を保ちつつ progress、tag は v0.1.0 まで打たない
+- 中間 v0.0.x release は打たない (= protocol module だけ release しても client/daemon が無く動作しない)
+- run / attach / detach / list / status / kill が全動作した時点で **v0.1.0** を打つ (DR-0007 MVP scope と整合)
+- main は green を保ちながら progress、tag は v0.1.0 まで打たない
 - release flow は kawaz/* 標準 (`pkf run bump-version --level=minor` → main push → CI が tag + GH Release 自動生成、`release-flow-awareness.md` 参照)
 
 ### テスト戦略
 
-- 各 message kind ごとに encode/decode の round-trip test
-- Frame::decode の malformed input に対する error handling test
-- end-to-end test: client が HandshakeRequest 送る → daemon が HandshakeResponse 返す
-- Transport trait の mock 実装で daemon ロジックを test (= 実 socket 不要)
+- 各 control message の round-trip (encode → decode → 比較)
+- frame layer の malformed input (oversized, unknown type, truncated, CBOR parse error)
+- golden test fixtures: 主要 message を CBOR encode した hex を `tests/fixtures/protocol/*.cbor.hex` に保存、wire 互換 regression 検出
+- mock `Transport` 実装で daemon ロジックを単体 test
+- e2e integration test: handshake → data 中継 → detach → cleanup
 
 ### 未確定事項 (実装フェーズで詰める)
 
-- `StatusResponse` の payload schema (= scrollback info, clients list, etc.)
-- `TailRequest`/`TailData`/`TailEnd` の細部
-- `WaitRequest`/`WaitResult` の rich result (regex captures, position, etc.)
-- `LeaderRequest` の semantics (v0.3.0 で確定)
-- backpressure / flow control (= daemon が遅い client にどう対処するか、初期は drop or buffer)
+- `status.response` の payload schema (= scrollback info, clients list, lock state, child pid 等)
+- `tail.request` / `tail.data` / `tail.end` の細部 (= since cursor, follow, line vs byte モード)
+- `wait.request` / `wait.result` の rich result (regex captures, position, timeout 結果)
+- error code 一覧 (実装と並行で網羅、本 DR では枠のみ)
+- cap flag 一覧の確定 (実装の進捗で追加)
+- per-client buffer 既定値の妥当性 (= 8 MiB が現実的か、運用で観察)
 
-これらは MVP 実装の中で TaskCreate で個別に詰める。
+これらは MVP 実装の中で個別 TaskCreate で詰める。
 
 ## 関連
 
 - [[DR-0005]] — 思想 (外側自動操作主軸)
-- [[DR-0006]] — CLI ground rules (本 DR の API を呼び出す client 側)
-- [[DR-0007]] — MVP scope (v0.0.1 で protocol を実装)
+- [[DR-0006]] — CLI ground rules (本 protocol を呼び出す client 側)
+- [[DR-0007]] — MVP scope (v0.1.0 で protocol + daemon + client)
 - [[2026-05-26-fd-passing-vs-stream]] — SCM_RIGHTS 不採用、stream 中継一本化の根拠
-- [[2026-05-26-multi-attach]] — daemon の broadcast/multiplex の poll パターン
+- [[2026-05-26-multi-attach]] — daemon broadcast/multiplex の poll パターン
+- [[2026-05-26-lock-token-env]] — env 経由 token 継承
 - [[2026-05-26-poc-summary]] — PoC 全体まとめ
+- 外部議論 artifacts (2026-05-26): CBOR 採用根拠、PtyMux 状況、industry 用語整理 ※ chat 内 ephemeral、URL は ハンドオフ参照
+- RFC 8949 — CBOR (Concise Binary Object Representation)
+- RFC 8742 — CBOR Sequences (将来活用)
