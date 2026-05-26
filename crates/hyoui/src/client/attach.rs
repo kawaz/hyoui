@@ -168,6 +168,19 @@ impl Default for AttachOptions {
     }
 }
 
+/// `ClientConnection::run` で stdin EOF を検出したときの挙動 (R5-FB2)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StdinEofAction {
+    /// 何もせず即 return (= 通常の attach。MVP 既定。stdin EOF は detach 同等)。
+    Detach,
+    /// EOT (= ASCII 0x04, Ctrl-D) を子 PTY に raw_data として送ってから return。
+    /// canonical mode の子 (例: bc / cat) は行頭の EOT を read EOF として
+    /// 解釈するため、`echo "1+2" | hyoui run --mode=headless -- bc` のような
+    /// pattern で子が自然終了する。
+    SendEof,
+}
+
 /// daemon と確立した 1 接続。
 ///
 /// `connect` で handshake 完了状態を持ち、`run` で stdin/stdout 中継に入る。
@@ -177,6 +190,10 @@ pub struct ClientConnection {
     writer: UnixStream,
     /// daemon が返した handshake response (= 確定した cap / mode / leader / session_id)。
     pub response: HandshakeResponse,
+    /// stdin EOF 時の挙動 (R5-FB2)。default `Detach` (= MVP attach 挙動)。
+    /// `set_stdin_eof_action(SendEof)` で `hyoui run --mode=headless -- bc`
+    /// のような pipe-through pattern で子に EOF を伝える。
+    eof_action: StdinEofAction,
 }
 
 impl ClientConnection {
@@ -246,7 +263,21 @@ impl ClientConnection {
             reader,
             writer,
             response,
+            eof_action: StdinEofAction::Detach,
         })
+    }
+
+    /// stdin EOF 時の挙動を設定 (R5-FB2)。default は `Detach` (= MVP attach
+    /// 挙動)。`SendEof` を設定すると `run` が stdin EOF を検出した瞬間に EOT
+    /// (= 0x04) を子 PTY に送ってから return する。
+    ///
+    /// 通常 `hyoui run --mode=headless -- <cmd>` のような pipe-through pattern
+    /// でのみ意味を持つ (= `hyoui attach` 側は detach 同等が望ましいので変更
+    /// しない)。
+    #[must_use]
+    pub fn with_stdin_eof_action(mut self, action: StdinEofAction) -> Self {
+        self.eof_action = action;
+        self
     }
 
     /// stdin / stdout を daemon と中継する。
@@ -325,8 +356,21 @@ impl ClientConnection {
                 let mut buf = [0u8; 8192];
                 match stdin.read(&mut buf) {
                     Ok(0) => {
-                        // stdin EOF → MVP では「自分は detach」と解釈、return
-                        // 本実装では detach frame は送らず単に socket close で終了
+                        // R5-FB2: stdin EOF の挙動は `eof_action` で分岐。
+                        // - Detach (default): 即 return (= MVP attach 挙動)
+                        // - SendEof: EOT (0x04) を子 PTY に送ってから return
+                        //   (= `hyoui run --mode=headless -- bc` の pipe pattern
+                        //   で子が canonical mode の場合に自然 exit させる)
+                        if self.eof_action == StdinEofAction::SendEof {
+                            let frame = Frame::raw_data(vec![0x04]);
+                            let _ = frame.encode_to(&mut self.writer);
+                            let _ = self.writer.flush();
+                            // daemon の出力を少し読み続ける選択肢もあるが、ここで
+                            // 即 return しても socket は close されず caller 側で
+                            // daemon thread を join するため、追加の write は
+                            // 不要 (= 子が EOT を見て read EOF → 普通に exit、
+                            // daemon の `master_fd::read_some` が 0 → 終了経路)。
+                        }
                         return Ok(());
                     }
                     Ok(n) => {
@@ -637,6 +681,73 @@ mod tests {
     /// に対し、connect 側が code-specific な next-action hint 付き文言を返すこと。
     /// 旧版はどの code でも `daemon error during handshake` 一律で、ユーザが
     /// 次に何をすればいいか分からなかった。
+    /// R5-FB2: `with_stdin_eof_action(SendEof)` を設定した ClientConnection で
+    /// stdin EOF を受けた瞬間に EOT (0x04) が socket に送られ、daemon の child
+    /// PTY (canonical mode) が EOF を見て自然終了することを確認する。
+    ///
+    /// 子 cmd は `cat` (= stdin を読み続け、EOF で exit する canonical-mode
+    /// reader)。stdin を 1 度も書かずに closure (= 即 EOF) させる pattern。
+    #[test]
+    fn headless_stdin_eof_terminates_child_reading_bc() {
+        // 名前は要件ファイル準拠だが、portability のため bc ではなく cat を使う。
+        // canonical mode + read EOF → exit という挙動は両者で同じ。
+        let dir = make_temp_socket_dir();
+        let sock = dir.path().join("eof.sock");
+        let cat_path = if std::path::Path::new("/bin/cat").exists() {
+            "/bin/cat"
+        } else if std::path::Path::new("/usr/bin/cat").exists() {
+            "/usr/bin/cat"
+        } else {
+            return; // CI 環境で cat が無ければ skip
+        };
+        let cfg = DaemonConfig::new("eof-test", sock.clone(), vec![cat_path.into()]);
+        let session = Session::start(cfg).expect("daemon start");
+        let daemon_handle = std::thread::spawn(move || session.serve());
+
+        // client 接続 + with_stdin_eof_action(SendEof)
+        let mut conn: Option<ClientConnection> = None;
+        for _ in 0..50 {
+            match ClientConnection::connect(&sock, AttachOptions::default()) {
+                Ok(c) => {
+                    conn = Some(c);
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let conn = conn
+            .expect("client connect should succeed")
+            .with_stdin_eof_action(StdinEofAction::SendEof);
+
+        // 即 EOF な stdin: pipe を作って write 端をすぐ drop する (= read 端は
+        // Ok(0) を即返す)。`ClientConnection::run` の `R: Read + AsFd` 制約を
+        // 満たすため、read 端は `std::fs::File::from(OwnedFd)` で File 化する。
+        let (rd, wr) = nix::unistd::pipe().expect("pipe");
+        drop(wr); // 即 EOF
+        let mut input = std::fs::File::from(rd);
+        let mut output: Vec<u8> = Vec::new();
+        let run_handle = std::thread::spawn(move || conn.run(&mut input, &mut output));
+
+        // daemon thread が 3s 以内に終了することを確認する (= cat が EOT で
+        // EOF を見て exit、master_fd 経由で daemon が ChildExited を観測)。
+        let start = std::time::Instant::now();
+        let mut daemon_done = false;
+        while start.elapsed() < Duration::from_secs(3) {
+            if daemon_handle.is_finished() {
+                daemon_done = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            daemon_done,
+            "daemon must terminate within 3s after stdin EOF + EOT propagation; elapsed={:?}",
+            start.elapsed()
+        );
+        let _ = daemon_handle.join();
+        let _ = run_handle.join();
+    }
+
     #[test]
     fn connect_token_mismatch_returns_specific_hint() {
         let dir = make_temp_socket_dir();

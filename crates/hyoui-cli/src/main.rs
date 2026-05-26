@@ -261,6 +261,18 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let stdin_is_tty = is_tty(stdin.as_fd());
+    // R5-FB2: stdin が pipe / file の場合 (= `echo "1+2" | hyoui run -- bc`
+    // のような pattern) は stdin EOF を子 PTY に EOT (0x04) として伝える。
+    // tty の場合は通常 EOF が来ないし、来ても detach 同等が望ましいので
+    // 既定の Detach のまま。`--mode=headless` の有無で分岐する選択肢もあるが、
+    // 「stdin が pipe か」の方が本質 (= tty なのに headless mode、tty で
+    // pipe ではないなど multi-axis に対応)。
+    let eof_action = if stdin_is_tty {
+        hyoui::client::StdinEofAction::Detach
+    } else {
+        hyoui::client::StdinEofAction::SendEof
+    };
+    let conn = conn.with_stdin_eof_action(eof_action);
     let _raw_guard = if stdin_is_tty {
         match nix::unistd::dup(stdin.as_fd()) {
             Ok(dup_for_guard) => match enter_raw(dup_for_guard) {
