@@ -9,10 +9,12 @@
 //! Schema evolution は cap flags (`Vec<String>`) 一本。固定 PROTOCOL_VERSION は持たない。
 //! 詳細は `docs/decisions/DR-0008-protocol-design.md` を参照。
 
+pub mod caps;
 mod frame;
 pub mod messages;
 pub mod transports;
 
+pub use caps::{MVP_CAPS, MissingCapability, intersect_caps, require_cap};
 pub use frame::{
     Frame, FrameError, MAX_FRAME_SIZE, ProtocolError, TYPE_CBOR_CONTROL, TYPE_RAW_DATA,
 };
