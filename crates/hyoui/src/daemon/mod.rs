@@ -28,6 +28,7 @@ mod control;
 mod lock;
 mod pty;
 mod session;
+mod wait;
 
 pub use config::DaemonConfig;
 pub use session::Session;
