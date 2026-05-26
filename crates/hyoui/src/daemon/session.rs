@@ -22,9 +22,7 @@ use nix::unistd::Pid;
 use crate::Error;
 #[cfg_attr(not(test), allow(unused_imports))]
 use crate::protocol::Mode;
-use crate::protocol::messages::{
-    LeaderNotify, ModeChange, TailData, TailEnd, TailEndReason, TailRequest,
-};
+use crate::protocol::messages::{LeaderNotify, ModeChange};
 use crate::protocol::{ControlMessage, Frame};
 use crate::scrollback::Scrollback;
 use crate::sys::{
@@ -35,13 +33,11 @@ use super::DaemonConfig;
 use super::accept::{
     MAX_PENDING_HANDSHAKES, PendingHandshake, process_pending_handshakes, spawn_handshake_worker,
 };
-use super::broadcast::{
-    ClientHandle, Subscription, broadcast_control, broadcast_master_bytes, instant_to_epoch_ms,
-    send_control,
-};
+use super::broadcast::{ClientHandle, broadcast_control, broadcast_master_bytes};
 use super::control::{ClientFrameOutcome, FrameOrError, handle_client_frame};
 use super::lock::{SessionState, elevate_next_leader};
 use super::pty::{ALIVE_RETRY_INTERVAL, ChildLifecycle, ChildState, STOPPED_POLL_INTERVAL};
+use super::tail::{broadcast_tail_end_to_followers, tail_end_reason_from_outcome};
 use super::wait::{
     PendingWait, check_wait_timeouts, compute_wait_poll_timeout, update_waits_on_master_bytes,
 };
@@ -179,21 +175,10 @@ impl Session {
         );
 
         // tail follow subscriber へ TailEnd を 1 発投げてから cleanup する。
-        // 終了理由は outcome に応じて分岐:
-        // - 子が exit した (= ChildExited) → ChildExited
-        // - client detach / Kill による session 終了 → ClientCancel
-        // - 致命 error → 送らない (= cleanup で socket close する方が誠実)
-        let tail_end_reason = match &outcome {
-            RelayOutcome::ChildExited(_) => Some(TailEndReason::ChildExited),
-            RelayOutcome::ClientDetachedOrKilled => Some(TailEndReason::ClientCancel),
-            RelayOutcome::Error(_) => None,
-        };
-        if let Some(reason) = tail_end_reason {
-            for ch in clients.iter() {
-                if matches!(ch.subscription, Subscription::TailFollow { .. }) {
-                    let _ = send_control(ch, ControlMessage::TailEnd(TailEnd { reason }));
-                }
-            }
+        // 終了理由の導出 (= ChildExited / ClientCancel / Error は送らない) と
+        // 一括 best-effort 送信は tail.rs の helper に委譲。
+        if let Some(reason) = tail_end_reason_from_outcome(&outcome) {
+            broadcast_tail_end_to_followers(&clients, reason);
         }
 
         // cleanup:
@@ -309,85 +294,6 @@ impl Drop for Session {
             }
             std::thread::sleep(REAP_POLL);
         }
-    }
-}
-
-/// `tail.request` を処理する (Phase 11)。
-///
-/// 流れ:
-/// 1. since_ms / last_bytes でフィルタした bytes を scrollback から取り出す
-/// 2. strip_ansi が true なら ANSI escape を strip (per-snapshot で 1 回だけ)
-/// 3. 取り出した bytes を 1 個の `TailData` として送信 (= chunk 境界は失う、
-///    timestamp_ms = now)
-/// 4. follow=false なら即 `TailEnd(Eof)`、follow=true なら subscription を
-///    `TailFollow` に切り替えて以降の master 出力も `TailData` で送り続ける
-///
-/// since_strict=true で since 範囲が ring buffer から押し出されていれば
-/// `TailEnd(BufferTruncated)` を返して subscription は変更しない。
-pub(super) fn handle_tail_request(
-    idx: usize,
-    req: TailRequest,
-    clients: &mut [ClientHandle],
-    scrollback: &Scrollback,
-) {
-    let now = Instant::now();
-    let bytes_opt: Option<Vec<u8>> = if let Some(since_ms) = req.since_ms {
-        let dur = std::time::Duration::from_millis(since_ms);
-        if req.since_strict {
-            match scrollback.since_strict(now, dur) {
-                Ok(b) => Some(b),
-                Err(_) => {
-                    // since 範囲が buffer から evict 済 → BufferTruncated で即終了
-                    let _ = send_control(
-                        &clients[idx],
-                        ControlMessage::TailEnd(TailEnd {
-                            reason: TailEndReason::BufferTruncated,
-                        }),
-                    );
-                    return;
-                }
-            }
-        } else {
-            Some(scrollback.since(now, dur))
-        }
-    } else if let Some(last_bytes) = req.last_bytes {
-        Some(scrollback.last_n_bytes(last_bytes as usize))
-    } else {
-        Some(scrollback.last_n_bytes(scrollback.total_bytes()))
-    };
-
-    let mut snapshot = bytes_opt.unwrap_or_default();
-    if let Some(last_bytes) = req.last_bytes {
-        let lb = last_bytes as usize;
-        if snapshot.len() > lb {
-            snapshot = snapshot[snapshot.len() - lb..].to_vec();
-        }
-    }
-    if req.strip_ansi {
-        snapshot = crate::strip::strip_ansi(&snapshot);
-    }
-
-    if !snapshot.is_empty() {
-        let _ = send_control(
-            &clients[idx],
-            ControlMessage::TailData(TailData {
-                bytes: snapshot,
-                timestamp_ms: instant_to_epoch_ms(now),
-            }),
-        );
-    }
-
-    if req.follow {
-        clients[idx].subscription = Subscription::TailFollow {
-            strip_ansi: req.strip_ansi,
-        };
-    } else {
-        let _ = send_control(
-            &clients[idx],
-            ControlMessage::TailEnd(TailEnd {
-                reason: TailEndReason::Eof,
-            }),
-        );
     }
 }
 
@@ -757,7 +663,7 @@ mod tests {
     use super::super::lock::{generate_lock_token, should_assign_leader};
     use super::*;
     use crate::protocol::messages::{
-        Detach, DetachTarget, ErrorCode, Kill, LockResult, SessionMode, WaitOutcome,
+        Detach, DetachTarget, ErrorCode, Kill, LockResult, SessionMode, TailEndReason, WaitOutcome,
     };
     use crate::protocol::{
         HandshakeRequest, HandshakeResponse, MVP_CAPS, TYPE_CBOR_CONTROL, TYPE_RAW_DATA,

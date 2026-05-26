@@ -1,6 +1,6 @@
 # DR-0009: `daemon/session.rs` の責務分割 — module 化と段階移行
 
-- Status: Active
+- Status: Active (Phase A-E 完了 2026-05-27、Phase F は別 task)
 - Date: 2026-05-27
 - Related: [[DR-0005]] (思想), [[DR-0006]] (CLI ground rules), [[DR-0007]] (MVP scope), [[DR-0008]] (protocol)
 - Backlog 解消: R4-H6 (session.rs 責務集約)、R4-M2 (handle_control_message 311 行) を本 DR で扱う
@@ -278,13 +278,30 @@ Phase B で dispatcher 化せず、handler 内部の巨大 match を維持する
 
 ## 次の TODO
 
-- [ ] **Phase A 着手**: `pty.rs` + `lock.rs` の新設、`Session::start` / `serve` から該当 fn / struct を移動、`cargo test --workspace` green を確認
-- [ ] Phase B 着手 (= R4-M2 解消): `control.rs` 新設 + `handle_control_message` dispatcher 化 + cap_check / mode_check helper
-- [ ] Phase C 着手 (= broadcast.rs 切り出し)
-- [ ] Phase D 着手 (= accept.rs 切り出し)
-- [ ] Phase E 着手 (= wait.rs / tail.rs 切り出し)
+- [x] **Phase A 着手**: `pty.rs` + `lock.rs` の新設、`Session::start` / `serve` から該当 fn / struct を移動、`cargo test --workspace` green を確認
+- [x] Phase B 着手 (= R4-M2 解消): `control.rs` 新設 + `handle_control_message` dispatcher 化 + cap_check / mode_check helper
+- [x] Phase C 着手 (= broadcast.rs 切り出し)
+- [x] Phase D 着手 (= accept.rs 切り出し)
+- [x] Phase E 着手 (= wait.rs / tail.rs 切り出し)
 - [ ] Phase 完了ごとに `docs/journal/2026-MM-DD-session-split-phase-X.md` でハマり所を記録
 - [ ] Phase E 完了後、R4-H7 (Transport abstraction) のための DR-0010 起票検討
+
+## Phase A-E 完了サマリ (2026-05-27)
+
+| Phase | 移動先 module | session.rs LOC |
+|---|---|---|
+| 起点 (v0.1.4) | — | 4364 |
+| Phase A | pty.rs (96) + lock.rs (92) | 4206 |
+| Phase B | control.rs (626) (dispatcher 化含む、R4-M2 解消) | 3784 |
+| Phase C | broadcast.rs (358) | 3473 |
+| Phase D | accept.rs (372) | 3140 |
+| Phase E | wait.rs (505) + tail.rs (135) | **2579** |
+
+- session.rs 総削減: 4364 → 2579 = **-1785 行** (-41%)
+- 新規 daemon module 数: 2 → 9 (config + session + pty + lock + control + broadcast + accept + wait + tail)
+- 全 Phase で `cargo test --workspace`: 276 件 pass、clippy: warning 0、unsafe lint: clean
+- 公開 API は不変 (`Session` のみ pub、内部は `pub(super)` で隠蔽)
+- Phase F (= serve_loop 内 inline 構造解体) は別 task、本 DR では着手保証なし
 
 ## 関連
 

@@ -51,7 +51,8 @@ use crate::sys::{FdExt, Pty};
 use super::DaemonConfig;
 use super::broadcast::{ClientHandle, broadcast_control, send_control};
 use super::lock::{SessionState, generate_lock_token};
-use super::session::{RelayOutcome, handle_tail_request};
+use super::session::RelayOutcome;
+use super::tail::handle_tail_request;
 use super::wait::{PendingWait, handle_wait_request};
 
 // === Frame 処理 outcome ===
