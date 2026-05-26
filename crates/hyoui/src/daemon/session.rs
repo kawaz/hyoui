@@ -1720,8 +1720,15 @@ fn handle_client_frame(
     }
 }
 
-/// CBOR control message のディスパッチ。lock / leader / mode / status / tail / wait 系の
-/// state 更新と broadcast を担う (Phase 10-11)。
+/// CBOR control message を kind 別 handler に dispatch する (R4-M2 解消)。
+///
+/// 旧実装の 311 行単一 `match` を、kind ごとの `handle_*` 関数 +
+/// 共通 cap_check / mode_check helper (= `ensure_cap` / `ensure_rw_mode` /
+/// `ensure_leader`) に分解した。各 handler は self-contained で、引数を
+/// 通じて必要な state (`SessionState`, `ClientHandle` slice, scrollback, config,
+/// pending_waits) を受け取る。
+///
+/// Phase 10-11 の state 更新と broadcast を担う。
 #[allow(clippy::too_many_arguments)]
 fn handle_control_message(
     pty: &Pty,
@@ -1734,272 +1741,21 @@ fn handle_control_message(
     config: &DaemonConfig,
     pending_waits: &mut Vec<PendingWait>,
 ) -> ClientFrameOutcome {
-    let ch_id = clients[idx].id;
-    let ch_leader = clients[idx].leader;
-
-    let ch_mode = clients[idx].mode;
     match msg {
         ControlMessage::Detach(d) => handle_detach_target(idx, d, clients),
-        ControlMessage::Kill(k) => {
-            // Kill は session 全体 terminate なので `Mode::Rw` (= leader 取りうる
-            // 主導 client) のみ許可。`Mode::Ro` (観察者) と `Mode::RwNoLeader`
-            // (入力可だが leader 取らない補助 client) は session を畳む権限なし。
-            // (Round2 #6: 旧実装は `!Ro` ガードで RwNoLeader も通過していた)
-            if !matches!(ch_mode, Mode::Rw) {
-                let _ = send_control(
-                    &clients[idx],
-                    ControlMessage::Error(ErrorMessage {
-                        code: ErrorCode::ModeNotAllowed,
-                        message: "kill requires rw mode (= leader-eligible)".into(),
-                        details: None,
-                    }),
-                );
-                return ClientFrameOutcome::Continue;
-            }
-            // signum 解釈: None なら SIGTERM、invalid 値 (0 や 範囲外) は error。
-            let signum = k.signum.unwrap_or(libc::SIGTERM as u8);
-            let sig = match nix_signal_from_signum(signum) {
-                Some(s) => s,
-                None => {
-                    let _ = send_control(
-                        &clients[idx],
-                        ControlMessage::Error(ErrorMessage {
-                            code: ErrorCode::SignalInvalid,
-                            message: format!("invalid signum: {signum}"),
-                            details: None,
-                        }),
-                    );
-                    return ClientFrameOutcome::Continue;
-                }
-            };
-            let _ = kill(child, sig);
-            ClientFrameOutcome::TerminateSession(RelayOutcome::ClientDetachedOrKilled)
-        }
-        ControlMessage::Signal(s) => {
-            // Ro 観察者は signal 送信不可 (= 子を SIGKILL できると Ro の前提が壊れる)。
-            // Rw / RwNoLeader は raw mode 中の Ctrl-C 等を CBOR 経由でも送れる必要があるので OK。
-            if matches!(ch_mode, Mode::Ro) {
-                let _ = send_control(
-                    &clients[idx],
-                    ControlMessage::Error(ErrorMessage {
-                        code: ErrorCode::ModeNotAllowed,
-                        message: "signal requires rw mode".into(),
-                        details: None,
-                    }),
-                );
-                return ClientFrameOutcome::Continue;
-            }
-            let sig = match nix_signal_from_signum(s.signum) {
-                Some(s) => s,
-                None => {
-                    let _ = send_control(
-                        &clients[idx],
-                        ControlMessage::Error(ErrorMessage {
-                            code: ErrorCode::SignalInvalid,
-                            message: format!("invalid signum: {}", s.signum),
-                            details: None,
-                        }),
-                    );
-                    return ClientFrameOutcome::Continue;
-                }
-            };
-            let _ = kill(child, sig);
-            ClientFrameOutcome::Continue
-        }
-        ControlMessage::Resize(r) => {
-            // resize は leader のみ許可 (DR-0008 §2.3)。それ以外は error 返却。
-            if !ch_leader {
-                let _ = send_control(
-                    &clients[idx],
-                    ControlMessage::Error(ErrorMessage {
-                        code: ErrorCode::ModeNotLeader,
-                        message: "resize requires leader role".into(),
-                        details: None,
-                    }),
-                );
-                return ClientFrameOutcome::Continue;
-            }
-            // sanitize: 0×0 や巨大値で curses 系子が壊れることがあるので clamp。
-            // 上限 4096 (= 一般 terminal で見ない値) で十分、下限 1 で 0 を排除。
-            const COLS_MIN: u16 = 1;
-            const COLS_MAX: u16 = 4096;
-            const ROWS_MIN: u16 = 1;
-            const ROWS_MAX: u16 = 4096;
-            let cols = r.cols.clamp(COLS_MIN, COLS_MAX);
-            let rows = r.rows.clamp(ROWS_MIN, ROWS_MAX);
-            let _ = pty.resize(cols, rows);
-            ClientFrameOutcome::Continue
-        }
-        ControlMessage::LockAcquire(req) => {
-            // D7: lock cap が無いと LockAcquire 受理しない
-            if !clients[idx].negotiated_caps.iter().any(|c| c == "lock") {
-                let _ = send_control(
-                    &clients[idx],
-                    ControlMessage::Error(ErrorMessage {
-                        code: ErrorCode::UnsupportedCapability,
-                        message: "lock.acquire requires `lock` cap".into(),
-                        details: None,
-                    }),
-                );
-                return ClientFrameOutcome::Continue;
-            }
-            // R4-C7: Mode::Ro (= 観察者) は lock を取れない。
-            // 旧実装は mode をチェックしておらず、Ro client が LockAcquire を送ると
-            // session 全体を Locked 化して rw client の書き込みを止められる
-            // session DoS が成立していた。DR-0008 §2.3 の意図 (= leader/lock は
-            // rw 系のみ) に揃え、Ro は mode.not-allowed で reject する。
-            if matches!(clients[idx].mode, Mode::Ro) {
-                let _ = send_control(
-                    &clients[idx],
-                    ControlMessage::Error(ErrorMessage {
-                        code: ErrorCode::ModeNotAllowed,
-                        message: "lock.acquire requires rw mode (= Ro cannot hold lock)".into(),
-                        details: None,
-                    }),
-                );
-                return ClientFrameOutcome::Continue;
-            }
-            // R4-C9: idempotency — 同じ client が既に lock を保持している場合は、
-            // 旧 token をそのまま返して Acquired を返す。
-            // 旧実装は `state.lock_holder.is_some()` だけで Denied を返していたため、
-            // 既に保持中の client が再 LockAcquire すると **自分の lock に弾かれる**
-            // footgun が発生していた。idempotent operation の標準的な挙動 (= 既に
-            // 同じ state なら success) に合わせる。
-            // mode.change broadcast は **行わない** (= state 変化なし)。
-            if state.lock_holder == Some(ch_id) {
-                let token = state.lock_token.clone();
-                let _ = req; // wait / timeout / process_bound は idempotent 再取得では未使用
-                let _ = send_control(
-                    &clients[idx],
-                    ControlMessage::LockResponse(LockResponse {
-                        result: LockResult::Acquired,
-                        token,
-                        queue_position: None,
-                    }),
-                );
-                return ClientFrameOutcome::Continue;
-            }
-            if state.lock_holder.is_some() {
-                // 「1 request → 1 response」契約を守るため、wait=true / wait=false
-                // どちらも LockResponse(Denied) 1 frame のみで応答する (Round2 #3
-                // = `error` を併送して 2 frame にすると client が後続 frame と
-                // mis-align するため)。MVP では wait queue 未実装なので wait=true
-                // でも Queued を返せない事実は DR-0008 に明記する想定。
-                let _ = req; // process_bound / timeout / wait は queue 実装まで未使用
-                let _ = send_control(
-                    &clients[idx],
-                    ControlMessage::LockResponse(LockResponse {
-                        result: LockResult::Denied,
-                        token: None,
-                        queue_position: None,
-                    }),
-                );
-                return ClientFrameOutcome::Continue;
-            }
-            let token = generate_lock_token();
-            state.lock_holder = Some(ch_id);
-            state.lock_token = Some(token.clone());
-            let _ = send_control(
-                &clients[idx],
-                ControlMessage::LockResponse(LockResponse {
-                    result: LockResult::Acquired,
-                    token: Some(token),
-                    queue_position: None,
-                }),
-            );
-            broadcast_control(
-                clients,
-                &ControlMessage::ModeChange(ModeChange {
-                    session_mode: SessionMode::Locked,
-                    lock_holder: Some(ch_id),
-                    client_mode: None,
-                }),
-            );
-            ClientFrameOutcome::Continue
-        }
+        ControlMessage::Kill(k) => handle_kill(child, idx, k, clients),
+        ControlMessage::Signal(s) => handle_signal(child, idx, s, clients),
+        ControlMessage::Resize(r) => handle_resize(pty, idx, r, clients),
+        ControlMessage::LockAcquire(req) => handle_lock_acquire(idx, req, clients, state),
+        ControlMessage::LockRelease(rel) => handle_lock_release(idx, rel, clients, state),
         ControlMessage::TailRequest(req) => {
-            // D7: tail-v1 cap が intersect から落ちている client は reject
-            if !clients[idx].negotiated_caps.iter().any(|c| c == "tail-v1") {
-                let _ = send_control(
-                    &clients[idx],
-                    ControlMessage::Error(ErrorMessage {
-                        code: ErrorCode::UnsupportedCapability,
-                        message: "tail.request requires `tail-v1` cap, but it was not \
-                                  negotiated at handshake"
-                            .into(),
-                        details: None,
-                    }),
-                );
-                return ClientFrameOutcome::Continue;
-            }
-            handle_tail_request(idx, req, clients, scrollback);
-            ClientFrameOutcome::Continue
+            handle_tail_request_dispatch(idx, req, clients, scrollback)
         }
         ControlMessage::WaitRequest(req) => {
-            if !clients[idx].negotiated_caps.iter().any(|c| c == "wait-l0") {
-                let _ = send_control(
-                    &clients[idx],
-                    ControlMessage::Error(ErrorMessage {
-                        code: ErrorCode::UnsupportedCapability,
-                        message: "wait.request requires `wait-l0` cap".into(),
-                        details: None,
-                    }),
-                );
-                return ClientFrameOutcome::Continue;
-            }
-            handle_wait_request(idx, req, clients, pending_waits);
-            ClientFrameOutcome::Continue
+            handle_wait_request_dispatch(idx, req, clients, pending_waits)
         }
         ControlMessage::StatusQuery(_) => {
-            // 子 pid の生死は waitpid(WNOHANG) で確認 (= reap せず存在チェックのみ)
-            let child_pid = match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
-                Ok(WaitStatus::StillAlive) => Some(child.as_raw() as u32),
-                _ => None,
-            };
-            let clients_info: Vec<ClientInfo> = clients
-                .iter()
-                .map(|c| ClientInfo {
-                    client_id: c.id,
-                    mode: c.mode,
-                    leader: c.leader,
-                })
-                .collect();
-            let resp = StatusResponse {
-                session_id: config.session_id.clone(),
-                child_pid,
-                clients: clients_info,
-                scrollback_bytes: scrollback.total_bytes() as u64,
-                lock_holder: state.lock_holder,
-            };
-            let _ = send_control(&clients[idx], ControlMessage::StatusResponse(resp));
-            ClientFrameOutcome::Continue
-        }
-        ControlMessage::LockRelease(rel) => {
-            // token + holder 両方を照合してから解放
-            let valid = state.lock_holder == Some(ch_id)
-                && state.lock_token.as_deref() == Some(rel.token.as_str());
-            if !valid {
-                let _ = send_control(
-                    &clients[idx],
-                    ControlMessage::Error(ErrorMessage {
-                        code: ErrorCode::LockNotHeld,
-                        message: "lock token mismatch or not the lock holder".into(),
-                        details: None,
-                    }),
-                );
-                return ClientFrameOutcome::Continue;
-            }
-            state.lock_holder = None;
-            state.lock_token = None;
-            broadcast_control(
-                clients,
-                &ControlMessage::ModeChange(ModeChange {
-                    session_mode: state.session_mode(),
-                    lock_holder: None,
-                    client_mode: None,
-                }),
-            );
-            ClientFrameOutcome::Continue
+            handle_status_query(child, idx, clients, state, scrollback, config)
         }
         // daemon → client 方向のはずの message が client → daemon に来た or 未実装 kind。
         // DR-0008 §3.2 「未知 kind は decode error」だが、ここに来るのは serde で既知
@@ -2014,19 +1770,401 @@ fn handle_control_message(
         | ControlMessage::StatusResponse(_)
         | ControlMessage::TailData(_)
         | ControlMessage::TailEnd(_)
-        | ControlMessage::WaitResult(_) => {
+        | ControlMessage::WaitResult(_) => reject_unexpected_kind(idx, clients),
+    }
+}
+
+// --- cap / mode 共通 helper (= 各 handler の入口で reject 系を集約) ---
+
+/// negotiated_caps に `cap` が含まれていれば `Ok(())`、無ければ
+/// `Error(UnsupportedCapability)` を送って `Err(())` を返す。
+///
+/// caller は `Err(())` を受けたら handler を `ClientFrameOutcome::Continue`
+/// で抜ける。`message` は cap が無い時に error message として使われる。
+fn ensure_cap(ch: &ClientHandle, cap: &str, message: &str) -> Result<(), ()> {
+    if ch.negotiated_caps.iter().any(|c| c == cap) {
+        Ok(())
+    } else {
+        let _ = send_control(
+            ch,
+            ControlMessage::Error(ErrorMessage {
+                code: ErrorCode::UnsupportedCapability,
+                message: message.into(),
+                details: None,
+            }),
+        );
+        Err(())
+    }
+}
+
+/// client の mode が `Mode::Rw` であれば `Ok(())`、それ以外なら
+/// `Error(ModeNotAllowed)` を送って `Err(())` を返す。
+///
+/// kill / lock.acquire など「Rw 限定」操作で使う。RwNoLeader を含めて
+/// rw 系を許可したい場合は `ensure_not_ro` を使う。
+fn ensure_rw_mode(ch: &ClientHandle, message: &str) -> Result<(), ()> {
+    if matches!(ch.mode, Mode::Rw) {
+        Ok(())
+    } else {
+        let _ = send_control(
+            ch,
+            ControlMessage::Error(ErrorMessage {
+                code: ErrorCode::ModeNotAllowed,
+                message: message.into(),
+                details: None,
+            }),
+        );
+        Err(())
+    }
+}
+
+/// client の mode が `Mode::Ro` でなければ `Ok(())` (= Rw / RwNoLeader は OK)、
+/// `Ro` なら `Error(ModeNotAllowed)` を送って `Err(())` を返す。
+///
+/// signal 送信のように「観察者 Ro は不可だが Rw 系は全部 OK」な操作で使う。
+fn ensure_not_ro(ch: &ClientHandle, message: &str) -> Result<(), ()> {
+    if matches!(ch.mode, Mode::Ro) {
+        let _ = send_control(
+            ch,
+            ControlMessage::Error(ErrorMessage {
+                code: ErrorCode::ModeNotAllowed,
+                message: message.into(),
+                details: None,
+            }),
+        );
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+/// client が leader であれば `Ok(())`、そうでなければ
+/// `Error(ModeNotLeader)` を送って `Err(())` を返す。
+///
+/// resize など「leader 限定」操作で使う。
+fn ensure_leader(ch: &ClientHandle, message: &str) -> Result<(), ()> {
+    if ch.leader {
+        Ok(())
+    } else {
+        let _ = send_control(
+            ch,
+            ControlMessage::Error(ErrorMessage {
+                code: ErrorCode::ModeNotLeader,
+                message: message.into(),
+                details: None,
+            }),
+        );
+        Err(())
+    }
+}
+
+// --- kind 別 handler 群 ---
+
+/// `ControlMessage::Kill` を処理する。
+///
+/// Kill は session 全体 terminate なので `Mode::Rw` (= leader 取りうる
+/// 主導 client) のみ許可。`Mode::Ro` (観察者) と `Mode::RwNoLeader`
+/// (入力可だが leader 取らない補助 client) は session を畳む権限なし。
+/// (Round2 #6: 旧実装は `!Ro` ガードで RwNoLeader も通過していた)
+fn handle_kill(
+    child: Pid,
+    idx: usize,
+    k: crate::protocol::messages::Kill,
+    clients: &mut [ClientHandle],
+) -> ClientFrameOutcome {
+    if ensure_rw_mode(&clients[idx], "kill requires rw mode (= leader-eligible)").is_err() {
+        return ClientFrameOutcome::Continue;
+    }
+    // signum 解釈: None なら SIGTERM、invalid 値 (0 や 範囲外) は error。
+    let signum = k.signum.unwrap_or(libc::SIGTERM as u8);
+    let sig = match nix_signal_from_signum(signum) {
+        Some(s) => s,
+        None => {
             let _ = send_control(
                 &clients[idx],
                 ControlMessage::Error(ErrorMessage {
-                    code: ErrorCode::ProtocolUnexpectedKind,
-                    message: "this kind is daemon→client only or not accepted in this direction"
-                        .into(),
+                    code: ErrorCode::SignalInvalid,
+                    message: format!("invalid signum: {signum}"),
                     details: None,
                 }),
             );
-            ClientFrameOutcome::Continue
+            return ClientFrameOutcome::Continue;
         }
+    };
+    let _ = kill(child, sig);
+    ClientFrameOutcome::TerminateSession(RelayOutcome::ClientDetachedOrKilled)
+}
+
+/// `ControlMessage::Signal` を処理する。
+///
+/// Ro 観察者は signal 送信不可 (= 子を SIGKILL できると Ro の前提が壊れる)。
+/// Rw / RwNoLeader は raw mode 中の Ctrl-C 等を CBOR 経由でも送れる必要があるので OK。
+fn handle_signal(
+    child: Pid,
+    idx: usize,
+    s: crate::protocol::messages::Signal,
+    clients: &mut [ClientHandle],
+) -> ClientFrameOutcome {
+    if ensure_not_ro(&clients[idx], "signal requires rw mode").is_err() {
+        return ClientFrameOutcome::Continue;
     }
+    let sig = match nix_signal_from_signum(s.signum) {
+        Some(s) => s,
+        None => {
+            let _ = send_control(
+                &clients[idx],
+                ControlMessage::Error(ErrorMessage {
+                    code: ErrorCode::SignalInvalid,
+                    message: format!("invalid signum: {}", s.signum),
+                    details: None,
+                }),
+            );
+            return ClientFrameOutcome::Continue;
+        }
+    };
+    let _ = kill(child, sig);
+    ClientFrameOutcome::Continue
+}
+
+/// `ControlMessage::Resize` を処理する (DR-0008 §2.3: leader 限定)。
+fn handle_resize(
+    pty: &Pty,
+    idx: usize,
+    r: crate::protocol::messages::Resize,
+    clients: &mut [ClientHandle],
+) -> ClientFrameOutcome {
+    if ensure_leader(&clients[idx], "resize requires leader role").is_err() {
+        return ClientFrameOutcome::Continue;
+    }
+    // sanitize: 0×0 や巨大値で curses 系子が壊れることがあるので clamp。
+    // 上限 4096 (= 一般 terminal で見ない値) で十分、下限 1 で 0 を排除。
+    const COLS_MIN: u16 = 1;
+    const COLS_MAX: u16 = 4096;
+    const ROWS_MIN: u16 = 1;
+    const ROWS_MAX: u16 = 4096;
+    let cols = r.cols.clamp(COLS_MIN, COLS_MAX);
+    let rows = r.rows.clamp(ROWS_MIN, ROWS_MAX);
+    let _ = pty.resize(cols, rows);
+    ClientFrameOutcome::Continue
+}
+
+/// `ControlMessage::LockAcquire` を処理する。
+///
+/// - D7: lock cap が必要
+/// - R4-C7: Mode::Ro は lock を取れない
+/// - R4-C9: idempotency — 同じ client が既に holder ならそのまま Acquired を返す
+/// - 他 client が holder なら Denied (wait queue は MVP 未実装、wait=true でも Denied)
+/// - lock 取得成功時は mode.change を broadcast
+fn handle_lock_acquire(
+    idx: usize,
+    req: crate::protocol::messages::LockAcquire,
+    clients: &mut [ClientHandle],
+    state: &mut SessionState,
+) -> ClientFrameOutcome {
+    let ch_id = clients[idx].id;
+    // D7: lock cap が無いと LockAcquire 受理しない
+    if ensure_cap(&clients[idx], "lock", "lock.acquire requires `lock` cap").is_err() {
+        return ClientFrameOutcome::Continue;
+    }
+    // R4-C7: Mode::Ro (= 観察者) は lock を取れない。
+    // 旧実装は mode をチェックしておらず、Ro client が LockAcquire を送ると
+    // session 全体を Locked 化して rw client の書き込みを止められる
+    // session DoS が成立していた。DR-0008 §2.3 の意図 (= leader/lock は
+    // rw 系のみ) に揃え、Ro は mode.not-allowed で reject する。
+    if matches!(clients[idx].mode, Mode::Ro) {
+        let _ = send_control(
+            &clients[idx],
+            ControlMessage::Error(ErrorMessage {
+                code: ErrorCode::ModeNotAllowed,
+                message: "lock.acquire requires rw mode (= Ro cannot hold lock)".into(),
+                details: None,
+            }),
+        );
+        return ClientFrameOutcome::Continue;
+    }
+    // R4-C9: idempotency — 同じ client が既に lock を保持している場合は、
+    // 旧 token をそのまま返して Acquired を返す。
+    // 旧実装は `state.lock_holder.is_some()` だけで Denied を返していたため、
+    // 既に保持中の client が再 LockAcquire すると **自分の lock に弾かれる**
+    // footgun が発生していた。idempotent operation の標準的な挙動 (= 既に
+    // 同じ state なら success) に合わせる。
+    // mode.change broadcast は **行わない** (= state 変化なし)。
+    if state.lock_holder == Some(ch_id) {
+        let token = state.lock_token.clone();
+        let _ = req; // wait / timeout / process_bound は idempotent 再取得では未使用
+        let _ = send_control(
+            &clients[idx],
+            ControlMessage::LockResponse(LockResponse {
+                result: LockResult::Acquired,
+                token,
+                queue_position: None,
+            }),
+        );
+        return ClientFrameOutcome::Continue;
+    }
+    if state.lock_holder.is_some() {
+        // 「1 request → 1 response」契約を守るため、wait=true / wait=false
+        // どちらも LockResponse(Denied) 1 frame のみで応答する (Round2 #3
+        // = `error` を併送して 2 frame にすると client が後続 frame と
+        // mis-align するため)。MVP では wait queue 未実装なので wait=true
+        // でも Queued を返せない事実は DR-0008 に明記する想定。
+        let _ = req; // process_bound / timeout / wait は queue 実装まで未使用
+        let _ = send_control(
+            &clients[idx],
+            ControlMessage::LockResponse(LockResponse {
+                result: LockResult::Denied,
+                token: None,
+                queue_position: None,
+            }),
+        );
+        return ClientFrameOutcome::Continue;
+    }
+    let token = generate_lock_token();
+    state.lock_holder = Some(ch_id);
+    state.lock_token = Some(token.clone());
+    let _ = send_control(
+        &clients[idx],
+        ControlMessage::LockResponse(LockResponse {
+            result: LockResult::Acquired,
+            token: Some(token),
+            queue_position: None,
+        }),
+    );
+    broadcast_control(
+        clients,
+        &ControlMessage::ModeChange(ModeChange {
+            session_mode: SessionMode::Locked,
+            lock_holder: Some(ch_id),
+            client_mode: None,
+        }),
+    );
+    ClientFrameOutcome::Continue
+}
+
+/// `ControlMessage::LockRelease` を処理する。
+///
+/// token + holder 両方を照合してから解放し、mode.change を broadcast する。
+fn handle_lock_release(
+    idx: usize,
+    rel: crate::protocol::messages::LockRelease,
+    clients: &mut [ClientHandle],
+    state: &mut SessionState,
+) -> ClientFrameOutcome {
+    let ch_id = clients[idx].id;
+    // token + holder 両方を照合してから解放
+    let valid =
+        state.lock_holder == Some(ch_id) && state.lock_token.as_deref() == Some(rel.token.as_str());
+    if !valid {
+        let _ = send_control(
+            &clients[idx],
+            ControlMessage::Error(ErrorMessage {
+                code: ErrorCode::LockNotHeld,
+                message: "lock token mismatch or not the lock holder".into(),
+                details: None,
+            }),
+        );
+        return ClientFrameOutcome::Continue;
+    }
+    state.lock_holder = None;
+    state.lock_token = None;
+    broadcast_control(
+        clients,
+        &ControlMessage::ModeChange(ModeChange {
+            session_mode: state.session_mode(),
+            lock_holder: None,
+            client_mode: None,
+        }),
+    );
+    ClientFrameOutcome::Continue
+}
+
+/// `ControlMessage::TailRequest` の cap check + handler 呼び出し。
+fn handle_tail_request_dispatch(
+    idx: usize,
+    req: TailRequest,
+    clients: &mut [ClientHandle],
+    scrollback: &Scrollback,
+) -> ClientFrameOutcome {
+    // D7: tail-v1 cap が intersect から落ちている client は reject
+    if ensure_cap(
+        &clients[idx],
+        "tail-v1",
+        "tail.request requires `tail-v1` cap, but it was not negotiated at handshake",
+    )
+    .is_err()
+    {
+        return ClientFrameOutcome::Continue;
+    }
+    handle_tail_request(idx, req, clients, scrollback);
+    ClientFrameOutcome::Continue
+}
+
+/// `ControlMessage::WaitRequest` の cap check + handler 呼び出し。
+fn handle_wait_request_dispatch(
+    idx: usize,
+    req: WaitRequest,
+    clients: &mut [ClientHandle],
+    pending_waits: &mut Vec<PendingWait>,
+) -> ClientFrameOutcome {
+    if ensure_cap(
+        &clients[idx],
+        "wait-l0",
+        "wait.request requires `wait-l0` cap",
+    )
+    .is_err()
+    {
+        return ClientFrameOutcome::Continue;
+    }
+    handle_wait_request(idx, req, clients, pending_waits);
+    ClientFrameOutcome::Continue
+}
+
+/// `ControlMessage::StatusQuery` を処理する。
+///
+/// 子 pid の生死は waitpid(WNOHANG) で確認 (= reap せず存在チェックのみ)。
+fn handle_status_query(
+    child: Pid,
+    idx: usize,
+    clients: &mut [ClientHandle],
+    state: &SessionState,
+    scrollback: &Scrollback,
+    config: &DaemonConfig,
+) -> ClientFrameOutcome {
+    let child_pid = match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+        Ok(WaitStatus::StillAlive) => Some(child.as_raw() as u32),
+        _ => None,
+    };
+    let clients_info: Vec<ClientInfo> = clients
+        .iter()
+        .map(|c| ClientInfo {
+            client_id: c.id,
+            mode: c.mode,
+            leader: c.leader,
+        })
+        .collect();
+    let resp = StatusResponse {
+        session_id: config.session_id.clone(),
+        child_pid,
+        clients: clients_info,
+        scrollback_bytes: scrollback.total_bytes() as u64,
+        lock_holder: state.lock_holder,
+    };
+    let _ = send_control(&clients[idx], ControlMessage::StatusResponse(resp));
+    ClientFrameOutcome::Continue
+}
+
+/// daemon → client 方向のはずの message が client → daemon に来た or 未実装 kind を
+/// `Error(ProtocolUnexpectedKind)` で reject する。
+fn reject_unexpected_kind(idx: usize, clients: &[ClientHandle]) -> ClientFrameOutcome {
+    let _ = send_control(
+        &clients[idx],
+        ControlMessage::Error(ErrorMessage {
+            code: ErrorCode::ProtocolUnexpectedKind,
+            message: "this kind is daemon→client only or not accepted in this direction".into(),
+            details: None,
+        }),
+    );
+    ClientFrameOutcome::Continue
 }
 
 /// serve_loop の relay 結果。
