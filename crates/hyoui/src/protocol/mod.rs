@@ -11,8 +11,12 @@
 
 mod frame;
 pub mod messages;
+pub mod transports;
 
 pub use frame::{
     Frame, FrameError, MAX_FRAME_SIZE, ProtocolError, TYPE_CBOR_CONTROL, TYPE_RAW_DATA,
 };
-pub use messages::{ControlMessage, ControlMessageError};
+pub use messages::{
+    ControlMessage, ControlMessageError, HandshakeRequest, HandshakeResponse, Mode,
+};
+pub use transports::{Transport, UnixStreamTransport};
