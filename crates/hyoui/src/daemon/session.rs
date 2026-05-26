@@ -12,6 +12,7 @@
 
 use std::os::fd::AsFd;
 use std::sync::atomic::Ordering;
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::Instant;
 
 use nix::poll::{PollFd, PollTimeout};
@@ -26,7 +27,8 @@ use crate::protocol::messages::{LeaderNotify, ModeChange};
 use crate::protocol::{ControlMessage, Frame};
 use crate::scrollback::Scrollback;
 use crate::sys::{
-    FdExt, Pty, UnixSock, poll::PollFlags, poll::PollOutcome, poll::poll, pty::Spawned,
+    FdExt, Pty, SelfPipe, UnixSock, install_self_pipe, poll::PollFlags, poll::PollOutcome,
+    poll::poll, pty::Spawned, register_self_pipe,
 };
 
 use super::DaemonConfig;
@@ -37,6 +39,53 @@ use super::broadcast::{ClientHandle, broadcast_control, broadcast_master_bytes};
 use super::control::{ClientFrameOutcome, FrameOrError, handle_client_frame};
 use super::lock::{SessionState, elevate_next_leader};
 use super::pty::{ALIVE_RETRY_INTERVAL, ChildLifecycle, ChildState, STOPPED_POLL_INTERVAL};
+
+/// R5-H6: SIGCHLD self-pipe ownership gate.
+///
+/// SIGCHLD disposition + the `SELFPIPE_WRITE_FD` global are process-wide;
+/// only one `Session::serve` at a time may own the SIGCHLD self-pipe.
+/// `Session::serve` `try_lock`s this mutex on entry: if acquired, it installs
+/// the SIGCHLD self-pipe and uses it to wake `poll(2)` on child state
+/// transitions (= STOP / CONT / exit). If `try_lock` fails (= another serve
+/// is already using it in the same process, e.g. concurrent test runs), the
+/// serve falls back to the legacy 500ms polling path with no correctness
+/// regression.
+///
+/// The guard is held inside `serve()` for the entire lifetime of the loop,
+/// and is dropped before `SelfPipe::drop` so that `SELFPIPE_WRITE_FD` is
+/// cleared before the next serve attempts to install its own self-pipe.
+static SIGCHLD_SELFPIPE_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII bundle: the owned `SelfPipe` plus the `MutexGuard` that proves we
+/// own the slot. Order matters in Drop: `pipe` drops first (clearing the
+/// global write-fd atomic), then `_guard` releases the lock. Rust drops
+/// struct fields in declaration order, so `pipe` MUST come before `_guard`.
+struct SigchldOwner {
+    pipe: SelfPipe,
+    _guard: MutexGuard<'static, ()>,
+}
+
+/// Attempt to acquire SIGCHLD self-pipe ownership for this serve. Returns
+/// `Some` on success (= SIGCHLD will deliver into `pipe`), `None` if either
+/// the lock is taken by another concurrent serve in this process or the
+/// self-pipe / sigaction install fails. The `None` path is non-fatal — the
+/// caller falls back to the legacy 500ms polling.
+fn acquire_sigchld_selfpipe() -> Option<SigchldOwner> {
+    let guard = match SIGCHLD_SELFPIPE_LOCK.try_lock() {
+        Ok(g) => g,
+        Err(TryLockError::WouldBlock) => return None,
+        Err(TryLockError::Poisoned(p)) => p.into_inner(),
+    };
+    let pipe = install_self_pipe().ok()?;
+    if register_self_pipe(Signal::SIGCHLD).is_err() {
+        // pipe drops here, clearing SELFPIPE_WRITE_FD; guard released too.
+        return None;
+    }
+    Some(SigchldOwner {
+        pipe,
+        _guard: guard,
+    })
+}
 use super::tail::{broadcast_tail_end_to_followers, tail_end_reason_from_outcome};
 use super::wait::{
     PendingWait, check_wait_timeouts, compute_wait_poll_timeout, update_waits_on_master_bytes,
@@ -192,6 +241,16 @@ impl Session {
         let mut state = SessionState::default();
         let mut scrollback = Scrollback::new(config.scrollback_bytes);
         let mut pending_waits: Vec<PendingWait> = Vec::new();
+
+        // R5-H6: Try to acquire process-wide SIGCHLD self-pipe ownership.
+        // The `Some` branch installs SIGCHLD → self-pipe so `poll(2)` wakes
+        // immediately on child STOP/CONT/exit (= 500ms latency → ~ms).
+        // The `None` branch falls back to the legacy ChildLifecycle polling
+        // (correct, just slower transition detection) when another serve
+        // already owns the slot in the same process (typically only happens
+        // in concurrent test runs).
+        let sigchld_owner = acquire_sigchld_selfpipe();
+
         let outcome = serve_loop(
             &pty,
             child,
@@ -202,7 +261,13 @@ impl Session {
             &mut state,
             &mut scrollback,
             &mut pending_waits,
+            sigchld_owner.as_ref().map(|o| &o.pipe),
         );
+
+        // Drop the SIGCHLD self-pipe explicitly before any further cleanup so
+        // the global `SELFPIPE_WRITE_FD` is cleared and a subsequent serve in
+        // the same process can claim the slot.
+        drop(sigchld_owner);
 
         // tail follow subscriber へ TailEnd を 1 発投げてから cleanup する。
         // 終了理由の導出 (= ChildExited / ClientCancel / Error は送らない) と
@@ -340,6 +405,7 @@ fn serve_loop(
     state: &mut SessionState,
     scrollback: &mut Scrollback,
     pending_waits: &mut Vec<PendingWait>,
+    sigchld_pipe: Option<&SelfPipe>,
 ) -> RelayOutcome {
     // R4-C3: 別 thread で進行中の handshake worker 群。worker が `do_handshake_stage`
     // を完了すると `rx` に Ok/Err が流れる。本 vector は serve_loop が所有し、各
@@ -348,15 +414,25 @@ fn serve_loop(
     // R4-H14: 子の Stopped/Continued 追跡。loop 越しに状態を保持する。
     let mut lifecycle = ChildLifecycle::default();
     loop {
-        // poll fd 構築: listener + master + 各 client reader
+        // poll fd 構築: listener + master + 各 client reader (+ SIGCHLD self-pipe)
         let listener_fd = listener.as_fd();
         let master_fd = pty.master_fd();
-        let mut poll_fds: Vec<PollFd> = Vec::with_capacity(2 + clients.len());
+        let mut poll_fds: Vec<PollFd> =
+            Vec::with_capacity(2 + clients.len() + usize::from(sigchld_pipe.is_some()));
         poll_fds.push(PollFd::new(listener_fd, PollFlags::POLLIN));
         poll_fds.push(PollFd::new(master_fd, PollFlags::POLLIN));
         for ch in clients.iter() {
             poll_fds.push(PollFd::new(ch.reader.as_fd(), PollFlags::POLLIN));
         }
+        // R5-H6: SIGCHLD self-pipe slot is appended last so it does not shift
+        // client indexing. Tracked separately by the `sigchld_idx` offset.
+        let sigchld_idx = if let Some(sp) = sigchld_pipe {
+            let idx = poll_fds.len();
+            poll_fds.push(PollFd::new(sp.read.as_fd(), PollFlags::POLLIN));
+            Some(idx)
+        } else {
+            None
+        };
 
         // backpressure overflow / writer dead で disconnect が必要な client_id を集める
         let mut overflow_ids: Vec<u64> = Vec::new();
@@ -384,7 +460,8 @@ fn serve_loop(
         // 解いてから check_wait_timeouts / process_pending_handshakes を呼ぶ。
         // Ready 経路では revents を集めてから drop する (= 通常処理に進む)。
         let outcome_kind = poll(&mut poll_fds, poll_timeout);
-        let (listener_revents, master_revents, client_revents) = match outcome_kind {
+        let (listener_revents, master_revents, client_revents, sigchld_ready) = match outcome_kind
+        {
             Ok(PollOutcome::Ready(_)) => {
                 let lrev = poll_fds[0].revents().unwrap_or(PollFlags::empty());
                 let mrev = poll_fds[1].revents().unwrap_or(PollFlags::empty());
@@ -393,11 +470,28 @@ fn serve_loop(
                     .enumerate()
                     .map(|(i, _)| poll_fds[2 + i].revents().unwrap_or(PollFlags::empty()))
                     .collect();
+                let sig_ready = sigchld_idx
+                    .map(|i| {
+                        poll_fds[i]
+                            .revents()
+                            .unwrap_or(PollFlags::empty())
+                            .contains(PollFlags::POLLIN)
+                    })
+                    .unwrap_or(false);
                 drop(poll_fds);
-                (lrev, mrev, crev)
+                (lrev, mrev, crev, sig_ready)
             }
             Ok(PollOutcome::Interrupted) => {
                 drop(poll_fds);
+                // R5-H6: SIGCHLD may have arrived; drain self-pipe + check
+                // child state. EINTR alone (without self-pipe ready) still
+                // benefits from the same drain (= no-op if empty).
+                if let Some(sp) = sigchld_pipe {
+                    let _ = sp.drain();
+                }
+                if let ChildState::Exited(code) = lifecycle.poll(child) {
+                    return RelayOutcome::ChildExited(code);
+                }
                 continue;
             }
             Ok(PollOutcome::Timeout) => {
@@ -447,6 +541,20 @@ fn serve_loop(
             state,
             &mut overflow_ids,
         );
+
+        // R5-H6: SIGCHLD wake-up handling. Drain the self-pipe to clear
+        // pending signal bytes, then run `lifecycle.poll(child)` to pick up
+        // any STOP / CONT / exit transition that just happened. If the child
+        // exited, return immediately so callers (= scrollback / tail) finish
+        // promptly (= no 500ms `STOPPED_POLL_INTERVAL` latency).
+        if sigchld_ready {
+            if let Some(sp) = sigchld_pipe {
+                let _ = sp.drain();
+            }
+            if let ChildState::Exited(code) = lifecycle.poll(child) {
+                return RelayOutcome::ChildExited(code);
+            }
+        }
 
         // 1. listener: 新規 client accept (= handshake worker を spawn するだけ。
         //    handshake 自体は別 thread で動くので serve_loop は blocking しない)

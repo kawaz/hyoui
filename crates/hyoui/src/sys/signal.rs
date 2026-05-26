@@ -325,6 +325,60 @@ mod tests {
         panic!("self-pipe never observed SIGUSR1");
     }
 
+    /// R5-H6: SIGCHLD self-pipe wakes immediately when a child changes state
+    /// (= SIGSTOP / SIGCONT / exit). Verifies the self-pipe receives the
+    /// SIGCHLD signal number byte without depending on the 500ms polling
+    /// fallback in serve_loop.
+    #[test]
+    fn sigchld_received_when_child_state_changes() {
+        let _guard = signal_test_guard();
+
+        use crate::sys::pty::Pty;
+        use nix::sys::wait::{WaitPidFlag, waitpid};
+
+        let pipe = install_self_pipe().expect("init self-pipe");
+        register_self_pipe(Signal::SIGCHLD).expect("register SIGCHLD");
+
+        // forkpty で子を生成。setsid 済の独立 process group に入る。
+        let spawned = Pty::spawn(&["/bin/sleep", "30"], 80, 24).expect("spawn sleep");
+        let child = spawned.child;
+
+        // 子の生成自体では SIGCHLD は配信されない (exit/stop/cont のみ)。
+        // 念のため pre-existing な SIGCHLD バイトを drain しておく。
+        let _ = pipe.drain();
+
+        // SIGSTOP を送る → 子が stop → SIGCHLD が親に配信 → self-pipe に書き込まれる
+        nix::sys::signal::kill(child, Signal::SIGSTOP).expect("SIGSTOP");
+
+        // kernel が SIGCHLD 配信 + handler 実行 + write(2) 完了するまで
+        // 短いリトライで待つ。500ms 上限。
+        let mut saw_sigchld = false;
+        for _ in 0..50 {
+            let drained = pipe.drain().expect("drain");
+            if drained
+                .iter()
+                .any(|b| *b == Signal::SIGCHLD as i32 as u8)
+            {
+                saw_sigchld = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // cleanup: 必ず子を回収してから assert (= test 失敗時も zombie 残さない)
+        let _ = nix::sys::signal::kill(child, Signal::SIGCONT);
+        let _ = nix::sys::signal::kill(child, Signal::SIGKILL);
+        let _ = waitpid(child, Some(WaitPidFlag::empty()));
+        // SIGCHLD disposition を default に戻して、SelfPipe drop と pipe 閉鎖の
+        // 後にも遅延配信された SIGCHLD が dangling handler を呼ばないようにする。
+        let _ = install_default(Signal::SIGCHLD);
+
+        assert!(
+            saw_sigchld,
+            "self-pipe should observe SIGCHLD within 500ms of SIGSTOP"
+        );
+    }
+
     #[test]
     fn install_winch_does_not_crash() {
         let _guard = signal_test_guard();
