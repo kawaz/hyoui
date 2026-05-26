@@ -90,9 +90,9 @@ _hyoui() {
         kill)
             case "$prev" in
                 --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                --signum) return 0 ;;
+                --signal) COMPREPLY=( $(compgen -W "SIGHUP SIGINT SIGQUIT SIGABRT SIGKILL SIGUSR1 SIGUSR2 SIGTERM SIGCONT SIGTSTP SIGCHLD" -- "$cur") ); return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --signum --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --signal --help -h" -- "$cur") )
             return 0 ;;
         status)
             case "$prev" in
@@ -162,7 +162,7 @@ _hyoui() {
                 kill)
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
-                        '--signum=[Signal number]:signum:' \
+                        '--signal=[Signal name (SIG-prefix uppercase, DR-0012)]:signal:(SIGHUP SIGINT SIGQUIT SIGABRT SIGKILL SIGUSR1 SIGUSR2 SIGTERM SIGCONT SIGTSTP SIGCHLD)' \
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:session id:'
                     ;;
@@ -309,7 +309,7 @@ complete -c hyoui -n '__hyoui_using_subcommand list' -s h -l help -d 'Show help 
 
 # `hyoui kill` options.
 complete -c hyoui -n '__hyoui_using_subcommand kill' -l socket -r -F -d 'Explicit socket path'
-complete -c hyoui -n '__hyoui_using_subcommand kill' -l signum -x    -d 'Signal number'
+complete -c hyoui -n '__hyoui_using_subcommand kill' -l signal -x -a 'SIGHUP SIGINT SIGQUIT SIGABRT SIGKILL SIGUSR1 SIGUSR2 SIGTERM SIGCONT SIGTSTP SIGCHLD' -d 'Signal name (SIG-prefix uppercase, DR-0012)'
 complete -c hyoui -n '__hyoui_using_subcommand kill' -s h -l help    -d 'Show help and exit'
 
 # `hyoui status` options.

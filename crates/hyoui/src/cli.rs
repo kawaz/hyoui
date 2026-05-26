@@ -171,8 +171,12 @@ pub struct KillConfig {
     pub socket: Option<String>,
     /// Target session id。
     pub session_id: Option<String>,
-    /// 子 PTY に送る signal 番号 (= default SIGTERM)。
-    pub signum: Option<u8>,
+    /// 子 PTY に送る signal 名 (= default SIGTERM、DR-0012)。
+    ///
+    /// 正規表記は SIG-prefix 大文字 ("SIGTERM" / "SIGKILL" 等)。受信した name は
+    /// daemon 側で OS native value に解決される。略名 ("TERM") / 小文字
+    /// ("sigterm") / 数値 ("15") は CLI 段で reject される。
+    pub signal: Option<String>,
 }
 
 /// `status` subcommand の出力形式 (= `--format=plain|json`)。
@@ -344,7 +348,7 @@ fn parse_kill(args: &[String]) -> Command {
     let mut cfg = KillConfig {
         socket: None,
         session_id: None,
-        signum: None,
+        signal: None,
     };
     let mut positionals: Vec<String> = Vec::new();
     let mut i = 0usize;
@@ -373,15 +377,36 @@ fn parse_kill(args: &[String]) -> Command {
                 Some(v) => cfg.socket = Some(v),
                 None => return Command::Error("--socket requires a value".into()),
             },
-            "--signum" => match value.as_deref() {
-                Some(v) => match v.parse::<u8>() {
-                    Ok(n) => cfg.signum = Some(n),
-                    Err(_) => {
-                        return Command::Error(format!("invalid --signum value: {v}"));
+            // DR-0012: 旧 `--signum N` は完全廃止。v0.2.0 breaking。
+            "--signal" => match value.as_deref() {
+                Some(v) => {
+                    // CLI 段で正規表記 (SIG-prefix 大文字) を強制する。
+                    // - 略名 ("TERM") は SIG-prefix 不在で reject
+                    // - 小文字 ("sigterm") は ASCII 大文字以外を含むので reject
+                    // - 数値 ("15") は SIG prefix 不在で reject
+                    // - 完全未知 ("SIGBOGUS") は CLI を通過し、daemon 側で
+                    //   signal.invalid として reject される
+                    if !v.starts_with("SIG")
+                        || v.len() <= 3
+                        || !v
+                            .bytes()
+                            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+                    {
+                        return Command::Error(format!(
+                            "invalid --signal value: {v} (expected SIG-prefix uppercase, e.g. SIGTERM)"
+                        ));
                     }
-                },
-                None => return Command::Error("--signum requires a value".into()),
+                    cfg.signal = Some(v.to_string());
+                }
+                None => return Command::Error("--signal requires a value".into()),
             },
+            "--signum" => {
+                // 旧形式は v0.2.0 で廃止。明確な error メッセージで誘導する
+                // (DR-0012, R5-C4)。
+                return Command::Error(
+                    "--signum is removed in v0.2.0 (DR-0012); use --signal NAME (e.g. --signal SIGTERM)".into(),
+                );
+            }
             other if other.starts_with('-') => {
                 return Command::Error(format!("unknown kill option: {other}"));
             }
@@ -1619,8 +1644,14 @@ fn usage_kill() -> String {
         \n\
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
-            --signum N      Signal number to send to the child PTY (default: SIGTERM=15)\n    \
+            --signal NAME   Signal name to send to the child PTY (default: SIGTERM)\n    \
             -h, --help      Show this help and exit\n\
+        \n\
+        SIGNAL NAME (DR-0012):\n    \
+            正規表記は SIG-prefix 大文字 (e.g. SIGTERM / SIGKILL / SIGINT / SIGHUP /\n    \
+            SIGQUIT / SIGUSR1 / SIGUSR2 / SIGCONT / SIGTSTP / SIGCHLD)\n    \
+            略名 (TERM) / 小文字 (sigterm) / 数値 (15) は受理されない\n    \
+            POSIX が signal 数値を規定していないため wire 上は name で送る\n\
         \n\
         EXIT CODE:\n    \
             0   送信完了 (= daemon が close するのを待ってから exit)\n    \
@@ -1628,9 +1659,9 @@ fn usage_kill() -> String {
             2   引数不足 (session-id も --socket も無し)\n\
         \n\
         EXAMPLES:\n    \
-            hyoui kill demo                         # session_id=demo に SIGTERM\n    \
-            hyoui kill demo --signum=9              # SIGKILL を送る\n    \
-            hyoui kill --socket=/tmp/x.sock         # socket 直指定で kill\n\
+            hyoui kill demo                          # session_id=demo に SIGTERM\n    \
+            hyoui kill demo --signal=SIGKILL         # SIGKILL を送る\n    \
+            hyoui kill --socket=/tmp/x.sock          # socket 直指定で kill\n\
         \n\
         RELATED:\n    \
             hyoui list          attach 可能な session 一覧 (= 対象選び)\n    \
@@ -2566,7 +2597,7 @@ mod tests {
 
     // R4-H1: each subcommand's `--help` must route to the subcommand-specific
     // HelpTopic (not Top). Regression: `hyoui kill --help` previously printed
-    // top-level help, which gave users no info about --signum, exit codes, etc.
+    // top-level help, which gave users no info about --signal, exit codes, etc.
 
     #[test]
     fn list_help_routes_to_list_topic() {
@@ -2652,7 +2683,7 @@ mod tests {
                 &["DETACH KEY", "--exclusive"],
             ),
             (HelpTopic::List, "hyoui list", &["SCAN ORDER"]),
-            (HelpTopic::Kill, "hyoui kill", &["--signum", "SIGTERM"]),
+            (HelpTopic::Kill, "hyoui kill", &["--signal", "SIGTERM"]),
             (HelpTopic::Status, "hyoui status", &["OUTPUT", "child-pid"]),
             (HelpTopic::Tail, "hyoui tail", &["--follow", "--since"]),
             (HelpTopic::Wait, "hyoui wait", &["PREDICATES", "wait-idle"]),
@@ -2754,6 +2785,65 @@ mod tests {
                 );
             }
             other => panic!("expected Error for invalid session_id, got {other:?}"),
+        }
+    }
+
+    /// DR-0012: `--signal=SIGTERM` が cfg.signal に正規表記文字列で格納される。
+    #[test]
+    fn parse_kill_signal_flag_accepts_sigterm() {
+        match parse_args(&args(&["kill", "demo", "--signal=SIGTERM"])) {
+            Command::Kill(cfg) => {
+                assert_eq!(cfg.signal.as_deref(), Some("SIGTERM"));
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+            }
+            other => panic!("expected Kill(signal=SIGTERM), got {other:?}"),
+        }
+        // 空白区切り形式 (= `--signal SIGKILL`) も同じ
+        match parse_args(&args(&["kill", "demo", "--signal", "SIGKILL"])) {
+            Command::Kill(cfg) => {
+                assert_eq!(cfg.signal.as_deref(), Some("SIGKILL"));
+            }
+            other => panic!("expected Kill(signal=SIGKILL), got {other:?}"),
+        }
+    }
+
+    /// DR-0012: 旧 `--signum N` (= u8 数値) は v0.2.0 で removed。明示的 error で
+    /// `--signal NAME` への誘導メッセージを返す。
+    #[test]
+    fn parse_kill_rejects_legacy_signum_flag() {
+        match parse_args(&args(&["kill", "demo", "--signum=15"])) {
+            Command::Error(msg) => {
+                assert!(
+                    msg.contains("--signum"),
+                    "error should mention removed flag: {msg}"
+                );
+                assert!(
+                    msg.contains("--signal"),
+                    "error should direct user to --signal: {msg}"
+                );
+                assert!(
+                    msg.contains("DR-0012") || msg.contains("v0.2.0"),
+                    "error should hint about the breaking change: {msg}"
+                );
+            }
+            other => panic!("expected Error for legacy --signum, got {other:?}"),
+        }
+    }
+
+    /// DR-0012: 略名 / 小文字 / 数値は CLI 段で reject される (= wire の正規化を
+    /// CLI 入口で強制)。
+    #[test]
+    fn parse_kill_rejects_non_canonical_signal_names() {
+        for bogus in &["TERM", "sigterm", "15", "SIG", "sig_term"] {
+            match parse_args(&args(&["kill", "demo", "--signal", bogus])) {
+                Command::Error(msg) => {
+                    assert!(
+                        msg.contains("invalid --signal"),
+                        "error for {bogus} should mention invalid --signal: {msg}"
+                    );
+                }
+                other => panic!("expected Error for `--signal {bogus}`, got {other:?}"),
+            }
         }
     }
 
