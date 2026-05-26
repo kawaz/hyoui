@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 /// 1 つの output chunk (1 回の pty read 単位)。
 #[derive(Clone, Debug)]
 pub struct OutputChunk {
+    /// chunk が daemon にて受信された時刻。
     pub ts: Instant,
+    /// 受信した bytes (= 1 回の `read(master_fd)` の戻り分)。
     pub bytes: Vec<u8>,
 }
 
@@ -118,11 +120,7 @@ impl Scrollback {
 
     /// `since` の厳密版。`last_evicted_ts >= since_start` (= since 範囲の最古部分が既に
     /// evict されてた可能性) なら `Err(BufferInsufficient)`。完全に buffer 内なら `Ok`。
-    pub fn since_strict(
-        &self,
-        now: Instant,
-        dur: Duration,
-    ) -> Result<Vec<u8>, BufferInsufficient> {
+    pub fn since_strict(&self, now: Instant, dur: Duration) -> Result<Vec<u8>, BufferInsufficient> {
         let since_start = now.checked_sub(dur).unwrap_or(now);
         if let Some(last_evict) = self.last_evicted_ts {
             if last_evict >= since_start {
