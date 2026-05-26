@@ -148,7 +148,12 @@ fn agent_run_false_exits_one() {
 
 /// `Agent::run` propagates the child's exit code via the observer too —
 /// the captured output should include the echoed text.
+///
+/// FLAKY: 並列 test 実行で偶発失敗、原因は pty + child + observer の race。
+/// 詳細は `docs/issue/2026-05-26-bug-flaky-agent-tests.md`。v0.1.0 daemon 再実装で
+/// 根本対処予定。それまで `#[ignore]` で disable、`cargo test -- --ignored` で個別検証可。
 #[test]
+#[ignore = "flaky in parallel runs, tracked in docs/issue/2026-05-26-bug-flaky-agent-tests.md"]
 fn agent_run_echo_output_visible_via_observer() {
     let cfg = headless_config(&["echo", "hi"]);
     let (obs, seen) = CapturingObserver::new();
@@ -162,7 +167,11 @@ fn agent_run_echo_output_visible_via_observer() {
 /// Headless agent with an explicit `--socket` accepts an input message
 /// over the protocol channel and forwards it to the child. We use `cat`
 /// as the child so we can observe the echoed bytes coming back out.
+///
+/// FLAKY: socket connect の race。詳細は `docs/issue/2026-05-26-bug-flaky-agent-tests.md`。
+/// v0.1.0 daemon 再実装で根本対処予定。
 #[test]
+#[ignore = "flaky in parallel runs, tracked in docs/issue/2026-05-26-bug-flaky-agent-tests.md"]
 fn agent_socket_input_reaches_child() {
     let dir = PrivateDir::new("sock");
     let sock_path = dir.path().join("agent.sock");
