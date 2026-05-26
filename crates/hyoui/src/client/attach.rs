@@ -728,11 +728,13 @@ mod tests {
         let mut output: Vec<u8> = Vec::new();
         let run_handle = std::thread::spawn(move || conn.run(&mut input, &mut output));
 
-        // daemon thread が 3s 以内に終了することを確認する (= cat が EOT で
+        // daemon thread が 10s 以内に終了することを確認する (= cat が EOT で
         // EOF を見て exit、master_fd 経由で daemon が ChildExited を観測)。
+        // R4-H5: timing-tight な threshold は CI 高負荷で flaky になるため、
+        // 旧 3s → 10s に緩和 (= 3x ルール準拠、event-based に書き換えは別)。
         let start = std::time::Instant::now();
         let mut daemon_done = false;
-        while start.elapsed() < Duration::from_secs(3) {
+        while start.elapsed() < Duration::from_secs(10) {
             if daemon_handle.is_finished() {
                 daemon_done = true;
                 break;
@@ -741,7 +743,7 @@ mod tests {
         }
         assert!(
             daemon_done,
-            "daemon must terminate within 3s after stdin EOF + EOT propagation; elapsed={:?}",
+            "daemon must terminate within 10s after stdin EOF + EOT propagation; elapsed={:?}",
             start.elapsed()
         );
         let _ = daemon_handle.join();
