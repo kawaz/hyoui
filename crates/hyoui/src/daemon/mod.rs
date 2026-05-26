@@ -20,5 +20,7 @@
 //! - finding 2026-05-26-daemon-fork (`--detached` 起動の pipe 同期、Phase 7 で使用予定)
 
 mod config;
+mod session;
 
 pub use config::DaemonConfig;
+pub use session::Session;
