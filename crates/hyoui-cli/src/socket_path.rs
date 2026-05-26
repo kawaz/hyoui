@@ -22,6 +22,22 @@ pub fn auto_session_id() -> String {
     format!("run-{}", std::process::id())
 }
 
+/// `session_id` whitelist validator の io::Error 化 wrapper。
+///
+/// canonical な validator は [`hyoui::cli::validate_session_id`] にある
+/// (= CLI parser と本 module の双方から呼ぶための共有ロジック)。本関数は
+/// 戻り値を `std::io::Error` (`ErrorKind::InvalidInput`) にラップして、
+/// `resolve_with_env` の戻り型と整合させるためだけの薄い shim。
+///
+/// # Errors
+///
+/// `session_id` が whitelist に反する場合、`std::io::ErrorKind::InvalidInput`
+/// と人間可読の reason を含む `std::io::Error` を返す。
+pub fn validate_session_id(session_id: &str) -> std::io::Result<()> {
+    hyoui::cli::validate_session_id(session_id)
+        .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))
+}
+
 /// daemon socket path を決定する。
 ///
 /// `explicit = Some(p)` ならそのまま、`None` なら自動 path:
@@ -61,6 +77,9 @@ pub fn resolve_with_env(
     if let Some(p) = explicit {
         return Ok(PathBuf::from(p));
     }
+    // R5-AUD-C2: session_id を `PathBuf::join` に渡す前に whitelist validate。
+    // 不正値が来た場合は dir 作成すら行わず即 reject (= traversal の副作用なし)。
+    validate_session_id(session_id)?;
     let dir = pick_socket_dir(env)?;
     ensure_socket_dir(&dir, env.uid)?;
     Ok(dir.join(format!("{session_id}.sock")))
@@ -248,6 +267,108 @@ mod tests {
         let uid = nix::unistd::geteuid().as_raw();
         let err = ensure_socket_dir(dir.path(), uid).expect_err("must err");
         assert!(err.to_string().contains("mode"));
+    }
+
+    // ------------------------------------------------------------------
+    // R5-AUD-C2: session_id whitelist validation regression tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn socket_path_accepts_normal_alphanumeric() {
+        // 正常系: ASCII 英数字 + `._-` 全てを使った典型値が通る。
+        for sid in [
+            "demo",
+            "run-12345",
+            "session_01",
+            "build.2025-05-27",
+            "a",
+            "A1b2_C3.D4-E5",
+        ] {
+            validate_session_id(sid)
+                .unwrap_or_else(|e| panic!("session_id {sid:?} should be accepted, got {e}"));
+        }
+    }
+
+    #[test]
+    fn socket_path_rejects_dot_dot_traversal() {
+        // `..` 単独 / `../foo` / `foo/../bar` 等の path traversal を全部 reject。
+        for sid in ["..", "../etc", "../../.ssh/control", "a/../b"] {
+            let err = validate_session_id(sid).expect_err(&format!("{sid:?} must err"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "sid={sid:?}");
+        }
+    }
+
+    #[test]
+    fn socket_path_rejects_slash() {
+        // `/` (= POSIX separator) / `\` (= Windows separator) を含む値を reject。
+        for sid in ["/abs/path", "rel/path", "a\\b", "x/y/z"] {
+            let err = validate_session_id(sid).expect_err(&format!("{sid:?} must err"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "sid={sid:?}");
+        }
+    }
+
+    #[test]
+    fn socket_path_rejects_empty_string() {
+        let err = validate_session_id("").expect_err("empty string must err");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("empty"),
+            "message should mention 'empty', got: {err}"
+        );
+    }
+
+    #[test]
+    fn socket_path_rejects_single_dot() {
+        // `.` 単独も path traversal component なので reject。
+        let err = validate_session_id(".").expect_err("'.' must err");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn socket_path_rejects_control_chars() {
+        // ANSI escape / 改行 / NUL は whitelist 外なので reject。
+        // R5-AUD-M4 で指摘の terminal escape injection 対策も兼ねる。
+        for sid in ["a\nb", "a\x1b[31mhack", "a\0b", "a b", "tab\tname"] {
+            let err = validate_session_id(sid).expect_err(&format!("{sid:?} must err"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "sid={sid:?}");
+        }
+    }
+
+    #[test]
+    fn socket_path_rejects_too_long() {
+        // 65 chars (= MAX + 1) は reject。
+        let max = hyoui::cli::MAX_SESSION_ID_LEN;
+        let long = "a".repeat(max + 1);
+        let err = validate_session_id(&long).expect_err("too long must err");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("too long"),
+            "message should mention 'too long', got: {err}"
+        );
+
+        // 64 chars (= MAX 丁度) は通る。
+        let max_ok = "a".repeat(max);
+        validate_session_id(&max_ok).expect("MAX length must be accepted");
+    }
+
+    #[test]
+    fn resolve_rejects_traversal_session_id() {
+        // resolve_with_env 経由でも path traversal 値は reject される
+        // (= 偶然 dir 検証を bypass しても socket file 生成に到達できない)。
+        let env = env_with(None, None);
+        let err =
+            resolve_with_env(None, "../../.ssh/control", &env).expect_err("traversal must err");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn resolve_explicit_path_bypasses_validation() {
+        // `--socket=<path>` 指定時は session_id 不要 / validate されない
+        // (= explicit path は呼出側責任、本 validator は session_id resolver 専用)。
+        let env = env_with(None, None);
+        let got = resolve_with_env(Some("/tmp/explicit.sock"), "..", &env)
+            .expect("explicit path bypasses session_id validate");
+        assert_eq!(got, PathBuf::from("/tmp/explicit.sock"));
     }
 
     fn rand_token() -> String {

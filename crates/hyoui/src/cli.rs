@@ -389,7 +389,14 @@ fn parse_kill(args: &[String]) -> Command {
                 );
             }
         }
-        1 => cfg.session_id = Some(positionals.into_iter().next().unwrap()),
+        1 => {
+            let sid = positionals.into_iter().next().unwrap();
+            // R5-AUD-C2: positional session_id を validate (= path traversal 早期 reject)
+            if let Err(e) = validate_session_id(&sid) {
+                return Command::Error(format!("kill: {e}"));
+            }
+            cfg.session_id = Some(sid);
+        }
         _ => return Command::Error("kill: too many positional arguments".into()),
     }
     Command::Kill(cfg)
@@ -462,7 +469,14 @@ where
             }
             None
         }
-        1 => Some(positionals.into_iter().next().unwrap()),
+        1 => {
+            let sid = positionals.into_iter().next().unwrap();
+            // R5-AUD-C2: positional session_id を validate (= path traversal 早期 reject)
+            if let Err(e) = validate_session_id(&sid) {
+                return Err(Command::Error(format!("{name}: {e}")));
+            }
+            Some(sid)
+        }
         _ => {
             return Err(Command::Error(format!(
                 "{name}: too many positional arguments"
@@ -627,6 +641,10 @@ fn parse_wait(args: &[String]) -> Command {
             Ok(None) => {
                 if session_id.is_some() {
                     return Command::Error(format!("wait: unexpected argument: {p}"));
+                }
+                // R5-AUD-C2: positional session_id を validate (= path traversal 早期 reject)
+                if let Err(e) = validate_session_id(&p) {
+                    return Command::Error(format!("wait: {e}"));
                 }
                 session_id = Some(p);
             }
@@ -1225,7 +1243,12 @@ fn parse_run(args: &[String]) -> Command {
                 consumed_extra = false; // bool flag は次 arg を食わない
             }
             "--session" => match value {
-                Some(v) => session = Some(v),
+                Some(v) => {
+                    if let Err(e) = validate_session_id(&v) {
+                        return Command::Error(format!("--session: {e}"));
+                    }
+                    session = Some(v);
+                }
                 None => return Command::Error("--session requires a value".into()),
             },
             other => return Command::Error(format!("unknown option: {other}")),
@@ -1650,6 +1673,54 @@ fn split_eq(arg: &str) -> (String, Option<String>) {
     } else {
         (arg.to_string(), None)
     }
+}
+
+/// `session_id` の最大長 (= 64 chars、POSIX `NAME_MAX` の半分以下に抑える)。
+///
+/// socket file 名は `<session_id>.sock` なので、parent dir + name で
+/// `PATH_MAX` を割ることはまずないが、上限を切ることで CBOR / ANSI escape
+/// 等の異常入力経路を早期 reject する (R5-AUD-C2 path traversal 対策)。
+pub const MAX_SESSION_ID_LEN: usize = 64;
+
+/// `session_id` を path traversal / 制御文字 / 過長から守る whitelist validator。
+///
+/// 許可: `[A-Za-z0-9._-]{1,64}`。さらに以下を明示 reject:
+///
+/// - 空 string (= "")
+/// - `.` 単独、`..` 単独 (= path 構成要素として親 dir 参照になる)
+/// - `/` / `\` を含む (= path separator、whitelist 外だが冗長 reject)
+///
+/// CLI argv parser 段階での早期 reject と、`socket_path::resolve` の前段
+/// 防御の **双方** で呼ばれる (= R5-AUD-C2 defense-in-depth)。
+///
+/// # Errors
+///
+/// validator に反する場合、人間可読な reason 文字列を返す。
+pub fn validate_session_id(session_id: &str) -> Result<(), String> {
+    if session_id.is_empty() {
+        return Err("session_id must not be empty".into());
+    }
+    if session_id.len() > MAX_SESSION_ID_LEN {
+        return Err(format!(
+            "session_id too long ({} bytes, max {MAX_SESSION_ID_LEN})",
+            session_id.len()
+        ));
+    }
+    if session_id == "." || session_id == ".." {
+        return Err(format!(
+            "session_id {session_id:?} is a path traversal component"
+        ));
+    }
+    for (idx, ch) in session_id.char_indices() {
+        let ok = ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-';
+        if !ok {
+            return Err(format!(
+                "session_id contains invalid character {ch:?} at byte {idx} \
+                 (allowed: [A-Za-z0-9._-])"
+            ));
+        }
+    }
+    Ok(())
 }
 
 // =============================================================================
@@ -2479,6 +2550,100 @@ mod tests {
                 !text.contains("SUBCOMMANDS:\n"),
                 "topic {topic:?} usage must not contain top-level SUBCOMMANDS list; got:\n{text}"
             );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // R5-AUD-C2: session_id whitelist regression tests (CLI parser side)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_run_rejects_invalid_session_id() {
+        // `hyoui run --session=<bad>` で path traversal / 制御文字 等を早期 reject。
+        let bad = [
+            "../../.ssh/control", // path traversal
+            "../etc",
+            "a/b",           // separator
+            "a\\b",          // windows separator
+            "..",            // dot-dot literal
+            ".",             // dot literal
+            "",              // empty (--session= 等で来る)
+            "a\nb",          // newline (control char)
+            "a\x1b[31mhack", // ANSI escape
+            "name with space",
+        ];
+        for sid in bad {
+            let arg = format!("--session={sid}");
+            match parse_args(&args(&["run", &arg, "--", "true"])) {
+                Command::Error(msg) => {
+                    assert!(
+                        msg.contains("--session") || msg.contains("session_id"),
+                        "error for {sid:?} should mention --session/session_id, got: {msg}"
+                    );
+                }
+                other => panic!("expected Error for invalid session_id {sid:?}, got {other:?}"),
+            }
+        }
+
+        // 過長 (65 chars) も reject。
+        let too_long = "a".repeat(MAX_SESSION_ID_LEN + 1);
+        let arg = format!("--session={too_long}");
+        match parse_args(&args(&["run", &arg, "--", "true"])) {
+            Command::Error(msg) => {
+                assert!(
+                    msg.contains("too long"),
+                    "error for too-long should mention 'too long', got: {msg}"
+                );
+            }
+            other => panic!("expected Error for too-long session_id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_run_accepts_normal_session_id() {
+        // 正常系: 一般的な session 名は通る (= 回帰時に既存ユーザを巻き込まない確認)。
+        for sid in ["demo", "run-12345", "session_01", "build.2025-05-27"] {
+            let arg = format!("--session={sid}");
+            match parse_args(&args(&["run", &arg, "--", "true"])) {
+                Command::Run(cfg) => {
+                    assert_eq!(cfg.session.as_deref(), Some(sid));
+                }
+                other => panic!("expected Run for valid session_id {sid:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_kill_rejects_invalid_session_id() {
+        // positional session_id 経由 (= `hyoui kill <bad>`) でも reject。
+        match parse_args(&args(&["kill", "../../.ssh/control"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("kill"), "error should mention 'kill': {msg}");
+                assert!(
+                    msg.contains("invalid character") || msg.contains("path traversal"),
+                    "error should explain why, got: {msg}"
+                );
+            }
+            other => panic!("expected Error for invalid session_id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_status_rejects_invalid_session_id() {
+        // parse_session_targeted 経由 (status/attach/tail) も reject。
+        match parse_args(&args(&["status", "a/b"])) {
+            Command::Error(_) => {}
+            other => panic!("expected Error for invalid session_id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_wait_rejects_invalid_session_id() {
+        // parse_wait の positional path も reject (= predicate と紛らわしいので
+        // session_id 側に落ちた値が validate されることを確認)。
+        match parse_args(&args(&["wait", "../foo", "text:READY"])) {
+            Command::Error(_) => {}
+            other => panic!("expected Error for invalid session_id, got {other:?}"),
         }
     }
 }
