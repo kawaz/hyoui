@@ -366,9 +366,10 @@ Wild debugger / Competitive 分析 / Rust API 設計
 - [ ] **R5-M23** `next_client_id` が monotonic increasing = ID 推測容易
   - 出典: Audit (R5-AUD-M1) / 該当: `daemon/accept.rs:312`
   - 提案: 内部 dense index は維持、wire 上の `client_id` を `rand u64` で 1 回振る。v0.2.0+ で `--target-client-id` 入れる前に
-- [ ] **R5-M24** `auto_session_id` が PID 単独 → 衝突 + 攻撃予測可能
+- [done] **R5-M24** `auto_session_id` が PID 単独 → 衝突 + 攻撃予測可能
   - 出典: Audit+POSIX (R5-AUD-M2, R5-POSIX-I3) / 該当: `socket_path.rs:21-23`
   - 提案: `format!("run-{}-{}", pid, rand_suffix)` (8 hex chars)
+  - 解消: `socket_path.rs::auto_session_id` を `run-<pid>-<rand4hex>` (4 byte = 8 hex char) に変更。`/dev/urandom` 直読み (rand crate 依存を増やさない)、failure 時は `run-<pid>` に silent fallback。連続生成で接尾辞がバラけることと `validate_session_id` を通過することを test で確認。`cli.rs` の関連 doc 文言も更新。
 - [ ] **R5-M25** `DaemonConfig.expected_token` の `Debug` derive で全文表示しうる (R4-H8 延長)
   - 出典: Audit (R5-AUD-M6) / 該当: `daemon/config.rs:43`
   - 提案: `expected_token` を `secrecy::SecretString` 風 newtype に包むか、`DaemonConfig` Debug を手書きで redact

@@ -14,12 +14,49 @@
 //! HOME 直下 (`~/.hyoui` 等) は使わない (= ユーザ HOME を汚さない)。
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// 自動生成 session_id (= 単発 `hyoui run` で衝突しない値)。
+///
+/// 形式: `run-<pid>-<rand4hex>` (例: `run-12345-9af3`)。
+///
+/// # R5-M24: なぜ pid 単独ではないか
+///
+/// 単純な `run-<pid>` だと:
+///
+/// * **衝突**: 同一 UID で `hyoui run` を高速連続で叩くと、kernel が直近の pid を
+///   recycle した瞬間に新旧セッションが同名になりうる (32-bit pid wrap など)。
+/// * **予測容易性**: 第三者が `pid` の取りうる範囲を total order で総当りでき、
+///   socket dir 列挙無しでも socket path を直撃しうる (同 UID 信頼境界内なので
+///   厳密な脅威ではないが defense-in-depth)。
+///
+/// 4 byte (= 32 bit) のランダム接尾辞を付けることで両方緩和する。urandom が
+/// 開けない・読めない極端な環境では pid 単独に fallback して動作継続させる
+/// (= silent regression、最悪ケースで旧挙動と同等)。
 pub fn auto_session_id() -> String {
-    format!("run-{}", std::process::id())
+    let pid = std::process::id();
+    match read_urandom_hex4() {
+        Some(suffix) => format!("run-{pid}-{suffix}"),
+        // urandom 不在は極めて稀。デバッグ容易性のため pid 単独 fallback。
+        None => format!("run-{pid}"),
+    }
+}
+
+/// `/dev/urandom` から 4 byte 読み、8-char lowercase hex string を返す。
+///
+/// 失敗時は `None`。caller は最低限の機能を保つために fallback すること。
+fn read_urandom_hex4() -> Option<String> {
+    let mut f = std::fs::File::open("/dev/urandom").ok()?;
+    let mut buf = [0u8; 4];
+    f.read_exact(&mut buf).ok()?;
+    let mut out = String::with_capacity(8);
+    for b in &buf {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    Some(out)
 }
 
 /// `session_id` whitelist validator の io::Error 化 wrapper。
@@ -160,6 +197,52 @@ mod tests {
         let sid = auto_session_id();
         assert!(sid.starts_with("run-"));
         assert!(sid.len() > "run-".len());
+        let pid_str = std::process::id().to_string();
+        // pid 部分が含まれていることを確認 (urandom 有無に関わらず成立)。
+        assert!(
+            sid.contains(&pid_str),
+            "auto_session_id {sid:?} missing pid {pid_str}"
+        );
+    }
+
+    /// R5-M24: `/dev/urandom` が読める通常環境では 4 byte (= 8 hex char) の
+    /// 接尾辞が付き、`run-<pid>-<rand>` 形式になる。
+    #[test]
+    fn auto_session_id_has_random_suffix_when_urandom_available() {
+        // 連続生成して全部同じだったら接尾辞が効いていない (pid は同じプロセスで不変)。
+        // urandom 不在環境では 1 種類だけ返るので skip 条件付き。
+        if !std::path::Path::new("/dev/urandom").exists() {
+            return;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            seen.insert(auto_session_id());
+        }
+        assert!(
+            seen.len() > 1,
+            "expected randomized suffix, got identical ids: {seen:?}"
+        );
+        // 形式チェック: 各 id が `run-<pid>-<8 hex>` の構造か。
+        let pid = std::process::id();
+        let pid_prefix = format!("run-{pid}-");
+        for id in &seen {
+            assert!(id.starts_with(&pid_prefix), "bad format: {id}");
+            let suffix = &id[pid_prefix.len()..];
+            assert_eq!(suffix.len(), 8, "suffix should be 8 hex chars: {id}");
+            assert!(
+                suffix.bytes().all(|b| b.is_ascii_hexdigit()),
+                "suffix must be hex: {id}"
+            );
+        }
+    }
+
+    /// R5-M24: 生成された id は `validate_session_id` を通過する
+    /// (= filesystem path として安全)。
+    #[test]
+    fn auto_session_id_passes_validation() {
+        let sid = auto_session_id();
+        hyoui::cli::validate_session_id(&sid)
+            .unwrap_or_else(|e| panic!("auto_session_id {sid:?} failed validation: {e}"));
     }
 
     #[test]

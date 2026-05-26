@@ -126,7 +126,7 @@ pub struct RunConfig {
     /// `--detached`: daemon を別 process で起動して親はすぐ exit。socket path を
     /// stdout に 1 行 print してから親が終わる。attach は別 process から行う。
     pub detached: bool,
-    /// `--session`: 自動採番 (run-<pid>) ではなく明示 session id を使う。
+    /// `--session`: 自動採番 (`run-<pid>-<rand4hex>`) ではなく明示 session id を使う。
     /// socket path 自動解決にもこの値が入る。
     pub session: Option<String>,
     /// Action when the child is suspended (preset by mode unless overridden).
