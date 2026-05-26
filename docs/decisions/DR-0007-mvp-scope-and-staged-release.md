@@ -212,3 +212,13 @@ hyoui play <session> --input FILE [--speed] [--input-only|--output-only]
 - `docs/journal/2026-05-26-cli-design-discussion.md` — 議論の経緯
 - `docs/journal/2026-05-26-night-phase10-11-release.md` — v0.1.0 release 時点の実装状態
 - `docs/ROADMAP.md` — 未実装機能の振り分け先
+
+---
+
+> **Note (2026-05-27)**: 本 DR は [[DR-0010]] で部分的に上書き済。
+> 具体的には以下 3 点が DR-0010 の決定に置き換わっている:
+> 1. v0.2.0 subcommand 数: 11 個 → 7 個 (= `input` / `lock` family への統合)
+> 2. serve gateway 配置: 同 repo `crates/hyoui-serve` → 別 repo `kawaz/hyoui-serve`
+> 3. snapshot (画面 emulator): v0.2.0 候補 → v0.3.0 押下げ
+>
+> 本 DR の他の決定 (= 段階リリース戦略、v0.1.0 時点の到達点、v0.3.0+ 順序) は引き続き有効。
