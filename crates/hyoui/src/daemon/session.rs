@@ -352,6 +352,8 @@ enum Subscription {
 /// - `accumulated`: wait 開始後に蓄積した master bytes (predicate scan 対象)
 /// - `last_activity`: Idle 用に最後に master 出力があった時刻 (= 開始時 = now)
 /// - `compiled_regex`: Pattern predicate のみ、wait 開始時 1 回 compile
+/// - `strip_carry`: `strip_escapes=true` 時に chunk 境界を跨ぐ partial ANSI
+///   escape を持ち越すための stateful stripper (R4-H3)。
 struct PendingWait {
     client_id: u64,
     predicate: WaitPredicate,
@@ -360,6 +362,7 @@ struct PendingWait {
     accumulated: Vec<u8>,
     last_activity: Instant,
     compiled_regex: Option<regex::bytes::Regex>,
+    strip_carry: crate::strip::StripAnsiCarry,
 }
 
 /// `accumulated` の上限 (= memory bound)。超過すると古い byte から truncate。
@@ -824,6 +827,7 @@ fn handle_wait_request(
         accumulated: Vec::new(),
         last_activity: now,
         compiled_regex,
+        strip_carry: crate::strip::StripAnsiCarry::new(),
     };
 
     // 開始即 (= accumulated 空) に match することは Text/Pattern では起きないが、
@@ -845,8 +849,9 @@ fn handle_wait_request(
 /// scan。マッチした wait は client へ `wait.result(Matched)` を送って remove する。
 ///
 /// `WaitMatchOptions::strip_escapes` / `newline_convert_lf` は scan 前に新 bytes に
-/// 適用する。`strip_escapes` は per-frame で完結 (= chunk 境界跨ぎ ANSI escape の
-/// 完全保証はしない)。
+/// 適用する。`strip_escapes` は per-wait の `StripAnsiCarry` で chunk 境界を跨ぐ
+/// partial ANSI escape を持ち越すため、escape を挟んで分割された needle も正しく
+/// match できる (R4-H3)。
 fn update_waits_on_master_bytes(
     pending_waits: &mut Vec<PendingWait>,
     clients: &mut [ClientHandle],
@@ -859,7 +864,8 @@ fn update_waits_on_master_bytes(
         w.last_activity = now;
 
         let mut bytes_to_add: Vec<u8> = if w.options.strip_escapes {
-            crate::strip::strip_ansi(new_bytes)
+            // stateful: 前 chunk の末尾で未完了の escape を carry。
+            w.strip_carry.push(new_bytes)
         } else {
             new_bytes.to_vec()
         };
@@ -4189,6 +4195,7 @@ mod tests {
             accumulated: Vec::new(),
             last_activity,
             compiled_regex: None,
+            strip_carry: crate::strip::StripAnsiCarry::new(),
         }
     }
 
@@ -4239,6 +4246,93 @@ mod tests {
         // pending_waits に残り続ける。
         check_wait_timeouts(&mut waits, &mut clients);
         assert_eq!(waits.len(), 1, "overflow Idle should not match");
+    }
+
+    /// R4-H3: needle が chunk 境界を跨いでも match できる。`accumulated` は元々
+    /// chunk 横断で蓄積されるため plain text では問題ないが、ここでは特に
+    /// `strip_escapes=true` + ANSI escape が chunk 境界で分割された場合に
+    /// 後続 chunk の escape parameter (例: `1m`) が raw text として漏れず、
+    /// needle が正しく検出されることを確認する。
+    #[test]
+    fn wait_text_matches_across_chunk_boundary_with_strip_escapes() {
+        use crate::protocol::messages::{WaitMatchOptions, WaitPredicate};
+
+        let now = Instant::now();
+        let mut waits = vec![PendingWait {
+            client_id: 1,
+            predicate: WaitPredicate::Text {
+                value: "READY".into(),
+            },
+            options: WaitMatchOptions {
+                strip_escapes: true,
+                newline_convert_lf: false,
+            },
+            deadline: None,
+            accumulated: Vec::new(),
+            last_activity: now,
+            compiled_regex: None,
+            strip_carry: crate::strip::StripAnsiCarry::new(),
+        }];
+        // No clients registered; update_waits_on_master_bytes silently skips
+        // sending when the client_id is unknown. The match itself is still
+        // observable via `waits.is_empty()` after the call (matched waits are
+        // removed).
+        let mut clients: Vec<ClientHandle> = Vec::new();
+
+        // chunk1: 通常テキスト + CSI escape の途中まで。
+        update_waits_on_master_bytes(&mut waits, &mut clients, b"prefix\x1b[3", now);
+        // ここでは "READY" は到達していない → match なし
+        assert_eq!(waits.len(), 1, "match before READY arrives");
+
+        // chunk2: escape を完結 (`1m`) + needle "READY"。
+        // stateless strip だと `1m` が raw として accumulated に入り、かつ
+        // chunk1 末尾の `\x1b[3` も raw として残るので、両者を結合した文字列に
+        // "READY" は含まれるが、本テストの主眼は「stripped 出力に raw `1m` が
+        // 漏れないこと」(= false positive 防止)。
+        update_waits_on_master_bytes(&mut waits, &mut clients, b"1mREADY\n", now);
+        assert!(
+            waits.is_empty(),
+            "needle should match across split escape, but wait is still pending"
+        );
+    }
+
+    /// R4-H3 (negative): 直前 chunk の partial escape が次 chunk と結合されて
+    /// false-positive を生まないこと。chunk1 末尾の `\x1b[3` と chunk2 先頭の
+    /// `1m` で完結する escape は raw `[31m` を accumulated に漏らさない。
+    #[test]
+    fn wait_text_no_false_positive_from_split_escape_params() {
+        use crate::protocol::messages::{WaitMatchOptions, WaitPredicate};
+
+        let now = Instant::now();
+        // needle は escape の parameter `[31m` を狙う。stateless 実装だとここに
+        // ヒットして false positive になる。stateful なら strip されるので不一致。
+        let mut waits = vec![PendingWait {
+            client_id: 1,
+            predicate: WaitPredicate::Text {
+                value: "[31m".into(),
+            },
+            options: WaitMatchOptions {
+                strip_escapes: true,
+                newline_convert_lf: false,
+            },
+            deadline: None,
+            accumulated: Vec::new(),
+            last_activity: now,
+            compiled_regex: None,
+            strip_carry: crate::strip::StripAnsiCarry::new(),
+        }];
+        let mut clients: Vec<ClientHandle> = Vec::new();
+
+        // chunk1: ESC `[` (= CSI 開始) で終わる
+        update_waits_on_master_bytes(&mut waits, &mut clients, b"\x1b[", now);
+        // chunk2: `31m` で escape 完結、その後 plain text
+        update_waits_on_master_bytes(&mut waits, &mut clients, b"31mhello", now);
+
+        assert_eq!(
+            waits.len(),
+            1,
+            "split CSI params must not leak as raw text and false-match"
+        );
     }
 
     /// R4-C9: 自己 LockAcquire は idempotent — 同じ client が既に lock を保持している
