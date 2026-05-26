@@ -27,13 +27,28 @@ pub enum WaitPredicate {
 }
 
 /// 装飾除去 / 改行変換のオプション (DR-0006 §11)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+///
+/// `Default::default()` は `strip_escapes = true` / `newline_convert_lf = false`
+/// を返す (CLI の `--no-strip-escapes` / `--newline-convert-lf` 未指定時と一致)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct WaitMatchOptions {
     /// マッチ対象から ANSI escape を strip した text を見る (default = true)。
     pub strip_escapes: bool,
-    /// CRLF → LF 正規化を施す。
+    /// CRLF → LF 正規化を施す (default = false)。
     pub newline_convert_lf: bool,
+}
+
+impl Default for WaitMatchOptions {
+    /// Design rationale: `#[derive(Default)]` だと `strip_escapes = false` になり
+    /// doc コメント (`default = true`) および CLI の既定値と矛盾するため、手動 impl で揃える
+    /// (R4-C6)。
+    fn default() -> Self {
+        Self {
+            strip_escapes: true,
+            newline_convert_lf: false,
+        }
+    }
 }
 
 /// `wait.request` payload (basic)。

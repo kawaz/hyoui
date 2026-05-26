@@ -441,6 +441,23 @@ mod tests {
     }
 
     #[test]
+    fn wait_match_options_default_matches_documented_values() {
+        // R4-C6: `WaitMatchOptions::default()` の戻り値が doc コメント
+        // (strip_escapes = true / newline_convert_lf = false) および CLI 既定値と
+        // 一致することを保証する。`#[derive(Default)]` だと strip_escapes が false に
+        // なるため、手動 impl Default で揃えている。
+        let opts = WaitMatchOptions::default();
+        assert!(
+            opts.strip_escapes,
+            "strip_escapes default must be true (matches doc and CLI default)"
+        );
+        assert!(
+            !opts.newline_convert_lf,
+            "newline_convert_lf default must be false (matches doc and CLI default)"
+        );
+    }
+
+    #[test]
     fn wait_result_roundtrip() {
         let msg = ControlMessage::WaitResult(WaitResult {
             outcome: WaitOutcome::Matched,
