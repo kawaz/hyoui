@@ -12,6 +12,7 @@ hyoui の設計判断記録一覧。ファイル名は `DR-NNNN-title.md`（4 �
 - [DR-0005](./DR-0005-design-philosophy-external-automation.md) — hyoui の思想再定義 (外側自動操作主軸、TUI multiplexer ではない、透明性最優先)
 - [DR-0006](./DR-0006-cli-ground-rules.md) — CLI 設計の地盤ルール (動作モデル、自動操作 API send/keys/paste/wait、排他 lock/tx)
 - [DR-0007](./DR-0007-mvp-scope-and-staged-release.md) — MVP scope と段階リリース (v0.1.0 / v0.2.0 serve / v0.3.0 leader CLI)
+- [DR-0008](./DR-0008-protocol-design.md) — protocol 設計 (wire format / message kinds / handshake / transport 抽象化、PoC 知見反映)
 
 ## Archived
 

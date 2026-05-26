@@ -241,7 +241,7 @@ Bracketed paste (`--bracketed-paste=auto|on|off`, default `auto`、alias `--no-b
 ### 11. wait L0 (MVP)
 
 ```bash
-hyoui wait <name> [match] [scope] [--timeout DUR] [--print=none|match|line|json] [--raw] [--lock-token T]
+hyoui wait <name> [match] [scope] [--timeout DUR] [--print=none|match|line|json] [--raw] [--newline-convert=preserve|lf|crlf] [--lock-token T]
 ```
 
 match 条件 (排他):
@@ -266,9 +266,21 @@ scope:
 
 装飾 (escape sequence) 取扱:
 
-- **default: ANSI escape (CSI/OSC/DCS 等) を strip した text に対して match**
-- `--raw`: raw bytes (escape 含む) に match (debug 用)
-- L0 の装飾除去は ANSI regex strip。cursor 移動による「同じ cell 上書き」は扱えない (= bytes 順と実画面の差は L1 emulator が完全版)
+- **default: ANSI escape (CSI/OSC/DCS/single char) を strip した text に対して match** (= `--strip-escapes` default ON)
+- `--raw`: raw bytes (escape 含む) に match (debug 用、`--strip-escapes` を OFF)
+- L0 の装飾除去は ANSI state machine による strip (= `crates/hyoui/src/strip.rs` 予定、PoC 08 で実装確認)
+- cursor 移動による「同じ cell 上書き」は扱えない (= bytes 順と実画面の差は L1 emulator が完全版)
+- **C0/C1 制御文字の扱い (MVP)**: ESC (= ANSI escape) **のみ strip**、BEL/BS/TAB/LF/CR/その他 C0 はそのまま残す (= text として有意)。`--aggressive-strip` (BEL/BS 等も削除) は v0.3.0+ で検討
+
+改行変換 (装飾除去とは別レイヤ):
+
+- `--newline-convert=preserve|lf|crlf` (default `preserve`、何もしない)
+  - `preserve`: bytes 透過、子の出力 (cooked モード子の `\r\n`、TUI app の `\n`) をそのまま
+  - `lf`: 子から来た `\r\n` / `\r` を `\n` に正規化
+  - `crlf`: `\n` を `\r\n` に
+- **なぜ装飾除去から分離か**: 改行は ANSI escape sequence ではない、C0 制御文字 (LF=0x0a, CR=0x0d) で text の一部。装飾除去とは責務が違う (escape vs 改行コード)
+- **PoC 02 の発見**: pty の default termios で `ONLCR` 有効 → 子が `\n` 書くと kernel が `\r\n` に変換 → master 側で `\r\n` 受信。wait/match で text match する際に `\r?\n` regex を書くか、`--newline-convert=lf` で正規化するかをユーザ選択
+- 詳細は [[2026-05-26-multi-attach]] (ONLCR セクション) と [[2026-05-26-ansi-strip]]
 
 timeout:
 
@@ -297,7 +309,7 @@ MVP API は破壊変更なしで上記拡張に乗る形 (= `--text/--pattern/--
 ### 11.5. tail (ad-hoc bytes stream client)
 
 ```bash
-hyoui tail <name> [--follow|--no-follow] [--since DUR [--since-strict]] [--last N] [--strip] [--lock-token T]
+hyoui tail <name> [--follow|--no-follow] [--since DUR [--since-strict]] [--last N] [--strip] [--newline-convert=preserve|lf|crlf] [--lock-token T]
 ```
 
 - daemon の ring buffer から bytes stream を取得、stdout に出力
@@ -306,7 +318,8 @@ hyoui tail <name> [--follow|--no-follow] [--since DUR [--since-strict]] [--last 
 - `--since DUR`: 過去 DUR 秒以内の出力 (ring buffer 内フィルタ、取れた分だけ)
 - `--since-strict`: buffer 不足 (= since 範囲の一部が押し出されてた) を検知して exit 非 0
 - `--last N`: 末尾 N bytes
-- `--strip`: ANSI escape 除去 (script で grep する用、default は装飾あり)
+- `--strip`: ANSI escape 除去 (= wait の `--strip-escapes` 相当、script で grep する用、default は装飾あり)
+- `--newline-convert=lf` で CRLF → LF 正規化も可 (改行は装飾除去とは別レイヤ、上記 wait section 参照)
 
 **用途は log/script モニタ**。`grep`/`less -R`/`awk` 等で処理する想定。
 
@@ -401,6 +414,16 @@ scrollback:
 - 両方とも `--newline` prefix だと混乱 (`--newline-at-end` を見て「改行コードを末尾基準で正規化?」と誤読リスク)
 - → 別名で分離: **`--line-ending`** (中身) + **`--trailing-newline`** (末尾)
 - `line-ending` は editorconfig/git の慣用語、`trailing-newline` は POSIX/Unix tool 慣用語
+
+### CRLF→LF 正規化を装飾除去に含める (PoC 08 で見直し)
+
+- 初稿では「装飾除去の一部として CRLF→LF も含める」と書いていたが、PoC 08 [[2026-05-26-ansi-strip]] で見直し
+- ANSI escape (CSI/OSC/DCS/single char) と改行 (LF/CR/CRLF) は意味的に **別レイヤ**:
+  - ANSI escape = 表示装飾の制御 (色、cursor 移動、bracketed paste 等)
+  - 改行 = text の一部 (line terminator)
+- 同じ flag で両方制御すると semantics 混乱 (= `--raw` で escape 残せても改行は変換される/されない?)
+- → wait/tail に **`--newline-convert=preserve|lf|crlf`** 別 flag (default `preserve`)、装飾除去 (`--raw` opt-out) と独立
+- これにより pty の ONLCR ([[2026-05-26-multi-attach]]) で発生する CRLF 問題に意図的対処可能
 
 ### `--newline=none` (旧案)
 
