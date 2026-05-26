@@ -268,14 +268,40 @@ use unistd as _unistd;
 mod tests {
     use super::*;
     use nix::sys::signal::Signal;
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    /// Serializes the tests in this module.
+    ///
+    /// Design rationale: every test here mutates **process-global** state
+    /// (`sigaction` dispositions, [`WINCH_MASTER_FD`], [`SELFPIPE_WRITE_FD`]).
+    /// `cargo test` runs `#[test]` fns on multiple threads by default, so two
+    /// of these tests racing in the same process can see each other's signal
+    /// handlers and globals (e.g. one test installing a handler while another
+    /// still expects the previous disposition, or two tests overwriting
+    /// `SELFPIPE_WRITE_FD` with each other's pipe write ends). We serialize
+    /// with a module-private mutex instead of pulling in `serial_test` for
+    /// three tests.
+    ///
+    /// `PoisonError::into_inner` is used so that a panic in one test does not
+    /// poison the mutex and block the remaining tests (the panic itself is
+    /// already surfaced as a test failure).
+    static SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn signal_test_guard() -> MutexGuard<'static, ()> {
+        SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
 
     #[test]
     fn sig_ignore_sigpipe() {
+        let _guard = signal_test_guard();
         install_ignore(Signal::SIGPIPE).expect("install ignore SIGPIPE");
     }
 
     #[test]
     fn selfpipe_roundtrip_via_raise() {
+        let _guard = signal_test_guard();
         // mirrors ffi_wbtest.mbt: "sig_selfpipe_init and sig_drain: roundtrip via raise"
         let pipe = install_self_pipe().expect("init");
         register_self_pipe(Signal::SIGUSR1).expect("register");
@@ -285,17 +311,31 @@ mod tests {
             let drained = pipe.drain().expect("drain");
             if !drained.is_empty() {
                 assert_eq!(drained[0], Signal::SIGUSR1 as i32 as u8);
+                // Restore SIGUSR1 to default before the SelfPipe drops so a
+                // late delivery doesn't hit a handler whose write fd was
+                // just closed. `SelfPipe::drop` also clears
+                // `SELFPIPE_WRITE_FD`, but resetting the disposition removes
+                // the dangling handler entirely.
+                let _ = install_default(Signal::SIGUSR1);
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
+        let _ = install_default(Signal::SIGUSR1);
         panic!("self-pipe never observed SIGUSR1");
     }
 
     #[test]
     fn install_winch_does_not_crash() {
+        let _guard = signal_test_guard();
         // mirrors ffi_wbtest.mbt: "sig_setup_winch: succeeds on pty master fd"
         let pty = crate::sys::pty::Pty::open(80, 24).expect("open pty");
+        let master_raw = pty.master_fd().as_raw_fd();
         install_winch(pty.master_fd()).expect("install winch");
+        // Restore SIGWINCH to default and clear the global so the next test
+        // (or production code in the same process) does not observe a
+        // handler pointing at an fd that is closed when `pty` drops.
+        let _ = install_default(Signal::SIGWINCH);
+        clear_winch_if(master_raw);
     }
 }
