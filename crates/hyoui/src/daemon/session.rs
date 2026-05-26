@@ -41,9 +41,20 @@ use super::DaemonConfig;
 
 /// daemon 1 つ分の起動済 session。
 ///
-/// `Session` 自身は `Drop` で子 PTY を SIGKILL しない (= 呼び出し側が
-/// graceful な lifecycle を制御する)。Phase 8 で `run()` を追加した時点で
-/// 子の reap / `unlink(socket_path)` まで責任を持つ。
+/// `Session` は **`Drop` で子 PTY を graceful に終了する** (R4-H4):
+/// - SIGTERM を送って最大 `DROP_TERM_WAIT` (= 500ms) 待つ
+/// - 残っていれば SIGKILL
+/// - `waitpid(WNOHANG)` で短い loop で reap し zombie を回収
+///
+/// `serve()` / `run()` は `self` を destructure で消費するため、正常 path では
+/// このフィールド由来の Drop は走らない (= 各フィールドが個別に Drop される)。
+/// Drop が発火するのは `Session::start` 後に `serve` / `run` を呼ばずに
+/// `Session` が drop されたケース (= test 内 panic / 初期化エラー後の early
+/// return 等) で、その場合に子が orphan として残らないようにする。
+///
+/// Pty/UnixSock は元々独自の Drop を持つため、Session::drop は child Pid の
+/// 始末だけを担当する。Drop 中は panic 安全のため全 syscall を `let _ = ...`
+/// で error 飲み込む (= panic 中の二重 panic で process abort を避ける)。
 #[derive(Debug)]
 pub struct Session {
     config: DaemonConfig,
@@ -97,6 +108,30 @@ impl Session {
     /// 子 PTY master fd (= 後の Phase で broadcast/multiplex に使用)。
     pub fn pty(&self) -> &Pty {
         &self.pty
+    }
+
+    /// `Session` を fields に解体する (R4-H4 internal)。
+    ///
+    /// `Session` は `Drop` を実装している (= 子 PTY の orphan 防止) ため、Rust の
+    /// destructure-move (`let Self { .. } = self`) は使えない。`serve` / `run` の
+    /// 正常 path で fields を取り出すには ManuallyDrop で Drop をバイパスする
+    /// 必要がある。本関数はその unsafe を 1 箇所に閉じ込めるためのヘルパ。
+    ///
+    /// 呼び出し後は `Session` の Drop は走らない。fields は呼び出し側が
+    /// 責任を持って drop する (= `Pty::drop` / `UnixSock::drop` は走る)。
+    fn into_parts(self) -> (DaemonConfig, Pty, Pid, UnixSock) {
+        // SAFETY: ManuallyDrop で Session の Drop をバイパスし、各 field を
+        // 1 度ずつ ptr::read で取り出す。各 field は move semantics でしか
+        // 触らないので二重 read は発生しない。`md` は drop されないので
+        // Session::drop も呼ばれない (= 意図通り)。
+        let md = std::mem::ManuallyDrop::new(self);
+        unsafe {
+            let config = std::ptr::read(&md.config);
+            let pty = std::ptr::read(&md.pty);
+            let child = std::ptr::read(&md.child);
+            let listener = std::ptr::read(&md.listener);
+            (config, pty, child, listener)
+        }
     }
 
     /// 1 client の handshake を完了させる (Phase 7 用、Phase 8 で置き換え)。
@@ -172,12 +207,10 @@ impl Session {
     /// client が先に消えた場合は子に SIGTERM を送って待つ (MVP は 1 client 構成
     /// なので、最後の client が消えたら session を畳む)。
     pub fn run(self) -> Result<i32, Error> {
-        let Self {
-            config,
-            pty,
-            child,
-            listener,
-        } = self;
+        // Session の Drop は「`start` 後 `serve`/`run` 未呼出」のフォールバック専用。
+        // 正常 path では Drop が走らないように `into_parts` で fields を取り出して
+        // self を ManuallyDrop で破棄する。
+        let (config, pty, child, listener) = self.into_parts();
 
         // 1. accept
         let client_fd: OwnedFd = listener.accept()?;
@@ -225,12 +258,10 @@ impl Session {
     /// daemon は終了する。「clients == 0 でも daemon 維持」は v0.2.0+ で
     /// `--keep-running` 等の opt-in で導入する想定。
     pub fn serve(self) -> Result<i32, Error> {
-        let Self {
-            config,
-            pty,
-            child,
-            listener,
-        } = self;
+        // R4-H4: Drop は `start` 後 `serve`/`run` 未呼出のフォールバック専用。
+        // serve は正常 path として fields を消費するので、into_parts で
+        // Drop をバイパスして fields を取り出す。
+        let (config, pty, child, listener) = self.into_parts();
         let mut clients: Vec<ClientHandle> = Vec::new();
         let mut next_client_id: u64 = 0;
         let mut state = SessionState::default();
@@ -298,6 +329,86 @@ impl Session {
         match outcome {
             RelayOutcome::ChildExited(_) | RelayOutcome::ClientDetachedOrKilled => Ok(exit_code),
             RelayOutcome::Error(e) => Err(e),
+        }
+    }
+}
+
+/// R4-H4: `Session` の Drop は `start()` 後に `serve`/`run` を呼ばずに drop された
+/// ケース (= test panic、初期化失敗後 early return 等) で子 PTY が orphan として
+/// 残らないようにする。
+///
+/// `serve()` / `run()` は `self` を destructure で消費するため、それらが
+/// 正常 path で走った後はこの Drop は呼ばれない (= 各フィールドが個別に Drop)。
+///
+/// 手順:
+/// 1. SIGTERM を送って graceful 終了を要求
+/// 2. 最大 `DROP_TERM_WAIT` ミリ秒、5ms 刻みで `waitpid(WNOHANG)` poll
+/// 3. まだ alive なら SIGKILL → 再 reap
+///
+/// panic 安全: Drop 内では panic を起こさないよう、syscall は全て `let _ = ...`
+/// で error を握り潰す。既に panic 中に Drop が走ると二重 panic で process
+/// abort になるため、ここで panic を新たに発生させないことが必須。
+impl Drop for Session {
+    fn drop(&mut self) {
+        use nix::sys::wait::{WaitPidFlag, WaitStatus};
+
+        /// SIGTERM 送信後に graceful 終了を待つ最大時間。
+        const DROP_TERM_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+        /// reap poll 間隔。短いほど CPU 寄り、長いほど drop 自体が遅延。
+        const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+        let child = self.child;
+
+        // 1. 既に reap 済か確認 (WNOHANG)。reap 済なら何もしない。
+        match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => { /* alive: 続行 */ }
+            Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => {
+                // 既に終了して reap 済 (or 今 reap)。何もしない。
+                return;
+            }
+            Ok(_) => { /* Stopped/Continued/ptrace 等: SIGTERM を試す */ }
+            Err(nix::errno::Errno::ECHILD) => {
+                // 既に他の waitpid で reap 済 (= serve/run の destructure 後では
+                // 起こり得ないが、外部 reaper 経由のテスト等に対する防御)。
+                return;
+            }
+            Err(_) => { /* 何らかの transient error。SIGTERM を試す */ }
+        }
+
+        // 2. SIGTERM を送る。child が既に exit 済なら ESRCH で失敗 → 無視。
+        let _ = kill(child, Signal::SIGTERM);
+
+        // 3. graceful wait loop。reap できたら return、timeout したら SIGKILL。
+        let deadline = std::time::Instant::now() + DROP_TERM_WAIT;
+        loop {
+            match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::StillAlive) => {}
+                Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => return,
+                Ok(_) => {}
+                Err(nix::errno::Errno::ECHILD) => return,
+                Err(_) => return, // 致命 error は飲み込んで脱出 (panic 禁止)
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(REAP_POLL);
+        }
+
+        // 4. SIGKILL → 短い loop で reap。
+        let _ = kill(child, Signal::SIGKILL);
+        let kill_deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        loop {
+            match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::StillAlive) => {}
+                Ok(_) => return,
+                Err(_) => return,
+            }
+            if std::time::Instant::now() >= kill_deadline {
+                // 諦める。zombie が残る可能性はあるが、Drop で長時間 block しない
+                // ことを優先 (= test の hang 防止)。
+                return;
+            }
+            std::thread::sleep(REAP_POLL);
         }
     }
 }
@@ -2472,6 +2583,51 @@ mod tests {
         drop(session); // Drop で listener が unlink される
         cleanup_child(pid);
         assert!(!sock.exists(), "socket should be unlinked on Drop");
+    }
+
+    /// R4-H4: `Session::start` 後に `serve`/`run` を呼ばずに drop されると、
+    /// 子 PTY は SIGTERM → 500ms 待ち → SIGKILL の順で reap され、
+    /// orphan process として残らない。
+    #[test]
+    fn session_drop_kills_orphan_child() {
+        let dir = make_temp_socket_dir();
+        let sock = dir.path().join("drop.sock");
+        // SIGTERM を無視せず素直に死ぬ sleep。30s alive。
+        let cmd = vec!["/bin/sleep".into(), "30".into()];
+        let cfg = DaemonConfig::new("drop-test", sock.clone(), cmd);
+        let session = Session::start(cfg).expect("start");
+        let pid = session.child_pid();
+
+        // 子は alive (= WNOHANG で StillAlive)
+        let pre = waitpid(pid, Some(WaitPidFlag::WNOHANG)).expect("waitpid pre");
+        assert!(matches!(pre, WaitStatus::StillAlive), "child should be alive, got {pre:?}");
+
+        drop(session); // Drop で SIGTERM → reap
+
+        // Drop 後は既に reap 済 → ECHILD を期待。Linux/macOS の signal 配送
+        // race を避けるため最大 1s リトライ。
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut reaped = false;
+        while std::time::Instant::now() < deadline {
+            match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                Err(nix::errno::Errno::ECHILD) => {
+                    reaped = true;
+                    break;
+                }
+                Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => {
+                    reaped = true;
+                    break;
+                }
+                _ => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        assert!(
+            reaped,
+            "child {pid:?} should be reaped by Session::drop, but waitpid still reports it alive"
+        );
+
+        // socket は UnixSock::drop で unlink される (= 既存挙動と同じ)
+        assert!(!sock.exists(), "socket should be unlinked");
     }
 
     #[test]
