@@ -19,6 +19,7 @@ pub use frame::{
     Frame, FrameError, MAX_FRAME_SIZE, ProtocolError, TYPE_CBOR_CONTROL, TYPE_RAW_DATA,
 };
 pub use messages::{
-    ControlMessage, ControlMessageError, HandshakeRequest, HandshakeResponse, Mode,
+    ControlMessage, ControlMessageError, ErrorCode, ErrorMessage, HandshakeRequest,
+    HandshakeResponse, Mode,
 };
 pub use transports::{Transport, UnixStreamTransport};

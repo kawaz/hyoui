@@ -13,8 +13,8 @@ use nix::poll::{PollFd, PollTimeout};
 use crate::Error;
 use crate::protocol::messages::{Detach, DetachTarget};
 use crate::protocol::{
-    ControlMessage, Frame, FrameError, HandshakeRequest, HandshakeResponse, MVP_CAPS, Mode,
-    ProtocolError, TYPE_CBOR_CONTROL, TYPE_RAW_DATA, Transport, UnixStreamTransport,
+    ControlMessage, ErrorCode, Frame, FrameError, HandshakeRequest, HandshakeResponse, MVP_CAPS,
+    Mode, ProtocolError, TYPE_CBOR_CONTROL, TYPE_RAW_DATA, Transport, UnixStreamTransport,
 };
 
 /// stdin read chunk の処理結果 (= `process_detach_prefix` の戻り値)。
@@ -218,15 +218,15 @@ impl ClientConnection {
         let response = match resp_msg {
             ControlMessage::HandshakeResponse(r) => r,
             ControlMessage::Error(e) => {
-                // R4-H2: handshake で daemon が返す error code 別に文言を出し分ける。
-                // 旧版は `daemon error during handshake` で済ませて、ユーザに「次に
-                // 何をすべきか」の hint が無かった。Error::Invalid は &'static str
-                // しか受け取れないので code → static str の switch で対応する。
-                return Err(Error::Invalid(match e.code.as_str() {
-                    "lock.denied" => "lock denied (= 他 client が exclusive lock を保持中。`hyoui status <session>` で lock-holder を確認、または別 session を使う)",
-                    "unsupported-capability" => "daemon が要求 cap を非対応 (= server を新しい version に upgrade するか、client から該当 cap を外す)",
-                    "auth.token-mismatch" => "HYOUI_LOCK_TOKEN が一致しません (= daemon 起動時の token と env が異なる。env を見直す)",
-                    "session.full" => "session の client 上限に到達 (= 他 client を detach するか、新規 session を起動)",
+                // R4-H2 + R4-H13: handshake で daemon が返す error code 別に文言を
+                // 出し分ける (H2)。code は ErrorCode enum (H13) で受けるため variant
+                // match で書く。Error::Invalid は &'static str しか受け取れないので
+                // variant → static str の switch で対応する。
+                return Err(Error::Invalid(match &e.code {
+                    ErrorCode::LockDenied => "lock denied (= 他 client が exclusive lock を保持中。`hyoui status <session>` で lock-holder を確認、または別 session を使う)",
+                    ErrorCode::UnsupportedCapability => "daemon が要求 cap を非対応 (= server を新しい version に upgrade するか、client から該当 cap を外す)",
+                    ErrorCode::AuthTokenMismatch => "HYOUI_LOCK_TOKEN が一致しません (= daemon 起動時の token と env が異なる。env を見直す)",
+                    ErrorCode::Unknown(s) if s == "session.full" => "session の client 上限に到達 (= 他 client を detach するか、新規 session を起動)",
                     _ => "daemon error during handshake (= `hyoui status <session>` でサーバ側の状態を確認してください)",
                 }));
             }

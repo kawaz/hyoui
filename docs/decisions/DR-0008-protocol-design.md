@@ -162,7 +162,30 @@ cap negotiation: daemon は client の caps と自身の caps の intersection �
 }
 ```
 
-error code は dotted text string で人間可読性優先 (= 数値 enum よりデバッグしやすい)。code 体系は実装フェーズで一覧化。
+error code は dotted text string で人間可読性優先 (= 数値 enum よりデバッグしやすい)。**Rust API 上は [`ErrorCode`] enum (`crates/hyoui/src/protocol/messages/error.rs`) で構造化**、wire 上は引き続き dotted text で encode/decode する (= 手書き Serialize/Deserialize で 1:1 対応、R4-H13)。
+
+**error code 一覧 (v0.1.0、R4-M11)** — 新 code を追加する際は本表と `ErrorCode` enum / `from_wire` を同期更新:
+
+| wire code | `ErrorCode` variant | 回復性 | 用途 |
+|---|---|---|---|
+| `protocol.malformed` | `ProtocolMalformed` | 致命 | frame / CBOR が解釈不能。直後に disconnect |
+| `protocol.unexpected-kind` | `ProtocolUnexpectedKind` | 回復可 | 受信した kind が方向 (client↔daemon) や状態的に不正 |
+| `unsupported-capability` | `UnsupportedCapability` | 回復可 | cap negotiation 後に未対応 feature が呼ばれた |
+| `handshake.timeout` | `HandshakeTimeout` | 致命 | handshake が制限時間内に完了しなかった |
+| `auth.token-mismatch` | `AuthTokenMismatch` | 致命 | handshake の auth_token が一致しない |
+| `backpressure.disconnect` | `BackpressureDisconnect` | 致命 | client 送信 queue が limit 超過、daemon が disconnect |
+| `mode.not-allowed` | `ModeNotAllowed` | 回復可 | 現 mode (interactive / readonly 等) で許可されない操作 |
+| `mode.not-leader` | `ModeNotLeader` | 回復可 | leader 専用操作 (resize 等) を non-leader が送った |
+| `lock.denied` | `LockDenied` | 回復可 | lock acquire を既存 holder が拒否 |
+| `lock.not-held` | `LockNotHeld` | 回復可 | lock 操作 (release 等) を保持していない client が送った |
+| `signal.invalid` | `SignalInvalid` | 回復可 | signal 番号 / 名前が不正 |
+| `wait.too-many` | `WaitTooMany` | 回復可 | wait 同時実行数の上限超過 |
+| `wait.invalid-text` | `WaitInvalidText` | 回復可 | wait の text 引数が不正 |
+| `wait.invalid-pattern` | `WaitInvalidPattern` | 回復可 | wait の pattern (正規表現) が不正 |
+| `detach.target-partial` | `DetachTargetPartial` | 回復可 | detach 対象指定の一部が見つからない / 失敗 |
+| (任意の未知 string) | `Unknown(String)` | — | 旧 binary が新 daemon から受け取った未知 code を drop せず保持 (前方互換) |
+
+`ErrorCode` enum は `#[non_exhaustive]` のため、library user は match で必ず `_` arm を用意する (= 新 code 追加で既存 caller が壊れない)。未知 code を受信したら `ErrorCode::Unknown(String)` で wire 文字列を保持するので、log / debug 用途で原 string を失わない。
 
 **`resize`**:
 ```cbor

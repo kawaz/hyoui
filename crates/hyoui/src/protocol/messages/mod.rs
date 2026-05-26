@@ -27,7 +27,7 @@ mod tail;
 mod wait;
 
 pub use control::{Resize, Signal};
-pub use error::ErrorMessage;
+pub use error::{ErrorCode, ErrorMessage};
 pub use handshake::{HandshakeRequest, HandshakeResponse, Mode};
 pub use lifecycle::{Detach, DetachTarget, Kill};
 pub use lock::{
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn error_roundtrip() {
         let msg = ControlMessage::Error(ErrorMessage {
-            code: "lock.denied".into(),
+            code: ErrorCode::LockDenied,
             message: "held by client 7".into(),
             details: None,
         });
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn error_with_details_roundtrip() {
         let msg = ControlMessage::Error(ErrorMessage {
-            code: "backpressure.disconnect".into(),
+            code: ErrorCode::BackpressureDisconnect,
             message: "client buffer full".into(),
             details: Some(ciborium::Value::Map(vec![
                 (

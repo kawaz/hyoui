@@ -24,9 +24,9 @@ use nix::unistd::Pid;
 
 use crate::Error;
 use crate::protocol::messages::{
-    ClientInfo, ErrorMessage, LeaderNotify, LockResponse, LockResult, ModeChange, SessionMode,
-    StatusResponse, TailData, TailEnd, TailEndReason, TailRequest, WaitMatchOptions, WaitOutcome,
-    WaitPredicate, WaitRequest, WaitResult,
+    ClientInfo, ErrorCode, ErrorMessage, LeaderNotify, LockResponse, LockResult, ModeChange,
+    SessionMode, StatusResponse, TailData, TailEnd, TailEndReason, TailRequest, WaitMatchOptions,
+    WaitOutcome, WaitPredicate, WaitRequest, WaitResult,
 };
 use crate::protocol::{
     ControlMessage, Frame, FrameError, HandshakeResponse, MVP_CAPS, Mode, ProtocolError,
@@ -467,7 +467,7 @@ fn handle_detach_target(
             let _ = send_control(
                 &clients[idx],
                 ControlMessage::Error(ErrorMessage {
-                    code: "detach.target-partial".into(),
+                    code: ErrorCode::DetachTargetPartial,
                     message: "detach target=others/all not fully implemented yet; \
                               only self will be detached (Phase 11 MVP は Myself のみ対応、\
                               v0.2.0+ で他 client も drop する semantic に拡張予定)"
@@ -574,7 +574,7 @@ fn enqueue_for_client(ch: &ClientHandle, bytes: Vec<u8>) -> EnqueueOutcome {
 /// 1 メッセージ、defensible)。writer_tx が closed なら加算分を戻して諦める。
 fn send_backpressure_error(ch: &ClientHandle, queued: usize) {
     let msg = ControlMessage::Error(ErrorMessage {
-        code: "backpressure.disconnect".into(),
+        code: ErrorCode::BackpressureDisconnect,
         message: "client buffer full".into(),
         details: Some(ciborium::Value::Map(vec![
             (
@@ -729,7 +729,7 @@ fn handle_wait_request(
         let _ = send_control(
             &clients[idx],
             ControlMessage::Error(ErrorMessage {
-                code: "wait.too-many".into(),
+                code: ErrorCode::WaitTooMany,
                 message: format!(
                     "too many pending waits for this client (limit {MAX_WAITS_PER_CLIENT})"
                 ),
@@ -746,7 +746,7 @@ fn handle_wait_request(
             let _ = send_control(
                 &clients[idx],
                 ControlMessage::Error(ErrorMessage {
-                    code: "wait.invalid-text".into(),
+                    code: ErrorCode::WaitInvalidText,
                     message: "text predicate value must not be empty".into(),
                     details: None,
                 }),
@@ -757,7 +757,7 @@ fn handle_wait_request(
             let _ = send_control(
                 &clients[idx],
                 ControlMessage::Error(ErrorMessage {
-                    code: "wait.invalid-pattern".into(),
+                    code: ErrorCode::WaitInvalidPattern,
                     message: "pattern regex must not be empty".into(),
                     details: None,
                 }),
@@ -784,7 +784,7 @@ fn handle_wait_request(
                 let _ = send_control(
                     &clients[idx],
                     ControlMessage::Error(ErrorMessage {
-                        code: "wait.invalid-pattern".into(),
+                        code: ErrorCode::WaitInvalidPattern,
                         message: format!(
                             "regex too long: {} bytes (limit {PATTERN_MAX_LEN})",
                             r.len()
@@ -804,7 +804,7 @@ fn handle_wait_request(
                     let _ = send_control(
                         &clients[idx],
                         ControlMessage::Error(ErrorMessage {
-                            code: "wait.invalid-pattern".into(),
+                            code: ErrorCode::WaitInvalidPattern,
                             message: "regex failed to compile (syntax or size limit)".into(),
                             details: None,
                         }),
@@ -1615,7 +1615,7 @@ fn do_handshake_stage(
         };
         if !token_ok {
             let body = ControlMessage::Error(ErrorMessage {
-                code: "auth.token-mismatch".into(),
+                code: ErrorCode::AuthTokenMismatch,
                 message: "handshake token does not match daemon configuration".into(),
                 details: None,
             })
@@ -1812,7 +1812,7 @@ fn handle_control_message(
                 let _ = send_control(
                     &clients[idx],
                     ControlMessage::Error(ErrorMessage {
-                        code: "mode.not-allowed".into(),
+                        code: ErrorCode::ModeNotAllowed,
                         message: "kill requires rw mode (= leader-eligible)".into(),
                         details: None,
                     }),
@@ -1827,7 +1827,7 @@ fn handle_control_message(
                     let _ = send_control(
                         &clients[idx],
                         ControlMessage::Error(ErrorMessage {
-                            code: "signal.invalid".into(),
+                            code: ErrorCode::SignalInvalid,
                             message: format!("invalid signum: {signum}"),
                             details: None,
                         }),
@@ -1845,7 +1845,7 @@ fn handle_control_message(
                 let _ = send_control(
                     &clients[idx],
                     ControlMessage::Error(ErrorMessage {
-                        code: "mode.not-allowed".into(),
+                        code: ErrorCode::ModeNotAllowed,
                         message: "signal requires rw mode".into(),
                         details: None,
                     }),
@@ -1858,7 +1858,7 @@ fn handle_control_message(
                     let _ = send_control(
                         &clients[idx],
                         ControlMessage::Error(ErrorMessage {
-                            code: "signal.invalid".into(),
+                            code: ErrorCode::SignalInvalid,
                             message: format!("invalid signum: {}", s.signum),
                             details: None,
                         }),
@@ -1875,7 +1875,7 @@ fn handle_control_message(
                 let _ = send_control(
                     &clients[idx],
                     ControlMessage::Error(ErrorMessage {
-                        code: "mode.not-leader".into(),
+                        code: ErrorCode::ModeNotLeader,
                         message: "resize requires leader role".into(),
                         details: None,
                     }),
@@ -1899,7 +1899,7 @@ fn handle_control_message(
                 let _ = send_control(
                     &clients[idx],
                     ControlMessage::Error(ErrorMessage {
-                        code: "unsupported-capability".into(),
+                        code: ErrorCode::UnsupportedCapability,
                         message: "lock.acquire requires `lock` cap".into(),
                         details: None,
                     }),
@@ -1915,7 +1915,7 @@ fn handle_control_message(
                 let _ = send_control(
                     &clients[idx],
                     ControlMessage::Error(ErrorMessage {
-                        code: "mode.not-allowed".into(),
+                        code: ErrorCode::ModeNotAllowed,
                         message: "lock.acquire requires rw mode (= Ro cannot hold lock)".into(),
                         details: None,
                     }),
@@ -1986,7 +1986,7 @@ fn handle_control_message(
                 let _ = send_control(
                     &clients[idx],
                     ControlMessage::Error(ErrorMessage {
-                        code: "unsupported-capability".into(),
+                        code: ErrorCode::UnsupportedCapability,
                         message: "tail.request requires `tail-v1` cap, but it was not \
                                   negotiated at handshake"
                             .into(),
@@ -2003,7 +2003,7 @@ fn handle_control_message(
                 let _ = send_control(
                     &clients[idx],
                     ControlMessage::Error(ErrorMessage {
-                        code: "unsupported-capability".into(),
+                        code: ErrorCode::UnsupportedCapability,
                         message: "wait.request requires `wait-l0` cap".into(),
                         details: None,
                     }),
@@ -2045,7 +2045,7 @@ fn handle_control_message(
                 let _ = send_control(
                     &clients[idx],
                     ControlMessage::Error(ErrorMessage {
-                        code: "lock.not-held".into(),
+                        code: ErrorCode::LockNotHeld,
                         message: "lock token mismatch or not the lock holder".into(),
                         details: None,
                     }),
@@ -2081,7 +2081,7 @@ fn handle_control_message(
             let _ = send_control(
                 &clients[idx],
                 ControlMessage::Error(ErrorMessage {
-                    code: "protocol.unexpected-kind".into(),
+                    code: ErrorCode::ProtocolUnexpectedKind,
                     message: "this kind is daemon→client only or not accepted in this direction"
                         .into(),
                     details: None,
@@ -2135,7 +2135,7 @@ fn do_handshake<R: std::io::Read, W: std::io::Write>(
         };
         if !token_ok {
             let body = ControlMessage::Error(ErrorMessage {
-                code: "auth.token-mismatch".into(),
+                code: ErrorCode::AuthTokenMismatch,
                 message: "handshake token does not match daemon configuration".into(),
                 details: None,
             })
@@ -3127,7 +3127,7 @@ mod tests {
         let ef = Frame::decode_from(&mut s2).expect("error");
         match ControlMessage::decode_from(ef.body.as_slice()).expect("decode") {
             ControlMessage::Error(e) => {
-                assert_eq!(e.code, "mode.not-leader");
+                assert_eq!(e.code, ErrorCode::ModeNotLeader);
             }
             o => panic!("expected Error, got {o:?}"),
         }
@@ -3844,7 +3844,7 @@ mod tests {
         let ef = Frame::decode_from(&mut s2).expect("error response");
         match ControlMessage::decode_from(ef.body.as_slice()).expect("decode") {
             ControlMessage::Error(e) => {
-                assert_eq!(e.code, "mode.not-allowed");
+                assert_eq!(e.code, ErrorCode::ModeNotAllowed);
             }
             o => panic!("expected Error, got {o:?}"),
         }
@@ -3881,7 +3881,7 @@ mod tests {
 
         let ef = Frame::decode_from(&mut s).expect("error");
         match ControlMessage::decode_from(ef.body.as_slice()).expect("decode") {
-            ControlMessage::Error(e) => assert_eq!(e.code, "signal.invalid"),
+            ControlMessage::Error(e) => assert_eq!(e.code, ErrorCode::SignalInvalid),
             o => panic!("expected Error, got {o:?}"),
         }
 
@@ -3921,7 +3921,7 @@ mod tests {
         // daemon は auth.token-mismatch error を返し、socket を切る
         let ef = Frame::decode_from(&mut s).expect("error");
         match ControlMessage::decode_from(ef.body.as_slice()).expect("decode") {
-            ControlMessage::Error(e) => assert_eq!(e.code, "auth.token-mismatch"),
+            ControlMessage::Error(e) => assert_eq!(e.code, ErrorCode::AuthTokenMismatch),
             o => panic!("expected Error, got {o:?}"),
         }
 
@@ -3999,7 +3999,7 @@ mod tests {
         while std::time::Instant::now() < deadline {
             match next_control(&mut s) {
                 ControlMessage::Error(e) => {
-                    assert_eq!(e.code, "wait.invalid-text");
+                    assert_eq!(e.code, ErrorCode::WaitInvalidText);
                     got_error = true;
                     break;
                 }
@@ -4113,7 +4113,7 @@ mod tests {
 
         let ef = Frame::decode_from(&mut s).expect("error");
         match ControlMessage::decode_from(ef.body.as_slice()).expect("decode") {
-            ControlMessage::Error(e) => assert_eq!(e.code, "auth.token-mismatch"),
+            ControlMessage::Error(e) => assert_eq!(e.code, ErrorCode::AuthTokenMismatch),
             o => panic!("expected Error, got {o:?}"),
         }
         // daemon は handshake 拒否 → Session::run が Err を返す (= join で確認)
@@ -4157,7 +4157,7 @@ mod tests {
 
         let ef = Frame::decode_from(&mut s2).expect("error");
         match ControlMessage::decode_from(ef.body.as_slice()).expect("decode") {
-            ControlMessage::Error(e) => assert_eq!(e.code, "mode.not-allowed"),
+            ControlMessage::Error(e) => assert_eq!(e.code, ErrorCode::ModeNotAllowed),
             o => panic!("expected mode.not-allowed Error, got {o:?}"),
         }
 
@@ -4378,7 +4378,7 @@ mod tests {
         let ef = Frame::decode_from(&mut s2).expect("error response");
         match ControlMessage::decode_from(ef.body.as_slice()).expect("decode") {
             ControlMessage::Error(e) => {
-                assert_eq!(e.code, "mode.not-allowed");
+                assert_eq!(e.code, ErrorCode::ModeNotAllowed);
             }
             o => panic!("expected mode.not-allowed Error, got {o:?}"),
         }
