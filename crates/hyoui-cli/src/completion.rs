@@ -215,8 +215,8 @@ _hyoui_run() {
     _arguments \
         '--mode=[Operating mode]:mode:(interactive headless)' \
         '--socket=[Unix socket path]:socket:_files' \
-        '--timeout=[Overall timeout in seconds]:seconds:' \
-        '--idle-timeout=[Output idle timeout in seconds]:seconds:' \
+        '--timeout=[Overall timeout (e.g. 30s / 1m / 1h30m)]:duration:' \
+        '--idle-timeout=[Output idle timeout (e.g. 500ms / 5s)]:duration:' \
         '--until=[Terminate when PATTERN appears in output]:pattern:' \
         '--size=[Virtual screen size COLSxROWS]:size:' \
         '--cols=[Virtual screen columns]:cols:' \
@@ -281,8 +281,8 @@ complete -c hyoui -n __hyoui_no_subcommand -s V -l version -d 'Show version and 
 # `hyoui run` options.
 complete -c hyoui -n '__hyoui_using_subcommand run' -l mode              -x -a 'interactive headless' -d 'Operating mode'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l socket            -r -F                          -d 'Unix socket path'
-complete -c hyoui -n '__hyoui_using_subcommand run' -l timeout           -x                              -d 'Overall timeout in seconds'
-complete -c hyoui -n '__hyoui_using_subcommand run' -l idle-timeout      -x                              -d 'Output idle timeout in seconds'
+complete -c hyoui -n '__hyoui_using_subcommand run' -l timeout           -x                              -d 'Overall timeout (e.g. 30s / 1m / 1h30m)'
+complete -c hyoui -n '__hyoui_using_subcommand run' -l idle-timeout      -x                              -d 'Output idle timeout (e.g. 500ms / 5s)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l until             -x                              -d 'Terminate when PATTERN appears'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l size              -x                              -d 'Virtual screen size COLSxROWS'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l cols              -x                              -d 'Virtual screen columns'

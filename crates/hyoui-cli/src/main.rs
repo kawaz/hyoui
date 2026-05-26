@@ -222,6 +222,14 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
 /// 既存 daemon に socket connect し、stdin/stdout を中継する。
 /// daemon は別 process / 別 hyoui run --detached 等で起動済みの想定。
 fn attach_command(cfg: AttachConfig) -> ExitCode {
+    // H3: HYOUI_DETACH_PREFIX を raw mode 入る **前** に validate。invalid なら
+    // 通常 terminal で stderr に出してから exit (= 旧 silent fallback で warning が
+    // raw mode 後の scrollback に流される罠を回避)。
+    if let Err(e) = hyoui::client::resolve_detach_prefix_from_env() {
+        eprintln!("hyoui: attach: {e}");
+        return ExitCode::from(2);
+    }
+
     let sock = if let Some(p) = cfg.socket.clone() {
         std::path::PathBuf::from(p)
     } else {
@@ -476,7 +484,10 @@ fn status_command(cfg: StatusConfig) -> ExitCode {
         };
         match msg {
             ControlMessage::StatusResponse(sr) => {
-                print_status_response(&sr);
+                match cfg.format {
+                    hyoui::cli::StatusFormat::Plain => print_status_plain(&sr),
+                    hyoui::cli::StatusFormat::Json => print_status_json(&sr),
+                }
                 return ExitCode::SUCCESS;
             }
             ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
@@ -488,7 +499,7 @@ fn status_command(cfg: StatusConfig) -> ExitCode {
     }
 }
 
-fn print_status_response(sr: &hyoui::protocol::messages::StatusResponse) {
+fn print_status_plain(sr: &hyoui::protocol::messages::StatusResponse) {
     println!("session-id: {}", sr.session_id);
     if let Some(pid) = sr.child_pid {
         println!("child-pid: {pid}");
@@ -506,6 +517,65 @@ fn print_status_response(sr: &hyoui::protocol::messages::StatusResponse) {
         let leader = if c.leader { " leader" } else { "" };
         println!("  - id={} mode={:?}{leader}", c.client_id, c.mode);
     }
+}
+
+/// H5: scripting / jq 用に 1 行 JSON object で StatusResponse を出力。
+/// 依存なしで手書き (= serde_json を入れるよりも軽い、status はフィールド限定)。
+fn print_status_json(sr: &hyoui::protocol::messages::StatusResponse) {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    out.push('{');
+    write!(&mut out, "\"session_id\":{}", json_string(&sr.session_id)).ok();
+    match sr.child_pid {
+        Some(pid) => write!(&mut out, ",\"child_pid\":{pid}").ok(),
+        None => write!(&mut out, ",\"child_pid\":null").ok(),
+    };
+    write!(&mut out, ",\"scrollback_bytes\":{}", sr.scrollback_bytes).ok();
+    match sr.lock_holder {
+        Some(h) => write!(&mut out, ",\"lock_holder\":{h}").ok(),
+        None => write!(&mut out, ",\"lock_holder\":null").ok(),
+    };
+    out.push_str(",\"clients\":[");
+    for (i, c) in sr.clients.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let mode_str = match c.mode {
+            hyoui::protocol::Mode::Rw => "rw",
+            hyoui::protocol::Mode::Ro => "ro",
+            hyoui::protocol::Mode::RwNoLeader => "rw-no-leader",
+        };
+        write!(
+            &mut out,
+            "{{\"client_id\":{},\"mode\":\"{}\",\"leader\":{}}}",
+            c.client_id, mode_str, c.leader
+        )
+        .ok();
+    }
+    out.push_str("]}");
+    println!("{out}");
+}
+
+/// JSON 文字列エスケープ (= " / \ / control char)。
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write as _;
+                write!(&mut out, "\\u{:04x}", c as u32).ok();
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// `tail` subcommand: connect → handshake (ro) → tail.request → stdout に書き出す。
@@ -560,7 +630,21 @@ fn tail_command(cfg: TailConfig) -> ExitCode {
                         let _ = stdout.write_all(&td.bytes);
                         let _ = stdout.flush();
                     }
-                    ControlMessage::TailEnd(_) => return ExitCode::SUCCESS,
+                    ControlMessage::TailEnd(te) => {
+                        // H4: 終了理由を stderr に明示 (= `| tee log` 等でログから
+                        // どの理由で stream が止まったかを知れるようにする)
+                        use hyoui::protocol::messages::TailEndReason;
+                        let reason_str = match te.reason {
+                            TailEndReason::Eof => "eof (= scrollback flush done)",
+                            TailEndReason::BufferTruncated => {
+                                "buffer-truncated (= since range evicted from ring buffer)"
+                            }
+                            TailEndReason::ClientCancel => "client-cancel",
+                            TailEndReason::ChildExited => "child-exited",
+                        };
+                        eprintln!("hyoui: tail: stream ended ({reason_str})");
+                        return ExitCode::SUCCESS;
+                    }
                     ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
                     _ => continue,
                 }

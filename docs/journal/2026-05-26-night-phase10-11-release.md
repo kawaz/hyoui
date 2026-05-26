@@ -70,6 +70,9 @@ attach detach prefix → v0.1.0 release prep。
 - 3 サブコマンドの `Config` 構造体 + 共通 helper `parse_session_targeted()` を導入
 - predicate parser: `text:<str>` / `pattern:<regex>` / `wait[-idle]:<dur>`
 - duration parser: `500ms` / `1s` / `2m` / bare ms
+  (※ 後続 Round3 で kawaz/timespec.mbt 仕様 + sub-ms 拡張に置換。bare 数字 reject、
+  `1h30m` 連結 / `1d-4h` 加減 / `1.5h` decimal / `1_000ms` underscore / case-insensitive
+  に対応。詳細は parse_duration_ms の docstring 参照)
 - `ClientConnection` に `recv_frame()` / `recv_control(buffer_raw_data)` 追加
   (= 1-shot CLI が response を 1 つ取り出す用)
 - exit code:

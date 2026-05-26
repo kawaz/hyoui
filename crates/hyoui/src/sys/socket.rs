@@ -9,17 +9,28 @@
 //!   hyoui ever becomes multithreaded the umask trick should be replaced
 //!   with `fchmod` (which doesn't exist for sockets) or `bind` to a
 //!   pre-mkstemp'd path.
+//! * `FD_CLOEXEC` is set on every socket fd (listener / connect / accept)
+//!   via `set_cloexec` for fd-leak defense-in-depth. SOCK_CLOEXEC is darwin-
+//!   incompatible so we use the portable `fcntl` path uniformly (= L6).
 //!
 //! [`UnixSock`] is an RAII wrapper: Drop closes the listening fd and
 //! `unlink(2)`s the socket file (best-effort).
 
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::sys::socket::{self, AddressFamily, Backlog, SockFlag, SockType, UnixAddr};
 
 use super::error::{Error, Result};
+
+/// Set `FD_CLOEXEC` on the given fd via `fcntl` (= portable defense-in-depth
+/// for L6; darwin lacks SOCK_CLOEXEC so we cannot rely on socket-time flags).
+fn set_cloexec<F: AsFd>(fd: &F) -> Result<()> {
+    fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(Error::from)?;
+    Ok(())
+}
 
 /// RAII wrapper around `umask(2)`. On Drop the previous mask is restored.
 #[derive(Debug)]
@@ -81,7 +92,6 @@ impl UnixSock {
         let path = path.as_ref().to_path_buf();
         Self::check_parent_dir(&path)?;
 
-        // Unlink stale socket if any. Ignore ENOENT.
         match nix::unistd::unlink(&path) {
             Ok(()) => {}
             Err(nix::errno::Errno::ENOENT) => {}
@@ -95,10 +105,11 @@ impl UnixSock {
             None,
         )
         .map_err(Error::from)?;
+        // L6: set FD_CLOEXEC on listener fd (portable).
+        set_cloexec(&fd)?;
 
         let addr = UnixAddr::new(path.as_path()).map_err(Error::from)?;
 
-        // Restrict mode around bind. UmaskGuard restores on drop.
         let _umask = UmaskGuard::set(nix::sys::stat::Mode::from_bits_truncate(0o077));
         socket::bind(fd.as_raw_fd(), &addr).map_err(Error::from)?;
         drop(_umask);
@@ -118,19 +129,19 @@ impl UnixSock {
         &self.path
     }
 
-    /// `accept(2)`. Returns the client fd.
+    /// `accept(2)` + `FD_CLOEXEC` set via fcntl. Returns the client fd.
     pub fn accept(&self) -> Result<OwnedFd> {
         let raw_fd = socket::accept(self.fd.as_raw_fd()).map_err(Error::from)?;
-        // `accept` returned a fresh kernel fd; no other Rust owner exists.
-        // We funnel the wrapping through `raw::own_raw_fd` so this file
-        // remains free of direct `unsafe`.
-        Ok(crate::sys::raw::own_raw_fd(raw_fd))
+        // L6: brief window between accept and fcntl. hyoui is single-threaded
+        // so no realistic race.
+        let owned = crate::sys::raw::own_raw_fd(raw_fd);
+        set_cloexec(&owned)?;
+        Ok(owned)
     }
 }
 
 impl Drop for UnixSock {
     fn drop(&mut self) {
-        // Close fd happens via OwnedFd::drop after this body.
         let _ = nix::unistd::unlink(&self.path);
     }
 }
@@ -145,12 +156,11 @@ pub fn connect<P: AsRef<Path>>(path: P) -> Result<OwnedFd> {
         None,
     )
     .map_err(Error::from)?;
+    // L6: set FD_CLOEXEC on client fd (portable).
+    set_cloexec(&fd)?;
     socket::connect(fd.as_raw_fd(), &addr).map_err(Error::from)?;
     Ok(fd)
 }
-
-// Needed for socket::bind / socket::connect (they take raw fd).
-use std::os::fd::AsRawFd;
 
 #[cfg(test)]
 mod tests {
@@ -160,7 +170,6 @@ mod tests {
 
     fn make_0700_dir() -> TempDir {
         let dir = TempDir::new().expect("tempdir");
-        // tempfile creates with 0700 on unix already, but be explicit.
         let perms = std::fs::Permissions::from_mode(0o700);
         std::fs::set_permissions(dir.path(), perms).expect("chmod 0700");
         dir
@@ -168,7 +177,6 @@ mod tests {
 
     #[test]
     fn listen_creates_socket_and_unlinks_on_drop() {
-        // mirrors ffi_wbtest.mbt: "sock_listen: creates socket and cleanup"
         let dir = make_0700_dir();
         let path = dir.path().join("test.sock");
         let sock = UnixSock::listen(&path).expect("listen");
@@ -189,15 +197,12 @@ mod tests {
 
     #[test]
     fn connect_accept_roundtrip() {
-        // mirrors ffi_wbtest.mbt: "sock_connect and sock_accept: roundtrip"
         let dir = make_0700_dir();
         let path = dir.path().join("rt.sock");
         let server = UnixSock::listen(&path).expect("listen");
-        // Make the server non-blocking so accept doesn't hang if connect races.
         use crate::sys::fd::FdExt;
         server.as_fd().set_nonblocking(true).expect("nonblock");
         let _client = connect(&path).expect("connect");
-        // Loop a few times to catch the case where accept races.
         let mut accepted = None;
         for _ in 0..20 {
             match server.accept() {
@@ -212,5 +217,33 @@ mod tests {
             }
         }
         assert!(accepted.is_some(), "accept never produced a fd");
+    }
+
+    #[test]
+    fn accepted_fd_has_cloexec_set() {
+        let dir = make_0700_dir();
+        let path = dir.path().join("cloexec.sock");
+        let server = UnixSock::listen(&path).expect("listen");
+        use crate::sys::fd::FdExt;
+        server.as_fd().set_nonblocking(true).expect("nonblock");
+        let _client = connect(&path).expect("connect");
+        for _ in 0..20 {
+            match server.accept() {
+                Ok(fd) => {
+                    let flags = fcntl(&fd, FcntlArg::F_GETFD).expect("F_GETFD");
+                    let fdflag = FdFlag::from_bits_truncate(flags);
+                    assert!(
+                        fdflag.contains(FdFlag::FD_CLOEXEC),
+                        "accepted fd should have FD_CLOEXEC"
+                    );
+                    return;
+                }
+                Err(Error::Errno(nix::errno::Errno::EAGAIN)) => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(e) => panic!("accept error: {e:?}"),
+            }
+        }
+        panic!("accept never produced a fd");
     }
 }

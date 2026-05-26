@@ -315,6 +315,10 @@ struct ClientHandle {
     leader: bool,
     /// 受信 subscription (= broadcast の encoding 種類を切り替える)。
     subscription: Subscription,
+    /// handshake 後の有効 capability 集合 (= MVP_CAPS と req.caps の intersect)。
+    /// D7: 後続 message の処理で「cap が無いのに該当 message を送ってきた」を
+    /// reject する。
+    negotiated_caps: Vec<String>,
     /// daemon → client への frame enqueue 用 unbounded mpsc。
     writer_tx: Sender<Vec<u8>>,
     /// 現在 queue 内に積まれている bytes 数 (= writer_pump が送信完了で減らす)。
@@ -364,6 +368,11 @@ const WAIT_ACCUMULATED_LIMIT: usize = 1024 * 1024;
 /// 1 client が同時に持てる pending wait の上限。超過すると新規 `wait.request` は
 /// error code=`wait.too-many` で reject (= N × WAIT_ACCUMULATED_LIMIT の OOM 防止)。
 const MAX_WAITS_PER_CLIENT: usize = 16;
+
+/// daemon が同時 attach を許す client 数上限 (= D6 集合 backpressure DoS 対策)。
+/// 超過した accept は即 socket close で reject。`client_buffer_bytes` が 8 MiB の
+/// 場合、64 clients × 8 MiB = 最大 512 MiB の queue 占有が理論上限。
+const MAX_CLIENTS_PER_DAEMON: usize = 64;
 
 /// session 全体の状態 (Phase 10)。lock 周りの state machine を保持する。
 ///
@@ -516,17 +525,22 @@ enum EnqueueOutcome {
     WriterDead,
 }
 
-/// 1 frame の bytes を 1 client の queue に積む。`queued_bytes` の atomic
-/// check-and-add で `buffer_limit` を厳密に守る。
+/// 1 frame の bytes を 1 client の queue に積む。
+///
+/// **race semantics (= L4 review メモ)**: `load` → `fetch_add` の間に他の writer が
+/// `fetch_add` していると、`queued_bytes` が `buffer_limit` を一時的に **超過**
+/// する。serve_loop は **single-threaded** main thread のみが broadcast / enqueue を
+/// 呼ぶため実 daemon では race しないが、unit test で別 thread から enqueue 呼ぶと
+/// 厳密 cap は崩れる。`compare_exchange_weak` loop で書き直せば厳密化できるが、
+/// 「ms 単位 throughput を最優先」と「将来 multi-writer になる必然性が低い」を
+/// 天秤にかけて relax で許容。実用上は writer_pump が `fetch_sub` するので大局
+/// 収束する。
 fn enqueue_for_client(ch: &ClientHandle, bytes: Vec<u8>) -> EnqueueOutcome {
     let size = bytes.len();
     let cur = ch.queued_bytes.load(Ordering::Acquire);
     if cur.saturating_add(size) > ch.buffer_limit {
         return EnqueueOutcome::Overflow;
     }
-    // 競合により実際の queued_bytes は cur より大きい可能性があるが、その場合は
-    // 次の broadcast 時の check で overflow になる。1 byte 単位の厳密性まで要求
-    // しないなら relax check + add の 2 段で十分。
     ch.queued_bytes.fetch_add(size, Ordering::AcqRel);
     if ch.writer_tx.send(bytes).is_err() {
         // writer thread 死亡 → queued_bytes を戻して終了
@@ -536,8 +550,14 @@ fn enqueue_for_client(ch: &ClientHandle, bytes: Vec<u8>) -> EnqueueOutcome {
     EnqueueOutcome::Sent
 }
 
-/// `backpressure.disconnect` error message を best-effort で投げる。queue 既に
-/// 満杯ならそのまま諦める (= 当該 client は close される)。
+/// `backpressure.disconnect` error message を best-effort で投げる。
+///
+/// L5: 旧実装は `writer_tx.send` を直接呼んで `queued_bytes` をバイパスしていた。
+/// すると writer_pump の `fetch_sub` で「送ったぶんを引く」想定が破れ、
+/// `queued_bytes` が unsigned wrap (= 巨大値) を返す可能性があった。本実装では
+/// `queued_bytes` を明示加算してから send することで writer_pump の `fetch_sub`
+/// と整合させる。`buffer_limit` は意図的に超えて送る (= disconnect 直前の最後の
+/// 1 メッセージ、defensible)。writer_tx が closed なら加算分を戻して諦める。
 fn send_backpressure_error(ch: &ClientHandle, queued: usize) {
     let msg = ControlMessage::Error(ErrorMessage {
         code: "backpressure.disconnect".into(),
@@ -564,8 +584,11 @@ fn send_backpressure_error(ch: &ClientHandle, queued: usize) {
     {
         return;
     }
-    // 直接 send (= queued_bytes は無視、disconnect 直前の best-effort)
-    let _ = ch.writer_tx.send(frame_bytes);
+    let size = frame_bytes.len();
+    ch.queued_bytes.fetch_add(size, Ordering::AcqRel);
+    if ch.writer_tx.send(frame_bytes).is_err() {
+        ch.queued_bytes.fetch_sub(size, Ordering::AcqRel);
+    }
 }
 
 /// CBOR control message を 1 client にだけ送る。
@@ -1105,6 +1128,16 @@ fn serve_loop(
 
         // 1. listener: 新規 client accept
         if listener_revents.contains(PollFlags::POLLIN) {
+            // D6: 集合 DoS 対策で attach 数を上限化。超過なら fd だけ accept して
+            // 即 close (= 接続試行を OS に到達させない形にすると、kernel の listen
+            // backlog で stuck する。一旦 fd を取って socket を close するのが安全)。
+            if clients.len() >= MAX_CLIENTS_PER_DAEMON {
+                if let Ok(fd) = listener.accept() {
+                    drop(fd);
+                }
+                // accept_new_client は呼ばない。次の poll 待ちへ
+                continue;
+            }
             match accept_new_client(listener, config, *next_client_id, clients) {
                 Ok(accepted) => {
                     *next_client_id += 1;
@@ -1146,12 +1179,17 @@ fn serve_loop(
         if pty_ready {
             let mut buf = [0u8; 8192];
             match pty.master_fd().read_some(&mut buf) {
-                Ok(0) => {
-                    if let Some(code) = child_actually_exited(child) {
-                        return RelayOutcome::ChildExited(code);
+                Ok(0) => match child_actually_exited(child) {
+                    ChildState::Exited(code) => return RelayOutcome::ChildExited(code),
+                    ChildState::StoppedOrContinued => {
+                        // D8: SIGTSTP'd 子で master EOF 系シグナルが続く場合の
+                        // busy-wait 回避。短い 5ms ではなく 100ms で sleep。
+                        std::thread::sleep(std::time::Duration::from_millis(100));
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
+                    ChildState::Alive => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                },
                 Ok(n) => {
                     // scrollback に push してから broadcast (subscription 種類で encoding 分岐)
                     let now = Instant::now();
@@ -1160,12 +1198,15 @@ fn serve_loop(
                     // pending waits に新規 bytes を流し込み、match 確認
                     update_waits_on_master_bytes(pending_waits, clients, &buf[..n], now);
                 }
-                Err(Error::Errno(nix::errno::Errno::EIO)) => {
-                    if let Some(code) = child_actually_exited(child) {
-                        return RelayOutcome::ChildExited(code);
+                Err(Error::Errno(nix::errno::Errno::EIO)) => match child_actually_exited(child) {
+                    ChildState::Exited(code) => return RelayOutcome::ChildExited(code),
+                    ChildState::StoppedOrContinued => {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
+                    ChildState::Alive => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                },
                 Err(Error::Errno(nix::errno::Errno::EAGAIN)) => {}
                 Err(e) => return RelayOutcome::Error(e),
             }
@@ -1358,7 +1399,7 @@ fn accept_new_client(
     let became_leader = should_assign_leader(clients, req.mode);
 
     let response = HandshakeResponse {
-        caps: intersect,
+        caps: intersect.clone(),
         session_id: config.session_id.clone(),
         client_id,
         leader: became_leader,
@@ -1379,6 +1420,7 @@ fn accept_new_client(
     let queued_bytes_for_pump = Arc::clone(&queued_bytes);
     let writer_thread =
         std::thread::spawn(move || writer_pump(rx, writer_main, queued_bytes_for_pump));
+    let negotiated_caps = intersect;
 
     Ok(AcceptedClient {
         handle: ClientHandle {
@@ -1386,6 +1428,7 @@ fn accept_new_client(
             mode: req.mode,
             leader: became_leader,
             subscription: Subscription::Raw,
+            negotiated_caps,
             writer_tx: tx,
             queued_bytes,
             buffer_limit: config.client_buffer_bytes,
@@ -1591,6 +1634,18 @@ fn handle_control_message(
             ClientFrameOutcome::Continue
         }
         ControlMessage::LockAcquire(req) => {
+            // D7: lock cap が無いと LockAcquire 受理しない
+            if !clients[idx].negotiated_caps.iter().any(|c| c == "lock") {
+                let _ = send_control(
+                    &clients[idx],
+                    ControlMessage::Error(ErrorMessage {
+                        code: "unsupported-capability".into(),
+                        message: "lock.acquire requires `lock` cap".into(),
+                        details: None,
+                    }),
+                );
+                return ClientFrameOutcome::Continue;
+            }
             if state.lock_holder.is_some() {
                 // 「1 request → 1 response」契約を守るため、wait=true / wait=false
                 // どちらも LockResponse(Denied) 1 frame のみで応答する (Round2 #3
@@ -1630,10 +1685,35 @@ fn handle_control_message(
             ClientFrameOutcome::Continue
         }
         ControlMessage::TailRequest(req) => {
+            // D7: tail-v1 cap が intersect から落ちている client は reject
+            if !clients[idx].negotiated_caps.iter().any(|c| c == "tail-v1") {
+                let _ = send_control(
+                    &clients[idx],
+                    ControlMessage::Error(ErrorMessage {
+                        code: "unsupported-capability".into(),
+                        message: "tail.request requires `tail-v1` cap, but it was not \
+                                  negotiated at handshake"
+                            .into(),
+                        details: None,
+                    }),
+                );
+                return ClientFrameOutcome::Continue;
+            }
             handle_tail_request(idx, req, clients, scrollback);
             ClientFrameOutcome::Continue
         }
         ControlMessage::WaitRequest(req) => {
+            if !clients[idx].negotiated_caps.iter().any(|c| c == "wait-l0") {
+                let _ = send_control(
+                    &clients[idx],
+                    ControlMessage::Error(ErrorMessage {
+                        code: "unsupported-capability".into(),
+                        message: "wait.request requires `wait-l0` cap".into(),
+                        details: None,
+                    }),
+                );
+                return ClientFrameOutcome::Continue;
+            }
             handle_wait_request(idx, req, clients, pending_waits);
             ClientFrameOutcome::Continue
         }
@@ -1840,29 +1920,32 @@ fn relay_loop(
         if pty_ready {
             let mut buf = [0u8; 8192];
             match pty.master_fd().read_some(&mut buf) {
-                Ok(0) => {
-                    // master FD で EOF (= 子 PTY が close した)。ただし macOS の
-                    // forkpty 直後の short window では子が exec 完了する前に
-                    // master 側で POLLHUP+EOF が出る race がある。waitpid(WNOHANG)
-                    // で子が actually exit したか確認する。
-                    if let Some(code) = child_actually_exited(child) {
-                        return RelayOutcome::ChildExited(code);
+                Ok(0) => match child_actually_exited(child) {
+                    ChildState::Exited(code) => return RelayOutcome::ChildExited(code),
+                    ChildState::StoppedOrContinued => {
+                        // D8: 子が SIGTSTP'd でも EOF を出すケースがある
+                        std::thread::sleep(std::time::Duration::from_millis(100));
                     }
-                    // 偽 EOF (= forkpty exec 中の transient)。少し待って再試行。
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
+                    ChildState::Alive => {
+                        // 偽 EOF (= forkpty exec 中の transient)。少し待って再試行
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                },
                 Ok(n) => {
                     let frame = Frame::raw_data(buf[..n].to_vec());
                     if let Err(e) = frame.encode_to(client_writer) {
                         return frame_send_outcome(e);
                     }
                 }
-                Err(Error::Errno(nix::errno::Errno::EIO)) => {
-                    if let Some(code) = child_actually_exited(child) {
-                        return RelayOutcome::ChildExited(code);
+                Err(Error::Errno(nix::errno::Errno::EIO)) => match child_actually_exited(child) {
+                    ChildState::Exited(code) => return RelayOutcome::ChildExited(code),
+                    ChildState::StoppedOrContinued => {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
+                    ChildState::Alive => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                },
                 Err(Error::Errno(nix::errno::Errno::EAGAIN)) => {
                     // POLLHUP の偽陽性 (= ready と通知されたが実 read で EAGAIN)。
                     // EWOULDBLOCK は Linux/macOS とも EAGAIN と同値 (POSIX 規定)。
@@ -1936,26 +2019,36 @@ fn relay_loop(
     }
 }
 
+/// 子 process の状態判定結果 (D8: Stopped を明示区別)。
+enum ChildState {
+    /// 子は exit 済。`Some(code)` は実 exit code、`None` は transient で取得不能。
+    Exited(Option<i32>),
+    /// 子は alive (= StillAlive または transient error)。caller は短い sleep でリトライ。
+    Alive,
+    /// 子は SIGTSTP / SIGCONT 等で stopped/continued。alive 扱いだが、出力は止まる
+    /// 可能性があるので caller は **長めの sleep** で busy-wait を避ける。
+    StoppedOrContinued,
+}
+
 /// 子 process が actually exit したかを `waitpid(WNOHANG)` で確認する。
 ///
 /// macOS の forkpty 直後の short window では子が exec 完了する前に
 /// master FD で POLLHUP / EOF が偽陽性で出る race がある (slave 側の reference
 /// count 揺らぎ等)。read が 0 / EIO を返したときに本関数で「子が実際に exit
 /// 済みか」を waitpid で確かめてから ChildExited 判定する。
-///
-/// 戻り値:
-/// - `Some(Some(code))`: 子は exit 済、exit code が `code`
-/// - `Some(None)`: 子は exit 済 (= waitpid が status を返した) だが exit code が
-///   取得できない (= 何らかの transient)
-/// - `None`: 子はまだ alive (StillAlive / Stopped / Continued / transient error)
-fn child_actually_exited(child: Pid) -> Option<Option<i32>> {
+fn child_actually_exited(child: Pid) -> ChildState {
     use nix::sys::wait::WaitPidFlag;
     match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
-        Ok(WaitStatus::StillAlive) => None,
-        Ok(WaitStatus::Exited(_, code)) => Some(Some(code)),
-        Ok(WaitStatus::Signaled(_, sig, _)) => Some(Some(128 + (sig as i32))),
-        Ok(_) => None,
-        Err(_) => None,
+        Ok(WaitStatus::StillAlive) => ChildState::Alive,
+        Ok(WaitStatus::Exited(_, code)) => ChildState::Exited(Some(code)),
+        Ok(WaitStatus::Signaled(_, sig, _)) => ChildState::Exited(Some(128 + (sig as i32))),
+        Ok(WaitStatus::Stopped(_, _)) | Ok(WaitStatus::Continued(_)) => {
+            ChildState::StoppedOrContinued
+        }
+        // ptrace event 等の wildcard (= `ptrace` feature 有効時) を defensively alive 扱い
+        #[allow(unreachable_patterns)]
+        Ok(_) => ChildState::Alive,
+        Err(_) => ChildState::Alive,
     }
 }
 
@@ -3373,6 +3466,7 @@ mod tests {
             mode: Mode::Rw,
             leader: true,
             subscription: Subscription::Raw,
+            negotiated_caps: vec![],
             writer_tx: tx,
             queued_bytes: Arc::new(AtomicUsize::new(0)),
             buffer_limit: 100,

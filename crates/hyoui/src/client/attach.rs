@@ -67,15 +67,21 @@ fn process_detach_prefix(chunk: &[u8], prefix_armed: &mut bool, prefix: u8) -> D
 /// - `"0xNN"` (hex) → 当該 byte
 /// - `"<integer>"` (decimal 0..=255) → 当該 byte
 /// - `"ctrl-X"` / `"^X"` (X = a..z) → `(X - 'a' + 1)` (= ASCII C0 制御文字)
-/// - 解釈不能なら stderr に warning を出して default にフォールバック
-pub fn resolve_detach_prefix_from_env() -> Option<u8> {
+///
+/// 解釈不能な値は **Err 化** して caller (= CLI の attach_command) が raw mode に
+/// 入る **前に** 明示 error として stderr 出力 + exit する責務を持つ
+/// (= レビュー指摘 H3: 旧版は silent fallback で raw mode 後の scrollback に
+/// warning が流されて気付かれない罠だった)。
+pub fn resolve_detach_prefix_from_env() -> Result<Option<u8>, String> {
     let raw = match std::env::var("HYOUI_DETACH_PREFIX") {
         Ok(v) => v,
-        Err(_) => return Some(DETACH_PREFIX_BYTE),
+        Err(_) => return Ok(Some(DETACH_PREFIX_BYTE)),
     };
-    parse_detach_prefix(&raw).unwrap_or_else(|| {
-        eprintln!("hyoui: invalid HYOUI_DETACH_PREFIX={raw:?}, falling back to Ctrl-A (0x01)");
-        Some(DETACH_PREFIX_BYTE)
+    parse_detach_prefix(&raw).ok_or_else(|| {
+        format!(
+            "invalid HYOUI_DETACH_PREFIX={raw:?}: expected hex (0xNN) / decimal \
+             (0..=255) / `Ctrl-X` / `^X` (X = a..z) / `none`/`off`/`disable`"
+        )
     })
 }
 
@@ -245,7 +251,10 @@ impl ClientConnection {
         stdin: &mut R,
         stdout: &mut W,
     ) -> Result<(), Error> {
-        let detach_prefix = resolve_detach_prefix_from_env();
+        // 万一 caller が事前 validate を忘れていた場合の defense-in-depth。
+        // 通常は CLI が attach 開始前に明示 validate して exit する (H3)。
+        let detach_prefix = resolve_detach_prefix_from_env()
+            .map_err(|_| Error::Invalid("invalid HYOUI_DETACH_PREFIX env"))?;
         let mut detach_prefix_armed: bool = false;
         loop {
             let socket_fd = self.reader.as_fd();

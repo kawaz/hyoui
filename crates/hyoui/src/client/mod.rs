@@ -6,4 +6,4 @@
 
 mod attach;
 
-pub use attach::{AttachOptions, ClientConnection};
+pub use attach::{AttachOptions, ClientConnection, resolve_detach_prefix_from_env};
