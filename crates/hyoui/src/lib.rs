@@ -39,6 +39,12 @@ pub mod strip;
 //   * 各 control message は `protocol::messages::*` で型付き
 pub mod protocol;
 
+// v0.1.0 daemon (DR-0008 §Consequences、DR-0007 MVP):
+//
+// 段階実装中 (Phase 6 = skeleton)。1 session = 子 PTY + Unix socket + scrollback +
+// attach clients の集合体。protocol module を frame レベルで使う。
+pub mod daemon;
+
 /// Library version (matches `Cargo.toml`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
