@@ -84,6 +84,10 @@ pub enum HelpTopic {
     Run,
     /// Help for the `attach` subcommand (detach key bindings, modes 等)。
     Attach,
+    /// Help for the `list` subcommand.
+    List,
+    /// Help for the `kill` subcommand.
+    Kill,
     /// Help for the `status` subcommand.
     Status,
     /// Help for the `tail` subcommand.
@@ -303,7 +307,7 @@ pub fn parse_args(args: &[String]) -> Command {
 fn parse_list(args: &[String]) -> Command {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         return Command::Help {
-            topic: HelpTopic::Top,
+            topic: HelpTopic::List,
         };
     }
     if !args.is_empty() {
@@ -338,7 +342,7 @@ fn parse_kill(args: &[String]) -> Command {
         match name.as_str() {
             "--help" | "-h" => {
                 return Command::Help {
-                    topic: HelpTopic::Top,
+                    topic: HelpTopic::Kill,
                 };
             }
             "--socket" => match value {
@@ -1048,6 +1052,8 @@ pub fn usage(topic: &HelpTopic) -> String {
         HelpTopic::UnknownSubcommand(name) => usage_top(Some(name.as_str())),
         HelpTopic::Run => usage_run(),
         HelpTopic::Attach => usage_attach(),
+        HelpTopic::List => usage_list(),
+        HelpTopic::Kill => usage_kill(),
         HelpTopic::Status => usage_status(),
         HelpTopic::Tail => usage_tail(),
         HelpTopic::Wait => usage_wait(),
@@ -1503,6 +1509,66 @@ fn usage_wait() -> String {
             hyoui wait demo text:READY --timeout=5s\n    \
             hyoui wait demo pattern:'ITEM-\\d+' --timeout=30s\n    \
             hyoui wait demo wait-idle:500ms\n",
+    )
+}
+
+fn usage_list() -> String {
+    String::from(
+        "hyoui list — list daemon sessions (= socket dir scan)\n\
+        \n\
+        USAGE:\n    \
+            hyoui list\n\
+        \n\
+        OPTIONS:\n    \
+            -h, --help      Show this help and exit\n\
+        \n\
+        OUTPUT (TAB separated, 1 line per session):\n    \
+            <session-id>\\t<socket-path>\n\
+        \n\
+        SCAN ORDER (= socket_path::resolve と同順、最初に見つかった dir のみ):\n    \
+            1. $XDG_RUNTIME_DIR/hyoui/\n    \
+            2. $TMPDIR/hyoui-<uid>/  (TMPDIR 未設定なら /tmp/hyoui-<uid>/)\n\
+        \n\
+        EXIT CODE:\n    \
+            0   正常終了 (= 0 件でも成功扱い、stderr に `no sessions found` を 1 行)\n\
+        \n\
+        EXAMPLES:\n    \
+            hyoui list                              # 全 session を一覧\n    \
+            hyoui list | awk '{print $1}'           # session id だけ抽出\n\
+        \n\
+        RELATED:\n    \
+            hyoui status <id>   session 1 件の詳細\n    \
+            hyoui attach <id>   session に接続\n    \
+            hyoui kill <id>     session を終了\n",
+    )
+}
+
+fn usage_kill() -> String {
+    String::from(
+        "hyoui kill — send signal to a daemon session and terminate it\n\
+        \n\
+        USAGE:\n    \
+            hyoui kill <session-id> [options]\n    \
+            hyoui kill --socket=<path> [options]\n\
+        \n\
+        OPTIONS:\n    \
+            --socket PATH   Explicit socket path (alternative to session-id)\n    \
+            --signum N      Signal number to send to the child PTY (default: SIGTERM=15)\n    \
+            -h, --help      Show this help and exit\n\
+        \n\
+        EXIT CODE:\n    \
+            0   送信完了 (= daemon が close するのを待ってから exit)\n    \
+            1   connect / send 失敗\n    \
+            2   引数不足 (session-id も --socket も無し)\n\
+        \n\
+        EXAMPLES:\n    \
+            hyoui kill demo                         # session_id=demo に SIGTERM\n    \
+            hyoui kill demo --signum=9              # SIGKILL を送る\n    \
+            hyoui kill --socket=/tmp/x.sock         # socket 直指定で kill\n\
+        \n\
+        RELATED:\n    \
+            hyoui list          attach 可能な session 一覧 (= 対象選び)\n    \
+            hyoui status <id>   session の現在状態を確認\n",
     )
 }
 
@@ -2315,5 +2381,81 @@ mod tests {
         let text = usage(&HelpTopic::UnknownSubcommand("frob".into()));
         assert!(text.contains("frob"));
         assert!(text.contains("SUBCOMMANDS"));
+    }
+
+    // R4-H1: each subcommand's `--help` must route to the subcommand-specific
+    // HelpTopic (not Top). Regression: `hyoui kill --help` previously printed
+    // top-level help, which gave users no info about --signum, exit codes, etc.
+
+    #[test]
+    fn list_help_routes_to_list_topic() {
+        match parse_args(&args(&["list", "--help"])) {
+            Command::Help {
+                topic: HelpTopic::List,
+            } => {}
+            other => panic!("expected Help{{List}}, got {other:?}"),
+        }
+        match parse_args(&args(&["list", "-h"])) {
+            Command::Help {
+                topic: HelpTopic::List,
+            } => {}
+            other => panic!("expected Help{{List}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kill_help_routes_to_kill_topic() {
+        match parse_args(&args(&["kill", "--help"])) {
+            Command::Help {
+                topic: HelpTopic::Kill,
+            } => {}
+            other => panic!("expected Help{{Kill}}, got {other:?}"),
+        }
+        match parse_args(&args(&["kill", "-h"])) {
+            Command::Help {
+                topic: HelpTopic::Kill,
+            } => {}
+            other => panic!("expected Help{{Kill}}, got {other:?}"),
+        }
+    }
+
+    // NOTE: status/tail/wait の help routing は status_tail_wait_help_routes_to_topic
+    // (上記) で既にカバー済み。R4-H1 で新規追加した list/kill は上の専用 test を、
+    // 全 subcommand の help text が subcommand-specific であることは下の
+    // subcommand_help_text_is_subcommand_specific でまとめてチェックする。
+
+    /// Each subcommand's usage text must contain the subcommand name and at least
+    /// one subcommand-specific keyword, so `hyoui <sub> --help` does NOT look
+    /// like the top-level help (= the original R4-H1 bug).
+    #[test]
+    fn subcommand_help_text_is_subcommand_specific() {
+        let cases: &[(HelpTopic, &str, &[&str])] = &[
+            (HelpTopic::Run, "hyoui run", &["--mode", "--timeout"]),
+            (HelpTopic::Attach, "hyoui attach", &["DETACH KEY", "--exclusive"]),
+            (HelpTopic::List, "hyoui list", &["SCAN ORDER"]),
+            (HelpTopic::Kill, "hyoui kill", &["--signum", "SIGTERM"]),
+            (HelpTopic::Status, "hyoui status", &["OUTPUT", "child-pid"]),
+            (HelpTopic::Tail, "hyoui tail", &["--follow", "--since"]),
+            (HelpTopic::Wait, "hyoui wait", &["PREDICATES", "wait-idle"]),
+            (HelpTopic::Completion, "hyoui completion", &["bash"]),
+        ];
+        for (topic, head, must_have) in cases {
+            let text = usage(topic);
+            assert!(
+                text.contains(head),
+                "topic {topic:?} usage must contain `{head}`; got:\n{text}"
+            );
+            for needle in must_have.iter() {
+                assert!(
+                    text.contains(needle),
+                    "topic {topic:?} usage must contain `{needle}`; got:\n{text}"
+                );
+            }
+            // Must NOT look like top-level help (= R4-H1 regression guard).
+            assert!(
+                !text.contains("SUBCOMMANDS:\n"),
+                "topic {topic:?} usage must not contain top-level SUBCOMMANDS list; got:\n{text}"
+            );
+        }
     }
 }
