@@ -23,7 +23,8 @@ use nix::unistd::Pid;
 use crate::Error;
 use crate::protocol::messages::{
     ClientInfo, ErrorMessage, LeaderNotify, LockResponse, LockResult, ModeChange, SessionMode,
-    StatusResponse, TailData, TailEnd, TailEndReason, TailRequest,
+    StatusResponse, TailData, TailEnd, TailEndReason, TailRequest, WaitMatchOptions, WaitOutcome,
+    WaitPredicate, WaitRequest, WaitResult,
 };
 use crate::protocol::{
     ControlMessage, Frame, FrameError, HandshakeResponse, MVP_CAPS, Mode, ProtocolError,
@@ -228,6 +229,7 @@ impl Session {
         let mut next_client_id: u64 = 0;
         let mut state = SessionState::default();
         let mut scrollback = Scrollback::new(config.scrollback_bytes);
+        let mut pending_waits: Vec<PendingWait> = Vec::new();
         let outcome = serve_loop(
             &pty,
             child,
@@ -238,6 +240,7 @@ impl Session {
             client_buffer_cap,
             &mut state,
             &mut scrollback,
+            &mut pending_waits,
         );
 
         // cleanup: 各 client の writer thread を terminate (= channel drop で recv 終わる)
@@ -284,6 +287,28 @@ enum Subscription {
     Raw,
     TailFollow { strip_ansi: bool },
 }
+
+/// `wait.request` の pending 状態 (Phase 11c)。
+///
+/// 各 wait は self-contained:
+/// - `predicate`: text / pattern (compiled regex) / idle
+/// - `options`: strip_escapes / newline_convert_lf
+/// - `deadline`: timeout_ms から計算した絶対時刻 (= 無限 wait は None)
+/// - `accumulated`: wait 開始後に蓄積した master bytes (predicate scan 対象)
+/// - `last_activity`: Idle 用に最後に master 出力があった時刻 (= 開始時 = now)
+/// - `compiled_regex`: Pattern predicate のみ、wait 開始時 1 回 compile
+struct PendingWait {
+    client_id: u64,
+    predicate: WaitPredicate,
+    options: WaitMatchOptions,
+    deadline: Option<Instant>,
+    accumulated: Vec<u8>,
+    last_activity: Instant,
+    compiled_regex: Option<regex::bytes::Regex>,
+}
+
+/// `accumulated` の上限 (= memory bound)。超過すると古い byte から truncate。
+const WAIT_ACCUMULATED_LIMIT: usize = 1024 * 1024;
 
 /// session 全体の状態 (Phase 10)。lock 周りの state machine を保持する。
 ///
@@ -461,6 +486,207 @@ fn broadcast_master_bytes(clients: &mut [ClientHandle], bytes: &[u8], ts: Instan
     }
 }
 
+/// `wait.request` を処理する (Phase 11c)。
+///
+/// PendingWait を作って `pending_waits` に push。各 predicate ごとに:
+/// - Text: substring match (= accumulated に対して `.windows().any()` 相当)
+/// - Pattern: regex compile を 1 度実行、accumulated に対して `is_match`
+///   (compile 失敗で error code=`wait.invalid-pattern` を返却)
+/// - Idle: master 出力が `ms` 静かなら成立 (= 開始時 last_activity = now、
+///   master 出力で last_activity 更新、`compute_wait_poll_timeout` で
+///   `last_activity + ms - now` を poll timeout として使う)
+fn handle_wait_request(
+    idx: usize,
+    req: WaitRequest,
+    clients: &mut [ClientHandle],
+    pending_waits: &mut Vec<PendingWait>,
+) {
+    let client_id = clients[idx].id;
+    let now = Instant::now();
+    let deadline = req
+        .timeout_ms
+        .and_then(|ms| now.checked_add(std::time::Duration::from_millis(ms)));
+
+    let compiled_regex = match &req.predicate {
+        WaitPredicate::Pattern { regex: r } => match regex::bytes::Regex::new(r) {
+            Ok(re) => Some(re),
+            Err(_) => {
+                // invalid regex → wait.result(Cancelled) で即終了 (= 致命でないが
+                // semantic error)。詳細は error code でなく separate Error 帰す手も
+                // あるが、MVP は WaitResult(Cancelled) で一本化。
+                let _ = send_control(
+                    &clients[idx],
+                    ControlMessage::Error(ErrorMessage {
+                        code: "wait.invalid-pattern".into(),
+                        message: "regex failed to compile".into(),
+                        details: None,
+                    }),
+                );
+                return;
+            }
+        },
+        _ => None,
+    };
+
+    let wait = PendingWait {
+        client_id,
+        predicate: req.predicate,
+        options: req.options,
+        deadline,
+        accumulated: Vec::new(),
+        last_activity: now,
+        compiled_regex,
+    };
+
+    // 開始即 (= accumulated 空) に match することは Text/Pattern では起きないが、
+    // Idle (ms = 0) だけは即成立しうる。即成立なら send + skip push。
+    if matches!(wait.predicate, WaitPredicate::Idle { ms: 0 }) {
+        let _ = send_control(
+            &clients[idx],
+            ControlMessage::WaitResult(WaitResult {
+                outcome: WaitOutcome::Matched,
+                matched_offset: None,
+            }),
+        );
+        return;
+    }
+    pending_waits.push(wait);
+}
+
+/// 各 pending wait の `accumulated` に新規 master bytes を append し、predicate を
+/// scan。マッチした wait は client へ `wait.result(Matched)` を送って remove する。
+///
+/// `WaitMatchOptions::strip_escapes` / `newline_convert_lf` は scan 前に新 bytes に
+/// 適用する。`strip_escapes` は per-frame で完結 (= chunk 境界跨ぎ ANSI escape の
+/// 完全保証はしない)。
+fn update_waits_on_master_bytes(
+    pending_waits: &mut Vec<PendingWait>,
+    clients: &mut [ClientHandle],
+    new_bytes: &[u8],
+    now: Instant,
+) {
+    let mut matched_indices: Vec<usize> = Vec::new();
+    for (i, w) in pending_waits.iter_mut().enumerate() {
+        // Idle 用に last_activity 更新 (= 静寂タイマーリセット)
+        w.last_activity = now;
+
+        let mut bytes_to_add: Vec<u8> = if w.options.strip_escapes {
+            crate::strip::strip_ansi(new_bytes)
+        } else {
+            new_bytes.to_vec()
+        };
+        if w.options.newline_convert_lf {
+            bytes_to_add = crate::strip::normalize_lf(&bytes_to_add);
+        }
+        w.accumulated.extend_from_slice(&bytes_to_add);
+        // memory bound: head から trim
+        if w.accumulated.len() > WAIT_ACCUMULATED_LIMIT {
+            let drop_n = w.accumulated.len() - WAIT_ACCUMULATED_LIMIT;
+            w.accumulated.drain(..drop_n);
+        }
+
+        let matched = match &w.predicate {
+            WaitPredicate::Text { value } => w
+                .accumulated
+                .windows(value.len())
+                .any(|win| win == value.as_bytes()),
+            WaitPredicate::Pattern { .. } => w
+                .compiled_regex
+                .as_ref()
+                .map(|re| re.is_match(&w.accumulated))
+                .unwrap_or(false),
+            WaitPredicate::Idle { .. } => false, // Idle は静寂判定なので bytes 増加で match しない
+        };
+        if matched {
+            matched_indices.push(i);
+        }
+    }
+    // matched を逆順で remove + WaitResult 送信
+    for i in matched_indices.into_iter().rev() {
+        let w = pending_waits.remove(i);
+        if let Some(ch) = clients.iter().find(|c| c.id == w.client_id) {
+            let _ = send_control(
+                ch,
+                ControlMessage::WaitResult(WaitResult {
+                    outcome: WaitOutcome::Matched,
+                    matched_offset: None,
+                }),
+            );
+        }
+    }
+}
+
+/// poll timeout を pending_waits の最も早い deadline (= timeout / idle 期限) から
+/// 計算する。pending が無ければ `PollTimeout::NONE` (= 無限 block)。
+fn compute_wait_poll_timeout(pending_waits: &[PendingWait]) -> PollTimeout {
+    let now = Instant::now();
+    let mut earliest: Option<std::time::Duration> = None;
+    for w in pending_waits {
+        let candidates: [Option<std::time::Duration>; 2] = [
+            w.deadline
+                .map(|d| d.saturating_duration_since(now))
+                .map(|d| d.max(std::time::Duration::ZERO)),
+            match w.predicate {
+                WaitPredicate::Idle { ms } => {
+                    let idle_dur = std::time::Duration::from_millis(ms);
+                    let target = w.last_activity + idle_dur;
+                    Some(target.saturating_duration_since(now))
+                }
+                _ => None,
+            },
+        ];
+        for cand in candidates.into_iter().flatten() {
+            earliest = Some(match earliest {
+                None => cand,
+                Some(prev) => prev.min(cand),
+            });
+        }
+    }
+    match earliest {
+        None => PollTimeout::NONE,
+        Some(d) => {
+            // PollTimeout は ms 精度。0 (= 即時 timeout) を許容、上限は i32 max ms。
+            let ms: i32 = i32::try_from(d.as_millis()).unwrap_or(i32::MAX);
+            PollTimeout::try_from(ms).unwrap_or(PollTimeout::NONE)
+        }
+    }
+}
+
+/// poll が timeout で起きた時に各 pending_wait の deadline / idle 経過をチェック。
+/// Idle 経過 → WaitResult(Matched)、deadline 経過 → WaitResult(Timeout) として remove。
+fn check_wait_timeouts(pending_waits: &mut Vec<PendingWait>, clients: &mut [ClientHandle]) {
+    let now = Instant::now();
+    let mut to_remove: Vec<(usize, WaitOutcome)> = Vec::new();
+    for (i, w) in pending_waits.iter().enumerate() {
+        // Idle predicate: now - last_activity >= idle_ms なら成立
+        if let WaitPredicate::Idle { ms } = w.predicate {
+            let target = w.last_activity + std::time::Duration::from_millis(ms);
+            if now >= target {
+                to_remove.push((i, WaitOutcome::Matched));
+                continue;
+            }
+        }
+        // 絶対 timeout: deadline 経過なら Timeout
+        if let Some(dl) = w.deadline {
+            if now >= dl {
+                to_remove.push((i, WaitOutcome::Timeout));
+            }
+        }
+    }
+    for (i, outcome) in to_remove.into_iter().rev() {
+        let w = pending_waits.remove(i);
+        if let Some(ch) = clients.iter().find(|c| c.id == w.client_id) {
+            let _ = send_control(
+                ch,
+                ControlMessage::WaitResult(WaitResult {
+                    outcome,
+                    matched_offset: None,
+                }),
+            );
+        }
+    }
+}
+
 /// `tail.request` を処理する (Phase 11)。
 ///
 /// 流れ:
@@ -590,6 +816,7 @@ fn serve_loop(
     client_buffer_cap: usize,
     state: &mut SessionState,
     scrollback: &mut Scrollback,
+    pending_waits: &mut Vec<PendingWait>,
 ) -> RelayOutcome {
     loop {
         // poll fd 構築: listener + master + 各 client reader
@@ -602,10 +829,15 @@ fn serve_loop(
             poll_fds.push(PollFd::new(ch.reader.as_fd(), PollFlags::POLLIN));
         }
 
-        match poll(&mut poll_fds, PollTimeout::NONE) {
+        let poll_timeout = compute_wait_poll_timeout(pending_waits);
+        match poll(&mut poll_fds, poll_timeout) {
             Ok(PollOutcome::Ready(_)) => {}
             Ok(PollOutcome::Interrupted) => continue,
-            Ok(PollOutcome::Timeout) => continue,
+            Ok(PollOutcome::Timeout) => {
+                // wait deadline / idle 経過チェック
+                check_wait_timeouts(pending_waits, clients);
+                continue;
+            }
             Err(e) => return RelayOutcome::Error(e),
         }
 
@@ -678,6 +910,8 @@ fn serve_loop(
                     let now = Instant::now();
                     scrollback.push(now, buf[..n].to_vec());
                     broadcast_master_bytes(clients, &buf[..n], now);
+                    // pending waits に新規 bytes を流し込み、match 確認
+                    update_waits_on_master_bytes(pending_waits, clients, &buf[..n], now);
                 }
                 Err(Error::Errno(nix::errno::Errno::EIO)) => {
                     if let Some(code) = child_actually_exited(child) {
@@ -717,7 +951,15 @@ fn serve_loop(
             match fre {
                 FrameOrError::Frame(frame) => {
                     match handle_client_frame(
-                        pty, child, idx, frame, clients, state, scrollback, config,
+                        pty,
+                        child,
+                        idx,
+                        frame,
+                        clients,
+                        state,
+                        scrollback,
+                        config,
+                        pending_waits,
                     ) {
                         ClientFrameOutcome::Continue => {}
                         ClientFrameOutcome::DropClient => indices_to_drop.push(idx),
@@ -747,6 +989,8 @@ fn serve_loop(
                 state.lock_holder = None;
                 state.lock_token = None;
             }
+            // pending waits も remove (= client が消えたら wait は cancel 同等)
+            pending_waits.retain(|w| w.client_id != ch.id);
             drop(ch.writer_tx);
             if let Some(t) = ch.writer_thread {
                 let _ = t.join();
@@ -908,6 +1152,7 @@ fn handle_client_frame(
     state: &mut SessionState,
     scrollback: &Scrollback,
     config: &DaemonConfig,
+    pending_waits: &mut Vec<PendingWait>,
 ) -> ClientFrameOutcome {
     match frame.ty {
         TYPE_RAW_DATA => {
@@ -934,14 +1179,24 @@ fn handle_client_frame(
                 Ok(m) => m,
                 Err(_) => return ClientFrameOutcome::Continue,
             };
-            handle_control_message(pty, child, idx, msg, clients, state, scrollback, config)
+            handle_control_message(
+                pty,
+                child,
+                idx,
+                msg,
+                clients,
+                state,
+                scrollback,
+                config,
+                pending_waits,
+            )
         }
         _ => ClientFrameOutcome::DropClient,
     }
 }
 
-/// CBOR control message のディスパッチ。lock / leader / mode / status 系の state 更新と
-/// broadcast を担う (Phase 10-11)。
+/// CBOR control message のディスパッチ。lock / leader / mode / status / tail / wait 系の
+/// state 更新と broadcast を担う (Phase 10-11)。
 #[allow(clippy::too_many_arguments)]
 fn handle_control_message(
     pty: &Pty,
@@ -952,6 +1207,7 @@ fn handle_control_message(
     state: &mut SessionState,
     scrollback: &Scrollback,
     config: &DaemonConfig,
+    pending_waits: &mut Vec<PendingWait>,
 ) -> ClientFrameOutcome {
     let ch_id = clients[idx].id;
     let ch_leader = clients[idx].leader;
@@ -1025,6 +1281,10 @@ fn handle_control_message(
         }
         ControlMessage::TailRequest(req) => {
             handle_tail_request(idx, req, clients, scrollback);
+            ClientFrameOutcome::Continue
+        }
+        ControlMessage::WaitRequest(req) => {
+            handle_wait_request(idx, req, clients, pending_waits);
             ClientFrameOutcome::Continue
         }
         ControlMessage::StatusQuery(_) => {
@@ -2245,6 +2505,239 @@ mod tests {
         .encode_to(&mut s)
         .expect("send");
         s.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    // ---- Phase 11c: wait.request ----
+
+    /// Phase 11c: wait.request(text) は新規 master 出力に target が含まれたら Matched。
+    #[test]
+    fn serve_wait_text_predicate_matches() {
+        use crate::protocol::messages::{WaitMatchOptions, WaitPredicate, WaitRequest};
+
+        let cmd = vec!["/bin/sh".into(), "-c".into(), "cat".into()];
+        let (_, sock_path, _dir, handle) = {
+            let dir = make_temp_socket_dir();
+            let sock_path = dir.path().join("test.sock");
+            let cfg = DaemonConfig::new("demo", sock_path.clone(), cmd);
+            let session = Session::start(cfg).expect("start");
+            let h = std::thread::spawn(move || session.serve());
+            ("demo".to_string(), sock_path, dir, h)
+        };
+
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut s1);
+        let _ = Frame::decode_from(&mut s1).expect("leader.notify");
+
+        // wait.request: text "READY"
+        Frame::cbor_control(
+            ControlMessage::WaitRequest(WaitRequest {
+                predicate: WaitPredicate::Text {
+                    value: "READY".into(),
+                },
+                timeout_ms: Some(5_000),
+                options: WaitMatchOptions::default(),
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+
+        // cat に "READY\n" を送り込む → cat が echo → master → wait scan で match
+        Frame::raw_data(b"READY\n".to_vec())
+            .encode_to(&mut s1)
+            .expect("send");
+        s1.flush().expect("flush");
+
+        // wait.result(Matched) を期待
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::time::Instant::now() > deadline {
+                panic!("timed out waiting for WaitResult");
+            }
+            match next_control(&mut s1) {
+                ControlMessage::WaitResult(wr) => {
+                    assert_eq!(wr.outcome, WaitOutcome::Matched);
+                    break;
+                }
+                _ => continue,
+            }
+        }
+
+        // cleanup
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// Phase 11c: wait.request(idle) は master 出力が idle_ms 間無いと Matched。
+    #[test]
+    fn serve_wait_idle_predicate_matches() {
+        use crate::protocol::messages::{WaitMatchOptions, WaitPredicate, WaitRequest};
+
+        // 子は出力しない (sleep だけ) → idle がすぐ成立する
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut s1);
+        let _ = Frame::decode_from(&mut s1).expect("leader.notify");
+
+        // idle 100ms wait
+        Frame::cbor_control(
+            ControlMessage::WaitRequest(WaitRequest {
+                predicate: WaitPredicate::Idle { ms: 100 },
+                timeout_ms: Some(5_000),
+                options: WaitMatchOptions::default(),
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+
+        let start = std::time::Instant::now();
+        let result = next_control(&mut s1);
+        let elapsed = start.elapsed();
+        match result {
+            ControlMessage::WaitResult(wr) => {
+                assert_eq!(wr.outcome, WaitOutcome::Matched);
+            }
+            o => panic!("expected WaitResult, got {o:?}"),
+        }
+        assert!(
+            elapsed >= Duration::from_millis(80),
+            "idle should wait at least 80ms (allowing for jitter), got {elapsed:?}"
+        );
+
+        // cleanup
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// Phase 11c: wait.request の timeout は WaitResult(Timeout) を返す。
+    #[test]
+    fn serve_wait_timeout_returns_timeout_outcome() {
+        use crate::protocol::messages::{WaitMatchOptions, WaitPredicate, WaitRequest};
+
+        // 子は何も出力しない sleep → text "NEVER" は決して来ない → timeout
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut s1);
+        let _ = Frame::decode_from(&mut s1).expect("leader.notify");
+
+        Frame::cbor_control(
+            ControlMessage::WaitRequest(WaitRequest {
+                predicate: WaitPredicate::Text {
+                    value: "NEVER".into(),
+                },
+                timeout_ms: Some(200),
+                options: WaitMatchOptions::default(),
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+
+        let start = std::time::Instant::now();
+        match next_control(&mut s1) {
+            ControlMessage::WaitResult(wr) => assert_eq!(wr.outcome, WaitOutcome::Timeout),
+            o => panic!("expected WaitResult, got {o:?}"),
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "should wait around 200ms, got {elapsed:?}"
+        );
+
+        // cleanup
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// Phase 11c: wait.request(pattern) regex match。
+    #[test]
+    fn serve_wait_pattern_predicate_matches() {
+        use crate::protocol::messages::{WaitMatchOptions, WaitPredicate, WaitRequest};
+
+        let cmd = vec!["/bin/sh".into(), "-c".into(), "cat".into()];
+        let (_, sock_path, _dir, handle) = {
+            let dir = make_temp_socket_dir();
+            let sock_path = dir.path().join("test.sock");
+            let cfg = DaemonConfig::new("demo", sock_path.clone(), cmd);
+            let session = Session::start(cfg).expect("start");
+            let h = std::thread::spawn(move || session.serve());
+            ("demo".to_string(), sock_path, dir, h)
+        };
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut s1);
+        let _ = Frame::decode_from(&mut s1).expect("leader.notify");
+
+        // pattern: r"ITEM-\d+"
+        Frame::cbor_control(
+            ControlMessage::WaitRequest(WaitRequest {
+                predicate: WaitPredicate::Pattern {
+                    regex: r"ITEM-\d+".into(),
+                },
+                timeout_ms: Some(5_000),
+                options: WaitMatchOptions::default(),
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+
+        Frame::raw_data(b"prefix ITEM-42 suffix\n".to_vec())
+            .encode_to(&mut s1)
+            .expect("send");
+        s1.flush().expect("flush");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::time::Instant::now() > deadline {
+                panic!("timed out");
+            }
+            if let ControlMessage::WaitResult(wr) = next_control(&mut s1) {
+                assert_eq!(wr.outcome, WaitOutcome::Matched);
+                break;
+            }
+        }
+
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
         let _ = handle.join().expect("daemon thread");
     }
 

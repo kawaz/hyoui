@@ -11,7 +11,7 @@
 //! - [x] Phase 8: raw data 中継 + detach + clean shutdown
 //! - [x] Phase 9: multi-attach + bounded mpsc (backpressure DR-0008 §8.2)
 //! - [x] Phase 10: lock + leader + mode change (wait queue 未実装、wait=true でも Denied)
-//! - [ ] Phase 11: status / tail / wait
+//! - [x] Phase 11: status / tail / wait (text/pattern/idle predicates、subscription 切替)
 //!
 //! ## 関連
 //!

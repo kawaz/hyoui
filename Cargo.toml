@@ -29,6 +29,7 @@ libc = "0.2"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl"] }
 
 [workspace.dependencies.tempfile]
 version = "3"
