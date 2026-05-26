@@ -902,9 +902,13 @@ fn compute_wait_poll_timeout(pending_waits: &[PendingWait]) -> PollTimeout {
                 .map(|d| d.max(std::time::Duration::ZERO)),
             match w.predicate {
                 WaitPredicate::Idle { ms } => {
+                    // u64::MAX 等の極端な ms で `Instant + Duration` が overflow すると
+                    // panic するため checked_add で防ぐ。overflow した場合は事実上
+                    // 「無限に先」なので候補に含めない (= None)。
                     let idle_dur = std::time::Duration::from_millis(ms);
-                    let target = w.last_activity + idle_dur;
-                    Some(target.saturating_duration_since(now))
+                    w.last_activity
+                        .checked_add(idle_dur)
+                        .map(|target| target.saturating_duration_since(now))
                 }
                 _ => None,
             },
@@ -920,6 +924,8 @@ fn compute_wait_poll_timeout(pending_waits: &[PendingWait]) -> PollTimeout {
         None => PollTimeout::NONE,
         Some(d) => {
             // PollTimeout は ms 精度。0 (= 即時 timeout) を許容、上限は i32 max ms。
+            // `as_millis()` は u128 を返すので `try_from + unwrap_or(i32::MAX)` で
+            // saturating cast (= u64::MAX ms 等が来ても panic しない)。
             let ms: i32 = i32::try_from(d.as_millis()).unwrap_or(i32::MAX);
             PollTimeout::try_from(ms).unwrap_or(PollTimeout::NONE)
         }
@@ -933,11 +939,17 @@ fn check_wait_timeouts(pending_waits: &mut Vec<PendingWait>, clients: &mut [Clie
     let mut to_remove: Vec<(usize, WaitOutcome)> = Vec::new();
     for (i, w) in pending_waits.iter().enumerate() {
         // Idle predicate: now - last_activity >= idle_ms なら成立
+        // u64::MAX 等で `Instant + Duration` が overflow すると panic するため
+        // checked_add で防ぐ。overflow した場合は事実上「無限に先」なので Match しない。
         if let WaitPredicate::Idle { ms } = w.predicate {
-            let target = w.last_activity + std::time::Duration::from_millis(ms);
-            if now >= target {
-                to_remove.push((i, WaitOutcome::Matched));
-                continue;
+            if let Some(target) = w
+                .last_activity
+                .checked_add(std::time::Duration::from_millis(ms))
+            {
+                if now >= target {
+                    to_remove.push((i, WaitOutcome::Matched));
+                    continue;
+                }
             }
         }
         // 絶対 timeout: deadline 経過なら Timeout
@@ -3875,5 +3887,73 @@ mod tests {
         .expect("send");
         s1.flush().expect("flush");
         let _ = handle.join().expect("daemon thread");
+    }
+
+    // ------- compute_wait_poll_timeout / check_wait_timeouts: u64 boundary tests (R4-C8)
+    //
+    // `Instant + Duration::from_millis(u64::MAX)` は overflow で panic するため、
+    // Idle{ms: u64::MAX} を受け取った時に panic せず saturate する必要がある。
+    // また compute 側の最終的な `as_millis` → i32 変換も `> i32::MAX` で
+    // saturating cast されることを境界値で確認。
+
+    fn make_pending_wait_idle(ms: u64, last_activity: Instant) -> PendingWait {
+        PendingWait {
+            client_id: 1,
+            predicate: WaitPredicate::Idle { ms },
+            options: WaitMatchOptions::default(),
+            deadline: None,
+            accumulated: Vec::new(),
+            last_activity,
+            compiled_regex: None,
+        }
+    }
+
+    #[test]
+    fn compute_wait_poll_timeout_saturates_on_u64_max() {
+        // Idle{ms: u64::MAX} で last_activity + idle_dur が overflow しても
+        // panic せず、有効な PollTimeout を返すこと。
+        let now = Instant::now();
+        let waits = vec![make_pending_wait_idle(u64::MAX, now)];
+        // 単に panic しないことを確認 (= R4-C8 の主目的)。
+        let _ = compute_wait_poll_timeout(&waits);
+    }
+
+    #[test]
+    fn compute_wait_poll_timeout_saturates_on_large_idle_ms() {
+        // i32::MAX ms (= ~24.8 日) を超える idle dur でも panic せず、
+        // PollTimeout に saturate (= i32::MAX ms 相当) すること。
+        let now = Instant::now();
+        let huge_ms = (i32::MAX as u64) + 1;
+        let waits = vec![make_pending_wait_idle(huge_ms, now)];
+        let to = compute_wait_poll_timeout(&waits);
+        // PollTimeout::NONE ではなく具体的な値を返すはず (saturate 成功)。
+        assert_ne!(to, PollTimeout::NONE, "should saturate, not NONE");
+    }
+
+    #[test]
+    fn compute_wait_poll_timeout_handles_mixed_normal_and_overflow() {
+        // 通常の Idle と overflow する Idle が混ざっても、通常側の
+        // 早い deadline が選ばれて panic しないこと。
+        let now = Instant::now();
+        let waits = vec![
+            make_pending_wait_idle(u64::MAX, now), // overflow → 候補から除外
+            make_pending_wait_idle(100, now),      // 100ms 後
+        ];
+        let to = compute_wait_poll_timeout(&waits);
+        // 100ms の方が earliest として採用されるはず。
+        assert_ne!(to, PollTimeout::NONE);
+    }
+
+    #[test]
+    fn check_wait_timeouts_does_not_panic_on_u64_max_idle() {
+        // R4-C8: check_wait_timeouts の `last_activity + Duration::from_millis(u64::MAX)`
+        // も overflow で panic していた。checked_add で防げていることを確認。
+        let now = Instant::now();
+        let mut waits = vec![make_pending_wait_idle(u64::MAX, now)];
+        let mut clients: Vec<ClientHandle> = Vec::new();
+        // panic しなければ OK。overflow した Idle は Matched 扱いされず、
+        // pending_waits に残り続ける。
+        check_wait_timeouts(&mut waits, &mut clients);
+        assert_eq!(waits.len(), 1, "overflow Idle should not match");
     }
 }
