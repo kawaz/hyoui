@@ -18,23 +18,28 @@ hyoui の将来検討項目。確定した段階リリース計画は [[DR-0007]
 | attach subcommand 専用 `--help` | handoff 2026-05-26 night | detach key 動作・mode 説明を専用 help に書く |
 | `wait` の chunk boundary 跨ぎ needle miss 修正 | R4-H3 | 現状 best-effort、状態保持型 strip + match に置換 |
 
-## v0.2.0（外側自動操作 API + serve gateway）
+## v0.2.0（外側自動操作 API + serve gateway 連携）
 
-[[DR-0007]] v0.2.0 セクションが詳細。要約:
+[[DR-0007]] v0.2.0 セクション + [[DR-0010]] (= subcommand 統合、serve 別 repo 化、snapshot 押下げ) が確定済 scope。要約:
 
-### 自動操作 CLI の本実装
+### 自動操作 CLI の本実装 (= [[DR-0010]] §1 で 11 → 7 に統合)
 
-- `hyoui send <session> [--file PATH | --text T]`
-- `hyoui keys <session> <spec>...`（`text:` / `key:` / `wait:` / `wait-idle:` prefix）
-- `hyoui paste <session> [--text|--file|--spool|--max-size|...]`（bracketed paste auto detect、in-flight state best-effort end 保証）
+確定 subcommand 7 個: `input` / `detach` / `status` / `tail` / `wait` / `lock` / `completion`
+
+- `hyoui input text <session> [--file PATH | --text T]`
+- `hyoui input keys <session> <spec>...`（`text:` / `key:` / `wait:` / `wait-idle:` prefix）
+- `hyoui input paste <session> [--text|--file|--spool|--max-size|...]`（bracketed paste auto detect、in-flight state best-effort end 保証）
 - `hyoui detach <session> [--all | --others]`
 - `hyoui status <session> [--format text|json]`
 - `hyoui tail <session> [--follow]`（daemon handler は v0.1.0 で実装済、CLI を proper に）
 - `hyoui wait <session> [--idle|--text|--pattern|--then-idle] [--timeout]`（同上）
-- `hyoui lock <session> [--timeout-* ...] [--mode wait|fail]`
-- `hyoui unlock <session> [--token T | --force]`
-- `hyoui tx <session> [--timeout-* ...] -- cmd args...`
+- `hyoui lock acquire <session> [--timeout-* ...] [--mode wait|fail]`
+- `hyoui lock release <session> [--token T | --force]`
+- `hyoui lock tx <session> [--timeout-* ...] -- cmd args...`
 - `hyoui completion <shell>`
+
+統合方針: `input` family (旧 send/keys/paste) と `lock` family (旧 lock/unlock/tx) に nested。
+[[DR-0005]] の「外側自動操作主軸」思想を `--help` 外形で表現するため。詳細は [[DR-0010]]。
 
 ### wait queue (lock の wait=true 対応)
 
@@ -48,17 +53,20 @@ v0.1.0 の lock は wait=true でも即 Denied 返却。v0.2.0 で proper な wa
 - ANSI escape strip の chunk 境界跨ぎ正規化
 - 出典: journal 2026-05-26-night、R4-M27
 
-### serve gateway
+### serve gateway (= [[DR-0010]] §2 で別 repo `kawaz/hyoui-serve` に切り出し)
 
 ```
-hyoui serve [--bind 127.0.0.1] [--port 6978] [--auth none|token|file:PATH]
+hyoui-serve [--bind 127.0.0.1] [--port 6978] [--auth none|token|file:PATH]
             [--tls cert,key] [--static-dir PATH] [--allow-spawn]
 ```
 
-- 別 crate (`crates/hyoui-serve` + `crates/hyoui-serve-cli`)
+- **別 repo** `kawaz/hyoui-serve` (独立 release cycle、独立 security boundary)
+- core (`kawaz/hyoui`) は `nix + serde + ciborium + regex` の lean な dependency footprint を維持
+- `hyoui` crate を依存に取り、`hyoui::client::AttachClient` 経由でセッション接続
 - xterm.js + WebSocket binary、protocol は v0.1.0 wire format をそのまま流す
 - default port `6978`（QWERTY 物理配置で h y o u i ≒ 6 9 7 8）
-- 出典: [[DR-0007]]、ユーザ確認 2026-05-26
+- 暫定回避策: `websocketd hyoui attach $SESS` (= 実用 90% カバー) を README に "unofficial integration" として掲載
+- 出典: [[DR-0007]]、[[DR-0010]]、ユーザ確認 2026-05-26
 
 ### bounded queue / backpressure の measurement
 
@@ -75,18 +83,7 @@ v0.1.0 default は queue cap 8 MiB の見積もり値。実 measurement で調�
 
 着手時に DR を立てるか、本セクションから外して採用見送りにするか判断する。
 
-### 画面 emulator + snapshot
-
-```
-hyoui snapshot <session> [--rect X,Y,W,H] [--format text|ansi|json]
-hyoui wait <session> --rect X,Y,W,H --pattern R
-hyoui wait <session> --cursor X,Y
-```
-
-- daemon 内に `vte` crate 等で screen grid を保持
-- primary / alternate screen の別 grid 管理 + `tail --screen=primary` で分離
-- 実装重 (vt100 ステート、escape sequence 完全解釈)、L0 (stream regex) で 8 割カバーできているので慎重に評価
-- 出典: [[DR-0007]] v0.2.0、R4-H12 / R4-M21
+注: 旧「画面 emulator + snapshot」項目は [[DR-0010]] §3 により v0.3.0 に押下げ済（下記 v0.3.0+ 参照）。
 
 ### `wait --child-exit` / `--regex-on-screen`
 
@@ -111,6 +108,20 @@ API を提供。
 
 ## v0.3.0+
 
+### 画面 emulator + snapshot (= [[DR-0010]] §3 で v0.2.0 候補から押下げ)
+
+```
+hyoui snapshot <session> [--rect X,Y,W,H] [--format text|ansi|json]
+hyoui wait <session> --rect X,Y,W,H --pattern R
+hyoui wait <session> --cursor X,Y
+```
+
+- daemon 内に `vte` crate 等で screen grid を保持
+- primary / alternate screen の別 grid 管理 + `tail --screen=primary` で分離
+- 実装重 (vt100 ステート、escape sequence 完全解釈)、L0 (stream regex) で 8 割カバーできているので慎重に評価
+- v0.3.0 で L1 (rect 指定) と L2 (named area、下記) を一体実装するのが筋
+- 出典: [[DR-0007]] v0.2.0 候補（→[[DR-0010]] で v0.3.0 押下げ）、R4-H12 / R4-M21
+
 ### 高度な TUI 自動化
 
 ```
@@ -119,7 +130,7 @@ hyoui wait <session> --predicate-file PATH             # JSON 述語
 ```
 
 config-driven area alias (`input-line`, `status-bar` 等の semantic 名)。
-画面 emulator (v0.2.0 候補) に依存。
+画面 emulator (上記 L1) に依存。
 出典: [[DR-0007]] v0.3.0
 
 ### leader CLI 露出
@@ -205,6 +216,7 @@ daemon 内永続出力先。tail (ad-hoc) と区別。詳細は
 
 - [[DR-0005]] — 思想
 - [[DR-0006]] — CLI ground rules（v0.2.0+ 自動操作 API の正本）
-- [[DR-0007]] — MVP scope と段階リリース（本 ROADMAP の骨子）
+- [[DR-0007]] — MVP scope と段階リリース（本 ROADMAP の骨子、[[DR-0010]] で部分上書き）
 - [[DR-0008]] — protocol（cap flags ベース schema evolution）
+- [[DR-0010]] — v0.2.0 scope re-scope + serve gateway 別 repo 化（本 ROADMAP の v0.2.0 確定 scope）
 - `docs/issue/2026-05-26-feature-recording-and-dump.md` — sink / record / dump の発想元
