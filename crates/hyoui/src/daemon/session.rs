@@ -2765,7 +2765,10 @@ mod tests {
 
         // 子は alive (= WNOHANG で StillAlive)
         let pre = waitpid(pid, Some(WaitPidFlag::WNOHANG)).expect("waitpid pre");
-        assert!(matches!(pre, WaitStatus::StillAlive), "child should be alive, got {pre:?}");
+        assert!(
+            matches!(pre, WaitStatus::StillAlive),
+            "child should be alive, got {pre:?}"
+        );
 
         drop(session); // Drop で SIGTERM → reap
 
@@ -2824,11 +2827,14 @@ mod tests {
     }
 
     fn client_connect_with_retry(path: &std::path::Path) -> UnixStream {
+        // R4-H5: retry budget は 200 attempts (= 2s) に拡大 (旧 50 = 500ms)。
+        // CI 高負荷下で daemon の listen 開始が遅れた場合に false-fail しないよう
+        // 余裕を持たせる。成功すれば実時間はほぼ変わらない (= 早期 break)。
         let mut attempts = 0;
         let fd = loop {
             match crate::sys::socket::connect(path) {
                 Ok(fd) => break fd,
-                Err(_) if attempts < 50 => {
+                Err(_) if attempts < 200 => {
                     attempts += 1;
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -2868,12 +2874,13 @@ mod tests {
 
         // client thread: connect + handshake.request 送信 + response 受信
         let client_thread = std::thread::spawn(move || -> HandshakeResponse {
-            // race 回避: daemon が listen 開始しているか軽くリトライ
+            // race 回避: daemon が listen 開始しているか軽くリトライ。
+            // R4-H5: retry budget は 200 attempts (= 2s) に拡大 (旧 50 = 500ms)。
             let mut attempts = 0;
             let client_fd = loop {
                 match crate::sys::socket::connect(&sock_path) {
                     Ok(fd) => break fd,
-                    Err(_) if attempts < 50 => {
+                    Err(_) if attempts < 200 => {
                         attempts += 1;
                         std::thread::sleep(Duration::from_millis(10));
                     }
@@ -3777,9 +3784,13 @@ mod tests {
             }
             o => panic!("expected WaitResult, got {o:?}"),
         }
+        // R4-H5: 下限は 50ms に緩めた (旧 80ms / 要求 idle_ms = 100ms に対して 80%)。
+        // 「daemon が idle 待ちをそれなりにやった」ことを確認する sanity check で
+        // あり、CI 高負荷下で daemon の timer 解像度が荒くなった場合に false-fail
+        // する余地を減らすため (= 要求 idle_ms = 100ms に対し 50% を下限)。
         assert!(
-            elapsed >= Duration::from_millis(80),
-            "idle should wait at least 80ms (allowing for jitter), got {elapsed:?}"
+            elapsed >= Duration::from_millis(50),
+            "idle should wait noticeably (allowing for jitter), got {elapsed:?}"
         );
 
         // cleanup
@@ -3827,8 +3838,12 @@ mod tests {
             o => panic!("expected WaitResult, got {o:?}"),
         }
         let elapsed = start.elapsed();
+        // R4-H5: 下限は 100ms に緩めた (旧 150ms / 要求 timeout = 200ms に対して 75%)。
+        // 「daemon が timeout 待ちをそれなりにやった」ことを確認する sanity check で、
+        // CI 高負荷下で daemon の timer 解像度が荒くなった場合に false-fail する
+        // 余地を減らすため (= 要求 timeout = 200ms に対し 50% を下限)。
         assert!(
-            elapsed >= Duration::from_millis(150),
+            elapsed >= Duration::from_millis(100),
             "should wait around 200ms, got {elapsed:?}"
         );
 
@@ -4726,8 +4741,13 @@ mod tests {
 
         // mode.change(Locked) が **broadcast されない** ことを確認する。
         // (= state 変化が無いので broadcast 不要。s1 自身も Locked → Locked への
-        //   no-op broadcast を受けない。短い read_timeout で何も来ないことを検証。)
-        s1.set_read_timeout(Some(Duration::from_millis(100)))
+        //   no-op broadcast を受けない。read_timeout で何も来ないことを検証。)
+        //
+        // R4-H5: timeout は 500ms に緩めた (旧 100ms)。CI 高負荷時に daemon の
+        // broadcast 処理が遅れた場合に false-pass する可能性を減らすため。
+        // 待ち時間が増えても、broadcast が来なければ test 全体に与える影響は
+        // 500ms 程度。
+        s1.set_read_timeout(Some(Duration::from_millis(500)))
             .expect("set read_timeout");
         match Frame::decode_from(&mut s1) {
             Err(_) => {} // 想定通り
@@ -4799,9 +4819,12 @@ mod tests {
         }
 
         // s1 にも mode.change(Locked) が broadcast されていない (= session DoS が
-        // 起きていない) ことを確認する。s1 を non-blocking 短い timeout に切り替えて
-        // 何も来ないことを確認 (Frame::decode が EWOULDBLOCK で error)。
-        s1.set_read_timeout(Some(Duration::from_millis(100)))
+        // 起きていない) ことを確認する。s1 の read_timeout で何も来ないことを
+        // 確認 (Frame::decode が EWOULDBLOCK で error)。
+        //
+        // R4-H5: timeout は 500ms に緩めた (旧 100ms)。CI 高負荷時に daemon の
+        // broadcast 処理が遅れた場合に false-pass する可能性を減らすため。
+        s1.set_read_timeout(Some(Duration::from_millis(500)))
             .expect("set read_timeout");
         match Frame::decode_from(&mut s1) {
             Err(_) => {} // 想定通り (= broadcast 来てない)

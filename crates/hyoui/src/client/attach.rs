@@ -223,11 +223,21 @@ impl ClientConnection {
                 // match で書く。Error::Invalid は &'static str しか受け取れないので
                 // variant → static str の switch で対応する。
                 return Err(Error::Invalid(match &e.code {
-                    ErrorCode::LockDenied => "lock denied (= 他 client が exclusive lock を保持中。`hyoui status <session>` で lock-holder を確認、または別 session を使う)",
-                    ErrorCode::UnsupportedCapability => "daemon が要求 cap を非対応 (= server を新しい version に upgrade するか、client から該当 cap を外す)",
-                    ErrorCode::AuthTokenMismatch => "HYOUI_LOCK_TOKEN が一致しません (= daemon 起動時の token と env が異なる。env を見直す)",
-                    ErrorCode::Unknown(s) if s == "session.full" => "session の client 上限に到達 (= 他 client を detach するか、新規 session を起動)",
-                    _ => "daemon error during handshake (= `hyoui status <session>` でサーバ側の状態を確認してください)",
+                    ErrorCode::LockDenied => {
+                        "lock denied (= 他 client が exclusive lock を保持中。`hyoui status <session>` で lock-holder を確認、または別 session を使う)"
+                    }
+                    ErrorCode::UnsupportedCapability => {
+                        "daemon が要求 cap を非対応 (= server を新しい version に upgrade するか、client から該当 cap を外す)"
+                    }
+                    ErrorCode::AuthTokenMismatch => {
+                        "HYOUI_LOCK_TOKEN が一致しません (= daemon 起動時の token と env が異なる。env を見直す)"
+                    }
+                    ErrorCode::Unknown(s) if s == "session.full" => {
+                        "session の client 上限に到達 (= 他 client を detach するか、新規 session を起動)"
+                    }
+                    _ => {
+                        "daemon error during handshake (= `hyoui status <session>` でサーバ側の状態を確認してください)"
+                    }
                 }));
             }
             _ => return Err(Error::Invalid("unexpected response to handshake.request")),
@@ -631,11 +641,8 @@ mod tests {
     fn connect_token_mismatch_returns_specific_hint() {
         let dir = make_temp_socket_dir();
         let sock = dir.path().join("test.sock");
-        let mut cfg = DaemonConfig::new(
-            "demo",
-            sock.clone(),
-            vec!["/bin/sleep".into(), "30".into()],
-        );
+        let mut cfg =
+            DaemonConfig::new("demo", sock.clone(), vec!["/bin/sleep".into(), "30".into()]);
         cfg.expected_token = Some("secret-xyz".into());
         let session = Session::start(cfg).expect("daemon start");
         let daemon_handle = std::thread::spawn(move || session.run());

@@ -176,7 +176,10 @@ mod tests {
     fn error_code_round_trip_via_cbor() {
         let known: &[(ErrorCode, &str)] = &[
             (ErrorCode::ProtocolMalformed, "protocol.malformed"),
-            (ErrorCode::ProtocolUnexpectedKind, "protocol.unexpected-kind"),
+            (
+                ErrorCode::ProtocolUnexpectedKind,
+                "protocol.unexpected-kind",
+            ),
             (ErrorCode::UnsupportedCapability, "unsupported-capability"),
             (ErrorCode::HandshakeTimeout, "handshake.timeout"),
             (ErrorCode::AuthTokenMismatch, "auth.token-mismatch"),

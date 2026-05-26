@@ -465,7 +465,10 @@ mod tests {
         // After both pushes, accumulated stripped bytes contain "READY".
         let needle = b"READY";
         let found = acc.windows(needle.len()).any(|w| w == needle);
-        assert!(found, "needle should match across split escape; got {acc:?}");
+        assert!(
+            found,
+            "needle should match across split escape; got {acc:?}"
+        );
     }
 
     #[test]

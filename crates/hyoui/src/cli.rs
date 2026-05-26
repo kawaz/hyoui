@@ -2450,7 +2450,11 @@ mod tests {
     fn subcommand_help_text_is_subcommand_specific() {
         let cases: &[(HelpTopic, &str, &[&str])] = &[
             (HelpTopic::Run, "hyoui run", &["--mode", "--timeout"]),
-            (HelpTopic::Attach, "hyoui attach", &["DETACH KEY", "--exclusive"]),
+            (
+                HelpTopic::Attach,
+                "hyoui attach",
+                &["DETACH KEY", "--exclusive"],
+            ),
             (HelpTopic::List, "hyoui list", &["SCAN ORDER"]),
             (HelpTopic::Kill, "hyoui kill", &["--signum", "SIGTERM"]),
             (HelpTopic::Status, "hyoui status", &["OUTPUT", "child-pid"]),

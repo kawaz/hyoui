@@ -49,25 +49,19 @@ fn print_connect_failure(cmd: &str, socket_path: &std::path::Path, err: &dyn std
         eprintln!(
             "       socket file が見つかりません。`hyoui list` で起動中の session を確認してください。"
         );
-        eprintln!(
-            "       session が無い場合は `hyoui run --detached -- <cmd>` で起動できます。"
-        );
+        eprintln!("       session が無い場合は `hyoui run --detached -- <cmd>` で起動できます。");
     } else {
         eprintln!(
             "       socket は存在するが connect できません。daemon process が応答していない可能性があります。"
         );
-        eprintln!(
-            "       `hyoui list` / `hyoui status <session>` で状態を確認してください。"
-        );
+        eprintln!("       `hyoui list` / `hyoui status <session>` で状態を確認してください。");
     }
 }
 
 /// `session id or --socket required` 系のエラーに hint を足す共通 helper。
 fn print_session_required(cmd: &str) {
     eprintln!("hyoui: {cmd}: session id (positional) または --socket=<path> が必要です");
-    eprintln!(
-        "       例: `hyoui {cmd} <session-id>` / `hyoui {cmd} --socket=/tmp/x.sock`"
-    );
+    eprintln!("       例: `hyoui {cmd} <session-id>` / `hyoui {cmd} --socket=/tmp/x.sock`");
     eprintln!("       起動中の session 一覧は `hyoui list` で確認できます。");
 }
 
@@ -290,9 +284,7 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("hyoui: attach: socket path 解決失敗: {e} (session: {sid})");
-                eprintln!(
-                    "       起動中の session 一覧は `hyoui list` で確認してください。"
-                );
+                eprintln!("       起動中の session 一覧は `hyoui list` で確認してください。");
                 return ExitCode::from(1);
             }
         }
@@ -398,9 +390,7 @@ fn list_command() -> ExitCode {
     if found == 0 {
         // 0 件は stderr で明示 (script 用に stdout を汚さない)
         eprintln!("hyoui: no sessions found");
-        eprintln!(
-            "       新しい session を始めるには: `hyoui run --detached -- <cmd>`"
-        );
+        eprintln!("       新しい session を始めるには: `hyoui run --detached -- <cmd>`");
         eprintln!(
             "       socket 候補 dir: $XDG_RUNTIME_DIR/hyoui または ${{TMPDIR:-/tmp}}/hyoui-<uid>"
         );
@@ -447,9 +437,7 @@ fn kill_command(cfg: KillConfig) -> ExitCode {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("hyoui: kill: socket path 解決失敗: {e} (session: {sid})");
-                eprintln!(
-                    "       起動中の session 一覧は `hyoui list` で確認してください。"
-                );
+                eprintln!("       起動中の session 一覧は `hyoui list` で確認してください。");
                 return ExitCode::from(1);
             }
         }
@@ -507,9 +495,7 @@ fn resolve_target_socket(
     };
     socket_path::resolve(None, sid).map_err(|e| {
         eprintln!("hyoui: {cmd}: socket path 解決失敗: {e} (session: {sid})");
-        eprintln!(
-            "       起動中の session 一覧は `hyoui list` で確認してください。"
-        );
+        eprintln!("       起動中の session 一覧は `hyoui list` で確認してください。");
         ExitCode::from(1)
     })
 }
