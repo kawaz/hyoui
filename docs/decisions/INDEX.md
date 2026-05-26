@@ -13,6 +13,7 @@ hyoui の設計判断記録一覧。ファイル名は `DR-NNNN-title.md`（4 �
 - [DR-0006](./DR-0006-cli-ground-rules.md) — CLI 設計の地盤ルール (動作モデル、自動操作 API send/keys/paste/wait、排他 lock/tx)
 - [DR-0007](./DR-0007-mvp-scope-and-staged-release.md) — MVP scope と段階リリース (v0.1.0 / v0.2.0 serve / v0.3.0 leader CLI)
 - [DR-0008](./DR-0008-protocol-design.md) — protocol 設計 (CBOR ハイブリッド framing、cap flags ベース schema evolution、gateway 戦略で PtyMux 将来互換)
+- [DR-0009](./DR-0009-session-module-split.md) — `daemon/session.rs` 責務分割 (= R4-H6 解消方針、R4-M2 を Phase B で解消、pty/accept/broadcast/control/lock/wait/tail に module 分離、Phase A-E 段階移行)
 
 ## Archived
 
