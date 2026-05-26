@@ -9,7 +9,7 @@ rust-version = "1.86"
 license = "MIT"
 authors = ["Yoshiaki Kawazu <kawazzz@gmail.com>"]
 repository = "https://github.com/kawaz/hyoui"
-description = "Suspendable wrapper around interactive PTY processes"
+description = "Drive `claude`, REPLs, and TUIs from the outside via CLI — a transparent PTY wrapper with no prefix keys"
 
 [workspace.dependencies]
 nix = { version = "0.31", default-features = false, features = [
