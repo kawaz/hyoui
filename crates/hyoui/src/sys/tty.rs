@@ -77,6 +77,19 @@ pub fn enter_raw(fd: OwnedFd) -> Result<TtyGuard> {
     let saved = termios::tcgetattr(fd.as_fd()).map_err(Error::from)?;
     let mut raw_t = saved.clone();
     termios::cfmakeraw(&mut raw_t);
+    // R5-M9: `cfmakeraw` clears `IUTF8`. Re-enable it on platforms that have
+    // it (Linux/Android, Apple) so multi-byte UTF-8 input (Japanese etc.)
+    // is erased a full code point at a time on Backspace, instead of one
+    // byte at a time which corrupts the display.
+    //
+    // Design rationale: ICANON is off in raw mode so the kernel does not
+    // run BS itself, but `IUTF8` still influences in-kernel line discipline
+    // helpers used by some terminals/screen readers; keeping it set matches
+    // the cooked-mode default and is a cheap defense-in-depth.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        raw_t.input_flags |= termios::InputFlags::IUTF8;
+    }
     termios::tcsetattr(fd.as_fd(), SetArg::TCSAFLUSH, &raw_t).map_err(Error::from)?;
     Ok(TtyGuard {
         fd: Some(fd),
@@ -141,6 +154,22 @@ mod tests {
                 assert!(ws.cols > 0);
             }
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn enter_raw_sets_iutf8_on_supported_platforms() {
+        // R5-M9: cfmakeraw drops IUTF8; enter_raw must re-set it so multi-byte
+        // input is erased a whole code point at a time. We verify by reading
+        // back termios from the master while the guard is active.
+        let pty = crate::sys::pty::Pty::open(80, 24).expect("open pty");
+        let master = pty.into_master();
+        let guard = enter_raw(master).expect("enter raw");
+        let cur = termios::tcgetattr(guard.fd()).expect("tcgetattr");
+        assert!(
+            cur.input_flags.contains(termios::InputFlags::IUTF8),
+            "IUTF8 must be set after enter_raw on UTF-8-aware platforms",
+        );
     }
 
     #[test]

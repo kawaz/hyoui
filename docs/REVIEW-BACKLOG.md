@@ -315,9 +315,10 @@ Wild debugger / Competitive 分析 / Rust API 設計
   - 出典: Formal+SRE (R5-FRM-H1, R5-SRE-M5) / 該当: `daemon/accept.rs:101-109, :353`
   - 状況: 実用上 microsecond window だが ghost-state 不整合。worker panic も静かに drop
   - 提案: `Option<JoinHandle>` 化、drop 時に bounded join (100ms)、worker entry を `catch_unwind` で wrap + log
-- [ ] **R5-M9** termios `cfmakeraw` 後に `IUTF8` (Linux) を明示 set してない
+- [done] **R5-M9** termios `cfmakeraw` 後に `IUTF8` (Linux) を明示 set してない
   - 出典: Kernel (R5-KER-M1) / 該当: `sys/tty.rs:79`
   - 提案: `enter_raw` の `raw_t.input_flags |= IUTF8` 1 行で日本語 BS 崩れ回避
+  - 解消: `enter_raw` に `cfg(any(linux, android, apple))` ガード付きで `raw_t.input_flags |= IUTF8` を追加。回帰防止に「enter_raw 後の termios で IUTF8 が立っている」アサート test を追加。
 - [ ] **R5-M10** `install_ignore(SIGPIPE)` が serve start path で呼ばれていない → broadcast 中の EPIPE で daemon abort リスク
   - 出典: Kernel (R5-KER-M2) / 該当: `sys/signal.rs:36-48`, `daemon::session::Session::serve`
   - 提案: `Session::start` か `serve` 冒頭で `install_ignore(SIGPIPE)` 呼ぶ
