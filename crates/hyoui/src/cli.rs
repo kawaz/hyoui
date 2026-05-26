@@ -642,7 +642,7 @@ fn parse_wait_predicate(s: &str) -> Result<Option<WaitCliPredicate>, String> {
 /// digits := DIGIT (DIGIT | '_')*
 /// sign := '+' | '-'
 /// unit := short_unit | long_unit
-/// short_unit := "ms" | "s" | "m" | "h" | "d" | "w"
+/// short_unit := "ns" | "us" | "μs" | "ms" | "s" | "m" | "h" | "d" | "w"
 /// long_unit := "millisecond"|"milliseconds" | "second"|"seconds"|"sec"
 ///            | "minute"|"minutes"|"min" | "hour"|"hours"
 ///            | "day"|"days" | "week"|"weeks"
@@ -656,21 +656,27 @@ fn parse_wait_predicate(s: &str) -> Result<Option<WaitCliPredicate>, String> {
 /// - **連結加算**: `1h30m` = 1 時間 + 30 分。同 group 内 segment は加算
 /// - **符号付き group**: `1d-4h` = 1 日 group - 4 時間 group = 20 時間
 /// - **whitespace tolerant**: `1 h 2 m` / `1h 2m` も accept
-/// - **ns / us / μs は reject** (= sub-ms 精度は ms 単位 timer 用途で意味なし)
+/// - **sub-ms 精度 (ns / us / μs) も accept、集積後に ms へ floor**:
+///   `1500us` = 1 ms (= 1500000ns / 1000000 を floor)、
+///   `999us` = 0 ms (= 999000ns / 1000000 = 0)、
+///   `500us 600us` = 1 ms (= 集積値 1100000ns で 1ms を超えた分は取り入れ)。
+///   timespec.mbt は YAGNI で reject していたが、本実装は集積 floor 方針
 /// - **`y` / `M` (年 / 月) は reject** (= 単位固定でないため)
 /// - **最終 total が負なら error** (= hyoui の duration は正値前提)
 fn parse_duration_ms(s: &str) -> Result<u64, String> {
-    let total_ms = parse_duration_ms_signed(s)?;
-    if total_ms < 0 {
+    let total_ns = parse_duration_ns_signed(s)?;
+    if total_ns < 0 {
         return Err(format!(
-            "duration resolved to negative value ({total_ms}ms) in {s:?}"
+            "duration resolved to negative value ({total_ns}ns) in {s:?}"
         ));
     }
-    Ok(total_ms as u64)
+    // ns → ms に floor (= 1ms 未満は切り捨て、集積値が 1ms を超えた分のみ取り入れ)
+    let total_ms = total_ns / 1_000_000;
+    u64::try_from(total_ms).map_err(|_| format!("duration overflows u64 ms: {s:?}"))
 }
 
-/// 符号付き ms を返す internal helper (= negative 許容版)。
-fn parse_duration_ms_signed(s: &str) -> Result<i64, String> {
+/// 符号付き ns で返す internal helper (= negative 許容、集積精度 ns)。
+fn parse_duration_ns_signed(s: &str) -> Result<i128, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty duration".into());
@@ -678,9 +684,9 @@ fn parse_duration_ms_signed(s: &str) -> Result<i64, String> {
     let chars: Vec<char> = s.chars().collect();
     let mut pos = 0usize;
 
-    let mut total_ms: i64 = 0;
-    let mut group_ms: i64 = 0;
-    let mut group_sign: i64 = 1;
+    let mut total_ns: i128 = 0;
+    let mut group_ns: i128 = 0;
+    let mut group_sign: i128 = 1;
     let mut parsed_any = false;
 
     while pos < chars.len() {
@@ -692,19 +698,19 @@ fn parse_duration_ms_signed(s: &str) -> Result<i64, String> {
         let mut new_group = false;
         match chars[pos] {
             '+' => {
-                total_ms = total_ms
-                    .checked_add(group_sign.checked_mul(group_ms).ok_or("overflow")?)
+                total_ns = total_ns
+                    .checked_add(group_sign.checked_mul(group_ns).ok_or("overflow")?)
                     .ok_or("overflow")?;
-                group_ms = 0;
+                group_ns = 0;
                 group_sign = 1;
                 pos += 1;
                 new_group = true;
             }
             '-' => {
-                total_ms = total_ms
-                    .checked_add(group_sign.checked_mul(group_ms).ok_or("overflow")?)
+                total_ns = total_ns
+                    .checked_add(group_sign.checked_mul(group_ns).ok_or("overflow")?)
                     .ok_or("overflow")?;
-                group_ms = 0;
+                group_ns = 0;
                 group_sign = -1;
                 pos += 1;
                 new_group = true;
@@ -730,29 +736,29 @@ fn parse_duration_ms_signed(s: &str) -> Result<i64, String> {
 
         let (int_part, frac_part, new_pos) = parse_number(&chars, pos)?;
         pos = skip_spaces(&chars, new_pos);
-        let (ms_mul, unit_end) = parse_unit(&chars, pos)?;
+        let (ns_mul, unit_end) = parse_unit(&chars, pos)?;
         if unit_end == pos {
             return Err(format!("missing unit after number in {s:?}"));
         }
         pos = unit_end;
 
-        let mut seg_ms = int_part
-            .checked_mul(ms_mul)
+        let mut seg_ns: i128 = (int_part as i128)
+            .checked_mul(ns_mul)
             .ok_or("duration component overflow")?;
         if frac_part > 0.0 {
-            let frac_ms = (frac_part * ms_mul as f64) as i64;
-            seg_ms = seg_ms.checked_add(frac_ms).ok_or("frac overflow")?;
+            let frac_ns = (frac_part * ns_mul as f64) as i128;
+            seg_ns = seg_ns.checked_add(frac_ns).ok_or("frac overflow")?;
         }
-        group_ms = group_ms.checked_add(seg_ms).ok_or("group accum overflow")?;
+        group_ns = group_ns.checked_add(seg_ns).ok_or("group accum overflow")?;
         parsed_any = true;
     }
     if !parsed_any {
         return Err(format!("no duration segments parsed from {s:?}"));
     }
-    total_ms = total_ms
-        .checked_add(group_sign.checked_mul(group_ms).ok_or("overflow")?)
+    total_ns = total_ns
+        .checked_add(group_sign.checked_mul(group_ns).ok_or("overflow")?)
         .ok_or("overflow")?;
-    Ok(total_ms)
+    Ok(total_ns)
 }
 
 fn skip_spaces(chars: &[char], start: usize) -> usize {
@@ -816,8 +822,8 @@ fn parse_number(chars: &[char], start: usize) -> Result<(i64, f64, usize), Strin
     Ok((int_part, frac, pos))
 }
 
-/// `parse_unit` は (ms_multiplier, end_pos) を返す。未知単位 / 拒否単位は Err。
-fn parse_unit(chars: &[char], start: usize) -> Result<(i64, usize), String> {
+/// `parse_unit` は (ns_multiplier, end_pos) を返す。未知単位 / 拒否単位は Err。
+fn parse_unit(chars: &[char], start: usize) -> Result<(i128, usize), String> {
     if start >= chars.len() {
         return Err("missing unit".into());
     }
@@ -830,23 +836,19 @@ fn parse_unit(chars: &[char], start: usize) -> Result<(i64, usize), String> {
         return Ok((0, start)); // no unit chars
     }
     let word: String = chars[start..end].iter().collect();
-    let ms = match word.as_str() {
-        // ms
-        "ms" | "millisecond" | "milliseconds" => 1i64,
-        // s
-        "s" | "sec" | "second" | "seconds" => 1_000,
-        // m
-        "m" | "min" | "minute" | "minutes" => 60_000,
-        // h
-        "h" | "hour" | "hours" => 3_600_000,
-        // d
-        "d" | "day" | "days" => 86_400_000,
-        // w
-        "w" | "week" | "weeks" => 604_800_000,
-        // explicit rejects: sub-ms
-        "ns" | "us" | "μs" => {
-            return Err(format!("sub-millisecond unit {word:?} not supported"));
-        }
+    const NS: i128 = 1;
+    const US: i128 = 1_000;
+    const MS: i128 = 1_000_000;
+    const SEC: i128 = 1_000_000_000;
+    let ns = match word.as_str() {
+        "ns" => NS,
+        "us" | "μs" => US,
+        "ms" | "millisecond" | "milliseconds" => MS,
+        "s" | "sec" | "second" | "seconds" => SEC,
+        "m" | "min" | "minute" | "minutes" => 60 * SEC,
+        "h" | "hour" | "hours" => 3600 * SEC,
+        "d" | "day" | "days" => 86_400 * SEC,
+        "w" | "week" | "weeks" => 604_800 * SEC,
         // explicit rejects: 年/月 (= 単位固定でない)
         "y" | "year" | "years" | "M" | "month" | "months" => {
             return Err(format!(
@@ -855,7 +857,7 @@ fn parse_unit(chars: &[char], start: usize) -> Result<(i64, usize), String> {
         }
         _ => return Err(format!("unknown unit {word:?}")),
     };
-    Ok((ms, end))
+    Ok((ns, end))
 }
 
 fn parse_attach(args: &[String]) -> Command {
@@ -1325,12 +1327,16 @@ fn usage_tail() -> String {
             --last-bytes N       末尾 N bytes に絞る\n    \
             -h, --help           Show this help and exit\n\
         \n\
-        DURATION FORMAT (kawaz/timespec.mbt 互換):\n    \
-            単位: ms / s / m / h / d / w (短形)、または millisecond(s) /\n    \
-            second(s) / sec / minute(s) / min / hour(s) / day(s) / week(s) (長形)。\n    \
+        DURATION FORMAT (kawaz/timespec.mbt 仕様 + sub-ms 拡張):\n    \
+            単位: ns / us / μs / ms / s / m / h / d / w (短形)、または\n    \
+            millisecond(s) / second(s) / sec / minute(s) / min / hour(s) /\n    \
+            day(s) / week(s) (長形)。\n    \
             decimal: 1.5h, underscore: 1_000ms, 連結: 1h30m, 加減: 1d-4h。\n    \
-            bare 数字 (= 単位なし) は **error**。年 (y) / 月 (M) / sub-ms\n    \
-            (ns/us/μs) は対応せず。\n\
+            sub-ms (ns/us/μs) も accept、内部 ns 集積後に ms へ floor:\n              \
+                500us 600us → 1.1ms → 1ms (= 集積で 1ms 超過分のみ取り入れ)\n              \
+                999us → 0.999ms → 0ms\n    \
+            bare 数字 (= 単位なし) は **error**。年 (y) / 月 (M) は単位固定でない\n    \
+            ため対応せず。\n\
         \n\
         EXIT CODE:\n    \
             0   正常終了 (= TailEnd 受信 or socket close)\n    \
@@ -1369,10 +1375,11 @@ fn usage_wait() -> String {
             --newline-convert-lf  CRLF → LF 正規化\n    \
             -h, --help            Show this help and exit\n\
         \n\
-        DURATION FORMAT (kawaz/timespec.mbt 互換):\n    \
-            短形 ms/s/m/h/d/w または長形 second(s) / minute(s) / hour(s) / day(s) /\n    \
-            week(s)。decimal (1.5h)、underscore (1_000ms)、連結 (1h30m)、加減 (1d-4h)。\n    \
-            bare 数字 / 年 (y) / 月 (M) / sub-ms (ns/us/μs) は **error**。\n\
+        DURATION FORMAT (kawaz/timespec.mbt 仕様 + sub-ms 拡張):\n    \
+            短形 ns/us/μs/ms/s/m/h/d/w または長形 second(s)/minute(s)/hour(s)/\n    \
+            day(s)/week(s)。decimal (1.5h)、underscore (1_000ms)、連結 (1h30m)、\n    \
+            加減 (1d-4h)。sub-ms (ns/us/μs) は accept、内部 ns 集積 → ms に floor\n    \
+            (例: 500us 600us = 1.1ms → 1ms)。bare 数字 / 年 (y) / 月 (M) は **error**。\n\
         \n\
         EXIT CODE:\n    \
             0   Matched\n    \
@@ -1904,13 +1911,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_duration_ms_sub_ms_units_rejected() {
-        // ns / us / μs は ms 単位 timer 用途で意味が無いため明示 reject
-        // (= kawaz/timespec.mbt の duration parser と同方針)
-        assert!(parse_duration_ms("999us").is_err());
-        assert!(parse_duration_ms("1500us").is_err());
-        assert!(parse_duration_ms("999999ns").is_err());
-        assert!(parse_duration_ms("2000μs").is_err());
+    fn parse_duration_ms_sub_ms_accepted_with_floor() {
+        // ns / us / μs は accept、集積後に ms へ floor (= 1ms 超過分のみ取り入れ)。
+        // timespec.mbt は YAGNI で reject していたが、hyoui は集積 floor 方針 (kawaz 確定)。
+        assert_eq!(parse_duration_ms("999us"), Ok(0)); // 0.999 ms → floor → 0
+        assert_eq!(parse_duration_ms("1500us"), Ok(1)); // 1.5 ms → floor → 1
+        assert_eq!(parse_duration_ms("1000us"), Ok(1)); // 1.0 ms
+        assert_eq!(parse_duration_ms("999999ns"), Ok(0)); // 0.999999 ms → 0
+        assert_eq!(parse_duration_ms("1000000ns"), Ok(1)); // 1.0 ms
+        assert_eq!(parse_duration_ms("2000μs"), Ok(2)); // 2.0 ms (multi-byte μ)
+        // 集積で 1 ms を超えた分は取り入れ
+        assert_eq!(parse_duration_ms("500us 600us"), Ok(1)); // 1.1 ms → floor → 1
+        assert_eq!(parse_duration_ms("500us 500us"), Ok(1)); // 1.0 ms ぴったり
+        assert_eq!(parse_duration_ms("999us 1us"), Ok(1)); // 1.0 ms 境界
+        // 完全混在: 1ms + 1500us = 2.5 ms → 2 ms
+        assert_eq!(parse_duration_ms("1ms 1500us"), Ok(2));
     }
 
     #[test]
