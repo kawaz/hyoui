@@ -1238,6 +1238,8 @@ fn serve_loop(
     // を完了すると `rx` に Ok/Err が流れる。本 vector は serve_loop が所有し、各
     // iteration で try_recv で完了したものを引き取って `clients` に integrate する。
     let mut pending_handshakes: Vec<PendingHandshake> = Vec::new();
+    // R4-H14: 子の Stopped/Continued 追跡。loop 越しに状態を保持する。
+    let mut lifecycle = ChildLifecycle::default();
     loop {
         // poll fd 構築: listener + master + 各 client reader
         let listener_fd = listener.as_fd();
@@ -1371,15 +1373,15 @@ fn serve_loop(
         if pty_ready {
             let mut buf = [0u8; 8192];
             match pty.master_fd().read_some(&mut buf) {
-                Ok(0) => match child_actually_exited(child) {
+                Ok(0) => match lifecycle.poll(child) {
                     ChildState::Exited(code) => return RelayOutcome::ChildExited(code),
-                    ChildState::StoppedOrContinued => {
-                        // D8: SIGTSTP'd 子で master EOF 系シグナルが続く場合の
-                        // busy-wait 回避。短い 5ms ではなく 100ms で sleep。
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    ChildState::Stopped => {
+                        // R4-H14: SIGTSTP'd 子で master EOF/POLLHUP が連続する間の
+                        // busy-wait 回避。SIGCONT が来るまで 500ms 単位で待機。
+                        std::thread::sleep(STOPPED_POLL_INTERVAL);
                     }
                     ChildState::Alive => {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        std::thread::sleep(ALIVE_RETRY_INTERVAL);
                     }
                 },
                 Ok(n) => {
@@ -1390,13 +1392,13 @@ fn serve_loop(
                     // pending waits に新規 bytes を流し込み、match 確認
                     update_waits_on_master_bytes(pending_waits, clients, &buf[..n], now);
                 }
-                Err(Error::Errno(nix::errno::Errno::EIO)) => match child_actually_exited(child) {
+                Err(Error::Errno(nix::errno::Errno::EIO)) => match lifecycle.poll(child) {
                     ChildState::Exited(code) => return RelayOutcome::ChildExited(code),
-                    ChildState::StoppedOrContinued => {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    ChildState::Stopped => {
+                        std::thread::sleep(STOPPED_POLL_INTERVAL);
                     }
                     ChildState::Alive => {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        std::thread::sleep(ALIVE_RETRY_INTERVAL);
                     }
                 },
                 Err(Error::Errno(nix::errno::Errno::EAGAIN)) => {}
@@ -2298,6 +2300,8 @@ fn relay_loop(
     // poll → 該当 fd を blocking 1 read (= 子 PTY 出力は raw bytes をまとめて
     // 取る、client 入力は 1 frame ずつ) という形で書く。
 
+    // R4-H14: 子の Stopped/Continued 追跡。loop 越しに状態を保持する。
+    let mut lifecycle = ChildLifecycle::default();
     loop {
         // PollFd の borrow が loop body 内で持続するのを避けるため、毎反復で
         // 取得しなおす (= client_reader を mutable borrow できるように)
@@ -2333,15 +2337,15 @@ fn relay_loop(
         if pty_ready {
             let mut buf = [0u8; 8192];
             match pty.master_fd().read_some(&mut buf) {
-                Ok(0) => match child_actually_exited(child) {
+                Ok(0) => match lifecycle.poll(child) {
                     ChildState::Exited(code) => return RelayOutcome::ChildExited(code),
-                    ChildState::StoppedOrContinued => {
-                        // D8: 子が SIGTSTP'd でも EOF を出すケースがある
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    ChildState::Stopped => {
+                        // R4-H14: SIGTSTP'd 中の master EOF/POLLHUP 連発を 500ms 単位で吸収。
+                        std::thread::sleep(STOPPED_POLL_INTERVAL);
                     }
                     ChildState::Alive => {
                         // 偽 EOF (= forkpty exec 中の transient)。少し待って再試行
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        std::thread::sleep(ALIVE_RETRY_INTERVAL);
                     }
                 },
                 Ok(n) => {
@@ -2350,13 +2354,13 @@ fn relay_loop(
                         return frame_send_outcome(e);
                     }
                 }
-                Err(Error::Errno(nix::errno::Errno::EIO)) => match child_actually_exited(child) {
+                Err(Error::Errno(nix::errno::Errno::EIO)) => match lifecycle.poll(child) {
                     ChildState::Exited(code) => return RelayOutcome::ChildExited(code),
-                    ChildState::StoppedOrContinued => {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    ChildState::Stopped => {
+                        std::thread::sleep(STOPPED_POLL_INTERVAL);
                     }
                     ChildState::Alive => {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        std::thread::sleep(ALIVE_RETRY_INTERVAL);
                     }
                 },
                 Err(Error::Errno(nix::errno::Errno::EAGAIN)) => {
@@ -2432,36 +2436,87 @@ fn relay_loop(
     }
 }
 
-/// 子 process の状態判定結果 (D8: Stopped を明示区別)。
+/// 子が通常 alive 時の master read=0/EIO retry 間隔。forkpty 直後の
+/// transient 偽 EOF を吸収する用途なので短く (= 200Hz)。
+const ALIVE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// 子が SIGTSTP/SIGSTOP で stopped 中の master poll 間隔 (R4-H14)。
+/// 子から出力が来る見込みが無いため大きめに (= ~2Hz)。SIGCONT を検出する
+/// `waitpid(WCONTINUED)` の latency もこの上限になる。
+const STOPPED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// 子 process の状態判定結果 (R4-H14: Stopped と Continued を区別)。
+#[derive(Debug)]
 enum ChildState {
     /// 子は exit 済。`Some(code)` は実 exit code、`None` は transient で取得不能。
     Exited(Option<i32>),
-    /// 子は alive (= StillAlive または transient error)。caller は短い sleep でリトライ。
+    /// 子は通常 alive (= StillAlive、または直前に Continued を受けた、transient error)。
+    /// caller は短い sleep で次の poll に戻る。
     Alive,
-    /// 子は SIGTSTP / SIGCONT 等で stopped/continued。alive 扱いだが、出力は止まる
-    /// 可能性があるので caller は **長めの sleep** で busy-wait を避ける。
-    StoppedOrContinued,
+    /// 子は SIGTSTP / SIGSTOP で stopped 中。master PTY 出力は事実上止まり、
+    /// poll → read=0 / EIO の busy spin になる可能性が高いので caller は
+    /// **長めの sleep** (= STOPPED_POLL_INTERVAL) で待機する。
+    Stopped,
 }
 
-/// 子 process が actually exit したかを `waitpid(WNOHANG)` で確認する。
+/// 子の lifecycle 追跡 (R4-H14)。
 ///
-/// macOS の forkpty 直後の short window では子が exec 完了する前に
-/// master FD で POLLHUP / EOF が偽陽性で出る race がある (slave 側の reference
-/// count 揺らぎ等)。read が 0 / EIO を返したときに本関数で「子が実際に exit
-/// 済みか」を waitpid で確かめてから ChildExited 判定する。
-fn child_actually_exited(child: Pid) -> ChildState {
-    use nix::sys::wait::WaitPidFlag;
-    match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
-        Ok(WaitStatus::StillAlive) => ChildState::Alive,
-        Ok(WaitStatus::Exited(_, code)) => ChildState::Exited(Some(code)),
-        Ok(WaitStatus::Signaled(_, sig, _)) => ChildState::Exited(Some(128 + (sig as i32))),
-        Ok(WaitStatus::Stopped(_, _)) | Ok(WaitStatus::Continued(_)) => {
-            ChildState::StoppedOrContinued
+/// `waitpid` の Stopped / Continued は **state transition でしか報告されない**
+/// (= kernel が wait queue から消費したら以降は StillAlive)。busy-wait を避ける
+/// ため自前で `stopped` フラグを保持し、次の Continued / Exited が来るまで
+/// 「stopped 中」として扱う。`WUNTRACED | WCONTINUED` を指定して waitpid を呼ぶ
+/// ことで transition を取りこぼさない。
+///
+/// 用途: serve_loop / relay_loop の中で master read が 0 / EIO を返した時に
+/// `poll(child)` を呼んで状態を更新し、ChildState で caller に sleep 間隔を
+/// 委ねる。
+#[derive(Debug, Default)]
+struct ChildLifecycle {
+    /// 直近の waitpid で Stopped を観測してから、まだ Continued / Exited を
+    /// 観測していない時のみ true。
+    stopped: bool,
+}
+
+impl ChildLifecycle {
+    /// `waitpid(WNOHANG | WUNTRACED | WCONTINUED)` で子の状態 transition を拾い、
+    /// 累積状態を踏まえて [`ChildState`] を返す。
+    ///
+    /// 旧 `child_actually_exited` 単体関数からの差し替え。state を持つので
+    /// caller は `ChildLifecycle` インスタンスを 1 つ loop 全体で使い回す。
+    fn poll(&mut self, child: Pid) -> ChildState {
+        use nix::sys::wait::WaitPidFlag;
+        let flags = WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED;
+        match waitpid(child, Some(flags)) {
+            Ok(WaitStatus::Exited(_, code)) => ChildState::Exited(Some(code)),
+            Ok(WaitStatus::Signaled(_, sig, _)) => ChildState::Exited(Some(128 + (sig as i32))),
+            Ok(WaitStatus::Stopped(_, _)) => {
+                self.stopped = true;
+                ChildState::Stopped
+            }
+            Ok(WaitStatus::Continued(_)) => {
+                self.stopped = false;
+                ChildState::Alive
+            }
+            Ok(WaitStatus::StillAlive) => {
+                // No new transition; report the latched state.
+                if self.stopped {
+                    ChildState::Stopped
+                } else {
+                    ChildState::Alive
+                }
+            }
+            // ptrace event 等の wildcard (= `ptrace` feature 有効時) を defensively alive 扱い
+            #[allow(unreachable_patterns)]
+            Ok(_) => ChildState::Alive,
+            Err(_) => {
+                // transient error (= ECHILD で reap 済の可能性等)。state を維持。
+                if self.stopped {
+                    ChildState::Stopped
+                } else {
+                    ChildState::Alive
+                }
+            }
         }
-        // ptrace event 等の wildcard (= `ptrace` feature 有効時) を defensively alive 扱い
-        #[allow(unreachable_patterns)]
-        Ok(_) => ChildState::Alive,
-        Err(_) => ChildState::Alive,
     }
 }
 
@@ -2528,12 +2583,14 @@ fn unix_stream_from_owned_fd(fd: OwnedFd) -> UnixStream {
     UnixStream::from(fd)
 }
 
-// Drop impl は持たない。
+// Drop impl の責務分担 (R4-H4 で Session 自体にも Drop 追加):
 // - listener (UnixSock) は自身の Drop で socket file を unlink
 // - pty (Pty) は自身の Drop で master fd を close
-// - 子 process の cleanup は Session::run の finalize_child が行う (= run 経由)
-// - run を呼ばずに drop した場合、子 process は orphan で残る可能性あり (test 側で
-//   cleanup_child する責任、または将来 Drop impl で SIGTERM 送る検討)
+// - 正常 path (Session::serve / run) では `into_parts` で Drop をバイパスして
+//   fields を取り出し、`finalize_child` が子の reap を担当する
+// - `serve`/`run` を呼ばずに Session が drop された場合 (test panic / early
+//   return) は `impl Drop for Session` (= session.rs 上部) が SIGTERM →
+//   500ms wait → SIGKILL で子を reap して orphan を防ぐ
 
 #[cfg(test)]
 mod tests {
@@ -2566,6 +2623,114 @@ mod tests {
         // 子 process が orphan で残らないように SIGKILL → wait。
         let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
         let _ = nix::sys::wait::waitpid(pid, None);
+    }
+
+    /// R4-H14: `ChildLifecycle` は SIGSTOP / SIGCONT の transition を取りこぼさず、
+    /// stopped 中は `ChildState::Stopped` を返し続け、SIGCONT 後は `Alive` に戻る。
+    /// 旧実装 (waitpid without WUNTRACED) では stop 検出が dead code で、
+    /// 結果として 5ms sleep の busy-wait に陥っていた。
+    #[test]
+    fn child_lifecycle_tracks_stopped_continued_transitions() {
+        use crate::sys::Pty;
+        use nix::sys::signal::Signal;
+
+        // cat: stdin blocking で確実に alive。
+        let spawned = Pty::spawn(&["cat"], 80, 24).expect("spawn cat");
+        let child = spawned.child;
+
+        let mut lc = ChildLifecycle::default();
+
+        // 初期状態: Alive
+        match lc.poll(child) {
+            ChildState::Alive => {}
+            other => panic!("expected Alive initially, got {other:?}"),
+        }
+
+        // SIGSTOP を送る → 次の poll で Stopped を観測
+        nix::sys::signal::kill(child, Signal::SIGSTOP).expect("SIGSTOP");
+        // kernel が状態遷移を反映するまで短くリトライ
+        let mut saw_stopped = false;
+        for _ in 0..50 {
+            if matches!(lc.poll(child), ChildState::Stopped) {
+                saw_stopped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(saw_stopped, "should observe Stopped after SIGSTOP");
+
+        // 続けて poll しても Stopped が latch されている (= state を保持)
+        for _ in 0..3 {
+            assert!(
+                matches!(lc.poll(child), ChildState::Stopped),
+                "Stopped should latch across polls"
+            );
+        }
+
+        // SIGCONT で再開 → Alive に戻る
+        nix::sys::signal::kill(child, Signal::SIGCONT).expect("SIGCONT");
+        let mut saw_alive = false;
+        for _ in 0..50 {
+            if matches!(lc.poll(child), ChildState::Alive) {
+                saw_alive = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(saw_alive, "should observe Alive after SIGCONT");
+
+        // cleanup
+        let _ = nix::sys::signal::kill(child, Signal::SIGKILL);
+        // exit を観測してから return (= zombie 残さない)
+        let mut saw_exited = false;
+        for _ in 0..100 {
+            if matches!(lc.poll(child), ChildState::Exited(_)) {
+                saw_exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(saw_exited, "should reap after SIGKILL");
+    }
+
+    /// R4-H14 (regression): stopped 中の連続 poll は CPU spin にならない。
+    /// 旧実装は `waitpid(WNOHANG)` のみで stop transition を捕捉できず、
+    /// `ChildState::Alive` を返して 5ms sleep の loop に陥っていた。
+    /// 本テストは `ChildLifecycle::poll` が stop 中に `Stopped` を返し、
+    /// caller が `STOPPED_POLL_INTERVAL` (500ms) で sleep できることを確認する。
+    #[test]
+    fn child_lifecycle_avoids_busywait_while_stopped() {
+        use crate::sys::Pty;
+        use nix::sys::signal::Signal;
+
+        let spawned = Pty::spawn(&["cat"], 80, 24).expect("spawn cat");
+        let child = spawned.child;
+        nix::sys::signal::kill(child, Signal::SIGSTOP).expect("SIGSTOP");
+
+        let mut lc = ChildLifecycle::default();
+        // Stop 観測まで待つ
+        for _ in 0..50 {
+            if matches!(lc.poll(child), ChildState::Stopped) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // 1 秒間連続で poll 結果が Stopped を返すこと
+        let start = std::time::Instant::now();
+        let mut polls = 0;
+        while start.elapsed() < Duration::from_millis(50) {
+            match lc.poll(child) {
+                ChildState::Stopped => polls += 1,
+                other => panic!("unexpected state during stop: {other:?}"),
+            }
+        }
+        assert!(polls > 0, "polled at least once during stop window");
+
+        // cleanup
+        let _ = nix::sys::signal::kill(child, Signal::SIGCONT);
+        let _ = nix::sys::signal::kill(child, Signal::SIGKILL);
+        let _ = waitpid(child, None);
     }
 
     #[test]
