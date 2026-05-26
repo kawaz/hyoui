@@ -564,6 +564,29 @@ CRITICAL を Agent 並列 (5-10 ws) で消す:
 
 commit `e39179f6` で D1-D8 + H1-H7 + L1-L6 全件解消済。詳細は jj log 参照。
 
+## Field findings (= 実機検証由来、cmux-msg 検証セッション 2026-05-27)
+
+出典: `docs/issue/2026-05-27-cmux-msg-experiment-feedback-v020-refresh.md` + `docs/findings/2026-05-27-headless-claude-remote-control-leak.md`
+
+### B1-B8
+
+- [ ] **R5-FB1** `hyoui run --until PATTERN` が機能していない (= 期待のパターン後も子が走り続ける)
+  - 出典: 実機検証 / 提案: v0.2.0 wait --pattern への redirect で deprecate も可
+- [ ] **R5-FB2** headless mode で stdin EOF が子に伝わらない (= `echo "1+2" | hyoui run -- bc` で hang)
+- [ ] **R5-FB3** `hyoui run --detached` 未実装 (= attach --help の RELATED 節に記載あるが本体未実装、v0.2.0 scope に組み込み要)
+- [ ] **R5-FB4** `run` 直後の wait/status が ENOENT (= socket 作成 race)
+- [ ] **R5-FB5** `--socket` 親 dir mode エラー文言が不親切 (= hint 追記で改善)
+- [done] **R5-FB6** `hyoui list/kill --help` 取りこぼし (= R4-H1 で list/kill は解消、completion --help だけ残)
+- [done] **R5-FB7** v0.2.0 で `kill` subcommand 去就 (= 2026-05-27 kawaz 確認: アプリ固有問題は `input keys` で対応可、kill は v0.1.x 互換維持で v0.2.0 scope 7 個から除外、DR-0010 据え置き)
+- [done] **R5-FB8** leader 死亡時 socket 残骸 (= R5-H3 で list stale 検出 + --prune-stale 実装済、commit `beb7dd05`)
+
+### Headless Remote Control finding
+
+- [ ] **R5-FB9** `hyoui run --mode=headless -- claude` で起動した child claude が Remote Control を継承 (= スマホ Claude アプリから直接介入可能)
+  - 出典: `docs/findings/2026-05-27-headless-claude-remote-control-leak.md`
+  - hyoui 自体の責任ではない (= claude code user settings 由来) が、`--child-env` で env override する経路や README 注記が望ましい
+  - v0.2.0 で `run --child-env KEY=VAL` 検討候補
+
 ## Round 1-2 (2026-05-26 night) — done
 
 Round 1: 5 personas + gemini → critical 10 + warning 5 fix (commit `24e00ead`)
