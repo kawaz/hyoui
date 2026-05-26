@@ -127,6 +127,24 @@ idle timeout は wait にも採用 (`--idle DUR`、`--then-idle DUR`)。
 9. daemon は in-flight paste state 持ち、異常終了 path で `ESC[201~` を best-effort 送信 (子 hang 防止)
 10. 「bracketed paste にキャンセル機構は原理的に存在しない」を確認、`--no-bracketed` で stream mode に切替えれば CLI 側 `^C` でクリーン中断可能、を回避策として明示
 
+### Phase 9.5: paste API 用語整理 (2 回目の paste 集中議論)
+
+DR-0005/0006/0007 を一度書き出した後、paste API オプション群を見返してユーザから多数の改名・整理提案:
+
+1. `--add-newline` 単独 flag → 3 値 enum (`never|auto|always`) or 異なる文脈名 `--newline-at-end=...`
+2. `--bracketed` 用語が paste 文脈離れて単体だと意味不明 → `--bracketed-paste` に改名 + 3 値 enum (auto|on|off)
+3. `2004h/l` (mode 制御、子 → terminal) と `200~/201~` (paste marker、terminal → 子) の使い分け明示要求
+4. `--chunk` → `--chunk-size` (明確化)
+5. `--token` → `--lock-token` (環境変数 `HYOUI_LOCK_TOKEN` と一貫)
+6. `--spool-overwrite` 等 → `--spool-file-*` prefix で統一 (`spool=<path>` 時のみ意味)
+7. `--spool-delete-after-send` → **default 化**、`--spool-file-keep` で opt-out
+8. `--spool-append` 廃止 (paste の責務外、tty dump 系は別 subcommand へ)
+9. paste には改行の文脈が 2 つある問題発見: 中身の改行コード正規化 + 末尾改行制御
+   - 両方 `--newline-...` だと混乱 → **`--line-ending`** (中身) + **`--trailing-newline`** (末尾) に分離
+10. 改行正規化の encoding 安全性 (UTF-8 は bytes レベル置換で safe、UTF-16 等は危険) を doc 明示
+11. `--trailing-newline` の値: `strip` (1 個削除、`echo ls | paste` で実行防止) と `trim` (全削除、外部入力で末尾改行数不定) の 2 値追加 → 最終 `keep|auto|force|strip|trim` の 5 値
+12. dump + record/play のアイデアが派生 → `docs/issue/2026-05-26-feature-recording-and-dump.md` に起票、`feature-` prefix で「未採用アイデア」を `docs/issue/` に蓄積する慣習を立ち上げ
+
 ### Phase 10: kuu リポへの help カテゴリ提案起票
 
 paste の CLI で「入力源 / spool / size / その他」のカテゴリ分けが見やすいと判明。

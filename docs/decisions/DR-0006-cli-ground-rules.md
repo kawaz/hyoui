@@ -182,16 +182,53 @@ Atomicity:
 | spool=memory/tmpfile/file | ⭕ | spool 削除 + error、子に 1 byte も送らない |
 | spool=none | ❌ | 既送分は子に確定、daemon は best-effort で `ESC[201~` 補完 |
 
-Bracketed paste:
-- 自動検出 (子が `ESC[?2004h` を出してたら bracketed mode と判定)
-- `--bracketed`/`--no-bracketed` で override
-- daemon は **in-flight paste state** を持ち、異常終了 path で `ESC[201~` を best-effort 送信 (子 hang を防ぐ)
+Bracketed paste (`--bracketed-paste=auto|on|off`, default `auto`、alias `--no-bracketed-paste` で off):
+
+子 ↔ terminal の 2 系統の escape を使い分ける:
+
+| escape | 方向 | 役割 |
+|---|---|---|
+| `ESC[?2004h` / `ESC[?2004l` | 子の出力 (子 → terminal) | 「俺は bracketed paste 対応してる」と子が要求 |
+| `ESC[200~` / `ESC[201~` | 子の入力 (terminal → 子) | paste 開始/終了マーカー |
+
+- `auto`: daemon は子の出力から `2004h` 検出で内部 state を on にし、wrap 時に `200~/201~` で囲む
+- `on`: 検出結果無視で強制 wrap
+- `off`: 強制 wrap しない
+- daemon は **in-flight paste state** を持ち、異常終了 path (Drop, signal handler) で `ESC[201~` を best-effort 送信 (子の paste 待ち hang を防ぐ)
+
+改行制御 (2 文脈、それぞれ独立フラグ):
+
+```
+--line-ending=preserve|lf|crlf            # 中身の改行コード正規化 (default preserve)
+--trailing-newline=keep|auto|force|strip|trim   # 末尾改行制御 (default keep)
+```
+
+`--line-ending`:
+| 値 | 動作 |
+|---|---|
+| `preserve` (default) | bytes 透過、何もしない |
+| `lf` | CRLF/CR → LF に正規化 |
+| `crlf` | CRLF に統一 |
+
+実装注意: 正規化は **UTF-8 (および ASCII 互換 encoding) 前提で bytes レベル置換**。UTF-8 の `0x0a/0x0d` は ASCII 範囲のみに出現するので safe。UTF-16/UCS-2 等で `0x0a/0x0d` が multi-byte 文字内に出る encoding では `preserve` を使うこと (doc に明示)。
+
+`--trailing-newline`:
+| 値 | 動作 | 用途 |
+|---|---|---|
+| `keep` (default) | bytes 透過 | 通常 |
+| `auto` | 末尾改行なければ 1 個追加 | shell に paste で確実に確定 |
+| `force` | 既存有無に関わらず 1 個追加 | 連続改行を意図的に作る |
+| `strip` | 末尾改行 1 個削除 | `echo ls \| hyoui paste` で実行を防ぐ |
+| `trim` | 末尾改行を全て削除 (連続分) | 外部入力で末尾改行数が不定、整える |
+
+`auto`/`force` で足す改行種別は `--line-ending` 指定に従う (`preserve` の場合は LF 固定)。
+`trim` は改行のみ対象 (tab/space は触らない)。
 
 その他:
-- `--newline=preserve|lf|crlf` (default `preserve`、bytes 透過。バイナリ判定不能なため自動変換 off が安全側)
-- `--add-newline` 末尾改行追加
-- `--chunk SIZE` (default 4096)、`--chunk-delay DUR` (default 0)
-- file spool: `--spool-overwrite` `--spool-append` `--spool-delete-after-send`
+- `--chunk-size SIZE` (default 4096)、`--chunk-delay DUR` (default 0)
+- `--lock-token T` (env `HYOUI_LOCK_TOKEN` 自動使用)
+- file spool 修飾子: `--spool-file-overwrite` (既存上書き許可、default error)、`--spool-file-keep` (send 後も残す、default 削除)
+- `--spool-append` は paste の責務外として廃止 (継続的な記録は別 subcommand 案 `hyoui dump`/`record` で検討、`docs/issue/2026-05-26-feature-recording-and-dump.md`)
 
 サイズ超過時 error message で誘導 4 つ提示:
 ```
@@ -254,7 +291,14 @@ hyoui wait <name> [--idle DUR | --text S | --pattern R | --then-idle DUR] [--tim
 - 代わりに spool mode を統一 (`--spool=memory|tmpfile|<path>|none`)、`--max-size` の意味を spool mode 別に定義
 - ユーザの size 不明承諾は `--spool=none` or `--max-size=0` で明示
 
-### `--newline=none`
+### `--newline=...` を 1 フラグに統合
+
+- paste API には改行の文脈が 2 つある: (a) 中身の改行コード正規化、(b) 末尾改行制御
+- 両方とも `--newline` prefix だと混乱 (`--newline-at-end` を見て「改行コードを末尾基準で正規化?」と誤読リスク)
+- → 別名で分離: **`--line-ending`** (中身) + **`--trailing-newline`** (末尾)
+- `line-ending` は editorconfig/git の慣用語、`trailing-newline` は POSIX/Unix tool 慣用語
+
+### `--newline=none` (旧案)
 
 - `none` が「改行 0 個」(= 削除) と誤読されるリスク
 - 「正規化しない」を `--newline=preserve` で表現、誤解の余地を消す
