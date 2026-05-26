@@ -13,7 +13,7 @@
 use crate::protocol::Mode;
 use crate::protocol::messages::SessionMode;
 
-use super::session::ClientHandle;
+use super::broadcast::ClientHandle;
 
 /// session 全体の状態 (Phase 10)。lock 周りの state machine を保持する。
 ///
