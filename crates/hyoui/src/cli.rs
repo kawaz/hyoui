@@ -105,6 +105,12 @@ pub struct RunConfig {
     pub until: Option<String>,
     /// Explicit socket path, or `None` to auto-generate.
     pub socket: Option<String>,
+    /// `--detached`: daemon を別 process で起動して親はすぐ exit。socket path を
+    /// stdout に 1 行 print してから親が終わる。attach は別 process から行う。
+    pub detached: bool,
+    /// `--session`: 自動採番 (run-<pid>) ではなく明示 session id を使う。
+    /// socket path 自動解決にもこの値が入る。
+    pub session: Option<String>,
     /// Action when the child is suspended (preset by mode unless overridden).
     pub on_child_suspend: OnChildSuspend,
     /// Action when the parent is suspended (preset by mode unless overridden).
@@ -311,6 +317,8 @@ fn parse_run(args: &[String]) -> Command {
     let mut on_child_suspend: Option<OnChildSuspend> = None;
     let mut on_parent_suspend: Option<OnParentSuspend> = None;
     let mut command: Vec<String> = Vec::new();
+    let mut detached = false;
+    let mut session: Option<String> = None;
 
     let mut i = 0usize;
     let mut in_command = false;
@@ -418,6 +426,14 @@ fn parse_run(args: &[String]) -> Command {
                 }
                 None => return Command::Error("--on-parent-suspend requires a value".into()),
             },
+            "--detached" => {
+                detached = true;
+                consumed_extra = false; // bool flag は次 arg を食わない
+            }
+            "--session" => match value {
+                Some(v) => session = Some(v),
+                None => return Command::Error("--session requires a value".into()),
+            },
             other => return Command::Error(format!("unknown option: {other}")),
         }
 
@@ -454,6 +470,8 @@ fn parse_run(args: &[String]) -> Command {
         idle_timeout_ms,
         until,
         socket,
+        detached,
+        session,
         on_child_suspend: final_child_suspend,
         on_parent_suspend: final_parent_suspend,
         command,

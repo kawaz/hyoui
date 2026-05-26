@@ -23,11 +23,20 @@ use hyoui::protocol::Mode;
 use hyoui::sys::{enter_raw, is_tty};
 
 mod completion;
+mod daemonize;
 mod socket_path;
 
 fn main() -> ExitCode {
     // Skip argv[0]: parse_args expects the trailing arguments only.
     let argv: Vec<String> = std::env::args().skip(1).collect();
+
+    // Hidden subcommand: 親 `hyoui run --detached ...` から self-exec 経由で
+    // 起動される daemon 子 process の entry point。cli parser を汚さないため
+    // ここで直接 dispatch する。
+    if argv.first().map(String::as_str) == Some("__daemonize-run") {
+        return daemonize::run_daemon_child(&argv[1..]);
+    }
+
     let cmd = parse_args(&argv);
 
     match cmd {
@@ -76,7 +85,22 @@ fn main() -> ExitCode {
 /// 3. main thread が attach client として接続、stdin/stdout を中継
 /// 4. daemon thread を join、その exit code を返す
 fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
-    let session_id = socket_path::auto_session_id();
+    if cfg.detached {
+        let cols = u16::try_from(cfg.cols).unwrap_or(80);
+        let rows = u16::try_from(cfg.rows).unwrap_or(24);
+        return daemonize::run_detached_parent(
+            cfg.session.clone(),
+            cfg.socket.clone(),
+            cols,
+            rows,
+            cfg.command,
+        );
+    }
+
+    let session_id = cfg
+        .session
+        .clone()
+        .unwrap_or_else(socket_path::auto_session_id);
     let sock = match socket_path::resolve(cfg.socket.as_deref(), &session_id) {
         Ok(p) => p,
         Err(e) => {
@@ -86,7 +110,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     };
     let cols = u16::try_from(cfg.cols).unwrap_or(80);
     let rows = u16::try_from(cfg.rows).unwrap_or(24);
-    let mut dcfg = DaemonConfig::new(session_id, sock.clone(), cfg.command);
+    let mut dcfg = DaemonConfig::new(session_id.clone(), sock.clone(), cfg.command);
     dcfg.cols = cols;
     dcfg.rows = rows;
 

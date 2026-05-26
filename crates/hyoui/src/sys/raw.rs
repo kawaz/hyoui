@@ -115,7 +115,10 @@ pub fn forkpty_then_exec(argv: &[CString], cols: u16, rows: u16) -> Result<Forke
 
 /// Take ownership of a raw fd. Caller must guarantee `raw` is a valid,
 /// currently-open fd with no other Rust owner.
-pub(crate) fn own_raw_fd(raw: RawFd) -> OwnedFd {
+///
+/// `unsafe` を呼び出し側に伝播させないための薄い wrapper。`hyoui-cli` の
+/// `forbid(unsafe_code)` 下で daemon の parent → child fd 継承を扱う等に使う。
+pub fn own_raw_fd(raw: RawFd) -> OwnedFd {
     // SAFETY: delegated to the caller's contract.
     unsafe { OwnedFd::from_raw_fd(raw) }
 }
