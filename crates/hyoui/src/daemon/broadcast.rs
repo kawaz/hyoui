@@ -15,6 +15,15 @@
 //! - [`broadcast_bytes`]: 既に encode 済 bytes を全 client に enqueue
 //! - [`instant_to_epoch_ms`]: tail.data の timestamp_ms 用近似変換
 //!
+//! ## payload sharing (R5-H9)
+//!
+//! broadcast 系の payload は [`SharedBytes`] (= `Arc<Vec<u8>>`) で共有する。
+//! 1 frame を encode した直後に `Arc::new` で wrap し、各 client への enqueue は
+//! `Arc::clone` (= refcount 加算のみ、bytes copy なし) で渡す。これにより
+//! `N clients × frame_size` 分の memcpy が消える (R5-PERF-H1 / R5-H9)。
+//! writer_pump は `&payload[..]` を `write_all` に渡し、payload は最後の Arc が
+//! drop された時点で解放される (= 全 client が socket 送信を完了した後)。
+//!
 //! ## session.rs / 他 module との接続
 //!
 //! - [`ClientHandle`] は `pub(super)` の private フィールドを持つ。
@@ -37,6 +46,13 @@ use crate::protocol::{ControlMessage, Frame, Mode};
 /// 場合、64 clients × 8 MiB = 最大 512 MiB の queue 占有が理論上限。
 pub(super) const MAX_CLIENTS_PER_DAEMON: usize = 64;
 
+/// broadcast payload の共有所有型 (R5-H9 zero-copy 化)。
+///
+/// 1 frame の encode 済 bytes を `Arc::new` で wrap し、`Arc::clone` で
+/// N clients に配布する。writer_pump は `&payload[..]` を `write_all` に渡し、
+/// payload bytes 自体は最後の Arc が drop された時点で解放される。
+pub(super) type SharedBytes = Arc<Vec<u8>>;
+
 /// 1 client の per-thread state (writer thread + 自前 byte bound queue + reader handle)。
 ///
 /// Phase 12: queue capacity は **byte 単位の厳密 cap** (DR-0008 §8.2)。
@@ -55,7 +71,12 @@ pub(super) struct ClientHandle {
     /// reject する。
     pub(super) negotiated_caps: Vec<String>,
     /// daemon → client への frame enqueue 用 unbounded mpsc。
-    pub(super) writer_tx: Sender<Vec<u8>>,
+    ///
+    /// R5-H9: payload を `Arc<Vec<u8>>` で共有して N clients に zero-copy 配布する
+    /// (= 旧実装は `Vec<u8>` をそのまま送って enqueue ごとに `Vec::clone` で
+    /// memcpy していた)。writer_pump は受け取った Arc を `&[u8]` で参照して
+    /// `write_all` に渡し、`drop(arc)` で refcount を減らす。
+    pub(super) writer_tx: Sender<SharedBytes>,
     /// 現在 queue 内に積まれている bytes 数 (= writer_pump が送信完了で減らす)。
     pub(super) queued_bytes: Arc<AtomicUsize>,
     /// queue の byte 上限 (= `DaemonConfig::client_buffer_bytes`)。
@@ -95,7 +116,7 @@ impl Drop for ClientHandle {
         let _ = self.reader.shutdown(std::net::Shutdown::Both);
         // (2) writer_tx を closed channel と入れ替えて旧 Sender を即 drop。
         //     channel close で writer_pump の rx.recv() が Err を返し loop 終了。
-        let (dummy_tx, _dummy_rx) = mpsc::channel::<Vec<u8>>();
+        let (dummy_tx, _dummy_rx) = mpsc::channel::<SharedBytes>();
         let _ = std::mem::replace(&mut self.writer_tx, dummy_tx);
         // (3) writer_pump 終了を join で reap。double-panic は join では起きない。
         if let Some(t) = self.writer_thread.take() {
@@ -137,14 +158,14 @@ pub(super) enum EnqueueOutcome {
 /// 「ms 単位 throughput を最優先」と「将来 multi-writer になる必然性が低い」を
 /// 天秤にかけて relax で許容。実用上は writer_pump が `fetch_sub` するので大局
 /// 収束する。
-pub(super) fn enqueue_for_client(ch: &ClientHandle, bytes: Vec<u8>) -> EnqueueOutcome {
-    let size = bytes.len();
+pub(super) fn enqueue_for_client(ch: &ClientHandle, payload: SharedBytes) -> EnqueueOutcome {
+    let size = payload.len();
     let cur = ch.queued_bytes.load(Ordering::Acquire);
     if cur.saturating_add(size) > ch.buffer_limit {
         return EnqueueOutcome::Overflow;
     }
     ch.queued_bytes.fetch_add(size, Ordering::AcqRel);
-    if ch.writer_tx.send(bytes).is_err() {
+    if ch.writer_tx.send(payload).is_err() {
         // writer thread 死亡 → queued_bytes を戻して終了
         ch.queued_bytes.fetch_sub(size, Ordering::AcqRel);
         return EnqueueOutcome::WriterDead;
@@ -187,8 +208,9 @@ pub(super) fn send_backpressure_error(ch: &ClientHandle, queued: usize) {
         return;
     }
     let size = frame_bytes.len();
+    let payload: SharedBytes = Arc::new(frame_bytes);
     ch.queued_bytes.fetch_add(size, Ordering::AcqRel);
-    if ch.writer_tx.send(frame_bytes).is_err() {
+    if ch.writer_tx.send(payload).is_err() {
         ch.queued_bytes.fetch_sub(size, Ordering::AcqRel);
     }
 }
@@ -209,7 +231,8 @@ pub(super) fn send_control(ch: &ClientHandle, msg: ControlMessage) -> bool {
     {
         return false;
     }
-    matches!(enqueue_for_client(ch, frame_bytes), EnqueueOutcome::Sent)
+    let payload: SharedBytes = Arc::new(frame_bytes);
+    matches!(enqueue_for_client(ch, payload), EnqueueOutcome::Sent)
 }
 
 /// `Instant` (monotonic) を Unix epoch millis に近似変換する。
@@ -237,13 +260,15 @@ pub(super) fn broadcast_master_bytes(
     bytes: &[u8],
     ts: Instant,
 ) -> Vec<u64> {
-    let raw_frame_bytes: Option<Vec<u8>> = if clients
+    // R5-H9: payload を 1 度だけ encode し、`Arc<Vec<u8>>` で wrap して
+    // N clients に `Arc::clone` (= refcount 加算のみ、bytes copy なし) で配布する。
+    let raw_frame_bytes: Option<SharedBytes> = if clients
         .iter()
         .any(|c| matches!(c.subscription, Subscription::Raw))
     {
         let mut buf = Vec::new();
         if Frame::raw_data(bytes.to_vec()).encode_to(&mut buf).is_ok() {
-            Some(buf)
+            Some(Arc::new(buf))
         } else {
             None
         }
@@ -252,11 +277,12 @@ pub(super) fn broadcast_master_bytes(
     };
 
     let ts_ms = instant_to_epoch_ms(ts);
-    let mut tail_cache: [Option<Vec<u8>>; 2] = [None, None];
-    let encode_tail = |strip: bool, cache: &mut [Option<Vec<u8>>; 2]| -> Option<Vec<u8>> {
+    // strip=false/true の 2 variant 分の payload を最大 1 度ずつ encode して cache。
+    let mut tail_cache: [Option<SharedBytes>; 2] = [None, None];
+    let encode_tail = |strip: bool, cache: &mut [Option<SharedBytes>; 2]| -> Option<SharedBytes> {
         let key = if strip { 1 } else { 0 };
         if let Some(ref cached) = cache[key] {
-            return Some(cached.clone());
+            return Some(Arc::clone(cached));
         }
         let payload = if strip {
             crate::strip::strip_ansi(bytes)
@@ -270,14 +296,15 @@ pub(super) fn broadcast_master_bytes(
         let body = msg.encode_to_vec().ok()?;
         let mut frame_bytes = Vec::new();
         Frame::cbor_control(body).encode_to(&mut frame_bytes).ok()?;
-        cache[key] = Some(frame_bytes.clone());
-        Some(frame_bytes)
+        let shared: SharedBytes = Arc::new(frame_bytes);
+        cache[key] = Some(Arc::clone(&shared));
+        Some(shared)
     };
 
     let mut overflow_ids: Vec<u64> = Vec::new();
     for ch in clients.iter() {
         let fb = match ch.subscription {
-            Subscription::Raw => raw_frame_bytes.clone(),
+            Subscription::Raw => raw_frame_bytes.as_ref().map(Arc::clone),
             Subscription::TailFollow { strip_ansi } => encode_tail(strip_ansi, &mut tail_cache),
         };
         if let Some(fb) = fb {
@@ -312,7 +339,8 @@ pub(super) fn broadcast_control(clients: &mut [ClientHandle], msg: &ControlMessa
     {
         return Vec::new();
     }
-    broadcast_bytes(clients, frame_bytes)
+    // R5-H9: encode 結果を `Arc` で wrap し、N clients に zero-copy 配布。
+    broadcast_bytes(clients, Arc::new(frame_bytes))
 }
 
 /// daemon → client の writer pump (= per-thread)。
@@ -320,13 +348,15 @@ pub(super) fn broadcast_control(clients: &mut [ClientHandle], msg: &ControlMessa
 /// `rx` から `Vec<u8>` を受け取って socket に write_all、送信完了で
 /// `queued_bytes` から減算する (= Phase 12 byte bound 厳密化)。送信失敗で thread 終了。
 pub(super) fn writer_pump(
-    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    rx: std::sync::mpsc::Receiver<SharedBytes>,
     mut sock: UnixStream,
     queued_bytes: Arc<AtomicUsize>,
 ) {
-    while let Ok(bytes) = rx.recv() {
-        let size = bytes.len();
-        if std::io::Write::write_all(&mut sock, &bytes).is_err() {
+    while let Ok(payload) = rx.recv() {
+        let size = payload.len();
+        // R5-H9: Arc<Vec<u8>> を `&[u8]` で参照して write_all に渡す
+        // (= Vec::clone による memcpy なし)。payload は scope 抜けで Arc が drop。
+        if std::io::Write::write_all(&mut sock, &payload[..]).is_err() {
             // client が close した。recv ループ抜けて thread 終了。
             return;
         }
@@ -338,10 +368,13 @@ pub(super) fn writer_pump(
 ///
 /// 戻り値: backpressure overflow / writer dead で disconnect すべき client の
 /// `client_id` 一覧 (Phase 12)。
-pub(super) fn broadcast_bytes(clients: &mut [ClientHandle], bytes: Vec<u8>) -> Vec<u64> {
+pub(super) fn broadcast_bytes(clients: &mut [ClientHandle], payload: SharedBytes) -> Vec<u64> {
+    // R5-H9: caller が 1 度だけ `Arc::new` した payload を受け取り、各 client
+    // へは `Arc::clone` (refcount 加算のみ) で配布する。旧実装は `Vec<u8>::clone`
+    // (= memcpy O(payload.len())) を N clients 分繰り返していた。
     let mut overflow_ids: Vec<u64> = Vec::new();
     for ch in clients.iter() {
-        match enqueue_for_client(ch, bytes.clone()) {
+        match enqueue_for_client(ch, Arc::clone(&payload)) {
             EnqueueOutcome::Sent => {}
             EnqueueOutcome::Overflow => {
                 send_backpressure_error(ch, ch.queued_bytes.load(Ordering::Acquire));
@@ -362,7 +395,7 @@ mod tests {
     #[test]
     fn enqueue_for_client_respects_buffer_limit() {
         // 単体 unit test: queued_bytes が buffer_limit を超えるなら Overflow
-        let (tx, _rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (tx, _rx) = std::sync::mpsc::channel::<SharedBytes>();
         // ダミー UnixStream 作って ClientHandle を構築
         let (a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
         let _keep = a; // close 防止用
@@ -380,14 +413,20 @@ mod tests {
         };
 
         // 50 byte → OK、累計 50
-        assert_eq!(enqueue_for_client(&ch, vec![0u8; 50]), EnqueueOutcome::Sent);
+        assert_eq!(
+            enqueue_for_client(&ch, Arc::new(vec![0u8; 50])),
+            EnqueueOutcome::Sent
+        );
         assert_eq!(ch.queued_bytes.load(Ordering::Acquire), 50);
         // 50 byte → 累計 100、まだ OK (= 100 <= 100)
-        assert_eq!(enqueue_for_client(&ch, vec![0u8; 50]), EnqueueOutcome::Sent);
+        assert_eq!(
+            enqueue_for_client(&ch, Arc::new(vec![0u8; 50])),
+            EnqueueOutcome::Sent
+        );
         assert_eq!(ch.queued_bytes.load(Ordering::Acquire), 100);
         // 1 byte → 累計 101 > 100、Overflow
         assert_eq!(
-            enqueue_for_client(&ch, vec![0u8; 1]),
+            enqueue_for_client(&ch, Arc::new(vec![0u8; 1])),
             EnqueueOutcome::Overflow
         );
         // queued_bytes は変化なし (= Overflow 時は加算前に reject)
@@ -404,7 +443,7 @@ mod tests {
     fn client_handle_drop_closes_writer_channel() {
         let (reader, writer_sock) = std::os::unix::net::UnixStream::pair().expect("pair");
         let _peer = reader.try_clone().expect("clone peer"); // 受信側 keep
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let (tx, rx) = mpsc::channel::<SharedBytes>();
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let queued_for_pump = Arc::clone(&queued_bytes);
         let writer_thread =
@@ -442,7 +481,7 @@ mod tests {
     /// 場合や、既に writer_thread を take 済みのコードパスからも安全に drop できる。
     #[test]
     fn client_handle_drop_idempotent_with_no_writer_thread() {
-        let (tx, _rx) = mpsc::channel::<Vec<u8>>();
+        let (tx, _rx) = mpsc::channel::<SharedBytes>();
         let (a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
         let _keep = a;
         let ch = ClientHandle {

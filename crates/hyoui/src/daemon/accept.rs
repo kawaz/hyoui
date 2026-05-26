@@ -40,7 +40,9 @@ use crate::protocol::{
 use crate::sys::UnixSock;
 
 use super::DaemonConfig;
-use super::broadcast::{ClientHandle, Subscription, broadcast_control, send_control, writer_pump};
+use super::broadcast::{
+    ClientHandle, SharedBytes, Subscription, broadcast_control, send_control, writer_pump,
+};
 use super::lock::{SessionState, should_assign_leader};
 
 /// R4-C3: handshake (= 1 client の HandshakeRequest 受信 + token 検証) を完了
@@ -308,7 +310,7 @@ fn finalize_accepted_client(
 
     // writer thread を立ち上げ、broadcast 用 unbounded mpsc + atomic byte counter を作る。
     // queue capacity は byte 単位の `enqueue_for_client` で厳密に enforce する。
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (tx, rx) = std::sync::mpsc::channel::<SharedBytes>();
     let queued_bytes = Arc::new(AtomicUsize::new(0));
     let queued_bytes_for_pump = Arc::clone(&queued_bytes);
     let writer_thread =
