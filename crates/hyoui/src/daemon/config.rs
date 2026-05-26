@@ -41,6 +41,18 @@ pub struct DaemonConfig {
     /// MVP では `None` 既定で運用 (= 同 UID + socket perm 0600 で十分とする)。
     /// 将来 TCP / WebSocket transport を加えるときに必須化する想定。
     pub expected_token: Option<String>,
+
+    /// R5-FB1: `hyoui run --until PATTERN`。子 PTY 出力に substring `PATTERN`
+    /// が現れた瞬間、子 process group に SIGTERM を送って session を畳む。
+    ///
+    /// - `None`: 監視なし (= default)
+    /// - `Some(needle)`: serve_loop が master byte stream に対し sliding window
+    ///   scan を行い、match した瞬間 `kill_pgrp(child, SIGTERM)` で終了させる
+    ///
+    /// scan は raw byte (= ANSI escape を含む) に対して行う。strip 済 stream で
+    /// 一致させたい場合は v0.2.0 で `wait --pattern` 経路を使う想定 (= 本機能は
+    /// `run` から手早く使うための簡易 needle match)。
+    pub until: Option<String>,
 }
 
 impl DaemonConfig {
@@ -57,6 +69,7 @@ impl DaemonConfig {
             scrollback_bytes: 1024 * 1024,
             client_buffer_bytes: 8 * 1024 * 1024,
             expected_token: None,
+            until: None,
         }
     }
 }

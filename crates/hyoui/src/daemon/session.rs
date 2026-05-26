@@ -60,6 +60,61 @@ fn kill_pgrp(child: Pid, sig: Signal) -> nix::Result<()> {
     kill(Pid::from_raw(-child.as_raw()), sig)
 }
 
+/// R5-FB1: `run --until PATTERN` の sliding window scanner。
+///
+/// 子 PTY master 出力に対し chunk 単位で `feed(&[u8])` を呼ぶ。各 chunk について
+/// `(carry + new_bytes)` の連結に対し substring scan を行い、match があれば
+/// `true` を返す。次回 chunk のため、carry には新 buf の末尾 `needle.len() - 1`
+/// bytes を残す (= needle が境界を跨いでいた場合に次 chunk 開始で確実に拾える)。
+///
+/// scan 対象は raw byte (= ANSI escape を含む)。strip-ansi 等は本 watcher では
+/// 行わない (= `wait --pattern` 経路で strip option を使う設計、本機能は
+/// `run` から手早く needle match するための簡易 path)。
+struct UntilWatcher {
+    needle: Vec<u8>,
+    carry: Vec<u8>,
+}
+
+impl UntilWatcher {
+    fn new(needle: String) -> Self {
+        Self {
+            needle: needle.into_bytes(),
+            carry: Vec::new(),
+        }
+    }
+
+    /// 新 chunk を投入して match 確認。一致したら true を返す (= 呼出側が
+    /// session 終了処理に進む)。一致しなければ carry を更新して false。
+    fn feed(&mut self, chunk: &[u8]) -> bool {
+        if self.needle.is_empty() {
+            return false;
+        }
+        // (carry + chunk) を scan 対象に組み立てる。
+        let mut window: Vec<u8> = Vec::with_capacity(self.carry.len() + chunk.len());
+        window.extend_from_slice(&self.carry);
+        window.extend_from_slice(chunk);
+        // substring scan (= 標準 windows().any() で十分。chunk size 8 KiB
+        // × needle 数十 bytes の積で per-iteration コストは数 μs オーダー)。
+        let matched = window.len() >= self.needle.len()
+            && window
+                .windows(self.needle.len())
+                .any(|w| w == self.needle.as_slice());
+        if matched {
+            return true;
+        }
+        // 次回 chunk のための carry 更新: window の末尾 (needle.len() - 1) bytes
+        // を残す (= 境界を跨ぐ partial match を捉えるため)。
+        let keep = self.needle.len().saturating_sub(1);
+        if window.len() > keep {
+            let cut = window.len() - keep;
+            self.carry = window[cut..].to_vec();
+        } else {
+            self.carry = window;
+        }
+        false
+    }
+}
+
 /// R5-H6: SIGCHLD self-pipe ownership gate.
 ///
 /// SIGCHLD disposition + the `SELFPIPE_WRITE_FD` global are process-wide;
@@ -435,6 +490,13 @@ fn serve_loop(
     let mut pending_handshakes: Vec<PendingHandshake> = Vec::new();
     // R4-H14: 子の Stopped/Continued 追跡。loop 越しに状態を保持する。
     let mut lifecycle = ChildLifecycle::default();
+    // R5-FB1: `run --until PATTERN` の sliding window matcher。chunk 境界を
+    // 跨ぐ needle を捉えるため、直近 (needle.len() - 1) bytes を carry に残す。
+    let mut until_watcher: Option<UntilWatcher> = config
+        .until
+        .as_ref()
+        .filter(|s| !s.is_empty())
+        .map(|s| UntilWatcher::new(s.clone()));
     loop {
         // poll fd 構築: listener + master + 各 client reader (+ SIGCHLD self-pipe)
         let listener_fd = listener.as_fd();
@@ -632,6 +694,19 @@ fn serve_loop(
                     overflow_ids.extend(broadcast_master_bytes(clients, &buf[..n], now));
                     // pending waits に新規 bytes を流し込み、match 確認
                     update_waits_on_master_bytes(pending_waits, clients, &buf[..n], now);
+                    // R5-FB1: `--until PATTERN` match 検査。一致した瞬間に
+                    // 子 process group へ SIGTERM を投げて session 終了させる。
+                    // (broadcast / scrollback の後で match 判定するのは、最後の
+                    // chunk も client / scrollback には届けるため。)
+                    if let Some(ref mut w) = until_watcher {
+                        if w.feed(&buf[..n]) {
+                            let _ = kill_pgrp(child, Signal::SIGTERM);
+                            // finalize_child が SIGTERM → wait → SIGKILL を実施。
+                            // `ClientDetachedOrKilled` を返すことで finalize 経路に
+                            // 乗せる (= `kill` subcommand と同じ後始末)。
+                            return RelayOutcome::ClientDetachedOrKilled;
+                        }
+                    }
                 }
                 Err(Error::Errno(nix::errno::Errno::EIO)) => match lifecycle.poll(child) {
                     ChildState::Exited(code) => return RelayOutcome::ChildExited(code),
@@ -861,6 +936,47 @@ mod tests {
         // 子 process が orphan で残らないように SIGKILL → wait。
         let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
         let _ = nix::sys::wait::waitpid(pid, None);
+    }
+
+    // ---- R5-FB1: UntilWatcher unit tests ----
+
+    /// chunk 内に needle が完全に含まれる場合は即 match。
+    #[test]
+    fn until_watcher_matches_within_single_chunk() {
+        let mut w = UntilWatcher::new("STOPHERE".into());
+        assert!(w.feed(b"some output STOPHERE more"));
+    }
+
+    /// needle が chunk 境界を跨ぐ場合も carry 経由で正しく match。
+    #[test]
+    fn until_watcher_matches_across_chunk_boundary() {
+        let mut w = UntilWatcher::new("STOPHERE".into());
+        // 1 chunk 目: needle の前半 (= partial match) のみ
+        assert!(!w.feed(b"prefix STOP"));
+        // 2 chunk 目: needle の後半。carry + new で連結し match
+        assert!(w.feed(b"HERE suffix"));
+    }
+
+    /// needle 不一致なら false を返し続ける + carry に末尾 (needle.len()-1)
+    /// bytes だけ残る (= memory が肥大しない)。
+    #[test]
+    fn until_watcher_misses_keep_only_tail_in_carry() {
+        let mut w = UntilWatcher::new("XYZ".into());
+        assert!(!w.feed(b"abcdefghij"));
+        // needle.len() - 1 = 2 bytes 残る (= "ij")
+        assert_eq!(w.carry.len(), 2);
+        assert_eq!(w.carry, b"ij");
+        assert!(!w.feed(b"klmnop"));
+        // carry が肥大しないこと: 高々 needle.len() - 1
+        assert_eq!(w.carry.len(), 2);
+    }
+
+    /// empty needle は無効 (= 何が入っても false)。`DaemonConfig` 側で空 string
+    /// は filter されているが、defense-in-depth で watcher 単体でも false を返す。
+    #[test]
+    fn until_watcher_empty_needle_never_matches() {
+        let mut w = UntilWatcher::new(String::new());
+        assert!(!w.feed(b"anything"));
     }
 
     /// R4-H14: `ChildLifecycle` は SIGSTOP / SIGCONT の transition を取りこぼさず、
@@ -1185,6 +1301,53 @@ mod tests {
         let session = Session::start(cfg).expect("start");
         let handle = std::thread::spawn(move || session.serve());
         (session_id, sock_path, dir, handle)
+    }
+
+    /// R5-FB1: `run --until PATTERN` を DaemonConfig.until で渡すと、子 PTY
+    /// 出力に PATTERN が現れた瞬間 daemon が子に SIGTERM を投げて session が
+    /// 終了する。bash で `STOPHERE` を出力したあと `SHOULDNOT` を出すコマンドを
+    /// 走らせ、`SHOULDNOT` の前に session が終わる (= until 機能配線済) ことを
+    /// 確認する。
+    #[test]
+    fn run_until_terminates_child_on_pattern_match() {
+        let dir = make_temp_socket_dir();
+        let sock_path = dir.path().join("until.sock");
+        // bash -c 'echo START; sleep 0.3; echo STOPHERE; sleep 5; echo SHOULDNOT'
+        // STOPHERE 直後に SIGTERM が届けば、5 秒の sleep を待たずに即終了するはず。
+        let cmd = vec![
+            "/bin/bash".into(),
+            "-c".into(),
+            "echo START; sleep 0.3; echo STOPHERE; sleep 5; echo SHOULDNOT".into(),
+        ];
+        let mut cfg = DaemonConfig::new("until-test", sock_path.clone(), cmd);
+        cfg.until = Some("STOPHERE".into());
+        let session = Session::start(cfg).expect("start");
+        let handle = std::thread::spawn(move || session.serve());
+
+        // session 終了を 3s 以内に確認する (= 5 秒 sleep の前に SIGTERM が
+        // 効いていることの保証)。
+        let start = std::time::Instant::now();
+        let mut joined = None;
+        while start.elapsed() < Duration::from_secs(3) {
+            if handle.is_finished() {
+                joined = Some(handle.join());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let res = joined.expect("daemon should terminate within 3s after --until match");
+        // SIGTERM で死ぬので shell convention の 128 + 15 = 143 が一般的。
+        // ただし bash の trap 等で異なる場合もあるので exit code 自体は緩く確認。
+        let exit = res.expect("daemon thread").expect("daemon serve result");
+        assert!(
+            exit != 0,
+            "process killed by --until should exit non-zero, got {exit}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "session must end within 3s of STOPHERE; elapsed = {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

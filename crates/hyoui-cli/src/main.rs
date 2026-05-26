@@ -199,6 +199,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
             cfg.socket.clone(),
             cols,
             rows,
+            cfg.until.clone(),
             cfg.command,
         );
     }
@@ -225,6 +226,13 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     if let Ok(token) = std::env::var("HYOUI_LOCK_TOKEN") {
         if !token.is_empty() {
             dcfg.expected_token = Some(token);
+        }
+    }
+    // R5-FB1: `--until PATTERN` を daemon 側に配線 (旧版は cli で parse される
+    // だけで daemon に渡っていなかった)。空 string は無効として扱う。
+    if let Some(needle) = cfg.until.clone() {
+        if !needle.is_empty() {
+            dcfg.until = Some(needle);
         }
     }
 

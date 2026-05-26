@@ -26,6 +26,7 @@ pub fn run_detached_parent(
     socket_override: Option<String>,
     cols: u16,
     rows: u16,
+    until: Option<String>,
     cmd: Vec<String>,
 ) -> ExitCode {
     let session_id = session_id_override.unwrap_or_else(socket_path::auto_session_id);
@@ -65,6 +66,12 @@ pub fn run_detached_parent(
     child.arg(format!("--cols={cols}"));
     child.arg(format!("--rows={rows}"));
     child.arg(format!("--ready-fd={wr_raw}"));
+    // R5-FB1: --until PATTERN を daemon 子に伝搬。空 string は無効。
+    if let Some(needle) = until.as_deref() {
+        if !needle.is_empty() {
+            child.arg(format!("--until={needle}"));
+        }
+    }
     child.arg("--");
     for c in cmd {
         child.arg(c);
@@ -116,6 +123,7 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
     let mut cols: u16 = 80;
     let mut rows: u16 = 24;
     let mut ready_fd: Option<i32> = None;
+    let mut until: Option<String> = None;
     let mut cmd: Vec<String> = Vec::new();
     let mut in_cmd = false;
     for arg in args {
@@ -137,6 +145,9 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
             rows = v.parse().unwrap_or(24);
         } else if let Some(v) = arg.strip_prefix("--ready-fd=") {
             ready_fd = v.parse().ok();
+        } else if let Some(v) = arg.strip_prefix("--until=") {
+            // R5-FB1: 親から渡された needle pattern
+            until = Some(v.to_string());
         }
     }
 
@@ -165,6 +176,12 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
     if let Ok(token) = std::env::var("HYOUI_LOCK_TOKEN") {
         if !token.is_empty() {
             dcfg.expected_token = Some(token);
+        }
+    }
+    // R5-FB1: --until pattern を daemon に配線。
+    if let Some(needle) = until {
+        if !needle.is_empty() {
+            dcfg.until = Some(needle);
         }
     }
 
