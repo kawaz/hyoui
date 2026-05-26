@@ -5,21 +5,15 @@
 //! * `Help`     — print usage to stdout (exit 0 for explicit help, exit 2 for
 //!   unknown subcommands so callers can detect misuse from the status code).
 //! * `Version`  — print `hyoui <VERSION>` and exit 0.
-//! * `Run(cfg)` — drive the PTY proxy via [`hyoui::agent::Agent`]; propagate
-//!   the child's exit code (masked to 8 bits, matching shell convention).
+//! * `Run(cfg)` — v0.1.0 で daemon module 経由に置換予定。現状は stub (PoC 削除後)。
 //! * `Completion { shell }` — emit a hand-written completion script.
 //! * `Error`    — print the diagnostic to stderr and exit 2.
-//!
-//! The `Agent` is consumed by `run()` (RAII cleanup on Drop); we use the
-//! null observer because the binary doesn't surface lifecycle events yet.
 
 #![forbid(unsafe_code)]
 
 use std::process::ExitCode;
 
-use hyoui::agent::Agent;
 use hyoui::cli::{Command, HelpTopic, parse_args, usage};
-use hyoui::observer::NullObserver;
 
 mod completion;
 
@@ -49,24 +43,12 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
 
-        Command::Run(cfg) => match Agent::new(cfg, Box::new(NullObserver::new())) {
-            Ok(agent) => match agent.run() {
-                Ok(code) => {
-                    // Shells mask exit codes to 8 bits; mirror that so a
-                    // child that exited 256 doesn't silently become 0.
-                    let masked = u8::try_from(code & 0xFF).unwrap_or(255);
-                    ExitCode::from(masked)
-                }
-                Err(e) => {
-                    eprintln!("hyoui: {e}");
-                    ExitCode::from(1)
-                }
-            },
-            Err(e) => {
-                eprintln!("hyoui: {e}");
-                ExitCode::from(1)
-            }
-        },
+        Command::Run(_cfg) => {
+            // PoC 段階の Agent 実装は DR-0008 確定に伴い削除済み。
+            // v0.1.0 で新 daemon module 経由に置換される予定。
+            eprintln!("hyoui: `run` は v0.1.0 で再実装中です (PoC Agent は削除済み)");
+            ExitCode::from(70) // EX_SOFTWARE: temporarily unimplemented
+        }
 
         Command::Completion { shell } => {
             print!("{}", completion::script(shell));

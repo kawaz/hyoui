@@ -1,35 +1,29 @@
 //! `hyoui` core library.
 //!
-//! Stage 2 ships the `sys` layer only: low-level syscall wrappers, RAII
-//! resource handles, and a typed `Error` enum that the upper layers
-//! (observer, agent, cli) will consume.
+//! v0.1.0 に向けて再構築中。DR-0008 (CBOR ハイブリッド framing) 確定後、
+//! 旧 PoC 産物の `agent` / 旧 length-prefixed `protocol` モジュールを削除済み。
+//! 新規 `protocol` / `daemon` / `client` モジュールが追って実装される。
 //!
 //! ## Unsafe policy
 //!
-//! `unsafe` is confined to exactly two modules:
+//! `unsafe` is confined to:
 //!
 //! * [`sys::raw`] — child process spawn (`forkpty`/`login_tty`), winsize
 //!   `ioctl`, and libc constants that are not available through `nix`.
 //! * [`sys::signal`] — `sigaction` installation, async-signal-safe handlers,
 //!   and the self-pipe write end.
 //!
-//! Every other module (including everything in the future agent/cli crates)
-//! must reach syscalls through the safe wrappers re-exported from `sys`.
+//! Every other module must reach syscalls through the safe wrappers
+//! re-exported from `sys`.
 
 #![cfg_attr(not(test), warn(missing_docs))]
 
 pub mod sys;
 
-// Stage 3 modules (doc-complete; lints enabled).
 pub mod cli;
 pub mod observer;
-pub mod protocol;
 
-// Stage 4: agent — the PTY-proxy event loop wired together from the
-// `sys`, `observer`, `protocol`, and `cli` modules above.
-pub mod agent;
-
-// v0.1.0 modules (PoC 07/08 から正規実装に取り込み):
+// v0.1.0 modules (PoC 07/08 から正規実装に取り込み済み):
 //
 //   * `scrollback` — daemon が子 pty 出力を timestamped chunks の ring buffer に蓄積
 //                    (DR-0006 §11.6, finding 2026-05-26-scrollback-ring-buffer.md)
