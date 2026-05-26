@@ -21,6 +21,7 @@
 //! - finding 2026-05-26-multi-attach (poll パターン)
 //! - finding 2026-05-26-daemon-fork (`--detached` 起動の pipe 同期、Phase 7 で使用予定)
 
+mod accept;
 mod broadcast;
 mod config;
 mod control;
