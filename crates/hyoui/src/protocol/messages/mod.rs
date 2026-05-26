@@ -43,7 +43,9 @@ mod wait;
 
 pub use control::{Resize, Signal};
 pub use error::{ErrorCode, ErrorMessage};
-pub use handshake::{HandshakeRequest, HandshakeResponse, Mode};
+pub use handshake::{
+    HandshakeRequest, HandshakeResponse, MAX_CAP_LEN, MAX_CAPS_COUNT, MAX_TOKEN_LEN, Mode,
+};
 pub use lifecycle::{Detach, DetachTarget, Kill};
 pub use lock::{
     LeaderNotify, LockAcquire, LockRelease, LockResponse, LockResult, ModeChange, SessionMode,

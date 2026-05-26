@@ -29,7 +29,10 @@ use std::sync::atomic::AtomicUsize;
 use std::time::Instant;
 
 use crate::Error;
-use crate::protocol::messages::{ErrorCode, ErrorMessage, LeaderNotify, ModeChange, SessionMode};
+use crate::protocol::messages::{
+    ErrorCode, ErrorMessage, LeaderNotify, MAX_CAP_LEN, MAX_CAPS_COUNT, MAX_TOKEN_LEN, ModeChange,
+    SessionMode,
+};
 use crate::protocol::{
     ControlMessage, Frame, HandshakeRequest, HandshakeResponse, MVP_CAPS, TYPE_CBOR_CONTROL,
     Transport, UnixStreamTransport, intersect_caps,
@@ -183,6 +186,25 @@ fn do_handshake_stage(
         _ => return Err(Error::Invalid("first message must be handshake.request")),
     };
 
+    // R5-H10: 認証 (token 検証) より前に caps / token の長さを cap する。
+    // 旧実装は serde decode 通過した HandshakeRequest を無条件で握っており、
+    // 1 worker あたり 16 MiB frame 上限ぎりぎりの caps/token を保持できた。
+    // `MAX_PENDING_HANDSHAKES = 64` と組み合わさると認証前段階で
+    // 1 GiB 級 transient peak が成立する (= memory exhaustion DoS)。
+    // 違反は ProtocolMalformed として明示 error 通知 → worker drop で
+    // 当該 memory を即解放する。
+    if let Err(msg) = validate_handshake_lengths(&req) {
+        let body = ControlMessage::Error(ErrorMessage {
+            code: ErrorCode::ProtocolMalformed,
+            message: msg.into(),
+            details: None,
+        })
+        .encode_to_vec()
+        .map_err(|_| Error::Invalid("handshake length error encode failed"))?;
+        let _ = Frame::cbor_control(body).encode_to(writer_main);
+        return Err(Error::Invalid("handshake field length exceeds limit"));
+    }
+
     // token validation: `config.expected_token` が Some なら client が同一 token を
     // 提示する必要あり。不一致なら handshake を拒否。constant-time 比較で timing leak
     // 回避。
@@ -213,6 +235,27 @@ fn do_handshake_stage(
     let intersect = intersect_caps(&req.caps, &mvp);
 
     Ok((req, intersect))
+}
+
+/// R5-H10: `HandshakeRequest` の caps / token の長さを cap する。
+///
+/// 違反時は人間可読な reason を `Err` で返す。caller は ProtocolMalformed の
+/// error frame として client に通知してから worker を drop する。
+fn validate_handshake_lengths(req: &HandshakeRequest) -> Result<(), &'static str> {
+    if req.caps.len() > MAX_CAPS_COUNT {
+        return Err("handshake.request.caps exceeds MAX_CAPS_COUNT");
+    }
+    for cap in &req.caps {
+        if cap.len() > MAX_CAP_LEN {
+            return Err("handshake.request.caps[*] exceeds MAX_CAP_LEN");
+        }
+    }
+    if let Some(tok) = req.token.as_deref()
+        && tok.len() > MAX_TOKEN_LEN
+    {
+        return Err("handshake.request.token exceeds MAX_TOKEN_LEN");
+    }
+    Ok(())
 }
 
 /// R4-C3: handshake worker から届いた中間結果を `AcceptedClient` に整える。
@@ -369,4 +412,67 @@ pub(super) fn process_pending_handshakes(
 /// hyoui 内 helper を経由することで「ここで所有権が移る」点を可視化する。
 pub(super) fn unix_stream_from_owned_fd(fd: OwnedFd) -> UnixStream {
     UnixStream::from(fd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::Mode;
+
+    fn req_with(caps: Vec<String>, token: Option<String>) -> HandshakeRequest {
+        HandshakeRequest {
+            caps,
+            mode: Mode::Rw,
+            exclusive: false,
+            detach_others: false,
+            token,
+        }
+    }
+
+    /// R5-H10: caps が `MAX_CAPS_COUNT` 以下なら通過。
+    #[test]
+    fn handshake_accepts_caps_at_max_count() {
+        let caps: Vec<String> = (0..MAX_CAPS_COUNT).map(|i| format!("c{i}")).collect();
+        validate_handshake_lengths(&req_with(caps, None)).expect("must accept");
+    }
+
+    /// R5-H10: caps の要素数が `MAX_CAPS_COUNT` を超えると reject。
+    #[test]
+    fn handshake_rejects_too_many_caps() {
+        let caps: Vec<String> = (0..=MAX_CAPS_COUNT).map(|i| format!("c{i}")).collect();
+        let err =
+            validate_handshake_lengths(&req_with(caps, None)).expect_err("must reject excess caps");
+        assert!(err.contains("MAX_CAPS_COUNT"), "reason was: {err}");
+    }
+
+    /// R5-H10: cap 1 個の byte 長が `MAX_CAP_LEN` を超えると reject。
+    #[test]
+    fn handshake_rejects_long_cap_string() {
+        let long_cap = "x".repeat(MAX_CAP_LEN + 1);
+        let err = validate_handshake_lengths(&req_with(vec![long_cap], None))
+            .expect_err("must reject long cap");
+        assert!(err.contains("MAX_CAP_LEN"), "reason was: {err}");
+    }
+
+    /// R5-H10: token が `MAX_TOKEN_LEN` 以下なら通過。
+    #[test]
+    fn handshake_accepts_token_at_max_len() {
+        let tok = "a".repeat(MAX_TOKEN_LEN);
+        validate_handshake_lengths(&req_with(Vec::new(), Some(tok))).expect("must accept");
+    }
+
+    /// R5-H10: token の byte 長が `MAX_TOKEN_LEN` を超えると reject。
+    #[test]
+    fn handshake_rejects_long_token() {
+        let long_tok = "a".repeat(MAX_TOKEN_LEN + 1);
+        let err = validate_handshake_lengths(&req_with(Vec::new(), Some(long_tok)))
+            .expect_err("must reject long token");
+        assert!(err.contains("MAX_TOKEN_LEN"), "reason was: {err}");
+    }
+
+    /// R5-H10: token = None は token 長検査をスキップ (= 通過)。
+    #[test]
+    fn handshake_accepts_no_token() {
+        validate_handshake_lengths(&req_with(Vec::new(), None)).expect("must accept");
+    }
 }

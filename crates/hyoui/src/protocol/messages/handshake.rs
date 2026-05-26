@@ -7,6 +7,37 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+// === handshake field 長さの上限 (R5-H10) ===
+//
+// HandshakeRequest は **認証前** に CBOR decode される (= token 検証より前)。
+// schema 上は `caps: Vec<String>` / `token: Option<String>` で長さ無制限のため、
+// 16 MiB frame 上限ぎりぎりまで自由に詰められる。これと
+// `MAX_PENDING_HANDSHAKES = MAX_CLIENTS_PER_DAEMON (64)` を組み合わせると、
+// 認証前段階で 1 GiB 級の transient peak (= 64 worker × 16 MiB) が成立し、
+// memory exhaustion 経由の daemon kill / 同居 process 巻き添えが起きる。
+//
+// 対策として decode 直後に caps / token の長さを cap する:
+//
+// - [`MAX_CAPS_COUNT`]: `caps` Vec の要素数上限 (= MVP_CAPS の 4 倍弱の余裕)
+// - [`MAX_CAP_LEN`]: 1 cap string の byte 長上限 (DR-0008 §2.2 の dotted name は
+//   実運用で 16 byte 程度、64 で十分)
+// - [`MAX_TOKEN_LEN`]: token string の byte 長上限 (128-bit hex = 32 byte が
+//   `generate_lock_token` の出力、256 で 8 倍の余裕)
+//
+// 違反時は [`super::ErrorCode::ProtocolMalformed`] を返して当該 worker を即終了
+// (= memory を抱え込まない)。serde の decode 自体は通過するため、validate は
+// `daemon::accept::do_handshake_stage` 側で行う。
+
+/// `HandshakeRequest.caps` の最大要素数。
+pub const MAX_CAPS_COUNT: usize = 32;
+
+/// `HandshakeRequest.caps` の各 cap string の最大 byte 長。
+pub const MAX_CAP_LEN: usize = 64;
+
+/// `HandshakeRequest.token` の最大 byte 長。`generate_lock_token` 出力は 32 byte、
+/// 8 倍の余裕を持たせる (= 将来 token format を変えても 256 byte 以内で済む想定)。
+pub const MAX_TOKEN_LEN: usize = 256;
+
 /// client / daemon の動作 mode (DR-0006)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
