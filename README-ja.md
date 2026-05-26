@@ -2,6 +2,10 @@
 
 > [English](./README.md) | 日本語
 
+[![CI](https://github.com/kawaz/hyoui/actions/workflows/ci.yml/badge.svg)](https://github.com/kawaz/hyoui/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/kawaz/hyoui?include_prereleases&sort=semver)](https://github.com/kawaz/hyoui/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
 **hyoui** `/ˈhjoʊi/`（ヒョーイ・憑依）— `claude` / REPL / TUI を **外側から** CLI で
 駆動する。prefix キーも in-band escape も無い、PTY 透過ラッパー。
 

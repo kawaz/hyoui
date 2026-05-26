@@ -388,9 +388,10 @@ Wild debugger / Competitive 分析 / Rust API 設計
   - 出典: Classic (R5-CLS-M2) / R4-L1 格上げ
   - 提案: R5 のうちに jj 1 change で削除、R4-L1 を done に
   - 解消: `crates/hyoui/src/observer.rs` を削除、`lib.rs` の `pub mod observer;` も除去。外部参照 0 件を grep で確認済み。R4-L1 も合わせて clean up。
-- [ ] **R5-M31** ライセンス badge / CI / release badge を README に置く
+- [done] **R5-M31** ライセンス badge / CI / release badge を README に置く
   - 出典: Sales (R5-SAL-M1, R5-SAL-M2)
   - 提案: README L1 直下に CI status / latest release / MIT license / (将来) crates.io / Homebrew badge
+  - 解消: README.md / README-ja.md の言語切替リンク直下に CI status / Release / MIT license の 3 badge を追加。crates.io / Homebrew は未公開なので将来追加 (R4 backlog item)。
 - [ ] **R5-M32** `.github/ISSUE_TEMPLATE/` 不在 = 困った時の聞き先不明
   - 出典: Sales (R5-SAL-M3)
   - 提案: bug_report.md + feature_request.md 最小追加、README に "Questions / Issues" セクション 1 行

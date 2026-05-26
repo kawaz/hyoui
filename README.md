@@ -2,6 +2,10 @@
 
 > English | [日本語](./README-ja.md)
 
+[![CI](https://github.com/kawaz/hyoui/actions/workflows/ci.yml/badge.svg)](https://github.com/kawaz/hyoui/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/kawaz/hyoui?include_prereleases&sort=semver)](https://github.com/kawaz/hyoui/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
 **hyoui** `/ˈhjoʊi/` (from Japanese 憑依, "spirit possession") — drive `claude`,
 REPLs, and TUIs **from the outside** via CLI. A transparent PTY wrapper with no
 prefix keys and no in-band escape.
