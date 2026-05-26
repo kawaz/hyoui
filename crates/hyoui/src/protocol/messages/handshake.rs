@@ -3,6 +3,8 @@
 //! kind の dispatch (= `kind = "handshake.request"` で variant 選択) は
 //! 親 [`super::ControlMessage`] enum 側で扱う。本 module は payload struct のみ。
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// client / daemon の動作 mode (DR-0006)。
@@ -18,7 +20,9 @@ pub enum Mode {
 }
 
 /// `handshake.request` payload。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` は手書き impl で `token` を `<redacted>` に置換する (secret 漏洩防止)。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct HandshakeRequest {
     /// 自分 (client) が話せる capability 一覧。
@@ -31,6 +35,26 @@ pub struct HandshakeRequest {
     pub detach_others: bool,
     /// HYOUI_LOCK_TOKEN env から継承した token (= null なら未提示)。
     pub token: Option<String>,
+}
+
+impl fmt::Debug for HandshakeRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HandshakeRequest")
+            .field("caps", &self.caps)
+            .field("mode", &self.mode)
+            .field("exclusive", &self.exclusive)
+            .field("detach_others", &self.detach_others)
+            .field("token", &redact_token(self.token.as_deref()))
+            .finish()
+    }
+}
+
+/// token を Debug 出力用に redact する (Some → `"<redacted>"`、None → `None`)。
+fn redact_token(token: Option<&str>) -> &'static str {
+    match token {
+        Some(_) => "Some(\"<redacted>\")",
+        None => "None",
+    }
 }
 
 /// `handshake.response` payload。

@@ -533,4 +533,106 @@ mod tests {
         });
         assert_eq!(msg, expected);
     }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // R4-H8: token を含む payload の Debug 出力が raw token を含まないこと。
+    //
+    // ログ・panic message 等で secret token が漏洩しないよう、`Debug` は
+    // 手書き impl で token を `<redacted>` に置換する。本テスト群は raw token
+    // 文字列が Debug 出力に含まれないことを保証する regression test。
+    // ──────────────────────────────────────────────────────────────────────
+
+    const SECRET_TOKEN: &str = "super-secret-token-value-do-not-leak";
+
+    #[test]
+    fn handshake_request_debug_redacts_token() {
+        let req = HandshakeRequest {
+            caps: vec!["data".into()],
+            mode: Mode::Rw,
+            exclusive: false,
+            detach_others: false,
+            token: Some(SECRET_TOKEN.into()),
+        };
+        let s = format!("{req:?}");
+        assert!(
+            !s.contains(SECRET_TOKEN),
+            "raw token must not appear in Debug output: {s}"
+        );
+        assert!(
+            s.contains("<redacted>"),
+            "Debug output must contain <redacted> marker: {s}"
+        );
+    }
+
+    #[test]
+    fn handshake_request_debug_none_token() {
+        let req = HandshakeRequest {
+            caps: vec![],
+            mode: Mode::Ro,
+            exclusive: false,
+            detach_others: false,
+            token: None,
+        };
+        let s = format!("{req:?}");
+        // None の場合は "<redacted>" を出さない (情報量を維持)
+        assert!(s.contains("None"), "None token must render as None: {s}");
+        assert!(
+            !s.contains("<redacted>"),
+            "None token must not be wrapped as redacted: {s}"
+        );
+    }
+
+    #[test]
+    fn lock_response_debug_redacts_token() {
+        let resp = LockResponse {
+            result: LockResult::Acquired,
+            token: Some(SECRET_TOKEN.into()),
+            queue_position: None,
+        };
+        let s = format!("{resp:?}");
+        assert!(
+            !s.contains(SECRET_TOKEN),
+            "raw token must not appear in Debug output: {s}"
+        );
+        assert!(
+            s.contains("<redacted>"),
+            "Debug output must contain <redacted> marker: {s}"
+        );
+    }
+
+    #[test]
+    fn lock_release_debug_redacts_token() {
+        let rel = LockRelease {
+            token: SECRET_TOKEN.into(),
+        };
+        let s = format!("{rel:?}");
+        assert!(
+            !s.contains(SECRET_TOKEN),
+            "raw token must not appear in Debug output: {s}"
+        );
+        assert!(
+            s.contains("<redacted>"),
+            "Debug output must contain <redacted> marker: {s}"
+        );
+    }
+
+    #[test]
+    fn control_message_debug_redacts_token_via_variant() {
+        // ControlMessage は #[derive(Debug)] のままだが、内部 struct が
+        // 手書き Debug を持つので variant 経由でも redact されることを確認。
+        let msg = ControlMessage::LockResponse(LockResponse {
+            result: LockResult::Acquired,
+            token: Some(SECRET_TOKEN.into()),
+            queue_position: None,
+        });
+        let s = format!("{msg:?}");
+        assert!(
+            !s.contains(SECRET_TOKEN),
+            "raw token must not leak through ControlMessage Debug: {s}"
+        );
+        assert!(
+            s.contains("<redacted>"),
+            "ControlMessage Debug must show redacted marker: {s}"
+        );
+    }
 }

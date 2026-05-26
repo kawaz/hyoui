@@ -1,6 +1,8 @@
 //! `lock.acquire` / `lock.response` / `lock.release` / `leader.notify` /
 //! `mode.change` payload (DR-0008 §2.3)。
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use super::Mode;
@@ -38,7 +40,9 @@ pub enum LockResult {
 }
 
 /// `lock.response` payload。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` は手書き impl で `token` を `<redacted>` に置換する (secret 漏洩防止)。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct LockResponse {
     /// 取得結果。
@@ -51,12 +55,38 @@ pub struct LockResponse {
     pub queue_position: Option<u32>,
 }
 
+impl fmt::Debug for LockResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LockResponse")
+            .field("result", &self.result)
+            .field(
+                "token",
+                &match self.token {
+                    Some(_) => "Some(\"<redacted>\")",
+                    None => "None",
+                },
+            )
+            .field("queue_position", &self.queue_position)
+            .finish()
+    }
+}
+
 /// `lock.release` payload。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` は手書き impl で `token` を `<redacted>` に置換する (secret 漏洩防止)。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct LockRelease {
     /// 保持していた token (daemon が照合)。
     pub token: String,
+}
+
+impl fmt::Debug for LockRelease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LockRelease")
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// `leader.notify` payload (daemon → all clients broadcast)。
