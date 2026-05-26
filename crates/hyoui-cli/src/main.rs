@@ -125,7 +125,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let daemon_handle = std::thread::spawn(move || session.run());
+    let daemon_handle = std::thread::spawn(move || session.serve());
 
     // client side: connect + attach
     let opts = AttachOptions::default();

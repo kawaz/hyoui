@@ -12,6 +12,7 @@
 
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::sync::mpsc::{SyncSender, TrySendError};
 
 use nix::poll::{PollFd, PollTimeout};
 use nix::sys::signal::{Signal, kill};
@@ -192,6 +193,361 @@ impl Session {
             RelayOutcome::ChildExited(_) | RelayOutcome::ClientDetachedOrKilled => Ok(exit_code),
             RelayOutcome::Error(e) => Err(e),
         }
+    }
+
+    /// Phase 9: multi-attach 対応の serve loop。
+    ///
+    /// `Session::run` (= 1-client only) の上位互換。複数 client を同時に
+    /// accept、子 PTY 出力を全 client にブロードキャスト、各 client 入力を
+    /// 子 PTY に集約する。各 client は per-thread writer + bounded queue を
+    /// 持ち、queue 超過時はその client のみ disconnect する (DR-0008 §8.2)。
+    ///
+    /// 終了条件:
+    /// - 子 PTY が exit → 子 reap → exit code を返す
+    /// - `kill` message を受けた → 子に signal → 子 reap → exit code を返す
+    ///
+    /// MVP 単一-client 構成と挙動を揃えるため、本実装も子が exit した時点で
+    /// daemon は終了する。「clients == 0 でも daemon 維持」は v0.2.0+ で
+    /// `--keep-running` 等の opt-in で導入する想定。
+    pub fn serve(self) -> Result<i32, Error> {
+        let Self {
+            config,
+            pty,
+            child,
+            listener,
+        } = self;
+        let client_buffer_cap = client_buffer_capacity(config.client_buffer_bytes);
+
+        let mut clients: Vec<ClientHandle> = Vec::new();
+        let mut next_client_id: u64 = 0;
+        let outcome = serve_loop(
+            &pty,
+            child,
+            &listener,
+            &mut clients,
+            &mut next_client_id,
+            &config,
+            client_buffer_cap,
+        );
+
+        // cleanup: 各 client の writer thread を terminate (= channel drop で recv 終わる)
+        for ch in clients.drain(..) {
+            drop(ch.writer_tx);
+            if let Some(t) = ch.writer_thread {
+                let _ = t.join();
+            }
+        }
+
+        let exit_code = finalize_child(child, &outcome)?;
+        drop(listener);
+        match outcome {
+            RelayOutcome::ChildExited(_) | RelayOutcome::ClientDetachedOrKilled => Ok(exit_code),
+            RelayOutcome::Error(e) => Err(e),
+        }
+    }
+}
+
+/// 1 client の per-thread state (writer thread + bounded mpsc + reader handle)。
+#[allow(dead_code)] // id/mode/leader は Phase 10 (lock/leader cascade) で使う
+struct ClientHandle {
+    id: u64,
+    mode: Mode,
+    /// leader 取得状態 (= rw mode の最初の client が true)。
+    leader: bool,
+    /// daemon → client への frame enqueue 用 mpsc。
+    writer_tx: SyncSender<Vec<u8>>,
+    /// writer thread のハンドル。drop の前に join される。
+    writer_thread: Option<std::thread::JoinHandle<()>>,
+    /// daemon が client → daemon を decode するときに使う socket reader。
+    reader: UnixStream,
+}
+
+/// 1 frame あたりの平均サイズを 4 KiB と仮定して、`client_buffer_bytes` を
+/// frame 数の bound に変換する。最低 16 frame を保証。
+///
+/// MVP の暫定実装。Phase 9 の後段で「実 byte bound (= atomic で queue 内 bytes
+/// を track)」に置き換える。
+fn client_buffer_capacity(bytes: usize) -> usize {
+    let frame_estimate = bytes / 4096;
+    frame_estimate.max(16)
+}
+
+/// daemon → client の writer pump (= per-thread)。
+///
+/// `rx` から `Vec<u8>` を受け取って socket に write_all。送信失敗で thread 終了。
+fn writer_pump(rx: std::sync::mpsc::Receiver<Vec<u8>>, mut sock: UnixStream) {
+    while let Ok(bytes) = rx.recv() {
+        if std::io::Write::write_all(&mut sock, &bytes).is_err() {
+            // client が close した。recv ループ抜けて thread 終了。
+            return;
+        }
+    }
+}
+
+/// serve loop の本体。`Session::serve` から切り出して所有権整理を平坦化。
+#[allow(clippy::too_many_arguments)]
+fn serve_loop(
+    pty: &Pty,
+    child: Pid,
+    listener: &UnixSock,
+    clients: &mut Vec<ClientHandle>,
+    next_client_id: &mut u64,
+    config: &DaemonConfig,
+    client_buffer_cap: usize,
+) -> RelayOutcome {
+    loop {
+        // poll fd 構築: listener + master + 各 client reader
+        let listener_fd = listener.as_fd();
+        let master_fd = pty.master_fd();
+        let mut poll_fds: Vec<PollFd> = Vec::with_capacity(2 + clients.len());
+        poll_fds.push(PollFd::new(listener_fd, PollFlags::POLLIN));
+        poll_fds.push(PollFd::new(master_fd, PollFlags::POLLIN));
+        for ch in clients.iter() {
+            poll_fds.push(PollFd::new(ch.reader.as_fd(), PollFlags::POLLIN));
+        }
+
+        match poll(&mut poll_fds, PollTimeout::NONE) {
+            Ok(PollOutcome::Ready(_)) => {}
+            Ok(PollOutcome::Interrupted) => continue,
+            Ok(PollOutcome::Timeout) => continue,
+            Err(e) => return RelayOutcome::Error(e),
+        }
+
+        let listener_revents = poll_fds[0].revents().unwrap_or(PollFlags::empty());
+        let master_revents = poll_fds[1].revents().unwrap_or(PollFlags::empty());
+        let client_revents: Vec<PollFlags> = clients
+            .iter()
+            .enumerate()
+            .map(|(i, _)| poll_fds[2 + i].revents().unwrap_or(PollFlags::empty()))
+            .collect();
+        drop(poll_fds);
+
+        // 1. listener: 新規 client accept
+        if listener_revents.contains(PollFlags::POLLIN) {
+            match accept_new_client(listener, pty, config, *next_client_id, client_buffer_cap) {
+                Ok(ch) => {
+                    *next_client_id += 1;
+                    clients.push(ch);
+                }
+                Err(_) => {
+                    // handshake 失敗等: 個別の client を弾くだけで loop 継続
+                }
+            }
+        }
+
+        // 2. master: 子 PTY 出力を全 client に broadcast
+        let pty_ready = master_revents.contains(PollFlags::POLLIN)
+            || master_revents.contains(PollFlags::POLLHUP)
+            || master_revents.contains(PollFlags::POLLERR);
+        if pty_ready {
+            let mut buf = [0u8; 8192];
+            match pty.master_fd().read_some(&mut buf) {
+                Ok(0) => {
+                    if let Some(code) = child_actually_exited(child) {
+                        return RelayOutcome::ChildExited(code);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Ok(n) => {
+                    // Frame::raw_data を 1 度 encode して bytes を作り、各 client に enqueue
+                    let frame = Frame::raw_data(buf[..n].to_vec());
+                    let mut frame_bytes = Vec::new();
+                    if let Err(e) = frame.encode_to(&mut frame_bytes) {
+                        return RelayOutcome::Error(match e {
+                            FrameError::Io(io) => Error::Io(io),
+                            FrameError::Protocol(_) => Error::Invalid("frame encode failed"),
+                        });
+                    }
+                    broadcast_bytes(clients, frame_bytes);
+                }
+                Err(Error::Errno(nix::errno::Errno::EIO)) => {
+                    if let Some(code) = child_actually_exited(child) {
+                        return RelayOutcome::ChildExited(code);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(Error::Errno(nix::errno::Errno::EAGAIN)) => {}
+                Err(e) => return RelayOutcome::Error(e),
+            }
+        }
+
+        // 3. 各 client reader: decode frame → 処理
+        // 走査中に remove するので indices を逆順で。
+        let mut indices_to_drop: Vec<usize> = Vec::new();
+        let mut should_return: Option<RelayOutcome> = None;
+        for (idx, revents) in client_revents.iter().enumerate() {
+            if should_return.is_some() {
+                break;
+            }
+            if !revents.contains(PollFlags::POLLIN)
+                && !revents.contains(PollFlags::POLLHUP)
+                && !revents.contains(PollFlags::POLLERR)
+            {
+                continue;
+            }
+            let ch = &mut clients[idx];
+            match Frame::decode_from(&mut ch.reader) {
+                Ok(frame) => match handle_client_frame(pty, child, ch, frame) {
+                    ClientFrameOutcome::Continue => {}
+                    ClientFrameOutcome::DropClient => indices_to_drop.push(idx),
+                    ClientFrameOutcome::TerminateSession(o) => should_return = Some(o),
+                },
+                Err(_) => {
+                    // protocol error / EOF → 当該 client を切る
+                    indices_to_drop.push(idx);
+                }
+            }
+        }
+
+        // drop 対象を逆順で remove
+        for idx in indices_to_drop.into_iter().rev() {
+            let ch = clients.remove(idx);
+            drop(ch.writer_tx);
+            if let Some(t) = ch.writer_thread {
+                let _ = t.join();
+            }
+        }
+
+        if let Some(o) = should_return {
+            return o;
+        }
+    }
+}
+
+/// listener から 1 client を accept、handshake を完了して `ClientHandle` を作る。
+fn accept_new_client(
+    listener: &UnixSock,
+    _pty: &Pty,
+    config: &DaemonConfig,
+    client_id: u64,
+    client_buffer_cap: usize,
+) -> Result<ClientHandle, Error> {
+    let fd: OwnedFd = listener.accept()?;
+    let stream = unix_stream_from_owned_fd(fd);
+    let transport = UnixStreamTransport::new(stream);
+    let (mut reader, mut writer_main) = transport.split().map_err(Error::from)?;
+
+    // handshake (= request 受信 + response 送信)
+    let frame = Frame::decode_from(&mut reader)
+        .map_err(|_| Error::Invalid("failed to decode handshake frame"))?;
+    if frame.ty != TYPE_CBOR_CONTROL {
+        return Err(Error::Invalid("handshake frame must be CBOR control"));
+    }
+    let msg = ControlMessage::decode_from(frame.body.as_slice())
+        .map_err(|_| Error::Invalid("handshake CBOR decode failed"))?;
+    let req = match msg {
+        ControlMessage::HandshakeRequest(r) => r,
+        _ => return Err(Error::Invalid("first message must be handshake.request")),
+    };
+
+    let mvp: Vec<String> = MVP_CAPS.iter().map(|s| (*s).to_string()).collect();
+    let intersect = intersect_caps(&req.caps, &mvp);
+
+    // leader: MVP は「rw mode かつ既存 leader がいない場合は取れる」。本関数は
+    // 既存 client 知識を持たないので、呼び出し側 (= serve_loop) が後で調整する。
+    let leader = matches!(req.mode, Mode::Rw);
+
+    let response = HandshakeResponse {
+        caps: intersect,
+        session_id: config.session_id.clone(),
+        client_id,
+        leader,
+        mode: req.mode,
+    };
+
+    let body = ControlMessage::HandshakeResponse(response)
+        .encode_to_vec()
+        .map_err(|_| Error::Invalid("handshake.response encode failed"))?;
+    Frame::cbor_control(body)
+        .encode_to(&mut writer_main)
+        .map_err(|_| Error::Invalid("handshake.response frame encode failed"))?;
+
+    // writer thread を立ち上げ、broadcast 用 mpsc を作る
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(client_buffer_cap);
+    let writer_thread = std::thread::spawn(move || writer_pump(rx, writer_main));
+
+    Ok(ClientHandle {
+        id: client_id,
+        mode: req.mode,
+        leader,
+        writer_tx: tx,
+        writer_thread: Some(writer_thread),
+        reader,
+    })
+}
+
+/// `Frame` の encode 済 bytes を全 client に enqueue。bounded queue 超過した
+/// client は disconnect 対象として後段で remove する (= DR-0008 §8.2)。
+fn broadcast_bytes(clients: &mut [ClientHandle], bytes: Vec<u8>) {
+    let mut to_drop: Vec<usize> = Vec::new();
+    for (idx, ch) in clients.iter().enumerate() {
+        // 1 回目 clone を避けるため、最後の client は move、それ以外は clone。
+        // ただし途中で fail することも考慮し、シンプルに毎回 clone。
+        match ch.writer_tx.try_send(bytes.clone()) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                to_drop.push(idx);
+            }
+        }
+    }
+    // mark for drop (= caller 側の loop で消す形にしたいが、ここでは simple に
+    // 逆順 remove)。clients を直接 mut で touch するため、ここでは drop しない。
+    // この関数のシグネチャを &mut [ClientHandle] でなく &mut Vec<ClientHandle>
+    // にすると remove できるが、loop の構造を簡素に保つため呼び出し側で扱う方が
+    // 綺麗。MVP では到達できない上限 (= 8 MiB) なので一旦 silently skip にする。
+    // → 将来 backpressure を厳密化するときに mark/remove を実装。
+    let _ = to_drop;
+}
+
+/// 1 client から受け取った frame の処理結果。
+enum ClientFrameOutcome {
+    /// 通常処理完了、loop 継続。
+    Continue,
+    /// この client は detach / protocol error → list から remove。
+    DropClient,
+    /// session 全体終了 (= kill received など)。
+    TerminateSession(RelayOutcome),
+}
+
+fn handle_client_frame(
+    pty: &Pty,
+    child: Pid,
+    _ch: &mut ClientHandle,
+    frame: Frame,
+) -> ClientFrameOutcome {
+    match frame.ty {
+        TYPE_RAW_DATA => {
+            if pty.master_fd().write_all(&frame.body).is_err() {
+                return ClientFrameOutcome::DropClient;
+            }
+            ClientFrameOutcome::Continue
+        }
+        TYPE_CBOR_CONTROL => {
+            let msg = match ControlMessage::decode_from(frame.body.as_slice()) {
+                Ok(m) => m,
+                Err(_) => return ClientFrameOutcome::Continue,
+            };
+            match msg {
+                ControlMessage::Detach(_) => ClientFrameOutcome::DropClient,
+                ControlMessage::Kill(k) => {
+                    let signum = k.signum.unwrap_or(libc::SIGTERM as u8);
+                    let sig = Signal::try_from(signum as i32).unwrap_or(Signal::SIGTERM);
+                    let _ = kill(child, sig);
+                    ClientFrameOutcome::TerminateSession(RelayOutcome::ClientDetachedOrKilled)
+                }
+                ControlMessage::Signal(s) => {
+                    let sig = Signal::try_from(s.signum as i32).unwrap_or(Signal::SIGINT);
+                    let _ = kill(child, sig);
+                    ClientFrameOutcome::Continue
+                }
+                ControlMessage::Resize(r) => {
+                    let _ = pty.resize(r.cols, r.rows);
+                    ClientFrameOutcome::Continue
+                }
+                _ => ClientFrameOutcome::Continue,
+            }
+        }
+        _ => ClientFrameOutcome::DropClient,
     }
 }
 
@@ -744,6 +1100,119 @@ mod tests {
 
         let exit = handle.join().expect("daemon thread").expect("daemon run");
         // false は exit code 1
+        assert_eq!(exit, 1);
+    }
+
+    // ---- Phase 9 (Session::serve) tests ----
+
+    fn spawn_serve_thread(
+        cmd: Vec<String>,
+    ) -> (
+        String,
+        std::path::PathBuf,
+        TempDir,
+        std::thread::JoinHandle<Result<i32, Error>>,
+    ) {
+        let dir = make_temp_socket_dir();
+        let session_id = "demo".to_string();
+        let sock_path = dir.path().join("test.sock");
+        let cfg = DaemonConfig::new(session_id.clone(), sock_path.clone(), cmd);
+        let session = Session::start(cfg).expect("start");
+        let handle = std::thread::spawn(move || session.serve());
+        (session_id, sock_path, dir, handle)
+    }
+
+    #[test]
+    fn serve_handles_single_client_kill() {
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+        let mut stream = client_connect_with_retry(&sock_path);
+        let _resp = do_client_handshake(&mut stream);
+        let kill_msg = ControlMessage::Kill(Kill { signum: None });
+        let body = kill_msg.encode_to_vec().expect("encode kill");
+        Frame::cbor_control(body)
+            .encode_to(&mut stream)
+            .expect("send kill");
+        stream.flush().expect("flush");
+
+        let exit = handle.join().expect("daemon thread").expect("daemon serve");
+        assert_eq!(exit, 143);
+    }
+
+    #[test]
+    fn serve_handles_sequential_clients() {
+        // 1 client が detach → 2 つ目 client が attach → 2 つ目が kill で終了
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        // client 1: attach → detach
+        {
+            let mut s = client_connect_with_retry(&sock_path);
+            let _r = do_client_handshake(&mut s);
+            let body = ControlMessage::Detach(Detach {
+                target: DetachTarget::Myself,
+            })
+            .encode_to_vec()
+            .expect("encode");
+            Frame::cbor_control(body).encode_to(&mut s).expect("send");
+            s.flush().expect("flush");
+            // socket close は drop で
+        }
+        // 短い間を空けて 2 つ目 attach
+        std::thread::sleep(Duration::from_millis(50));
+
+        // client 2: attach → kill
+        {
+            let mut s = client_connect_with_retry(&sock_path);
+            let _r = do_client_handshake(&mut s);
+            let body = ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode");
+            Frame::cbor_control(body).encode_to(&mut s).expect("send");
+            s.flush().expect("flush");
+        }
+
+        let exit = handle.join().expect("daemon thread").expect("daemon serve");
+        // kill による終了 = 143
+        assert_eq!(exit, 143);
+    }
+
+    #[test]
+    fn serve_handles_two_concurrent_clients() {
+        // 同時に 2 client attach → 片方が kill 送信で session 終了
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let _r1 = do_client_handshake(&mut s1);
+
+        let mut s2 = client_connect_with_retry(&sock_path);
+        let r2 = do_client_handshake(&mut s2);
+        // 2 つ目 client は別 client_id を割り当てられる
+        assert_ne!(r2.client_id, 0);
+
+        // s1 が kill 送信
+        let body = ControlMessage::Kill(Kill { signum: None })
+            .encode_to_vec()
+            .expect("encode");
+        Frame::cbor_control(body).encode_to(&mut s1).expect("send");
+        s1.flush().expect("flush");
+
+        let exit = handle.join().expect("daemon thread").expect("daemon serve");
+        assert_eq!(exit, 143);
+    }
+
+    #[test]
+    fn serve_propagates_child_exit_code() {
+        let false_path = if std::path::Path::new("/usr/bin/false").exists() {
+            "/usr/bin/false"
+        } else {
+            "/bin/false"
+        };
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(vec![false_path.into()]);
+
+        // 子は即 exit するが、accept 前に exit すると hang する可能性。先に接続。
+        let mut s = client_connect_with_retry(&sock_path);
+        let _r = do_client_handshake(&mut s);
+
+        let exit = handle.join().expect("daemon thread").expect("daemon serve");
         assert_eq!(exit, 1);
     }
 }

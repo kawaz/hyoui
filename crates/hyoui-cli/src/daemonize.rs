@@ -177,8 +177,8 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
         // owned は scope 末で drop = close される。
     }
 
-    // session.run() でブロック (= accept + relay + finalize)
-    match session.run() {
+    // session.serve() でブロック (= multi-attach accept + relay + finalize)
+    match session.serve() {
         Ok(_code) => ExitCode::SUCCESS,
         Err(_) => ExitCode::from(1),
     }
