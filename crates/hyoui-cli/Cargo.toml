@@ -13,7 +13,7 @@ name = "hyoui"
 path = "src/main.rs"
 
 [dependencies]
-hyoui = { path = "../hyoui" }
+hyoui = { path = "../hyoui", version = "0.1" }
 nix = { workspace = true }
 
 [dev-dependencies]
