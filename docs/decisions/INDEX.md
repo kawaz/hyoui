@@ -16,6 +16,7 @@ hyoui の設計判断記録一覧。ファイル名は `DR-NNNN-title.md`（4 �
 - [DR-0009](./DR-0009-session-module-split.md) — `daemon/session.rs` 責務分割 (= R4-H6 解消方針、R4-M2 を Phase B で解消、pty/accept/broadcast/control/lock/wait/tail に module 分離、Phase A-E 段階移行)
 - [DR-0010](./DR-0010-v020-scope-and-serve-placement.md) — v0.2.0 scope re-scope + serve gateway 配置判断 (= R5-H4 / R5-H5、subcommand 11→7 への統合、serve を別 repo `kawaz/hyoui-serve` 切り出し、snapshot を v0.3.0 押下げ、DR-0007 部分上書き)
 - [DR-0011](./DR-0011-observability-strategy.md) — observability 戦略 (= R5-H1 解消方針、tracing 採用、Phase A: log instrument / Phase B: status --metrics / Phase C: detached child log file + hyoui logs、v0.2.0 serve gateway 前提)
+- [DR-0012](./DR-0012-signal-wire-name-not-number.md) — signal wire を u8 number から signal name string に変更 (= R5-POSIX-C1 / R5-C4 解消、DR-0008 §protocol 部分上書き、v0.2.0 breaking change、cross-OS serve gateway 対応)
 
 ## Archived
 
