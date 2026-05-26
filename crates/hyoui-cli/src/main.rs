@@ -129,6 +129,14 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     let mut dcfg = DaemonConfig::new(session_id.clone(), sock.clone(), cfg.command);
     dcfg.cols = cols;
     dcfg.rows = rows;
+    // Round2 #2: HYOUI_LOCK_TOKEN env を daemon の expected_token に配線。
+    // 値が空文字列の場合は Some("") にせず None 扱い (= 認証無効化) として扱う
+    // (= `expected_token = Some("")` で全 client 通過してしまう問題の二重防御)。
+    if let Ok(token) = std::env::var("HYOUI_LOCK_TOKEN") {
+        if !token.is_empty() {
+            dcfg.expected_token = Some(token);
+        }
+    }
 
     let session = match Session::start(dcfg) {
         Ok(s) => s,

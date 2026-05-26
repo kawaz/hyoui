@@ -74,6 +74,7 @@ attach detach prefix → v0.1.0 release prep。
   (= 1-shot CLI が response を 1 つ取り出す用)
 - exit code:
   - wait: Matched=0 / Timeout=1 / Cancelled=2 / ChildExited=130
+    (※ Round1 fix で ChildExited=3 に変更、130 は SIGINT 慣例と衝突するため)
   - tail / status: 通常 0、connect 失敗 1
 
 ## detach prefix (Ctrl-A D)

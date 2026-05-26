@@ -3,8 +3,8 @@
 //! Each function returns a self-contained completion script for the
 //! corresponding shell. The scripts are intentionally hand-written rather
 //! than generated, so the supported subcommand/option surface evolves in
-//! lock-step with [`hyoui::cli`]. Future stages (`send`, `attach`, `status`)
-//! are listed pre-emptively so users get tab-completion on day one.
+//! lock-step with [`hyoui::cli`]. Future stages (`send`, `detach`) are
+//! listed pre-emptively so users get tab-completion on day one.
 
 use hyoui::cli::Shell;
 
@@ -44,7 +44,7 @@ _hyoui() {
 
     if [[ -z "$sub" ]]; then
         # Top-level: subcommands + global flags.
-        COMPREPLY=( $(compgen -W "run completion send attach status --help -h --version -V" -- "$cur") )
+        COMPREPLY=( $(compgen -W "run attach list kill status tail wait completion send detach --help -h --version -V" -- "$cur") )
         return 0
     fi
 
@@ -74,6 +74,43 @@ _hyoui() {
             return 0 ;;
         completion)
             COMPREPLY=( $(compgen -W "bash zsh fish --help -h" -- "$cur") )
+            return 0 ;;
+        attach)
+            case "$prev" in
+                --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                --mode) COMPREPLY=( $(compgen -W "rw ro rw-no-leader" -- "$cur") ); return 0 ;;
+            esac
+            COMPREPLY=( $(compgen -W "--socket --mode --exclusive --detach-others --help -h" -- "$cur") )
+            return 0 ;;
+        list)
+            COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
+            return 0 ;;
+        kill)
+            case "$prev" in
+                --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                --signum) return 0 ;;
+            esac
+            COMPREPLY=( $(compgen -W "--socket --signum --help -h" -- "$cur") )
+            return 0 ;;
+        status)
+            case "$prev" in
+                --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+            esac
+            COMPREPLY=( $(compgen -W "--socket --help -h" -- "$cur") )
+            return 0 ;;
+        tail)
+            case "$prev" in
+                --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                --since|--last-bytes) return 0 ;;
+            esac
+            COMPREPLY=( $(compgen -W "--socket --follow --strip-ansi --since --last-bytes --help -h" -- "$cur") )
+            return 0 ;;
+        wait)
+            case "$prev" in
+                --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                --timeout) return 0 ;;
+            esac
+            COMPREPLY=( $(compgen -W "--socket --timeout --no-strip-escapes --newline-convert-lf --help -h text: pattern: wait: wait-idle:" -- "$cur") )
             return 0 ;;
         *)
             return 0 ;;
@@ -108,6 +145,50 @@ _hyoui() {
                         '1:shell:(bash zsh fish)' \
                         '(-h --help)'{-h,--help}'[Show help]'
                     ;;
+                attach)
+                    _arguments \
+                        '--socket=[Explicit socket path]:socket:_files' \
+                        '--mode=[Operating mode]:mode:(rw ro rw-no-leader)' \
+                        '--exclusive[Demand exclusive ownership]' \
+                        '--detach-others[Drop other clients on connect]' \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '*:session id:'
+                    ;;
+                list)
+                    _arguments '(-h --help)'{-h,--help}'[Show help]'
+                    ;;
+                kill)
+                    _arguments \
+                        '--socket=[Explicit socket path]:socket:_files' \
+                        '--signum=[Signal number]:signum:' \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '*:session id:'
+                    ;;
+                status)
+                    _arguments \
+                        '--socket=[Explicit socket path]:socket:_files' \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '*:session id:'
+                    ;;
+                tail)
+                    _arguments \
+                        '--socket=[Explicit socket path]:socket:_files' \
+                        '--follow[Continue streaming live output]' \
+                        '--strip-ansi[Strip ANSI escapes in output]' \
+                        '--since=[Drop chunks older than DUR (e.g. 500ms / 2s / 1m)]:duration:' \
+                        '--last-bytes=[Trim to last N bytes]:bytes:' \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '*:session id:'
+                    ;;
+                wait)
+                    _arguments \
+                        '--socket=[Explicit socket path]:socket:_files' \
+                        '--timeout=[Absolute timeout (e.g. 5s / 30s)]:duration:' \
+                        '--no-strip-escapes[Do not strip ANSI escapes before matching]' \
+                        '--newline-convert-lf[Convert CRLF to LF before matching]' \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '*:positional (predicate or session-id):'
+                    ;;
             esac
             ;;
     esac
@@ -117,10 +198,15 @@ _hyoui_subcommands() {
     local -a subs
     subs=(
         'run:Run a command inside a PTY as a transparent proxy'
+        'attach:Attach to a running session'
+        'list:List daemon sessions'
+        'kill:Send signal to a session and terminate it'
+        'status:Print session status'
+        'tail:Stream scrollback / live output'
+        'wait:Wait until predicate matches'
         'completion:Print a shell completion script'
         'send:(reserved) Send input to a running session'
-        'attach:(reserved) Attach to a running session'
-        'status:(reserved) Show session status'
+        'detach:(reserved) Detach helper'
     )
     _describe -t commands 'hyoui subcommand' subs
 }
@@ -154,7 +240,7 @@ function __hyoui_using_subcommand
     set -e cmd[1]
     for arg in $cmd
         switch $arg
-            case run completion send attach status
+            case run attach list kill status tail wait completion send detach
                 if test "$arg" = "$argv[1]"
                     return 0
                 end
@@ -169,7 +255,7 @@ function __hyoui_no_subcommand
     set -e cmd[1]
     for arg in $cmd
         switch $arg
-            case run completion send attach status
+            case run attach list kill status tail wait completion send detach
                 return 1
         end
     end
@@ -178,10 +264,15 @@ end
 
 # Top-level: subcommands.
 complete -c hyoui -n __hyoui_no_subcommand -f -a run        -d 'Run a command inside a PTY as a transparent proxy'
+complete -c hyoui -n __hyoui_no_subcommand -f -a attach     -d 'Attach to a running session'
+complete -c hyoui -n __hyoui_no_subcommand -f -a list       -d 'List daemon sessions'
+complete -c hyoui -n __hyoui_no_subcommand -f -a kill       -d 'Send signal to a session and terminate it'
+complete -c hyoui -n __hyoui_no_subcommand -f -a status     -d 'Print session status'
+complete -c hyoui -n __hyoui_no_subcommand -f -a tail       -d 'Stream scrollback / live output'
+complete -c hyoui -n __hyoui_no_subcommand -f -a wait       -d 'Wait until predicate matches'
 complete -c hyoui -n __hyoui_no_subcommand -f -a completion -d 'Print a shell completion script'
 complete -c hyoui -n __hyoui_no_subcommand -f -a send       -d '(reserved) Send input to a running session'
-complete -c hyoui -n __hyoui_no_subcommand -f -a attach     -d '(reserved) Attach to a running session'
-complete -c hyoui -n __hyoui_no_subcommand -f -a status     -d '(reserved) Show session status'
+complete -c hyoui -n __hyoui_no_subcommand -f -a detach     -d '(reserved) Detach helper'
 
 # Top-level global flags.
 complete -c hyoui -n __hyoui_no_subcommand -s h -l help    -d 'Show help and exit'
@@ -203,6 +294,40 @@ complete -c hyoui -n '__hyoui_using_subcommand run' -s h -l help                
 # `hyoui completion` options.
 complete -c hyoui -n '__hyoui_using_subcommand completion' -f -a 'bash zsh fish' -d 'Target shell'
 complete -c hyoui -n '__hyoui_using_subcommand completion' -s h -l help          -d 'Show help and exit'
+
+# `hyoui attach` options.
+complete -c hyoui -n '__hyoui_using_subcommand attach' -l socket         -r -F                        -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_using_subcommand attach' -l mode           -x -a 'rw ro rw-no-leader'   -d 'Operating mode'
+complete -c hyoui -n '__hyoui_using_subcommand attach' -l exclusive                                    -d 'Demand exclusive ownership'
+complete -c hyoui -n '__hyoui_using_subcommand attach' -l detach-others                                -d 'Drop other clients on connect'
+complete -c hyoui -n '__hyoui_using_subcommand attach' -s h -l help                                    -d 'Show help and exit'
+
+# `hyoui list` options.
+complete -c hyoui -n '__hyoui_using_subcommand list' -s h -l help -d 'Show help and exit'
+
+# `hyoui kill` options.
+complete -c hyoui -n '__hyoui_using_subcommand kill' -l socket -r -F -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_using_subcommand kill' -l signum -x    -d 'Signal number'
+complete -c hyoui -n '__hyoui_using_subcommand kill' -s h -l help    -d 'Show help and exit'
+
+# `hyoui status` options.
+complete -c hyoui -n '__hyoui_using_subcommand status' -l socket -r -F -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_using_subcommand status' -s h -l help    -d 'Show help and exit'
+
+# `hyoui tail` options.
+complete -c hyoui -n '__hyoui_using_subcommand tail' -l socket          -r -F  -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_using_subcommand tail' -l follow                  -d 'Continue streaming live output'
+complete -c hyoui -n '__hyoui_using_subcommand tail' -l strip-ansi              -d 'Strip ANSI escapes in output'
+complete -c hyoui -n '__hyoui_using_subcommand tail' -l since           -x      -d 'Drop chunks older than DUR (500ms / 2s / 1m)'
+complete -c hyoui -n '__hyoui_using_subcommand tail' -l last-bytes      -x      -d 'Trim to last N bytes'
+complete -c hyoui -n '__hyoui_using_subcommand tail' -s h -l help               -d 'Show help and exit'
+
+# `hyoui wait` options.
+complete -c hyoui -n '__hyoui_using_subcommand wait' -l socket            -r -F  -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_using_subcommand wait' -l timeout           -x      -d 'Absolute timeout (5s / 30s)'
+complete -c hyoui -n '__hyoui_using_subcommand wait' -l no-strip-escapes          -d 'Do not strip ANSI escapes before matching'
+complete -c hyoui -n '__hyoui_using_subcommand wait' -l newline-convert-lf        -d 'Convert CRLF to LF before matching'
+complete -c hyoui -n '__hyoui_using_subcommand wait' -s h -l help                 -d 'Show help and exit'
 "#
 }
 
@@ -236,12 +361,24 @@ mod tests {
     }
 
     #[test]
+    fn completion_all_shells_mention_implemented_subcommands() {
+        for sh in [Shell::Bash, Shell::Zsh, Shell::Fish] {
+            let s = script(sh);
+            for sub in ["run", "attach", "list", "kill", "status", "tail", "wait"] {
+                assert!(s.contains(sub), "shell {sh:?} missing `{sub}`");
+            }
+        }
+    }
+
+    #[test]
     fn completion_all_shells_mention_reserved_subcommands() {
         for sh in [Shell::Bash, Shell::Zsh, Shell::Fish] {
             let s = script(sh);
-            assert!(s.contains("send"), "shell {sh:?} missing `send`");
-            assert!(s.contains("attach"), "shell {sh:?} missing `attach`");
-            assert!(s.contains("status"), "shell {sh:?} missing `status`");
+            assert!(s.contains("send"), "shell {sh:?} missing reserved `send`");
+            assert!(
+                s.contains("detach"),
+                "shell {sh:?} missing reserved `detach`"
+            );
         }
     }
 }

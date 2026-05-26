@@ -565,16 +565,22 @@ fn parse_wait(args: &[String]) -> Command {
     // predicate は "text:" / "pattern:" / "wait:" / "wait-idle:" prefix で識別。
     let mut session_id: Option<String> = None;
     for p in positionals {
-        if let Some(pred) = parse_wait_predicate(&p) {
-            if predicate.is_some() {
-                return Command::Error("wait: predicate specified more than once".into());
+        match parse_wait_predicate(&p) {
+            Ok(Some(pred)) => {
+                if predicate.is_some() {
+                    return Command::Error("wait: predicate specified more than once".into());
+                }
+                predicate = Some(pred);
             }
-            predicate = Some(pred);
-        } else {
-            if session_id.is_some() {
-                return Command::Error(format!("wait: unexpected argument: {p}"));
+            Ok(None) => {
+                if session_id.is_some() {
+                    return Command::Error(format!("wait: unexpected argument: {p}"));
+                }
+                session_id = Some(p);
             }
-            session_id = Some(p);
+            Err(e) => {
+                return Command::Error(format!("wait: predicate `{p}`: {e}"));
+            }
         }
     }
     let predicate = match predicate {
@@ -599,19 +605,31 @@ fn parse_wait(args: &[String]) -> Command {
 }
 
 /// `text:<str>` / `pattern:<regex>` / `wait:<dur>` / `wait-idle:<dur>` の
-/// CLI prefix を [`WaitCliPredicate`] に変換。該当 prefix が無ければ `None`。
-fn parse_wait_predicate(s: &str) -> Option<WaitCliPredicate> {
+/// CLI prefix を [`WaitCliPredicate`] に変換。
+///
+/// 戻り値:
+/// - `Ok(Some(pred))`: 認識済 prefix + valid payload
+/// - `Ok(None)`: prefix にマッチしない (= caller は positional session_id 扱い)
+/// - `Err(msg)`: prefix にマッチしたが payload (= duration) の parse 失敗
+///   (= Round2 #9: 旧版は `.ok()` で潰して silently None だったため、user が
+///   `wait-idle:500` (旧 bare ms 記法) を渡したとき「unexpected argument」と
+///   いう誤メッセージが出た。明示 Err で原因を伝える)
+fn parse_wait_predicate(s: &str) -> Result<Option<WaitCliPredicate>, String> {
     if let Some(rest) = s.strip_prefix("text:") {
-        Some(WaitCliPredicate::Text(rest.to_string()))
-    } else if let Some(rest) = s.strip_prefix("pattern:") {
-        Some(WaitCliPredicate::Pattern(rest.to_string()))
-    } else if let Some(rest) = s.strip_prefix("wait-idle:") {
-        parse_duration_ms(rest).ok().map(WaitCliPredicate::Idle)
-    } else if let Some(rest) = s.strip_prefix("wait:") {
-        parse_duration_ms(rest).ok().map(WaitCliPredicate::Idle)
-    } else {
-        None
+        return Ok(Some(WaitCliPredicate::Text(rest.to_string())));
     }
+    if let Some(rest) = s.strip_prefix("pattern:") {
+        return Ok(Some(WaitCliPredicate::Pattern(rest.to_string())));
+    }
+    let idle_rest = s
+        .strip_prefix("wait-idle:")
+        .or_else(|| s.strip_prefix("wait:"));
+    if let Some(rest) = idle_rest {
+        return parse_duration_ms(rest)
+            .map(|ms| Some(WaitCliPredicate::Idle(ms)))
+            .map_err(|e| format!("invalid duration in predicate: {e}"));
+    }
+    Ok(None)
 }
 
 /// 期間文字列を ms に変換する。

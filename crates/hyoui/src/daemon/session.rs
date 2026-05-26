@@ -191,6 +191,7 @@ impl Session {
             &mut client_reader,
             &mut client_writer,
             &config.session_id,
+            config.expected_token.as_deref(),
         )?;
 
         // 3. relay loop
@@ -433,17 +434,25 @@ fn handle_detach_target(
     match detach.target {
         DetachTarget::Myself => ClientFrameOutcome::DropClient,
         DetachTarget::Others | DetachTarget::All => {
+            // Round2 #7: error 通知 + 自分も drop する。
+            // 旧 Round1 実装は `Continue` で client を生かしたまま error だけ送って
+            // いたが、旧仕様 (silent skip → DropClient だった) を仮定する client は
+            // socket open のまま hang する。「target が `Others`/`All` で部分実装」
+            // という事実を error で伝えつつ、後方互換 (= 最低限自分は drop される)
+            // を維持する。Others/All の本来の動作 (= 他 client / 全 client drop)
+            // は v0.2.0+ で実装予定。
             let _ = send_control(
                 &clients[idx],
                 ControlMessage::Error(ErrorMessage {
-                    code: "detach.target-not-implemented".into(),
-                    message: "detach target=others/all is not implemented yet (Phase 11 MVP \
-                              は Myself のみ対応、v0.2.0+ で追加予定)"
+                    code: "detach.target-partial".into(),
+                    message: "detach target=others/all not fully implemented yet; \
+                              only self will be detached (Phase 11 MVP は Myself のみ対応、\
+                              v0.2.0+ で他 client も drop する semantic に拡張予定)"
                         .into(),
                     details: None,
                 }),
             );
-            ClientFrameOutcome::Continue
+            ClientFrameOutcome::DropClient
         }
     }
 }
@@ -692,6 +701,35 @@ fn handle_wait_request(
         );
         return;
     }
+    // Text/Pattern の空 needle reject (= Round2 #1)。
+    // 空 value だと scan ループの `accumulated.windows(0)` が std spec で panic、
+    // daemon thread を落とすため事前に明示 error 返却で防ぐ。
+    match &req.predicate {
+        WaitPredicate::Text { value } if value.is_empty() => {
+            let _ = send_control(
+                &clients[idx],
+                ControlMessage::Error(ErrorMessage {
+                    code: "wait.invalid-text".into(),
+                    message: "text predicate value must not be empty".into(),
+                    details: None,
+                }),
+            );
+            return;
+        }
+        WaitPredicate::Pattern { regex } if regex.is_empty() => {
+            let _ = send_control(
+                &clients[idx],
+                ControlMessage::Error(ErrorMessage {
+                    code: "wait.invalid-pattern".into(),
+                    message: "pattern regex must not be empty".into(),
+                    details: None,
+                }),
+            );
+            return;
+        }
+        _ => {}
+    }
+
     let now = Instant::now();
     let deadline = req
         .timeout_ms
@@ -1288,12 +1326,20 @@ fn accept_new_client(
         _ => return Err(Error::Invalid("first message must be handshake.request")),
     };
 
-    // token validation (Phase 13 / Round1 修正): `config.expected_token` が
-    // Some なら client が同一 token を提示する必要あり。不一致なら handshake を
-    // 拒否して接続を切る。constant-time 比較で timing leak を避ける。
+    // token validation: `config.expected_token` が Some なら client が同一 token を
+    // 提示する必要あり。不一致なら handshake を拒否。constant-time 比較で timing leak
+    // 回避。
+    // Round2 #10: 旧実装は `provided = req.token.as_deref().unwrap_or("")` で
+    // `req.token = None` を空文字列と等価扱いしていたため、`expected_token = Some("")`
+    // を運用ミスで設定すると全 client が free pass で通過する欠陥があった。
+    // → `req.token` が `None` の場合は明示的に mismatch 扱い、`Some(s)` の場合のみ
+    // constant_time_eq で比較する。
     if let Some(expected) = config.expected_token.as_deref() {
-        let provided = req.token.as_deref().unwrap_or("");
-        if !constant_time_eq(expected.as_bytes(), provided.as_bytes()) {
+        let token_ok = match req.token.as_deref() {
+            Some(provided) => constant_time_eq(expected.as_bytes(), provided.as_bytes()),
+            None => false,
+        };
+        if !token_ok {
             let body = ControlMessage::Error(ErrorMessage {
                 code: "auth.token-mismatch".into(),
                 message: "handshake token does not match daemon configuration".into(),
@@ -1455,14 +1501,16 @@ fn handle_control_message(
     match msg {
         ControlMessage::Detach(d) => handle_detach_target(idx, d, clients),
         ControlMessage::Kill(k) => {
-            // Kill は session 全体 terminate なので Rw client のみ許可。
-            // Ro は session を畳む権限なし (Ro = 観察者)。
-            if matches!(ch_mode, Mode::Ro) {
+            // Kill は session 全体 terminate なので `Mode::Rw` (= leader 取りうる
+            // 主導 client) のみ許可。`Mode::Ro` (観察者) と `Mode::RwNoLeader`
+            // (入力可だが leader 取らない補助 client) は session を畳む権限なし。
+            // (Round2 #6: 旧実装は `!Ro` ガードで RwNoLeader も通過していた)
+            if !matches!(ch_mode, Mode::Rw) {
                 let _ = send_control(
                     &clients[idx],
                     ControlMessage::Error(ErrorMessage {
                         code: "mode.not-allowed".into(),
-                        message: "kill requires rw mode".into(),
+                        message: "kill requires rw mode (= leader-eligible)".into(),
                         details: None,
                     }),
                 );
@@ -1544,23 +1592,12 @@ fn handle_control_message(
         }
         ControlMessage::LockAcquire(req) => {
             if state.lock_holder.is_some() {
-                // 既存 holder あり: MVP では wait queue 未実装なので wait=true でも
-                // Queued を返さず error で「queue 未対応」を明示する。client は
-                // `LockResult::Denied` で raw な失敗を受け取ることもできるが、
-                // wait=true 期待時に Denied だけだと「実装が縮退している」のが
-                // 見えないため `error` code=`lock.wait-queue-unsupported` で明示。
-                if req.wait {
-                    let _ = send_control(
-                        &clients[idx],
-                        ControlMessage::Error(ErrorMessage {
-                            code: "lock.wait-queue-unsupported".into(),
-                            message: "lock wait queue is not implemented (v0.2.0+); \
-                                      use wait=false to receive Denied without blocking"
-                                .into(),
-                            details: None,
-                        }),
-                    );
-                }
+                // 「1 request → 1 response」契約を守るため、wait=true / wait=false
+                // どちらも LockResponse(Denied) 1 frame のみで応答する (Round2 #3
+                // = `error` を併送して 2 frame にすると client が後続 frame と
+                // mis-align するため)。MVP では wait queue 未実装なので wait=true
+                // でも Queued を返せない事実は DR-0008 に明記する想定。
+                let _ = req; // process_bound / timeout / wait は queue 実装まで未使用
                 let _ = send_control(
                     &clients[idx],
                     ControlMessage::LockResponse(LockResponse {
@@ -1569,7 +1606,6 @@ fn handle_control_message(
                         queue_position: None,
                     }),
                 );
-                let _ = req; // process_bound / timeout は queue 実装まで未使用
                 return ClientFrameOutcome::Continue;
             }
             let token = generate_lock_token();
@@ -1700,6 +1736,7 @@ fn do_handshake<R: std::io::Read, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
     session_id: &str,
+    expected_token: Option<&str>,
 ) -> Result<HandshakeResponse, Error> {
     let frame = Frame::decode_from(reader)
         .map_err(|_| Error::Invalid("failed to decode handshake frame"))?;
@@ -1712,6 +1749,26 @@ fn do_handshake<R: std::io::Read, W: std::io::Write>(
         ControlMessage::HandshakeRequest(r) => r,
         _ => return Err(Error::Invalid("first message must be handshake.request")),
     };
+
+    // Round2 #5: do_handshake 経路でも token validation を入れる
+    // (= accept_new_client と同 logic、片肺解消)。`req.token = None` は強制 mismatch。
+    if let Some(expected) = expected_token {
+        let token_ok = match req.token.as_deref() {
+            Some(provided) => constant_time_eq(expected.as_bytes(), provided.as_bytes()),
+            None => false,
+        };
+        if !token_ok {
+            let body = ControlMessage::Error(ErrorMessage {
+                code: "auth.token-mismatch".into(),
+                message: "handshake token does not match daemon configuration".into(),
+                details: None,
+            })
+            .encode_to_vec()
+            .map_err(|_| Error::Invalid("auth error encode failed"))?;
+            let _ = Frame::cbor_control(body).encode_to(writer);
+            return Err(Error::Invalid("handshake token mismatch"));
+        }
+    }
 
     let mvp: Vec<String> = MVP_CAPS.iter().map(|s| (*s).to_string()).collect();
     let intersect = intersect_caps(&req.caps, &mvp);
@@ -3505,6 +3562,224 @@ mod tests {
         .encode_to(&mut s2)
         .expect("send");
         s2.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    // ---- Round2 fixes: regress confirmations ----
+
+    /// Round2 #1: 空 Text predicate を送ると `wait.invalid-text` error が返り、
+    /// daemon は panic せず session 継続。
+    #[test]
+    fn serve_wait_empty_text_predicate_rejected() {
+        use crate::protocol::messages::{WaitMatchOptions, WaitPredicate, WaitRequest};
+
+        let cmd = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf hello; sleep 30".into(),
+        ];
+        let dir = make_temp_socket_dir();
+        let sock_path = dir.path().join("test.sock");
+        let cfg = DaemonConfig::new("demo", sock_path.clone(), cmd);
+        let session = Session::start(cfg).expect("start");
+        let handle = std::thread::spawn(move || session.serve());
+
+        let mut s = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut s);
+        let _ = Frame::decode_from(&mut s).expect("leader.notify");
+
+        Frame::cbor_control(
+            ControlMessage::WaitRequest(WaitRequest {
+                predicate: WaitPredicate::Text {
+                    value: String::new(),
+                },
+                timeout_ms: Some(1000),
+                options: WaitMatchOptions::default(),
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s)
+        .expect("send");
+        s.flush().expect("flush");
+
+        // Error を待つ (raw_data frame は skip)
+        let mut got_error = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            match next_control(&mut s) {
+                ControlMessage::Error(e) => {
+                    assert_eq!(e.code, "wait.invalid-text");
+                    got_error = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(got_error, "expected wait.invalid-text error");
+
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s)
+        .expect("send");
+        s.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// Round2 #3: LockAcquire(wait=true) で holder ありの場合、
+    /// **1 frame だけ** (LockResponse Denied) を返す (= Error と LockResponse の
+    /// 2 frame だった旧版が直っているか確認)。
+    #[test]
+    fn serve_lock_acquire_wait_returns_single_frame() {
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut s1);
+        let _ = Frame::decode_from(&mut s1).expect("s1 leader.notify");
+
+        let mut s2 = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut s2);
+
+        // s1 が lock 取得
+        Frame::cbor_control(
+            ControlMessage::LockAcquire(crate::protocol::messages::LockAcquire {
+                wait: false,
+                timeout_abs_ms: None,
+                timeout_idle_ms: None,
+                process_bound: false,
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+        // s1 が LockResponse (Acquired) + ModeChange、s2 が ModeChange
+        let _ = Frame::decode_from(&mut s1).expect("s1 lock resp");
+        let _ = Frame::decode_from(&mut s1).expect("s1 mode change");
+        let _ = Frame::decode_from(&mut s2).expect("s2 mode change");
+
+        // s2 が wait=true で lock acquire 試行
+        Frame::cbor_control(
+            ControlMessage::LockAcquire(crate::protocol::messages::LockAcquire {
+                wait: true,
+                timeout_abs_ms: None,
+                timeout_idle_ms: None,
+                process_bound: false,
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s2)
+        .expect("send");
+        s2.flush().expect("flush");
+
+        // s2 は 1 frame だけ受信、それは LockResponse(Denied)
+        let resp = next_control(&mut s2);
+        match resp {
+            ControlMessage::LockResponse(lr) => {
+                assert_eq!(lr.result, LockResult::Denied);
+                assert!(lr.token.is_none());
+            }
+            o => panic!("expected single LockResponse(Denied), got {o:?}"),
+        }
+
+        // cleanup
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// Round2 #5: do_handshake (Session::run 経路) も expected_token を検証する。
+    #[test]
+    fn run_handshake_token_mismatch_rejected() {
+        let dir = make_temp_socket_dir();
+        let sock_path = dir.path().join("test.sock");
+        let mut cfg = DaemonConfig::new("demo", sock_path.clone(), long_running_cmd());
+        cfg.expected_token = Some("secret-xyz".into());
+        let session = Session::start(cfg).expect("start");
+        let handle = std::thread::spawn(move || session.run());
+
+        let mut s = client_connect_with_retry(&sock_path);
+        let req = ControlMessage::HandshakeRequest(HandshakeRequest {
+            caps: MVP_CAPS.iter().map(|s| s.to_string()).collect(),
+            mode: Mode::Rw,
+            exclusive: false,
+            detach_others: false,
+            token: None, // 未提示 = mismatch
+        });
+        let body = req.encode_to_vec().expect("encode");
+        Frame::cbor_control(body).encode_to(&mut s).expect("send");
+        s.flush().expect("flush");
+
+        let ef = Frame::decode_from(&mut s).expect("error");
+        match ControlMessage::decode_from(ef.body.as_slice()).expect("decode") {
+            ControlMessage::Error(e) => assert_eq!(e.code, "auth.token-mismatch"),
+            o => panic!("expected Error, got {o:?}"),
+        }
+        // daemon は handshake 拒否 → Session::run が Err を返す (= join で確認)
+        let res = handle.join().expect("daemon thread");
+        assert!(res.is_err(), "Session::run should error on token mismatch");
+    }
+
+    /// Round2 #6: RwNoLeader client が Kill を送ると mode.not-allowed エラー。
+    #[test]
+    fn serve_rw_no_leader_kill_rejected() {
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        // session 維持用 Rw client
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut s1);
+        let _ = Frame::decode_from(&mut s1).expect("s1 leader.notify");
+
+        // RwNoLeader client
+        let mut s2 = client_connect_with_retry(&sock_path);
+        let req = ControlMessage::HandshakeRequest(HandshakeRequest {
+            caps: MVP_CAPS.iter().map(|s| s.to_string()).collect(),
+            mode: Mode::RwNoLeader,
+            exclusive: false,
+            detach_others: false,
+            token: None,
+        });
+        let body = req.encode_to_vec().expect("encode");
+        Frame::cbor_control(body).encode_to(&mut s2).expect("send");
+        s2.flush().expect("flush");
+        let _ = Frame::decode_from(&mut s2).expect("s2 handshake resp");
+
+        // s2 (RwNoLeader) が Kill 試行 → mode.not-allowed
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s2)
+        .expect("send");
+        s2.flush().expect("flush");
+
+        let ef = Frame::decode_from(&mut s2).expect("error");
+        match ControlMessage::decode_from(ef.body.as_slice()).expect("decode") {
+            ControlMessage::Error(e) => assert_eq!(e.code, "mode.not-allowed"),
+            o => panic!("expected mode.not-allowed Error, got {o:?}"),
+        }
+
+        // cleanup
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
         let _ = handle.join().expect("daemon thread");
     }
 }

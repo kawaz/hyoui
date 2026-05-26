@@ -160,6 +160,13 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
     let mut dcfg = DaemonConfig::new(session_id, socket, cmd);
     dcfg.cols = cols;
     dcfg.rows = rows;
+    // Round2 #2: HYOUI_LOCK_TOKEN env を daemon 側の expected_token に伝搬。
+    // detached daemon child は親 process から env を受け継ぐ。
+    if let Ok(token) = std::env::var("HYOUI_LOCK_TOKEN") {
+        if !token.is_empty() {
+            dcfg.expected_token = Some(token);
+        }
+    }
 
     let session = match Session::start(dcfg) {
         Ok(s) => s,
