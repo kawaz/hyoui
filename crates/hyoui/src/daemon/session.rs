@@ -1903,6 +1903,23 @@ fn handle_control_message(
                 );
                 return ClientFrameOutcome::Continue;
             }
+            // R4-C7: Mode::Ro (= 観察者) は lock を取れない。
+            // 旧実装は mode をチェックしておらず、Ro client が LockAcquire を送ると
+            // session 全体を Locked 化して rw client の書き込みを止められる
+            // session DoS が成立していた。DR-0008 §2.3 の意図 (= leader/lock は
+            // rw 系のみ) に揃え、Ro は mode.not-allowed で reject する。
+            if matches!(clients[idx].mode, Mode::Ro) {
+                let _ = send_control(
+                    &clients[idx],
+                    ControlMessage::Error(ErrorMessage {
+                        code: "mode.not-allowed".into(),
+                        message: "lock.acquire requires rw mode (= Ro cannot hold lock)"
+                            .into(),
+                        details: None,
+                    }),
+                );
+                return ClientFrameOutcome::Continue;
+            }
             if state.lock_holder.is_some() {
                 // 「1 request → 1 response」契約を守るため、wait=true / wait=false
                 // どちらも LockResponse(Denied) 1 frame のみで応答する (Round2 #3
@@ -4200,6 +4217,81 @@ mod tests {
         // pending_waits に残り続ける。
         check_wait_timeouts(&mut waits, &mut clients);
         assert_eq!(waits.len(), 1, "overflow Idle should not match");
+    }
+
+    /// R4-C7: Mode::Ro client が LockAcquire を送ると mode.not-allowed エラーを返し、
+    /// session 全体が Locked 化しない (= session DoS を防ぐ)。
+    #[test]
+    fn serve_ro_client_lock_acquire_rejected() {
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        // session 維持用 Rw client (s1)
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let _r1 = do_client_handshake(&mut s1);
+        let _ = Frame::decode_from(&mut s1).expect("s1 leader.notify");
+
+        // Ro client (s2)
+        let mut s2 = client_connect_with_retry(&sock_path);
+        let req = ControlMessage::HandshakeRequest(HandshakeRequest {
+            caps: MVP_CAPS.iter().map(|s| s.to_string()).collect(),
+            mode: Mode::Ro,
+            exclusive: false,
+            detach_others: false,
+            token: None,
+        });
+        let body = req.encode_to_vec().expect("encode");
+        Frame::cbor_control(body).encode_to(&mut s2).expect("send");
+        s2.flush().expect("flush");
+        let _ = Frame::decode_from(&mut s2).expect("s2 handshake resp"); // discard
+
+        // s2 (Ro) が LockAcquire 送信 → mode.not-allowed
+        Frame::cbor_control(
+            ControlMessage::LockAcquire(crate::protocol::messages::LockAcquire {
+                wait: false,
+                timeout_abs_ms: None,
+                timeout_idle_ms: None,
+                process_bound: false,
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s2)
+        .expect("send");
+        s2.flush().expect("flush");
+
+        let ef = Frame::decode_from(&mut s2).expect("error response");
+        match ControlMessage::decode_from(ef.body.as_slice()).expect("decode") {
+            ControlMessage::Error(e) => {
+                assert_eq!(e.code, "mode.not-allowed");
+            }
+            o => panic!("expected mode.not-allowed Error, got {o:?}"),
+        }
+
+        // s1 にも mode.change(Locked) が broadcast されていない (= session DoS が
+        // 起きていない) ことを確認する。s1 を non-blocking 短い timeout に切り替えて
+        // 何も来ないことを確認 (Frame::decode が EWOULDBLOCK で error)。
+        s1.set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("set read_timeout");
+        match Frame::decode_from(&mut s1) {
+            Err(_) => {} // 想定通り (= broadcast 来てない)
+            Ok(f) => {
+                let m =
+                    ControlMessage::decode_from(f.body.as_slice()).expect("decode broadcast");
+                panic!("unexpected broadcast received on s1: {m:?}");
+            }
+        }
+        s1.set_read_timeout(None).expect("clear timeout");
+
+        // cleanup
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
     }
 
     /// R4-C3: slow-loris client (= handshake.request を送らずに socket を開きっぱなし
