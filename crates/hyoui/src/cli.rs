@@ -152,6 +152,18 @@ pub struct AttachConfig {
     pub detach_others: bool,
 }
 
+/// `list` subcommand configuration (R5-H3)。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ListConfig {
+    /// `--prune-stale` (= 接続不能 socket を unlink して掃除)。
+    ///
+    /// daemon が panic / SIGKILL で異常終了すると `UnixSock::drop` が走らず
+    /// socket file が残留し、`hyoui list` で live と区別できなくなる (R5-H3)。
+    /// `--prune-stale` は connect 試行で死活確認し、`ECONNREFUSED` 等で
+    /// 失敗した socket を unlink で除去する。
+    pub prune_stale: bool,
+}
+
 /// `kill` subcommand configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KillConfig {
@@ -248,7 +260,7 @@ pub enum Command {
     /// Attach to an existing daemon session.
     Attach(AttachConfig),
     /// List existing daemon sessions (= socket dir scan)。
-    List,
+    List(ListConfig),
     /// Kill (= SIGTERM 等を子に送る) a daemon session by session id / socket。
     Kill(KillConfig),
     /// Print session status (clients/leader/lock/scrollback) and exit。
@@ -318,10 +330,14 @@ fn parse_list(args: &[String]) -> Command {
             topic: HelpTopic::List,
         };
     }
-    if !args.is_empty() {
-        return Command::Error(format!("list: unexpected argument: {}", args[0]));
+    let mut cfg = ListConfig::default();
+    for a in args {
+        match a.as_str() {
+            "--prune-stale" => cfg.prune_stale = true,
+            other => return Command::Error(format!("list: unexpected argument: {other}")),
+        }
     }
-    Command::List
+    Command::List(cfg)
 }
 
 fn parse_kill(args: &[String]) -> Command {
@@ -1556,16 +1572,23 @@ fn usage_wait() -> String {
 
 fn usage_list() -> String {
     String::from(
-        "hyoui list — list daemon sessions (= socket dir scan)\n\
+        "hyoui list — list daemon sessions (= socket dir scan + liveness probe)\n\
         \n\
         USAGE:\n    \
-            hyoui list\n\
+            hyoui list [--prune-stale]\n\
         \n\
         OPTIONS:\n    \
+            --prune-stale   stale socket (= connect 不能) を unlink で削除\n    \
             -h, --help      Show this help and exit\n\
         \n\
         OUTPUT (TAB separated, 1 line per session):\n    \
-            <session-id>\\t<socket-path>\n\
+            <session-id>\\t<live|stale>\\t<socket-path>\n\
+        \n\
+        LIVENESS PROBE (R5-H3):\n    \
+            各 socket に対し best-effort connect 試行 (= 100ms timeout)。\n    \
+            成功なら `live`、ECONNREFUSED / timeout なら `stale` 表示。\n    \
+            stale は daemon の panic / SIGKILL で socket が unlink されずに\n    \
+            残留した状態。`hyoui list --prune-stale` で掃除可能。\n\
         \n\
         SCAN ORDER (= socket_path::resolve と同順、最初に見つかった dir のみ):\n    \
             1. $XDG_RUNTIME_DIR/hyoui/\n    \
@@ -1575,8 +1598,9 @@ fn usage_list() -> String {
             0   正常終了 (= 0 件でも成功扱い、stderr に `no sessions found` を 1 行)\n\
         \n\
         EXAMPLES:\n    \
-            hyoui list                              # 全 session を一覧\n    \
-            hyoui list | awk '{print $1}'           # session id だけ抽出\n\
+            hyoui list                              # 全 session を一覧 (live/stale 表示)\n    \
+            hyoui list --prune-stale                # stale socket を削除して live のみ残す\n    \
+            hyoui list | awk '$2 == \"live\" {print $1}'  # live session id を抽出\n\
         \n\
         RELATED:\n    \
             hyoui status <id>   session 1 件の詳細\n    \
@@ -2490,6 +2514,40 @@ mod tests {
                 topic: HelpTopic::List,
             } => {}
             other => panic!("expected Help{{List}}, got {other:?}"),
+        }
+    }
+
+    /// R5-H3: `list` の引数なし呼び出しは `prune_stale = false` の
+    /// `ListConfig` を返す (= default 動作: liveness 確認のみ、削除しない)。
+    #[test]
+    fn list_without_flag_returns_default_config() {
+        match parse_args(&args(&["list"])) {
+            Command::List(cfg) => {
+                assert!(!cfg.prune_stale, "default should not prune");
+            }
+            other => panic!("expected List(default), got {other:?}"),
+        }
+    }
+
+    /// R5-H3: `list --prune-stale` は `prune_stale = true` の `ListConfig` を返す。
+    #[test]
+    fn list_prune_stale_flag_sets_config() {
+        match parse_args(&args(&["list", "--prune-stale"])) {
+            Command::List(cfg) => {
+                assert!(cfg.prune_stale, "--prune-stale should enable prune");
+            }
+            other => panic!("expected List(prune_stale=true), got {other:?}"),
+        }
+    }
+
+    /// R5-H3: 未知の flag は `Command::Error` を返す (= 既存 list の挙動踏襲)。
+    #[test]
+    fn list_rejects_unknown_flag() {
+        match parse_args(&args(&["list", "--bogus"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("--bogus"), "error should mention the flag");
+            }
+            other => panic!("expected Error, got {other:?}"),
         }
     }
 

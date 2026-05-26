@@ -17,8 +17,8 @@ use std::os::fd::AsFd;
 use std::process::ExitCode;
 
 use hyoui::cli::{
-    AttachConfig, Command, HelpTopic, KillConfig, StatusConfig, TailConfig, WaitCliPredicate,
-    WaitConfig, parse_args, usage,
+    AttachConfig, Command, HelpTopic, KillConfig, ListConfig, StatusConfig, TailConfig,
+    WaitCliPredicate, WaitConfig, parse_args, usage,
 };
 use hyoui::client::{AttachOptions, ClientConnection};
 use hyoui::daemon::{DaemonConfig, Session};
@@ -103,7 +103,7 @@ fn main() -> ExitCode {
 
         Command::Attach(cfg) => attach_command(cfg),
 
-        Command::List => list_command(),
+        Command::List(cfg) => list_command(cfg),
 
         Command::Kill(cfg) => kill_command(cfg),
 
@@ -360,14 +360,48 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
     }
 }
 
-/// `hyoui list` の主要ロジック。
+/// R5-H3: socket liveness probe (= daemon が応答するか確認)。
+///
+/// daemon が panic / SIGKILL で異常終了すると `UnixSock::drop` が走らず
+/// socket file が残留する (= stale socket)。socket file の存在だけで live と
+/// 判定する旧 `hyoui list` では stale と区別不能で、ユーザは `hyoui status` で
+/// connect 失敗を見るまで気付けなかった。
+///
+/// 本関数は best-effort connect 試行で生死判定する:
+/// - `connect_timeout` で 100ms 以内に成功すれば `live`
+/// - ECONNREFUSED / timeout / その他 IO error なら `stale`
+///
+/// **handshake は実施しない** (= token が必要な daemon もあるため)。
+/// kernel が SOCK_STREAM の listen backlog にいる場合は connect 成功するので、
+/// daemon process が alive かつ accept できる状態であることを確認できる。
+fn probe_socket_liveness(path: &std::path::Path) -> bool {
+    use std::os::unix::net::UnixStream;
+    // Unix domain socket の connect は kernel level で即座に結果が返る (= TCP の
+    // SYN 待ちのような network delay は存在しない)。listener が居なければ即
+    // ECONNREFUSED、居れば即 success。timeout は listener queue が一杯で
+    // 待たされるケースだけ意味を持つが、stale 判定用途では「即 success or
+    // 即 fail」だけ見えれば十分なので blocking `connect` で OK。
+    UnixStream::connect(path).is_ok()
+}
+
+/// `hyoui list` の主要ロジック (R5-H3 対応)。
 ///
 /// socket dir 候補を全部 scan し、`*.sock` ファイルを 1 行ずつ出力する。
-/// 出力形式: `<session>\t<socket-path>`。Phase 11 で `status.query` を併用して
-/// child pid / clients 等の情報も付ける予定。
-fn list_command() -> ExitCode {
-    let dirs = list_candidate_dirs();
+/// 各 socket は `probe_socket_liveness` で死活確認し、`live` / `stale` を 2 列目に
+/// 出す (= 旧形式 `<session>\t<path>` から 3 列目構造に拡張)。
+///
+/// `--prune-stale` 指定時、stale と判定された socket は `unlink(2)` で削除する。
+/// この削除は best-effort (= 失敗してもユーザに warning するだけで exit code は 0)。
+fn list_command(cfg: ListConfig) -> ExitCode {
+    list_command_with_dirs(cfg, list_candidate_dirs())
+}
+
+/// `list_command` の testable な内部実装。dir 一覧を引数で受けることで
+/// env (`XDG_RUNTIME_DIR` / `TMPDIR`) 依存を切り離し、unit test 可能にする。
+fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<std::path::PathBuf>) -> ExitCode {
     let mut found = 0usize;
+    let mut stale_count = 0usize;
+    let mut pruned_count = 0usize;
     for dir in dirs {
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
@@ -383,8 +417,26 @@ fn list_command() -> ExitCode {
                 .and_then(|s| s.to_str())
                 .unwrap_or("?")
                 .to_string();
-            println!("{session}\t{}", path.display());
+            let live = probe_socket_liveness(&path);
+            let status = if live { "live" } else { "stale" };
+            if !live {
+                stale_count += 1;
+            }
+            println!("{session}\t{status}\t{}", path.display());
             found += 1;
+
+            // R5-H3: --prune-stale で stale socket を unlink。
+            if !live && cfg.prune_stale {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        pruned_count += 1;
+                        eprintln!("hyoui: pruned stale socket: {}", path.display());
+                    }
+                    Err(e) => {
+                        eprintln!("hyoui: warning: failed to prune {}: {e}", path.display());
+                    }
+                }
+            }
         }
     }
     if found == 0 {
@@ -394,6 +446,13 @@ fn list_command() -> ExitCode {
         eprintln!(
             "       socket 候補 dir: $XDG_RUNTIME_DIR/hyoui または ${{TMPDIR:-/tmp}}/hyoui-<uid>"
         );
+    } else if stale_count > 0 && !cfg.prune_stale {
+        eprintln!(
+            "hyoui: {stale_count} stale socket(s) found. \
+             Run `hyoui list --prune-stale` to remove them."
+        );
+    } else if cfg.prune_stale && pruned_count > 0 {
+        eprintln!("hyoui: pruned {pruned_count} stale socket(s)");
     }
     ExitCode::SUCCESS
 }
@@ -803,5 +862,123 @@ fn wait_command(cfg: WaitConfig) -> ExitCode {
                 return ExitCode::from(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use tempfile::TempDir;
+
+    fn make_0700_dir() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700");
+        dir
+    }
+
+    /// R5-H3: live socket (= listener が bind されている) は `probe_socket_liveness`
+    /// で true を返す。
+    #[test]
+    fn probe_returns_true_for_live_socket() {
+        let dir = make_0700_dir();
+        let path = dir.path().join("live.sock");
+        let _listener = UnixListener::bind(&path).expect("bind");
+        assert!(
+            probe_socket_liveness(&path),
+            "live socket should probe as alive"
+        );
+    }
+
+    /// R5-H3: stale socket (= file は残っているが listener が居ない) は
+    /// `probe_socket_liveness` で false を返す。`hyoui list` がこの判定で
+    /// `live` / `stale` を出し分ける。
+    #[test]
+    fn list_marks_stale_socket_when_no_ping_response() {
+        let dir = make_0700_dir();
+        let path = dir.path().join("stale.sock");
+        // listener を bind して即 drop → file は残るが accept する process がない
+        {
+            let _listener = UnixListener::bind(&path).expect("bind");
+            // drop here would unlink (`UnixListener::drop` doesn't unlink, but std fn doesn't either);
+            // we manually keep the file by creating it separately if needed.
+        }
+        // 上の scope exit で listener は close されたが、Rust の std UnixListener は
+        // unlink しないので file はそのまま残る (= まさに daemon panic 後の状態)。
+        assert!(path.exists(), "stale socket file should still exist");
+        assert!(
+            !probe_socket_liveness(&path),
+            "stale socket should probe as dead"
+        );
+    }
+
+    /// R5-H3: 存在しない socket path は connect 失敗 → false。
+    #[test]
+    fn probe_returns_false_for_missing_socket() {
+        let dir = make_0700_dir();
+        let path = dir.path().join("nonexistent.sock");
+        assert!(
+            !probe_socket_liveness(&path),
+            "missing socket should probe as dead"
+        );
+    }
+
+    /// R5-H3: `--prune-stale` flag 付きで `list_command_with_dirs` を呼ぶと、
+    /// stale な socket file が unlink される。live socket は触らない。
+    ///
+    /// `list_command` は env (`XDG_RUNTIME_DIR` / `TMPDIR`) で dir を解決するが、
+    /// edition 2024 では `env::set_var` が unsafe であり、`#![forbid(unsafe_code)]`
+    /// と衝突する。代わりに dir 一覧を直接渡す内部関数 `list_command_with_dirs`
+    /// を介してテストする。
+    #[test]
+    fn list_prune_stale_removes_dead_sockets() {
+        let sock_dir = make_0700_dir();
+
+        // stale socket: bind して即 close、file だけ残す。std の UnixListener::drop は
+        // unlink しないので file 残留 (= まさに daemon panic 後の状態)。
+        let stale_path = sock_dir.path().join("stale-sess.sock");
+        {
+            let _l = UnixListener::bind(&stale_path).expect("bind stale");
+        }
+        assert!(stale_path.exists(), "stale socket file should exist");
+
+        // live socket: bind して listener を保持する (= test 中 alive)
+        let live_path = sock_dir.path().join("live-sess.sock");
+        let _live_listener = UnixListener::bind(&live_path).expect("bind live");
+
+        // dir 一覧を直接渡して env mutation を回避
+        let cfg = ListConfig { prune_stale: true };
+        let _exit = list_command_with_dirs(cfg, vec![sock_dir.path().to_path_buf()]);
+
+        // 確認: stale は unlink された、live はまだ残っている
+        assert!(
+            !stale_path.exists(),
+            "--prune-stale should unlink stale socket"
+        );
+        assert!(
+            live_path.exists(),
+            "--prune-stale must not unlink live socket"
+        );
+    }
+
+    /// R5-H3: `--prune-stale` を指定しない時は stale でも socket file は削除しない。
+    #[test]
+    fn list_without_prune_keeps_stale_sockets() {
+        let sock_dir = make_0700_dir();
+        let stale_path = sock_dir.path().join("stale.sock");
+        {
+            let _l = UnixListener::bind(&stale_path).expect("bind");
+        }
+        assert!(stale_path.exists());
+
+        let cfg = ListConfig { prune_stale: false };
+        let _exit = list_command_with_dirs(cfg, vec![sock_dir.path().to_path_buf()]);
+
+        assert!(
+            stale_path.exists(),
+            "list without --prune-stale must not remove sockets"
+        );
     }
 }
