@@ -78,9 +78,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn waitpid_no_children_with_nohang_returns_no_change() {
-        // mirrors ffi_wbtest.mbt: "proc_waitpid: pid -1 with nohang returns None"
-        let outcome = wait_for_status(Pid::from_raw(-1), true).expect("ok");
-        assert!(matches!(outcome, WaitOutcome::NoChange));
+    fn waitpid_with_nohang_returns_no_change_for_alive_child() {
+        // pid=-1 (= any child) は parallel test 環境で他テストの子と race する
+        // (= 他テストが exit 直後の child を持つと、本テストの waitpid(-1) が
+        // それを拾って Exited を返してしまう、CI で観測された flaky)。
+        // 特定 pid を spawn して「alive child を WNOHANG で wait」シナリオを
+        // 再現すれば NoChange path を race-free に検証できる。
+        use std::process::Command;
+        let mut child = Command::new("/bin/sleep")
+            .arg("1")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = Pid::from_raw(child.id() as i32);
+        let outcome = wait_for_status(pid, true).expect("ok");
+        assert!(
+            matches!(outcome, WaitOutcome::NoChange),
+            "alive child + WNOHANG should return NoChange, got {outcome:?}"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
