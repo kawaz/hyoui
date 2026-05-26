@@ -40,6 +40,24 @@ use super::control::{ClientFrameOutcome, FrameOrError, handle_client_frame};
 use super::lock::{SessionState, elevate_next_leader};
 use super::pty::{ALIVE_RETRY_INTERVAL, ChildLifecycle, ChildState, STOPPED_POLL_INTERVAL};
 
+/// R5-H7: send `sig` to the child's whole process group instead of only the
+/// session-leader PID, so descendants that the shell may have backgrounded
+/// (= grandchildren of the daemon, e.g. `sh -c 'sleep 100 &'`) are not
+/// orphaned to `init`/`launchd`.
+///
+/// `forkpty(3)` internally calls `login_tty(3)` which calls `setsid(2)`,
+/// making the child both a session leader and a process group leader with
+/// `pgid == pid`. `kill(2)` with a negative pid is the POSIX `killpg(2)`
+/// equivalent and targets every process whose pgid matches `|pid|`.
+///
+/// Errors are intentionally ignored at most call sites (Drop / finalize),
+/// matching `tmux` / `screen` / `abduco` which always treat this as a
+/// best-effort terminate. The function still returns the underlying
+/// `nix::Result` for tests that need to assert delivery.
+fn kill_pgrp(child: Pid, sig: Signal) -> nix::Result<()> {
+    kill(Pid::from_raw(-child.as_raw()), sig)
+}
+
 /// R5-H6: SIGCHLD self-pipe ownership gate.
 ///
 /// SIGCHLD disposition + the `SELFPIPE_WRITE_FD` global are process-wide;
@@ -356,7 +374,8 @@ impl Drop for Session {
         }
 
         // 2. SIGTERM を送る。child が既に exit 済なら ESRCH で失敗 → 無視。
-        let _ = kill(child, Signal::SIGTERM);
+        // R5-H7: process group (= setsid 済の子 + その子孫) 全体に届かせる。
+        let _ = kill_pgrp(child, Signal::SIGTERM);
 
         // 3. graceful wait loop。reap できたら return、timeout したら SIGKILL。
         let deadline = std::time::Instant::now() + DROP_TERM_WAIT;
@@ -375,7 +394,8 @@ impl Drop for Session {
         }
 
         // 4. SIGKILL → 短い loop で reap。
-        let _ = kill(child, Signal::SIGKILL);
+        // R5-H7: SIGTERM 同様 process group 全体に向ける。
+        let _ = kill_pgrp(child, Signal::SIGKILL);
         let kill_deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
         loop {
             match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
@@ -460,8 +480,7 @@ fn serve_loop(
         // 解いてから check_wait_timeouts / process_pending_handshakes を呼ぶ。
         // Ready 経路では revents を集めてから drop する (= 通常処理に進む)。
         let outcome_kind = poll(&mut poll_fds, poll_timeout);
-        let (listener_revents, master_revents, client_revents, sigchld_ready) = match outcome_kind
-        {
+        let (listener_revents, master_revents, client_revents, sigchld_ready) = match outcome_kind {
             Ok(PollOutcome::Ready(_)) => {
                 let lrev = poll_fds[0].revents().unwrap_or(PollFlags::empty());
                 let mrev = poll_fds[1].revents().unwrap_or(PollFlags::empty());
@@ -757,8 +776,10 @@ fn finalize_child(child: Pid, outcome: &RelayOutcome) -> Result<i32, Error> {
 
     // ChildExited 以外 (= client 都合の終了) は子に SIGTERM を送ってから wait。
     // 既に exit 済なら kill は ESRCH で失敗 → 無視。
+    // R5-H7: process group 全体に向けて、子が exec した孫 (= shell の background
+    // job 等) も同じ SIGTERM で reap 対象にする。
     if !matches!(outcome, RelayOutcome::ChildExited(_)) {
-        let _ = kill(child, Signal::SIGTERM);
+        let _ = kill_pgrp(child, Signal::SIGTERM);
     }
 
     // 子を reap。
@@ -1004,6 +1025,91 @@ mod tests {
 
         // socket は UnixSock::drop で unlink される (= 既存挙動と同じ)
         assert!(!sock.exists(), "socket should be unlinked");
+    }
+
+    /// R5-H7: `Session::Drop` の kill 経路は子の process group 全体に送られ、
+    /// 子が exec した shell が背後に置いた孫 (= `sh -c 'sleep ... &'`) も
+    /// orphan として残さず即時 reap される。
+    ///
+    /// 旧実装 (= `kill(child, SIGTERM)` 単発) では、shell session leader だけが
+    /// 終了し、孫 sleep は init/launchd に reparent されて生き残っていた。
+    /// 本テストは killpg 化後の挙動 (= 孫 PID が ESRCH を返す = 死亡) を確認する。
+    #[test]
+    fn session_drop_kills_grandchild_via_killpg() {
+        // 孫 PID を受け渡すための tmp ファイル。
+        let pid_dir = tempfile::tempdir().expect("pid tempdir");
+        let pid_file = pid_dir.path().join("grandchild.pid");
+
+        let dir = make_temp_socket_dir();
+        let sock = dir.path().join("killpg.sock");
+        // sh -c で sleep を background に置き、$! を pid_file に書く。
+        // sleep の stdin/stdout は /dev/null にして slave PTY を握らない
+        // (= SIGHUP に依存せず、純粋に killpg だけで死ぬことを検証する)。
+        //
+        // 親 sh は `wait` で sleep を待つ → SIGTERM で sh 自身が死ぬ →
+        // 旧実装ならここで sleep が orphan 化、新実装なら killpg で sleep も死ぬ。
+        let pid_path_str = pid_file
+            .to_str()
+            .expect("pid_file path is utf8")
+            .to_string();
+        let script =
+            format!("sleep 30 </dev/null >/dev/null 2>&1 & echo $! > {pid_path_str}; wait");
+        let cmd = vec!["/bin/sh".into(), "-c".into(), script];
+        let cfg = DaemonConfig::new("killpg-test", sock.clone(), cmd);
+        let session = Session::start(cfg).expect("start");
+        let shell_pid = session.child_pid();
+
+        // 孫 PID が書き出されるまで最大 2 秒待つ。
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let grandchild_pid: i32 = loop {
+            if let Ok(s) = std::fs::read_to_string(&pid_file) {
+                if let Some(line) = s.lines().next() {
+                    if let Ok(pid) = line.trim().parse::<i32>() {
+                        break pid;
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild PID file {pid_file:?} not written within 2s"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(grandchild_pid > 0, "grandchild pid must be positive");
+
+        // 孫が live であることを確認 (= signal 0 で ESRCH でない)。
+        let grandchild = Pid::from_raw(grandchild_pid);
+        assert!(
+            kill(grandchild, None).is_ok(),
+            "grandchild {grandchild_pid} should be alive before drop"
+        );
+
+        // Session を drop → Drop impl の killpg(SIGTERM → SIGKILL) で
+        // shell + 孫 sleep の両方が死ぬはず。
+        drop(session);
+
+        // 孫が消えるまで待つ。ESRCH (= プロセス無し) を期待。
+        // killpg の SIGTERM → 500ms 待ち → SIGKILL の最悪ケースに余裕を加えて 3s。
+        let kill_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut grandchild_dead = false;
+        while std::time::Instant::now() < kill_deadline {
+            match kill(grandchild, None) {
+                Err(nix::errno::Errno::ESRCH) => {
+                    grandchild_dead = true;
+                    break;
+                }
+                Ok(()) | Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        assert!(
+            grandchild_dead,
+            "grandchild {grandchild_pid} should be killed via killpg, but is still alive after 3s"
+        );
+
+        // shell も既に reap 済のはず (= Session::Drop が waitpid している)。
+        // grandchild は他 process なので waitpid できない (= orphan reaper の責務)。
+        // ECHILD が返れば既に reap されている。
+        let _ = shell_pid; // unused warning 抑止
     }
 
     #[test]

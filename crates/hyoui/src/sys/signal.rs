@@ -355,10 +355,7 @@ mod tests {
         let mut saw_sigchld = false;
         for _ in 0..50 {
             let drained = pipe.drain().expect("drain");
-            if drained
-                .iter()
-                .any(|b| *b == Signal::SIGCHLD as i32 as u8)
-            {
+            if drained.contains(&(Signal::SIGCHLD as i32 as u8)) {
                 saw_sigchld = true;
                 break;
             }
