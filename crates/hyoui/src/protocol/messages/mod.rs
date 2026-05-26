@@ -17,6 +17,21 @@ use std::io::{Read, Write};
 
 use serde::{Deserialize, Serialize};
 
+/// CBOR decode 時の最大再帰深度 (R5-AUD-C1)。
+///
+/// ciborium の default は 256 で、`panic = "abort"` 設定 + 16 MiB frame 上限と
+/// 組み合わさると、認証前 (= handshake token 検証より前) の `decode_from` 経路で
+/// nested CBOR (array of array …) を投げられて daemon worker thread の stack を
+/// 枯渇させ、process 全体を abort できる DoS が成立する。
+///
+/// 制御メッセージの schema (DR-0008 §2.3) はすべて shallow で、最深部の
+/// `ErrorMessage::details` (`Option<ciborium::Value>`) を含めても実運用で 8 段
+/// 必要になることはない。16 段の余裕を持たせて拒否ライン (= 16 を超える深さの
+/// CBOR は [`ControlMessageError::Decode`] で reject) とする。
+///
+/// この値を上げる場合は stack overflow リスクの再評価が必要 (R5-AUD-C1 を参照)。
+pub const MAX_CBOR_RECURSION_DEPTH: usize = 16;
+
 mod control;
 mod error;
 mod handshake;
@@ -150,11 +165,18 @@ impl ControlMessage {
 
     /// `r` から 1 つの CBOR item を読んで control message として decode。
     ///
+    /// 再帰深度は [`MAX_CBOR_RECURSION_DEPTH`] で制限されており、これを超える
+    /// nested CBOR は [`ControlMessageError::Decode`]
+    /// (= `ciborium::de::Error::RecursionLimitExceeded`) として拒否される
+    /// (R5-AUD-C1: 認証前 stack overflow DoS 対策)。
+    ///
     /// # Errors
     ///
-    /// * [`ControlMessageError::Decode`] — CBOR parse 失敗、未知 kind、型不一致。
+    /// * [`ControlMessageError::Decode`] — CBOR parse 失敗、未知 kind、型不一致、
+    ///   または再帰深度が [`MAX_CBOR_RECURSION_DEPTH`] を超過。
     pub fn decode_from<R: Read>(r: R) -> Result<Self, ControlMessageError> {
-        ciborium::de::from_reader(r).map_err(ControlMessageError::Decode)
+        ciborium::de::from_reader_with_recursion_limit(r, MAX_CBOR_RECURSION_DEPTH)
+            .map_err(ControlMessageError::Decode)
     }
 
     /// CBOR encode して `Vec<u8>` を返す (frame の body にそのまま入れる用)。
@@ -616,6 +638,96 @@ mod tests {
             s.contains("<redacted>"),
             "Debug output must contain <redacted> marker: {s}"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // R5-AUD-C1: CBOR decode の再帰深度制限。
+    //
+    // 認証 (= handshake token 検証) より前に呼ばれる `decode_from` 経路で、
+    // 深くネストした CBOR を送られると、ciborium の default (256) や無制限
+    // 設定では daemon worker thread の stack を食い潰し、`panic = "abort"`
+    // で daemon プロセス全体が落ちる DoS が成立する。
+    //
+    // `MAX_CBOR_RECURSION_DEPTH` (= 16) を超える nested input は
+    // `ControlMessageError::Decode` (内部 = `Error::RecursionLimitExceeded`)
+    // として **panic ではなく** Result で reject されることを保証する。
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// CBOR でネストした array (`[[[...]]]`) を `depth` 段組み立てる。
+    /// 各層は `array(1)` (= header 0x81) + 最内殻に空 array (0x80) を置く。
+    /// 結果として再帰深度は `depth` 段 (空 array が 1 段としてカウント) になる。
+    fn nested_array_cbor(depth: usize) -> Vec<u8> {
+        // `array(1)` (= header 0x81) を depth-1 段、最内殻に空 array (0x80) を 1 段。
+        let outer = depth.saturating_sub(1);
+        let mut buf = vec![0x81u8; outer]; // array(1) × (depth - 1)
+        buf.push(0x80); // 最内殻の array(0)
+        buf
+    }
+
+    #[test]
+    fn cbor_decode_rejects_deeply_nested_input() {
+        // MAX_CBOR_RECURSION_DEPTH を大きく超える深さで decode → reject 必須
+        // (= panic でなく ControlMessageError::Decode に変換される)
+        let depth = MAX_CBOR_RECURSION_DEPTH + 64;
+        let bytes = nested_array_cbor(depth);
+        let err = ControlMessage::decode_from(bytes.as_slice())
+            .expect_err("deeply nested CBOR must be rejected");
+        match err {
+            ControlMessageError::Decode(ciborium::de::Error::RecursionLimitExceeded) => {}
+            ControlMessageError::Decode(other) => {
+                // 念のため: 別経路 (Semantic / Syntax) で reject されるのも可
+                // (型不一致で先に弾かれる可能性があるため)。ただし最低限 Decode で
+                // 受け止められていることを確認。
+                eprintln!("decoded as different error variant: {other:?}");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cbor_decode_rejects_extremely_deep_input_without_stack_overflow() {
+        // 旧実装 (default ciborium = 256 限度、または limit 未設定で実質無制限)
+        // では 100k 段 nested を投げると stack overflow / abort していた。
+        // limit を導入したので、`Err` で安全に reject されることを保証する
+        // (= panic も abort もしない)。
+        let depth = 100_000;
+        let bytes = nested_array_cbor(depth);
+        let result = ControlMessage::decode_from(bytes.as_slice());
+        assert!(
+            result.is_err(),
+            "extremely deep CBOR must return Err, not panic"
+        );
+    }
+
+    #[test]
+    fn cbor_decode_accepts_normal_depth() {
+        // 通常運用で出てくる深さの ControlMessage (= handshake.request /
+        // error with details) は問題なく decode できることを保証する。
+        // handshake.request: map → caps array → strings (= 概ね 2-3 段)
+        let req = ControlMessage::HandshakeRequest(HandshakeRequest {
+            caps: vec!["data".into(), "lock".into(), "tail-v1".into()],
+            mode: Mode::Rw,
+            exclusive: false,
+            detach_others: false,
+            token: Some("tok".into()),
+        });
+        let bytes = req.encode_to_vec().expect("encode");
+        let decoded = ControlMessage::decode_from(bytes.as_slice()).expect("decode");
+        assert_eq!(decoded, req);
+
+        // error.details に深さ 3 (= map → array → scalar) を入れても受理
+        // (MAX_CBOR_RECURSION_DEPTH = 16 で十分余裕がある)
+        let err = ControlMessage::Error(ErrorMessage {
+            code: ErrorCode::LockDenied,
+            message: "x".into(),
+            details: Some(ciborium::Value::Map(vec![(
+                ciborium::Value::Text("k".into()),
+                ciborium::Value::Array(vec![ciborium::Value::Integer(1.into())]),
+            )])),
+        });
+        let bytes = err.encode_to_vec().expect("encode");
+        let decoded = ControlMessage::decode_from(bytes.as_slice()).expect("decode");
+        assert_eq!(decoded, err);
     }
 
     #[test]
