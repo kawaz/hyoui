@@ -570,13 +570,17 @@ commit `e39179f6` で D1-D8 + H1-H7 + L1-L6 全件解消済。詳細は jj log �
 
 ### B1-B8
 
-- [ ] **R5-FB1** `hyoui run --until PATTERN` が機能していない (= 期待のパターン後も子が走り続ける)
-  - 出典: 実機検証 / 提案: v0.2.0 wait --pattern への redirect で deprecate も可
-- [ ] **R5-FB2** headless mode で stdin EOF が子に伝わらない (= `echo "1+2" | hyoui run -- bc` で hang)
+- [done] **R5-FB1** `hyoui run --until PATTERN` が機能していない (= 期待のパターン後も子が走り続ける)
+  - 出典: 実機検証 / 解消 (2026-05-27): `DaemonConfig.until` + `UntilWatcher` (= sliding window matcher with carry buffer) を serve_loop に配線。master byte stream の chunk 境界を跨ぐ needle も検出。match 時に `kill_pgrp(child, SIGTERM)` → `ClientDetachedOrKilled` 経路で finalize
+- [done] **R5-FB2** headless mode で stdin EOF が子に伝わらない (= `echo "1+2" | hyoui run -- bc` で hang)
+  - 出典: 実機検証 / 解消 (2026-05-27): `StdinEofAction` enum (Detach / SendEof) を `hyoui::client` に新設、`ClientConnection::with_stdin_eof_action(SendEof)` で stdin EOF 時に EOT (0x04) を子 PTY に raw_data 送信。`hyoui-cli/main.rs::run_command` で stdin が TTY 以外の場合 (= pipe / file / heredoc) に SendEof を自動選択
 - [ ] **R5-FB3** `hyoui run --detached` 未実装 (= attach --help の RELATED 節に記載あるが本体未実装、v0.2.0 scope に組み込み要)
-- [ ] **R5-FB4** `run` 直後の wait/status が ENOENT (= socket 作成 race)
-- [ ] **R5-FB5** `--socket` 親 dir mode エラー文言が不親切 (= hint 追記で改善)
+- [done] **R5-FB4** `run` 直後の wait/status が ENOENT (= socket 作成 race)
+  - 出典: 実機検証 / 解消 (2026-05-27): `connect_with_retry()` helper を `hyoui-cli/main.rs` に新設、socket 不存在系 errno (ENOENT / ECONNREFUSED) のみ 100ms × 20 attempts = 2s budget で retry。attach / kill / status / tail / wait の 5 subcommand に適用。認証エラー / protocol error は retry せず即 fail で hint 経路へ
+- [done] **R5-FB5** `--socket` 親 dir mode エラー文言が不親切 (= hint 追記で改善)
+  - 出典: 実機検証 / 解消 (2026-05-27): `sys/socket.rs::check_parent_dir` の Precondition 文言に next-action hint を追加 (= `$XDG_RUNTIME_DIR` / `$TMPDIR` 推奨、`chmod 700 <parent>` の直し方明示)。`Error::Precondition` の `&'static str` リテラルを更新するだけで ErrorCode 体系は触らず
 - [done] **R5-FB6** `hyoui list/kill --help` 取りこぼし (= R4-H1 で list/kill は解消、completion --help だけ残)
+  - 完全解消 (2026-05-27): `usage_completion()` を list/kill と同じ pattern (USAGE / OPTIONS / SHELLS / EXAMPLES / RELATED 5 節構造) で再実装。help 配線そのものは parse_completion で既に HelpTopic::Completion ルーティング済
 - [done] **R5-FB7** v0.2.0 で `kill` subcommand 去就 (= 2026-05-27 kawaz 確認: アプリ固有問題は `input keys` で対応可、kill は v0.1.x 互換維持で v0.2.0 scope 7 個から除外、DR-0010 据え置き)
 - [done] **R5-FB8** leader 死亡時 socket 残骸 (= R5-H3 で list stale 検出 + --prune-stale 実装済、commit `beb7dd05`)
 
