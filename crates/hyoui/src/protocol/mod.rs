@@ -10,7 +10,9 @@
 //! 詳細は `docs/decisions/DR-0008-protocol-design.md` を参照。
 
 mod frame;
+pub mod messages;
 
 pub use frame::{
     Frame, FrameError, MAX_FRAME_SIZE, ProtocolError, TYPE_CBOR_CONTROL, TYPE_RAW_DATA,
 };
+pub use messages::{ControlMessage, ControlMessageError};
