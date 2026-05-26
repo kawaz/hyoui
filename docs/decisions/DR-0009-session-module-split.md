@@ -267,7 +267,8 @@ Phase B で dispatcher 化せず、handler 内部の巨大 match を維持する
 
 - **Transport abstraction (R4-H7) との接続は本 DR では扱わない**。R4-H7 (= UnixStream 前提のコードが daemon に散在) は DR-0008 改訂 + 後続 DR (DR-0010 想定) で「Transport 境界の再定義」を扱う。本 DR の分割完了後に Transport 抽象を被せる経路を残す: 具体的には `accept.rs` の `spawn_handshake_worker` / `do_handshake_stage` / `finalize_accepted_client` の I/O 部分、`broadcast.rs` の `writer_pump` の I/O 部分が抽象化点になる予定
 - R4-M3 (Session::serve cleanup Drop 不在) は R4-H4 で `Session` に `Drop` 追加済 + `into_parts` で正常 path をバイパス済 (= panic safety は確保済)。本 DR の分割では Drop 構造そのものは触らず、現状を維持する。`serve_loop` 内の drop cascade を `Drop` for `ClientHandle` に寄せる案は Phase F の検討事項とする
-- session.rs 内の `unsafe` (= `Session::into_parts` の `ptr::read` ×4) は分割後も残る。Option-based 化 (= 各 field を `Option<T>` にして `.take()` で消費) は別 task として切り出す (本 DR の scope 外)
+- ~~session.rs 内の `unsafe` (= `Session::into_parts` の `ptr::read` ×4) は分割後も残る。Option-based 化 (= 各 field を `Option<T>` にして `.take()` で消費) は別 task として切り出す (本 DR の scope 外)~~
+  - **解消済 (2026-05-27)**: `Session` を `{ config, inner: Option<SessionInner> }` 化し、`serve` で `inner.take()` で move-out する形に書き換えた。`Session::into_parts` (= unsafe ヘルパ) は削除、daemon module 全体で unsafe 数 0 達成。lint:unsafe whitelist からも `daemon/session.rs` を削除済
 
 ### 関連項目の更新
 

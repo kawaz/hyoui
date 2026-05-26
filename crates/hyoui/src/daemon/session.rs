@@ -49,11 +49,12 @@ use super::wait::{
 /// - 残っていれば SIGKILL
 /// - `waitpid(WNOHANG)` で短い loop で reap し zombie を回収
 ///
-/// `serve()` は `self` を destructure で消費するため、正常 path では
-/// このフィールド由来の Drop は走らない (= 各フィールドが個別に Drop される)。
-/// Drop が発火するのは `Session::start` 後に `serve` を呼ばずに
-/// `Session` が drop されたケース (= test 内 panic / 初期化エラー後の early
-/// return 等) で、その場合に子が orphan として残らないようにする。
+/// `serve()` は `inner.take()` で `SessionInner` を取り出して消費するため、正常
+/// path ではその後の Drop で `inner == None` となり no-op になる (= 各フィールドは
+/// `SessionInner` の destructure 経由で個別に Drop される)。Drop が実質的に発火
+/// するのは `Session::start` 後に `serve` を呼ばずに `Session` が drop された
+/// ケース (= test 内 panic / 初期化エラー後の early return 等) で、その場合に
+/// 子が orphan として残らないようにする。
 ///
 /// Pty/UnixSock は元々独自の Drop を持つため、Session::drop は child Pid の
 /// 始末だけを担当する。Drop 中は panic 安全のため全 syscall を `let _ = ...`
@@ -61,6 +62,15 @@ use super::wait::{
 #[derive(Debug)]
 pub struct Session {
     config: DaemonConfig,
+    /// `serve` 経由で消費されると `None` になり、その後の Drop は no-op になる。
+    /// `start` 直後は常に `Some`。
+    inner: Option<SessionInner>,
+}
+
+/// `Session` の本体リソース。`Option<SessionInner>` で包むことで `serve` が
+/// `take()` で move-out できるようにし、Drop bypass の `unsafe` を不要にする。
+#[derive(Debug)]
+struct SessionInner {
     pty: Pty,
     child: Pid,
     listener: UnixSock,
@@ -87,10 +97,20 @@ impl Session {
         let listener = UnixSock::listen(&config.socket_path)?;
         Ok(Self {
             config,
-            pty,
-            child,
-            listener,
+            inner: Some(SessionInner {
+                pty,
+                child,
+                listener,
+            }),
         })
+    }
+
+    /// `inner` を `Some` 前提で参照する内部ヘルパ。`start` 直後 〜 `serve` の
+    /// `take()` 直前までは必ず `Some`。
+    fn inner(&self) -> &SessionInner {
+        self.inner
+            .as_ref()
+            .expect("Session::inner accessed after serve consumed it (bug)")
     }
 
     /// session 名 (handshake response 用 + status 表示用)。
@@ -100,41 +120,17 @@ impl Session {
 
     /// 子 PTY の PID。
     pub fn child_pid(&self) -> Pid {
-        self.child
+        self.inner().child
     }
 
     /// listener が bind している socket path。
     pub fn socket_path(&self) -> &std::path::Path {
-        self.listener.path()
+        self.inner().listener.path()
     }
 
     /// 子 PTY master fd (= 後の Phase で broadcast/multiplex に使用)。
     pub fn pty(&self) -> &Pty {
-        &self.pty
-    }
-
-    /// `Session` を fields に解体する (R4-H4 internal)。
-    ///
-    /// `Session` は `Drop` を実装している (= 子 PTY の orphan 防止) ため、Rust の
-    /// destructure-move (`let Self { .. } = self`) は使えない。`serve` / `run` の
-    /// 正常 path で fields を取り出すには ManuallyDrop で Drop をバイパスする
-    /// 必要がある。本関数はその unsafe を 1 箇所に閉じ込めるためのヘルパ。
-    ///
-    /// 呼び出し後は `Session` の Drop は走らない。fields は呼び出し側が
-    /// 責任を持って drop する (= `Pty::drop` / `UnixSock::drop` は走る)。
-    fn into_parts(self) -> (DaemonConfig, Pty, Pid, UnixSock) {
-        // SAFETY: ManuallyDrop で Session の Drop をバイパスし、各 field を
-        // 1 度ずつ ptr::read で取り出す。各 field は move semantics でしか
-        // 触らないので二重 read は発生しない。`md` は drop されないので
-        // Session::drop も呼ばれない (= 意図通り)。
-        let md = std::mem::ManuallyDrop::new(self);
-        unsafe {
-            let config = std::ptr::read(&md.config);
-            let pty = std::ptr::read(&md.pty);
-            let child = std::ptr::read(&md.child);
-            let listener = std::ptr::read(&md.listener);
-            (config, pty, child, listener)
-        }
+        &self.inner().pty
     }
 
     /// Phase 9: multi-attach 対応の serve loop。
@@ -152,11 +148,22 @@ impl Session {
     /// MVP 単一-client 構成と挙動を揃えるため、本実装も子が exit した時点で
     /// daemon は終了する。「clients == 0 でも daemon 維持」は v0.2.0+ で
     /// `--keep-running` 等の opt-in で導入する想定。
-    pub fn serve(self) -> Result<i32, Error> {
+    pub fn serve(mut self) -> Result<i32, Error> {
         // R4-H4: Drop は `start` 後 `serve` 未呼出のフォールバック専用。
-        // serve は正常 path として fields を消費するので、into_parts で
-        // Drop をバイパスして fields を取り出す。
-        let (config, pty, child, listener) = self.into_parts();
+        // serve は正常 path として inner を消費する。`inner.take()` 後は
+        // serve の末尾で self が drop されるとき `Session::drop` が呼ばれるが、
+        // inner == None で no-op になる (= 各 field は SessionInner の
+        // destructure で個別に drop される)。`self.config` は self が drop
+        // されるときに通常通り drop される。
+        let SessionInner {
+            pty,
+            child,
+            listener,
+        } = self
+            .inner
+            .take()
+            .expect("Session::serve called twice or after consumption (bug)");
+        let config = &self.config;
         let mut clients: Vec<ClientHandle> = Vec::new();
         let mut next_client_id: u64 = 0;
         let mut state = SessionState::default();
@@ -168,7 +175,7 @@ impl Session {
             &listener,
             &mut clients,
             &mut next_client_id,
-            &config,
+            config,
             &mut state,
             &mut scrollback,
             &mut pending_waits,
@@ -241,7 +248,13 @@ impl Drop for Session {
         /// reap poll 間隔。短いほど CPU 寄り、長いほど drop 自体が遅延。
         const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
-        let child = self.child;
+        // `inner` が `None` なら `serve` が正常 path で消費済み (= 子 reap は
+        // `finalize_child` 経由で完了済) なので no-op。`Some` のときだけ
+        // fallback の SIGTERM → SIGKILL reap を行う。
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        let child = inner.child;
 
         // 1. 既に reap 済か確認 (WNOHANG)。reap 済なら何もしない。
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
@@ -647,14 +660,16 @@ fn finalize_child(child: Pid, outcome: &RelayOutcome) -> Result<i32, Error> {
     }
 }
 
-// Drop impl の責務分担 (R4-H4 で Session 自体にも Drop 追加):
+// Drop impl の責務分担 (R4-H4 で Session 自体にも Drop 追加 → R4-H6 で Option-based 化):
 // - listener (UnixSock) は自身の Drop で socket file を unlink
 // - pty (Pty) は自身の Drop で master fd を close
-// - 正常 path (Session::serve) では `into_parts` で Drop をバイパスして
-//   fields を取り出し、`finalize_child` が子の reap を担当する
+// - 正常 path (Session::serve) では `self.inner.take()` で `SessionInner` を
+//   move-out し、destructure で pty/child/listener を取り出す。serve の末尾で
+//   self が drop されるとき `Session::drop` は `inner == None` で no-op。
+//   子の reap は `finalize_child` が担当する
 // - `serve` を呼ばずに Session が drop された場合 (test panic / early
-//   return) は `impl Drop for Session` (= session.rs 上部) が SIGTERM →
-//   500ms wait → SIGKILL で子を reap して orphan を防ぐ
+//   return) は `impl Drop for Session` (= session.rs 上部) が `inner == Some`
+//   を見て SIGTERM → 500ms wait → SIGKILL で子を reap して orphan を防ぐ
 
 #[cfg(test)]
 mod tests {
