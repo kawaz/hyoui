@@ -27,9 +27,14 @@ nix = { version = "0.31", default-features = false, features = [
 ] }
 libc = "0.2"
 thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
 
 [workspace.dependencies.tempfile]
 version = "3"
+
+[workspace.dependencies.hex]
+version = "0.4"
 
 [profile.release]
 lto = "fat"

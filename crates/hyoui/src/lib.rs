@@ -32,6 +32,13 @@ pub mod observer;
 pub mod scrollback;
 pub mod strip;
 
+// v0.1.0 wire protocol (DR-0008 確定版):
+//
+//   * Frame layout: [u32 LE size][u8 type][body]、wire 外枠は永久固定
+//   * type=0x00 raw PTY data / 0x01 CBOR control message / 0x02+ 予約
+//   * 各 control message は `protocol::messages::*` で型付き
+pub mod protocol;
+
 /// Library version (matches `Cargo.toml`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
