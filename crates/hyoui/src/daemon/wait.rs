@@ -210,6 +210,25 @@ pub(super) fn handle_wait_request(
 /// 適用する。`strip_escapes` は per-wait の `StripAnsiCarry` で chunk 境界を跨ぐ
 /// partial ANSI escape を持ち越すため、escape を挟んで分割された needle も正しく
 /// match できる (R4-H3)。
+///
+/// ## invariant: needle 検出範囲 (R5-H19 / R5-FRM-C3)
+///
+/// `accumulated` は memory bound (= [`WAIT_ACCUMULATED_LIMIT`]) を超えた場合、
+/// `drain(..(len - limit))` で **先頭から** 余剰 byte を捨てる。新 bytes は
+/// `extend_from_slice` で末尾に追加されるので、trim 後の `accumulated` は
+/// **常に「最新 `WAIT_ACCUMULATED_LIMIT` バイト」** を保持する。
+///
+/// この invariant により、needle (= Text の value / Pattern の regex match) が
+/// 「最新 `WAIT_ACCUMULATED_LIMIT` バイト以内に出現」していれば必ず検出される。
+/// 逆に言うと、daemon は `WAIT_ACCUMULATED_LIMIT` を超えて古い byte に出現した
+/// needle は検出できない (= sliding window scan)。これは memory bound と
+/// detection completeness のトレードオフによる設計判断 (DR-0008 §wait scan)。
+///
+/// **将来 trim ロジックを変更する人へ**: trim 後に「最新 `WAIT_ACCUMULATED_LIMIT`
+/// バイトが保持されている」という invariant を壊さないこと。例えば「時間経過で
+/// 古い chunk を間引く」「特定区切り文字で分割」等を入れる場合、needle が
+/// 「最新の limit バイト中に必ず含まれる」という保証が崩れる。本関数末尾の
+/// `debug_assert!` で trim 後の長さ上限を機械検証している。
 pub(super) fn update_waits_on_master_bytes(
     pending_waits: &mut Vec<PendingWait>,
     clients: &mut [ClientHandle],
@@ -231,11 +250,18 @@ pub(super) fn update_waits_on_master_bytes(
             bytes_to_add = crate::strip::normalize_lf(&bytes_to_add);
         }
         w.accumulated.extend_from_slice(&bytes_to_add);
-        // memory bound: head から trim
+        // memory bound: head から trim、末尾 WAIT_ACCUMULATED_LIMIT バイトを保持
         if w.accumulated.len() > WAIT_ACCUMULATED_LIMIT {
             let drop_n = w.accumulated.len() - WAIT_ACCUMULATED_LIMIT;
             w.accumulated.drain(..drop_n);
         }
+        // R5-H19: trim 後の invariant を機械検証 (= needle 検出範囲 = 末尾 limit
+        // バイト)。将来 trim ロジックが変わって invariant が壊れたら test で検出。
+        debug_assert!(
+            w.accumulated.len() <= WAIT_ACCUMULATED_LIMIT,
+            "trim must keep accumulated within WAIT_ACCUMULATED_LIMIT (= {WAIT_ACCUMULATED_LIMIT} bytes), got {}",
+            w.accumulated.len()
+        );
 
         let matched = match &w.predicate {
             WaitPredicate::Text { value } => w
@@ -500,6 +526,57 @@ mod tests {
             waits.len(),
             1,
             "split CSI params must not leak as raw text and false-match"
+        );
+    }
+
+    /// R5-H19: 大量の master bytes を投入しても `accumulated.len()` が
+    /// `WAIT_ACCUMULATED_LIMIT` を超えないこと (= trim invariant の機械検証)。
+    ///
+    /// pending wait が text predicate で「絶対に match しない needle」を持つ状態で、
+    /// `WAIT_ACCUMULATED_LIMIT` の 3 倍の master bytes を投入する。各 iteration の
+    /// `debug_assert!` が trim 後の上限を機械検証している。
+    #[test]
+    fn update_waits_keeps_accumulated_within_limit() {
+        let now = Instant::now();
+        let mut waits = vec![PendingWait {
+            client_id: 1,
+            predicate: WaitPredicate::Text {
+                // 絶対 match しない needle (= 全 bytes を投入し終わるまで wait は残る)
+                value: "__NEVER_MATCH_NEEDLE__".into(),
+            },
+            options: WaitMatchOptions::default(),
+            deadline: None,
+            accumulated: Vec::new(),
+            last_activity: now,
+            compiled_regex: None,
+            strip_carry: crate::strip::StripAnsiCarry::new(),
+        }];
+        let mut clients: Vec<ClientHandle> = Vec::new();
+
+        // 1 chunk = 256 KiB を 13 回 = 約 3.25 MiB (> 3 × 1 MiB) 投入。
+        // debug_assert! が trim 後の不変量を毎 iteration で検証する。
+        let chunk = vec![b'x'; 256 * 1024];
+        for _ in 0..13 {
+            update_waits_on_master_bytes(&mut waits, &mut clients, &chunk, now);
+        }
+
+        assert_eq!(
+            waits.len(),
+            1,
+            "needle should never match, wait must remain"
+        );
+        let w = &waits[0];
+        // release build でも assert で invariant を確認 (debug_assert は debug only)
+        assert!(
+            w.accumulated.len() <= WAIT_ACCUMULATED_LIMIT,
+            "accumulated must stay within WAIT_ACCUMULATED_LIMIT, got {} bytes",
+            w.accumulated.len()
+        );
+        // 末尾 1 MiB を保持していること (= ちょうど limit に張り付く)
+        assert_eq!(
+            w.accumulated.len(),
+            WAIT_ACCUMULATED_LIMIT,
+            "after enough input, accumulated should saturate at the limit"
         );
     }
 }
