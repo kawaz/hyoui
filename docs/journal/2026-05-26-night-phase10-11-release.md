@@ -105,18 +105,35 @@ printf '[a]\nversion = "0.0.0"\n[b]\nversion = "0.0.0"\n' | \
 → 1 つ目だけ 0.1.0 に置換、2 つ目は据え置き
 
 **Cargo.toml 修正は v0.1.0 release commit 内で手動対応**、Taskfile 修正は
-follow-up commit に分離。canonical (= kawaz/bump-semver の Taskfile.pkl) にも
-同 bug 存在の可能性大、別 PR で追従予定。
+follow-up commit に分離。
+
+→ canonical (= kawaz/bump-semver の Taskfile.pkl) を確認したところ、bump-semver
+本体には Cargo.toml の workspace.package 同期 workaround **そのものが無い**
+(= bump-semver 自身は VERSION 1 つだけ管理)。perl bug は hyoui の Taskfile に
+独自に書かれたもの。canonical 側への PR は不要。
 
 ## 残作業 (v0.2.0+)
 
 - wait queue (= lock.acquire wait=true の queue 対応)
-- bounded queue 厳密化 (= 4 KiB frame 仮定の cap を byte bound に置換)
 - tail.data の chunk 境界保持 (= 現状 buffer dump を 1 個の TailData で潰す)
 - TailEnd(ChildExited) を child exit 時に tail subscriber へ broadcast
 - detach prefix の customize (--detach-prefix env / option)
 - ANSI escape strip の chunk 境界跨ぎ正規化 (= 現状 best-effort)
 - attach subcommand 専用 --help (detach key 動作を明記)
+
+### v0.1.0 後 (本セッション内) で完了済
+
+- **bounded queue 厳密化 (Phase 12)**: `Arc<AtomicUsize> queued_bytes` で byte
+  単位の cap を check-and-add 方式で enforce、overflow で `error` kind=
+  `backpressure.disconnect` を送って当該 client を `shutdown(Both)` で drop。
+  e2e test (`yes` 子 + 読まない client) で 4096 byte cap 超過時の disconnect 確認
+
+### 当初想定していたが不要と判明
+
+- **bump-semver canonical 側への perl bug 追従 PR**: canonical
+  (kawaz/bump-semver) を確認したところ workspace.package 同期 workaround は
+  そのものが存在しない (= bump-semver は VERSION 1 つだけ管理)。perl 文字列は
+  hyoui の Taskfile に独自に書かれたもの。canonical 側修正は不要
 
 ## 使用 protocol cap
 
