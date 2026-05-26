@@ -5,7 +5,7 @@
 //! * `Help`     — print usage to stdout (exit 0 for explicit help, exit 2 for
 //!   unknown subcommands so callers can detect misuse from the status code).
 //! * `Version`  — print `hyoui <VERSION>` and exit 0.
-//! * `Run(cfg)` — daemon::Session::run 経由で子 PTY を foreground 実行。
+//! * `Run(cfg)` — daemon::Session::serve 経由で子 PTY を foreground 実行。
 //!   socket path は `--socket` 指定 / 未指定なら自動 (`socket_path::resolve`)。
 //! * `Completion { shell }` — emit a hand-written completion script.
 //! * `Error`    — print the diagnostic to stderr and exit 2.

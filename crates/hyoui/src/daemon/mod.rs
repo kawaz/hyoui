@@ -8,8 +8,10 @@
 //!
 //! - [x] Phase 6: skeleton (`DaemonConfig`、module 構成)
 //! - [x] Phase 7: 子 PTY spawn + listener bind + 1 client + handshake
+//!   (= `accept_handshake_once`、R4-M1 で撤去済、Phase 9 で完全置換)
 //! - [x] Phase 8: raw data 中継 + detach + clean shutdown
-//! - [x] Phase 9: multi-attach + bounded mpsc (backpressure DR-0008 §8.2)
+//!   (= `Session::run`、R4-M1 で撤去済、Phase 9 で完全置換)
+//! - [x] Phase 9: multi-attach + bounded mpsc (backpressure DR-0008 §8.2) ← 現役
 //! - [x] Phase 10: lock + leader + mode change (wait queue 未実装、wait=true でも Denied)
 //! - [x] Phase 11: status / tail / wait (text/pattern/idle predicates、subscription 切替)
 //!

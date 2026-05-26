@@ -1,14 +1,14 @@
-//! daemon 1 つ分の session 状態 + 起動ロジック (Phase 7-8)。
+//! daemon 1 つ分の session 状態 + 起動ロジック。
 //!
 //! `Session::start` で:
 //! 1. 子 PTY を `Pty::spawn` で起動 (= forkpty + login_tty + execvp)
 //! 2. Unix socket を `UnixSock::listen` で bind (perm 0600 + 親 dir 0700)
 //!
-//! Phase 7: `accept_handshake_once` で単発 handshake (= e2e test 用)。
-//! Phase 8: `run()` で 1 client の完結 lifecycle (= handshake → data 中継 →
-//! 子 exit / client detach → 子 reap → daemon exit code 返却)。
+//! `Session::serve` (Phase 9 で導入) が本流の lifecycle entry point:
+//! multi-attach + bounded mpsc + lock/leader + status/tail/wait を担う。
 //!
-//! Phase 9 以降で multi-attach、lock/leader、status/tail/wait を順次入れる。
+//! 旧 `accept_handshake_once` (Phase 7) と `run` (Phase 8、1-client 限定の同期 path) は
+//! R4-M1 (v0.1.4) で撤去済。`serve` で完全に置き換えられた。
 
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
@@ -29,8 +29,8 @@ use crate::protocol::messages::{
     WaitOutcome, WaitPredicate, WaitRequest, WaitResult,
 };
 use crate::protocol::{
-    ControlMessage, Frame, FrameError, HandshakeResponse, MVP_CAPS, Mode, ProtocolError,
-    TYPE_CBOR_CONTROL, TYPE_RAW_DATA, Transport, UnixStreamTransport, intersect_caps,
+    ControlMessage, Frame, HandshakeResponse, MVP_CAPS, Mode, TYPE_CBOR_CONTROL, TYPE_RAW_DATA,
+    Transport, UnixStreamTransport, intersect_caps,
 };
 use crate::scrollback::Scrollback;
 use crate::sys::{
@@ -46,9 +46,9 @@ use super::DaemonConfig;
 /// - 残っていれば SIGKILL
 /// - `waitpid(WNOHANG)` で短い loop で reap し zombie を回収
 ///
-/// `serve()` / `run()` は `self` を destructure で消費するため、正常 path では
+/// `serve()` は `self` を destructure で消費するため、正常 path では
 /// このフィールド由来の Drop は走らない (= 各フィールドが個別に Drop される)。
-/// Drop が発火するのは `Session::start` 後に `serve` / `run` を呼ばずに
+/// Drop が発火するのは `Session::start` 後に `serve` を呼ばずに
 /// `Session` が drop されたケース (= test 内 panic / 初期化エラー後の early
 /// return 等) で、その場合に子が orphan として残らないようにする。
 ///
@@ -79,7 +79,7 @@ impl Session {
         let argv: Vec<&str> = config.cmd.iter().map(String::as_str).collect();
         let Spawned { pty, child } = Pty::spawn(&argv, config.cols, config.rows)?;
         // master FD を nonblock にして、POLLHUP 偽陽性 (macOS) で read_some が
-        // block するのを防ぐ。read_some は EAGAIN を返す → relay_loop で continue。
+        // block するのを防ぐ。read_some は EAGAIN を返す → serve_loop で continue。
         pty.master_fd().set_nonblocking(true)?;
         let listener = UnixSock::listen(&config.socket_path)?;
         Ok(Self {
@@ -134,121 +134,13 @@ impl Session {
         }
     }
 
-    /// 1 client の handshake を完了させる (Phase 7 用、Phase 8 で置き換え)。
-    ///
-    /// 流れ:
-    /// 1. `listener.accept()` で client fd を取る
-    /// 2. 最初の Frame を読み、`type=0x01` + `kind="handshake.request"` を期待
-    /// 3. cap negotiation (MVP_CAPS と intersect)
-    /// 4. `client_id = 0` 固定で `handshake.response` を返す
-    /// 5. client_id 0 を leader として割り当てる
-    ///
-    /// 返り値は (client_id, handshake response の中身) のタプル。
-    ///
-    /// 返した時点で client connection は close されている (= 後続 Phase で
-    /// connection 持続版に差し替え)。
-    pub fn accept_handshake_once(&self) -> Result<(u64, HandshakeResponse), Error> {
-        let client_fd: OwnedFd = self.listener.accept()?;
-        let stream = unix_stream_from_owned_fd(client_fd);
-        let transport = UnixStreamTransport::new(stream);
-        let (mut reader, mut writer) = transport.split().map_err(Error::from)?;
-
-        let frame = Frame::decode_from(&mut reader)
-            .map_err(|_| Error::Invalid("failed to decode handshake frame"))?;
-        if frame.ty != crate::protocol::TYPE_CBOR_CONTROL {
-            return Err(Error::Invalid("handshake frame must be CBOR control"));
-        }
-        let msg = ControlMessage::decode_from(frame.body.as_slice())
-            .map_err(|_| Error::Invalid("handshake CBOR decode failed"))?;
-        let req = match msg {
-            ControlMessage::HandshakeRequest(r) => r,
-            _ => return Err(Error::Invalid("first message must be handshake.request")),
-        };
-
-        // cap negotiation
-        let mvp: Vec<String> = MVP_CAPS.iter().map(|s| (*s).to_string()).collect();
-        let intersect = intersect_caps(&req.caps, &mvp);
-
-        // mode は request をそのまま採用 (= Phase 10 で lock/leader 制約に基づく
-        // 上書きを実装)。client_id = 0、Phase 9 で multi-attach の採番に差し替え。
-        let response = HandshakeResponse {
-            caps: intersect,
-            session_id: self.config.session_id.clone(),
-            client_id: 0,
-            leader: matches!(req.mode, Mode::Rw),
-            mode: req.mode,
-        };
-
-        let body = ControlMessage::HandshakeResponse(response.clone())
-            .encode_to_vec()
-            .map_err(|_| Error::Invalid("handshake.response encode failed"))?;
-        Frame::cbor_control(body)
-            .encode_to(&mut writer)
-            .map_err(|_| Error::Invalid("handshake.response frame encode failed"))?;
-
-        // reader/writer drop で client connection close。
-        Ok((response.client_id, response))
-    }
-
-    /// 1 client の完結 lifecycle を実行し、子 PTY の exit code を返す (Phase 8)。
-    ///
-    /// 流れ:
-    /// 1. listener から 1 client accept
-    /// 2. handshake (request 受信 + response 送信)
-    /// 3. relay_loop: 子 PTY ↔ client の双方向 bytes 中継 + control message 処理
-    /// 4. 終了時に子 PTY を reap (waitpid) して exit code 取得
-    ///
-    /// 終了条件:
-    /// - 子 PTY 出力で EOF (= 子が exit、master FD は EIO/0 byte read)
-    /// - client が `detach` / `kill` message 送信 or socket EOF
-    /// - protocol violation (= 不正 frame)
-    ///
-    /// 子が client より先に exit した場合は exit code をそのまま返す。
-    /// client が先に消えた場合は子に SIGTERM を送って待つ (MVP は 1 client 構成
-    /// なので、最後の client が消えたら session を畳む)。
-    pub fn run(self) -> Result<i32, Error> {
-        // Session の Drop は「`start` 後 `serve`/`run` 未呼出」のフォールバック専用。
-        // 正常 path では Drop が走らないように `into_parts` で fields を取り出して
-        // self を ManuallyDrop で破棄する。
-        let (config, pty, child, listener) = self.into_parts();
-
-        // 1. accept
-        let client_fd: OwnedFd = listener.accept()?;
-        let stream = unix_stream_from_owned_fd(client_fd);
-        let transport = UnixStreamTransport::new(stream);
-        let (mut client_reader, mut client_writer) = transport.split().map_err(Error::from)?;
-
-        // 2. handshake (= accept_handshake_once と同じロジックだが connection 維持)
-        do_handshake(
-            &pty,
-            &mut client_reader,
-            &mut client_writer,
-            &config.session_id,
-            config.expected_token.as_deref(),
-        )?;
-
-        // 3. relay loop
-        let outcome = relay_loop(&pty, child, &mut client_reader, &mut client_writer);
-
-        // 4. cleanup: 子 PTY を reap して exit code 取得
-        // outcome により、必要なら子に signal を送ってから wait する。
-        let exit_code = finalize_child(child, &outcome)?;
-
-        // listener は self.listener が move 済みなので drop = unlink される。
-        drop(listener);
-
-        match outcome {
-            RelayOutcome::ChildExited(_) | RelayOutcome::ClientDetachedOrKilled => Ok(exit_code),
-            RelayOutcome::Error(e) => Err(e),
-        }
-    }
-
     /// Phase 9: multi-attach 対応の serve loop。
     ///
-    /// `Session::run` (= 1-client only) の上位互換。複数 client を同時に
-    /// accept、子 PTY 出力を全 client にブロードキャスト、各 client 入力を
-    /// 子 PTY に集約する。各 client は per-thread writer + bounded queue を
-    /// 持ち、queue 超過時はその client のみ disconnect する (DR-0008 §8.2)。
+    /// 旧 `Session::run` (= Phase 8、1-client 限定) の上位互換であり、R4-M1 で
+    /// 唯一の本流 entry point になった。複数 client を同時に accept、子 PTY 出力を
+    /// 全 client にブロードキャスト、各 client 入力を子 PTY に集約する。各 client は
+    /// per-thread writer + bounded queue を持ち、queue 超過時はその client のみ
+    /// disconnect する (DR-0008 §8.2)。
     ///
     /// 終了条件:
     /// - 子 PTY が exit → 子 reap → exit code を返す
@@ -258,7 +150,7 @@ impl Session {
     /// daemon は終了する。「clients == 0 でも daemon 維持」は v0.2.0+ で
     /// `--keep-running` 等の opt-in で導入する想定。
     pub fn serve(self) -> Result<i32, Error> {
-        // R4-H4: Drop は `start` 後 `serve`/`run` 未呼出のフォールバック専用。
+        // R4-H4: Drop は `start` 後 `serve` 未呼出のフォールバック専用。
         // serve は正常 path として fields を消費するので、into_parts で
         // Drop をバイパスして fields を取り出す。
         let (config, pty, child, listener) = self.into_parts();
@@ -333,12 +225,12 @@ impl Session {
     }
 }
 
-/// R4-H4: `Session` の Drop は `start()` 後に `serve`/`run` を呼ばずに drop された
+/// R4-H4: `Session` の Drop は `start()` 後に `serve` を呼ばずに drop された
 /// ケース (= test panic、初期化失敗後 early return 等) で子 PTY が orphan として
 /// 残らないようにする。
 ///
-/// `serve()` / `run()` は `self` を destructure で消費するため、それらが
-/// 正常 path で走った後はこの Drop は呼ばれない (= 各フィールドが個別に Drop)。
+/// `serve()` は `self` を destructure で消費するため、正常 path で走った後は
+/// この Drop は呼ばれない (= 各フィールドが個別に Drop)。
 ///
 /// 手順:
 /// 1. SIGTERM を送って graceful 終了を要求
@@ -2211,7 +2103,7 @@ fn handle_control_message(
     }
 }
 
-/// `Session::run` の relay loop 結果。
+/// serve_loop の relay 結果。
 #[derive(Debug)]
 enum RelayOutcome {
     /// 子 PTY 側で EOF を検出 (= 子 process が exit した)。exit code が判明していれば
@@ -2222,218 +2114,6 @@ enum RelayOutcome {
     ClientDetachedOrKilled,
     /// 回復不能な error (= protocol violation 等)。
     Error(Error),
-}
-
-/// handshake を 1 接続分処理する (`Session::accept_handshake_once` と同じ
-/// CBOR 取扱 + cap negotiation)。`Session::run` で接続維持版に再利用する。
-fn do_handshake<R: std::io::Read, W: std::io::Write>(
-    _pty: &Pty,
-    reader: &mut R,
-    writer: &mut W,
-    session_id: &str,
-    expected_token: Option<&str>,
-) -> Result<HandshakeResponse, Error> {
-    let frame = Frame::decode_from(reader)
-        .map_err(|_| Error::Invalid("failed to decode handshake frame"))?;
-    if frame.ty != TYPE_CBOR_CONTROL {
-        return Err(Error::Invalid("handshake frame must be CBOR control"));
-    }
-    let msg = ControlMessage::decode_from(frame.body.as_slice())
-        .map_err(|_| Error::Invalid("handshake CBOR decode failed"))?;
-    let req = match msg {
-        ControlMessage::HandshakeRequest(r) => r,
-        _ => return Err(Error::Invalid("first message must be handshake.request")),
-    };
-
-    // Round2 #5: do_handshake 経路でも token validation を入れる
-    // (= accept_new_client と同 logic、片肺解消)。`req.token = None` は強制 mismatch。
-    if let Some(expected) = expected_token {
-        let token_ok = match req.token.as_deref() {
-            Some(provided) => constant_time_eq(expected.as_bytes(), provided.as_bytes()),
-            None => false,
-        };
-        if !token_ok {
-            let body = ControlMessage::Error(ErrorMessage {
-                code: ErrorCode::AuthTokenMismatch,
-                message: "handshake token does not match daemon configuration".into(),
-                details: None,
-            })
-            .encode_to_vec()
-            .map_err(|_| Error::Invalid("auth error encode failed"))?;
-            let _ = Frame::cbor_control(body).encode_to(writer);
-            return Err(Error::Invalid("handshake token mismatch"));
-        }
-    }
-
-    let mvp: Vec<String> = MVP_CAPS.iter().map(|s| (*s).to_string()).collect();
-    let intersect = intersect_caps(&req.caps, &mvp);
-
-    let response = HandshakeResponse {
-        caps: intersect,
-        session_id: session_id.to_string(),
-        client_id: 0,
-        leader: matches!(req.mode, Mode::Rw),
-        mode: req.mode,
-    };
-
-    let body = ControlMessage::HandshakeResponse(response.clone())
-        .encode_to_vec()
-        .map_err(|_| Error::Invalid("handshake.response encode failed"))?;
-    Frame::cbor_control(body)
-        .encode_to(writer)
-        .map_err(|_| Error::Invalid("handshake.response frame encode failed"))?;
-
-    Ok(response)
-}
-
-/// 子 PTY master と client socket を poll し、bytes を双方向に中継する。
-///
-/// 制御 message (detach / kill / resize / signal) も client → daemon 方向で
-/// 解釈する。未対応 message kind は silently skip (= MVP 範囲外なので)。
-fn relay_loop(
-    pty: &Pty,
-    child: Pid,
-    client_reader: &mut UnixStream,
-    client_writer: &mut UnixStream,
-) -> RelayOutcome {
-    // 読みっぱなしの 1 frame buffer を持ちまわす実装は複雑なので、毎ループ
-    // poll → 該当 fd を blocking 1 read (= 子 PTY 出力は raw bytes をまとめて
-    // 取る、client 入力は 1 frame ずつ) という形で書く。
-
-    // R4-H14: 子の Stopped/Continued 追跡。loop 越しに状態を保持する。
-    let mut lifecycle = ChildLifecycle::default();
-    loop {
-        // PollFd の borrow が loop body 内で持続するのを避けるため、毎反復で
-        // 取得しなおす (= client_reader を mutable borrow できるように)
-        let pty_master = pty.master_fd();
-        let client_fd_borrow = client_reader.as_fd();
-        let mut fds = [
-            PollFd::new(pty_master, PollFlags::POLLIN),
-            PollFd::new(client_fd_borrow, PollFlags::POLLIN),
-        ];
-
-        match poll(&mut fds, PollTimeout::NONE) {
-            Ok(PollOutcome::Ready(_)) => {}
-            Ok(PollOutcome::Interrupted) => continue,
-            Ok(PollOutcome::Timeout) => continue, // NONE なので来ないが念のため
-            Err(e) => return RelayOutcome::Error(e),
-        }
-
-        let pty_revents = fds[0].revents().unwrap_or(PollFlags::empty());
-        let client_revents = fds[1].revents().unwrap_or(PollFlags::empty());
-        // `fds` 配列が握っていた borrow (= pty.master_fd / client_reader.as_fd)
-        // を解放する。`fds` は Drop を実装しないが、scope を切るために変数 shadow
-        // で「ここで forget して以後参照不要」を表現する。
-        let _ = fds;
-
-        // 子 PTY → client: master FD ready なら read → raw data frame を送る。
-        // macOS の PTY master は子が alive でも POLLHUP を出す瞬間がある (= slave
-        // 側の reference count 揺らぎ等)。POLLHUP 単独で ChildExited 扱いすると
-        // 誤検知になるため、POLLIN / POLLHUP どちらも read を試し、Ok(0) / EIO
-        // が返ったときだけ ChildExited と判断する。
-        let pty_ready = pty_revents.contains(PollFlags::POLLIN)
-            || pty_revents.contains(PollFlags::POLLHUP)
-            || pty_revents.contains(PollFlags::POLLERR);
-        if pty_ready {
-            let mut buf = [0u8; 8192];
-            match pty.master_fd().read_some(&mut buf) {
-                Ok(0) => match lifecycle.poll(child) {
-                    ChildState::Exited(code) => return RelayOutcome::ChildExited(code),
-                    ChildState::Stopped => {
-                        // R4-H14: SIGTSTP'd 中の master EOF/POLLHUP 連発を 500ms 単位で吸収。
-                        std::thread::sleep(STOPPED_POLL_INTERVAL);
-                    }
-                    ChildState::Alive => {
-                        // 偽 EOF (= forkpty exec 中の transient)。少し待って再試行
-                        std::thread::sleep(ALIVE_RETRY_INTERVAL);
-                    }
-                },
-                Ok(n) => {
-                    let frame = Frame::raw_data(buf[..n].to_vec());
-                    if let Err(e) = frame.encode_to(client_writer) {
-                        return frame_send_outcome(e);
-                    }
-                }
-                Err(Error::Errno(nix::errno::Errno::EIO)) => match lifecycle.poll(child) {
-                    ChildState::Exited(code) => return RelayOutcome::ChildExited(code),
-                    ChildState::Stopped => {
-                        std::thread::sleep(STOPPED_POLL_INTERVAL);
-                    }
-                    ChildState::Alive => {
-                        std::thread::sleep(ALIVE_RETRY_INTERVAL);
-                    }
-                },
-                Err(Error::Errno(nix::errno::Errno::EAGAIN)) => {
-                    // POLLHUP の偽陽性 (= ready と通知されたが実 read で EAGAIN)。
-                    // EWOULDBLOCK は Linux/macOS とも EAGAIN と同値 (POSIX 規定)。
-                    // 次の iteration で client_fd 側 ready を処理する。
-                }
-                Err(e) => return RelayOutcome::Error(e),
-            }
-        }
-
-        // client → 子 PTY: 1 frame ずつ decode して処理
-        if client_revents.contains(PollFlags::POLLIN) {
-            let frame = match Frame::decode_from(client_reader) {
-                Ok(f) => f,
-                Err(FrameError::Protocol(ProtocolError::UnexpectedEof(_))) => {
-                    // client が黙って切断 → 子に SIGTERM (= 後段で finalize)
-                    return RelayOutcome::ClientDetachedOrKilled;
-                }
-                Err(_) => {
-                    // protocol violation → 同様に client 側を切る
-                    return RelayOutcome::ClientDetachedOrKilled;
-                }
-            };
-
-            match frame.ty {
-                TYPE_RAW_DATA => {
-                    if let Err(e) = pty.master_fd().write_all(&frame.body) {
-                        return RelayOutcome::Error(e);
-                    }
-                }
-                TYPE_CBOR_CONTROL => {
-                    let msg = match ControlMessage::decode_from(frame.body.as_slice()) {
-                        Ok(m) => m,
-                        Err(_) => continue, // 未知 kind 等 → silently skip
-                    };
-                    match msg {
-                        ControlMessage::Detach(_) => {
-                            // MVP は 1 client なので detach == session 終了
-                            return RelayOutcome::ClientDetachedOrKilled;
-                        }
-                        ControlMessage::Kill(k) => {
-                            let signum = k.signum.unwrap_or(libc::SIGTERM as u8);
-                            let sig = nix::sys::signal::Signal::try_from(signum as i32)
-                                .unwrap_or(Signal::SIGTERM);
-                            let _ = kill(child, sig);
-                            return RelayOutcome::ClientDetachedOrKilled;
-                        }
-                        ControlMessage::Signal(s) => {
-                            let sig = nix::sys::signal::Signal::try_from(s.signum as i32)
-                                .unwrap_or(Signal::SIGINT);
-                            let _ = kill(child, sig);
-                        }
-                        ControlMessage::Resize(r) => {
-                            let _ = pty.resize(r.cols, r.rows);
-                        }
-                        _ => {
-                            // 他 kind (status/lock/tail/wait/...) は Phase 9+ で
-                            // 実装。MVP では silently skip。
-                        }
-                    }
-                }
-                _ => {
-                    // 未知 type は Frame::decode_from で既に protocol error を
-                    // 投げているはずなのでここには来ないはず。来たら無視。
-                }
-            }
-        } else if client_revents.contains(PollFlags::POLLHUP)
-            || client_revents.contains(PollFlags::POLLERR)
-        {
-            return RelayOutcome::ClientDetachedOrKilled;
-        }
-    }
 }
 
 /// 子が通常 alive 時の master read=0/EIO retry 間隔。forkpty 直後の
@@ -2467,7 +2147,7 @@ enum ChildState {
 /// 「stopped 中」として扱う。`WUNTRACED | WCONTINUED` を指定して waitpid を呼ぶ
 /// ことで transition を取りこぼさない。
 ///
-/// 用途: serve_loop / relay_loop の中で master read が 0 / EIO を返した時に
+/// 用途: serve_loop の中で master read が 0 / EIO を返した時に
 /// `poll(child)` を呼んで状態を更新し、ChildState で caller に sleep 間隔を
 /// 委ねる。
 #[derive(Debug, Default)]
@@ -2517,20 +2197,6 @@ impl ChildLifecycle {
                 }
             }
         }
-    }
-}
-
-/// frame 送信失敗時の RelayOutcome 振り分け。
-///
-/// `BrokenPipe` (= client が読まずに切断) は client 側問題なので
-/// `ClientDetachedOrKilled` 扱い、他の I/O error は致命的とする。
-fn frame_send_outcome(e: FrameError) -> RelayOutcome {
-    match e {
-        FrameError::Io(io_err) if io_err.kind() == std::io::ErrorKind::BrokenPipe => {
-            RelayOutcome::ClientDetachedOrKilled
-        }
-        FrameError::Io(io_err) => RelayOutcome::Error(Error::Io(io_err)),
-        FrameError::Protocol(_) => RelayOutcome::ClientDetachedOrKilled,
     }
 }
 
@@ -2586,9 +2252,9 @@ fn unix_stream_from_owned_fd(fd: OwnedFd) -> UnixStream {
 // Drop impl の責務分担 (R4-H4 で Session 自体にも Drop 追加):
 // - listener (UnixSock) は自身の Drop で socket file を unlink
 // - pty (Pty) は自身の Drop で master fd を close
-// - 正常 path (Session::serve / run) では `into_parts` で Drop をバイパスして
+// - 正常 path (Session::serve) では `into_parts` で Drop をバイパスして
 //   fields を取り出し、`finalize_child` が子の reap を担当する
-// - `serve`/`run` を呼ばずに Session が drop された場合 (test panic / early
+// - `serve` を呼ばずに Session が drop された場合 (test panic / early
 //   return) は `impl Drop for Session` (= session.rs 上部) が SIGTERM →
 //   500ms wait → SIGKILL で子を reap して orphan を防ぐ
 
@@ -2807,25 +2473,6 @@ mod tests {
         assert!(matches!(err, Error::Invalid(_)));
     }
 
-    /// daemon を別 thread で起動して試験するための helper。
-    /// (session_id, socket_path, JoinHandle<Result<i32, Error>>) を返す。
-    fn spawn_daemon_thread(
-        cmd: Vec<String>,
-    ) -> (
-        String,
-        std::path::PathBuf,
-        TempDir,
-        std::thread::JoinHandle<Result<i32, Error>>,
-    ) {
-        let dir = make_temp_socket_dir();
-        let session_id = "demo".to_string();
-        let sock_path = dir.path().join("test.sock");
-        let cfg = DaemonConfig::new(session_id.clone(), sock_path.clone(), cmd);
-        let session = Session::start(cfg).expect("start");
-        let handle = std::thread::spawn(move || session.run());
-        (session_id, sock_path, dir, handle)
-    }
-
     fn client_connect_with_retry(path: &std::path::Path) -> UnixStream {
         // R4-H5: retry budget は 200 attempts (= 2s) に拡大 (旧 50 = 500ms)。
         // CI 高負荷下で daemon の listen 開始が遅れた場合に false-fail しないよう
@@ -2862,155 +2509,6 @@ mod tests {
             ControlMessage::HandshakeResponse(r) => r,
             other => panic!("unexpected: {other:?}"),
         }
-    }
-
-    #[test]
-    fn accept_handshake_once_completes() {
-        let dir = make_temp_socket_dir();
-        let sock_path = dir.path().join("test.sock");
-        let cfg = DaemonConfig::new("demo", sock_path.clone(), long_running_cmd());
-        let session = Session::start(cfg).expect("start");
-        let pid = session.child_pid();
-
-        // client thread: connect + handshake.request 送信 + response 受信
-        let client_thread = std::thread::spawn(move || -> HandshakeResponse {
-            // race 回避: daemon が listen 開始しているか軽くリトライ。
-            // R4-H5: retry budget は 200 attempts (= 2s) に拡大 (旧 50 = 500ms)。
-            let mut attempts = 0;
-            let client_fd = loop {
-                match crate::sys::socket::connect(&sock_path) {
-                    Ok(fd) => break fd,
-                    Err(_) if attempts < 200 => {
-                        attempts += 1;
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(e) => panic!("client connect failed: {e:?}"),
-                }
-            };
-
-            let mut stream = UnixStream::from(client_fd);
-            let req = ControlMessage::HandshakeRequest(HandshakeRequest {
-                caps: vec!["data".into(), "lock".into(), "snapshot-v1".into()],
-                mode: Mode::Rw,
-                exclusive: false,
-                detach_others: false,
-                token: None,
-            });
-            let body = req.encode_to_vec().expect("cbor encode");
-            Frame::cbor_control(body)
-                .encode_to(&mut stream)
-                .expect("write frame");
-            stream.flush().expect("flush");
-
-            let resp_frame = Frame::decode_from(&mut stream).expect("decode response");
-            assert_eq!(resp_frame.ty, crate::protocol::TYPE_CBOR_CONTROL);
-            let resp_msg = ControlMessage::decode_from(resp_frame.body.as_slice())
-                .expect("decode response cbor");
-            match resp_msg {
-                ControlMessage::HandshakeResponse(r) => r,
-                other => panic!("unexpected: {other:?}"),
-            }
-        });
-
-        // daemon thread (= main): accept + handshake
-        let (client_id, response) = session.accept_handshake_once().expect("handshake");
-
-        let resp_via_client = client_thread.join().expect("client thread");
-
-        // 検証
-        assert_eq!(client_id, 0);
-        assert_eq!(response.session_id, "demo");
-        assert_eq!(response.client_id, 0);
-        assert!(response.leader, "rw mode の最初の client は leader 取れる");
-        // cap negotiation: client 側の caps と MVP_CAPS の intersect
-        // (snapshot-v1 は MVP 外なので落ちる)
-        assert_eq!(response.caps, vec!["data".to_string(), "lock".to_string()]);
-
-        // server 送信内容 = client 受信内容
-        assert_eq!(response, resp_via_client);
-
-        drop(session);
-        cleanup_child(pid);
-    }
-
-    #[test]
-    fn run_exits_when_client_sends_kill() {
-        let (_sid, sock_path, _dir, handle) =
-            spawn_daemon_thread(vec!["/bin/sleep".into(), "30".into()]);
-
-        let mut stream = client_connect_with_retry(&sock_path);
-        let _resp = do_client_handshake(&mut stream);
-
-        // kill frame (default = SIGTERM)
-        let kill_msg = ControlMessage::Kill(Kill { signum: None });
-        let body = kill_msg.encode_to_vec().expect("encode kill");
-        Frame::cbor_control(body)
-            .encode_to(&mut stream)
-            .expect("send kill");
-        stream.flush().expect("flush");
-
-        let exit = handle.join().expect("daemon thread").expect("daemon run");
-        // SIGTERM (= 15) で殺されたら 128 + 15 = 143
-        assert_eq!(exit, 143);
-    }
-
-    #[test]
-    fn run_exits_when_client_sends_detach() {
-        let (_sid, sock_path, _dir, handle) =
-            spawn_daemon_thread(vec!["/bin/sleep".into(), "30".into()]);
-
-        let mut stream = client_connect_with_retry(&sock_path);
-        let _resp = do_client_handshake(&mut stream);
-
-        let detach_msg = ControlMessage::Detach(Detach {
-            target: DetachTarget::Myself,
-        });
-        let body = detach_msg.encode_to_vec().expect("encode detach");
-        Frame::cbor_control(body)
-            .encode_to(&mut stream)
-            .expect("send detach");
-        stream.flush().expect("flush");
-
-        let exit = handle.join().expect("daemon thread").expect("daemon run");
-        // detach は session 終了 → finalize_child で SIGTERM → 143
-        assert_eq!(exit, 143);
-    }
-
-    #[test]
-    fn run_exits_when_client_disconnects() {
-        let (_sid, sock_path, _dir, handle) =
-            spawn_daemon_thread(vec!["/bin/sleep".into(), "30".into()]);
-
-        let mut stream = client_connect_with_retry(&sock_path);
-        let _resp = do_client_handshake(&mut stream);
-
-        // 黙って close
-        drop(stream);
-
-        let exit = handle.join().expect("daemon thread").expect("daemon run");
-        // socket EOF も session 終了 → SIGTERM → 143
-        assert_eq!(exit, 143);
-    }
-
-    #[test]
-    fn run_propagates_child_exit_code() {
-        // /usr/bin/false (= exit 1) を起動 → 子は即 exit
-        // ※ /bin/false (macOS) or /usr/bin/false (linux)
-        let false_path = if std::path::Path::new("/usr/bin/false").exists() {
-            "/usr/bin/false"
-        } else {
-            "/bin/false"
-        };
-        let (_sid, sock_path, _dir, handle) = spawn_daemon_thread(vec![false_path.into()]);
-
-        // client が接続して handshake する前に子が exit すると accept で
-        // hang する可能性がある。先に接続する。
-        let mut stream = client_connect_with_retry(&sock_path);
-        let _resp = do_client_handshake(&mut stream);
-
-        let exit = handle.join().expect("daemon thread").expect("daemon run");
-        // false は exit code 1
-        assert_eq!(exit, 1);
     }
 
     // ---- Phase 9 (Session::serve) tests ----
@@ -4432,38 +3930,6 @@ mod tests {
         .expect("send");
         s1.flush().expect("flush");
         let _ = handle.join().expect("daemon thread");
-    }
-
-    /// Round2 #5: do_handshake (Session::run 経路) も expected_token を検証する。
-    #[test]
-    fn run_handshake_token_mismatch_rejected() {
-        let dir = make_temp_socket_dir();
-        let sock_path = dir.path().join("test.sock");
-        let mut cfg = DaemonConfig::new("demo", sock_path.clone(), long_running_cmd());
-        cfg.expected_token = Some("secret-xyz".into());
-        let session = Session::start(cfg).expect("start");
-        let handle = std::thread::spawn(move || session.run());
-
-        let mut s = client_connect_with_retry(&sock_path);
-        let req = ControlMessage::HandshakeRequest(HandshakeRequest {
-            caps: MVP_CAPS.iter().map(|s| s.to_string()).collect(),
-            mode: Mode::Rw,
-            exclusive: false,
-            detach_others: false,
-            token: None, // 未提示 = mismatch
-        });
-        let body = req.encode_to_vec().expect("encode");
-        Frame::cbor_control(body).encode_to(&mut s).expect("send");
-        s.flush().expect("flush");
-
-        let ef = Frame::decode_from(&mut s).expect("error");
-        match ControlMessage::decode_from(ef.body.as_slice()).expect("decode") {
-            ControlMessage::Error(e) => assert_eq!(e.code, ErrorCode::AuthTokenMismatch),
-            o => panic!("expected Error, got {o:?}"),
-        }
-        // daemon は handshake 拒否 → Session::run が Err を返す (= join で確認)
-        let res = handle.join().expect("daemon thread");
-        assert!(res.is_err(), "Session::run should error on token mismatch");
     }
 
     /// Round2 #6: RwNoLeader client が Kill を送ると mode.not-allowed エラー。

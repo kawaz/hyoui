@@ -589,7 +589,7 @@ mod tests {
         let sock = dir.path().join("test.sock");
         let cfg = DaemonConfig::new("demo", sock.clone(), cmd);
         let session = Session::start(cfg).expect("daemon start");
-        let daemon_handle = std::thread::spawn(move || session.run());
+        let daemon_handle = std::thread::spawn(move || session.serve());
 
         // listener bind 完了後の socket connect は retry なしで通る想定だが、
         // CI の slow path に備えて短いリトライ
@@ -645,7 +645,7 @@ mod tests {
             DaemonConfig::new("demo", sock.clone(), vec!["/bin/sleep".into(), "30".into()]);
         cfg.expected_token = Some("secret-xyz".into());
         let session = Session::start(cfg).expect("daemon start");
-        let daemon_handle = std::thread::spawn(move || session.run());
+        let daemon_handle = std::thread::spawn(move || session.serve());
 
         // listener bind 完了を待ってから connect (= CI の slow path 対策)。
         // 連続 connect で daemon を多重に handshake させないため、ENOENT 系の
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn run_returns_when_daemon_closes() {
-        // /bin/true は即 exit → daemon の Session::run も即終了 → client run も EOF
+        // /bin/true は即 exit → daemon の Session::serve も即終了 → client run も EOF
         // で抜ける
         let true_path = if std::path::Path::new("/usr/bin/true").exists() {
             "/usr/bin/true"

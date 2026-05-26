@@ -5,7 +5,7 @@
 //! stdout に 1 行出して exit する。
 //!
 //! 子 ([`run_daemon_child`]) は setsid で controlling tty を切り、stdio を
-//! /dev/null に redirect、その後 `Session::start` → `Session::run` を実行する。
+//! /dev/null に redirect、その後 `Session::start` → `Session::serve` を実行する。
 //! Session::start 直後に「ready pipe」に 1 byte 書いて親に通知する。
 
 use std::os::fd::IntoRawFd;
