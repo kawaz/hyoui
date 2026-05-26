@@ -11,10 +11,66 @@ use std::path::Path;
 use nix::poll::{PollFd, PollTimeout};
 
 use crate::Error;
+use crate::protocol::messages::{Detach, DetachTarget};
 use crate::protocol::{
     ControlMessage, Frame, FrameError, HandshakeRequest, HandshakeResponse, MVP_CAPS, Mode,
     ProtocolError, TYPE_CBOR_CONTROL, TYPE_RAW_DATA, Transport, UnixStreamTransport,
 };
+
+/// stdin read chunk の処理結果 (= `process_detach_prefix` の戻り値)。
+#[derive(Debug, PartialEq, Eq)]
+enum DetachAction {
+    /// 通常通り bytes を forward。Vec が空なら no-op。
+    Forward(Vec<u8>),
+    /// detach が起動された (= prefix + 'd' 検知)。`Vec` は detach 起動より前の
+    /// forward 分 (= 同 chunk 内で prefix 前にあった bytes)。
+    TriggerDetach(Vec<u8>),
+}
+
+/// chunk 内の bytes を走査し、prefix state machine を更新しつつ forward bytes を
+/// 抽出する。`prefix_armed` は呼び出し間で state を維持するため `&mut`。
+///
+/// 規則:
+/// - `prefix_armed=false` で `DETACH_PREFIX_BYTE` 検知 → armed=true、forward しない
+/// - `prefix_armed=true` で `DETACH_TRIGGER_BYTE` 検知 → `TriggerDetach`、以降は無視
+/// - `prefix_armed=true` で `DETACH_PREFIX_BYTE` 検知 → literal `DETACH_PREFIX_BYTE`
+///   を forward、armed=false (= escape)
+/// - `prefix_armed=true` でその他 byte 検知 → prefix + 当該 byte 両方とも捨てる、
+///   armed=false (= screen 慣例の "no matching command")
+/// - その他: そのまま forward
+fn process_detach_prefix(chunk: &[u8], prefix_armed: &mut bool) -> DetachAction {
+    let mut forward = Vec::with_capacity(chunk.len());
+    for &b in chunk {
+        if *prefix_armed {
+            *prefix_armed = false;
+            match b {
+                DETACH_TRIGGER_BYTE => return DetachAction::TriggerDetach(forward),
+                DETACH_PREFIX_BYTE => forward.push(DETACH_PREFIX_BYTE), // escape
+                _ => {
+                    // unknown post-prefix key → 両 byte 捨てる
+                }
+            }
+        } else if b == DETACH_PREFIX_BYTE {
+            *prefix_armed = true;
+        } else {
+            forward.push(b);
+        }
+    }
+    DetachAction::Forward(forward)
+}
+
+/// detach prefix の既定 byte (= `Ctrl-A`, 0x01)。screen 慣例。
+///
+/// stdin で `Ctrl-A` を 1 度押すと「prefix armed」状態になり、次の 1 byte で:
+/// - `'d'` (0x64) → detach (= Detach message を送って attach 終了)
+/// - `Ctrl-A` (0x01) → literal `Ctrl-A` を forward (= escape)
+/// - その他 → prefix + 当該 byte を共に **捨てる** (= screen/tmux 慣例の
+///   "no matching command" 扱い)。literal forward が必要なら escape を使う
+///
+/// MVP は固定値。将来 `--detach-prefix` 等で customize 可能にする予定。
+pub const DETACH_PREFIX_BYTE: u8 = 0x01;
+/// detach prefix の後に来ると detach を起動する byte (= `'d'`, 0x64)。
+pub const DETACH_TRIGGER_BYTE: u8 = b'd';
 use crate::sys::{poll::PollFlags, poll::PollOutcome, poll::poll, socket as sys_socket};
 
 /// `ClientConnection::connect` で渡す接続オプション (HandshakeRequest 相当)。
@@ -127,6 +183,7 @@ impl ClientConnection {
         stdin: &mut R,
         stdout: &mut W,
     ) -> Result<(), Error> {
+        let mut detach_prefix_armed: bool = false;
         loop {
             let socket_fd = self.reader.as_fd();
             let stdin_fd = stdin.as_fd();
@@ -185,9 +242,32 @@ impl ClientConnection {
                         return Ok(());
                     }
                     Ok(n) => {
-                        let frame = Frame::raw_data(buf[..n].to_vec());
-                        if frame.encode_to(&mut self.writer).is_err() {
+                        // detach prefix state machine を通して送出 bytes をフィルタ
+                        let action = process_detach_prefix(&buf[..n], &mut detach_prefix_armed);
+                        if let DetachAction::TriggerDetach(forward_before) = &action {
+                            // detach 前の forward 分があれば flush
+                            if !forward_before.is_empty() {
+                                let frame = Frame::raw_data(forward_before.clone());
+                                let _ = frame.encode_to(&mut self.writer);
+                                let _ = self.writer.flush();
+                            }
+                            // Detach message を送って正常終了
+                            let detach = ControlMessage::Detach(Detach {
+                                target: DetachTarget::Myself,
+                            });
+                            if let Ok(body) = detach.encode_to_vec() {
+                                let _ = Frame::cbor_control(body).encode_to(&mut self.writer);
+                                let _ = self.writer.flush();
+                            }
                             return Ok(());
+                        }
+                        if let DetachAction::Forward(forward_bytes) = action {
+                            if !forward_bytes.is_empty() {
+                                let frame = Frame::raw_data(forward_bytes);
+                                if frame.encode_to(&mut self.writer).is_err() {
+                                    return Ok(());
+                                }
+                            }
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -273,6 +353,63 @@ mod tests {
     use crate::daemon::{DaemonConfig, Session};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    // ---- process_detach_prefix unit tests ----
+
+    #[test]
+    fn detach_prefix_passes_through_normal_bytes() {
+        let mut armed = false;
+        let a = process_detach_prefix(b"hello", &mut armed);
+        assert_eq!(a, DetachAction::Forward(b"hello".to_vec()));
+        assert!(!armed);
+    }
+
+    #[test]
+    fn detach_prefix_then_d_triggers_detach() {
+        let mut armed = false;
+        let a = process_detach_prefix(b"\x01d", &mut armed);
+        assert_eq!(a, DetachAction::TriggerDetach(Vec::new()));
+        assert!(!armed);
+    }
+
+    #[test]
+    fn detach_prefix_keeps_state_across_chunks() {
+        let mut armed = false;
+        // chunk 1: 終端で prefix → armed=true、forward 空
+        let a1 = process_detach_prefix(b"abc\x01", &mut armed);
+        assert_eq!(a1, DetachAction::Forward(b"abc".to_vec()));
+        assert!(armed);
+        // chunk 2: 'd' で detach
+        let a2 = process_detach_prefix(b"d", &mut armed);
+        assert_eq!(a2, DetachAction::TriggerDetach(Vec::new()));
+        assert!(!armed);
+    }
+
+    #[test]
+    fn detach_prefix_escape_doubles_prefix() {
+        let mut armed = false;
+        let a = process_detach_prefix(b"\x01\x01", &mut armed);
+        assert_eq!(a, DetachAction::Forward(b"\x01".to_vec()));
+        assert!(!armed);
+    }
+
+    #[test]
+    fn detach_prefix_unknown_key_swallows_both() {
+        let mut armed = false;
+        // Ctrl-A + 'x' → 両方とも捨てる
+        let a = process_detach_prefix(b"\x01x", &mut armed);
+        assert_eq!(a, DetachAction::Forward(Vec::new()));
+        assert!(!armed);
+    }
+
+    #[test]
+    fn detach_prefix_detach_with_preceding_bytes() {
+        let mut armed = false;
+        // "hello" の後に prefix+d → "hello" を forward した上で detach
+        let a = process_detach_prefix(b"hello\x01d", &mut armed);
+        assert_eq!(a, DetachAction::TriggerDetach(b"hello".to_vec()));
+        assert!(!armed);
+    }
 
     fn make_temp_socket_dir() -> TempDir {
         use std::os::unix::fs::PermissionsExt;
