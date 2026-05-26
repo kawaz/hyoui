@@ -213,7 +213,11 @@ impl ClientConnection {
             .map_err(|_| Error::Invalid("control message CBOR encode failed"))?;
         Frame::cbor_control(body)
             .encode_to(&mut self.writer)
-            .map_err(|_| Error::Invalid("control message frame send failed"))?;
+            .map_err(|e| match e {
+                FrameError::Io(io) => Error::Io(io),
+                FrameError::Protocol(_) => Error::Invalid("control message frame protocol error"),
+            })?;
+        self.writer.flush().map_err(Error::Io)?;
         Ok(())
     }
 }

@@ -57,6 +57,9 @@ impl Session {
         }
         let argv: Vec<&str> = config.cmd.iter().map(String::as_str).collect();
         let Spawned { pty, child } = Pty::spawn(&argv, config.cols, config.rows)?;
+        // master FD を nonblock にして、POLLHUP 偽陽性 (macOS) で read_some が
+        // block するのを防ぐ。read_some は EAGAIN を返す → relay_loop で continue。
+        pty.master_fd().set_nonblocking(true)?;
         let listener = UnixSock::listen(&config.socket_path)?;
         Ok(Self {
             config,
@@ -185,11 +188,8 @@ impl Session {
         // listener は self.listener が move 済みなので drop = unlink される。
         drop(listener);
 
-        // relay_loop の error 系は exit code に反映 (= 子の exit_code 優先、
-        // ただし relay 中の致命的エラーは Error として返す)。
         match outcome {
-            RelayOutcome::ChildExited => Ok(exit_code),
-            RelayOutcome::ClientDetachedOrKilled => Ok(exit_code),
+            RelayOutcome::ChildExited(_) | RelayOutcome::ClientDetachedOrKilled => Ok(exit_code),
             RelayOutcome::Error(e) => Err(e),
         }
     }
@@ -198,8 +198,9 @@ impl Session {
 /// `Session::run` の relay loop 結果。
 #[derive(Debug)]
 enum RelayOutcome {
-    /// 子 PTY 側で EOF を検出 (= 子 process が exit した)。
-    ChildExited,
+    /// 子 PTY 側で EOF を検出 (= 子 process が exit した)。exit code が判明していれば
+    /// `Some(code)` に保持する (= waitpid を 2 度呼ばないため)。
+    ChildExited(Option<i32>),
     /// client が `detach` / `kill` を送ったか socket EOF。`kill` の場合は子に
     /// signal が送られた状態でこの enum に至る。
     ClientDetachedOrKilled,
@@ -285,13 +286,27 @@ fn relay_loop(
         // で「ここで forget して以後参照不要」を表現する。
         let _ = fds;
 
-        // 子 PTY → client: master FD ready なら read → raw data frame を送る
-        if pty_revents.contains(PollFlags::POLLIN) {
+        // 子 PTY → client: master FD ready なら read → raw data frame を送る。
+        // macOS の PTY master は子が alive でも POLLHUP を出す瞬間がある (= slave
+        // 側の reference count 揺らぎ等)。POLLHUP 単独で ChildExited 扱いすると
+        // 誤検知になるため、POLLIN / POLLHUP どちらも read を試し、Ok(0) / EIO
+        // が返ったときだけ ChildExited と判断する。
+        let pty_ready = pty_revents.contains(PollFlags::POLLIN)
+            || pty_revents.contains(PollFlags::POLLHUP)
+            || pty_revents.contains(PollFlags::POLLERR);
+        if pty_ready {
             let mut buf = [0u8; 8192];
             match pty.master_fd().read_some(&mut buf) {
                 Ok(0) => {
-                    // master EOF (= 子 exit) → 子の status は呼び出し側で reap
-                    return RelayOutcome::ChildExited;
+                    // master FD で EOF (= 子 PTY が close した)。ただし macOS の
+                    // forkpty 直後の short window では子が exec 完了する前に
+                    // master 側で POLLHUP+EOF が出る race がある。waitpid(WNOHANG)
+                    // で子が actually exit したか確認する。
+                    if let Some(code) = child_actually_exited(child) {
+                        return RelayOutcome::ChildExited(code);
+                    }
+                    // 偽 EOF (= forkpty exec 中の transient)。少し待って再試行。
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 Ok(n) => {
                     let frame = Frame::raw_data(buf[..n].to_vec());
@@ -300,15 +315,18 @@ fn relay_loop(
                     }
                 }
                 Err(Error::Errno(nix::errno::Errno::EIO)) => {
-                    // macOS では master 側 read EOF が EIO になる慣習
-                    return RelayOutcome::ChildExited;
+                    if let Some(code) = child_actually_exited(child) {
+                        return RelayOutcome::ChildExited(code);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(Error::Errno(nix::errno::Errno::EAGAIN)) => {
+                    // POLLHUP の偽陽性 (= ready と通知されたが実 read で EAGAIN)。
+                    // EWOULDBLOCK は Linux/macOS とも EAGAIN と同値 (POSIX 規定)。
+                    // 次の iteration で client_fd 側 ready を処理する。
                 }
                 Err(e) => return RelayOutcome::Error(e),
             }
-        } else if pty_revents.contains(PollFlags::POLLHUP)
-            || pty_revents.contains(PollFlags::POLLERR)
-        {
-            return RelayOutcome::ChildExited;
         }
 
         // client → 子 PTY: 1 frame ずつ decode して処理
@@ -375,6 +393,29 @@ fn relay_loop(
     }
 }
 
+/// 子 process が actually exit したかを `waitpid(WNOHANG)` で確認する。
+///
+/// macOS の forkpty 直後の short window では子が exec 完了する前に
+/// master FD で POLLHUP / EOF が偽陽性で出る race がある (slave 側の reference
+/// count 揺らぎ等)。read が 0 / EIO を返したときに本関数で「子が実際に exit
+/// 済みか」を waitpid で確かめてから ChildExited 判定する。
+///
+/// 戻り値:
+/// - `Some(Some(code))`: 子は exit 済、exit code が `code`
+/// - `Some(None)`: 子は exit 済 (= waitpid が status を返した) だが exit code が
+///   取得できない (= 何らかの transient)
+/// - `None`: 子はまだ alive (StillAlive / Stopped / Continued / transient error)
+fn child_actually_exited(child: Pid) -> Option<Option<i32>> {
+    use nix::sys::wait::WaitPidFlag;
+    match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+        Ok(WaitStatus::StillAlive) => None,
+        Ok(WaitStatus::Exited(_, code)) => Some(Some(code)),
+        Ok(WaitStatus::Signaled(_, sig, _)) => Some(Some(128 + (sig as i32))),
+        Ok(_) => None,
+        Err(_) => None,
+    }
+}
+
 /// frame 送信失敗時の RelayOutcome 振り分け。
 ///
 /// `BrokenPipe` (= client が読まずに切断) は client 側問題なので
@@ -392,30 +433,36 @@ fn frame_send_outcome(e: FrameError) -> RelayOutcome {
 /// 子 PTY を reap して exit code を返す。
 ///
 /// outcome に応じて:
-/// - `ChildExited`: 子は既に exit 済 → waitpid で reap、status 取得
+/// - `ChildExited(Some(code))`: 既に `child_actually_exited` で reap 済、code をそのまま返す
+/// - `ChildExited(None)`: exit 検知だが code 未取得 → waitpid で確認
 /// - `ClientDetachedOrKilled`: 子はまだ生きている可能性 → SIGTERM → wait
 ///
-/// 130 (= 128 + SIGINT) のように shell の慣習に合わせる: signal で終了 → 128 + signum。
+/// signal で終了の場合は shell convention に従い `128 + signum` を返す。
 fn finalize_child(child: Pid, outcome: &RelayOutcome) -> Result<i32, Error> {
+    // `child_actually_exited` で既に code を取得済なら、それを優先 (waitpid を
+    // 二重に呼ぶと ECHILD になる)。
+    if let RelayOutcome::ChildExited(Some(code)) = outcome {
+        return Ok(*code);
+    }
+
     // ChildExited 以外 (= client 都合の終了) は子に SIGTERM を送ってから wait。
     // 既に exit 済なら kill は ESRCH で失敗 → 無視。
-    if !matches!(outcome, RelayOutcome::ChildExited) {
+    if !matches!(outcome, RelayOutcome::ChildExited(_)) {
         let _ = kill(child, Signal::SIGTERM);
     }
 
-    // 子を reap。SIGTERM 後 EAGAIN/WNOHANG ループはせず blocking で待つ。
-    // 子が SIGTERM を無視する pathological ケースは MVP 外。
+    // 子を reap。
     loop {
         match waitpid(child, Some(WaitPidFlag::empty())) {
             Ok(WaitStatus::Exited(_, code)) => return Ok(code),
             Ok(WaitStatus::Signaled(_, sig, _)) => return Ok(128 + (sig as i32)),
-            Ok(_) => continue, // Stopped/Continued 等は ignore して再 wait
+            Ok(_) => continue,
             Err(nix::errno::Errno::EINTR) => continue,
             Err(nix::errno::Errno::ECHILD) => {
-                // 既に reap 済 (= SIGCHLD ハンドラが拾った等)。exit code 不明だが
-                // outcome に応じて 0 / 143 (= SIGTERM kill) を返す。
+                // 既に reap 済 (= SIGCHLD ハンドラが拾った等)。outcome に応じて
+                // 0 / 143 (= SIGTERM kill) を返す。
                 return Ok(match outcome {
-                    RelayOutcome::ChildExited => 0,
+                    RelayOutcome::ChildExited(_) => 0,
                     _ => 143,
                 });
             }

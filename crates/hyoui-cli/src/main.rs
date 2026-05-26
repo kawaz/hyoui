@@ -16,7 +16,7 @@ use std::io::Write;
 use std::os::fd::AsFd;
 use std::process::ExitCode;
 
-use hyoui::cli::{AttachConfig, Command, HelpTopic, parse_args, usage};
+use hyoui::cli::{AttachConfig, Command, HelpTopic, KillConfig, parse_args, usage};
 use hyoui::client::{AttachOptions, ClientConnection};
 use hyoui::daemon::{DaemonConfig, Session};
 use hyoui::protocol::Mode;
@@ -63,6 +63,10 @@ fn main() -> ExitCode {
         Command::Run(cfg) => run_command(cfg),
 
         Command::Attach(cfg) => attach_command(cfg),
+
+        Command::List => list_command(),
+
+        Command::Kill(cfg) => kill_command(cfg),
 
         Command::Completion { shell } => {
             print!("{}", completion::script(shell));
@@ -284,4 +288,116 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// `hyoui list` の主要ロジック。
+///
+/// socket dir 候補を全部 scan し、`*.sock` ファイルを 1 行ずつ出力する。
+/// 出力形式: `<session>\t<socket-path>`。Phase 11 で `status.query` を併用して
+/// child pid / clients 等の情報も付ける予定。
+fn list_command() -> ExitCode {
+    let dirs = list_candidate_dirs();
+    let mut found = 0usize;
+    for dir in dirs {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue, // dir 不存在は無視 (= 何も daemon 起動してない可能性)
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("sock") {
+                continue;
+            }
+            let session = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string();
+            println!("{session}\t{}", path.display());
+            found += 1;
+        }
+    }
+    if found == 0 {
+        // 0 件は stderr で明示 (script 用に stdout を汚さない)
+        eprintln!("hyoui: no sessions found");
+    }
+    ExitCode::SUCCESS
+}
+
+/// `hyoui list` で scan する候補 dir を返す。
+fn list_candidate_dirs() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
+        if !xdg.is_empty() {
+            let p = std::path::PathBuf::from(xdg).join("hyoui");
+            if p.is_dir() {
+                out.push(p);
+            }
+        }
+    }
+    let tmp = std::env::var_os("TMPDIR")
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    let uid = nix::unistd::geteuid().as_raw();
+    let p = tmp.join(format!("hyoui-{uid}"));
+    if p.is_dir() {
+        out.push(p);
+    }
+    out
+}
+
+/// `hyoui kill <session>` の主要ロジック。
+fn kill_command(cfg: KillConfig) -> ExitCode {
+    let sock = if let Some(p) = cfg.socket.clone() {
+        std::path::PathBuf::from(p)
+    } else {
+        let sid = match cfg.session_id.as_deref() {
+            Some(s) => s,
+            None => {
+                eprintln!("hyoui: kill: session id or --socket required");
+                return ExitCode::from(2);
+            }
+        };
+        match socket_path::resolve(None, sid) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("hyoui: kill: socket path 解決失敗: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    };
+
+    let opts = AttachOptions {
+        mode: Mode::Ro, // kill だけ送るので入力なし、ro で OK
+        caps: hyoui::protocol::MVP_CAPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
+        exclusive: false,
+        detach_others: false,
+    };
+
+    let mut conn = match ClientConnection::connect(&sock, opts) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hyoui: kill: connect 失敗: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let kill = hyoui::protocol::messages::Kill { signum: cfg.signum };
+    if let Err(e) = conn.send_control(&hyoui::protocol::ControlMessage::Kill(kill)) {
+        eprintln!("hyoui: kill: send 失敗: {e}");
+        return ExitCode::from(1);
+    }
+
+    // daemon が close するのを待ってから exit。read で EOF を待つ。
+    // ClientConnection::run は stdin が必要なので使えない。明示的に socket を
+    // drop して exit。
+    drop(conn);
+
+    println!("hyoui: kill 送信完了: {}", sock.display());
+    ExitCode::SUCCESS
 }

@@ -134,6 +134,17 @@ pub struct AttachConfig {
     pub detach_others: bool,
 }
 
+/// `kill` subcommand configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KillConfig {
+    /// Target socket path (explicit) または session_id から resolve。
+    pub socket: Option<String>,
+    /// Target session id。
+    pub session_id: Option<String>,
+    /// 子 PTY に送る signal 番号 (= default SIGTERM)。
+    pub signum: Option<u8>,
+}
+
 /// Result of parsing argv (excluding argv[0]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -148,6 +159,10 @@ pub enum Command {
     Run(RunConfig),
     /// Attach to an existing daemon session.
     Attach(AttachConfig),
+    /// List existing daemon sessions (= socket dir scan)。
+    List,
+    /// Kill (= SIGTERM 等を子に送る) a daemon session by session id / socket。
+    Kill(KillConfig),
     /// Print a completion script for the given shell.
     Completion {
         /// Target shell.
@@ -187,15 +202,96 @@ pub fn parse_args(args: &[String]) -> Command {
     match head {
         "run" => parse_run(rest),
         "attach" => parse_attach(rest),
+        "list" => parse_list(rest),
+        "kill" => parse_kill(rest),
         "completion" => parse_completion(rest),
         // Reserved for future stages.
-        "send" | "status" | "list" | "kill" | "detach" => Command::Error(format!(
+        "send" | "status" | "detach" => Command::Error(format!(
             "subcommand `{head}` is reserved but not yet implemented"
         )),
         other => Command::Help {
             topic: HelpTopic::UnknownSubcommand(other.to_string()),
         },
     }
+}
+
+fn parse_list(args: &[String]) -> Command {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return Command::Help {
+            topic: HelpTopic::Top,
+        };
+    }
+    if !args.is_empty() {
+        return Command::Error(format!("list: unexpected argument: {}", args[0]));
+    }
+    Command::List
+}
+
+fn parse_kill(args: &[String]) -> Command {
+    let mut cfg = KillConfig {
+        socket: None,
+        session_id: None,
+        signum: None,
+    };
+    let mut positionals: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (name, inline_value) = split_eq(arg);
+        let mut consumed_extra = false;
+        let value: Option<String> = match inline_value {
+            Some(v) => Some(v),
+            None => {
+                if i + 1 < args.len() {
+                    consumed_extra = true;
+                    Some(args[i + 1].clone())
+                } else {
+                    None
+                }
+            }
+        };
+        match name.as_str() {
+            "--help" | "-h" => {
+                return Command::Help {
+                    topic: HelpTopic::Top,
+                };
+            }
+            "--socket" => match value {
+                Some(v) => cfg.socket = Some(v),
+                None => return Command::Error("--socket requires a value".into()),
+            },
+            "--signum" => match value.as_deref() {
+                Some(v) => match v.parse::<u8>() {
+                    Ok(n) => cfg.signum = Some(n),
+                    Err(_) => {
+                        return Command::Error(format!("invalid --signum value: {v}"));
+                    }
+                },
+                None => return Command::Error("--signum requires a value".into()),
+            },
+            other if other.starts_with('-') => {
+                return Command::Error(format!("unknown kill option: {other}"));
+            }
+            _ => {
+                consumed_extra = false;
+                positionals.push(args[i].clone());
+            }
+        }
+        i += 1;
+        if consumed_extra {
+            i += 1;
+        }
+    }
+    match positionals.len() {
+        0 => {
+            if cfg.socket.is_none() {
+                return Command::Error("kill: session id (positional) or --socket required".into());
+            }
+        }
+        1 => cfg.session_id = Some(positionals.into_iter().next().unwrap()),
+        _ => return Command::Error("kill: too many positional arguments".into()),
+    }
+    Command::Kill(cfg)
 }
 
 fn parse_attach(args: &[String]) -> Command {
@@ -1036,9 +1132,9 @@ mod tests {
 
     #[test]
     fn reserved_subcommands_return_error() {
-        // attach は実装済 (= 別 test)。`send` / `status` / `list` / `kill` / `detach` は
-        // まだ reserved (Phase A4+ で実装)。
-        for name in ["send", "status", "list", "kill", "detach"] {
+        // attach / list / kill は実装済 (= 別 test)。`send` / `status` / `detach`
+        // はまだ reserved。
+        for name in ["send", "status", "detach"] {
             match parse_args(&args(&[name])) {
                 Command::Error(msg) => assert!(msg.contains(name), "msg = {msg}"),
                 other => panic!("expected Error for `{name}`, got {other:?}"),
