@@ -242,9 +242,38 @@ impl Session {
             &mut pending_waits,
         );
 
-        // cleanup: 各 client の writer thread を terminate
-        // (= channel drop で recv 終わるが、write_all 中に block していると recv に
-        // 戻らないので socket shutdown も実行して write_all を即時 error 化する)
+        // tail follow subscriber へ TailEnd を 1 発投げてから cleanup する。
+        // 終了理由は outcome に応じて分岐 (child exit / kill による client cancel)。
+        let tail_end_reason = match &outcome {
+            RelayOutcome::ChildExited(_) => Some(TailEndReason::ChildExited),
+            RelayOutcome::ClientDetachedOrKilled => Some(TailEndReason::ChildExited),
+            RelayOutcome::Error(_) => None,
+        };
+        if let Some(reason) = tail_end_reason {
+            for ch in clients.iter() {
+                if matches!(ch.subscription, Subscription::TailFollow { .. }) {
+                    let _ = send_control(ch, ControlMessage::TailEnd(TailEnd { reason }));
+                }
+            }
+        }
+
+        // cleanup:
+        // 1. writer_tx を drop → writer_pump は残り frame を drain してから recv 終了
+        // 2. queued_bytes が 0 になる (or 短い timeout) を待つ
+        // 3. socket shutdown (= まだ write_all で block 中なら強制解除)
+        // 4. join
+        //
+        // ※ writer_tx drop だけだと、writer_pump が write_all で block 中の場合
+        //   recv に戻らず join hang する。そのため drain wait + shutdown を入れる。
+        let drain_deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        for ch in clients.iter() {
+            // socket が正常 (= client が読んでる) なら 200ms 以内に drain 完了する
+            while ch.queued_bytes.load(Ordering::Acquire) > 0
+                && std::time::Instant::now() < drain_deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
         for ch in clients.drain(..) {
             drop(ch.writer_tx);
             let _ = ch.reader.shutdown(std::net::Shutdown::Both);
@@ -2593,6 +2622,58 @@ mod tests {
         .encode_to(&mut s)
         .expect("send");
         s.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// tail follow=true な client は子 PTY exit 時に TailEnd(ChildExited) を受信する。
+    #[test]
+    fn serve_tail_follow_receives_tail_end_on_child_exit() {
+        use crate::protocol::messages::TailRequest;
+
+        // 子は短時間で exit する `/bin/sh -c "sleep 0.2"` を使う
+        let cmd = vec!["/bin/sh".into(), "-c".into(), "sleep 0.2".into()];
+        let dir = make_temp_socket_dir();
+        let sock_path = dir.path().join("test.sock");
+        let cfg = DaemonConfig::new("demo", sock_path.clone(), cmd);
+        let session = Session::start(cfg).expect("start");
+        let handle = std::thread::spawn(move || session.serve());
+
+        let mut s = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut s);
+        let _ = Frame::decode_from(&mut s).expect("leader.notify");
+
+        // tail follow=true で subscribe
+        Frame::cbor_control(
+            ControlMessage::TailRequest(TailRequest {
+                since_ms: None,
+                since_strict: false,
+                follow: true,
+                strip_ansi: false,
+                last_bytes: None,
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s)
+        .expect("send");
+        s.flush().expect("flush");
+
+        // 子 exit までに来る何らかの frame の中で TailEnd(ChildExited) を待つ
+        let mut got_child_exited = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match next_control(&mut s) {
+                ControlMessage::TailEnd(te) => {
+                    if te.reason == TailEndReason::ChildExited {
+                        got_child_exited = true;
+                        break;
+                    }
+                }
+                _ => continue,
+            }
+        }
+        assert!(got_child_exited, "expected TailEnd(ChildExited)");
+
         let _ = handle.join().expect("daemon thread");
     }
 

@@ -82,6 +82,8 @@ pub enum HelpTopic {
     Top,
     /// Help for the `run` subcommand.
     Run,
+    /// Help for the `attach` subcommand (detach key bindings, modes 等)。
+    Attach,
     /// Help for the `completion` subcommand.
     Completion,
     /// User invoked an unknown subcommand; render top-level help with note.
@@ -660,7 +662,7 @@ fn parse_attach(args: &[String]) -> Command {
         match name.as_str() {
             "--help" | "-h" => {
                 return Command::Help {
-                    topic: HelpTopic::Top, // attach 専用 help は v0.2.0 で
+                    topic: HelpTopic::Attach,
                 };
             }
             "--socket" => match value {
@@ -715,6 +717,7 @@ pub fn usage(topic: &HelpTopic) -> String {
         HelpTopic::Top => usage_top(None),
         HelpTopic::UnknownSubcommand(name) => usage_top(Some(name.as_str())),
         HelpTopic::Run => usage_run(),
+        HelpTopic::Attach => usage_attach(),
         HelpTopic::Completion => usage_completion(),
     }
 }
@@ -995,6 +998,44 @@ fn usage_run() -> String {
             SHELL            Fallback command when none is given (legacy)\n    \
             XDG_RUNTIME_DIR  Base directory for the auto-generated socket path\n    \
             TMPDIR           Socket path base when XDG_RUNTIME_DIR is unset\n",
+    )
+}
+
+fn usage_attach() -> String {
+    String::from(
+        "hyoui attach — attach to an existing daemon session\n\
+        \n\
+        USAGE:\n    \
+            hyoui attach <session-id> [options]\n    \
+            hyoui attach --socket=<path> [options]\n\
+        \n\
+        OPTIONS:\n    \
+            --socket PATH         Explicit socket path (alternative to session-id)\n    \
+            --mode rw|ro|rw-no-leader\n                          \
+                Operating mode (default: rw)\n    \
+            --exclusive           Demand exclusive session ownership at start\n    \
+            --detach-others       Drop other attached clients on connect\n    \
+            -h, --help            Show this help and exit\n\
+        \n\
+        DETACH KEY (= session を生かしたまま client だけ抜ける):\n    \
+            Ctrl-A d              detach (session 維持 + 自分だけ Detach 送って終了)\n    \
+            Ctrl-A Ctrl-A         escape — literal Ctrl-A を子 PTY に送る\n    \
+            Ctrl-A <other>        prefix と当該キー両方を捨てる (= screen 慣例)\n    \
+            ※ prefix のカスタマイズは将来 --detach-prefix で対応予定\n\
+        \n\
+        EXAMPLES:\n    \
+            hyoui attach demo                       # session_id=demo に attach\n    \
+            hyoui attach --socket=/tmp/x.sock       # 直接 socket 指定\n    \
+            hyoui attach demo --mode=ro             # 読み取り専用 attach\n    \
+            hyoui attach demo --detach-others       # 他 client を蹴って奪う\n\
+        \n\
+        RELATED:\n    \
+            hyoui run --detached    daemon を background 起動\n    \
+            hyoui list              attach 可能な session 一覧\n    \
+            hyoui status <id>       session 状態を 1 度取得\n    \
+            hyoui tail <id>         scrollback / live stream を流す\n    \
+            hyoui wait <id> ...     条件達成まで block する\n    \
+            hyoui kill <id>         daemon に SIGTERM を送って終了\n",
     )
 }
 
@@ -1573,6 +1614,24 @@ mod tests {
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn attach_help_routes_to_attach_topic() {
+        match parse_args(&args(&["attach", "--help"])) {
+            Command::Help {
+                topic: HelpTopic::Attach,
+            } => {}
+            other => panic!("expected Help(Attach), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_help_text_mentions_detach_key() {
+        let text = usage(&HelpTopic::Attach);
+        assert!(text.contains("Ctrl-A d"), "help should document Ctrl-A d");
+        assert!(text.contains("escape"), "help should document escape");
+        assert!(text.contains("--mode"), "help should mention --mode option");
     }
 
     #[test]
