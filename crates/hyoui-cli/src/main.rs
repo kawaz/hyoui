@@ -32,6 +32,45 @@ mod completion;
 mod daemonize;
 mod socket_path;
 
+/// `connect 失敗` 系の error メッセージに next-action hint を足す共通 helper。
+///
+/// R4-H2: 旧版は `hyoui: attach: connect 失敗: <io error>` だけで止まっていて
+/// 「次に何をすればいいか」が分からなかった (= 新規ユーザがハマる)。
+///
+/// `socket_path` を渡すと `(socket: <path>)` を表示し、socket が存在しない場合は
+/// `hyoui list` で確認するよう促す。
+fn print_connect_failure(cmd: &str, socket_path: &std::path::Path, err: &dyn std::fmt::Display) {
+    let exists = socket_path.exists();
+    eprintln!(
+        "hyoui: {cmd}: connect 失敗: {err} (socket: {})",
+        socket_path.display()
+    );
+    if !exists {
+        eprintln!(
+            "       socket file が見つかりません。`hyoui list` で起動中の session を確認してください。"
+        );
+        eprintln!(
+            "       session が無い場合は `hyoui run --detached -- <cmd>` で起動できます。"
+        );
+    } else {
+        eprintln!(
+            "       socket は存在するが connect できません。daemon process が応答していない可能性があります。"
+        );
+        eprintln!(
+            "       `hyoui list` / `hyoui status <session>` で状態を確認してください。"
+        );
+    }
+}
+
+/// `session id or --socket required` 系のエラーに hint を足す共通 helper。
+fn print_session_required(cmd: &str) {
+    eprintln!("hyoui: {cmd}: session id (positional) または --socket=<path> が必要です");
+    eprintln!(
+        "       例: `hyoui {cmd} <session-id>` / `hyoui {cmd} --socket=/tmp/x.sock`"
+    );
+    eprintln!("       起動中の session 一覧は `hyoui list` で確認できます。");
+}
+
 fn main() -> ExitCode {
     // Skip argv[0]: parse_args expects the trailing arguments only.
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -236,14 +275,17 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         let sid = match cfg.session_id.as_deref() {
             Some(s) => s,
             None => {
-                eprintln!("hyoui: attach: session id or --socket required");
+                print_session_required("attach");
                 return ExitCode::from(2);
             }
         };
         match socket_path::resolve(None, sid) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("hyoui: attach: socket path 解決失敗: {e}");
+                eprintln!("hyoui: attach: socket path 解決失敗: {e} (session: {sid})");
+                eprintln!(
+                    "       起動中の session 一覧は `hyoui list` で確認してください。"
+                );
                 return ExitCode::from(1);
             }
         }
@@ -254,7 +296,8 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         Some("ro") => Mode::Ro,
         Some("rw-no-leader") => Mode::RwNoLeader,
         Some(other) => {
-            eprintln!("hyoui: attach: invalid --mode value: {other}");
+            eprintln!("hyoui: attach: invalid --mode value: {other:?}");
+            eprintln!("       valid values: `rw` | `ro` | `rw-no-leader`");
             return ExitCode::from(2);
         }
     };
@@ -274,7 +317,7 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
     let conn = match ClientConnection::connect(&sock, opts) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("hyoui: attach: connect 失敗: {e}");
+            print_connect_failure("attach", &sock, &e);
             return ExitCode::from(1);
         }
     };
@@ -348,6 +391,12 @@ fn list_command() -> ExitCode {
     if found == 0 {
         // 0 件は stderr で明示 (script 用に stdout を汚さない)
         eprintln!("hyoui: no sessions found");
+        eprintln!(
+            "       新しい session を始めるには: `hyoui run --detached -- <cmd>`"
+        );
+        eprintln!(
+            "       socket 候補 dir: $XDG_RUNTIME_DIR/hyoui または ${{TMPDIR:-/tmp}}/hyoui-<uid>"
+        );
     }
     ExitCode::SUCCESS
 }
@@ -383,14 +432,17 @@ fn kill_command(cfg: KillConfig) -> ExitCode {
         let sid = match cfg.session_id.as_deref() {
             Some(s) => s,
             None => {
-                eprintln!("hyoui: kill: session id or --socket required");
+                print_session_required("kill");
                 return ExitCode::from(2);
             }
         };
         match socket_path::resolve(None, sid) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("hyoui: kill: socket path 解決失敗: {e}");
+                eprintln!("hyoui: kill: socket path 解決失敗: {e} (session: {sid})");
+                eprintln!(
+                    "       起動中の session 一覧は `hyoui list` で確認してください。"
+                );
                 return ExitCode::from(1);
             }
         }
@@ -410,7 +462,7 @@ fn kill_command(cfg: KillConfig) -> ExitCode {
     let mut conn = match ClientConnection::connect(&sock, opts) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("hyoui: kill: connect 失敗: {e}");
+            print_connect_failure("kill", &sock, &e);
             return ExitCode::from(1);
         }
     };
@@ -442,12 +494,15 @@ fn resolve_target_socket(
     let sid = match session_id {
         Some(s) => s,
         None => {
-            eprintln!("hyoui: {cmd}: session id or --socket required");
+            print_session_required(cmd);
             return Err(ExitCode::from(2));
         }
     };
     socket_path::resolve(None, sid).map_err(|e| {
-        eprintln!("hyoui: {cmd}: socket path 解決失敗: {e}");
+        eprintln!("hyoui: {cmd}: socket path 解決失敗: {e} (session: {sid})");
+        eprintln!(
+            "       起動中の session 一覧は `hyoui list` で確認してください。"
+        );
         ExitCode::from(1)
     })
 }
@@ -466,7 +521,7 @@ fn status_command(cfg: StatusConfig) -> ExitCode {
     let mut conn = match ClientConnection::connect(&sock, opts) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("hyoui: status: connect 失敗: {e}");
+            print_connect_failure("status", &sock, &e);
             return ExitCode::from(1);
         }
     };
@@ -592,7 +647,7 @@ fn tail_command(cfg: TailConfig) -> ExitCode {
     let mut conn = match ClientConnection::connect(&sock, opts) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("hyoui: tail: connect 失敗: {e}");
+            print_connect_failure("tail", &sock, &e);
             return ExitCode::from(1);
         }
     };
@@ -679,7 +734,7 @@ fn wait_command(cfg: WaitConfig) -> ExitCode {
     let mut conn = match ClientConnection::connect(&sock, opts) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("hyoui: wait: connect 失敗: {e}");
+            print_connect_failure("wait", &sock, &e);
             return ExitCode::from(1);
         }
     };

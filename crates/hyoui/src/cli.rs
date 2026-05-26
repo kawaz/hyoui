@@ -374,7 +374,11 @@ fn parse_kill(args: &[String]) -> Command {
     match positionals.len() {
         0 => {
             if cfg.socket.is_none() {
-                return Command::Error("kill: session id (positional) or --socket required".into());
+                return Command::Error(
+                    "kill: session id (positional) または --socket=<path> が必要です。\
+                     例: `hyoui kill <session-id>` / `hyoui list` で session 一覧を確認できます"
+                        .into(),
+                );
             }
         }
         1 => cfg.session_id = Some(positionals.into_iter().next().unwrap()),
@@ -444,7 +448,8 @@ where
         0 => {
             if socket.is_none() {
                 return Err(Command::Error(format!(
-                    "{name}: session id (positional) or --socket required"
+                    "{name}: session id (positional) または --socket=<path> が必要です。\
+                     例: `hyoui {name} <session-id>` / `hyoui list` で session 一覧を確認できます"
                 )));
             }
             None
@@ -631,7 +636,11 @@ fn parse_wait(args: &[String]) -> Command {
         }
     };
     if session_id.is_none() && socket.is_none() {
-        return Command::Error("wait: session id (positional) or --socket required".into());
+        return Command::Error(
+            "wait: session id (positional) または --socket=<path> が必要です。\
+             例: `hyoui wait <session-id> text:READY --timeout=5s` / `hyoui list` で session 一覧を確認できます"
+                .into(),
+        );
     }
     Command::Wait(WaitConfig {
         socket,
@@ -1034,7 +1043,9 @@ fn parse_attach(args: &[String]) -> Command {
         0 => {
             if cfg.socket.is_none() {
                 return Command::Error(
-                    "attach: session id (positional) or --socket required".into(),
+                    "attach: session id (positional) または --socket=<path> が必要です。\
+                     例: `hyoui attach <session-id>` / `hyoui list` で session 一覧を確認できます"
+                        .into(),
                 );
             }
         }

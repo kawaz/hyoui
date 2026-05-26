@@ -218,10 +218,16 @@ impl ClientConnection {
         let response = match resp_msg {
             ControlMessage::HandshakeResponse(r) => r,
             ControlMessage::Error(e) => {
-                return Err(Error::Invalid(if e.code == "lock.denied" {
-                    "lock denied"
-                } else {
-                    "daemon error during handshake"
+                // R4-H2: handshake で daemon が返す error code 別に文言を出し分ける。
+                // 旧版は `daemon error during handshake` で済ませて、ユーザに「次に
+                // 何をすべきか」の hint が無かった。Error::Invalid は &'static str
+                // しか受け取れないので code → static str の switch で対応する。
+                return Err(Error::Invalid(match e.code.as_str() {
+                    "lock.denied" => "lock denied (= 他 client が exclusive lock を保持中。`hyoui status <session>` で lock-holder を確認、または別 session を使う)",
+                    "unsupported-capability" => "daemon が要求 cap を非対応 (= server を新しい version に upgrade するか、client から該当 cap を外す)",
+                    "auth.token-mismatch" => "HYOUI_LOCK_TOKEN が一致しません (= daemon 起動時の token と env が異なる。env を見直す)",
+                    "session.full" => "session の client 上限に到達 (= 他 client を detach するか、新規 session を起動)",
+                    _ => "daemon error during handshake (= `hyoui status <session>` でサーバ側の状態を確認してください)",
                 }));
             }
             _ => return Err(Error::Invalid("unexpected response to handshake.request")),
@@ -615,6 +621,67 @@ mod tests {
         .expect("send kill");
         let exit = handle.join().expect("daemon thread").expect("daemon run");
         assert_eq!(exit, 143);
+    }
+
+    /// R4-H2: handshake error response (= daemon が `auth.token-mismatch` 等を返した)
+    /// に対し、connect 側が code-specific な next-action hint 付き文言を返すこと。
+    /// 旧版はどの code でも `daemon error during handshake` 一律で、ユーザが
+    /// 次に何をすればいいか分からなかった。
+    #[test]
+    fn connect_token_mismatch_returns_specific_hint() {
+        let dir = make_temp_socket_dir();
+        let sock = dir.path().join("test.sock");
+        let mut cfg = DaemonConfig::new(
+            "demo",
+            sock.clone(),
+            vec!["/bin/sleep".into(), "30".into()],
+        );
+        cfg.expected_token = Some("secret-xyz".into());
+        let session = Session::start(cfg).expect("daemon start");
+        let daemon_handle = std::thread::spawn(move || session.run());
+
+        // listener bind 完了を待ってから connect (= CI の slow path 対策)。
+        // 連続 connect で daemon を多重に handshake させないため、ENOENT 系の
+        // 「まだ socket が無い」errno だけ retry し、handshake まで届いたら break。
+        let mut last_err: Option<Error> = None;
+        for attempt in 0..50 {
+            let res = ClientConnection::connect(
+                &sock,
+                AttachOptions {
+                    token: Some("wrong-token".into()),
+                    ..AttachOptions::default()
+                },
+            );
+            match res {
+                Ok(_) => panic!("expected handshake to be rejected, but connect succeeded"),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    // socket 未生成由来の Errno (ENOENT/ECONNREFUSED) は retry
+                    if attempt < 49
+                        && (msg.contains("No such file") || msg.contains("Connection refused"))
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    last_err = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = last_err.expect("connect should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("HYOUI_LOCK_TOKEN") || msg.contains("token"),
+            "error message must mention token-related hint, got: {msg}"
+        );
+        // 必ず一律の `daemon error during handshake` ではないこと (= R4-H2)
+        assert!(
+            !msg.contains("daemon error during handshake"),
+            "must not fall through to generic message, got: {msg}"
+        );
+
+        // daemon thread は handshake 拒否で Err 終了
+        let _ = daemon_handle.join();
     }
 
     #[test]
