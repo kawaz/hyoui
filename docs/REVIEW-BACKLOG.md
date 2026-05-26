@@ -400,9 +400,10 @@ Wild debugger / Competitive 分析 / Rust API 設計
   - 出典: Sales (R5-SAL-M4) / docs-structure.md 規約準拠
   - 提案: `docs/MANUAL{-ja}.md` 骨組み追加 (ユースケース recipe 集)、README/DESIGN との棲み分け明示。v0.2.0 API 完成時に本格化
   - 解消: `docs/MANUAL-ja.md` / `docs/MANUAL.md` を新設 (相互リンク `>` blockquote 付き、v0.1 系で動くレシピ + troubleshooting 表 + 関連リンク)。README の Documentation セクションから MANUAL を案内。本格化は v0.2.0 API 確定時。
-- [ ] **R5-M34** GitHub repo Topics タグ未設定 (SEO)
+- [done] **R5-M34** GitHub repo Topics タグ未設定 (SEO)
   - 出典: Sales (R5-SAL-M7)
   - 提案: `pty`/`terminal`/`automation`/`cli`/`rust`/`daemon`/`tmux`/`expect`/`claude`/`repl`/`interactive`/`session-manager`
+  - 解消: `docs/issue/2026-05-27-github-repo-topics.md` を起票して具体的な `gh repo edit --add-topic ...` コマンド列・確認手順・Done 条件を記録。実行自体は git 管理外の操作なので、kawaz が手元で 1 回実行 → issue ファイルを削除して完了。
 - [ ] **R5-M35** `RunConfig` / `AttachConfig` 全 field pub = invariant 不在 (R4-M18 補強)
   - 出典: Classic (R5-CLS-M3) / R4-M18 補強
   - 提案: field を `pub(crate)` 閉じ、reader method (unsigned narrowing で invariant 表現) + `RunConfig::new(command)` + 必須 setter
