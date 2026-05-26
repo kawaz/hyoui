@@ -75,6 +75,11 @@ pub enum ErrorCode {
     WaitInvalidPattern,
     /// `detach.target-partial` — detach 対象指定の一部が見つからない / 失敗。
     DetachTargetPartial,
+    /// `master.write-timeout` — client → master PTY への raw_data write が、
+    /// 子の slow-reader (line discipline buffer 満杯) で idle timeout を超えた。
+    /// daemon は当該 client を disconnect する (= 子に届かなかった bytes は
+    /// drop)。R5-C3 で導入。
+    MasterWriteTimeout,
     /// 未知の error code。wire 上の dotted text を保持する。
     ///
     /// 前方互換のため、新しい daemon / client が将来追加した code を
@@ -102,6 +107,7 @@ impl ErrorCode {
             ErrorCode::WaitInvalidText => "wait.invalid-text",
             ErrorCode::WaitInvalidPattern => "wait.invalid-pattern",
             ErrorCode::DetachTargetPartial => "detach.target-partial",
+            ErrorCode::MasterWriteTimeout => "master.write-timeout",
             ErrorCode::Unknown(s) => s.as_str(),
         }
     }
@@ -125,6 +131,7 @@ impl ErrorCode {
             "wait.invalid-text" => ErrorCode::WaitInvalidText,
             "wait.invalid-pattern" => ErrorCode::WaitInvalidPattern,
             "detach.target-partial" => ErrorCode::DetachTargetPartial,
+            "master.write-timeout" => ErrorCode::MasterWriteTimeout,
             other => ErrorCode::Unknown(other.to_string()),
         }
     }
@@ -193,6 +200,7 @@ mod tests {
             (ErrorCode::WaitInvalidText, "wait.invalid-text"),
             (ErrorCode::WaitInvalidPattern, "wait.invalid-pattern"),
             (ErrorCode::DetachTargetPartial, "detach.target-partial"),
+            (ErrorCode::MasterWriteTimeout, "master.write-timeout"),
         ];
 
         for (variant, wire) in known {

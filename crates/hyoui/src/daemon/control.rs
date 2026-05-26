@@ -55,6 +55,23 @@ use super::session::RelayOutcome;
 use super::tail::handle_tail_request;
 use super::wait::{PendingWait, handle_wait_request};
 
+// === Tunables ===
+
+/// client → master PTY への raw_data write が、子の slow-reader (= line
+/// discipline buffer 満杯) のために forward progress を立てられない時の
+/// **per-chunk idle timeout** (ms)。
+///
+/// 値の根拠 (R5-C3): Linux の N_TTY line discipline buffer は典型 4–8 KiB
+/// で、子が `read(2)` を 1 回呼べばその分すぐ空く。**500 ms** は「子が完全に
+/// 読まなくなった (= SIGSTOP 中 / dead / 永久 loop) のを検出するに十分」と
+/// 同時に「子が真に slow だが進行中の場合に間違って disconnect しない」
+/// 距離。R4 で writer_pump 側 backpressure (8 MiB queue) との非対称が
+/// 1000× だった指摘 (R5-KER-C1) に対し、ここで上限を持たせる。
+///
+/// 注意: timeout は **forward progress が無い時間** であり、絶対 deadline
+/// ではない。子が steady に読んでいれば MB 級 paste も完走する。
+const MASTER_WRITE_IDLE_TIMEOUT_MS: u32 = 500;
+
 // === Frame 処理 outcome ===
 
 /// 1 client から受け取った frame の処理結果。
@@ -102,10 +119,34 @@ pub(super) fn handle_client_frame(
                     return ClientFrameOutcome::Continue;
                 }
             }
-            if pty.master_fd().write_all(&frame.body).is_err() {
-                return ClientFrameOutcome::DropClient;
+            // R5-C3: master fd は NONBLOCK なので `write_all` だと EAGAIN
+            // (= 子の line discipline buffer 4–8 KiB が満杯の瞬間) を即
+            // disconnect 扱いし、slow-reader 経由の client DoS が成立する。
+            // `write_all_with_idle_timeout` は EAGAIN を poll(POLLOUT) で
+            // 待ち、forward progress が `MASTER_WRITE_IDLE_TIMEOUT_MS` 続け
+            // ないときだけ ETIMEDOUT を返す。タイムアウト時は明示 error
+            // (= `master.write-timeout`) を通知してから DropClient する。
+            match pty
+                .master_fd()
+                .write_all_with_idle_timeout(&frame.body, MASTER_WRITE_IDLE_TIMEOUT_MS)
+            {
+                Ok(()) => ClientFrameOutcome::Continue,
+                Err(crate::sys::Error::Errno(nix::errno::Errno::ETIMEDOUT)) => {
+                    let _ = send_control(
+                        &clients[idx],
+                        ControlMessage::Error(ErrorMessage {
+                            code: ErrorCode::MasterWriteTimeout,
+                            message: format!(
+                                "master PTY write made no forward progress for {MASTER_WRITE_IDLE_TIMEOUT_MS} ms \
+                                (child is a slow reader); disconnecting client"
+                            ),
+                            details: None,
+                        }),
+                    );
+                    ClientFrameOutcome::DropClient
+                }
+                Err(_) => ClientFrameOutcome::DropClient,
             }
-            ClientFrameOutcome::Continue
         }
         TYPE_CBOR_CONTROL => {
             let msg = match ControlMessage::decode_from(frame.body.as_slice()) {

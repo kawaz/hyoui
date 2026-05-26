@@ -183,6 +183,7 @@ error code は dotted text string で人間可読性優先 (= 数値 enum より
 | `wait.invalid-text` | `WaitInvalidText` | 回復可 | wait の text 引数が不正 |
 | `wait.invalid-pattern` | `WaitInvalidPattern` | 回復可 | wait の pattern (正規表現) が不正 |
 | `detach.target-partial` | `DetachTargetPartial` | 回復可 | detach 対象指定の一部が見つからない / 失敗 |
+| `master.write-timeout` | `MasterWriteTimeout` | 致命 | client → master PTY への raw_data write が子の slow-reader で idle timeout 超過、daemon が disconnect (R5-C3) |
 | (任意の未知 string) | `Unknown(String)` | — | 旧 binary が新 daemon から受け取った未知 code を drop せず保持 (前方互換) |
 
 `ErrorCode` enum は `#[non_exhaustive]` のため、library user は match で必ず `_` arm を用意する (= 新 code 追加で既存 caller が壊れない)。未知 code を受信したら `ErrorCode::Unknown(String)` で wire 文字列を保持するので、log / debug 用途で原 string を失わない。
