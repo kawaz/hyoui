@@ -10,6 +10,9 @@ ignore = []
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# workspace 内の path = "../foo" 形式の dep は wildcard 扱いされるが、
+# これは内部依存で外部 crate ではないので allow。
+allow-wildcard-paths = true
 # Disallow specific crates here if needed.
 deny = []
 skip = []
