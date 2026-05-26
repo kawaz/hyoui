@@ -189,15 +189,16 @@ impl Session {
         }
 
         // cleanup:
-        // 1. writer_tx を drop → writer_pump は残り frame を drain してから recv 終了
-        // 2. **per-client** で queued_bytes==0 を最大 200ms 待つ (= 1 client の hang
+        // 1. per-client で queued_bytes==0 を最大 200ms 待つ (= 1 client の hang
         //    が他 client の drain budget を食い潰さないように、deadline を共有せず
         //    client ごとに 200ms ずつ振る)
-        // 3. socket shutdown (= まだ write_all で block 中なら強制解除)
-        // 4. join
+        // 2. `clients.drain(..)` で各 `ClientHandle` を scope-exit させ、`Drop` impl
+        //    (R5-H18) が writer_tx close + reader shutdown + writer_thread join を
+        //    一括実行する
         //
-        // ※ writer_tx drop だけだと、writer_pump が write_all で block 中の場合
-        //   recv に戻らず join hang する。そのため drain wait + shutdown を入れる。
+        // ※ Drop だけだと残り frame を drain できないため、drain wait は明示的に
+        //   先行させる (= writer_pump が残 frame を全て write_all し終わるまで
+        //   200ms 待つ。timeout で抜けたら Drop の shutdown で強制終了)。
         const DRAIN_BUDGET_PER_CLIENT: std::time::Duration = std::time::Duration::from_millis(200);
         for ch in clients.iter() {
             let deadline = std::time::Instant::now() + DRAIN_BUDGET_PER_CLIENT;
@@ -207,13 +208,7 @@ impl Session {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
-        for ch in clients.drain(..) {
-            drop(ch.writer_tx);
-            let _ = ch.reader.shutdown(std::net::Shutdown::Both);
-            if let Some(t) = ch.writer_thread {
-                let _ = t.join();
-            }
-        }
+        clients.clear();
 
         let exit_code = finalize_child(child, &outcome)?;
         drop(listener);
@@ -406,11 +401,9 @@ fn serve_loop(
                 for idx in indices_to_drop.into_iter().rev() {
                     let ch = clients.remove(idx);
                     pending_waits.retain(|w| w.client_id != ch.id);
-                    drop(ch.writer_tx);
-                    let _ = ch.reader.shutdown(std::net::Shutdown::Both);
-                    if let Some(t) = ch.writer_thread {
-                        let _ = t.join();
-                    }
+                    // ClientHandle::Drop が writer_tx close + reader shutdown +
+                    // writer_thread join を一括実行 (R5-H18)。
+                    drop(ch);
                 }
                 continue;
             }
@@ -568,13 +561,10 @@ fn serve_loop(
             }
             // pending waits も remove (= client が消えたら wait は cancel 同等)
             pending_waits.retain(|w| w.client_id != ch.id);
-            drop(ch.writer_tx);
-            // backpressure 超過時の writer_pump は write_all で block 中の可能性が
-            // あるため、socket shutdown で write_all を即 error 化する
-            let _ = ch.reader.shutdown(std::net::Shutdown::Both);
-            if let Some(t) = ch.writer_thread {
-                let _ = t.join();
-            }
+            // ClientHandle::Drop が writer_tx close + reader shutdown +
+            // writer_thread join を一括実行 (R5-H18)。backpressure 超過時の
+            // writer_pump が write_all で block 中でも shutdown で即 error 化される。
+            drop(ch);
         }
 
         // leader cascade: leader が消えた場合、次の Rw client を昇格させる

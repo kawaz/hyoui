@@ -26,7 +26,7 @@
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Sender};
 use std::time::Instant;
 
 use crate::protocol::messages::{ErrorCode, ErrorMessage, TailData};
@@ -64,6 +64,44 @@ pub(super) struct ClientHandle {
     pub(super) writer_thread: Option<std::thread::JoinHandle<()>>,
     /// daemon が client → daemon を decode するときに使う socket reader。
     pub(super) reader: UnixStream,
+}
+
+/// `ClientHandle` の drop でリソース cleanup を一括化する (R5-H18 / R5-FRM-H2)。
+///
+/// 通常の cleanup 経路 (= session.rs の `serve_loop` の overflow/drop cascade、
+/// `Session::serve` 終了時の drain) では `clients.remove(idx)` / `clients.drain(..)`
+/// で `ClientHandle` を所有取りして scope-exit させ、この `Drop` が走ることで
+/// (a) socket shutdown → (b) writer_tx close → (c) writer_thread join が **必ず**
+/// 実行される。これにより:
+///
+/// - **panic safety**: `Session::serve` 中に panic で unwind しても `Vec<ClientHandle>`
+///   の Drop が各 element を drop し、writer thread が detached leak せず必ず join される
+/// - **forget 防止**: 個別 site で `drop(writer_tx)` / `shutdown` / `join` の 3 行を
+///   コピペしていた重複が 1 箇所に集約され、片方を書き忘れる事故が起きない
+///
+/// 順序の根拠:
+///
+/// 1. `reader.shutdown(Both)`: 共有 FD (= UnixStreamTransport::split で try_clone した
+///    片割れ) を Both で shutdown。writer_pump が `write_all` で block 中なら即 error
+///    で抜ける
+/// 2. `writer_tx` を closed dummy へ `mem::replace`: 旧 Sender を即時 drop。
+///    writer_pump が `rx.recv()` で block 中 (= channel 空) でも channel close で抜ける
+/// 3. `writer_thread.join()`: writer_pump が (1) or (2) で必ず終了するので join は
+///    短時間で完了する。`JoinHandle::join` 自体は thread の panic を伝播せず Result で
+///    返すので、unwinding 中の Drop でも double-panic は発生しない
+impl Drop for ClientHandle {
+    fn drop(&mut self) {
+        // (1) 共有 socket FD を shutdown して writer_pump の write_all を unblock。
+        let _ = self.reader.shutdown(std::net::Shutdown::Both);
+        // (2) writer_tx を closed channel と入れ替えて旧 Sender を即 drop。
+        //     channel close で writer_pump の rx.recv() が Err を返し loop 終了。
+        let (dummy_tx, _dummy_rx) = mpsc::channel::<Vec<u8>>();
+        let _ = std::mem::replace(&mut self.writer_tx, dummy_tx);
+        // (3) writer_pump 終了を join で reap。double-panic は join では起きない。
+        if let Some(t) = self.writer_thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 /// client の出力 subscription (Phase 11)。
@@ -354,5 +392,72 @@ mod tests {
         );
         // queued_bytes は変化なし (= Overflow 時は加算前に reject)
         assert_eq!(ch.queued_bytes.load(Ordering::Acquire), 100);
+    }
+
+    /// R5-H18: `ClientHandle::Drop` が writer_pump thread を確実に終了させること。
+    ///
+    /// 本物の writer_pump thread を spawn し、`rx.recv()` で block させた状態で
+    /// `ClientHandle` を drop する。Drop が writer_tx を closed dummy に
+    /// `mem::replace` するので channel close で recv が Err を返し、writer_pump
+    /// が return → join が短時間で完了する。
+    #[test]
+    fn client_handle_drop_closes_writer_channel() {
+        let (reader, writer_sock) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let _peer = reader.try_clone().expect("clone peer"); // 受信側 keep
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let queued_for_pump = Arc::clone(&queued_bytes);
+        let writer_thread =
+            std::thread::spawn(move || writer_pump(rx, writer_sock, queued_for_pump));
+
+        let ch = ClientHandle {
+            id: 99,
+            mode: Mode::Rw,
+            leader: true,
+            subscription: Subscription::Raw,
+            negotiated_caps: vec![],
+            writer_tx: tx,
+            queued_bytes,
+            buffer_limit: 1024,
+            writer_thread: Some(writer_thread),
+            reader,
+        };
+
+        // 短時間 sleep して writer_pump が rx.recv() で block している状態を確実にする
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // drop → Drop impl が走り writer thread が join されるはず。
+        // 200ms 以内に panic/hang せず drop が完了することを確認 (bounded budget)。
+        let start = std::time::Instant::now();
+        drop(ch);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "Drop should complete quickly, took {elapsed:?}"
+        );
+    }
+
+    /// R5-H18: `ClientHandle::Drop` は writer_thread が None でも panic しない
+    /// (= idempotent 性の最低限の保証)。test 用に直接 ClientHandle を組み立てた
+    /// 場合や、既に writer_thread を take 済みのコードパスからも安全に drop できる。
+    #[test]
+    fn client_handle_drop_idempotent_with_no_writer_thread() {
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>();
+        let (a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let _keep = a;
+        let ch = ClientHandle {
+            id: 0,
+            mode: Mode::Rw,
+            leader: false,
+            subscription: Subscription::Raw,
+            negotiated_caps: vec![],
+            writer_tx: tx,
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            buffer_limit: 100,
+            writer_thread: None,
+            reader: b,
+        };
+        // panic なしで drop できることだけ確認
+        drop(ch);
     }
 }
