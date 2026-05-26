@@ -1441,10 +1441,7 @@ fn process_pending_handshakes(
                         });
                         if let Some(mc) = mode_change_for_locked.as_ref() {
                             // accept した client に「現在 lock 中」を通知
-                            let _ = send_control(
-                                &accepted.handle,
-                                ControlMessage::ModeChange(*mc),
-                            );
+                            let _ = send_control(&accepted.handle, ControlMessage::ModeChange(*mc));
                         }
                         clients.push(accepted.handle);
                         if became_leader {
@@ -1501,7 +1498,12 @@ struct AcceptedClient {
 /// 渡し、main thread 側で leader 判定 + response 送信 + `ClientHandle` 構築を行う。
 /// 失敗時 (= protocol error / token mismatch) は worker が socket に error frame を
 /// 送ってから socket を drop し、本構造体は `Err` で main thread に届く。
-type HandshakeStageOk = (UnixStream, UnixStream, crate::protocol::HandshakeRequest, Vec<String>);
+type HandshakeStageOk = (
+    UnixStream,
+    UnixStream,
+    crate::protocol::HandshakeRequest,
+    Vec<String>,
+);
 
 /// R4-C3: pending handshake (= worker thread が走っている in-flight な handshake)。
 ///
@@ -1554,7 +1556,8 @@ fn spawn_handshake_worker(
     let worker = std::thread::Builder::new()
         .name("hyoui-handshake".into())
         .spawn(move || {
-            let result = do_handshake_stage(&mut reader, &mut writer_main, expected_token.as_deref());
+            let result =
+                do_handshake_stage(&mut reader, &mut writer_main, expected_token.as_deref());
             match result {
                 Ok((req, intersect)) => {
                     let _ = tx.send(Ok((reader, writer_main, req, intersect)));
@@ -1913,9 +1916,28 @@ fn handle_control_message(
                     &clients[idx],
                     ControlMessage::Error(ErrorMessage {
                         code: "mode.not-allowed".into(),
-                        message: "lock.acquire requires rw mode (= Ro cannot hold lock)"
-                            .into(),
+                        message: "lock.acquire requires rw mode (= Ro cannot hold lock)".into(),
                         details: None,
+                    }),
+                );
+                return ClientFrameOutcome::Continue;
+            }
+            // R4-C9: idempotency — 同じ client が既に lock を保持している場合は、
+            // 旧 token をそのまま返して Acquired を返す。
+            // 旧実装は `state.lock_holder.is_some()` だけで Denied を返していたため、
+            // 既に保持中の client が再 LockAcquire すると **自分の lock に弾かれる**
+            // footgun が発生していた。idempotent operation の標準的な挙動 (= 既に
+            // 同じ state なら success) に合わせる。
+            // mode.change broadcast は **行わない** (= state 変化なし)。
+            if state.lock_holder == Some(ch_id) {
+                let token = state.lock_token.clone();
+                let _ = req; // wait / timeout / process_bound は idempotent 再取得では未使用
+                let _ = send_control(
+                    &clients[idx],
+                    ControlMessage::LockResponse(LockResponse {
+                        result: LockResult::Acquired,
+                        token,
+                        queue_position: None,
                     }),
                 );
                 return ClientFrameOutcome::Continue;
@@ -4219,6 +4241,100 @@ mod tests {
         assert_eq!(waits.len(), 1, "overflow Idle should not match");
     }
 
+    /// R4-C9: 自己 LockAcquire は idempotent — 同じ client が既に lock を保持している
+    /// 状態で再度 LockAcquire を送ると、Denied ではなく Acquired を返し、token は
+    /// 初回と同じものを返す (= 新発行しない)。mode.change broadcast は発生しない。
+    #[test]
+    fn serve_lock_acquire_is_idempotent_for_self_holder() {
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let _r1 = do_client_handshake(&mut s1);
+        let _ = Frame::decode_from(&mut s1).expect("s1 leader.notify");
+
+        // s1 が lock 取得 (1 回目)
+        Frame::cbor_control(
+            ControlMessage::LockAcquire(crate::protocol::messages::LockAcquire {
+                wait: false,
+                timeout_abs_ms: None,
+                timeout_idle_ms: None,
+                process_bound: false,
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+
+        let resp1_frame = Frame::decode_from(&mut s1).expect("decode resp1");
+        let token1 = match ControlMessage::decode_from(resp1_frame.body.as_slice()).expect("decode")
+        {
+            ControlMessage::LockResponse(lr) => {
+                assert_eq!(lr.result, LockResult::Acquired);
+                lr.token.expect("first acquire returns token")
+            }
+            o => panic!("expected LockResponse(Acquired), got {o:?}"),
+        };
+        // mode.change(Locked) は捨てる
+        let _ = Frame::decode_from(&mut s1).expect("mode.change locked");
+
+        // s1 が同じ lock を再取得 (= idempotent)
+        Frame::cbor_control(
+            ControlMessage::LockAcquire(crate::protocol::messages::LockAcquire {
+                wait: false,
+                timeout_abs_ms: None,
+                timeout_idle_ms: None,
+                process_bound: false,
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+
+        let resp2_frame = Frame::decode_from(&mut s1).expect("decode resp2");
+        let token2 = match ControlMessage::decode_from(resp2_frame.body.as_slice()).expect("decode")
+        {
+            ControlMessage::LockResponse(lr) => {
+                assert_eq!(
+                    lr.result,
+                    LockResult::Acquired,
+                    "self-reacquire must succeed (idempotent)"
+                );
+                lr.token.expect("self-reacquire returns token")
+            }
+            o => panic!("expected LockResponse(Acquired), got {o:?}"),
+        };
+        assert_eq!(token1, token2, "self-reacquire must return the same token");
+
+        // mode.change(Locked) が **broadcast されない** ことを確認する。
+        // (= state 変化が無いので broadcast 不要。s1 自身も Locked → Locked への
+        //   no-op broadcast を受けない。短い read_timeout で何も来ないことを検証。)
+        s1.set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("set read_timeout");
+        match Frame::decode_from(&mut s1) {
+            Err(_) => {} // 想定通り
+            Ok(f) => {
+                let m = ControlMessage::decode_from(f.body.as_slice()).expect("decode broadcast");
+                panic!("unexpected broadcast on self-reacquire: {m:?}");
+            }
+        }
+        s1.set_read_timeout(None).expect("clear timeout");
+
+        // cleanup
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
     /// R4-C7: Mode::Ro client が LockAcquire を送ると mode.not-allowed エラーを返し、
     /// session 全体が Locked 化しない (= session DoS を防ぐ)。
     #[test]
@@ -4275,8 +4391,7 @@ mod tests {
         match Frame::decode_from(&mut s1) {
             Err(_) => {} // 想定通り (= broadcast 来てない)
             Ok(f) => {
-                let m =
-                    ControlMessage::decode_from(f.body.as_slice()).expect("decode broadcast");
+                let m = ControlMessage::decode_from(f.body.as_slice()).expect("decode broadcast");
                 panic!("unexpected broadcast received on s1: {m:?}");
             }
         }
