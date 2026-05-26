@@ -2,12 +2,35 @@
 
 > English | [日本語](./README-ja.md)
 
-**hyoui** `/ˈhjoʊi/` (from Japanese 憑依, "spirit possession") — a transparent
-PTY wrapper CLI that "possesses" a child process and moves as one with it.
+**hyoui** `/ˈhjoʊi/` (from Japanese 憑依, "spirit possession") — drive `claude`,
+REPLs, and TUIs **from the outside** via CLI. A transparent PTY wrapper with no
+prefix keys and no in-band escape.
+
+<!-- TODO(R5-H15): asciinema cast / GIF goes here -->
+<!-- See docs/issue/2026-05-27-readme-asciinema-cast.md for the recording/placement plan -->
+<!--
+[![asciicast](https://asciinema.org/a/PLACEHOLDER.svg)](https://asciinema.org/a/PLACEHOLDER)
+-->
 
 hyoui launches an arbitrary command inside a PTY, stays completely transparent
 toward the child, and instead offers a **foothold from the outside** to observe,
 inject input, and drive the process from CLI / scripts.
+
+## Who is hyoui for?
+
+hyoui is not a tool you "live inside" of — it is a tool that drives one from
+the outside. You probably want it if:
+
+- **You script `claude` / Claude Code from CI or shell scripts** and are tired
+  of fighting `tmux send-keys` quoting, or don't want to write `expect` scripts
+- **You need to re-attach to long-running LLM / REPL / TUI sessions**,
+  e.g. reconnect from your phone via SSH to a `claude` session you left running
+  overnight
+- **You want to drive an interactive command from a test or ops script** with
+  input injection (`send`) and output waiting (`wait`) via a single CLI
+
+If your goal is "press `Ctrl-b` to split panes and live in a multiplexer", use
+tmux or zellij. hyoui is designed to **run inside** them.
 
 ## What it does
 
@@ -28,14 +51,14 @@ Primary use cases:
 
 ## Installation
 
-### Homebrew (planned)
+### Pre-built binaries (GitHub Releases)
 
 ```bash
-brew install kawaz/tap/hyoui
+# Grab a binary for your platform from the latest release:
+# https://github.com/kawaz/hyoui/releases/latest
 ```
 
-> Not published to the tap yet as of v0.1.0. Use the GitHub Release archives or
-> a source build until then.
+Binaries are published for Linux x86_64 / aarch64 and macOS Intel / Apple Silicon.
 
 ### Cargo
 
@@ -51,6 +74,16 @@ cd hyoui
 cargo build --release
 # binary at target/release/hyoui
 ```
+
+### Homebrew (planned)
+
+```bash
+brew install kawaz/tap/hyoui
+```
+
+> Formula publication to the tap is in progress (see
+> [`docs/issue/2026-05-27-homebrew-tap-deploy-key.md`](./docs/issue/2026-05-27-homebrew-tap-deploy-key.md)).
+> Until then, use one of the three install paths above.
 
 Supported platforms: Linux / macOS (Rust 1.86+, PTY and Unix sockets — Windows
 is not supported).
@@ -101,22 +134,39 @@ See [`docs/DESIGN.md`](./docs/DESIGN.md) and
 While attached, `Ctrl-A D` detaches the client (screen-style; the child keeps
 running). `Ctrl-A Ctrl-A` sends a literal Ctrl-A to the child.
 
-## How it differs from tmux / screen / Pexpect
+## How it differs from existing tools
 
-hyoui is **not a terminal multiplexer**.
+hyoui is **not a terminal multiplexer**. The landscape splits into two camps:
+tools you "live inside" and tools you "drive from the outside".
 
-| | hyoui | tmux / screen | Pexpect / Expect |
+### Tools you live inside (not competitors — compose with hyoui)
+
+| | hyoui | tmux / screen | zellij |
 |---|---|---|---|
-| In-band prefix key | **none** (transparent) | required (C-b / C-a) | none |
-| Windows / panes | none (1 session = 1 PTY) | core feature | none |
-| External input injection from CLI | **first-class** (`send`/`keys`/`paste`, v0.2.0+) | `send-keys` | library call |
-| External output waiting | **first-class** (`wait`/`tail`) | `pipe-pane` (indirect) | `expect()` |
-| Daemon lifecycle | starts with `run`, exits with the child | long-lived server, many sessions | dies with the child |
-| Primary use case | scripts / external drivers controlling long-running processes | humans living inside a multiplexer | test automation libraries |
+| In-band prefix key | **none** (transparent) | required (C-b / C-a) | required (C-p / C-q etc.) |
+| Windows / panes | none (1 session = 1 PTY) | core feature | core feature |
+| Primary use case | driven from the outside | humans living inside | humans living inside |
 
-In short: hyoui is not a replacement for a multiplexer — you can run hyoui
-inside tmux. It sits as the layer that **drives a shell or REPL from outside**
-for scripts.
+→ "Run hyoui inside tmux" / "run `hyoui run` from a zellij pane" is the
+intended composition.
+
+### Tools you drive from the outside (this is hyoui's lane)
+
+| | hyoui | abduco / dtach | shpool | Pexpect / Expect | ttyd / gotty | asciinema |
+|---|---|---|---|---|---|---|
+| 1-daemon-1-session model | yes | yes | yes | no | no | no |
+| Input injection from external CLI | **first-class** (v0.2.0+) | no | no | library call | via browser | record-only |
+| Output waiting from outside | **first-class** (`wait`/`tail`) | no | no | `expect()` | no | no |
+| Record / replay | planned for v0.2.0+ | no | no | no | no | core feature |
+| HTTP / browser gateway | planned for v0.2.0+ (`serve`) | no | no | no | core feature | replay only |
+| Daemon lifecycle | starts with `run`, exits with the child | session manager | long-lived server | dies with the child | server | N/A |
+
+In short: hyoui's unique position is **a 1-daemon-1-session transparent PTY
+wrapper with a first-class CLI / HTTP API for external automation**. abduco
+and dtach lack external automation, shpool is server-resident, ttyd assumes a
+browser, and expect is a library. The goal is to put "the ergonomics of `expect`",
+"the attach experience of `abduco`", and "the remote reach of `ttyd`" into one
+CLI.
 
 See [DR-0005](./docs/decisions/DR-0005-design-philosophy-external-automation.md)
 for the full design philosophy.
@@ -131,10 +181,23 @@ with it, and from the outside becomes a control handle
 
 ## Status
 
-v0.1.0 = MVP. The four commands `run` / `attach` / `list` / `kill`, plus
-multi-attach and protocol cap negotiation, are usable. Automation APIs such as
-`send` / `keys` / `paste` / `wait` / `tail` / `lock` / `tx` will land
-incrementally in v0.2.0+ ([`docs/ROADMAP.md`](./docs/ROADMAP.md)).
+v0.1.x = **external API stabilization phase**. The four commands `run` /
+`attach` / `list` / `kill`, plus multi-attach and protocol cap negotiation, are
+usable.
+
+**Production readiness:**
+
+- Tested platforms: Linux x86_64 / aarch64, macOS Intel / Apple Silicon
+- Breaking change policy: **during v0.x, minor bumps may include breaking changes**
+  (we won't sell snake oil before the API solidifies)
+- Production use: **not yet recommended for v0.1.x**. kawaz uses it daily to
+  drive `claude` (eat-your-own-dogfood), but treat business-critical use as
+  self-test territory
+- **Production-stable target: v0.2.0+**, gated on the `serve` gateway and the
+  automation API surface (`send` / `keys` / `paste` / `wait` / `tail` / `lock` /
+  `tx`)
+
+Roadmap details: [`docs/ROADMAP.md`](./docs/ROADMAP.md).
 
 ## Documentation
 

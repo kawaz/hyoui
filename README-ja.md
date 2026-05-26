@@ -2,10 +2,32 @@
 
 > [English](./README.md) | 日本語
 
-**hyoui** `/ˈhjoʊi/`（ヒョーイ・憑依）— 子プロセスに「憑依」して一体で動く、透過的な PTY ラッパー CLI。
+**hyoui** `/ˈhjoʊi/`（ヒョーイ・憑依）— `claude` / REPL / TUI を **外側から** CLI で
+駆動する。prefix キーも in-band escape も無い、PTY 透過ラッパー。
+
+<!-- TODO(R5-H15): asciinema cast / GIF 配置予定 -->
+<!-- 録画 / 配置手順は docs/issue/2026-05-27-readme-asciinema-cast.md を参照 -->
+<!--
+[![asciicast](https://asciinema.org/a/PLACEHOLDER.svg)](https://asciinema.org/a/PLACEHOLDER)
+-->
 
 任意のコマンドを PTY の中で起動し、内側からは透過的に振る舞いながら、
 **外側から監視・自動操作するための足場**を提供する。
+
+## Who is hyoui for?
+
+「ターミナルの中で生活する」ツールではなく、「外側から駆動する」ツール。
+以下に当てはまるなら多分使い所がある:
+
+- **claude / Claude Code を CI やスクリプトから操りたい**:
+  `tmux send-keys` の quoting 地獄に疲れた、`expect` script を書きたくない
+- **長時間走る LLM / REPL / TUI セッションに attach し直したい**:
+  夜走らせた `claude` セッションに朝スマホから ssh で繋ぎ直す、など
+- **テスト・運用スクリプトから interactive command を expect 的に駆動したい**:
+  入力注入 (`send`) と出力待ち (`wait`) を CLI 一本でやりたい
+
+逆に「`Ctrl-b` を押して画面を分割して人間が生活する」用途は tmux / zellij の仕事。
+hyoui は **tmux の中で動かす** 想定。
 
 ## 何ができる
 
@@ -23,13 +45,14 @@ gateway 経由で外側から制御** する。
 
 ## Installation
 
-### Homebrew (planned)
+### Pre-built binaries (GitHub Releases)
 
 ```bash
-brew install kawaz/tap/hyoui
+# 最新 release から自分の platform 用 binary を取得
+# https://github.com/kawaz/hyoui/releases/latest
 ```
 
-> v0.1.0 時点では tap への formula 公開は未実施。GitHub Release から binary 取得 or ソースビルドを使う。
+Linux x86_64 / aarch64, macOS Intel / Apple Silicon の binary を提供。
 
 ### Cargo
 
@@ -45,6 +68,15 @@ cd hyoui
 cargo build --release
 # binary は target/release/hyoui
 ```
+
+### Homebrew (planned)
+
+```bash
+brew install kawaz/tap/hyoui
+```
+
+> tap への formula 公開は準備中（[`docs/issue/2026-05-27-homebrew-tap-deploy-key.md`](./docs/issue/2026-05-27-homebrew-tap-deploy-key.md)）。
+> それまでは上記 3 経路を使う。
 
 対応 platform: Linux / macOS（Rust 1.86+、PTY と Unix socket を使うため Windows は未対応）。
 
@@ -93,21 +125,37 @@ hyoui kill "$SESS"
 attach 中の `Ctrl-A D` でクライアントだけ detach（screen 互換、子は生き続ける）。
 `Ctrl-A Ctrl-A` で literal Ctrl-A を子に送る。
 
-## tmux / screen / Pexpect との違い
+## 既存ツールとの違い
 
-hyoui は **terminal multiplexer ではない**。
+hyoui は **terminal multiplexer ではない**。「人が中で生活する系」と「外側から
+制御する系」で 2 段に整理する。
 
-| | hyoui | tmux / screen | Pexpect / Expect |
+### 人が中で生活する系（hyoui の競合ではない、組み合わせて使える）
+
+| | hyoui | tmux / screen | zellij |
 |---|---|---|---|
-| in-band prefix キー | **無し**（透過） | 必須（C-b / C-a） | 無し |
-| window / pane | 無し（1 session = 1 PTY） | 中心機能 | 無し |
-| 外側 CLI からの入力注入 | **first-class**（`send` / `keys` / `paste`、v0.2.0+） | `send-keys` あり | library から call |
-| 外側からの出力待ち | **first-class**（`wait` / `tail`） | `pipe-pane` で間接的 | `expect()` |
-| daemon ライフサイクル | 起動と同時、子 exit で終了 | server 常駐、複数 session | 子と心中 |
-| 主用途 | スクリプト/外部 driver から触る long-running プロセス | 人が中で生活する | テスト自動化 |
+| in-band prefix キー | **無し**（透過） | 必須（C-b / C-a） | 必須（C-p / C-q 等） |
+| window / pane | 無し（1 session = 1 PTY） | 中心機能 | 中心機能 |
+| 主用途 | 外部から駆動 | 人間が中で生活 | 人間が中で生活 |
 
-要するに「TUI multiplexer の代わりではなく、tmux の中で hyoui を動かす」想定。
-スクリプトから shell や REPL を **外側から駆動** する layer として位置づく。
+→ 「tmux の中で hyoui を動かす」「zellij の pane で hyoui run する」が想定。
+
+### 外側から制御する系（ここが hyoui の領域）
+
+| | hyoui | abduco / dtach | shpool | Pexpect / Expect | ttyd / gotty | asciinema |
+|---|---|---|---|---|---|---|
+| 1 daemon 1 session モデル | ◯ | ◯ | ◯ | × | × | × |
+| 外側 CLI からの入力注入 | **first-class**（v0.2.0+） | × | × | library から call | ブラウザ経由 | 録画のみ |
+| 外側からの出力待ち | **first-class**（`wait` / `tail`） | × | × | `expect()` | × | × |
+| 録画 / replay | v0.2.0+ で計画 | × | × | × | × | 中心機能 |
+| HTTP / ブラウザ gateway | v0.2.0+ で計画（`serve`） | × | × | × | 中心機能 | replay のみ |
+| daemon ライフサイクル | 起動と同時、子 exit で終了 | session manager 型 | 永続 server | 子と心中 | server 型 | N/A |
+
+要するに「**1 daemon 1 session の透過 PTY ラッパー** に対して、**外側から自動操作するための
+CLI / HTTP API** を first-class で乗せる」のが hyoui の独自ポジション。
+abduco / dtach は外側操作 API が無く、shpool は server 永続型、ttyd はブラウザ前提、
+expect は library。「`expect` の使いやすさ」「`abduco` の attach 体験」「`ttyd` の遠隔操作」
+の 3 つを CLI 一本で揃えるのが目標。
 
 詳しい思想は [DR-0005](./docs/decisions/DR-0005-design-philosophy-external-automation.md) を参照。
 
@@ -119,9 +167,21 @@ hyoui は **terminal multiplexer ではない**。
 
 ## Status
 
-v0.1.0 = MVP。`run` / `attach` / `list` / `kill` + multi-attach + protocol cap
-negotiation までが安定動作。`send` / `keys` / `paste` / `wait` / `tail` / `lock` /
-`tx` などの自動操作 API は v0.2.0 以降で順次提供（[`docs/ROADMAP.md`](./docs/ROADMAP.md)）。
+v0.1.x = **外側 API 確立期**。`run` / `attach` / `list` / `kill` + multi-attach +
+protocol cap negotiation までが安定動作。
+
+**production readiness**:
+
+- 動作確認済 platform: Linux x86_64 / aarch64, macOS Intel / Apple Silicon
+- breaking change policy: **v0.x の間は minor bump で breaking 可**
+  （API が固まるまで snake oil を売らない方針）
+- production 利用: **v0.1.x はまだ非推奨**。kawaz 自身が `claude` 駆動の
+  daily-driver として使用 (= eat your own dogfood) しているが、業務運用には
+  self-test 推奨
+- **production stable は v0.2.0+ 予定**: `serve` gateway 公開と自動操作 API
+  (`send` / `keys` / `paste` / `wait` / `tail` / `lock` / `tx`) の確立が条件
+
+ロードマップ詳細: [`docs/ROADMAP.md`](./docs/ROADMAP.md)。
 
 ## ドキュメント
 
