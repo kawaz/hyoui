@@ -152,8 +152,10 @@ local bumpVersion: Task = new {
     #"""
     set -euo pipefail
     new_version=$(bump-semver "$LEVEL" VERSION --write --no-hint)
-    # workspace.package.version は bump-semver が直接扱えないため sed で同期 (DR-0003)
-    perl -i -pe 'BEGIN{$v=shift @ARGV} s/^version\s*=\s*"[^"]*"/version = "$v"/ if !$done++' \
+    # workspace.package.version は bump-semver が直接扱えないため perl で同期 (DR-0003)
+    # 注: `if !$done++` だと 1 行目のみで判定するため、match 未成立でも flag が立ち
+    # 後続行で s/// が走らない。`s/// and $done=1` 形式で「初回 match 時のみ」に修正。
+    perl -i -pe 'BEGIN{$v=shift @ARGV} s/^version\s*=\s*"[^"]*"/version = "$v"/ and $done=1 unless $done' \
       "$new_version" Cargo.toml
     # cargo check で Cargo.lock を再生成 (workspace 全体)
     cargo check --workspace --offline >/dev/null 2>&1 || cargo check --workspace >/dev/null
