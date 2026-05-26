@@ -129,7 +129,7 @@ fn main() {
         *unique.entry(s.clone()).or_default() += 1;
     }
     let mut sorted: Vec<(String, usize)> = unique.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|x| std::cmp::Reverse(x.1));
     for (s, n) in sorted.iter().take(40) {
         eprintln!("  {n:5} × {s:?}");
     }
