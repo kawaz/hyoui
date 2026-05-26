@@ -12,7 +12,9 @@
 
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::Sender;
 use std::time::Instant;
 
 use nix::poll::{PollFd, PollTimeout};
@@ -223,8 +225,6 @@ impl Session {
             child,
             listener,
         } = self;
-        let client_buffer_cap = client_buffer_capacity(config.client_buffer_bytes);
-
         let mut clients: Vec<ClientHandle> = Vec::new();
         let mut next_client_id: u64 = 0;
         let mut state = SessionState::default();
@@ -237,15 +237,17 @@ impl Session {
             &mut clients,
             &mut next_client_id,
             &config,
-            client_buffer_cap,
             &mut state,
             &mut scrollback,
             &mut pending_waits,
         );
 
-        // cleanup: 各 client の writer thread を terminate (= channel drop で recv 終わる)
+        // cleanup: 各 client の writer thread を terminate
+        // (= channel drop で recv 終わるが、write_all 中に block していると recv に
+        // 戻らないので socket shutdown も実行して write_all を即時 error 化する)
         for ch in clients.drain(..) {
             drop(ch.writer_tx);
+            let _ = ch.reader.shutdown(std::net::Shutdown::Both);
             if let Some(t) = ch.writer_thread {
                 let _ = t.join();
             }
@@ -260,7 +262,12 @@ impl Session {
     }
 }
 
-/// 1 client の per-thread state (writer thread + bounded mpsc + reader handle)。
+/// 1 client の per-thread state (writer thread + 自前 byte bound queue + reader handle)。
+///
+/// Phase 12: queue capacity は **byte 単位の厳密 cap** (DR-0008 §8.2)。
+/// `writer_tx` は unbounded mpsc、enqueue の可否は `queued_bytes` を atomic で
+/// check + add し、`buffer_limit` 超過なら enqueue を拒否して当該 client を
+/// disconnect する (= `error` kind=`backpressure.disconnect` を best-effort 送信)。
 struct ClientHandle {
     id: u64,
     mode: Mode,
@@ -268,8 +275,12 @@ struct ClientHandle {
     leader: bool,
     /// 受信 subscription (= broadcast の encoding 種類を切り替える)。
     subscription: Subscription,
-    /// daemon → client への frame enqueue 用 mpsc。
-    writer_tx: SyncSender<Vec<u8>>,
+    /// daemon → client への frame enqueue 用 unbounded mpsc。
+    writer_tx: Sender<Vec<u8>>,
+    /// 現在 queue 内に積まれている bytes 数 (= writer_pump が送信完了で減らす)。
+    queued_bytes: Arc<AtomicUsize>,
+    /// queue の byte 上限 (= `DaemonConfig::client_buffer_bytes`)。
+    buffer_limit: usize,
     /// writer thread のハンドル。drop の前に join される。
     writer_thread: Option<std::thread::JoinHandle<()>>,
     /// daemon が client → daemon を decode するときに使う socket reader。
@@ -393,10 +404,73 @@ fn elevate_next_leader(clients: &mut [ClientHandle]) -> Option<u64> {
     None
 }
 
-/// CBOR control message を 1 client にだけ送る (= bounded queue 経由)。
+/// 1 client への frame enqueue 結果 (Phase 12 backpressure)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnqueueOutcome {
+    /// queue に追加成功、writer thread が socket に書き出す。
+    Sent,
+    /// `buffer_limit` 超過 (= 当該 client を disconnect すべき)。
+    Overflow,
+    /// writer thread が既に死亡 (= socket close 検知済み、再 enqueue 不能)。
+    WriterDead,
+}
+
+/// 1 frame の bytes を 1 client の queue に積む。`queued_bytes` の atomic
+/// check-and-add で `buffer_limit` を厳密に守る。
+fn enqueue_for_client(ch: &ClientHandle, bytes: Vec<u8>) -> EnqueueOutcome {
+    let size = bytes.len();
+    let cur = ch.queued_bytes.load(Ordering::Acquire);
+    if cur.saturating_add(size) > ch.buffer_limit {
+        return EnqueueOutcome::Overflow;
+    }
+    // 競合により実際の queued_bytes は cur より大きい可能性があるが、その場合は
+    // 次の broadcast 時の check で overflow になる。1 byte 単位の厳密性まで要求
+    // しないなら relax check + add の 2 段で十分。
+    ch.queued_bytes.fetch_add(size, Ordering::AcqRel);
+    if ch.writer_tx.send(bytes).is_err() {
+        // writer thread 死亡 → queued_bytes を戻して終了
+        ch.queued_bytes.fetch_sub(size, Ordering::AcqRel);
+        return EnqueueOutcome::WriterDead;
+    }
+    EnqueueOutcome::Sent
+}
+
+/// `backpressure.disconnect` error message を best-effort で投げる。queue 既に
+/// 満杯ならそのまま諦める (= 当該 client は close される)。
+fn send_backpressure_error(ch: &ClientHandle, queued: usize) {
+    let msg = ControlMessage::Error(ErrorMessage {
+        code: "backpressure.disconnect".into(),
+        message: "client buffer full".into(),
+        details: Some(ciborium::Value::Map(vec![
+            (
+                ciborium::Value::Text("queued_bytes".into()),
+                ciborium::Value::Integer((queued as u64).into()),
+            ),
+            (
+                ciborium::Value::Text("limit".into()),
+                ciborium::Value::Integer((ch.buffer_limit as u64).into()),
+            ),
+        ])),
+    });
+    let body = match msg.encode_to_vec() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let mut frame_bytes = Vec::new();
+    if Frame::cbor_control(body)
+        .encode_to(&mut frame_bytes)
+        .is_err()
+    {
+        return;
+    }
+    // 直接 send (= queued_bytes は無視、disconnect 直前の best-effort)
+    let _ = ch.writer_tx.send(frame_bytes);
+}
+
+/// CBOR control message を 1 client にだけ送る。
 ///
-/// 送信失敗 (= queue 満杯 / writer thread 死亡) は `false` を返す。caller は
-/// 必要に応じて当該 client を drop 対象にできる。
+/// `true` = enqueue 成功、`false` = overflow / writer dead (= caller は当該
+/// client を drop すべき)。
 fn send_control(ch: &ClientHandle, msg: ControlMessage) -> bool {
     let body = match msg.encode_to_vec() {
         Ok(b) => b,
@@ -409,7 +483,7 @@ fn send_control(ch: &ClientHandle, msg: ControlMessage) -> bool {
     {
         return false;
     }
-    ch.writer_tx.try_send(frame_bytes).is_ok()
+    matches!(enqueue_for_client(ch, frame_bytes), EnqueueOutcome::Sent)
 }
 
 /// `Instant` (monotonic) を Unix epoch millis に近似変換する。
@@ -429,8 +503,10 @@ fn instant_to_epoch_ms(ts: Instant) -> i64 {
 
 /// 子 PTY 出力 `bytes` を全 client に broadcast する。subscription 種類に応じて
 /// raw_data frame (= Raw) or tail.data CBOR frame (= TailFollow) を送る。
-fn broadcast_master_bytes(clients: &mut [ClientHandle], bytes: &[u8], ts: Instant) {
-    // Raw 用の frame bytes は 1 度だけ encode してから全 Raw subscriber に clone enqueue
+///
+/// 戻り値: backpressure overflow / writer dead で disconnect すべき client の
+/// `client_id` 一覧 (Phase 12)。
+fn broadcast_master_bytes(clients: &mut [ClientHandle], bytes: &[u8], ts: Instant) -> Vec<u64> {
     let raw_frame_bytes: Option<Vec<u8>> = if clients
         .iter()
         .any(|c| matches!(c.subscription, Subscription::Raw))
@@ -445,9 +521,8 @@ fn broadcast_master_bytes(clients: &mut [ClientHandle], bytes: &[u8], ts: Instan
         None
     };
 
-    // Tail 用は strip_ansi の値ごとに 1 度だけ encode してキャッシュ
     let ts_ms = instant_to_epoch_ms(ts);
-    let mut tail_cache: [Option<Vec<u8>>; 2] = [None, None]; // [strip=false, strip=true]
+    let mut tail_cache: [Option<Vec<u8>>; 2] = [None, None];
     let encode_tail = |strip: bool, cache: &mut [Option<Vec<u8>>; 2]| -> Option<Vec<u8>> {
         let key = if strip { 1 } else { 0 };
         if let Some(ref cached) = cache[key] {
@@ -469,21 +544,26 @@ fn broadcast_master_bytes(clients: &mut [ClientHandle], bytes: &[u8], ts: Instan
         Some(frame_bytes)
     };
 
+    let mut overflow_ids: Vec<u64> = Vec::new();
     for ch in clients.iter() {
         let fb = match ch.subscription {
             Subscription::Raw => raw_frame_bytes.clone(),
             Subscription::TailFollow { strip_ansi } => encode_tail(strip_ansi, &mut tail_cache),
         };
         if let Some(fb) = fb {
-            match ch.writer_tx.try_send(fb) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                    // backpressure / disconnect: 後段の broadcast_bytes と同じ
-                    // silently skip (= MVP は到達しない 8 MiB)。Phase 12 で厳密化。
+            match enqueue_for_client(ch, fb) {
+                EnqueueOutcome::Sent => {}
+                EnqueueOutcome::Overflow => {
+                    send_backpressure_error(ch, ch.queued_bytes.load(Ordering::Acquire));
+                    overflow_ids.push(ch.id);
+                }
+                EnqueueOutcome::WriterDead => {
+                    overflow_ids.push(ch.id);
                 }
             }
         }
     }
+    overflow_ids
 }
 
 /// `wait.request` を処理する (Phase 11c)。
@@ -767,40 +847,40 @@ fn handle_tail_request(
 }
 
 /// CBOR control message を全 client に broadcast。
-fn broadcast_control(clients: &mut [ClientHandle], msg: &ControlMessage) {
+///
+/// 戻り値: backpressure overflow / writer dead で disconnect すべき client の
+/// `client_id` 一覧 (Phase 12)。
+fn broadcast_control(clients: &mut [ClientHandle], msg: &ControlMessage) -> Vec<u64> {
     let body = match msg.encode_to_vec() {
         Ok(b) => b,
-        Err(_) => return,
+        Err(_) => return Vec::new(),
     };
     let mut frame_bytes = Vec::new();
     if Frame::cbor_control(body)
         .encode_to(&mut frame_bytes)
         .is_err()
     {
-        return;
+        return Vec::new();
     }
-    broadcast_bytes(clients, frame_bytes);
-}
-
-/// 1 frame あたりの平均サイズを 4 KiB と仮定して、`client_buffer_bytes` を
-/// frame 数の bound に変換する。最低 16 frame を保証。
-///
-/// MVP の暫定実装。Phase 9 の後段で「実 byte bound (= atomic で queue 内 bytes
-/// を track)」に置き換える。
-fn client_buffer_capacity(bytes: usize) -> usize {
-    let frame_estimate = bytes / 4096;
-    frame_estimate.max(16)
+    broadcast_bytes(clients, frame_bytes)
 }
 
 /// daemon → client の writer pump (= per-thread)。
 ///
-/// `rx` から `Vec<u8>` を受け取って socket に write_all。送信失敗で thread 終了。
-fn writer_pump(rx: std::sync::mpsc::Receiver<Vec<u8>>, mut sock: UnixStream) {
+/// `rx` から `Vec<u8>` を受け取って socket に write_all、送信完了で
+/// `queued_bytes` から減算する (= Phase 12 byte bound 厳密化)。送信失敗で thread 終了。
+fn writer_pump(
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    mut sock: UnixStream,
+    queued_bytes: Arc<AtomicUsize>,
+) {
     while let Ok(bytes) = rx.recv() {
+        let size = bytes.len();
         if std::io::Write::write_all(&mut sock, &bytes).is_err() {
             // client が close した。recv ループ抜けて thread 終了。
             return;
         }
+        queued_bytes.fetch_sub(size, Ordering::AcqRel);
     }
 }
 
@@ -813,7 +893,6 @@ fn serve_loop(
     clients: &mut Vec<ClientHandle>,
     next_client_id: &mut u64,
     config: &DaemonConfig,
-    client_buffer_cap: usize,
     state: &mut SessionState,
     scrollback: &mut Scrollback,
     pending_waits: &mut Vec<PendingWait>,
@@ -828,6 +907,9 @@ fn serve_loop(
         for ch in clients.iter() {
             poll_fds.push(PollFd::new(ch.reader.as_fd(), PollFlags::POLLIN));
         }
+
+        // backpressure overflow / writer dead で disconnect が必要な client_id を集める
+        let mut overflow_ids: Vec<u64> = Vec::new();
 
         let poll_timeout = compute_wait_poll_timeout(pending_waits);
         match poll(&mut poll_fds, poll_timeout) {
@@ -852,13 +934,7 @@ fn serve_loop(
 
         // 1. listener: 新規 client accept
         if listener_revents.contains(PollFlags::POLLIN) {
-            match accept_new_client(
-                listener,
-                config,
-                *next_client_id,
-                client_buffer_cap,
-                clients,
-            ) {
+            match accept_new_client(listener, config, *next_client_id, clients) {
                 Ok(accepted) => {
                     *next_client_id += 1;
                     let new_id = accepted.handle.id;
@@ -878,12 +954,12 @@ fn serve_loop(
                     if became_leader {
                         // 他 client に新 leader を通知 (= 新 client 自身は handshake.response
                         // で leader=true を受け取り済みだが、broadcast でも届く)
-                        broadcast_control(
+                        overflow_ids.extend(broadcast_control(
                             clients,
                             &ControlMessage::LeaderNotify(LeaderNotify {
                                 client_id: Some(new_id),
                             }),
-                        );
+                        ));
                     }
                 }
                 Err(_) => {
@@ -909,7 +985,7 @@ fn serve_loop(
                     // scrollback に push してから broadcast (subscription 種類で encoding 分岐)
                     let now = Instant::now();
                     scrollback.push(now, buf[..n].to_vec());
-                    broadcast_master_bytes(clients, &buf[..n], now);
+                    overflow_ids.extend(broadcast_master_bytes(clients, &buf[..n], now));
                     // pending waits に新規 bytes を流し込み、match 確認
                     update_waits_on_master_bytes(pending_waits, clients, &buf[..n], now);
                 }
@@ -943,6 +1019,12 @@ fn serve_loop(
         }
 
         let mut indices_to_drop: Vec<usize> = Vec::new();
+        // backpressure overflow / writer dead で集まった client_id → indices に変換
+        for id in overflow_ids.drain(..) {
+            if let Some(i) = clients.iter().position(|c| c.id == id) {
+                indices_to_drop.push(i);
+            }
+        }
         let mut should_return: Option<RelayOutcome> = None;
         for (idx, fre) in frames_to_process {
             if should_return.is_some() {
@@ -992,6 +1074,9 @@ fn serve_loop(
             // pending waits も remove (= client が消えたら wait は cancel 同等)
             pending_waits.retain(|w| w.client_id != ch.id);
             drop(ch.writer_tx);
+            // backpressure 超過時の writer_pump は write_all で block 中の可能性が
+            // あるため、socket shutdown で write_all を即 error 化する
+            let _ = ch.reader.shutdown(std::net::Shutdown::Both);
             if let Some(t) = ch.writer_thread {
                 let _ = t.join();
             }
@@ -1050,7 +1135,6 @@ fn accept_new_client(
     listener: &UnixSock,
     config: &DaemonConfig,
     client_id: u64,
-    client_buffer_cap: usize,
     clients: &[ClientHandle],
 ) -> Result<AcceptedClient, Error> {
     let fd: OwnedFd = listener.accept()?;
@@ -1091,9 +1175,13 @@ fn accept_new_client(
         .encode_to(&mut writer_main)
         .map_err(|_| Error::Invalid("handshake.response frame encode failed"))?;
 
-    // writer thread を立ち上げ、broadcast 用 mpsc を作る
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(client_buffer_cap);
-    let writer_thread = std::thread::spawn(move || writer_pump(rx, writer_main));
+    // writer thread を立ち上げ、broadcast 用 unbounded mpsc + atomic byte counter を作る。
+    // queue capacity は byte 単位の `enqueue_for_client` で厳密に enforce する。
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    let queued_bytes_for_pump = Arc::clone(&queued_bytes);
+    let writer_thread =
+        std::thread::spawn(move || writer_pump(rx, writer_main, queued_bytes_for_pump));
 
     Ok(AcceptedClient {
         handle: ClientHandle {
@@ -1102,6 +1190,8 @@ fn accept_new_client(
             leader: became_leader,
             subscription: Subscription::Raw,
             writer_tx: tx,
+            queued_bytes,
+            buffer_limit: config.client_buffer_bytes,
             writer_thread: Some(writer_thread),
             reader,
         },
@@ -1109,27 +1199,25 @@ fn accept_new_client(
     })
 }
 
-/// `Frame` の encode 済 bytes を全 client に enqueue。bounded queue 超過した
-/// client は disconnect 対象として後段で remove する (= DR-0008 §8.2)。
-fn broadcast_bytes(clients: &mut [ClientHandle], bytes: Vec<u8>) {
-    let mut to_drop: Vec<usize> = Vec::new();
-    for (idx, ch) in clients.iter().enumerate() {
-        // 1 回目 clone を避けるため、最後の client は move、それ以外は clone。
-        // ただし途中で fail することも考慮し、シンプルに毎回 clone。
-        match ch.writer_tx.try_send(bytes.clone()) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                to_drop.push(idx);
+/// `Frame` の encode 済 bytes を全 client に enqueue。
+///
+/// 戻り値: backpressure overflow / writer dead で disconnect すべき client の
+/// `client_id` 一覧 (Phase 12)。
+fn broadcast_bytes(clients: &mut [ClientHandle], bytes: Vec<u8>) -> Vec<u64> {
+    let mut overflow_ids: Vec<u64> = Vec::new();
+    for ch in clients.iter() {
+        match enqueue_for_client(ch, bytes.clone()) {
+            EnqueueOutcome::Sent => {}
+            EnqueueOutcome::Overflow => {
+                send_backpressure_error(ch, ch.queued_bytes.load(Ordering::Acquire));
+                overflow_ids.push(ch.id);
+            }
+            EnqueueOutcome::WriterDead => {
+                overflow_ids.push(ch.id);
             }
         }
     }
-    // mark for drop (= caller 側の loop で消す形にしたいが、ここでは simple に
-    // 逆順 remove)。clients を直接 mut で touch するため、ここでは drop しない。
-    // この関数のシグネチャを &mut [ClientHandle] でなく &mut Vec<ClientHandle>
-    // にすると remove できるが、loop の構造を簡素に保つため呼び出し側で扱う方が
-    // 綺麗。MVP では到達できない上限 (= 8 MiB) なので一旦 silently skip にする。
-    // → 将来 backpressure を厳密化するときに mark/remove を実装。
-    let _ = to_drop;
+    overflow_ids
 }
 
 /// 1 client から受け取った frame の処理結果。
@@ -2818,5 +2906,132 @@ mod tests {
         .expect("send");
         s1.flush().expect("flush");
         let _ = handle.join().expect("daemon thread");
+    }
+
+    // ---- Phase 12: byte bound backpressure ----
+
+    /// Phase 12: client_buffer_bytes を超過すると当該 client は backpressure.disconnect
+    /// で切断され、socket は close される。他の client は影響を受けず通常動作。
+    #[test]
+    fn serve_backpressure_disconnects_slow_client() {
+        // yes(1) は "y\n" を fast loop で出力 → 子 PTY master に大量の bytes が積まれる
+        let yes_path = if std::path::Path::new("/usr/bin/yes").exists() {
+            "/usr/bin/yes"
+        } else {
+            "/bin/yes"
+        };
+        let dir = make_temp_socket_dir();
+        let sock_path = dir.path().join("test.sock");
+        let mut cfg = DaemonConfig::new("demo", sock_path.clone(), vec![yes_path.into()]);
+        cfg.client_buffer_bytes = 4096; // 小さくして即超過させる
+        let session = Session::start(cfg).expect("start");
+        let handle = std::thread::spawn(move || session.serve());
+
+        // client 1: rw、handshake のみ。socket を読まずに放置 → backpressure 対象
+        let mut slow = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut slow);
+        // handshake response 直後の leader.notify 1 つだけ読んで、その後は何も読まない
+        let _ = Frame::decode_from(&mut slow).expect("slow leader.notify");
+
+        // client 2: rw、こちらも attach するが「ちゃんと recv する側」として機能
+        // させたい。試験安定化のためここでも何も読まない (= daemon は data を broadcast
+        // し、slow が overflow したら disconnect する)。
+        // 注: 本 test では `他 client が動き続けること` までは検証せず、`slow が
+        // 切断されること` だけ確認する。
+
+        // 子 yes の出力が daemon の broadcast loop を経て slow の writer queue に
+        // 積まれる。slow が socket を読まないと OS socket buffer (~64 KiB) が埋まる
+        // → writer_pump が write_all で block → queued_bytes 増加 → buffer_limit
+        // (4096 byte) 超過 → daemon が slow を切る (shutdown Both)。
+        // よってここでは「しばらく読まずに放置」してから socket を drain、最後に EOF。
+        // しばらく放置 → daemon が backpressure 検知して shutdown するはず
+        std::thread::sleep(Duration::from_secs(1));
+
+        // socket を nonblocking にして drain。EOF (= read returns 0) を待つ。
+        slow.set_nonblocking(true).expect("set_nonblocking");
+        let mut tmpbuf = [0u8; 8192];
+        let mut total_read = 0usize;
+        let mut eof_detected = false;
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(10) {
+            match std::io::Read::read(&mut slow, &mut tmpbuf) {
+                Ok(0) => {
+                    eof_detected = true;
+                    break;
+                }
+                Ok(n) => {
+                    total_read += n;
+                    if total_read > 1024 * 1024 {
+                        panic!("slow client received >1 MiB; backpressure didn't kick in");
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // まだ shutdown されていない → 少し待って再試行
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => {
+                    eof_detected = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            eof_detected,
+            "slow client should be disconnected (EOF on read); total_read = {total_read}"
+        );
+
+        // cleanup: daemon は yes 子を抱えたまま slow disconnect 後も alive のはず
+        // (= 子 PTY 出力は scrollback に積まれるだけ)。kill 子で daemon 終了。
+        let _ = nix::sys::signal::kill(
+            // yes child is still running; we have no direct PID, rely on daemon kill
+            nix::unistd::Pid::from_raw(-1),
+            None,
+        );
+        // 別 client で kill を送れば確実
+        let mut k = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut k);
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut k)
+        .expect("send kill");
+        k.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    #[test]
+    fn enqueue_for_client_respects_buffer_limit() {
+        // 単体 unit test: queued_bytes が buffer_limit を超えるなら Overflow
+        let (tx, _rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        // ダミー UnixStream 作って ClientHandle を構築
+        let (a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let _keep = a; // close 防止用
+        let ch = ClientHandle {
+            id: 0,
+            mode: Mode::Rw,
+            leader: true,
+            subscription: Subscription::Raw,
+            writer_tx: tx,
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            buffer_limit: 100,
+            writer_thread: None,
+            reader: b,
+        };
+
+        // 50 byte → OK、累計 50
+        assert_eq!(enqueue_for_client(&ch, vec![0u8; 50]), EnqueueOutcome::Sent);
+        assert_eq!(ch.queued_bytes.load(Ordering::Acquire), 50);
+        // 50 byte → 累計 100、まだ OK (= 100 <= 100)
+        assert_eq!(enqueue_for_client(&ch, vec![0u8; 50]), EnqueueOutcome::Sent);
+        assert_eq!(ch.queued_bytes.load(Ordering::Acquire), 100);
+        // 1 byte → 累計 101 > 100、Overflow
+        assert_eq!(
+            enqueue_for_client(&ch, vec![0u8; 1]),
+            EnqueueOutcome::Overflow
+        );
+        // queued_bytes は変化なし (= Overflow 時は加算前に reject)
+        assert_eq!(ch.queued_bytes.load(Ordering::Acquire), 100);
     }
 }
