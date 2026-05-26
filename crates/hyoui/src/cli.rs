@@ -632,43 +632,230 @@ fn parse_wait_predicate(s: &str) -> Result<Option<WaitCliPredicate>, String> {
     Ok(None)
 }
 
-/// 期間文字列を ms に変換する。
+/// 期間文字列を ms に変換する (kawaz/timespec.mbt の duration parser を参考)。
 ///
-/// 受理する形式:
-/// - `500ms` / `2s` / `1m` (= 単位必須が推奨形)
-/// - `0` (= ゼロは bare で OK、両単位とも 0 で同じ)
+/// ## 文法
 ///
-/// **bare 数値 (= 単位なし) は error**。旧版は ms 扱いだったが `run --timeout`
-/// (= 秒扱い) との非対称が UX 罠だったため、新規 CLI (= `wait` / `tail`) では
-/// 単位必須にした (= レビュー指摘 A9)。
+/// ```text
+/// duration := SP? component (SP? sign SP? component)* SP?
+/// component := digits ('.' digits)? SP? unit
+/// digits := DIGIT (DIGIT | '_')*
+/// sign := '+' | '-'
+/// unit := short_unit | long_unit
+/// short_unit := "ms" | "s" | "m" | "h" | "d" | "w"
+/// long_unit := "millisecond"|"milliseconds" | "second"|"seconds"|"sec"
+///            | "minute"|"minutes"|"min" | "hour"|"hours"
+///            | "day"|"days" | "week"|"weeks"
+/// ```
+///
+/// ## 仕様
+///
+/// - **単位必須**: bare 数字 / 空文字列は error
+/// - **decimal 対応**: `1.5h` = 90 分
+/// - **underscore separator**: `1_000.5s` = 1000.5 秒 (= 1_000_500 ms)
+/// - **連結加算**: `1h30m` = 1 時間 + 30 分。同 group 内 segment は加算
+/// - **符号付き group**: `1d-4h` = 1 日 group - 4 時間 group = 20 時間
+/// - **whitespace tolerant**: `1 h 2 m` / `1h 2m` も accept
+/// - **ns / us / μs は reject** (= sub-ms 精度は ms 単位 timer 用途で意味なし)
+/// - **`y` / `M` (年 / 月) は reject** (= 単位固定でないため)
+/// - **最終 total が負なら error** (= hyoui の duration は正値前提)
 fn parse_duration_ms(s: &str) -> Result<u64, String> {
+    let total_ms = parse_duration_ms_signed(s)?;
+    if total_ms < 0 {
+        return Err(format!(
+            "duration resolved to negative value ({total_ms}ms) in {s:?}"
+        ));
+    }
+    Ok(total_ms as u64)
+}
+
+/// 符号付き ms を返す internal helper (= negative 許容版)。
+fn parse_duration_ms_signed(s: &str) -> Result<i64, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty duration".into());
     }
-    if let Some(num) = s.strip_suffix("ms") {
-        return num
-            .parse::<u64>()
-            .map_err(|_| format!("bad ms value: {num}"));
+    let chars: Vec<char> = s.chars().collect();
+    let mut pos = 0usize;
+
+    let mut total_ms: i64 = 0;
+    let mut group_ms: i64 = 0;
+    let mut group_sign: i64 = 1;
+    let mut parsed_any = false;
+
+    while pos < chars.len() {
+        pos = skip_spaces(&chars, pos);
+        if pos >= chars.len() {
+            break;
+        }
+        // group 区切り符号
+        let mut new_group = false;
+        match chars[pos] {
+            '+' => {
+                total_ms = total_ms
+                    .checked_add(group_sign.checked_mul(group_ms).ok_or("overflow")?)
+                    .ok_or("overflow")?;
+                group_ms = 0;
+                group_sign = 1;
+                pos += 1;
+                new_group = true;
+            }
+            '-' => {
+                total_ms = total_ms
+                    .checked_add(group_sign.checked_mul(group_ms).ok_or("overflow")?)
+                    .ok_or("overflow")?;
+                group_ms = 0;
+                group_sign = -1;
+                pos += 1;
+                new_group = true;
+            }
+            _ => {}
+        }
+        pos = skip_spaces(&chars, pos);
+        // 符号の後ろに digit が無いと invalid (例: `1m-` / `1m+`)
+        if pos >= chars.len() {
+            if new_group {
+                return Err(format!("trailing sign without component in {s:?}"));
+            }
+            break;
+        }
+        if !chars[pos].is_ascii_digit() {
+            if new_group {
+                return Err(format!(
+                    "expected digit after sign at position {pos} in {s:?}"
+                ));
+            }
+            break;
+        }
+
+        let (int_part, frac_part, new_pos) = parse_number(&chars, pos)?;
+        pos = skip_spaces(&chars, new_pos);
+        let (ms_mul, unit_end) = parse_unit(&chars, pos)?;
+        if unit_end == pos {
+            return Err(format!("missing unit after number in {s:?}"));
+        }
+        pos = unit_end;
+
+        let mut seg_ms = int_part
+            .checked_mul(ms_mul)
+            .ok_or("duration component overflow")?;
+        if frac_part > 0.0 {
+            let frac_ms = (frac_part * ms_mul as f64) as i64;
+            seg_ms = seg_ms.checked_add(frac_ms).ok_or("frac overflow")?;
+        }
+        group_ms = group_ms.checked_add(seg_ms).ok_or("group accum overflow")?;
+        parsed_any = true;
     }
-    if let Some(num) = s.strip_suffix('s') {
-        let n = num
-            .parse::<u64>()
-            .map_err(|_| format!("bad s value: {num}"))?;
-        return Ok(n.saturating_mul(1_000));
+    if !parsed_any {
+        return Err(format!("no duration segments parsed from {s:?}"));
     }
-    if let Some(num) = s.strip_suffix('m') {
-        let n = num
-            .parse::<u64>()
-            .map_err(|_| format!("bad m value: {num}"))?;
-        return Ok(n.saturating_mul(60_000));
+    total_ms = total_ms
+        .checked_add(group_sign.checked_mul(group_ms).ok_or("overflow")?)
+        .ok_or("overflow")?;
+    Ok(total_ms)
+}
+
+fn skip_spaces(chars: &[char], start: usize) -> usize {
+    let mut pos = start;
+    while pos < chars.len() && (chars[pos] == ' ' || chars[pos] == '\t') {
+        pos += 1;
     }
-    if s == "0" {
-        return Ok(0);
+    pos
+}
+
+/// `123.456` / `1_000_000.5_0` 形式の数値を読む。
+/// underscore は許容、segment 間で位置を進める。
+fn parse_number(chars: &[char], start: usize) -> Result<(i64, f64, usize), String> {
+    let mut pos = start;
+    let mut int_part: i64 = 0;
+    let mut has_int_digit = false;
+    while pos < chars.len() {
+        let c = chars[pos];
+        if c == '_' {
+            pos += 1;
+            continue;
+        }
+        if let Some(d) = c.to_digit(10) {
+            int_part = int_part
+                .checked_mul(10)
+                .and_then(|v| v.checked_add(d as i64))
+                .ok_or("integer part overflow")?;
+            has_int_digit = true;
+            pos += 1;
+        } else {
+            break;
+        }
     }
-    Err(format!(
-        "duration unit required (ms/s/m): {s} (例: 500ms, 2s, 1m)"
-    ))
+    if !has_int_digit {
+        return Err("expected digit".into());
+    }
+    let mut frac: f64 = 0.0;
+    if pos < chars.len() && chars[pos] == '.' {
+        pos += 1;
+        let mut frac_digits = 0;
+        while pos < chars.len() {
+            let c = chars[pos];
+            if c == '_' {
+                pos += 1;
+                continue;
+            }
+            if let Some(d) = c.to_digit(10) {
+                frac = frac * 10.0 + (d as f64);
+                frac_digits += 1;
+                pos += 1;
+            } else {
+                break;
+            }
+        }
+        let mut scale = 1.0;
+        for _ in 0..frac_digits {
+            scale *= 10.0;
+        }
+        frac /= scale;
+    }
+    Ok((int_part, frac, pos))
+}
+
+/// `parse_unit` は (ms_multiplier, end_pos) を返す。未知単位 / 拒否単位は Err。
+fn parse_unit(chars: &[char], start: usize) -> Result<(i64, usize), String> {
+    if start >= chars.len() {
+        return Err("missing unit".into());
+    }
+    // 末尾の `s` 複数形があるので、まず word を読み取って lookup する方が簡素
+    let mut end = start;
+    while end < chars.len() && (chars[end].is_ascii_alphabetic() || chars[end] == 'μ') {
+        end += 1;
+    }
+    if end == start {
+        return Ok((0, start)); // no unit chars
+    }
+    let word: String = chars[start..end].iter().collect();
+    let ms = match word.as_str() {
+        // ms
+        "ms" | "millisecond" | "milliseconds" => 1i64,
+        // s
+        "s" | "sec" | "second" | "seconds" => 1_000,
+        // m
+        "m" | "min" | "minute" | "minutes" => 60_000,
+        // h
+        "h" | "hour" | "hours" => 3_600_000,
+        // d
+        "d" | "day" | "days" => 86_400_000,
+        // w
+        "w" | "week" | "weeks" => 604_800_000,
+        // explicit rejects: sub-ms
+        "ns" | "us" | "μs" => {
+            return Err(format!("sub-millisecond unit {word:?} not supported"));
+        }
+        // explicit rejects: 年/月 (= 単位固定でない)
+        "y" | "year" | "years" | "M" | "month" | "months" => {
+            return Err(format!(
+                "calendar unit {word:?} not supported (lengths vary)"
+            ));
+        }
+        _ => return Err(format!("unknown unit {word:?}")),
+    };
+    Ok((ms, end))
 }
 
 fn parse_attach(args: &[String]) -> Command {
@@ -866,16 +1053,16 @@ fn parse_run(args: &[String]) -> Command {
                 None => return Command::Error("--rows requires a value".into()),
             },
             "--timeout" => match value.as_deref() {
-                Some(v) => match parse_seconds_ms(v) {
-                    Some(ms) => timeout_ms = Some(ms),
-                    None => return Command::Error(format!("invalid --timeout value: {v}")),
+                Some(v) => match parse_duration_ms(v) {
+                    Ok(ms) => timeout_ms = Some(ms as i64),
+                    Err(e) => return Command::Error(format!("--timeout: {e}")),
                 },
                 None => return Command::Error("--timeout requires a value".into()),
             },
             "--idle-timeout" => match value.as_deref() {
-                Some(v) => match parse_seconds_ms(v) {
-                    Some(ms) => idle_timeout_ms = Some(ms),
-                    None => return Command::Error(format!("invalid --idle-timeout value: {v}")),
+                Some(v) => match parse_duration_ms(v) {
+                    Ok(ms) => idle_timeout_ms = Some(ms as i64),
+                    Err(e) => return Command::Error(format!("--idle-timeout: {e}")),
                 },
                 None => return Command::Error("--idle-timeout requires a value".into()),
             },
@@ -1029,8 +1216,8 @@ fn usage_run() -> String {
             --size COLSxROWS              Virtual screen size, e.g. 80x24 (headless)\n    \
             --cols N                      Virtual screen columns (headless)\n    \
             --rows M                      Virtual screen rows (headless)\n    \
-            --timeout SEC                 Overall timeout in seconds\n    \
-            --idle-timeout SEC            Output idle timeout in seconds\n    \
+            --timeout DUR                 Overall timeout (e.g. 30s, 1m, 2h)\n    \
+            --idle-timeout DUR            Output idle timeout (e.g. 500ms, 5s)\n    \
             --until PATTERN               Terminate when PATTERN appears in output\n    \
             --socket PATH                 Unix socket path for input injection\n    \
             --on-child-suspend=follow|auto-resume\n                                  \
@@ -1138,9 +1325,12 @@ fn usage_tail() -> String {
             --last-bytes N       末尾 N bytes に絞る\n    \
             -h, --help           Show this help and exit\n\
         \n\
-        DURATION FORMAT:\n    \
-            500ms / 2s / 1m のいずれか。bare 数字 (= 単位なし) は **error**。\n    \
-            run --timeout (= 秒扱い) との非対称を避けるため統一していない。\n\
+        DURATION FORMAT (kawaz/timespec.mbt 互換):\n    \
+            単位: ms / s / m / h / d / w (短形)、または millisecond(s) /\n    \
+            second(s) / sec / minute(s) / min / hour(s) / day(s) / week(s) (長形)。\n    \
+            decimal: 1.5h, underscore: 1_000ms, 連結: 1h30m, 加減: 1d-4h。\n    \
+            bare 数字 (= 単位なし) は **error**。年 (y) / 月 (M) / sub-ms\n    \
+            (ns/us/μs) は対応せず。\n\
         \n\
         EXIT CODE:\n    \
             0   正常終了 (= TailEnd 受信 or socket close)\n    \
@@ -1179,8 +1369,10 @@ fn usage_wait() -> String {
             --newline-convert-lf  CRLF → LF 正規化\n    \
             -h, --help            Show this help and exit\n\
         \n\
-        DURATION FORMAT:\n    \
-            500ms / 2s / 1m のいずれか。bare 数字は **error**。\n\
+        DURATION FORMAT (kawaz/timespec.mbt 互換):\n    \
+            短形 ms/s/m/h/d/w または長形 second(s) / minute(s) / hour(s) / day(s) /\n    \
+            week(s)。decimal (1.5h)、underscore (1_000ms)、連結 (1h30m)、加減 (1d-4h)。\n    \
+            bare 数字 / 年 (y) / 月 (M) / sub-ms (ns/us/μs) は **error**。\n\
         \n\
         EXIT CODE:\n    \
             0   Matched\n    \
@@ -1209,48 +1401,6 @@ fn usage_completion() -> String {
 // =============================================================================
 // Parsing helpers (mirror the bootstrap MoonBit implementation)
 // =============================================================================
-
-/// Parse a seconds string (integer or decimal) into milliseconds.
-/// Returns `None` on invalid input.
-fn parse_seconds_ms(s: &str) -> Option<i64> {
-    if s.is_empty() {
-        return None;
-    }
-    let mut int_part: i64 = 0;
-    let mut frac_part: i64 = 0;
-    let mut frac_digits = 0;
-    let mut seen_dot = false;
-    let mut any_digit = false;
-    for ch in s.chars() {
-        if ch == '.' {
-            if seen_dot {
-                return None;
-            }
-            seen_dot = true;
-        } else if ch.is_ascii_digit() {
-            any_digit = true;
-            let d = (ch as i64) - ('0' as i64);
-            if !seen_dot {
-                int_part = int_part * 10 + d;
-            } else if frac_digits < 3 {
-                frac_part = frac_part * 10 + d;
-                frac_digits += 1;
-            }
-            // extra fractional digits beyond millisecond precision are dropped
-        } else {
-            return None;
-        }
-    }
-    if !any_digit {
-        return None;
-    }
-    // scale frac_part up to exactly 3 digits (milliseconds)
-    while frac_digits < 3 {
-        frac_part *= 10;
-        frac_digits += 1;
-    }
-    Some(int_part * 1000 + frac_part)
-}
 
 /// Parse a non-negative integer string. Returns `None` on invalid input.
 fn parse_int(s: &str) -> Option<i32> {
@@ -1429,18 +1579,26 @@ mod tests {
     }
 
     #[test]
-    fn run_timeout_integer_seconds() {
-        match parse_args(&args(&["run", "--timeout", "5", "--", "sleep", "10"])) {
+    fn run_timeout_with_unit() {
+        match parse_args(&args(&["run", "--timeout", "5s", "--", "sleep", "10"])) {
             Command::Run(cfg) => assert_eq!(cfg.timeout_ms, Some(5000)),
             other => panic!("expected Run, got {other:?}"),
         }
     }
 
     #[test]
-    fn run_timeout_decimal_seconds() {
-        match parse_args(&args(&["run", "--timeout", "1.5", "--", "sleep", "10"])) {
-            Command::Run(cfg) => assert_eq!(cfg.timeout_ms, Some(1500)),
+    fn run_timeout_concatenated_units() {
+        match parse_args(&args(&["run", "--timeout", "1m30s", "--", "sleep", "200"])) {
+            Command::Run(cfg) => assert_eq!(cfg.timeout_ms, Some(90_000)),
             other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_timeout_bare_number_is_error() {
+        match parse_args(&args(&["run", "--timeout", "5", "--", "sleep", "10"])) {
+            Command::Error(_) => {}
+            other => panic!("expected Error (bare numbers not allowed), got {other:?}"),
         }
     }
 
@@ -1448,7 +1606,7 @@ mod tests {
     fn run_idle_timeout_and_until() {
         match parse_args(&args(&[
             "run",
-            "--idle-timeout=2",
+            "--idle-timeout=2s",
             "--until",
             "DONE",
             "--",
@@ -1507,16 +1665,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_seconds_ms_edge_cases() {
-        assert_eq!(parse_seconds_ms("0"), Some(0));
-        assert_eq!(parse_seconds_ms("10"), Some(10000));
-        assert_eq!(parse_seconds_ms("0.001"), Some(1));
-        assert_eq!(parse_seconds_ms("2.5"), Some(2500));
-        assert_eq!(parse_seconds_ms(""), None);
-        assert_eq!(parse_seconds_ms("abc"), None);
-        assert_eq!(parse_seconds_ms("1.2.3"), None);
-    }
+    // parse_seconds_ms は撤去済 (= duration parser に統合)
 
     #[test]
     fn parse_size_edge_cases() {
@@ -1722,17 +1871,116 @@ mod tests {
     }
 
     #[test]
-    fn parse_duration_ms_requires_unit() {
+    fn parse_duration_ms_basic_units() {
         assert_eq!(parse_duration_ms("500ms"), Ok(500));
         assert_eq!(parse_duration_ms("2s"), Ok(2_000));
         assert_eq!(parse_duration_ms("1m"), Ok(60_000));
-        assert_eq!(parse_duration_ms("0"), Ok(0)); // bare 0 だけ許容
-        // bare 数字 (= 単位なし) は error (= レビュー指摘 A9)
+        assert_eq!(parse_duration_ms("3h"), Ok(3 * 3_600_000));
+        assert_eq!(parse_duration_ms("1d"), Ok(86_400_000));
+        assert_eq!(parse_duration_ms("1w"), Ok(7 * 86_400_000));
+    }
+
+    #[test]
+    fn parse_duration_ms_concatenation() {
+        // 1m5s200ms = 60000 + 5000 + 200 = 65200
+        assert_eq!(parse_duration_ms("1m5s200ms"), Ok(65_200));
+        // 1m1s = 61000
+        assert_eq!(parse_duration_ms("1m1s"), Ok(61_000));
+        // 1ms (= ms 単位、minute 1 + second ではない)
+        assert_eq!(parse_duration_ms("1ms"), Ok(1));
+    }
+
+    #[test]
+    fn parse_duration_ms_signed_arithmetic() {
+        // 1d-4h = 24h - 4h = 20h = 72_000_000
+        assert_eq!(parse_duration_ms("1d-4h"), Ok(20 * 3_600_000));
+        // 1d+4h = 28h
+        assert_eq!(parse_duration_ms("1d+4h"), Ok(28 * 3_600_000));
+        // 途中で負になっても最終が正なら OK
+        assert_eq!(
+            parse_duration_ms("2h-30m+15m"),
+            Ok((120 - 30 + 15) * 60_000)
+        );
+    }
+
+    #[test]
+    fn parse_duration_ms_sub_ms_units_rejected() {
+        // ns / us / μs は ms 単位 timer 用途で意味が無いため明示 reject
+        // (= kawaz/timespec.mbt の duration parser と同方針)
+        assert!(parse_duration_ms("999us").is_err());
+        assert!(parse_duration_ms("1500us").is_err());
+        assert!(parse_duration_ms("999999ns").is_err());
+        assert!(parse_duration_ms("2000μs").is_err());
+    }
+
+    #[test]
+    fn parse_duration_ms_long_unit_forms() {
+        assert_eq!(parse_duration_ms("3minutes"), Ok(180_000));
+        assert_eq!(parse_duration_ms("1hour"), Ok(3_600_000));
+        assert_eq!(parse_duration_ms("2days"), Ok(172_800_000));
+        assert_eq!(parse_duration_ms("1week"), Ok(604_800_000));
+        assert_eq!(parse_duration_ms("500milliseconds"), Ok(500));
+        assert_eq!(parse_duration_ms("30sec"), Ok(30_000));
+        assert_eq!(parse_duration_ms("5min"), Ok(300_000));
+    }
+
+    #[test]
+    fn parse_duration_ms_decimal_support() {
+        // timespec.mbt 仕様: 1.5h = 5400000ms
+        assert_eq!(parse_duration_ms("1.5h"), Ok(5_400_000));
+        assert_eq!(parse_duration_ms("3.5s"), Ok(3_500));
+        assert_eq!(parse_duration_ms("0.5m"), Ok(30_000));
+    }
+
+    #[test]
+    fn parse_duration_ms_underscore_separator() {
+        assert_eq!(parse_duration_ms("3_600_000ms"), Ok(3_600_000));
+        assert_eq!(parse_duration_ms("1_000s"), Ok(1_000_000));
+        assert_eq!(parse_duration_ms("1_000.5s"), Ok(1_000_500));
+        assert_eq!(parse_duration_ms("1_000.5_0s"), Ok(1_000_500));
+    }
+
+    #[test]
+    fn parse_duration_ms_whitespace_tolerant() {
+        assert_eq!(parse_duration_ms("1h 2m"), Ok(3_720_000));
+        assert_eq!(parse_duration_ms(" 1h 2m "), Ok(3_720_000));
+        assert_eq!(parse_duration_ms(" 1 h 2 m "), Ok(3_720_000));
+    }
+
+    #[test]
+    fn parse_duration_ms_duplicate_unit_merge() {
+        // 1h5m1h = (1+1)h + 5m = 2h5m = 7_500_000
+        assert_eq!(parse_duration_ms("1h5m1h"), Ok(7_500_000));
+    }
+
+    #[test]
+    fn parse_duration_ms_mixed_long_short() {
+        assert_eq!(parse_duration_ms("1hour 30m"), Ok(5_400_000));
+        assert_eq!(parse_duration_ms("2 days 5h"), Ok(190_800_000));
+    }
+
+    #[test]
+    fn parse_duration_ms_rejects_bare_number() {
+        assert!(parse_duration_ms("0").is_err());
         assert!(parse_duration_ms("500").is_err());
         assert!(parse_duration_ms("1000").is_err());
-        // 異常入力
+    }
+
+    #[test]
+    fn parse_duration_ms_rejects_invalid() {
         assert!(parse_duration_ms("").is_err());
         assert!(parse_duration_ms("xs").is_err());
+        assert!(parse_duration_ms("1y").is_err()); // y = year は不採用
+        assert!(parse_duration_ms("1M").is_err()); // M = month は不採用 (= 単位曖昧)
+        assert!(parse_duration_ms("ms").is_err()); // 数字なし
+        assert!(parse_duration_ms("1m-").is_err()); // 末尾 - 不完全
+    }
+
+    #[test]
+    fn parse_duration_ms_negative_total_rejected() {
+        // 最終 total が負なら error
+        assert!(parse_duration_ms("-1h").is_err());
+        assert!(parse_duration_ms("1h-2h").is_err());
     }
 
     #[test]
