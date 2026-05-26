@@ -162,6 +162,7 @@ name = "hyoui-cli"
 version = "0.0.0"
 dependencies = [
  "hyoui",
+ "nix",
  "tempfile",
 ]
 

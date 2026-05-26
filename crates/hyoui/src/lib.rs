@@ -41,9 +41,14 @@ pub mod protocol;
 
 // v0.1.0 daemon (DR-0008 §Consequences、DR-0007 MVP):
 //
-// 段階実装中 (Phase 6 = skeleton)。1 session = 子 PTY + Unix socket + scrollback +
-// attach clients の集合体。protocol module を frame レベルで使う。
+// 段階実装中。1 session = 子 PTY + Unix socket + scrollback + attach clients の
+// 集合体。protocol module を frame レベルで使う。
 pub mod daemon;
+
+// v0.1.0 client (= attach 側、DR-0006 §3):
+//
+// daemon と対称構造で stdin/stdout を中継。protocol module を frame レベルで使う。
+pub mod client;
 
 /// Library version (matches `Cargo.toml`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
