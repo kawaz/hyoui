@@ -583,6 +583,10 @@ commit `e39179f6` で D1-D8 + H1-H7 + L1-L6 全件解消済。詳細は jj log �
   - 完全解消 (2026-05-27): `usage_completion()` を list/kill と同じ pattern (USAGE / OPTIONS / SHELLS / EXAMPLES / RELATED 5 節構造) で再実装。help 配線そのものは parse_completion で既に HelpTopic::Completion ルーティング済
 - [done] **R5-FB7** v0.2.0 で `kill` subcommand 去就 (= 2026-05-27 kawaz 確認: アプリ固有問題は `input keys` で対応可、kill は v0.1.x 互換維持で v0.2.0 scope 7 個から除外、DR-0010 据え置き)
 - [done] **R5-FB8** leader 死亡時 socket 残骸 (= R5-H3 で list stale 検出 + --prune-stale 実装済、commit `beb7dd05`)
+- [ ] **R5-FB2b** `headless_stdin_eof_terminates_child_reading_bc` test を event-based に書き直し
+  - 出典: v0.1.12/v0.1.13 CI Linux で flaky (elapsed>10s)、production code 本体 (R5-FB2, commit `a574e792`) は OK、test 設計のみ問題
+  - 対処 (一時): `#[ignore]` で skip、v0.1.14 で CI green 化
+  - 恒久: daemon が ChildExited を broadcast したら client が即終了する経路を直接観測する event-based test に置換
 
 ### Headless Remote Control finding
 
