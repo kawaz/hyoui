@@ -32,6 +32,56 @@ mod completion;
 mod daemonize;
 mod socket_path;
 
+/// R5-FB4: socket connect の短時間 retry。
+///
+/// `hyoui run --detached -- <cmd> &` の直後に `hyoui wait <session>` を叩く
+/// pattern で、daemon の listener bind が間に合わずに ENOENT で即 fail する
+/// 現象が頻発していた (= 実機検証で kawaz 指摘)。
+///
+/// 同 process 内 (= `hyoui run` non-detached) の場合は `Session::start` で
+/// listen 完了を保証しているため retry 不要だが、別 process との競合では
+/// kernel listen が成立する瞬間まで待つ必要がある。
+///
+/// 戦略:
+/// - socket 不存在系の errno (ENOENT / ECONNREFUSED) のみ retry
+/// - 100ms × 20 attempts = 2s budget (= `hyoui run --detached` の典型起動時間
+///   100-500ms に対し十分なマージン)
+/// - 認証エラー (= AuthTokenMismatch 等) や protocol error は retry しない
+///   (= retry しても同じエラーで終わる、即 fail で hint を出す方が良い)
+fn connect_with_retry(
+    sock: &std::path::Path,
+    opts: AttachOptions,
+) -> Result<ClientConnection, hyoui::sys::Error> {
+    use hyoui::sys::Error;
+    use nix::errno::Errno;
+    const MAX_ATTEMPTS: u32 = 20;
+    const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+    let mut attempt = 0u32;
+    loop {
+        match ClientConnection::connect(sock, opts.clone()) {
+            Ok(c) => return Ok(c),
+            Err(e) => {
+                let retryable = match &e {
+                    Error::Errno(Errno::ENOENT) | Error::Errno(Errno::ECONNREFUSED) => true,
+                    // io::Error 経路 (= UnixStream::connect 由来) は kind() で判定。
+                    // sys::socket::connect は nix の Errno を返すので通常こちらには
+                    // 来ないが、defensive coding として両方を見る。
+                    Error::Io(io_err) => matches!(
+                        io_err.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ),
+                    _ => false,
+                };
+                attempt += 1;
+                if !retryable || attempt >= MAX_ATTEMPTS {
+                    return Err(e);
+                }
+                std::thread::sleep(RETRY_INTERVAL);
+            }
+        }
+    }
+}
+
 /// `connect 失敗` 系の error メッセージに next-action hint を足す共通 helper。
 ///
 /// R4-H2: 旧版は `hyoui: attach: connect 失敗: <io error>` だけで止まっていて
@@ -313,7 +363,9 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         detach_others: cfg.detach_others,
     };
 
-    let conn = match ClientConnection::connect(&sock, opts) {
+    // R5-FB4: socket 不存在系 errno は短時間 retry (= 別 process の daemon が
+    // listen するまでの window 対策)。詳細は `connect_with_retry` doc を参照。
+    let conn = match connect_with_retry(&sock, opts) {
         Ok(c) => c,
         Err(e) => {
             print_connect_failure("attach", &sock, &e);
@@ -513,7 +565,8 @@ fn kill_command(cfg: KillConfig) -> ExitCode {
         detach_others: false,
     };
 
-    let mut conn = match ClientConnection::connect(&sock, opts) {
+    // R5-FB4: socket 不存在系 errno は短時間 retry。
+    let mut conn = match connect_with_retry(&sock, opts) {
         Ok(c) => c,
         Err(e) => {
             print_connect_failure("kill", &sock, &e);
@@ -570,7 +623,8 @@ fn status_command(cfg: StatusConfig) -> ExitCode {
         mode: Mode::Ro,
         ..AttachOptions::default()
     };
-    let mut conn = match ClientConnection::connect(&sock, opts) {
+    // R5-FB4: socket 不存在系 errno は短時間 retry。
+    let mut conn = match connect_with_retry(&sock, opts) {
         Ok(c) => c,
         Err(e) => {
             print_connect_failure("status", &sock, &e);
@@ -702,7 +756,8 @@ fn tail_command(cfg: TailConfig) -> ExitCode {
         mode: Mode::Ro,
         ..AttachOptions::default()
     };
-    let mut conn = match ClientConnection::connect(&sock, opts) {
+    // R5-FB4: socket 不存在系 errno は短時間 retry。
+    let mut conn = match connect_with_retry(&sock, opts) {
         Ok(c) => c,
         Err(e) => {
             print_connect_failure("tail", &sock, &e);
@@ -793,7 +848,8 @@ fn wait_command(cfg: WaitConfig) -> ExitCode {
         mode: Mode::Ro,
         ..AttachOptions::default()
     };
-    let mut conn = match ClientConnection::connect(&sock, opts) {
+    // R5-FB4: socket 不存在系 errno は短時間 retry。
+    let mut conn = match connect_with_retry(&sock, opts) {
         Ok(c) => c,
         Err(e) => {
             print_connect_failure("wait", &sock, &e);
@@ -979,6 +1035,97 @@ mod tests {
         assert!(
             stale_path.exists(),
             "list without --prune-stale must not remove sockets"
+        );
+    }
+
+    /// R5-FB4: socket がまだ存在しない時点で connect_with_retry を呼んでも、
+    /// 別 thread で daemon が立ち上がるまで retry し、成功すること。
+    ///
+    /// `hyoui run --detached -- <cmd> &` の直後に `hyoui wait <session>` を
+    /// 叩く実機 pattern を模擬する。
+    #[test]
+    fn wait_retries_until_socket_appears() {
+        use hyoui::daemon::{DaemonConfig, Session};
+        use std::sync::{Arc, Barrier};
+        use std::time::Duration;
+
+        let sock_dir = make_0700_dir();
+        let sock_path = sock_dir.path().join("retry.sock");
+
+        // socket は最初存在しない (= ENOENT)。daemon thread を別途立ち上げる前に
+        // connect_with_retry を呼んで、retry 経路を実際に通すことを保証する。
+        assert!(
+            !sock_path.exists(),
+            "precondition: socket must not exist yet"
+        );
+
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_daemon = Arc::clone(&barrier);
+        let sock_for_daemon = sock_path.clone();
+        let daemon_handle = std::thread::spawn(move || {
+            // client が connect_with_retry の最初の attempt を済ませた後に
+            // daemon を立ち上げる (= retry path を確実に通すため)。
+            barrier_daemon.wait();
+            // 数 retry interval 分待ってから listener bind する (= ENOENT を
+            // 数回返してから socket を作る)
+            std::thread::sleep(Duration::from_millis(300));
+            let cfg = DaemonConfig::new(
+                "retry-test",
+                sock_for_daemon,
+                vec!["/bin/sleep".into(), "30".into()],
+            );
+            let session = Session::start(cfg).expect("daemon start");
+            session.serve()
+        });
+
+        barrier.wait();
+        let opts = AttachOptions {
+            mode: Mode::Ro,
+            ..AttachOptions::default()
+        };
+        let result = connect_with_retry(&sock_path, opts);
+        assert!(
+            result.is_ok(),
+            "connect_with_retry must succeed once daemon starts; got: {:?}",
+            result.err()
+        );
+        drop(result);
+
+        // daemon を kill して thread を終わらせる
+        let kill_opts = AttachOptions {
+            mode: Mode::Ro,
+            ..AttachOptions::default()
+        };
+        if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
+            let kill = hyoui::protocol::messages::Kill { signum: None };
+            let _ = conn.send_control(&ControlMessage::Kill(kill));
+            drop(conn);
+        }
+        let _ = daemon_handle.join();
+    }
+
+    /// R5-FB4: socket が永遠に作られない場合、retry 期限切れで Err 返却。
+    /// retry budget (= 約 2s) を超えたら諦めて caller に error を返す。
+    #[test]
+    fn connect_with_retry_gives_up_when_socket_never_appears() {
+        let sock_dir = make_0700_dir();
+        let sock_path = sock_dir.path().join("never.sock");
+        let start = std::time::Instant::now();
+        let opts = AttachOptions {
+            mode: Mode::Ro,
+            ..AttachOptions::default()
+        };
+        let result = connect_with_retry(&sock_path, opts);
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_err(),
+            "expected ENOENT to bubble up after retry budget"
+        );
+        // 20 attempts × 100ms ≈ 2s。short-circuit で 100ms 未満で fail したら
+        // retry 経路を通っていないことになるので fail させる。
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1500),
+            "retry budget should be ~2s, but failed in {elapsed:?}"
         );
     }
 }
