@@ -346,7 +346,18 @@ client は不足 capability を見て「未対応機能」とエラーを返せ�
   - `messages/handshake.rs`, `messages/data.rs`, `messages/lock.rs`, `messages/tail.rs`, `messages/wait.rs`, etc.
   - `transports/unix.rs` (MVP)、将来 `transports/tcp.rs`, `transports/websocket.rs`
 - 既存 `crates/hyoui/src/protocol.rs` (= 単純 length-prefixed) は本 DR の `Frame::decode` のベース、`messages/` で kind 毎の payload encode/decode を追加
+- **新 module**: `crates/hyoui/src/daemon/` (socket bind + multi-attach + 永続 PTY 管理)
+  - 既存 `crates/hyoui/src/agent.rs` (v0.0.0 の単純 PTY ラッパー、697 行) は意味的に別物 (daemon = socket bind + 永続、agent = 単発 fork + 中継) なので**廃止**
+  - ただし参考実装として残す価値はあるので `crates/hyoui/examples/00-pty-wrapper.rs` に移植 (依存を解消した standalone 版に書き換え)。PoC 01-08 と並ぶ「PoC 00」扱い
+  - `cli.rs::run` は新 daemon module を呼ぶ形に置換
 - daemon の event loop は Frame 単位で dispatch (= 既存 PoC 02 の bytes 中継から拡張)
+
+### Release タイミング (v0.0.x → v0.1.0)
+
+- **中間 v0.0.x release は打たない**。protocol module だけ release しても client/daemon が無く動作しないため
+- run / attach / detach / list / status / kill が全動作する状態で初めて **v0.1.0** を打つ (= DR-0007 の MVP scope と整合)
+- それまでは main は green を保ちつつ progress、tag は v0.1.0 まで打たない
+- release flow は kawaz/* 標準 (`pkf run bump-version --level=minor` → main push → CI が tag + GH Release 自動生成、`release-flow-awareness.md` 参照)
 
 ### テスト戦略
 
