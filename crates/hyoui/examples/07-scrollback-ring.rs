@@ -23,6 +23,7 @@ struct Scrollback {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // since_start は Debug 出力のみで参照、PoC のため意図的に保持
 struct BufferInsufficient {
     last_evicted_ts: Instant,
     since_start: Instant,
