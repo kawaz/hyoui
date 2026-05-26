@@ -195,6 +195,15 @@ protocol cap negotiation までが安定動作。
 - [`docs/journal/`](./docs/journal/) — 開発ジャーナル
 - [`docs/findings/`](./docs/findings/) — PoC 知見
 
+## 質問 / Issue
+
+- バグ・想定外挙動の報告:
+  [bug report テンプレート](./.github/ISSUE_TEMPLATE/bug_report.md) を使って issue 起票。
+- 機能要望:
+  [feature request テンプレート](./.github/ISSUE_TEMPLATE/feature_request.md) を使って issue 起票。
+- 純粋な質問・相談:
+  まず [Discussion](https://github.com/kawaz/hyoui/discussions) で。
+
 ## License
 
 MIT License — Yoshiaki Kawazu (@kawaz)

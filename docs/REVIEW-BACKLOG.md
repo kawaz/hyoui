@@ -392,9 +392,10 @@ Wild debugger / Competitive 分析 / Rust API 設計
   - 出典: Sales (R5-SAL-M1, R5-SAL-M2)
   - 提案: README L1 直下に CI status / latest release / MIT license / (将来) crates.io / Homebrew badge
   - 解消: README.md / README-ja.md の言語切替リンク直下に CI status / Release / MIT license の 3 badge を追加。crates.io / Homebrew は未公開なので将来追加 (R4 backlog item)。
-- [ ] **R5-M32** `.github/ISSUE_TEMPLATE/` 不在 = 困った時の聞き先不明
+- [done] **R5-M32** `.github/ISSUE_TEMPLATE/` 不在 = 困った時の聞き先不明
   - 出典: Sales (R5-SAL-M3)
   - 提案: bug_report.md + feature_request.md 最小追加、README に "Questions / Issues" セクション 1 行
+  - 解消: `.github/ISSUE_TEMPLATE/{bug_report.md,feature_request.md,config.yml}` を追加 (config.yml で Discussion に誘導)。README.md / README-ja.md に「Questions / Issues」セクションを追加。
 - [ ] **R5-M33** エンドユーザ向け MANUAL.md / MANUAL-ja.md 不在 = docs 棲み分け曖昧
   - 出典: Sales (R5-SAL-M4) / docs-structure.md 規約準拠
   - 提案: `docs/MANUAL{-ja}.md` 骨組み追加 (ユースケース recipe 集)、README/DESIGN との棲み分け明示。v0.2.0 API 完成時に本格化

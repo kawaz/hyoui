@@ -211,6 +211,15 @@ Roadmap details: [`docs/ROADMAP.md`](./docs/ROADMAP.md).
 - [`docs/journal/`](./docs/journal/) — Development journal
 - [`docs/findings/`](./docs/findings/) — PoC findings
 
+## Questions / Issues
+
+- Bug or unexpected behavior? File an issue with the
+  [bug report template](./.github/ISSUE_TEMPLATE/bug_report.md).
+- Want a feature or change? Use the
+  [feature request template](./.github/ISSUE_TEMPLATE/feature_request.md).
+- Just have a question? Open a
+  [Discussion](https://github.com/kawaz/hyoui/discussions) first.
+
 ## License
 
 MIT License — Yoshiaki Kawazu (@kawaz)

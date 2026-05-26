@@ -1,0 +1,7 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question / discussion
+    url: https://github.com/kawaz/hyoui/discussions
+    about: |
+      For general usage questions, design discussion, or "is this a bug
+      or a misconfiguration?" please start a discussion thread first.
