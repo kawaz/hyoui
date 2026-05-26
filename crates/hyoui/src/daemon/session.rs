@@ -20,6 +20,9 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
 use crate::Error;
+use crate::protocol::messages::{
+    ErrorMessage, LeaderNotify, LockResponse, LockResult, ModeChange, SessionMode,
+};
 use crate::protocol::{
     ControlMessage, Frame, FrameError, HandshakeResponse, MVP_CAPS, Mode, ProtocolError,
     TYPE_CBOR_CONTROL, TYPE_RAW_DATA, Transport, UnixStreamTransport, intersect_caps,
@@ -220,6 +223,7 @@ impl Session {
 
         let mut clients: Vec<ClientHandle> = Vec::new();
         let mut next_client_id: u64 = 0;
+        let mut state = SessionState::default();
         let outcome = serve_loop(
             &pty,
             child,
@@ -228,6 +232,7 @@ impl Session {
             &mut next_client_id,
             &config,
             client_buffer_cap,
+            &mut state,
         );
 
         // cleanup: 各 client の writer thread を terminate (= channel drop で recv 終わる)
@@ -248,7 +253,6 @@ impl Session {
 }
 
 /// 1 client の per-thread state (writer thread + bounded mpsc + reader handle)。
-#[allow(dead_code)] // id/mode/leader は Phase 10 (lock/leader cascade) で使う
 struct ClientHandle {
     id: u64,
     mode: Mode,
@@ -260,6 +264,124 @@ struct ClientHandle {
     writer_thread: Option<std::thread::JoinHandle<()>>,
     /// daemon が client → daemon を decode するときに使う socket reader。
     reader: UnixStream,
+}
+
+/// session 全体の状態 (Phase 10)。lock 周りの state machine を保持する。
+///
+/// 現状の field:
+/// - `lock_holder`: lock 保持中の client id (= `None` なら未 lock)
+/// - `lock_token`: 発行済 token (= `LockRelease` 検証用)
+///
+/// Wait queue は MVP では未実装 (`LockAcquire { wait: true, .. }` でも `Denied`
+/// を返す)。queue 実装は v0.2.0+ の Phase 12 で検討。
+#[derive(Debug, Default)]
+struct SessionState {
+    lock_holder: Option<u64>,
+    lock_token: Option<String>,
+}
+
+impl SessionState {
+    /// session 全体の SessionMode (= mode.change の `session_mode` 用)。
+    ///
+    /// MVP は「lock 中 = `Locked`、それ以外 = `Rw`」。`Ro` 強制 (= 誰も書けない)
+    /// は v0.2.0+ で `--read-only` daemon option 等を導入したときに使う。
+    fn session_mode(&self) -> SessionMode {
+        if self.lock_holder.is_some() {
+            SessionMode::Locked
+        } else {
+            SessionMode::Rw
+        }
+    }
+}
+
+/// 256-bit (32 hex char) の lock token を生成する。
+///
+/// 同 UID 信頼領域なので crypto 強度は厳格に必要ではないが、`/dev/urandom` を
+/// 使えば実質予測不能。読めない (= テスト環境等) 場合は timestamp + pid +
+/// counter を fallback として混ぜる。
+fn generate_lock_token() -> String {
+    use std::io::Read;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let mut buf = [0u8; 16];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut buf);
+    }
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let pid = std::process::id() as u64;
+    let extra = ts ^ pid ^ counter;
+    for (i, byte) in buf.iter_mut().enumerate().take(8) {
+        *byte ^= ((extra >> (56 - i * 8)) & 0xff) as u8;
+    }
+    let mut out = String::with_capacity(32);
+    for b in &buf {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// 新規 rw client が leader 取得すべきかを判定する (= 既存に leader が居ないか)。
+///
+/// `RwNoLeader` mode の client は leader 候補から除外 (= 明示的に leader を
+/// 取らない意思表示)。
+fn should_assign_leader(clients: &[ClientHandle], new_mode: Mode) -> bool {
+    matches!(new_mode, Mode::Rw) && !clients.iter().any(|c| c.leader)
+}
+
+/// leader が居ない状態 (= leader cascade 候補) のときに、次の `Mode::Rw` client を
+/// leader に昇格させる。成功すれば新 leader の id を返す。
+fn elevate_next_leader(clients: &mut [ClientHandle]) -> Option<u64> {
+    if clients.iter().any(|c| c.leader) {
+        return None;
+    }
+    for c in clients.iter_mut() {
+        if matches!(c.mode, Mode::Rw) {
+            c.leader = true;
+            return Some(c.id);
+        }
+    }
+    None
+}
+
+/// CBOR control message を 1 client にだけ送る (= bounded queue 経由)。
+///
+/// 送信失敗 (= queue 満杯 / writer thread 死亡) は `false` を返す。caller は
+/// 必要に応じて当該 client を drop 対象にできる。
+fn send_control(ch: &ClientHandle, msg: ControlMessage) -> bool {
+    let body = match msg.encode_to_vec() {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let mut frame_bytes = Vec::new();
+    if Frame::cbor_control(body)
+        .encode_to(&mut frame_bytes)
+        .is_err()
+    {
+        return false;
+    }
+    ch.writer_tx.try_send(frame_bytes).is_ok()
+}
+
+/// CBOR control message を全 client に broadcast。
+fn broadcast_control(clients: &mut [ClientHandle], msg: &ControlMessage) {
+    let body = match msg.encode_to_vec() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let mut frame_bytes = Vec::new();
+    if Frame::cbor_control(body)
+        .encode_to(&mut frame_bytes)
+        .is_err()
+    {
+        return;
+    }
+    broadcast_bytes(clients, frame_bytes);
 }
 
 /// 1 frame あたりの平均サイズを 4 KiB と仮定して、`client_buffer_bytes` を
@@ -294,6 +416,7 @@ fn serve_loop(
     next_client_id: &mut u64,
     config: &DaemonConfig,
     client_buffer_cap: usize,
+    state: &mut SessionState,
 ) -> RelayOutcome {
     loop {
         // poll fd 構築: listener + master + 各 client reader
@@ -324,10 +447,39 @@ fn serve_loop(
 
         // 1. listener: 新規 client accept
         if listener_revents.contains(PollFlags::POLLIN) {
-            match accept_new_client(listener, pty, config, *next_client_id, client_buffer_cap) {
-                Ok(ch) => {
+            match accept_new_client(
+                listener,
+                config,
+                *next_client_id,
+                client_buffer_cap,
+                clients,
+            ) {
+                Ok(accepted) => {
                     *next_client_id += 1;
-                    clients.push(ch);
+                    let new_id = accepted.handle.id;
+                    let became_leader = accepted.became_leader;
+                    let mode_change_for_locked = state.lock_holder.map(|holder| ModeChange {
+                        session_mode: SessionMode::Locked,
+                        lock_holder: Some(holder),
+                        client_mode: None,
+                    });
+                    let new_handle_writer_ref = &accepted.handle;
+                    if let Some(mc) = mode_change_for_locked.as_ref() {
+                        // accept した client に「現在 lock 中」を通知
+                        let _ =
+                            send_control(new_handle_writer_ref, ControlMessage::ModeChange(*mc));
+                    }
+                    clients.push(accepted.handle);
+                    if became_leader {
+                        // 他 client に新 leader を通知 (= 新 client 自身は handshake.response
+                        // で leader=true を受け取り済みだが、broadcast でも届く)
+                        broadcast_control(
+                            clients,
+                            &ControlMessage::LeaderNotify(LeaderNotify {
+                                client_id: Some(new_id),
+                            }),
+                        );
+                    }
                 }
                 Err(_) => {
                     // handshake 失敗等: 個別の client を弾くだけで loop 継続
@@ -372,13 +524,10 @@ fn serve_loop(
         }
 
         // 3. 各 client reader: decode frame → 処理
-        // 走査中に remove するので indices を逆順で。
-        let mut indices_to_drop: Vec<usize> = Vec::new();
-        let mut should_return: Option<RelayOutcome> = None;
+        // frame ハンドリングは state / 他 client への副作用 (= lock state 変化、
+        // broadcast 等) を持つため、まず frame を取り出してから処理する。
+        let mut frames_to_process: Vec<(usize, FrameOrError)> = Vec::new();
         for (idx, revents) in client_revents.iter().enumerate() {
-            if should_return.is_some() {
-                break;
-            }
             if !revents.contains(PollFlags::POLLIN)
                 && !revents.contains(PollFlags::POLLHUP)
                 && !revents.contains(PollFlags::POLLERR)
@@ -387,25 +536,75 @@ fn serve_loop(
             }
             let ch = &mut clients[idx];
             match Frame::decode_from(&mut ch.reader) {
-                Ok(frame) => match handle_client_frame(pty, child, ch, frame) {
-                    ClientFrameOutcome::Continue => {}
-                    ClientFrameOutcome::DropClient => indices_to_drop.push(idx),
-                    ClientFrameOutcome::TerminateSession(o) => should_return = Some(o),
-                },
-                Err(_) => {
+                Ok(frame) => frames_to_process.push((idx, FrameOrError::Frame(frame))),
+                Err(_) => frames_to_process.push((idx, FrameOrError::Error)),
+            }
+        }
+
+        let mut indices_to_drop: Vec<usize> = Vec::new();
+        let mut should_return: Option<RelayOutcome> = None;
+        for (idx, fre) in frames_to_process {
+            if should_return.is_some() {
+                break;
+            }
+            match fre {
+                FrameOrError::Frame(frame) => {
+                    match handle_client_frame(pty, child, idx, frame, clients, state) {
+                        ClientFrameOutcome::Continue => {}
+                        ClientFrameOutcome::DropClient => indices_to_drop.push(idx),
+                        ClientFrameOutcome::TerminateSession(o) => should_return = Some(o),
+                    }
+                }
+                FrameOrError::Error => {
                     // protocol error / EOF → 当該 client を切る
                     indices_to_drop.push(idx);
                 }
             }
         }
 
-        // drop 対象を逆順で remove
+        // drop 対象を逆順で remove (= leader cascade + lock auto-release 含む)
+        // 重複 index も発生しうるので dedup する
+        indices_to_drop.sort_unstable();
+        indices_to_drop.dedup();
+        let mut dropped_held_lock = false;
+        let mut dropped_any_leader = false;
         for idx in indices_to_drop.into_iter().rev() {
             let ch = clients.remove(idx);
+            if ch.leader {
+                dropped_any_leader = true;
+            }
+            if state.lock_holder == Some(ch.id) {
+                dropped_held_lock = true;
+                state.lock_holder = None;
+                state.lock_token = None;
+            }
             drop(ch.writer_tx);
             if let Some(t) = ch.writer_thread {
                 let _ = t.join();
             }
+        }
+
+        // leader cascade: leader が消えた場合、次の Rw client を昇格させる
+        if dropped_any_leader {
+            let new_leader = elevate_next_leader(clients);
+            broadcast_control(
+                clients,
+                &ControlMessage::LeaderNotify(LeaderNotify {
+                    client_id: new_leader,
+                }),
+            );
+        }
+
+        // lock 自動解放: lock holder が抜けた場合、session mode を Rw に戻す
+        if dropped_held_lock {
+            broadcast_control(
+                clients,
+                &ControlMessage::ModeChange(ModeChange {
+                    session_mode: state.session_mode(),
+                    lock_holder: None,
+                    client_mode: None,
+                }),
+            );
         }
 
         if let Some(o) = should_return {
@@ -414,14 +613,33 @@ fn serve_loop(
     }
 }
 
+/// `frames_to_process` 用の中間型 (= frame 取得成功 / 失敗を持ち回る)。
+enum FrameOrError {
+    Frame(Frame),
+    Error,
+}
+
+/// 新規 client の accept 結果。
+struct AcceptedClient {
+    handle: ClientHandle,
+    /// この client が leader として確定されたか (= Phase 10 leader assignment)。
+    became_leader: bool,
+}
+
 /// listener から 1 client を accept、handshake を完了して `ClientHandle` を作る。
+///
+/// Phase 10:
+/// - 既存 clients を見て leader 取得可否を判定 (= `should_assign_leader`)
+/// - session 中の lock 状態は handshake.response に乗らない (= schema 拡張なし)
+///   ので、accept 完了直後の caller 側で必要なら `mode.change` を当該 client に
+///   1 発送る (Phase 10 では caller が handle する)。
 fn accept_new_client(
     listener: &UnixSock,
-    _pty: &Pty,
     config: &DaemonConfig,
     client_id: u64,
     client_buffer_cap: usize,
-) -> Result<ClientHandle, Error> {
+    clients: &[ClientHandle],
+) -> Result<AcceptedClient, Error> {
     let fd: OwnedFd = listener.accept()?;
     let stream = unix_stream_from_owned_fd(fd);
     let transport = UnixStreamTransport::new(stream);
@@ -443,15 +661,13 @@ fn accept_new_client(
     let mvp: Vec<String> = MVP_CAPS.iter().map(|s| (*s).to_string()).collect();
     let intersect = intersect_caps(&req.caps, &mvp);
 
-    // leader: MVP は「rw mode かつ既存 leader がいない場合は取れる」。本関数は
-    // 既存 client 知識を持たないので、呼び出し側 (= serve_loop) が後で調整する。
-    let leader = matches!(req.mode, Mode::Rw);
+    let became_leader = should_assign_leader(clients, req.mode);
 
     let response = HandshakeResponse {
         caps: intersect,
         session_id: config.session_id.clone(),
         client_id,
-        leader,
+        leader: became_leader,
         mode: req.mode,
     };
 
@@ -466,13 +682,16 @@ fn accept_new_client(
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(client_buffer_cap);
     let writer_thread = std::thread::spawn(move || writer_pump(rx, writer_main));
 
-    Ok(ClientHandle {
-        id: client_id,
-        mode: req.mode,
-        leader,
-        writer_tx: tx,
-        writer_thread: Some(writer_thread),
-        reader,
+    Ok(AcceptedClient {
+        handle: ClientHandle {
+            id: client_id,
+            mode: req.mode,
+            leader: became_leader,
+            writer_tx: tx,
+            writer_thread: Some(writer_thread),
+            reader,
+        },
+        became_leader,
     })
 }
 
@@ -512,11 +731,26 @@ enum ClientFrameOutcome {
 fn handle_client_frame(
     pty: &Pty,
     child: Pid,
-    _ch: &mut ClientHandle,
+    idx: usize,
     frame: Frame,
+    clients: &mut [ClientHandle],
+    state: &mut SessionState,
 ) -> ClientFrameOutcome {
     match frame.ty {
         TYPE_RAW_DATA => {
+            let ch_id = clients[idx].id;
+            let ch_mode = clients[idx].mode;
+            // 書き込み authorization:
+            // - Ro mode は書けない (silently drop)
+            // - lock 中は lock holder のみ書ける (= 他 rw も silently drop)
+            if matches!(ch_mode, Mode::Ro) {
+                return ClientFrameOutcome::Continue;
+            }
+            if let Some(holder) = state.lock_holder {
+                if holder != ch_id {
+                    return ClientFrameOutcome::Continue;
+                }
+            }
             if pty.master_fd().write_all(&frame.body).is_err() {
                 return ClientFrameOutcome::DropClient;
             }
@@ -527,27 +761,120 @@ fn handle_client_frame(
                 Ok(m) => m,
                 Err(_) => return ClientFrameOutcome::Continue,
             };
-            match msg {
-                ControlMessage::Detach(_) => ClientFrameOutcome::DropClient,
-                ControlMessage::Kill(k) => {
-                    let signum = k.signum.unwrap_or(libc::SIGTERM as u8);
-                    let sig = Signal::try_from(signum as i32).unwrap_or(Signal::SIGTERM);
-                    let _ = kill(child, sig);
-                    ClientFrameOutcome::TerminateSession(RelayOutcome::ClientDetachedOrKilled)
-                }
-                ControlMessage::Signal(s) => {
-                    let sig = Signal::try_from(s.signum as i32).unwrap_or(Signal::SIGINT);
-                    let _ = kill(child, sig);
-                    ClientFrameOutcome::Continue
-                }
-                ControlMessage::Resize(r) => {
-                    let _ = pty.resize(r.cols, r.rows);
-                    ClientFrameOutcome::Continue
-                }
-                _ => ClientFrameOutcome::Continue,
-            }
+            handle_control_message(pty, child, idx, msg, clients, state)
         }
         _ => ClientFrameOutcome::DropClient,
+    }
+}
+
+/// CBOR control message のディスパッチ。lock / leader / mode 系の state 更新と
+/// broadcast を担う (Phase 10)。
+fn handle_control_message(
+    pty: &Pty,
+    child: Pid,
+    idx: usize,
+    msg: ControlMessage,
+    clients: &mut [ClientHandle],
+    state: &mut SessionState,
+) -> ClientFrameOutcome {
+    let ch_id = clients[idx].id;
+    let ch_leader = clients[idx].leader;
+
+    match msg {
+        ControlMessage::Detach(_) => ClientFrameOutcome::DropClient,
+        ControlMessage::Kill(k) => {
+            let signum = k.signum.unwrap_or(libc::SIGTERM as u8);
+            let sig = Signal::try_from(signum as i32).unwrap_or(Signal::SIGTERM);
+            let _ = kill(child, sig);
+            ClientFrameOutcome::TerminateSession(RelayOutcome::ClientDetachedOrKilled)
+        }
+        ControlMessage::Signal(s) => {
+            // signal は client 自由 (= lock 中でも認める)。raw mode 中の SIGINT
+            // 送信路として使うため、leader / lock 制約は掛けない。
+            let sig = Signal::try_from(s.signum as i32).unwrap_or(Signal::SIGINT);
+            let _ = kill(child, sig);
+            ClientFrameOutcome::Continue
+        }
+        ControlMessage::Resize(r) => {
+            // resize は leader のみ許可 (DR-0008 §2.3)。それ以外は error 返却。
+            if !ch_leader {
+                let _ = send_control(
+                    &clients[idx],
+                    ControlMessage::Error(ErrorMessage {
+                        code: "mode.not-leader".into(),
+                        message: "resize requires leader role".into(),
+                        details: None,
+                    }),
+                );
+                return ClientFrameOutcome::Continue;
+            }
+            let _ = pty.resize(r.cols, r.rows);
+            ClientFrameOutcome::Continue
+        }
+        ControlMessage::LockAcquire(req) => {
+            // MVP: queue 未実装。`wait=true` でも grant か Denied のいずれか
+            // (= 既存 holder が居れば即 Denied)。
+            if state.lock_holder.is_some() {
+                let _ = send_control(
+                    &clients[idx],
+                    ControlMessage::LockResponse(LockResponse {
+                        result: LockResult::Denied,
+                        token: None,
+                        queue_position: None,
+                    }),
+                );
+                let _ = req; // process_bound / timeout は queue 実装まで未使用
+                return ClientFrameOutcome::Continue;
+            }
+            let token = generate_lock_token();
+            state.lock_holder = Some(ch_id);
+            state.lock_token = Some(token.clone());
+            let _ = send_control(
+                &clients[idx],
+                ControlMessage::LockResponse(LockResponse {
+                    result: LockResult::Acquired,
+                    token: Some(token),
+                    queue_position: None,
+                }),
+            );
+            broadcast_control(
+                clients,
+                &ControlMessage::ModeChange(ModeChange {
+                    session_mode: SessionMode::Locked,
+                    lock_holder: Some(ch_id),
+                    client_mode: None,
+                }),
+            );
+            ClientFrameOutcome::Continue
+        }
+        ControlMessage::LockRelease(rel) => {
+            // token + holder 両方を照合してから解放
+            let valid = state.lock_holder == Some(ch_id)
+                && state.lock_token.as_deref() == Some(rel.token.as_str());
+            if !valid {
+                let _ = send_control(
+                    &clients[idx],
+                    ControlMessage::Error(ErrorMessage {
+                        code: "lock.not-held".into(),
+                        message: "lock token mismatch or not the lock holder".into(),
+                        details: None,
+                    }),
+                );
+                return ClientFrameOutcome::Continue;
+            }
+            state.lock_holder = None;
+            state.lock_token = None;
+            broadcast_control(
+                clients,
+                &ControlMessage::ModeChange(ModeChange {
+                    session_mode: state.session_mode(),
+                    lock_holder: None,
+                    client_mode: None,
+                }),
+            );
+            ClientFrameOutcome::Continue
+        }
+        _ => ClientFrameOutcome::Continue,
     }
 }
 
@@ -1214,5 +1541,357 @@ mod tests {
 
         let exit = handle.join().expect("daemon thread").expect("daemon serve");
         assert_eq!(exit, 1);
+    }
+
+    // ---- Phase 10 helper unit tests ----
+
+    #[test]
+    fn generate_lock_token_unique_and_hex32() {
+        let a = generate_lock_token();
+        let b = generate_lock_token();
+        assert_eq!(a.len(), 32, "token must be 32 hex chars (16 bytes)");
+        assert_eq!(b.len(), 32);
+        assert_ne!(a, b, "two tokens must differ");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn should_assign_leader_picks_first_rw() {
+        let clients: Vec<ClientHandle> = Vec::new();
+        assert!(should_assign_leader(&clients, Mode::Rw));
+        assert!(!should_assign_leader(&clients, Mode::Ro));
+        assert!(
+            !should_assign_leader(&clients, Mode::RwNoLeader),
+            "rw-no-leader は明示拒否なので leader 取らない"
+        );
+    }
+
+    #[test]
+    fn session_mode_reflects_lock_holder() {
+        let mut s = SessionState::default();
+        assert_eq!(s.session_mode(), SessionMode::Rw);
+        s.lock_holder = Some(7);
+        s.lock_token = Some("abcd".into());
+        assert_eq!(s.session_mode(), SessionMode::Locked);
+    }
+
+    // ---- Phase 10 e2e tests (= serve_loop 経由) ----
+
+    /// Phase 10: 2nd rw client は leader を取らない (1st が既に leader)。
+    #[test]
+    fn serve_only_first_rw_becomes_leader() {
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let r1 = do_client_handshake(&mut s1);
+        assert!(r1.leader);
+
+        let mut s2 = client_connect_with_retry(&sock_path);
+        let r2 = do_client_handshake(&mut s2);
+        assert!(!r2.leader, "2nd rw client must not be leader");
+        assert_ne!(r1.client_id, r2.client_id);
+
+        // cleanup: kill
+        let body = ControlMessage::Kill(Kill { signum: None })
+            .encode_to_vec()
+            .expect("encode");
+        Frame::cbor_control(body).encode_to(&mut s1).expect("send");
+        s1.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// Phase 10: lock acquire は token を返し、mode.change(Locked) を全 client に broadcast。
+    #[test]
+    fn serve_lock_acquire_grants_and_broadcasts_mode_change() {
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let r1 = do_client_handshake(&mut s1);
+        // s1 accept 時の leader.notify を捨てる
+        let _ = Frame::decode_from(&mut s1).expect("s1 leader.notify");
+
+        let mut s2 = client_connect_with_retry(&sock_path);
+        let _r2 = do_client_handshake(&mut s2);
+
+        // s1 が lock 取得
+        let body = ControlMessage::LockAcquire(crate::protocol::messages::LockAcquire {
+            wait: false,
+            timeout_abs_ms: None,
+            timeout_idle_ms: None,
+            process_bound: false,
+        })
+        .encode_to_vec()
+        .expect("encode");
+        Frame::cbor_control(body).encode_to(&mut s1).expect("send");
+        s1.flush().expect("flush");
+
+        // s1 は lock.response(Acquired, token=...) を受信
+        let resp_frame = Frame::decode_from(&mut s1).expect("decode resp");
+        let resp = ControlMessage::decode_from(resp_frame.body.as_slice()).expect("decode cbor");
+        let token = match resp {
+            ControlMessage::LockResponse(lr) => {
+                assert_eq!(lr.result, LockResult::Acquired);
+                assert_eq!(lr.token.as_ref().map(|t| t.len()), Some(32));
+                lr.token.clone()
+            }
+            other => panic!("expected LockResponse, got {other:?}"),
+        };
+        assert!(token.is_some());
+
+        // s1 / s2 とも mode.change(Locked, lock_holder=s1.client_id) を受信
+        for s in [&mut s1, &mut s2] {
+            let mc_frame = Frame::decode_from(s).expect("decode mode.change frame");
+            let mc = ControlMessage::decode_from(mc_frame.body.as_slice()).expect("decode mc");
+            match mc {
+                ControlMessage::ModeChange(c) => {
+                    assert_eq!(c.session_mode, SessionMode::Locked);
+                    assert_eq!(c.lock_holder, Some(r1.client_id));
+                }
+                other => panic!("expected ModeChange, got {other:?}"),
+            }
+        }
+
+        // cleanup
+        let body = ControlMessage::Kill(Kill { signum: None })
+            .encode_to_vec()
+            .expect("encode");
+        Frame::cbor_control(body).encode_to(&mut s1).expect("send");
+        s1.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// Phase 10: 2 件目の lock acquire は Denied、state 変化なし。
+    #[test]
+    fn serve_lock_acquire_while_locked_returns_denied() {
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut s1);
+        // s1 accept 時の leader.notify を捨てる
+        let _ = Frame::decode_from(&mut s1).expect("s1 leader.notify");
+        let mut s2 = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut s2);
+
+        // s1 が lock 取得
+        Frame::cbor_control(
+            ControlMessage::LockAcquire(crate::protocol::messages::LockAcquire {
+                wait: false,
+                timeout_abs_ms: None,
+                timeout_idle_ms: None,
+                process_bound: false,
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+        // s1 が response + mode.change を受け取る、s2 が mode.change を受け取る
+        let _ = Frame::decode_from(&mut s1).expect("response");
+        let _ = Frame::decode_from(&mut s1).expect("mode.change s1");
+        let _ = Frame::decode_from(&mut s2).expect("mode.change s2");
+
+        // s2 が lock 取得試行 (= 拒否される)
+        Frame::cbor_control(
+            ControlMessage::LockAcquire(crate::protocol::messages::LockAcquire {
+                wait: false,
+                timeout_abs_ms: None,
+                timeout_idle_ms: None,
+                process_bound: false,
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s2)
+        .expect("send");
+        s2.flush().expect("flush");
+        let resp_frame = Frame::decode_from(&mut s2).expect("resp");
+        let resp = ControlMessage::decode_from(resp_frame.body.as_slice()).expect("decode");
+        match resp {
+            ControlMessage::LockResponse(lr) => {
+                assert_eq!(lr.result, LockResult::Denied);
+                assert!(lr.token.is_none());
+            }
+            other => panic!("expected LockResponse(Denied), got {other:?}"),
+        }
+
+        // cleanup
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// Phase 10: lock release は token 一致で成功、mode.change(Rw) を broadcast。
+    #[test]
+    fn serve_lock_release_clears_state() {
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut s1);
+        // s1 accept 時の leader.notify を捨てる
+        let _ = Frame::decode_from(&mut s1).expect("s1 leader.notify");
+
+        // acquire
+        Frame::cbor_control(
+            ControlMessage::LockAcquire(crate::protocol::messages::LockAcquire {
+                wait: false,
+                timeout_abs_ms: None,
+                timeout_idle_ms: None,
+                process_bound: false,
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+        let resp_frame = Frame::decode_from(&mut s1).expect("resp");
+        let token = match ControlMessage::decode_from(resp_frame.body.as_slice()).expect("decode") {
+            ControlMessage::LockResponse(lr) => lr.token.expect("token"),
+            o => panic!("expected LockResponse, got {o:?}"),
+        };
+        // mode.change(Locked) は捨てる
+        let _ = Frame::decode_from(&mut s1).expect("mode.change locked");
+
+        // release
+        Frame::cbor_control(
+            ControlMessage::LockRelease(crate::protocol::messages::LockRelease {
+                token: token.clone(),
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+
+        // mode.change(Rw, lock_holder=None) を受信
+        let mc_frame = Frame::decode_from(&mut s1).expect("mode.change rw");
+        match ControlMessage::decode_from(mc_frame.body.as_slice()).expect("decode") {
+            ControlMessage::ModeChange(c) => {
+                assert_eq!(c.session_mode, SessionMode::Rw);
+                assert!(c.lock_holder.is_none());
+            }
+            o => panic!("expected ModeChange, got {o:?}"),
+        }
+
+        // cleanup
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// Phase 10: leader が detach すると、次の rw client に cascade + leader.notify broadcast。
+    #[test]
+    fn serve_leader_cascades_on_detach() {
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let r1 = do_client_handshake(&mut s1);
+        assert!(r1.leader);
+        let mut s2 = client_connect_with_retry(&sock_path);
+        let r2 = do_client_handshake(&mut s2);
+        assert!(!r2.leader);
+
+        // s2 は s1 が leader になった瞬間の leader.notify を 1 つ受け取る (= s1 accept 時の broadcast)
+        // ※ s1 自身も自分の leader.notify を 1 つ受け取る。これらを先に捨てる。
+        // s1 については s2 accept 時の broadcast が起きない (s2 は leader にならないので) ことを利用し、
+        // s1 が受け取る leader.notify は s1 accept 時の 1 件のみ。
+        let nf = Frame::decode_from(&mut s1).expect("s1 leader.notify");
+        match ControlMessage::decode_from(nf.body.as_slice()).expect("decode") {
+            ControlMessage::LeaderNotify(n) => assert_eq!(n.client_id, Some(r1.client_id)),
+            o => panic!("expected LeaderNotify, got {o:?}"),
+        }
+
+        // s1 を detach (= leader 抜ける)
+        Frame::cbor_control(
+            ControlMessage::Detach(Detach {
+                target: DetachTarget::Myself,
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+        drop(s1);
+
+        // s2 が新 leader として通知される (cascade)
+        let nf2 = Frame::decode_from(&mut s2).expect("s2 cascade notify");
+        match ControlMessage::decode_from(nf2.body.as_slice()).expect("decode") {
+            ControlMessage::LeaderNotify(n) => assert_eq!(n.client_id, Some(r2.client_id)),
+            o => panic!("expected LeaderNotify(cascade), got {o:?}"),
+        }
+
+        // cleanup
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s2)
+        .expect("send");
+        s2.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// Phase 10: 非 leader が resize すると error 返却、子 pty は変化しない。
+    #[test]
+    fn serve_non_leader_resize_gets_error() {
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut s1);
+        // s1 leader.notify を捨てる
+        let _ = Frame::decode_from(&mut s1).expect("leader notify");
+
+        let mut s2 = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut s2);
+        // s2 は leader でないので leader.notify broadcast を受けない (became_leader=false)
+
+        // s2 が resize 送信
+        Frame::cbor_control(
+            ControlMessage::Resize(crate::protocol::messages::Resize {
+                cols: 100,
+                rows: 30,
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s2)
+        .expect("send");
+        s2.flush().expect("flush");
+
+        // s2 が error を受信
+        let ef = Frame::decode_from(&mut s2).expect("error");
+        match ControlMessage::decode_from(ef.body.as_slice()).expect("decode") {
+            ControlMessage::Error(e) => {
+                assert_eq!(e.code, "mode.not-leader");
+            }
+            o => panic!("expected Error, got {o:?}"),
+        }
+
+        // cleanup
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signum: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s1)
+        .expect("send");
+        s1.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
     }
 }

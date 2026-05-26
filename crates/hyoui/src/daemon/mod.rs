@@ -7,10 +7,10 @@
 //! ## 段階実装の進捗 (Phase)
 //!
 //! - [x] Phase 6: skeleton (`DaemonConfig`、module 構成)
-//! - [ ] Phase 7: 子 PTY spawn + listener bind + 1 client + handshake
-//! - [ ] Phase 8: raw data 中継 + detach + clean shutdown
-//! - [ ] Phase 9: multi-attach + bounded mpsc (backpressure DR-0008 §8.2)
-//! - [ ] Phase 10: lock + leader + mode change
+//! - [x] Phase 7: 子 PTY spawn + listener bind + 1 client + handshake
+//! - [x] Phase 8: raw data 中継 + detach + clean shutdown
+//! - [x] Phase 9: multi-attach + bounded mpsc (backpressure DR-0008 §8.2)
+//! - [x] Phase 10: lock + leader + mode change (wait queue 未実装、wait=true でも Denied)
 //! - [ ] Phase 11: status / tail / wait
 //!
 //! ## 関連
