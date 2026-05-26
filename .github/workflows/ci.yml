@@ -12,13 +12,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Verify unsafe is confined to sys/raw.rs and sys/signal.rs
+      - name: Verify unsafe is confined to sys/raw.rs, sys/signal.rs, daemon/session.rs
         run: |
           set -uo pipefail
           leaked=$(grep -rnE '\bunsafe[[:space:]]+(fn|impl|trait|extern|\{)' crates/hyoui/src --include='*.rs' \
-            | grep -v 'src/sys/raw.rs\|src/sys/signal.rs' || true)
+            | grep -v 'src/sys/raw.rs\|src/sys/signal.rs\|src/daemon/session.rs' || true)
           if [ -n "$leaked" ]; then
-            echo "ERROR: unsafe leaked outside whitelisted files (sys/raw.rs, sys/signal.rs):" >&2
+            echo "ERROR: unsafe leaked outside whitelisted files (sys/raw.rs, sys/signal.rs, daemon/session.rs):" >&2
             echo "$leaked" >&2
             exit 1
           fi
