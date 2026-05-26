@@ -63,6 +63,11 @@ pub struct UnixSock {
 
 impl UnixSock {
     /// Verify `parent_of(path)` is mode 0700 and owned by current euid.
+    ///
+    /// R5-FB5: 不親切な error 文言 (= 旧版「socket parent directory must be
+    /// mode 0700」だけ) を hint 付きに改善。`--socket /tmp/x.sock` のような
+    /// 安易な指定で kawaz が混乱した issue に対応。文言だけ更新で `ErrorCode`
+    /// 系の構造は触らない。
     fn check_parent_dir(path: &Path) -> Result<()> {
         let parent = path
             .parent()
@@ -74,13 +79,16 @@ impl UnixSock {
         let mode = meta.mode() & 0o777;
         if mode != 0o700 {
             return Err(Error::Precondition(
-                "socket parent directory must be mode 0700",
+                "socket parent directory must be mode 0700 \
+                 (use $XDG_RUNTIME_DIR or $TMPDIR, or run `chmod 700 <parent>`)",
             ));
         }
         let euid = nix::unistd::geteuid();
         if nix::unistd::Uid::from_raw(meta.uid()) != euid {
             return Err(Error::Precondition(
-                "socket parent directory must be owned by current euid",
+                "socket parent directory must be owned by current euid \
+                 (= 別 user 所有の dir を --socket で指定した可能性。\
+                 hyoui の自動 path ($XDG_RUNTIME_DIR/hyoui or $TMPDIR/hyoui-<uid>) を使う)",
             ));
         }
         Ok(())
@@ -193,6 +201,34 @@ mod tests {
         let path = dir.path().join("nope.sock");
         let err = UnixSock::listen(&path).expect_err("expected Precondition");
         assert!(matches!(err, Error::Precondition(_)));
+    }
+
+    /// R5-FB5: parent mode 0700 違反時のエラー文言が next-action hint を
+    /// 含むこと (= 旧版は「must be mode 0700」だけで、初見ユーザがどこを
+    /// 直せばいいかわからなかった)。文言の正本は `check_parent_dir` の
+    /// `Error::Precondition` リテラル。
+    #[test]
+    fn socket_parent_mode_error_includes_hint() {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 0755");
+        let path = dir.path().join("nohint.sock");
+        let err = UnixSock::listen(&path).expect_err("expected Precondition");
+        let msg = format!("{err}");
+        // 基本メッセージ
+        assert!(
+            msg.contains("mode 0700"),
+            "error must mention mode 0700; got: {msg}"
+        );
+        // hint: 推奨 dir + 直し方
+        assert!(
+            msg.contains("XDG_RUNTIME_DIR") || msg.contains("TMPDIR"),
+            "error must hint at $XDG_RUNTIME_DIR / $TMPDIR; got: {msg}"
+        );
+        assert!(
+            msg.contains("chmod 700"),
+            "error must hint at `chmod 700`; got: {msg}"
+        );
     }
 
     #[test]
