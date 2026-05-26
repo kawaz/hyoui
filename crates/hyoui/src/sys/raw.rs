@@ -17,6 +17,9 @@
 //! * [`borrow_raw_fd`] and [`own_raw_fd`] — thin wrappers around
 //!   `BorrowedFd::borrow_raw` / `OwnedFd::from_raw_fd` so the rest of the
 //!   crate never spells those operations directly.
+//!
+//! * [`setrlimit_core_zero`] / [`getrlimit_core`] — `setrlimit(RLIMIT_CORE)` /
+//!   `getrlimit(RLIMIT_CORE)`. R5-H12 で daemon の core dump 抑止に使う。
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -107,6 +110,61 @@ pub fn forkpty_then_exec(argv: &[CString], cols: u16, rows: u16) -> Result<Forke
             unsafe { libc::_exit(127) };
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// setrlimit / getrlimit (RLIMIT_CORE) — R5-H12
+// ---------------------------------------------------------------------------
+
+/// Soft / hard limit pair for [`getrlimit_core`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RlimitPair {
+    /// `rlim_cur` (= soft limit).
+    pub soft: u64,
+    /// `rlim_max` (= hard limit).
+    pub hard: u64,
+}
+
+/// Force `RLIMIT_CORE` to `(0, 0)` so that `panic = "abort"` / SIGSEGV /
+/// SIGABRT do **not** produce a core dump.
+///
+/// R5-H12: daemon process memory に `lock_token` や `HYOUI_LOCK_TOKEN` 環境変数の
+/// plain-text 値が常駐するため、abort 時に `/cores/...` や `systemd-coredump` で
+/// 同 UID の他 process / 管理者にこれら secret が leak する。
+/// daemon 起動直後 (`Session::start`) に soft/hard 両方を 0 に固定して core dump
+/// 生成を恒久抑止する。
+///
+/// 既存 path に core dump file が落ちているケース (= 過去の crash の残骸) は
+/// 触らない — これは「次の crash で書かれる core dump」を抑止する操作。
+pub fn setrlimit_core_zero() -> Result<()> {
+    let rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `&rlim` outlives the syscall; `RLIMIT_CORE` is a valid constant.
+    // `setrlimit` writes nothing through the pointer (read-only argument).
+    let r = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &rlim) };
+    if r == -1 {
+        return Err(Error::Errno(Errno::last()));
+    }
+    Ok(())
+}
+
+/// Read the current `RLIMIT_CORE` soft/hard pair. R5-H12 test 用。
+pub fn getrlimit_core() -> Result<RlimitPair> {
+    // SAFETY: `rlim` is fully overwritten on success; on failure we never read
+    // it. `RLIMIT_CORE` is a valid resource constant.
+    let mut rlim: libc::rlimit = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut rlim) };
+    if r == -1 {
+        return Err(Error::Errno(Errno::last()));
+    }
+    // `libc::rlim_t` は macOS / Linux で `u64` (= `RlimitPair` の field と同型)。
+    // 暗黙の同型代入で OK。
+    Ok(RlimitPair {
+        soft: rlim.rlim_cur,
+        hard: rlim.rlim_max,
+    })
 }
 
 // ---------------------------------------------------------------------------

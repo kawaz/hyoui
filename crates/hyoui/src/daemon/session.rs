@@ -76,6 +76,18 @@ struct SessionInner {
     listener: UnixSock,
 }
 
+/// R5-H12: `HYOUI_ALLOW_CORE` env が `"1"` のとき true を返す。
+/// `Session::start` で core dump 抑止を skip する opt-out 用 (debug 時のみ想定)。
+fn core_dump_allowed_by_env() -> bool {
+    core_dump_allowed_value(std::env::var("HYOUI_ALLOW_CORE").ok().as_deref())
+}
+
+/// `core_dump_allowed_by_env` のテスト可能化版。
+/// `Some("1")` のときのみ true、それ以外 (未設定 / 他の値 / 空文字) は false。
+fn core_dump_allowed_value(v: Option<&str>) -> bool {
+    matches!(v, Some("1"))
+}
+
 impl Session {
     /// 子 PTY を spawn し、Unix socket を bind して session を立ち上げる。
     ///
@@ -88,6 +100,17 @@ impl Session {
     pub fn start(config: DaemonConfig) -> Result<Self, Error> {
         if config.cmd.is_empty() {
             return Err(Error::Invalid("DaemonConfig::cmd must not be empty"));
+        }
+        // R5-H12: daemon process は `lock_token` / `HYOUI_LOCK_TOKEN` env 等の
+        // secret を memory 上に常駐させる。`panic = "abort"` / SIGSEGV / SIGABRT
+        // で core dump が `/cores/...` や `systemd-coredump` に書かれると、
+        // 同 UID の他 process / 管理者に secret が leak する。
+        // soft/hard 両方を 0 に固定して恒久抑止する。
+        // `HYOUI_ALLOW_CORE=1` 指定時のみ skip して debug できる (= opt-out)。
+        // 既存 path に core dump file が残っているケースは touch しない
+        // (= これは「次の crash で書かれる」抑止)。
+        if !core_dump_allowed_by_env() {
+            crate::sys::raw::setrlimit_core_zero()?;
         }
         let argv: Vec<&str> = config.cmd.iter().map(String::as_str).collect();
         let Spawned { pty, child } = Pty::spawn(&argv, config.cols, config.rows)?;
@@ -1036,6 +1059,50 @@ mod tests {
     }
 
     // ---- Phase 10 helper unit tests ----
+
+    /// R5-H12: `core_dump_allowed_value` は `Some("1")` のときだけ true。
+    /// 未設定 / 空文字 / 他の値 (`"0"`, `"true"`, `"yes"`) はすべて false。
+    #[test]
+    fn core_dump_allowed_value_only_matches_one() {
+        assert!(core_dump_allowed_value(Some("1")));
+        assert!(!core_dump_allowed_value(None));
+        assert!(!core_dump_allowed_value(Some("")));
+        assert!(!core_dump_allowed_value(Some("0")));
+        assert!(!core_dump_allowed_value(Some("true")));
+        assert!(!core_dump_allowed_value(Some("yes")));
+        assert!(!core_dump_allowed_value(Some("1\n")));
+    }
+
+    /// R5-H12: `Session::start` 通過後は `RLIMIT_CORE` の soft/hard が両方 0 に
+    /// 固定される (= panic / SIGSEGV で core dump が書かれない)。
+    ///
+    /// 注意: 一度 hard を 0 に落とすと process 寿命中は二度と上げられない。
+    /// 本 test と他の `Session::start` を呼ぶ test (例:
+    /// `start_spawns_child_and_binds_socket`) は同一 process 内で並列実行され、
+    /// どれが先に走っても以降は永久に (0, 0) なので race 条件は無い
+    /// (= test 間でリセット不要)。
+    #[test]
+    fn session_start_sets_core_rlimit_to_zero() {
+        use crate::sys::raw::getrlimit_core;
+
+        let dir = make_temp_socket_dir();
+        let sock = dir.path().join("core.sock");
+        let cfg = DaemonConfig::new("core-test", sock, long_running_cmd());
+        let session = Session::start(cfg).expect("start");
+        let pid = session.child_pid();
+        drop(session);
+        cleanup_child(pid);
+
+        let rl = getrlimit_core().expect("getrlimit");
+        assert_eq!(
+            rl.soft, 0,
+            "RLIMIT_CORE soft must be 0 after Session::start"
+        );
+        assert_eq!(
+            rl.hard, 0,
+            "RLIMIT_CORE hard must be 0 after Session::start"
+        );
+    }
 
     #[test]
     fn generate_lock_token_unique_and_hex32() {
