@@ -381,9 +381,10 @@ Wild debugger / Competitive 分析 / Rust API 設計
 - [ ] **R5-M29** `cli.rs` 2484 行手書き parser = 自前 ad-hoc parser 膨張、R4-M20 格上げ
   - 出典: Classic (R5-CLS-M1) / R4-M20 補強
   - 提案: DR-0010 「CLI parser を clap (builder API) に移行」を v0.2.0 着手前に起票、800 行に削減見込み
-- [ ] **R5-M30** `observer.rs` (dead surface) 削除一択、保留する理由なし
+- [done] **R5-M30** `observer.rs` (dead surface) 削除一択、保留する理由なし
   - 出典: Classic (R5-CLS-M2) / R4-L1 格上げ
   - 提案: R5 のうちに jj 1 change で削除、R4-L1 を done に
+  - 解消: `crates/hyoui/src/observer.rs` を削除、`lib.rs` の `pub mod observer;` も除去。外部参照 0 件を grep で確認済み。R4-L1 も合わせて clean up。
 - [ ] **R5-M31** ライセンス badge / CI / release badge を README に置く
   - 出典: Sales (R5-SAL-M1, R5-SAL-M2)
   - 提案: README L1 直下に CI status / latest release / MIT license / (将来) crates.io / Homebrew badge
