@@ -15,5 +15,8 @@ path = "src/main.rs"
 [dependencies]
 hyoui = { path = "../hyoui" }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints.rust]
 unsafe_code = "forbid"

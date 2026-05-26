@@ -5,7 +5,8 @@
 //! * `Help`     — print usage to stdout (exit 0 for explicit help, exit 2 for
 //!   unknown subcommands so callers can detect misuse from the status code).
 //! * `Version`  — print `hyoui <VERSION>` and exit 0.
-//! * `Run(cfg)` — v0.1.0 で daemon module 経由に置換予定。現状は stub (PoC 削除後)。
+//! * `Run(cfg)` — daemon::Session::run 経由で子 PTY を foreground 実行。
+//!   socket path は `--socket` 指定 / 未指定なら自動 (`socket_path::resolve`)。
 //! * `Completion { shell }` — emit a hand-written completion script.
 //! * `Error`    — print the diagnostic to stderr and exit 2.
 
@@ -14,8 +15,10 @@
 use std::process::ExitCode;
 
 use hyoui::cli::{Command, HelpTopic, parse_args, usage};
+use hyoui::daemon::{DaemonConfig, Session};
 
 mod completion;
+mod socket_path;
 
 fn main() -> ExitCode {
     // Skip argv[0]: parse_args expects the trailing arguments only.
@@ -43,11 +46,39 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
 
-        Command::Run(_cfg) => {
-            // PoC 段階の Agent 実装は DR-0008 確定に伴い削除済み。
-            // v0.1.0 で新 daemon module 経由に置換される予定。
-            eprintln!("hyoui: `run` は v0.1.0 で再実装中です (PoC Agent は削除済み)");
-            ExitCode::from(70) // EX_SOFTWARE: temporarily unimplemented
+        Command::Run(cfg) => {
+            let session_id = socket_path::auto_session_id();
+            let sock = match socket_path::resolve(cfg.socket.as_deref(), &session_id) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("hyoui: socket path 解決失敗: {e}");
+                    return ExitCode::from(1);
+                }
+            };
+            let cols = u16::try_from(cfg.cols).unwrap_or(80);
+            let rows = u16::try_from(cfg.rows).unwrap_or(24);
+            let mut dcfg = DaemonConfig::new(session_id, sock, cfg.command);
+            dcfg.cols = cols;
+            dcfg.rows = rows;
+
+            let session = match Session::start(dcfg) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("hyoui: daemon 起動失敗: {e}");
+                    return ExitCode::from(1);
+                }
+            };
+            match session.run() {
+                Ok(code) => {
+                    // shell convention: 8 bit mask
+                    let masked = u8::try_from(code & 0xFF).unwrap_or(255);
+                    ExitCode::from(masked)
+                }
+                Err(e) => {
+                    eprintln!("hyoui: daemon 実行エラー: {e}");
+                    ExitCode::from(1)
+                }
+            }
         }
 
         Command::Completion { shell } => {
