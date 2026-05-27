@@ -9,8 +9,9 @@
 //!
 //! ## 本 file の test の位置付け
 //!
-//! 軸 1 と同様に、DR-0001 軸 2 は未実装 (= task #34)。本 file は現実態を assert
-//! で記録し、task #34 で実装が入ったら assert が壊れる形にしておく。
+//! DR-0001 軸 2 は **task #34 で実装済 (2026-05-27)**。本 file は期待動作を確認する
+//! regression 防止 test。`OnParentSuspend::Transparent` で子も連動 STOPPED に、
+//! `Decouple` で子はそのまま走り続けることを検証する。
 //!
 //! ## 検証手段
 //!
@@ -81,17 +82,17 @@ fn axis2_sleep_interactive_default_external_tstp() {
     let parent_after = h.process_state().expect("parent observable");
     let child_after = process_state_of(child.pid).expect("child observable");
 
-    // 子の現実態: 軸 2 transparent が未実装なので、親が STOPPED になっても
-    // 子は走り続ける (= decouple と同じ状態)。
+    // DR-0001 軸 2 `transparent` 実装後: 親 SIGTSTP 受信 → 子 pgrp にも SIGSTOP
+    // → 子も STOPPED ('T') に follow。
     assert!(
-        !child_after.is_state('T'),
-        "現実態 (interactive transparent 未実装): 親 SIGTSTP 後も子は走り続ける。\
-         task #34 で実装されたら 'T' に follow するはず。got: {child_after:?}"
+        child_after.is_state('T'),
+        "DR-0001 軸 2 transparent: 親 SIGTSTP 後に子も STOPPED ('T') に follow するはず。\
+         got: {child_after:?}"
     );
 
-    // 親の state は SIGTSTP default 動作で STOP になっているはず。
-    // ただし「SIGTSTP を block している」「SIGCONT が即届く」等の理由で
-    // STOP しない場合もあり得る → 現実態を観測して記録だけ残す。
+    // 親も SIGTSTP → raise(SIGSTOP) で STOPPED になる想定。informational として
+    // log は残すが、test の assert はしない (= SIGTSTP の default 動作は環境差で
+    // 揺れる可能性、本軸の主題は子の追従挙動)。
     eprintln!(
         "[axis2_sleep_interactive_default_external_tstp] parent_after.stat = {:?} (informational)",
         parent_after.stat
@@ -102,6 +103,7 @@ fn axis2_sleep_interactive_default_external_tstp() {
         nix::unistd::Pid::from_raw(h.pid().as_raw()),
         Signal::SIGCONT,
     );
+    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.pid), Signal::SIGCONT);
     h.kill().ok();
 }
 
@@ -212,22 +214,23 @@ fn axis2_bash_interactive_default_external_tstp() {
     settle();
 
     let child_after = process_state_of(child.pid).expect("bash observable");
-    // 現実態 (interactive transparent 未実装): 子 bash は走り続ける。
+    // DR-0001 軸 2 transparent (bash REPL category): 子 bash も STOPPED に follow。
     assert!(
-        !child_after.is_state('T'),
-        "現実態 (bash REPL category): 軸 2 transparent 未配線、子 bash は走り続ける。\
-         task #34 で実装されたら 'T' に follow するはず。got: {child_after:?}"
+        child_after.is_state('T'),
+        "DR-0001 軸 2 transparent (bash REPL category): 子 bash も STOPPED ('T') に \
+         follow するはず。got: {child_after:?}"
     );
 
     let _ = nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(h.pid().as_raw()),
         Signal::SIGCONT,
     );
+    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.pid), Signal::SIGCONT);
     h.kill().ok();
 }
 
 /// matrix cell B5: `/bin/cat` を起動して親 hyoui に SIGTSTP (= line-oriented
-/// category)。
+/// category)。軸 2 transparent で子 cat も連動 STOPPED することを検証。
 #[test]
 fn axis2_cat_interactive_default_external_tstp() {
     let runner = HyouiTestRunner::new();
@@ -245,15 +248,17 @@ fn axis2_cat_interactive_default_external_tstp() {
     settle();
 
     let child_after = process_state_of(child.pid).expect("cat observable");
-    // 現実態 (cat line-oriented category): 子は走り続ける。
+    // DR-0001 軸 2 transparent (cat line-oriented category): 子も STOPPED に follow。
     assert!(
-        !child_after.is_state('T'),
-        "現実態 (cat category): 軸 2 transparent 未配線。got: {child_after:?}"
+        child_after.is_state('T'),
+        "DR-0001 軸 2 transparent (cat category): 子も STOPPED ('T') に follow するはず。\
+         got: {child_after:?}"
     );
 
     let _ = nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(h.pid().as_raw()),
         Signal::SIGCONT,
     );
+    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.pid), Signal::SIGCONT);
     h.kill().ok();
 }
