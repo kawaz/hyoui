@@ -17,13 +17,15 @@ use std::os::fd::AsFd;
 use std::process::ExitCode;
 
 use hyoui::cli::{
-    AttachConfig, Command, HelpTopic, KillConfig, ListConfig, StatusConfig, TailConfig,
-    WaitCliPredicate, WaitConfig, parse_args, usage,
+    AttachConfig, Command, HelpTopic, KillConfig, ListConfig, ScreenCommand, ScreenDumpCliFormat,
+    ScreenDumpCliLayer, ScreenDumpConfig, StatusConfig, TailConfig, WaitCliPredicate, WaitConfig,
+    parse_args, usage,
 };
 use hyoui::client::{AttachOptions, ClientConnection};
 use hyoui::daemon::{DaemonConfig, Session};
 use hyoui::protocol::messages::{
-    StatusQuery, TailRequest, WaitMatchOptions, WaitOutcome, WaitPredicate, WaitRequest,
+    DumpRect, ScreenDumpFormat, ScreenDumpLayer, ScreenDumpRequest, StatusQuery, TailRequest,
+    WaitMatchOptions, WaitOutcome, WaitPredicate, WaitRequest,
 };
 use hyoui::protocol::{ControlMessage, Mode};
 use hyoui::sys::{enter_raw, is_tty};
@@ -162,6 +164,18 @@ fn main() -> ExitCode {
         Command::Tail(cfg) => tail_command(cfg),
 
         Command::Wait(cfg) => wait_command(cfg),
+
+        Command::Screen(sub) => match sub {
+            ScreenCommand::Dump(cfg) => screen_dump_command(cfg),
+            // `ScreenCommand` is `#[non_exhaustive]`; future variants surface as
+            // a generic skew error so older binaries report clearly.
+            _ => {
+                eprintln!(
+                    "hyoui: screen: unsupported screen subcommand variant (binary/library version skew)"
+                );
+                ExitCode::from(2)
+            }
+        },
 
         Command::Completion { shell } => {
             print!("{}", completion::script(shell));
@@ -946,6 +960,161 @@ fn wait_command(cfg: WaitConfig) -> ExitCode {
     }
 }
 
+/// `screen dump <session>` subcommand (= DR-0013 §9 + DR-0006 §10.2)。
+///
+/// connect → handshake (cap=`screen-dump-v1`) → `screen.dump.request` 送信 →
+/// `screen.dump.response` を受信して payload を stdout (or `--output` file) に
+/// 書き出す。
+///
+/// daemon が `screen-dump-v1` を intersect しない場合、`screen.dump.request` を
+/// 送ると daemon が `error` (= `unsupported-capability`) を返す。これは
+/// `ControlMessage::Error` 経路で受け取り、stderr に表示して exit 1。
+fn screen_dump_command(cfg: ScreenDumpConfig) -> ExitCode {
+    let sock = match resolve_target_socket(
+        "screen dump",
+        cfg.socket.as_deref(),
+        cfg.session_id.as_deref(),
+    ) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+
+    // protocol 側 enum へ変換 (= CLI 表現と wire 表現の境界)。
+    let format = match cfg.format {
+        ScreenDumpCliFormat::Ansi => ScreenDumpFormat::Ansi,
+        ScreenDumpCliFormat::Binary => ScreenDumpFormat::Binary,
+        ScreenDumpCliFormat::Cbor => ScreenDumpFormat::Cbor,
+        // `ScreenDumpCliFormat` is `#[non_exhaustive]`; treat unknown variants as
+        // a binary/library version skew rather than silently degrading.
+        _ => {
+            eprintln!(
+                "hyoui: screen dump: unsupported format variant (binary/library version skew)"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let layer = match cfg.layer {
+        ScreenDumpCliLayer::Visible => ScreenDumpLayer::Visible,
+        ScreenDumpCliLayer::Scrollback => ScreenDumpLayer::Scrollback,
+        ScreenDumpCliLayer::Both => ScreenDumpLayer::Both,
+        _ => {
+            eprintln!(
+                "hyoui: screen dump: unsupported layer variant (binary/library version skew)"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let rect = cfg.rect.map(|r| DumpRect {
+        x: r.x,
+        y: r.y,
+        w: r.w,
+        h: r.h,
+    });
+
+    // handshake では MVP_CAPS を全部要求する (= 既存の status/tail/wait と同じ pattern)。
+    // `screen-dump-v1` も MVP_CAPS に含まれているため daemon と intersect する。
+    // token は env (HYOUI_LOCK_TOKEN) から取る (= 認証付き daemon にも attach 可能)。
+    let opts = AttachOptions {
+        mode: Mode::Ro,
+        token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
+        ..AttachOptions::default()
+    };
+    // R5-FB4: socket 不存在系 errno は短時間 retry。
+    let mut conn = match connect_with_retry(&sock, opts) {
+        Ok(c) => c,
+        Err(e) => {
+            print_connect_failure("screen dump", &sock, &e);
+            return ExitCode::from(1);
+        }
+    };
+
+    // PDU serial は client 側で採番 (= response 対応付け確認用)。固定値で良い (= 1).
+    let req = ScreenDumpRequest {
+        format,
+        layer,
+        rect,
+        serial: Some(1),
+    };
+    if let Err(e) = conn.send_control(&ControlMessage::ScreenDumpRequest(req)) {
+        eprintln!("hyoui: screen dump: send 失敗: {e}");
+        return ExitCode::from(1);
+    }
+
+    // NOTE: `--timeout=<ms>` (= cfg.timeout_ms) は CLI 層で parse 済だが、現状の
+    // `ClientConnection::recv_control` は blocking で socket-level read timeout を
+    // 露出していない。daemon は `screen.dump.request` を受けたら即同期で
+    // `screen.dump.response` を返す設計 (= DR-0013 §9) のため、実害はほぼ無い。
+    // timeout 配線は別 task で `ClientConnection` 側に `set_read_timeout` を
+    // 露出させてから対応する (= 残懸念として明示)。
+    let _ = cfg.timeout_ms;
+    loop {
+        let msg = match conn.recv_control(None) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("hyoui: screen dump: recv 失敗: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        match msg {
+            ControlMessage::ScreenDumpResponse(resp) => {
+                // serial echo は debug 用、本実装では body だけ書き出せば十分。
+                return write_screen_dump_payload(&resp.payload, cfg.output.as_deref());
+            }
+            ControlMessage::Error(e) => {
+                eprintln!(
+                    "hyoui: screen dump: daemon error: code={:?} message={}",
+                    e.code, e.message
+                );
+                // daemon が `screen-dump-v1` を持たない場合は `unsupported-capability`
+                // が message に入ってくる。next-action hint を出す:
+                if e.message.contains("screen-dump-v1") {
+                    eprintln!("       daemon が `screen-dump-v1` cap をサポートしていません。");
+                    eprintln!("       daemon を新しいバージョンに更新してください。");
+                }
+                return ExitCode::from(1);
+            }
+            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+            other => {
+                eprintln!("hyoui: screen dump: unexpected response: {other:?}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+}
+
+/// `screen dump` の payload を stdout または `--output=<path>` に書き出す。
+///
+/// stdout 書き出しは `lock` を取って raw bytes を直接流す (= terminal 再生用の
+/// ANSI sequence を decode せず通す)。file 書き出しは `truncate` で上書き。
+fn write_screen_dump_payload(payload: &[u8], output: Option<&str>) -> ExitCode {
+    match output {
+        Some(path) => match std::fs::File::create(path) {
+            Ok(mut f) => match f.write_all(payload).and_then(|()| f.flush()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("hyoui: screen dump: 書き出し失敗 ({path}): {e}");
+                    ExitCode::from(1)
+                }
+            },
+            Err(e) => {
+                eprintln!("hyoui: screen dump: file open 失敗 ({path}): {e}");
+                ExitCode::from(1)
+            }
+        },
+        None => {
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            match lock.write_all(payload).and_then(|()| lock.flush()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("hyoui: screen dump: stdout 書き出し失敗: {e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1117,6 +1286,93 @@ mod tests {
         drop(result);
 
         // daemon を kill して thread を終わらせる
+        let kill_opts = AttachOptions {
+            mode: Mode::Ro,
+            ..AttachOptions::default()
+        };
+        if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
+            let kill = hyoui::protocol::messages::Kill { signal: None };
+            let _ = conn.send_control(&ControlMessage::Kill(kill));
+            drop(conn);
+        }
+        let _ = daemon_handle.join();
+    }
+
+    /// `write_screen_dump_payload` (= --output 指定なし) は stdout に流す。
+    /// stdout を直接乗っ取るのは難しいため、ここでは `--output=<path>` 経路
+    /// (= file 書き出し) を確認する。
+    #[test]
+    fn write_screen_dump_payload_writes_to_file() {
+        let dir = make_0700_dir();
+        let out = dir.path().join("dump.bin");
+        let payload = b"\x1b[1;1HHELLO\r\n";
+        let out_str = out.to_str().expect("path utf8").to_string();
+        let code = write_screen_dump_payload(payload, Some(&out_str));
+        // ExitCode の比較はできないが、文字化けせず作成されていることを確認。
+        // exit code が SUCCESS の場合はファイル一致を見れば十分。
+        let _ = code;
+        let got = std::fs::read(&out).expect("read back");
+        assert_eq!(got, payload);
+    }
+
+    /// daemon を起動して `screen dump --format=ansi` を実行、payload が
+    /// stdout (= file 経路で代用) に書かれるところまで通すスモークテスト。
+    ///
+    /// 既存 daemon test (`crates/hyoui/src/daemon/session.rs::serve_screen_dump_ansi_returns_state_formatted`)
+    /// で protocol レベルの確認はあるので、ここでは CLI dispatch が
+    /// `screen.dump.request` を正しく送って response の payload が file 経由で
+    /// 取り出せることを確認する (= CLI 層の wiring の retrogression 検知)。
+    #[test]
+    fn screen_dump_command_writes_response_payload_to_file() {
+        use hyoui::daemon::{DaemonConfig, Session};
+
+        let sock_dir = make_0700_dir();
+        let sock_path = sock_dir.path().join("dump-test.sock");
+        let out_path = sock_dir.path().join("dump.out");
+
+        // daemon spawn (= 子プロセスは 1 回 "SMOKE" を出して sleep 待機)。
+        let sock_for_daemon = sock_path.clone();
+        let daemon_handle = std::thread::spawn(move || {
+            let cfg = DaemonConfig::new(
+                "screen-dump-test",
+                sock_for_daemon,
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf 'SMOKE'; sleep 30".into(),
+                ],
+            );
+            let session = Session::start(cfg).expect("daemon start");
+            session.serve()
+        });
+
+        // daemon の listener が立ち上がるまで retry connect で待つ + 子の最初の
+        // 出力 "SMOKE" が screen state に反映されるまで少し待つ (= 50ms × 数回)。
+        // 既存 daemon test と同様に read_until_contains を本気で実装してもよいが、
+        // ここでは smoke レベルの assertion (= payload が空でない) で十分。
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let cfg = ScreenDumpConfig {
+            socket: Some(sock_path.to_string_lossy().into_owned()),
+            session_id: None,
+            format: ScreenDumpCliFormat::Ansi,
+            layer: ScreenDumpCliLayer::Visible,
+            rect: None,
+            output: Some(out_path.to_string_lossy().into_owned()),
+            timeout_ms: 5_000,
+        };
+        let _exit = screen_dump_command(cfg);
+
+        // payload が file に書かれているはず (= ANSI prefix `\x1b` で始まる)。
+        let got = std::fs::read(&out_path).expect("read output");
+        assert!(!got.is_empty(), "dump payload must not be empty");
+        assert!(
+            got.starts_with(b"\x1b"),
+            "ANSI dump should start with ESC, got first byte: {:?}",
+            got.first()
+        );
+
+        // cleanup: daemon に kill 送って thread を終わらせる
         let kill_opts = AttachOptions {
             mode: Mode::Ro,
             ..AttachOptions::default()

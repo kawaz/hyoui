@@ -99,6 +99,10 @@ pub enum HelpTopic {
     Tail,
     /// Help for the `wait` subcommand (predicate / timeout / exit code 一覧)。
     Wait,
+    /// Help for the `screen` parent subcommand (= 子一覧 / 共通オプション)。
+    Screen,
+    /// Help for the `screen dump` subcommand (= DR-0006 §10.2)。
+    ScreenDump,
     /// Help for the `completion` subcommand.
     Completion,
     /// User invoked an unknown subcommand; render top-level help with note.
@@ -248,6 +252,88 @@ pub struct WaitConfig {
     pub newline_convert_lf: bool,
 }
 
+/// `screen dump` subcommand の format 選択肢 (= DR-0006 §10.2)。
+///
+/// protocol 層の `ScreenDumpFormat` と 1:1 対応。CLI 段で `--format=ansi` /
+/// `--format=binary` / `--format=cbor` を受理する。`--format=json` は protocol
+/// 上は予約 variant だが daemon が `format-not-implemented` を返す MVP scope 外
+/// なので CLI 段でも reject する (= 早期 fail で誤入力を見つける)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ScreenDumpCliFormat {
+    /// `state_formatted()` の raw ANSI sequence (= terminal で cat 再生可能)。
+    #[default]
+    Ansi,
+    /// 空白除去 + 改行 plaintext (= grep / log 用途)。
+    Binary,
+    /// CBOR encode された structured `ScreenSnapshot` (= 機械処理 / debug)。
+    Cbor,
+}
+
+/// `screen dump` subcommand の layer 選択肢 (= DR-0006 §10.2)。
+///
+/// MVP では `--layer=visible` のみが daemon で実装済。`scrollback` / `both` は
+/// forward-compat な CLI 側 enum として用意するが、現状 daemon が `layer-not-implemented`
+/// を返す。本タスクでは visible のみ送信する CLI とし、`scrollback` / `both` は
+/// 別 task で配線する (cli-design-preferences の `--enable/--disable` パターンではなく、
+/// 値選択型なので forward-compat variant として CLI 段で reject)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ScreenDumpCliLayer {
+    /// 現在 visible な viewport のみ (= MVP 唯一の実装済)。
+    #[default]
+    Visible,
+    /// scrollback (= 過去) のみ。Phase B/C で daemon 配線後に CLI 側も解放予定。
+    Scrollback,
+    /// scrollback + visible 連結。Phase B/C 同様。
+    Both,
+}
+
+/// `screen dump` subcommand の rect 指定 (= DR-0006 §10.2)。
+///
+/// `--rect=x,y,w,h` (= u16 4 つを comma 区切り) を表す。Phase B では daemon が
+/// rect を受信しても無視する仕様 (= 全画面のみ対応) だが、CLI 段で構文 validate
+/// しておくことで forward-compat 配線時に CLI の改修が不要。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenDumpCliRect {
+    /// 矩形左上 col (= 0-origin)。
+    pub x: u16,
+    /// 矩形左上 row (= 0-origin)。
+    pub y: u16,
+    /// 矩形 width (cols 単位)。
+    pub w: u16,
+    /// 矩形 height (rows 単位)。
+    pub h: u16,
+}
+
+/// `screen dump <session>` subcommand configuration (= DR-0013 §9 + DR-0006 §10.2)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenDumpConfig {
+    /// Target socket path (explicit) または session_id から resolve。
+    pub socket: Option<String>,
+    /// Target session id。
+    pub session_id: Option<String>,
+    /// `--format=ansi|binary|cbor` (= default ansi)。
+    pub format: ScreenDumpCliFormat,
+    /// `--layer=visible|scrollback|both` (= default visible、MVP は visible のみ送信)。
+    pub layer: ScreenDumpCliLayer,
+    /// `--rect=x,y,w,h` (= 未指定なら full viewport、Phase B 段では daemon が
+    /// 受信しても無視)。
+    pub rect: Option<ScreenDumpCliRect>,
+    /// `--output=<path>` (= 未指定なら stdout に書き出し)。
+    pub output: Option<String>,
+    /// `--timeout=<ms>` (= response 受信 timeout、default 5000ms)。
+    pub timeout_ms: u64,
+}
+
+/// `screen` 親 subcommand の子 dispatch (= DR-0006 §10.1)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScreenCommand {
+    /// `screen dump <session>` (= visible bytes dump)。
+    Dump(ScreenDumpConfig),
+}
+
 /// Result of parsing argv (excluding argv[0]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -273,6 +359,8 @@ pub enum Command {
     Tail(TailConfig),
     /// Wait until predicate (text/pattern/idle) matches, then exit。
     Wait(WaitConfig),
+    /// `screen` 親 subcommand (= 子: `dump` / 将来 `snapshot`)。
+    Screen(ScreenCommand),
     /// Print a completion script for the given shell.
     Completion {
         /// Target shell.
@@ -317,6 +405,7 @@ pub fn parse_args(args: &[String]) -> Command {
         "status" => parse_status(rest),
         "tail" => parse_tail(rest),
         "wait" => parse_wait(rest),
+        "screen" => parse_screen(rest),
         "completion" => parse_completion(rest),
         // Reserved for future stages.
         "send" | "detach" => Command::Error(format!(
@@ -1135,6 +1224,8 @@ pub fn usage(topic: &HelpTopic) -> String {
         HelpTopic::Status => usage_status(),
         HelpTopic::Tail => usage_tail(),
         HelpTopic::Wait => usage_wait(),
+        HelpTopic::Screen => usage_screen(),
+        HelpTopic::ScreenDump => usage_screen_dump(),
         HelpTopic::Completion => usage_completion(),
     }
 }
@@ -1336,6 +1427,174 @@ fn parse_run(args: &[String]) -> Command {
     })
 }
 
+/// `screen` 親 subcommand の dispatcher (= DR-0006 §10.1)。
+///
+/// 引数なし / `--help` / `-h` は親 help を出す (= cli-design-preferences の
+/// 「引数なし実行時は --help を表示」「子・孫ネスト可」)。最初の positional を
+/// 子 subcommand 名として扱い、`dump` 以外は UnknownSubcommand 扱い。
+fn parse_screen(args: &[String]) -> Command {
+    if args.is_empty() {
+        return Command::Help {
+            topic: HelpTopic::Screen,
+        };
+    }
+    let head = args[0].as_str();
+    match head {
+        "--help" | "-h" => Command::Help {
+            topic: HelpTopic::Screen,
+        },
+        "dump" => parse_screen_dump(&args[1..]),
+        // 将来 `screen snapshot` を追加する slot。今は未実装で reserved 扱い。
+        "snapshot" => {
+            Command::Error("screen snapshot: 未実装 (= 別 task で配線予定、DR-0006 §10.3)".into())
+        }
+        other if other.starts_with('-') => {
+            Command::Error(format!("screen: unknown option: {other}"))
+        }
+        other => Command::Error(format!(
+            "screen: unknown subcommand `{other}` (supported: dump)"
+        )),
+    }
+}
+
+/// `screen dump <session>` parser (= DR-0013 §9 + DR-0006 §10.2)。
+///
+/// 受理する options:
+/// - `--socket=<path>` — session_id の代替 (= shared helper)
+/// - `--format=ansi|binary|cbor` (= default ansi)。`json` は MVP scope 外
+/// - `--layer=visible|scrollback|both` (= default visible、MVP は visible のみ)
+/// - `--rect=x,y,w,h` (= u16 4 つ、forward-compat: daemon は現状無視)
+/// - `--output=<path>` — stdout の代わりに file へ書き出し
+/// - `--timeout=<ms>` — response 受信 timeout (= default 5000ms)
+#[allow(clippy::result_large_err)]
+fn parse_screen_dump(args: &[String]) -> Command {
+    let mut format = ScreenDumpCliFormat::default();
+    let mut layer = ScreenDumpCliLayer::default();
+    let mut rect: Option<ScreenDumpCliRect> = None;
+    let mut output: Option<String> = None;
+    let mut timeout_ms: u64 = 5_000;
+    let res = parse_session_targeted("screen dump", args, HelpTopic::ScreenDump, |opt, value| {
+        match opt {
+            "--format" => {
+                let v = value.ok_or_else(|| {
+                    Command::Error("screen dump: --format requires a value".into())
+                })?;
+                match v.as_str() {
+                    "ansi" => {
+                        format = ScreenDumpCliFormat::Ansi;
+                        Ok(true)
+                    }
+                    "binary" => {
+                        format = ScreenDumpCliFormat::Binary;
+                        Ok(true)
+                    }
+                    "cbor" => {
+                        format = ScreenDumpCliFormat::Cbor;
+                        Ok(true)
+                    }
+                    "json" => Err(Command::Error(
+                        "screen dump: --format=json は MVP scope 外 (= 別 task)。\
+                         ansi / binary / cbor を使ってください"
+                            .into(),
+                    )),
+                    other => Err(Command::Error(format!(
+                        "screen dump: --format must be `ansi`|`binary`|`cbor`, got {other:?}"
+                    ))),
+                }
+            }
+            "--layer" => {
+                let v = value.ok_or_else(|| {
+                    Command::Error("screen dump: --layer requires a value".into())
+                })?;
+                match v.as_str() {
+                    "visible" => {
+                        layer = ScreenDumpCliLayer::Visible;
+                        Ok(true)
+                    }
+                    "scrollback" => {
+                        layer = ScreenDumpCliLayer::Scrollback;
+                        Ok(true)
+                    }
+                    "both" => {
+                        layer = ScreenDumpCliLayer::Both;
+                        Ok(true)
+                    }
+                    other => Err(Command::Error(format!(
+                        "screen dump: --layer must be `visible`|`scrollback`|`both`, got {other:?}"
+                    ))),
+                }
+            }
+            "--rect" => {
+                let v = value
+                    .ok_or_else(|| Command::Error("screen dump: --rect requires a value".into()))?;
+                let parsed = parse_screen_dump_rect(&v).map_err(|e| {
+                    Command::Error(format!("screen dump: --rect: {e} (expected x,y,w,h)"))
+                })?;
+                rect = Some(parsed);
+                Ok(true)
+            }
+            "--output" => {
+                let v = value.ok_or_else(|| {
+                    Command::Error("screen dump: --output requires a value".into())
+                })?;
+                output = Some(v);
+                Ok(true)
+            }
+            "--timeout" => {
+                let v = value.ok_or_else(|| {
+                    Command::Error("screen dump: --timeout requires a value".into())
+                })?;
+                let ms = parse_duration_ms(&v)
+                    .map_err(|e| Command::Error(format!("screen dump: --timeout: {e}")))?;
+                timeout_ms = ms;
+                Ok(true)
+            }
+            other => Err(Command::Error(format!(
+                "screen dump: unknown option: {other}"
+            ))),
+        }
+    });
+    match res {
+        Ok((socket, session_id)) => Command::Screen(ScreenCommand::Dump(ScreenDumpConfig {
+            socket,
+            session_id,
+            format,
+            layer,
+            rect,
+            output,
+            timeout_ms,
+        })),
+        Err(c) => c,
+    }
+}
+
+/// `--rect=x,y,w,h` を `ScreenDumpCliRect` に変換する。各 component は u16 範囲。
+fn parse_screen_dump_rect(s: &str) -> Result<ScreenDumpCliRect, String> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 4 {
+        return Err(format!(
+            "expected 4 comma-separated values (x,y,w,h), got {} part(s) in {s:?}",
+            parts.len()
+        ));
+    }
+    let mut vals = [0u16; 4];
+    for (i, p) in parts.iter().enumerate() {
+        let trimmed = p.trim();
+        if trimmed.is_empty() {
+            return Err(format!("empty component at index {i} in {s:?}"));
+        }
+        vals[i] = trimmed
+            .parse::<u16>()
+            .map_err(|e| format!("invalid u16 at index {i} ({trimmed:?}): {e}"))?;
+    }
+    Ok(ScreenDumpCliRect {
+        x: vals[0],
+        y: vals[1],
+        w: vals[2],
+        h: vals[3],
+    })
+}
+
 fn parse_completion(args: &[String]) -> Command {
     if args.is_empty() {
         return Command::Error("completion requires a shell name (bash|zsh|fish)".into());
@@ -1384,6 +1643,7 @@ fn usage_top(unknown: Option<&str>) -> String {
             status      Print session status (clients/leader/lock/scrollback)\n    \
             tail        Stream scrollback / live output (--follow で継続)\n    \
             wait        Wait until predicate (text/pattern/idle) matches\n    \
+            screen      Dump / inspect virtual screen state (subcommands: dump)\n    \
             completion  Print a shell completion script (bash|zsh|fish)\n\
         \n\
         RESERVED (not yet implemented):\n    \
@@ -1666,6 +1926,73 @@ fn usage_kill() -> String {
         RELATED:\n    \
             hyoui list          attach 可能な session 一覧 (= 対象選び)\n    \
             hyoui status <id>   session の現在状態を確認\n",
+    )
+}
+
+fn usage_screen() -> String {
+    String::from(
+        "hyoui screen — inspect / dump virtual screen state (DR-0006 §10)\n\
+        \n\
+        USAGE:\n    \
+            hyoui screen <subcommand> [options]\n\
+        \n\
+        SUBCOMMANDS:\n    \
+            dump        Dump visible (or scrollback) bytes (= ANSI / binary / CBOR)\n\
+        \n\
+        RESERVED (not yet implemented):\n    \
+            snapshot    structured state query (= DR-0006 §10.3、別 task で配線)\n\
+        \n\
+        OPTIONS:\n    \
+            -h, --help      Show this help and exit\n\
+        \n\
+        Run `hyoui screen <subcommand> --help` for per-subcommand help.\n",
+    )
+}
+
+fn usage_screen_dump() -> String {
+    String::from(
+        "hyoui screen dump — dump virtual screen state (DR-0013 §9 + DR-0006 §10.2)\n\
+        \n\
+        USAGE:\n    \
+            hyoui screen dump <session-id> [options]\n    \
+            hyoui screen dump --socket=<path> [options]\n\
+        \n\
+        OPTIONS:\n    \
+            --socket PATH       Explicit socket path (alternative to session-id)\n    \
+            --format FMT        Output format (default: ansi)\n                        \
+                ansi   — raw ANSI bytes (= terminal で cat 再生可)\n                        \
+                binary — 空白除去 + 改行 plaintext (= grep 用)\n                        \
+                cbor   — CBOR encoded ScreenSnapshot (= 機械処理)\n                        \
+                (json は MVP scope 外 / 別 task)\n    \
+            --layer LAYER       Layer (default: visible)\n                        \
+                visible    — 現在 viewport (= MVP 唯一の実装済)\n                        \
+                scrollback — 過去のみ (= forward-compat、daemon 側未実装)\n                        \
+                both       — scrollback + visible (= 同上)\n    \
+            --rect X,Y,W,H      矩形指定 (forward-compat: daemon 現状無視)\n    \
+            --output PATH       書き出し先 (= 未指定なら stdout)\n    \
+            --timeout DUR       response 受信 timeout (= default 5s。DUR 形式: 5s/500ms/...)\n    \
+            -h, --help          Show this help and exit\n\
+        \n\
+        ENVIRONMENT:\n    \
+            HYOUI_LOCK_TOKEN    lock token を env で渡す (= handshake.token)\n\
+        \n\
+        EXIT CODE:\n    \
+            0   正常終了 (= response 受信、payload を出力済)\n    \
+            1   connect / I/O / daemon error (= daemon が unsupported-capability\n        \
+                を返す場合も含む)\n    \
+            2   引数不足 / 未知 option\n\
+        \n\
+        EXAMPLES:\n    \
+            hyoui screen dump demo                      # 現在 visible の ANSI dump (stdout)\n    \
+            hyoui screen dump demo --format=ansi | cat  # terminal で再生\n    \
+            hyoui screen dump demo --output=screen.ans  # ファイルに保存\n    \
+            hyoui screen dump demo --format=cbor > s.cbor  # CBOR binary 保存\n    \
+            hyoui screen dump demo --format=binary | grep ERROR\n\
+        \n\
+        RELATED:\n    \
+            hyoui screen snapshot <id>   構造化 state query (= 未実装、別 task)\n    \
+            hyoui wait <id> ...          状態条件を待つ\n    \
+            hyoui tail <id>              bytes stream を流す\n",
     )
 }
 
@@ -2864,5 +3191,253 @@ mod tests {
             Command::Error(_) => {}
             other => panic!("expected Error for invalid session_id, got {other:?}"),
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // DR-0013 §9 + DR-0006 §10.2: `screen dump` subcommand parser tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_screen_no_args_shows_parent_help() {
+        match parse_args(&args(&["screen"])) {
+            Command::Help { topic } => assert_eq!(topic, HelpTopic::Screen),
+            other => panic!("expected Help::Screen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_help_flag_shows_parent_help() {
+        match parse_args(&args(&["screen", "--help"])) {
+            Command::Help { topic } => assert_eq!(topic, HelpTopic::Screen),
+            other => panic!("expected Help::Screen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_unknown_subcommand_errors() {
+        match parse_args(&args(&["screen", "bogus"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("bogus"), "msg should mention name: {msg}")
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_snapshot_reserved() {
+        // snapshot は別 task 予定なので Error で reject (= 早期 fail)。
+        match parse_args(&args(&["screen", "snapshot", "demo"])) {
+            Command::Error(msg) => assert!(msg.contains("未実装") || msg.contains("snapshot")),
+            other => panic!("expected Error for snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_dump_default_format_and_layer() {
+        match parse_args(&args(&["screen", "dump", "demo"])) {
+            Command::Screen(ScreenCommand::Dump(cfg)) => {
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert!(cfg.socket.is_none());
+                assert_eq!(cfg.format, ScreenDumpCliFormat::Ansi);
+                assert_eq!(cfg.layer, ScreenDumpCliLayer::Visible);
+                assert!(cfg.rect.is_none());
+                assert!(cfg.output.is_none());
+                assert_eq!(cfg.timeout_ms, 5_000);
+            }
+            other => panic!("expected Screen::Dump, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_dump_help_flag() {
+        match parse_args(&args(&["screen", "dump", "--help"])) {
+            Command::Help { topic } => assert_eq!(topic, HelpTopic::ScreenDump),
+            other => panic!("expected Help::ScreenDump, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_dump_format_choices() {
+        for (s, want) in &[
+            ("ansi", ScreenDumpCliFormat::Ansi),
+            ("binary", ScreenDumpCliFormat::Binary),
+            ("cbor", ScreenDumpCliFormat::Cbor),
+        ] {
+            let arg = format!("--format={s}");
+            match parse_args(&args(&["screen", "dump", "demo", &arg])) {
+                Command::Screen(ScreenCommand::Dump(cfg)) => {
+                    assert_eq!(&cfg.format, want, "format {s}");
+                }
+                other => panic!("expected Screen::Dump for format={s}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_screen_dump_format_json_rejected() {
+        match parse_args(&args(&["screen", "dump", "demo", "--format=json"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("MVP") || msg.contains("json") || msg.contains("scope"))
+            }
+            other => panic!("expected Error for --format=json, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_dump_format_invalid_errors() {
+        match parse_args(&args(&["screen", "dump", "demo", "--format=xml"])) {
+            Command::Error(msg) => assert!(msg.contains("xml")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_dump_layer_choices() {
+        for (s, want) in &[
+            ("visible", ScreenDumpCliLayer::Visible),
+            ("scrollback", ScreenDumpCliLayer::Scrollback),
+            ("both", ScreenDumpCliLayer::Both),
+        ] {
+            let arg = format!("--layer={s}");
+            match parse_args(&args(&["screen", "dump", "demo", &arg])) {
+                Command::Screen(ScreenCommand::Dump(cfg)) => {
+                    assert_eq!(&cfg.layer, want, "layer {s}");
+                }
+                other => panic!("expected Screen::Dump for layer={s}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_screen_dump_rect_ok() {
+        match parse_args(&args(&["screen", "dump", "demo", "--rect=0,1,80,24"])) {
+            Command::Screen(ScreenCommand::Dump(cfg)) => {
+                let r = cfg.rect.expect("rect should be set");
+                assert_eq!(r.x, 0);
+                assert_eq!(r.y, 1);
+                assert_eq!(r.w, 80);
+                assert_eq!(r.h, 24);
+            }
+            other => panic!("expected Screen::Dump, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_dump_rect_with_spaces_ok() {
+        // 余白 trim する
+        match parse_args(&args(&[
+            "screen",
+            "dump",
+            "demo",
+            "--rect= 0 , 0 , 10 , 5 ",
+        ])) {
+            Command::Screen(ScreenCommand::Dump(cfg)) => {
+                let r = cfg.rect.expect("rect should be set");
+                assert_eq!((r.x, r.y, r.w, r.h), (0, 0, 10, 5));
+            }
+            other => panic!("expected Screen::Dump, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_dump_rect_wrong_count_errors() {
+        match parse_args(&args(&["screen", "dump", "demo", "--rect=0,1,80"])) {
+            Command::Error(msg) => assert!(msg.contains("4")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_dump_rect_invalid_int_errors() {
+        match parse_args(&args(&["screen", "dump", "demo", "--rect=0,1,abc,24"])) {
+            Command::Error(msg) => assert!(msg.contains("u16") || msg.contains("invalid")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_dump_output_option() {
+        match parse_args(&args(&[
+            "screen",
+            "dump",
+            "demo",
+            "--output=/tmp/screen.ans",
+        ])) {
+            Command::Screen(ScreenCommand::Dump(cfg)) => {
+                assert_eq!(cfg.output.as_deref(), Some("/tmp/screen.ans"));
+            }
+            other => panic!("expected Screen::Dump, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_dump_timeout_option() {
+        match parse_args(&args(&["screen", "dump", "demo", "--timeout=2s"])) {
+            Command::Screen(ScreenCommand::Dump(cfg)) => {
+                assert_eq!(cfg.timeout_ms, 2_000);
+            }
+            other => panic!("expected Screen::Dump, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_dump_socket_alternative() {
+        match parse_args(&args(&["screen", "dump", "--socket=/tmp/x.sock"])) {
+            Command::Screen(ScreenCommand::Dump(cfg)) => {
+                assert_eq!(cfg.socket.as_deref(), Some("/tmp/x.sock"));
+                assert!(cfg.session_id.is_none());
+            }
+            other => panic!("expected Screen::Dump, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_dump_requires_session_or_socket() {
+        match parse_args(&args(&["screen", "dump"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("session") || msg.contains("socket"))
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_dump_unknown_option_errors() {
+        match parse_args(&args(&["screen", "dump", "demo", "--bogus"])) {
+            Command::Error(msg) => assert!(msg.contains("bogus") || msg.contains("screen dump")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_dump_rejects_invalid_session_id() {
+        match parse_args(&args(&["screen", "dump", "../foo"])) {
+            Command::Error(_) => {}
+            other => panic!("expected Error for invalid session_id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_screen_lists_dump_subcommand() {
+        let text = usage(&HelpTopic::Screen);
+        assert!(text.contains("hyoui screen"));
+        assert!(text.contains("dump"));
+    }
+
+    #[test]
+    fn usage_screen_dump_lists_options() {
+        let text = usage(&HelpTopic::ScreenDump);
+        assert!(text.contains("hyoui screen dump"));
+        assert!(text.contains("--format"));
+        assert!(text.contains("--layer"));
+        assert!(text.contains("--rect"));
+        assert!(text.contains("--output"));
+        assert!(text.contains("--timeout"));
+    }
+
+    #[test]
+    fn usage_top_lists_screen() {
+        let text = usage(&HelpTopic::Top);
+        assert!(text.contains("screen"));
     }
 }
