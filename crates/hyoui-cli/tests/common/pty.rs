@@ -290,41 +290,17 @@ impl SpawnedHyoui {
         nix::sys::signal::kill(self.pid, sig)
     }
 
-    /// 子の process state を取得する (= `ps -o pid,ppid,pgid,sid,stat,comm` 相当)。
+    /// 子の process state を取得する (= `ps -o pid,ppid,pgid,stat,comm` 相当)。
     ///
     /// macOS / Linux 両対応のため、`ps` コマンドを subprocess で呼ぶ
     /// (= /proc は macOS にない、`ps` は POSIX で利用可能)。
+    ///
+    /// **注**: `sid` (session id) は macOS の `ps` keyword では非対応のため
+    /// 含めない (= 既存 keyword set で両 OS 動作確認済)。session leader 判定が
+    /// 必要な場面は `state.pgid == state.pid` で代替 (= DR-0001 §実装ノート
+    /// 「子は独立セッションリーダーなので 子の pgid == 子の pid」)。
     pub fn process_state(&self) -> std::io::Result<ProcessState> {
-        let pid_str = self.pid.as_raw().to_string();
-        let out = Command::new("ps")
-            .args(["-o", "pid=,ppid=,pgid=,sid=,stat=,comm=", "-p", &pid_str])
-            .output()?;
-        if !out.status.success() {
-            return Err(std::io::Error::other(format!(
-                "ps failed (status={}): stderr={:?}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            )));
-        }
-        let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 6 {
-            return Err(std::io::Error::other(format!(
-                "ps output unparseable (need 6+ fields): {line:?}"
-            )));
-        }
-        let parse_i32 = |s: &str| -> std::io::Result<i32> {
-            s.parse::<i32>()
-                .map_err(|e| std::io::Error::other(format!("parse {s:?}: {e}")))
-        };
-        Ok(ProcessState {
-            pid: parse_i32(parts[0])?,
-            ppid: parse_i32(parts[1])?,
-            pgid: parse_i32(parts[2])?,
-            sid: parse_i32(parts[3])?,
-            stat: parts[4].to_string(),
-            comm: parts[5..].join(" "),
-        })
+        process_state_of(self.pid.as_raw())
     }
 
     /// `hyoui screen dump --socket=<sock> --format=ansi` を別 process で呼んで
@@ -383,17 +359,153 @@ impl Drop for SpawnedHyoui {
     }
 }
 
-/// `ps` 出力から抽出した子の state。
+/// `ps` 出力から抽出した process state。
+///
+/// session leader 判定は `pgid == pid` で行う (= macOS の `ps -o sid=` 非対応の
+/// workaround)。
 #[derive(Debug, Clone)]
 pub struct ProcessState {
     pub pid: i32,
     pub ppid: i32,
     pub pgid: i32,
-    pub sid: i32,
     /// `ps` の stat field (= "R", "S", "T", "Z+", "Ss" 等)。
+    /// 1 文字目が state 主分類:
+    /// - `R`: Running
+    /// - `S`: Sleeping (interruptible)
+    /// - `T`: Stopped (= SIGSTOP/SIGTSTP)
+    /// - `Z`: Zombie
+    /// - `I`: Idle (macOS, BSD)
     pub stat: String,
-    /// `ps` の comm (= 短い process 名)。
+    /// `ps` の comm (= 短い process 名)。macOS は `/full/path/to/binary args...`
+    /// が出る場合もあるので、test 側で startsWith / contains で比較する想定。
     pub comm: String,
+}
+
+impl ProcessState {
+    /// `stat` の主分類が指定文字に一致するかを返す (= 例: `is_state('T')` で
+    /// Stopped 判定)。`ps` の stat は "Ss" / "S+" 等の suffix を含む場合があるため、
+    /// 1 文字目だけを見る。
+    pub fn is_state(&self, primary: char) -> bool {
+        self.stat.starts_with(primary)
+    }
+}
+
+/// 指定 PID の process state を取得する (= `ps -p <pid> -o ...`)。
+///
+/// macOS/Linux 両対応の最小 keyword set (`pid,ppid,pgid,stat,comm`) を使う。
+/// プロセスが既に消えている場合は `ps` が空 stdout + status=1 を返すので
+/// `NotFound` 系 err として伝播。
+pub fn process_state_of(pid: i32) -> std::io::Result<ProcessState> {
+    let pid_str = pid.to_string();
+    let out = Command::new("ps")
+        .args(["-o", "pid=,ppid=,pgid=,stat=,comm=", "-p", &pid_str])
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "ps -p {pid_str} failed (status={}): stderr={:?}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        ));
+    }
+    let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if line.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("ps -p {pid_str}: empty output (process gone?)"),
+        ));
+    }
+    parse_ps_line(&line)
+}
+
+/// `ps -A -o pid=,ppid=,pgid=,stat=,comm=` の出力を全 process 分 parse する。
+///
+/// 内部 helper、test 側からは `find_children` / `find_descendants` 経由で使う。
+fn all_processes() -> std::io::Result<Vec<ProcessState>> {
+    let out = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,pgid=,stat=,comm="])
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "ps -A failed (status={}): stderr={:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    let mut result = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(ps) = parse_ps_line(line) {
+            result.push(ps);
+        }
+        // parse 失敗行は skip (= comm に space を含む行で 5 field を割らない
+        // ケースは parse_ps_line の堅牢化で吸収される)
+    }
+    Ok(result)
+}
+
+/// `ps -o pid=,ppid=,pgid=,stat=,comm=` の 1 行を parse する。
+///
+/// `comm` (5 番目以降) は空白を含むことがある (= macOS は full path + args が
+/// 出る場合) ので、最初の 4 field を `split_whitespace` で取り、残りを `comm`
+/// に join する。
+fn parse_ps_line(line: &str) -> std::io::Result<ProcessState> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 5 {
+        return Err(std::io::Error::other(format!(
+            "ps line unparseable (need 5+ fields): {line:?}"
+        )));
+    }
+    let parse_i32 = |s: &str| -> std::io::Result<i32> {
+        s.parse::<i32>()
+            .map_err(|e| std::io::Error::other(format!("parse {s:?}: {e}")))
+    };
+    Ok(ProcessState {
+        pid: parse_i32(parts[0])?,
+        ppid: parse_i32(parts[1])?,
+        pgid: parse_i32(parts[2])?,
+        stat: parts[3].to_string(),
+        comm: parts[4..].join(" "),
+    })
+}
+
+/// 指定 PID を親に持つ直接の子プロセス一覧を返す (= ppid == parent_pid)。
+pub fn find_children(parent_pid: i32) -> std::io::Result<Vec<ProcessState>> {
+    let all = all_processes()?;
+    Ok(all.into_iter().filter(|p| p.ppid == parent_pid).collect())
+}
+
+/// 直接の子を 1 つだけ返す (= 複数いれば最初の 1 つ、いなければ `NotFound`)。
+pub fn find_child_of(parent_pid: i32) -> std::io::Result<ProcessState> {
+    let children = find_children(parent_pid)?;
+    children.into_iter().next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no child found for ppid={parent_pid}"),
+        )
+    })
+}
+
+/// 指定 PID の子孫 (= 子・孫・ひ孫 ...) 全部を返す。
+///
+/// 単純な BFS で `ppid` を辿る。`root_pid` 自身は含めない。
+pub fn find_descendants(root_pid: i32) -> std::io::Result<Vec<ProcessState>> {
+    let all = all_processes()?;
+    let mut result = Vec::new();
+    let mut frontier: Vec<i32> = vec![root_pid];
+    while let Some(parent) = frontier.pop() {
+        for p in &all {
+            if p.ppid == parent && !result.iter().any(|r: &ProcessState| r.pid == p.pid) {
+                result.push(p.clone());
+                frontier.push(p.pid);
+            }
+        }
+    }
+    Ok(result)
 }
 
 /// `haystack` 内に `needle` が初めて現れる index を返す (= byte-level substring search)。
