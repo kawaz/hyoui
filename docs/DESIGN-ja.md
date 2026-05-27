@@ -95,12 +95,16 @@ Frame: [u32 LE size][u8 type][body]   size ≤ 16 MiB
 Control message body (type=0x01) = CBOR map { "kind": "<dotted.name>", ...payload }
   例: handshake.request / handshake.response / lock.acquire / lock.response
        resize / signal / tail.request / tail.data / tail.end
-       wait.request / wait.result / status.query / status.response / error / kill
+       screen.dump.request / screen.dump.response / screen.snapshot.request /
+       screen.snapshot.response / status.query / status.response / error / kill
 ```
 
 - **wire 外枠 (size + type + body) は永久固定**。breaking change は別 socket path で fork
 - 制御メッセージは CBOR map で **未知 field は ignore**、cap flags で「相手が話せるか」交渉
-- v0.1.0 cap 集合: `["data", "lock", "tail-v1", "wait-l0"]`
+- v0.1.0 cap 集合: `["data", "lock", "tail-v1", "screen-dump-v1", "state-snapshot-v1"]`
+- wait は **state-based** (= cap なし、CLI 側で `screen.snapshot.request` を polling)。
+  旧 `wait.request` / `wait.result` (scrollback regex 経路、`wait-l0` cap) は
+  DR-0006 §9 改訂で廃止
 
 ### 2.3 daemon (`crates/hyoui/src/daemon/session.rs`)
 

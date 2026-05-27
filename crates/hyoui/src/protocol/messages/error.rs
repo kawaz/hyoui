@@ -67,12 +67,6 @@ pub enum ErrorCode {
     LockNotHeld,
     /// `signal.invalid` — signal 番号 / 名前が不正。
     SignalInvalid,
-    /// `wait.too-many` — wait 同時実行数の上限超過。
-    WaitTooMany,
-    /// `wait.invalid-text` — wait の text 引数が不正 (空 / encoding 等)。
-    WaitInvalidText,
-    /// `wait.invalid-pattern` — wait の pattern (正規表現) が不正。
-    WaitInvalidPattern,
     /// `detach.target-partial` — detach 対象指定の一部が見つからない / 失敗。
     DetachTargetPartial,
     /// `master.write-timeout` — client → master PTY への raw_data write が、
@@ -107,9 +101,6 @@ impl ErrorCode {
             ErrorCode::LockDenied => "lock.denied",
             ErrorCode::LockNotHeld => "lock.not-held",
             ErrorCode::SignalInvalid => "signal.invalid",
-            ErrorCode::WaitTooMany => "wait.too-many",
-            ErrorCode::WaitInvalidText => "wait.invalid-text",
-            ErrorCode::WaitInvalidPattern => "wait.invalid-pattern",
             ErrorCode::DetachTargetPartial => "detach.target-partial",
             ErrorCode::MasterWriteTimeout => "master.write-timeout",
             ErrorCode::InternalError => "internal.error",
@@ -132,9 +123,6 @@ impl ErrorCode {
             "lock.denied" => ErrorCode::LockDenied,
             "lock.not-held" => ErrorCode::LockNotHeld,
             "signal.invalid" => ErrorCode::SignalInvalid,
-            "wait.too-many" => ErrorCode::WaitTooMany,
-            "wait.invalid-text" => ErrorCode::WaitInvalidText,
-            "wait.invalid-pattern" => ErrorCode::WaitInvalidPattern,
             "detach.target-partial" => ErrorCode::DetachTargetPartial,
             "master.write-timeout" => ErrorCode::MasterWriteTimeout,
             "internal.error" => ErrorCode::InternalError,
@@ -202,9 +190,6 @@ mod tests {
             (ErrorCode::LockDenied, "lock.denied"),
             (ErrorCode::LockNotHeld, "lock.not-held"),
             (ErrorCode::SignalInvalid, "signal.invalid"),
-            (ErrorCode::WaitTooMany, "wait.too-many"),
-            (ErrorCode::WaitInvalidText, "wait.invalid-text"),
-            (ErrorCode::WaitInvalidPattern, "wait.invalid-pattern"),
             (ErrorCode::DetachTargetPartial, "detach.target-partial"),
             (ErrorCode::MasterWriteTimeout, "master.write-timeout"),
             (ErrorCode::InternalError, "internal.error"),

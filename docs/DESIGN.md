@@ -105,14 +105,18 @@ Frame: [u32 LE size][u8 type][body]   size ≤ 16 MiB
 Control message body (type=0x01) = CBOR map { "kind": "<dotted.name>", ...payload }
   e.g. handshake.request / handshake.response / lock.acquire / lock.response
        resize / signal / tail.request / tail.data / tail.end
-       wait.request / wait.result / status.query / status.response / error / kill
+       screen.dump.request / screen.dump.response / screen.snapshot.request /
+       screen.snapshot.response / status.query / status.response / error / kill
 ```
 
 - The **outer wire envelope (size + type + body) is permanently fixed**;
   breaking changes use a separate socket path (fork)
 - Control messages are CBOR maps where **unknown fields are ignored**;
   cap flags negotiate "what the peer can speak"
-- v0.1.0 cap set: `["data", "lock", "tail-v1", "wait-l0"]`
+- v0.1.0 cap set: `["data", "lock", "tail-v1", "screen-dump-v1", "state-snapshot-v1"]`
+- Wait is **state-based** (= no cap; CLI side polls `screen.snapshot.request`).
+  The legacy `wait.request` / `wait.result` path (scrollback regex, `wait-l0`
+  cap) was removed per the DR-0006 §9 revision.
 
 ### 2.3 Daemon (`crates/hyoui/src/daemon/session.rs`)
 

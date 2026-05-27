@@ -702,7 +702,6 @@ mod tests {
                 "data".to_string(),
                 "lock".into(),
                 "tail-v1".into(),
-                "wait-l0".into(),
                 "screen-dump-v1".into(),
                 "state-snapshot-v1".into(),
             ]

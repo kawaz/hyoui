@@ -9,21 +9,21 @@ use std::collections::BTreeSet;
 
 /// MVP (v0.1.0) で hyoui daemon / client が両方持つ capability の名前一覧。
 ///
-/// DR-0007 / DR-0008 §8 に整合 (= MVP scope: data 中継 / lock / tail / wait-l0)。
-/// 将来 cap (snapshot / wait L1+ / leader CLI 等) は v0.2.0+ で追加。
+/// DR-0007 / DR-0008 §8 に整合 (= MVP scope: data 中継 / lock / tail /
+/// state-based wait)。state-based wait は cap を持たず、CLI 側で
+/// `screen.snapshot.request` を polling する形に再実装された (DR-0006 §9 改訂)。
+/// 将来 cap (leader CLI 等) は v0.2.0+ で追加。
 ///
 /// 各 cap の意味:
 /// - `"data"`: raw PTY data 中継 (= type=0x00 frame、子 stdout/stdin)
 /// - `"lock"`: `lock.*` + `leader.notify` + `mode.change` messages
 /// - `"tail-v1"`: `tail.*` messages (`-v1` は schema breaking change の余地)
-/// - `"wait-l0"`: `wait.*` messages の L0 述語 (text/pattern/idle)。L1+ は別 cap
 /// - `"screen-dump-v1"`: `screen.dump.*` messages (DR-0013 §9、debug / 自動 test 用)
 /// - `"state-snapshot-v1"`: `screen.snapshot.*` messages (DR-0013 §9、構造化 state)
 pub const MVP_CAPS: &[&str] = &[
     "data",
     "lock",
     "tail-v1",
-    "wait-l0",
     "screen-dump-v1",
     "state-snapshot-v1",
 ];
@@ -73,7 +73,14 @@ mod tests {
         assert!(MVP_CAPS.contains(&"data"));
         assert!(MVP_CAPS.contains(&"lock"));
         assert!(MVP_CAPS.contains(&"tail-v1"));
-        assert!(MVP_CAPS.contains(&"wait-l0"));
+        assert!(MVP_CAPS.contains(&"screen-dump-v1"));
+        assert!(MVP_CAPS.contains(&"state-snapshot-v1"));
+    }
+
+    /// wait-l0 cap は DR-0006 §9 改訂 (state-based wait 移行) に伴い削除済。
+    #[test]
+    fn mvp_caps_does_not_contain_removed_wait_l0() {
+        assert!(!MVP_CAPS.contains(&"wait-l0"));
     }
 
     #[test]
