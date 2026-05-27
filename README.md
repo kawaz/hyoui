@@ -20,6 +20,12 @@ hyoui launches an arbitrary command inside a PTY, stays completely transparent
 toward the child, and instead offers a **foothold from the outside** to observe,
 inject input, and drive the process from CLI / scripts.
 
+The daemon parses the child PTY through a [`vt100`](https://docs.rs/vt100)-based
+screen emulator and **owns the canonical screen state**. That foundation is
+what makes attach restore (including observing alt-screen-resident TUIs),
+match-against-current-visible-state `wait`, and structured snapshots work
+reliably ([[DR-0013]]).
+
 ## Who is hyoui for?
 
 hyoui is not a tool you "live inside" of — it is a tool that drives one from
@@ -31,7 +37,7 @@ the outside. You probably want it if:
   e.g. reconnect from your phone via SSH to a `claude` session you left running
   overnight
 - **You want to drive an interactive command from a test or ops script** with
-  input injection (`send`) and output waiting (`wait`) via a single CLI
+  input injection and waiting against the current screen, all from a single CLI
 
 If your goal is "press `Ctrl-b` to split panes and live in a multiplexer", use
 tmux or zellij. hyoui is designed to **run inside** them.
@@ -47,9 +53,13 @@ subcommands (and a future HTTP gateway).
 Primary use cases:
 
 - Drive long-running interactive processes (e.g. `claude`, a REPL, `ssh`, a TUI
-  app) and attach/detach to them as many times as you like
-- Inject input and wait for output from CI / scripts (`send` / `wait`, expanded
-  in v0.2.0+)
+  app) and attach/detach to them as many times as you like. On attach the
+  daemon repaints the screen from its canonical state, so even alt-screen apps
+  come back without redraw glitches
+- Inject input and wait for output from CI / scripts via `hyoui input` with the
+  `text:` / `key:` / `paste:` / `wait:` / `wait-idle:` spec family, plus
+  `hyoui wait`, `hyoui screen dump` / `screen snapshot`, and `hyoui lock` /
+  `tx`
 - Share one session across multiple clients (pair programming, observation,
   human-in-the-loop)
 
@@ -121,14 +131,62 @@ hyoui attach "$SESS" --mode=ro
 hyoui kill "$SESS"
 ```
 
-### Subcommands (v0.1.0)
+Attach repaints the screen from the daemon's canonical state in a single
+frame ([[DR-0013]] §4 Phase A), so alt-screen-resident apps like the `claude`
+TUI come back exactly as they were before detach.
+
+### Automation: input / wait / screen / lock
+
+```bash
+# direct text combined with a key
+hyoui input "$SESS" "text:ls -la" "key:Enter"
+
+# match against the current visible state (no false hits from past redraws)
+hyoui input "$SESS" "wait:^Continue\\?" "key:Enter"
+
+# binary control bytes (= ESC[A = Up arrow)
+hyoui input "$SESS" "hex:1b5b41"
+
+# multi-line script via bracketed paste
+hyoui input "$SESS" "paste:$(cat script.py)"
+
+# standalone wait (with timeout / printing controls)
+hyoui wait "$SESS" "^\\$" --timeout=10s --print=line
+
+# screen dump (ANSI bytes; reproduces in a terminal via cat)
+hyoui screen dump "$SESS"
+hyoui screen dump "$SESS" --layer=both --rect=0,0,80,5
+
+# structured snapshot (JSON; easy to pipe into jq)
+hyoui screen snapshot "$SESS" --include=Cursor
+hyoui screen snapshot "$SESS" --include=Cells,Cursor,Mode | jq '.cursor'
+
+# exclusive acquire (other clients become forced-ro; you become leader)
+hyoui lock acquire "$SESS" --timeout-idle=30s
+hyoui lock release "$SESS"
+
+# transactional locking (child process inherits HYOUI_LOCK_TOKEN;
+# auto-released on child exit)
+hyoui lock tx "$SESS" -- hyoui input "$SESS" "wait:^Prompt>" "text:..." "key:Enter"
+
+# raw byte stream for grep / save (log / asciinema preprocessing)
+hyoui tail "$SESS" --since-strict --last-bytes=4096
+```
+
+### Main subcommands
 
 | Command | Purpose |
 |---|---|
 | `hyoui run [--detached] [--session=ID] [--size=COLSxROWS] -- cmd args...` | Start a PTY and daemonize |
-| `hyoui attach <session> \| --socket=PATH [--mode=rw\|ro\|rw-no-leader] [--exclusive] [--detach-others]` | I/O bridge |
+| `hyoui attach <session> [--mode=rw\|ro\|rw-no-leader]` | I/O bridge (repaints from screen state on attach) |
 | `hyoui list` | Enumerate active sessions |
 | `hyoui kill <session> [--signum=N]` | Send a signal to the child (default SIGTERM) |
+| `hyoui input <session> <spec>...` | Inject input via `text:` / `hex:` / `file:` / `paste:` / `key:` / `wait:` / `wait-idle:` specs |
+| `hyoui wait <session> <pattern>` | Wait until a regex matches the current visible state |
+| `hyoui screen dump <session>` | Dump the screen as ANSI bytes (terminal-replayable) |
+| `hyoui screen snapshot <session>` | Structured screen-state snapshot (JSON / CBOR) |
+| `hyoui lock acquire\|release\|tx <session>` | Exclusion for atomic automation |
+| `hyoui tail <session>` | Raw byte stream (logging / grep / asciinema preprocessing) |
 
 See [`docs/DESIGN.md`](./docs/DESIGN.md) and
 [`docs/decisions/INDEX.md`](./docs/decisions/INDEX.md) for the full spec.
@@ -159,21 +217,27 @@ intended composition.
 | | hyoui | abduco / dtach | shpool | Pexpect / Expect | ttyd / gotty | asciinema |
 |---|---|---|---|---|---|---|
 | 1-daemon-1-session model | yes | yes | yes | no | no | no |
-| Input injection from external CLI | **first-class** (v0.2.0+) | no | no | library call | via browser | record-only |
-| Output waiting from outside | **first-class** (`wait`/`tail`) | no | no | `expect()` | no | no |
-| Record / replay | planned for v0.2.0+ | no | no | no | no | core feature |
-| HTTP / browser gateway | planned for v0.2.0+ (`serve`) | no | no | no | core feature | replay only |
+| Daemon owns canonical screen state | **yes** (vt100-based) | no | no | no | no | no |
+| Input injection from external CLI | **first-class** (`input` family) | no | no | library call | via browser | record-only |
+| Wait against the current visible state | **first-class** (state-based `wait`) | no | no | `expect()` (child PTY stream regex) | no | no |
+| Structured snapshot / dump | **first-class** (`screen dump` / `screen snapshot`) | no | no | no | no | no |
+| Record / replay | planned | no | no | no | no | core feature |
+| HTTP / browser gateway | planned (= `kawaz/hyoui-serve`) | no | no | no | core feature | replay only |
 | Daemon lifecycle | starts with `run`, exits with the child | session manager | long-lived server | dies with the child | server | N/A |
 
 In short: hyoui's unique position is **a 1-daemon-1-session transparent PTY
-wrapper with a first-class CLI / HTTP API for external automation**. abduco
-and dtach lack external automation, shpool is server-resident, ttyd assumes a
+wrapper** whose daemon **owns the canonical screen state**, with a
+**first-class CLI / HTTP API for external automation** on top. abduco and
+dtach lack external automation, shpool is server-resident, ttyd assumes a
 browser, and expect is a library. The goal is to put "the ergonomics of `expect`",
 "the attach experience of `abduco`", and "the remote reach of `ttyd`" into one
 CLI.
 
 See [DR-0005](./docs/decisions/DR-0005-design-philosophy-external-automation.md)
-for the full design philosophy.
+for the full design philosophy, and
+[DR-0013](./docs/decisions/DR-0013-screen-emulator-and-attach-stability.md)
+for the canonical-screen-state foundation behind attach restore and
+state-based automation.
 
 ## About the name
 
@@ -185,21 +249,28 @@ with it, and from the outside becomes a control handle
 
 ## Status
 
-v0.1.x = **external API stabilization phase**. The four commands `run` /
-`attach` / `list` / `kill`, plus multi-attach and protocol cap negotiation, are
-usable.
+v0.1.x = **external API stabilization phase**.
+
+- `run` / `attach` / `list` / `kill` + multi-attach + protocol cap
+  negotiation: stable since v0.1.0
+- Screen emulator adoption + attach handshake redraw + state-based wait /
+  snapshot / dump: completed in [[DR-0013]] Phase A/B (= the **core machinery
+  for observing claude TUI sessions and driving them from the outside is in
+  place**)
+- The input family (`text:` / `hex:` / `file:` / `paste:` / `key:` / `wait:`
+  / `wait-idle:` specs) and lock / tx are implemented
 
 **Production readiness:**
 
 - Tested platforms: Linux x86_64 / aarch64, macOS Intel / Apple Silicon
 - Breaking change policy: **during v0.x, minor bumps may include breaking changes**
   (we won't sell snake oil before the API solidifies)
-- Production use: **not yet recommended for v0.1.x**. kawaz uses it daily to
-  drive `claude` (eat-your-own-dogfood), but treat business-critical use as
-  self-test territory
-- **Production-stable target: v0.2.0+**, gated on the `serve` gateway and the
-  automation API surface (`send` / `keys` / `paste` / `wait` / `tail` / `lock` /
-  `tx`)
+- Production use: kawaz uses it daily to drive `claude`
+  (eat-your-own-dogfood), but treat business-critical use as self-test
+  territory for now
+- **Production-stable target**: after the `serve` gateway (in a separate repo
+  `kawaz/hyoui-serve`) ships and the remaining work (record / replay,
+  observability, L2 wait, ...) lands
 
 Roadmap details: [`docs/ROADMAP.md`](./docs/ROADMAP.md).
 
