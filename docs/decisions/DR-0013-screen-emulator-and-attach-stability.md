@@ -239,6 +239,29 @@ tmux の `window-size` option (= `smallest` / `largest` / `manual` / `latest`) �
 - scrollback の reflow は **やらない** (= MVP は dvtm pattern、過去行は元の wrap のまま)。
   要求が出たら tmux pattern に拡張は別 task
 
+#### Update (2026-05-27, Phase B 実装): byte-base / rows-base の責務分離方針に修正
+
+Phase B 実装着手時に「既存 `scrollback.rs` を vt100 内蔵 ring に置換」を素直に実施すると、
+**`hyoui tail` の `since_ms` / `since_strict` / `last_bytes` の byte-base timestamp 意味論が壊れる**
+(= vt100 内蔵 ring は rows-base、timestamp は持たない) ことが判明。
+
+修正方針:
+
+- **byte-base 層 (= `scrollback.rs`)**: tail コマンド用に維持 (= timestamp filter / 受信時刻順)。
+  そのまま残す
+- **rows-base 層 (= vt100 内蔵 ring)**: cell 単位アクセス用、screen.dump / screen.snapshot の
+  scrollback layer などで利用 (= Phase C で配線、現状は `Parser::new(_, _, 0)` で無効化)
+- 両層を **責務分離** (= 同じ「過去履歴」概念を別レイヤーで持つ)、二重管理ではなく
+  異なる用途の層と再定義
+
+bytes ↔ rows の換算 (= §7 の旧記述「`scrollback_rows = scrollback_bytes / (cols * 4)`」) も
+**廃止**。根拠が脆い (= cell byte 数は UTF-8 と style overhead で大きく揺れる) + tail 意味論を
+保つために換算自体が不要。代わりに `screen_input_log_bytes` (default 1 MiB) を独立 config として
+導入 (= Phase B 実装済)。
+
+`last_evicted_age` counter (= 上記の自前 `u64`) は **Phase C で配線**。Phase B 時点で
+vt100 内蔵 ring は無効化されているため、本 counter も未配線。
+
 ### 9. debug / inspection protocol (新規)
 
 機械観察 / 自動テスト用に CBOR control message を 2 種類追加する:
