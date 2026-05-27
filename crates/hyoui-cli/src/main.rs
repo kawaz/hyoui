@@ -17,9 +17,10 @@ use std::os::fd::AsFd;
 use std::process::ExitCode;
 
 use hyoui::cli::{
-    AttachConfig, Command, HelpTopic, KillConfig, ListConfig, ScreenCommand, ScreenDumpCliFormat,
-    ScreenDumpCliLayer, ScreenDumpConfig, ScreenSnapshotConfig, SnapshotCliComponent, StatusConfig,
-    TailConfig, WaitCliPredicate, WaitConfig, parse_args, usage,
+    AttachConfig, Command, HelpTopic, InputCommand, InputSpec, KillConfig, ListConfig,
+    ScreenCommand, ScreenDumpCliFormat, ScreenDumpCliLayer, ScreenDumpConfig, ScreenSnapshotConfig,
+    SnapshotCliComponent, StatusConfig, TailConfig, WaitCliPredicate, WaitConfig, parse_args,
+    usage,
 };
 use hyoui::client::{AttachOptions, ClientConnection};
 use hyoui::daemon::{DaemonConfig, Session};
@@ -178,6 +179,8 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+
+        Command::Input(cmd) => input_command(cmd),
 
         Command::Completion { shell } => {
             print!("{}", completion::script(shell));
@@ -1288,6 +1291,88 @@ fn write_screen_snapshot_payload(payload: &[u8], output: Option<&str>) -> ExitCo
                 }
             }
         }
+    }
+}
+
+/// `hyoui input <session> <spec>...` subcommand (= DR-0006 §8、task #15)。
+///
+/// 本タスクでは parser + dispatcher 骨格のみ。各 spec の実際の送信処理は
+/// 別 task で配線する:
+/// - text / hex / file / paste / key — task #16
+/// - wait / wait-idle — task #17
+///
+/// 現状の挙動: socket path resolve → connect/handshake は **skip** し、spec 配列を
+/// 順に [`dispatch_spec`] に渡す。dispatch_spec は全 variant で `not yet implemented`
+/// stderr を出して exit 1。最初の spec で fail するため後続 spec は走らない。
+///
+/// session_id 形式の validate は parser 側 (= `validate_session_id`) で済んでいる。
+/// `--socket=<path>` 経路で session_id 省略時も spec list は parser で必須化済。
+fn input_command(cmd: InputCommand) -> ExitCode {
+    // socket path resolve (= 後の task でこの connection を再利用)。本タスクでは
+    // dispatch_spec が即 bail するため connect 試行はしないが、socket / session_id
+    // どちらか必須の guard だけは保持する (= 早期 fail で UX を保つ)。
+    if cmd.socket.is_none() && cmd.session_id.is_none() {
+        // 通常 parser 側で reject されるはずだが defense-in-depth。
+        print_session_required("input");
+        return ExitCode::from(2);
+    }
+    // timeout は task #16/#17 で handler に渡す。本タスクでは未使用 (= `_` で握り潰し)。
+    let _ = cmd.timeout;
+
+    if cmd.specs.is_empty() {
+        // 通常 parser 側で reject されるはず。
+        eprintln!("hyoui: input: spec list が空です (内部 invariant 違反)");
+        return ExitCode::from(2);
+    }
+
+    // 各 spec を順に dispatch。最初の bail で exit 1 する (= 部分実行も MVP scope 外)。
+    for (idx, spec) in cmd.specs.iter().enumerate() {
+        match dispatch_spec(spec) {
+            Ok(()) => {}
+            Err(msg) => {
+                eprintln!("hyoui: input: spec[{idx}]: {msg}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// 1 つの [`InputSpec`] を daemon に送信する dispatcher (= 本タスクでは bail のみ)。
+///
+/// 各 prefix の handler は別 task で実装する。本タスクでは spec の variant 別に
+/// 「未実装」メッセージを返すだけ。これにより、CLI parse は成功するが実際の動作は
+/// 「task #16/#17 で配線する」と明示できる (= 早期 visibility for downstream)。
+///
+/// 返り値:
+/// - `Ok(())` — 送信完了 (= 本タスクでは到達不能)
+/// - `Err(msg)` — handler 未実装 / 送信失敗の human-readable reason
+fn dispatch_spec(spec: &InputSpec) -> Result<(), String> {
+    match spec {
+        InputSpec::Text(_) => {
+            Err("text: handler not yet implemented (= task #16 で配線予定)".to_string())
+        }
+        InputSpec::Hex(_) => {
+            Err("hex: handler not yet implemented (= task #16 で配線予定)".to_string())
+        }
+        InputSpec::File(_) => Err(
+            "file: handler not yet implemented (= task #16 / path validation は #21)".to_string(),
+        ),
+        InputSpec::Paste(_) => {
+            Err("paste: handler not yet implemented (= task #16 で配線予定)".to_string())
+        }
+        InputSpec::Key(_) => {
+            Err("key: handler not yet implemented (= task #16 で配線予定)".to_string())
+        }
+        InputSpec::Wait(_) => {
+            Err("wait: handler not yet implemented (= task #17 で配線予定)".to_string())
+        }
+        InputSpec::WaitIdle(_) => {
+            Err("wait-idle: handler not yet implemented (= task #17 で配線予定)".to_string())
+        }
+        // `InputSpec` is `#[non_exhaustive]`; future variants surface as a generic
+        // skew error so older binaries report clearly.
+        _ => Err("unsupported InputSpec variant (binary/library version skew)".to_string()),
     }
 }
 

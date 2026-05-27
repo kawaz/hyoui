@@ -4,6 +4,11 @@
 //! It performs no I/O and spawns no processes, so it can be exhaustively
 //! covered by unit tests.
 //!
+//! `input` subcommand の spec parser (= DR-0006 §8) は本ファイル末尾の
+//! "Input spec" section にまとめてある (= [`InputSpec`] / [`parse_input_spec`]
+//! / [`InputCommand`])。本タスクでは parser + dispatcher 骨格のみで、
+//! 各 spec prefix の handler は別 task (#16/#17) で実装する。
+//!
 //! # Subcommand layout
 //!
 //! ```text
@@ -26,6 +31,8 @@
 //! cmd`; the subcommand must be explicit.
 
 use std::fmt;
+use std::path::PathBuf;
+use std::time::Duration;
 
 /// Operating mode for the `run` subcommand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +106,8 @@ pub enum HelpTopic {
     Tail,
     /// Help for the `wait` subcommand (predicate / timeout / exit code 一覧)。
     Wait,
+    /// Help for the `input` subcommand (= DR-0006 §8、spec prefix カタログ等)。
+    Input,
     /// Help for the `screen` parent subcommand (= 子一覧 / 共通オプション)。
     Screen,
     /// Help for the `screen dump` subcommand (= DR-0006 §10.2)。
@@ -427,6 +436,13 @@ pub enum Command {
     Wait(WaitConfig),
     /// `screen` 親 subcommand (= 子: `dump` / 将来 `snapshot`)。
     Screen(ScreenCommand),
+    /// `input` subcommand (= DR-0006 §8、spec sequence の順序保証送信)。
+    ///
+    /// 本タスク (= #15) で parser + dispatcher 骨格のみ追加。各 spec prefix の
+    /// handler は task #16 (text/hex/file/paste/key) / #17 (wait/wait-idle) で
+    /// 実装するため、CLI parse は成功するが [`InputSpec`] dispatcher は
+    /// `bail!("... not yet implemented")` を返す。
+    Input(InputCommand),
     /// Print a completion script for the given shell.
     Completion {
         /// Target shell.
@@ -472,6 +488,7 @@ pub fn parse_args(args: &[String]) -> Command {
         "tail" => parse_tail(rest),
         "wait" => parse_wait(rest),
         "screen" => parse_screen(rest),
+        "input" => parse_input(rest),
         "completion" => parse_completion(rest),
         // Reserved for future stages.
         "send" | "detach" => Command::Error(format!(
@@ -1293,6 +1310,7 @@ pub fn usage(topic: &HelpTopic) -> String {
         HelpTopic::Screen => usage_screen(),
         HelpTopic::ScreenDump => usage_screen_dump(),
         HelpTopic::ScreenSnapshot => usage_screen_snapshot(),
+        HelpTopic::Input => usage_input(),
         HelpTopic::Completion => usage_completion(),
     }
 }
@@ -1855,6 +1873,7 @@ fn usage_top(unknown: Option<&str>) -> String {
             tail        Stream scrollback / live output (--follow で継続)\n    \
             wait        Wait until predicate (text/pattern/idle) matches\n    \
             screen      Dump / inspect virtual screen state (subcommands: dump)\n    \
+            input       Send input via spec list (DR-0006 §8; text:/key:/wait: ...)\n    \
             completion  Print a shell completion script (bash|zsh|fish)\n\
         \n\
         RESERVED (not yet implemented):\n    \
@@ -2279,6 +2298,361 @@ fn usage_completion() -> String {
         \n\
         RELATED:\n    \
             hyoui --help        全 subcommand 一覧\n",
+    )
+}
+
+// =============================================================================
+// Input spec (DR-0006 §8) — 本タスク #15 で追加した parser + dispatcher 骨格
+// =============================================================================
+//
+// `hyoui input <session> <spec>...` の spec 単位の表現。各 spec は出現順で
+// daemon に送信される (= 順序保証)。本タスクでは **parser のみ実装**、
+// 各 prefix の実際の送信処理は別 task で配線する。
+
+/// `hyoui input <session>` に渡される 1 spec の表現 (= DR-0006 §8.2 カタログ)。
+///
+/// CLI 文字列上では `<prefix>:<value>` の形 (= 例 `text:hello` / `wait-idle:500ms`)。
+/// パースは [`parse_input_spec`] で行う。各 variant の `value` は parser 段で
+/// 軽い validation を済ませてから保持する (= prefix-specific の重い validation は
+/// handler 側 task で実施)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InputSpec {
+    /// `text:<string>` — UTF-8 文字列を direct (= no bracket) で送る。
+    ///
+    /// 中身の改行 / escape 解釈は handler で行う (= DR-0006 §8.2: shell 任せ)。
+    /// 本タスクの parser は受け取った文字列をそのまま保持するだけ。
+    Text(String),
+    /// `hex:<hex>` — even-length の hex string を bytes として送る。
+    ///
+    /// parser 段で hex string の形式 validation を行う (= `[0-9a-fA-F]+` かつ
+    /// even length)。decode 結果の `Vec<u8>` を保持する。
+    Hex(Vec<u8>),
+    /// `file:<path>` — ファイル内容を bytes として送る (= 大規模 input 用)。
+    ///
+    /// parser 段では path 文字列のみ保持。ファイル存在確認 / size 制御 / spool
+    /// 戦略は handler 側 task (= #16/#21) で実装する。
+    File(PathBuf),
+    /// `paste:<string>` — UTF-8 文字列を bracketed paste で wrap して送る。
+    ///
+    /// `ESC[200~` ... `ESC[201~` の wrap は handler 側で実施。
+    Paste(String),
+    /// `key:<name>` — symbolic key 名 (= `C-c` / `M-x` / `Enter` / `Tab` 等)。
+    ///
+    /// parser 段では文字列をそのまま保持。alias 解決 / modifier 順序正規化 /
+    /// escape sequence への変換は handler 側 task (= #16) で実施する。
+    Key(String),
+    /// `wait:<pattern>` — visible state regex match まで block する pre-condition。
+    ///
+    /// regex の compile validation は handler 側 task (= #17) で実施。parser は
+    /// 文字列をそのまま保持する。
+    Wait(String),
+    /// `wait-idle:<duration>` — 入力 idle 期間が指定時間経過するまで block。
+    ///
+    /// duration parse は parser 段で実施 (= `parse_duration_ms` 経由)。`Duration`
+    /// に保持することで handler が単位変換せず使える。
+    WaitIdle(Duration),
+}
+
+/// `hyoui input <session> <spec>...` の parsed configuration。
+///
+/// [`InputSpec`] の Vec を順序通り保持する。handler 側 task (= #16) では
+/// `specs.iter()` を loop して dispatch する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputCommand {
+    /// Explicit socket path (= `--socket`)。`session_id` の代替経路。
+    pub socket: Option<String>,
+    /// Target session id (= positional 第 1 引数)。`socket` 指定時は None でも OK。
+    pub session_id: Option<String>,
+    /// Spec list (= 出現順で送信、空 Vec は parser 段で reject)。
+    pub specs: Vec<InputSpec>,
+    /// Per-spec timeout (= default 5s、特に `wait:` / `wait-idle:` で意味を持つ)。
+    pub timeout: Duration,
+}
+
+/// [`InputSpec`] のパース結果 (= prefix で type 判別、payload validate)。
+///
+/// 戻り値の variant は [`InputSpec`] そのまま。spec 文字列 → InputSpec 変換は
+/// CLI 段で完了させる方針 (= handler 側で 2 度 parse しない)。
+///
+/// # Errors
+///
+/// - 不明な prefix (= `text:` 等の 7 種以外)
+/// - `:` を含まない (= prefix がない裸の文字列)
+/// - `hex:` の中身が奇数長 / non-hex 文字を含む
+/// - `wait-idle:` の中身が duration として parse できない
+///
+/// **path validation / regex compile / hex の semantics 検証** は handler 側 task
+/// で実施する (= parser は構文 layer のみ担う)。
+pub fn parse_input_spec(s: &str) -> Result<InputSpec, String> {
+    // prefix と value を `:` で 1 回 split。`:` 自体は value に含まれていい
+    // (= regex / paste 内に `:` がよく出る) ので、最初の `:` だけで分ける。
+    let (prefix, value) = match s.split_once(':') {
+        Some(pair) => pair,
+        None => {
+            return Err(format!(
+                "missing prefix `:` in spec {s:?} \
+                 (expected one of: text:, hex:, file:, paste:, key:, wait:, wait-idle:)"
+            ));
+        }
+    };
+
+    match prefix {
+        "text" => Ok(InputSpec::Text(value.to_string())),
+        "hex" => parse_hex_value(value).map(InputSpec::Hex),
+        "file" => Ok(InputSpec::File(PathBuf::from(value))),
+        "paste" => Ok(InputSpec::Paste(value.to_string())),
+        "key" => {
+            if value.is_empty() {
+                return Err("key: spec requires a non-empty key name".into());
+            }
+            Ok(InputSpec::Key(value.to_string()))
+        }
+        "wait" => {
+            // §8.2 によれば `wait:<pattern>` は regex (= state match)。
+            // wait-idle は別 prefix。旧 `wait:<duration>` (= idle alias) は
+            // 本 DR で廃止。空 pattern は意味を成さないので reject。
+            if value.is_empty() {
+                return Err("wait: spec requires a non-empty regex pattern".into());
+            }
+            Ok(InputSpec::Wait(value.to_string()))
+        }
+        "wait-idle" => {
+            let ms = parse_duration_ms(value)
+                .map_err(|e| format!("wait-idle: invalid duration {value:?}: {e}"))?;
+            Ok(InputSpec::WaitIdle(Duration::from_millis(ms)))
+        }
+        // 不明な prefix。helpful な hint を出す (= edit distance による suggest は
+        // 本タスクの scope 外、別 task #22 で UX 向上として配線可能)。
+        other => Err(format!(
+            "unknown spec prefix {other:?}, expected one of: \
+             text, hex, file, paste, key, wait, wait-idle"
+        )),
+    }
+}
+
+/// `hex:` の payload を decode。even-length + ascii hex のみ accept。
+fn parse_hex_value(s: &str) -> Result<Vec<u8>, String> {
+    if s.is_empty() {
+        return Err("hex: spec requires non-empty hex string".into());
+    }
+    if s.len() % 2 != 0 {
+        return Err(format!(
+            "hex: payload must be even-length (got {} chars in {s:?})",
+            s.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_nibble(bytes[i])
+            .ok_or_else(|| format!("hex: non-hex char {:?} at position {i}", bytes[i] as char))?;
+        let lo = hex_nibble(bytes[i + 1]).ok_or_else(|| {
+            format!(
+                "hex: non-hex char {:?} at position {}",
+                bytes[i + 1] as char,
+                i + 1
+            )
+        })?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// `hyoui input <session> <spec>... [options]` parser。
+///
+/// 受理する options:
+/// - `--socket=<path>` — session_id の代替
+/// - `--timeout=<dur>` — per-spec timeout (= default 5s)
+///
+/// 受理する positional:
+/// - 第 1 引数 = `session_id` (= `--socket` 指定時は省略可)
+/// - 残り = spec list (= 1 つ以上必須、空 spec list は error)
+///
+/// **本タスクでは parser のみ**。各 spec の handler は別 task (= #16/#17) で配線。
+fn parse_input(args: &[String]) -> Command {
+    let mut socket: Option<String> = None;
+    let mut timeout_ms: u64 = 5_000;
+    let mut positionals: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (opt_name, inline_value) = split_eq(arg);
+        let mut consumed_extra = false;
+        let value: Option<String> = match inline_value {
+            Some(v) => Some(v),
+            None => {
+                // 次 arg を value 候補にするのは `--key value` の形だけ。
+                // spec list の途中 (= `text:hello` 等) は positional として
+                // 扱いたいので、`--` で始まらない次 arg は value 扱いしない
+                // (= screen dump 等の既存 pattern と整合)。
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    consumed_extra = true;
+                    Some(args[i + 1].clone())
+                } else {
+                    None
+                }
+            }
+        };
+        match opt_name.as_str() {
+            "--help" | "-h" => {
+                return Command::Help {
+                    topic: HelpTopic::Input,
+                };
+            }
+            "--socket" => match value {
+                Some(v) => {
+                    socket = Some(v);
+                }
+                None => return Command::Error("input: --socket requires a value".into()),
+            },
+            "--timeout" => match value {
+                Some(v) => match parse_duration_ms(&v) {
+                    Ok(ms) => timeout_ms = ms,
+                    Err(e) => return Command::Error(format!("input: --timeout: {e}")),
+                },
+                None => return Command::Error("input: --timeout requires a value".into()),
+            },
+            other if other.starts_with("--") => {
+                return Command::Error(format!("input: unknown option: {other}"));
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                // 単独 `-` は将来 stdin 入力源として予約しうるが、本タスクの
+                // scope では明示 reject。`-h` は上で吸収済。
+                return Command::Error(format!("input: unknown option: {other}"));
+            }
+            _ => {
+                consumed_extra = false;
+                positionals.push(args[i].clone());
+            }
+        }
+        i += 1;
+        if consumed_extra {
+            i += 1;
+        }
+    }
+
+    // positional の最初は session_id。それ以降が spec list。
+    // ただし `--socket` 指定時は session_id を省略でき、全 positional が spec。
+    // 判別は positional 第 1 引数が「spec prefix を含むか」ではなく
+    // session_id とみなしてから validate (= `text:` 等が session_id 形式の
+    // validation に引っかかる)。
+    //
+    // 戦略:
+    // 1. `--socket` 指定 → 全 positional を spec として parse
+    // 2. それ以外 → 第 1 positional を session_id 候補とみなし、`validate_session_id`
+    //    が通れば session_id、通らない場合は error (= 「最初の引数が session_id か
+    //    spec か」を曖昧にしない、ユーザに spec を最初に書くなら `--socket` を
+    //    使わせる)
+    let (session_id, spec_strs): (Option<String>, &[String]) = if socket.is_some() {
+        (None, positionals.as_slice())
+    } else {
+        match positionals.first() {
+            None => {
+                return Command::Error(
+                    "input: session id (positional) または --socket=<path> が必要です。\
+                     例: `hyoui input <session-id> text:hello key:Enter`"
+                        .into(),
+                );
+            }
+            Some(first) => {
+                if let Err(e) = validate_session_id(first) {
+                    return Command::Error(format!("input: {e}"));
+                }
+                (Some(first.clone()), &positionals[1..])
+            }
+        }
+    };
+
+    if spec_strs.is_empty() {
+        return Command::Error(
+            "input: spec list が空です (= 最低 1 つ <prefix>:<value> を指定してください)。\
+             例: `hyoui input <session-id> text:hello key:Enter` / \
+             prefix 一覧は `hyoui input --help` 参照"
+                .into(),
+        );
+    }
+
+    let mut specs: Vec<InputSpec> = Vec::with_capacity(spec_strs.len());
+    for s in spec_strs {
+        match parse_input_spec(s) {
+            Ok(spec) => specs.push(spec),
+            Err(e) => return Command::Error(format!("input: spec `{s}`: {e}")),
+        }
+    }
+
+    Command::Input(InputCommand {
+        socket,
+        session_id,
+        specs,
+        timeout: Duration::from_millis(timeout_ms),
+    })
+}
+
+fn usage_input() -> String {
+    String::from(
+        "hyoui input — send input via spec list (DR-0006 §8)\n\
+        \n\
+        USAGE:\n    \
+            hyoui input <session-id> <spec>... [options]\n    \
+            hyoui input --socket=<path> <spec>... [options]\n\
+        \n\
+        SPECS (= 出現順で送信、order-preserved):\n    \
+            text:<string>      Direct UTF-8 text (no bracketed paste)\n    \
+            hex:<hex>          Hex-encoded binary bytes (even-length)\n    \
+            file:<path>        File content as bytes (大規模 input 用)\n    \
+            paste:<string>     Bracketed paste で囲んで送信\n    \
+            key:<name>         Symbolic key (= C-c / M-x / Enter / Tab / Up ...)\n    \
+            wait:<pattern>     visible state regex match まで block (= state-based)\n    \
+            wait-idle:<dur>    入力 idle <dur> 経過まで block (= 単位必須)\n\
+        \n\
+        OPTIONS:\n    \
+            --socket PATH      Explicit socket path (alternative to session-id)\n    \
+            --timeout DUR      Per-spec timeout (default: 5s; DUR 形式は下記参照)\n    \
+            -h, --help         Show this help and exit\n\
+        \n\
+        ENVIRONMENT:\n    \
+            HYOUI_LOCK_TOKEN   lock token を env で渡す (= handshake.token)\n\
+        \n\
+        DURATION FORMAT (kawaz/timespec.mbt 仕様 + sub-ms 拡張):\n    \
+            短形 ns/us/μs/ms/s/m/h/d/w または長形 second(s)/minute(s)/hour(s)/\n    \
+            day(s)/week(s)。decimal (1.5h)、underscore (1_000ms)、連結 (1h30m)、\n    \
+            加減 (1d-4h)。bare 数字 / 年 (y) / 月 (M) は **error**。\n\
+        \n\
+        EXIT CODE:\n    \
+            0   全 spec 送信完了\n    \
+            1   connect / spec dispatch / daemon error\n    \
+            2   引数不足 / 未知 prefix / 未知 option\n\
+        \n\
+        EXAMPLES:\n    \
+            hyoui input demo text:hello key:Enter\n    \
+            hyoui input demo \"text:ls -la\" key:Enter\n    \
+            hyoui input demo \"paste:$(cat script.py)\"\n    \
+            hyoui input demo hex:1b5b41                # = ESC[A (= Up arrow)\n    \
+            hyoui input demo file:./payload.txt\n    \
+            hyoui input demo \"wait:^\\\\$\" \"text:export FOO=bar\" key:Enter\n    \
+            hyoui input demo key:C-c\n\
+        \n\
+        NOTE:\n    \
+            本 subcommand は task #15 で parser + dispatcher 骨格のみ実装。\n    \
+            各 spec prefix の実際の送信処理は task #16 (text/hex/file/paste/key) /\n    \
+            #17 (wait/wait-idle) で配線される。本 binary では spec を 1 つでも\n    \
+            含めると `not yet implemented` で exit 1 する。\n\
+        \n\
+        RELATED:\n    \
+            hyoui screen snapshot <id>   入力後の state を確認\n    \
+            hyoui wait <id> ...          条件達成まで block (= 単独 subcommand 形)\n",
     )
 }
 
@@ -3921,5 +4295,347 @@ mod tests {
     fn usage_top_lists_screen() {
         let text = usage(&HelpTopic::Top);
         assert!(text.contains("screen"));
+    }
+
+    // -------- input subcommand + spec parser (DR-0006 §8、task #15) --------
+
+    // -------- parse_input_spec (= 各 prefix の成功 / 失敗ケース) --------
+
+    #[test]
+    fn parse_input_spec_text_ok() {
+        assert_eq!(
+            parse_input_spec("text:hello").unwrap(),
+            InputSpec::Text("hello".into())
+        );
+        // 空文字列 text は許容 (= shell escape の都合で空 string を渡す pattern)
+        assert_eq!(
+            parse_input_spec("text:").unwrap(),
+            InputSpec::Text(String::new())
+        );
+        // `:` を含む text 値も OK (= 最初の `:` で split、それ以降は value 内)
+        assert_eq!(
+            parse_input_spec("text:foo:bar:baz").unwrap(),
+            InputSpec::Text("foo:bar:baz".into())
+        );
+    }
+
+    #[test]
+    fn parse_input_spec_hex_ok() {
+        assert_eq!(
+            parse_input_spec("hex:1b5b41").unwrap(),
+            InputSpec::Hex(vec![0x1b, 0x5b, 0x41])
+        );
+        // 大文字 / 大小混在 OK
+        assert_eq!(
+            parse_input_spec("hex:DEadBEEF").unwrap(),
+            InputSpec::Hex(vec![0xde, 0xad, 0xbe, 0xef])
+        );
+    }
+
+    #[test]
+    fn parse_input_spec_hex_invalid_errors() {
+        // odd length
+        let err = parse_input_spec("hex:abc").unwrap_err();
+        assert!(err.contains("even-length"), "got: {err}");
+        // empty
+        let err = parse_input_spec("hex:").unwrap_err();
+        assert!(err.contains("non-empty"), "got: {err}");
+        // non-hex char
+        let err = parse_input_spec("hex:zz").unwrap_err();
+        assert!(err.contains("non-hex"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_input_spec_file_ok() {
+        match parse_input_spec("file:./payload.txt").unwrap() {
+            InputSpec::File(p) => assert_eq!(p, PathBuf::from("./payload.txt")),
+            other => panic!("expected File, got {other:?}"),
+        }
+        // 絶対 path / `-` (= stdin) も parser は素通し (= handler 側 task で扱う)
+        match parse_input_spec("file:/tmp/data").unwrap() {
+            InputSpec::File(p) => assert_eq!(p, PathBuf::from("/tmp/data")),
+            other => panic!("expected File, got {other:?}"),
+        }
+        match parse_input_spec("file:-").unwrap() {
+            InputSpec::File(p) => assert_eq!(p, PathBuf::from("-")),
+            other => panic!("expected File, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_spec_paste_ok() {
+        assert_eq!(
+            parse_input_spec("paste:line1\nline2").unwrap(),
+            InputSpec::Paste("line1\nline2".into())
+        );
+    }
+
+    #[test]
+    fn parse_input_spec_key_ok() {
+        assert_eq!(
+            parse_input_spec("key:Enter").unwrap(),
+            InputSpec::Key("Enter".into())
+        );
+        assert_eq!(
+            parse_input_spec("key:C-c").unwrap(),
+            InputSpec::Key("C-c".into())
+        );
+        assert_eq!(
+            parse_input_spec("key:M-x").unwrap(),
+            InputSpec::Key("M-x".into())
+        );
+        // 空 key は reject (= 「prefix だけ書いて value 空」は意味なし)
+        assert!(parse_input_spec("key:").is_err());
+    }
+
+    #[test]
+    fn parse_input_spec_wait_ok() {
+        assert_eq!(
+            parse_input_spec("wait:^Prompt>").unwrap(),
+            InputSpec::Wait("^Prompt>".into())
+        );
+        // 空 pattern は reject
+        let err = parse_input_spec("wait:").unwrap_err();
+        assert!(err.contains("non-empty"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_input_spec_wait_idle_ok() {
+        match parse_input_spec("wait-idle:500ms").unwrap() {
+            InputSpec::WaitIdle(d) => assert_eq!(d, Duration::from_millis(500)),
+            other => panic!("expected WaitIdle, got {other:?}"),
+        }
+        match parse_input_spec("wait-idle:2s").unwrap() {
+            InputSpec::WaitIdle(d) => assert_eq!(d, Duration::from_secs(2)),
+            other => panic!("expected WaitIdle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_spec_wait_idle_invalid_errors() {
+        // bare 数字 = 単位なし、parse_duration_ms で reject
+        let err = parse_input_spec("wait-idle:500").unwrap_err();
+        assert!(err.contains("wait-idle:"), "got: {err}");
+        // empty
+        let err = parse_input_spec("wait-idle:").unwrap_err();
+        assert!(err.contains("wait-idle:"), "got: {err}");
+        // garbage
+        let err = parse_input_spec("wait-idle:abc").unwrap_err();
+        assert!(err.contains("wait-idle:"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_input_spec_unknown_prefix_errors() {
+        let err = parse_input_spec("bogus:value").unwrap_err();
+        assert!(err.contains("unknown spec prefix"), "got: {err}");
+        assert!(
+            err.contains("text"),
+            "should list known prefixes, got: {err}"
+        );
+        assert!(
+            err.contains("wait-idle"),
+            "should list known prefixes, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_input_spec_missing_colon_errors() {
+        let err = parse_input_spec("hello").unwrap_err();
+        assert!(err.contains("missing prefix"), "got: {err}");
+    }
+
+    // -------- parse_args / parse_input (= subcommand integration) --------
+
+    #[test]
+    fn parse_input_basic_session_and_spec() {
+        match parse_args(&args(&["input", "demo", "text:hello"])) {
+            Command::Input(cmd) => {
+                assert_eq!(cmd.session_id.as_deref(), Some("demo"));
+                assert_eq!(cmd.socket, None);
+                assert_eq!(cmd.specs, vec![InputSpec::Text("hello".into())]);
+                assert_eq!(cmd.timeout, Duration::from_secs(5));
+            }
+            other => panic!("expected Input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_multiple_specs_preserve_order() {
+        match parse_args(&args(&[
+            "input",
+            "demo",
+            "text:ls -la",
+            "key:Enter",
+            "wait:^\\$",
+            "wait-idle:200ms",
+        ])) {
+            Command::Input(cmd) => {
+                assert_eq!(
+                    cmd.specs,
+                    vec![
+                        InputSpec::Text("ls -la".into()),
+                        InputSpec::Key("Enter".into()),
+                        InputSpec::Wait("^\\$".into()),
+                        InputSpec::WaitIdle(Duration::from_millis(200)),
+                    ]
+                );
+            }
+            other => panic!("expected Input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_help_flag() {
+        match parse_args(&args(&["input", "--help"])) {
+            Command::Help {
+                topic: HelpTopic::Input,
+            } => {}
+            other => panic!("expected Help(Input), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_no_session_no_socket_errors() {
+        // session_id も --socket も指定なし
+        match parse_args(&args(&["input"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("session id"), "got: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_empty_spec_list_errors() {
+        match parse_args(&args(&["input", "demo"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("spec list が空"), "got: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_socket_alternative_no_session() {
+        // --socket=path だけ、session_id 省略可、spec は必須
+        match parse_args(&args(&["input", "--socket=/tmp/x.sock", "text:hi"])) {
+            Command::Input(cmd) => {
+                assert_eq!(cmd.socket.as_deref(), Some("/tmp/x.sock"));
+                assert_eq!(cmd.session_id, None);
+                assert_eq!(cmd.specs, vec![InputSpec::Text("hi".into())]);
+            }
+            other => panic!("expected Input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_socket_with_empty_specs_errors() {
+        // --socket だけで spec 0 個 → spec list 空 error
+        match parse_args(&args(&["input", "--socket=/tmp/x.sock"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("spec list が空"), "got: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_timeout_option() {
+        match parse_args(&args(&["input", "demo", "--timeout=2s", "text:x"])) {
+            Command::Input(cmd) => {
+                assert_eq!(cmd.timeout, Duration::from_secs(2));
+            }
+            other => panic!("expected Input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_timeout_bare_number_errors() {
+        // 単位なしは parse_duration_ms で reject される
+        match parse_args(&args(&["input", "demo", "--timeout=5", "text:x"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("--timeout"), "got: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_unknown_option_errors() {
+        match parse_args(&args(&["input", "demo", "--bogus=1", "text:x"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("unknown option"), "got: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_unknown_spec_prefix_errors() {
+        match parse_args(&args(&["input", "demo", "bogus:value"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("unknown spec prefix"), "got: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_invalid_session_id_errors() {
+        // session_id に `..` や path separator が含まれていれば
+        // validate_session_id で reject される
+        match parse_args(&args(&["input", "..", "text:x"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("path traversal"), "got: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_hex_invalid_propagates_to_command_error() {
+        match parse_args(&args(&["input", "demo", "hex:zz"])) {
+            Command::Error(msg) => {
+                assert!(
+                    msg.contains("non-hex") || msg.contains("hex:"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    // -------- usage / help integration --------
+
+    #[test]
+    fn usage_input_lists_prefixes() {
+        let text = usage(&HelpTopic::Input);
+        assert!(text.contains("hyoui input"));
+        for prefix in [
+            "text:",
+            "hex:",
+            "file:",
+            "paste:",
+            "key:",
+            "wait:",
+            "wait-idle:",
+        ] {
+            assert!(
+                text.contains(prefix),
+                "usage_input should mention {prefix}, got:\n{text}"
+            );
+        }
+        // option section
+        assert!(text.contains("--socket"));
+        assert!(text.contains("--timeout"));
+    }
+
+    #[test]
+    fn usage_top_lists_input() {
+        let text = usage(&HelpTopic::Top);
+        assert!(
+            text.contains("input"),
+            "top usage should list input subcommand"
+        );
     }
 }
