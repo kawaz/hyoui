@@ -46,7 +46,82 @@ _hyoui() {
 
     if [[ -z "$sub" ]]; then
         # Top-level: subcommands + global flags.
-        COMPREPLY=( $(compgen -W "run attach list kill status tail wait completion send detach --help -h --version -V" -- "$cur") )
+        COMPREPLY=( $(compgen -W "run attach list kill status tail wait screen input completion send detach --help -h --version -V" -- "$cur") )
+        return 0
+    fi
+
+    # Detect `screen` sub-subcommand (= `screen dump` / `screen snapshot`).
+    if [[ "$sub" == "screen" ]]; then
+        local screen_sub=""
+        for (( i=1; i < cword; i++ )); do
+            local w="${words[i]}"
+            if [[ "$w" == "screen" ]]; then
+                # find first non-flag after `screen`
+                local j
+                for (( j=i+1; j < cword; j++ )); do
+                    case "${words[j]}" in
+                        -*) ;;
+                        *) screen_sub="${words[j]}"; break ;;
+                    esac
+                done
+                break
+            fi
+        done
+        if [[ -z "$screen_sub" ]]; then
+            COMPREPLY=( $(compgen -W "dump snapshot --help -h" -- "$cur") )
+            return 0
+        fi
+        case "$screen_sub" in
+            dump)
+                case "$prev" in
+                    --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                    --format) COMPREPLY=( $(compgen -W "ansi binary cbor" -- "$cur") ); return 0 ;;
+                    --layer) COMPREPLY=( $(compgen -W "visible scrollback both" -- "$cur") ); return 0 ;;
+                    --output) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                    --rect|--timeout) return 0 ;;
+                esac
+                COMPREPLY=( $(compgen -W "--socket --format --layer --rect --output --timeout --help -h" -- "$cur") )
+                return 0 ;;
+            snapshot)
+                case "$prev" in
+                    --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                    --include) COMPREPLY=( $(compgen -W "screen cursor size mode title" -- "$cur") ); return 0 ;;
+                    --output) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                    --timeout) return 0 ;;
+                esac
+                COMPREPLY=( $(compgen -W "--socket --include --output --timeout --help -h" -- "$cur") )
+                return 0 ;;
+        esac
+    fi
+
+    # `input` の spec prefix を current word の状態に応じて補完。
+    if [[ "$sub" == "input" ]]; then
+        case "$prev" in
+            --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+            --timeout|--lock-token|--max-file-bytes) return 0 ;;
+        esac
+        # spec prefix の途中 (= "text:" / "key:" 等) に来たら value 部分は補完しない
+        # (= 任意文字列 / regex / path)。ただし "file:" の場合は path 補完を提供。
+        case "$cur" in
+            file:*)
+                local p="${cur#file:}"
+                COMPREPLY=( $(compgen -f -- "$p") )
+                # `file:` prefix を残す形で再構成
+                local i
+                for (( i=0; i < ${#COMPREPLY[@]}; i++ )); do
+                    COMPREPLY[$i]="file:${COMPREPLY[$i]}"
+                done
+                return 0 ;;
+            key:*)
+                local k="${cur#key:}"
+                COMPREPLY=( $(compgen -W "Enter Return Tab Esc Escape Backspace Delete Space Up Down Left Right Home End PageUp PageDown F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12" -- "$k") )
+                local i
+                for (( i=0; i < ${#COMPREPLY[@]}; i++ )); do
+                    COMPREPLY[$i]="key:${COMPREPLY[$i]}"
+                done
+                return 0 ;;
+        esac
+        COMPREPLY=( $(compgen -W "--socket --timeout --lock-token --max-file-bytes --help -h text: hex: file: paste: key: wait: wait-idle:" -- "$cur") )
         return 0
     fi
 
@@ -191,6 +266,12 @@ _hyoui() {
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:positional (predicate or session-id):'
                     ;;
+                screen)
+                    _hyoui_screen
+                    ;;
+                input)
+                    _hyoui_input
+                    ;;
             esac
             ;;
     esac
@@ -206,11 +287,97 @@ _hyoui_subcommands() {
         'status:Print session status'
         'tail:Stream scrollback / live output'
         'wait:Wait until predicate matches'
+        'screen:Dump / inspect virtual screen state (dump, snapshot)'
+        'input:Send input via spec list (DR-0006 §8)'
         'completion:Print a shell completion script'
         'send:(reserved) Send input to a running session'
         'detach:(reserved) Detach helper'
     )
     _describe -t commands 'hyoui subcommand' subs
+}
+
+_hyoui_screen() {
+    local context state state_descr line
+    typeset -A opt_args
+    _arguments -C \
+        '1: :_hyoui_screen_subcommands' \
+        '*::arg:->screen_args'
+    case $state in
+        screen_args)
+            case $line[1] in
+                dump)
+                    _arguments \
+                        '--socket=[Explicit socket path]:socket:_files' \
+                        '--format=[Output format]:format:(ansi binary cbor)' \
+                        '--layer=[Layer to dump]:layer:(visible scrollback both)' \
+                        '--rect=[Sub-rectangle x,y,w,h]:rect:' \
+                        '--output=[Output file path]:file:_files' \
+                        '--timeout=[Response timeout]:duration:' \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '*:session id:'
+                    ;;
+                snapshot)
+                    _arguments \
+                        '--socket=[Explicit socket path]:socket:_files' \
+                        '*--include=[Snapshot components to include]:component:(screen cursor size mode title)' \
+                        '--output=[Output file path]:file:_files' \
+                        '--timeout=[Response timeout]:duration:' \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '*:session id:'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_hyoui_screen_subcommands() {
+    local -a subs
+    subs=(
+        'dump:Dump current screen / scrollback as ANSI / binary / CBOR'
+        'snapshot:Take a structured snapshot (screen + cursor + size + mode)'
+    )
+    _describe -t commands 'hyoui screen subcommand' subs
+}
+
+_hyoui_input() {
+    # `input` の positional は <session> <spec>...。spec は order-preserved。
+    # spec prefix を候補に出し、`file:` だけ path 補完を効かせる。
+    _arguments \
+        '--socket=[Explicit socket path]:socket:_files' \
+        '--timeout=[Per-spec timeout (e.g. 5s)]:duration:' \
+        '--lock-token=[Explicit lock token (overrides HYOUI_LOCK_TOKEN)]:token:' \
+        '--max-file-bytes=[Max bytes for file: spec (0 = unlimited)]:bytes:' \
+        '(-h --help)'{-h,--help}'[Show help]' \
+        '*::spec:_hyoui_input_spec'
+}
+
+_hyoui_input_spec() {
+    # current word が `file:...` なら path 補完、`key:...` なら key name 補完、
+    # それ以外なら prefix 候補のみ。
+    case $words[$CURRENT] in
+        file:*)
+            local p=${words[$CURRENT]#file:}
+            _path_files -W / -g '*' && return 0
+            ;;
+        key:*)
+            local k=${words[$CURRENT]#key:}
+            local -a keys
+            keys=(Enter Return Tab Esc Escape Backspace Delete Space Up Down Left Right Home End PageUp PageDown F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12)
+            compadd -P 'key:' -- $keys
+            return 0
+            ;;
+    esac
+    local -a prefixes
+    prefixes=(
+        'text\::Direct UTF-8 text (no bracketed paste)'
+        'hex\::Hex-encoded binary bytes'
+        'file\::File content as bytes'
+        'paste\::Bracketed paste wrap'
+        'key\::Symbolic key name'
+        'wait\::Wait until regex matches visible state'
+        'wait-idle\::Wait until input idle for duration'
+    )
+    _describe -t specs 'input spec prefix' prefixes
 }
 
 _hyoui_run() {
@@ -242,7 +409,7 @@ function __hyoui_using_subcommand
     set -e cmd[1]
     for arg in $cmd
         switch $arg
-            case run attach list kill status tail wait completion send detach
+            case run attach list kill status tail wait screen input completion send detach
                 if test "$arg" = "$argv[1]"
                     return 0
                 end
@@ -257,11 +424,54 @@ function __hyoui_no_subcommand
     set -e cmd[1]
     for arg in $cmd
         switch $arg
-            case run attach list kill status tail wait completion send detach
+            case run attach list kill status tail wait screen input completion send detach
                 return 1
         end
     end
     return 0
+end
+
+# screen の子 subcommand 検出 (= `screen dump` / `screen snapshot`)。
+function __hyoui_screen_using_sub
+    set -l cmd (commandline -opc)
+    set -e cmd[1]
+    set -l seen_screen 0
+    for arg in $cmd
+        if test $seen_screen -eq 1
+            switch $arg
+                case dump snapshot
+                    if test "$arg" = "$argv[1]"
+                        return 0
+                    end
+                    return 1
+            end
+        end
+        if test "$arg" = "screen"
+            set seen_screen 1
+        end
+    end
+    return 1
+end
+
+function __hyoui_screen_no_sub
+    set -l cmd (commandline -opc)
+    set -e cmd[1]
+    set -l seen_screen 0
+    for arg in $cmd
+        if test $seen_screen -eq 1
+            switch $arg
+                case dump snapshot
+                    return 1
+            end
+        end
+        if test "$arg" = "screen"
+            set seen_screen 1
+        end
+    end
+    if test $seen_screen -eq 1
+        return 0
+    end
+    return 1
 end
 
 # Top-level: subcommands.
@@ -272,6 +482,8 @@ complete -c hyoui -n __hyoui_no_subcommand -f -a kill       -d 'Send signal to a
 complete -c hyoui -n __hyoui_no_subcommand -f -a status     -d 'Print session status'
 complete -c hyoui -n __hyoui_no_subcommand -f -a tail       -d 'Stream scrollback / live output'
 complete -c hyoui -n __hyoui_no_subcommand -f -a wait       -d 'Wait until predicate matches'
+complete -c hyoui -n __hyoui_no_subcommand -f -a screen     -d 'Dump / inspect virtual screen state'
+complete -c hyoui -n __hyoui_no_subcommand -f -a input      -d 'Send input via spec list (DR-0006 §8)'
 complete -c hyoui -n __hyoui_no_subcommand -f -a completion -d 'Print a shell completion script'
 complete -c hyoui -n __hyoui_no_subcommand -f -a send       -d '(reserved) Send input to a running session'
 complete -c hyoui -n __hyoui_no_subcommand -f -a detach     -d '(reserved) Detach helper'
@@ -330,6 +542,34 @@ complete -c hyoui -n '__hyoui_using_subcommand wait' -l timeout           -x    
 complete -c hyoui -n '__hyoui_using_subcommand wait' -l no-strip-escapes          -d 'Do not strip ANSI escapes before matching'
 complete -c hyoui -n '__hyoui_using_subcommand wait' -l newline-convert-lf        -d 'Convert CRLF to LF before matching'
 complete -c hyoui -n '__hyoui_using_subcommand wait' -s h -l help                 -d 'Show help and exit'
+
+# `hyoui screen` 子 subcommand
+complete -c hyoui -n __hyoui_screen_no_sub -f -a dump     -d 'Dump screen / scrollback as ANSI / binary / CBOR'
+complete -c hyoui -n __hyoui_screen_no_sub -f -a snapshot -d 'Take a structured snapshot (screen + cursor + size + mode)'
+
+# `hyoui screen dump` options
+complete -c hyoui -n '__hyoui_screen_using_sub dump' -l socket  -r -F                          -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_screen_using_sub dump' -l format  -x -a 'ansi binary cbor'       -d 'Output format'
+complete -c hyoui -n '__hyoui_screen_using_sub dump' -l layer   -x -a 'visible scrollback both' -d 'Layer to dump'
+complete -c hyoui -n '__hyoui_screen_using_sub dump' -l rect    -x                              -d 'Sub-rectangle x,y,w,h'
+complete -c hyoui -n '__hyoui_screen_using_sub dump' -l output  -r -F                          -d 'Output file path'
+complete -c hyoui -n '__hyoui_screen_using_sub dump' -l timeout -x                              -d 'Response timeout'
+complete -c hyoui -n '__hyoui_screen_using_sub dump' -s h -l help                               -d 'Show help and exit'
+
+# `hyoui screen snapshot` options
+complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l socket  -r -F                                -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l include -x -a 'screen cursor size mode title' -d 'Snapshot components to include'
+complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l output  -r -F                                -d 'Output file path'
+complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l timeout -x                                    -d 'Response timeout'
+complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -s h -l help                                     -d 'Show help and exit'
+
+# `hyoui input` options + spec prefix
+complete -c hyoui -n '__hyoui_using_subcommand input' -l socket          -r -F  -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_using_subcommand input' -l timeout         -x      -d 'Per-spec timeout (e.g. 5s)'
+complete -c hyoui -n '__hyoui_using_subcommand input' -l lock-token      -x      -d 'Explicit lock token (overrides HYOUI_LOCK_TOKEN)'
+complete -c hyoui -n '__hyoui_using_subcommand input' -l max-file-bytes  -x      -d 'Max bytes for file: spec (0 = unlimited)'
+complete -c hyoui -n '__hyoui_using_subcommand input' -s h -l help              -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_using_subcommand input' -f -a 'text\: hex\: file\: paste\: key\: wait\: wait-idle\:' -d 'Input spec prefix'
 "#
 }
 
@@ -366,8 +606,34 @@ mod tests {
     fn completion_all_shells_mention_implemented_subcommands() {
         for sh in [Shell::Bash, Shell::Zsh, Shell::Fish] {
             let s = script(sh);
-            for sub in ["run", "attach", "list", "kill", "status", "tail", "wait"] {
+            for sub in [
+                "run", "attach", "list", "kill", "status", "tail", "wait", "screen", "input",
+            ] {
                 assert!(s.contains(sub), "shell {sh:?} missing `{sub}`");
+            }
+        }
+    }
+
+    #[test]
+    fn completion_all_shells_mention_screen_subsubcommands() {
+        for sh in [Shell::Bash, Shell::Zsh, Shell::Fish] {
+            let s = script(sh);
+            assert!(s.contains("dump"), "shell {sh:?} missing `dump`");
+            assert!(s.contains("snapshot"), "shell {sh:?} missing `snapshot`");
+        }
+    }
+
+    #[test]
+    fn completion_all_shells_mention_input_spec_prefixes() {
+        for sh in [Shell::Bash, Shell::Zsh, Shell::Fish] {
+            let s = script(sh);
+            // bash/fish は `text:` 形式、zsh は `text\:` (= escape) 形式で出る。
+            // どちらの形式でも prefix 文字列が含まれていればよい。
+            for prefix in ["text", "hex", "file", "paste", "key", "wait-idle"] {
+                assert!(
+                    s.contains(prefix),
+                    "shell {sh:?} missing spec prefix `{prefix}`"
+                );
             }
         }
     }
