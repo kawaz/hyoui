@@ -1,9 +1,18 @@
 # claude TUI 自動操作 PoC からのフィードバック (dump plain-text format + scrollback layer)
 
-- Status: Open
+- Status: Partially Done (= 要望 1 対応済、要望 2 / 副次要望は別 issue で継続)
 - Date: 2026-05-27
 - Priority: Middle
 - 発見元: claude-cmux-msg main 側で `hyoui input + wait + screen dump` を使って claude TUI を実機操作した PoC
+
+## 進捗
+
+- 2026-05-27: **要望 1 (= `--format=text/plain` 追加) 対応済**。
+  protocol enum + daemon dispatch + CLI 受理 + test を実装。
+  alias 3 種 (`text` / `text/plain` / `plain`) を受理、行末空白保持 + ANSI escape strip
+  の仕様で TUI 盤面状態をそのまま読める形に。
+  要望 2 (scrollback layer) と副次要望 (wait alternation) は別 issue / 別 task で
+  検討継続。
 
 ## PoC サマリ
 
