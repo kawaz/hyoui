@@ -8,11 +8,10 @@
 //!
 //! ## 本 file の test の位置付け
 //!
-//! 現状 DR-0001 軸 1/2 は **未実装** (= task #34 で実装予定)。本 file の test は
-//! DR-0014 §検証主義に従い、**「期待動作」ではなく「現実態」を assert で記録**
-//! する形式。task #34 で実装が入ったら、本 file の assert が壊れることが
-//! 「修正が効いている」trigger になる (= 修正時に必ず本 file を見直すよう強制
-//! する仕組み)。
+//! DR-0001 軸 1 は **task #34 で実装済 (2026-05-27)**。本 file の assert は
+//! 期待動作 (= DR-0001 §軸 1 の仕様) を確認する regression 防止 test として
+//! 機能する。`OnChildSuspend::Follow` で親が STOPPED に follow、`AutoResume` で
+//! 子が即復帰することを検証する。
 //!
 //! ## マトリクス cell の選定 (= DR-0014 §最低 3 種類の category)
 //!
@@ -69,10 +68,8 @@ fn wait_for_child(parent_pid: i32, max_ms: u64) -> std::io::Result<common::pty::
 }
 
 /// matrix cell A1: `/bin/sleep 30` を interactive mode で起動し、
-/// 子 (sleep) に **SIGSTOP** を送って STOP。親 hyoui の現実態を観測する。
-///
-/// **DR-0001 軸 1 期待動作 (interactive `follow`)**: 子 STOPPED → 親も STOPPED。
-/// **現実態 (= 軸 1 未実装)**: 子 STOPPED、親は Running のまま。
+/// 子 (sleep) に **SIGSTOP** を送って STOP。親 hyoui が follow して STOPPED に
+/// なることを検証する (= DR-0001 軸 1 `follow` の期待動作)。
 #[test]
 fn axis1_sleep_interactive_default_external_sigstop() {
     let runner = HyouiTestRunner::new();
@@ -104,22 +101,27 @@ fn axis1_sleep_interactive_default_external_sigstop() {
     );
 
     let parent_after = h.process_state().expect("parent observable");
-    // 現実態固定: 軸 1 未実装なので親は Running のまま (= follow しない)。
-    // task #34 で follow が実装されたら、ここは `is_state('T')` に反転する。
+    // DR-0001 軸 1 `follow` 実装後: 子 STOPPED 観測時に親が `raise(SIGSTOP)` で
+    // 自身も停止する。`stat` は 'T' で始まる (= Stopped)。
     assert!(
-        !parent_after.is_state('T'),
-        "現実態: 軸 1 follow 未実装のため親は STOP に follow しない。\
-         task #34 で実装されたら assert を反転する。got: {parent_after:?}"
+        parent_after.is_state('T'),
+        "DR-0001 軸 1 follow: 子 STOPPED 後は親も STOPPED ('T') になるはず。\
+         got: {parent_after:?}"
     );
 
-    // cleanup: 子 SIGCONT + 親 kill
+    // cleanup: 親と子の両方に SIGCONT を送ってから kill。
+    // 親が STOPPED のままだと kill (= SIGTERM) を受け取って処理できない。
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(h.pid().as_raw()),
+        Signal::SIGCONT,
+    );
     let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.pid), Signal::SIGCONT);
     h.kill().ok();
 }
 
-/// matrix cell A2: 明示 `--on-child-suspend=follow` を指定しても挙動が変わらないこと。
-///
-/// flag は parse されるが配線されていない現実態を assert で記録 (= task #34 trigger)。
+/// matrix cell A2: 明示 `--on-child-suspend=follow` を指定したときも親が
+/// follow して STOPPED になることを検証 (= A1 と同じ挙動だが flag override 経路の
+/// 配線が機能していることを確認)。
 #[test]
 fn axis1_sleep_interactive_explicit_follow() {
     let runner = HyouiTestRunner::new();
@@ -140,22 +142,25 @@ fn axis1_sleep_interactive_explicit_follow() {
     settle();
 
     let parent_after = h.process_state().expect("parent observable");
-    // 現実態固定: explicit follow 指定でも親は STOP しない (= flag は parse 済だが
-    // 実装側で配線されていない)。task #34 で配線されたら反転。
+    // DR-0001 軸 1 `follow` 実装後: 子 STOPPED 観測時に親も STOPPED へ follow。
     assert!(
-        !parent_after.is_state('T'),
-        "現実態: --on-child-suspend=follow 配線未実装。got: {parent_after:?}"
+        parent_after.is_state('T'),
+        "DR-0001 軸 1 explicit follow: 親 STOPPED ('T') になるはず。\
+         got: {parent_after:?}"
     );
 
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(h.pid().as_raw()),
+        Signal::SIGCONT,
+    );
     let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.pid), Signal::SIGCONT);
     h.kill().ok();
 }
 
 /// matrix cell A3: 明示 `--on-child-suspend=auto-resume` で子を強制復帰。
 ///
-/// **期待動作 (DR-0001 軸 1 `auto-resume`)**: 子 STOPPED → 親が即 SIGCONT を送り
-/// 子が即 Running に戻る (= 子の STOP は実質的に観測されない、または非常に短い)。
-/// **現実態**: 配線未実装なので子は STOP したまま放置。
+/// **DR-0001 軸 1 `auto-resume`**: 子 STOPPED → 親が即 SIGCONT を送り
+/// 子が即 Running に戻る (= 子の STOP 滞留は観測されない)。
 #[test]
 fn axis1_sleep_interactive_explicit_auto_resume() {
     let runner = HyouiTestRunner::new();
@@ -176,12 +181,14 @@ fn axis1_sleep_interactive_explicit_auto_resume() {
     settle();
 
     let child_after = process_state_of(child.pid).expect("child still observable");
-    // 現実態固定: 軸 1 auto-resume 未実装のため、SIGSTOP 後は STOP のまま。
-    // task #34 で実装されたら Running ('R') / Sleeping ('S') に戻るはず。
+    // DR-0001 軸 1 `auto-resume` 実装後: 子は SIGSTOP を受けて一瞬 STOPPED に
+    // 遷移するが、親が SIGCHLD self-pipe で transition を観測した直後に
+    // `killpg(child, SIGCONT)` を投げて復帰させる。観測時点では既に Running
+    // (= 'R') または Sleeping (= 'S') に戻っている。
     assert!(
-        child_after.is_state('T'),
-        "現実態: auto-resume 未配線のため子は STOP したまま。\
-         task #34 で実装されたら R/S に戻る。got: {child_after:?}"
+        !child_after.is_state('T'),
+        "DR-0001 軸 1 auto-resume: 子は SIGSTOP 後も走り続ける (= R/S)。\
+         got: {child_after:?}"
     );
 
     // cleanup
@@ -191,7 +198,7 @@ fn axis1_sleep_interactive_explicit_auto_resume() {
 
 /// matrix cell A4: `--mode=headless` の default は `auto-resume`。
 ///
-/// 子 SIGSTOP → 期待は即復帰、現実態は STOP 放置。
+/// 子 SIGSTOP → DR-0001 軸 1 `auto-resume` で即復帰する (= preset 経由の配線確認)。
 #[test]
 fn axis1_sleep_headless_default_auto_resume() {
     let runner = HyouiTestRunner::new();
@@ -205,11 +212,11 @@ fn axis1_sleep_headless_default_auto_resume() {
     settle();
 
     let child_after = process_state_of(child.pid).expect("child observable");
-    // 現実態固定: headless preset の auto-resume が配線されていない。
+    // DR-0001 軸 1 `auto-resume` (headless preset 経由): 子は即復帰。
     assert!(
-        child_after.is_state('T'),
-        "現実態: headless auto-resume 未配線。\
-         task #34 で実装されたら R/S に戻る。got: {child_after:?}"
+        !child_after.is_state('T'),
+        "DR-0001 軸 1 auto-resume (headless preset): 子は STOP しない (= R/S)。\
+         got: {child_after:?}"
     );
 
     let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.pid), Signal::SIGCONT);
@@ -217,8 +224,8 @@ fn axis1_sleep_headless_default_auto_resume() {
 }
 
 /// matrix cell A5: `/bin/cat` (= line-oriented stdin reader) を interactive で
-/// 起動し、子に SIGSTOP。category 違い (TUI ではなく line-oriented) でも現実態が
-/// 同じことを確認 (= サンプル多様性、DR-0014 §最低 3 種類)。
+/// 起動し、子に SIGSTOP。category 違い (TUI ではなく line-oriented) でも軸 1
+/// `follow` が機能することを確認 (= サンプル多様性、DR-0014 §最低 3 種類)。
 #[test]
 fn axis1_cat_interactive_default_external_sigstop() {
     let runner = HyouiTestRunner::new();
@@ -238,17 +245,21 @@ fn axis1_cat_interactive_default_external_sigstop() {
 
     let parent_after = h.process_state().expect("parent observable");
     assert!(
-        !parent_after.is_state('T'),
-        "現実態 (cat category): 軸 1 follow 未配線、親は STOP に follow しない。\
+        parent_after.is_state('T'),
+        "DR-0001 軸 1 follow (cat category): 親も STOPPED ('T') に follow するはず。\
          got: {parent_after:?}"
     );
 
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(h.pid().as_raw()),
+        Signal::SIGCONT,
+    );
     let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.pid), Signal::SIGCONT);
     h.kill().ok();
 }
 
 /// matrix cell A6: `bash --norc -i` (= interactive REPL category) を起動し、
-/// 子 bash に SIGSTOP。3 種目の category で現実態を確認。
+/// 子 bash に SIGSTOP。3 種目の category で軸 1 `follow` を確認。
 ///
 /// bash interactive は **job control を持つ** ため、本来は内側で job control が
 /// 走る (= bash が前景子の signal を受けて分散する) はず。ただし bash 自身が
@@ -279,11 +290,15 @@ fn axis1_bash_interactive_default_external_sigstop() {
 
     let parent_after = h.process_state().expect("parent observable");
     assert!(
-        !parent_after.is_state('T'),
-        "現実態 (bash REPL category): 軸 1 follow 未配線、親は STOP に follow しない。\
+        parent_after.is_state('T'),
+        "DR-0001 軸 1 follow (bash REPL category): 親も STOPPED ('T') に follow するはず。\
          got: {parent_after:?}"
     );
 
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(h.pid().as_raw()),
+        Signal::SIGCONT,
+    );
     let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.pid), Signal::SIGCONT);
     h.kill().ok();
 }
