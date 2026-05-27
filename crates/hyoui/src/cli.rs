@@ -500,7 +500,18 @@ pub fn parse_args(args: &[String]) -> Command {
         "input" => parse_input(rest),
         "completion" => parse_completion(rest),
         // Reserved for future stages.
-        "send" | "detach" => Command::Error(format!(
+        //
+        // `send` / `detach` は旧 leaf 設計の名残として予約。
+        //
+        // `tx` / `lock` / `unlock` は DR-0006 §7 で確定済みの自動操作排他 subcommand。
+        // protocol 層 (= `LockAcquire` / `LockResponse` / `LockRelease` message と
+        // `LockDenied` / `LockNotHeld` error code、daemon の `handle_lock_acquire` /
+        // `handle_lock_release` handler) は既に実装済だが、これら CLI subcommand 本体
+        // (= token 生成 / 子 process 起動 + env 注入 / refcount / timeout 管理) は
+        // 未実装。MVP では子側で `--lock-token=<T>` flag または `HYOUI_LOCK_TOKEN`
+        // env を渡せば lock 配下で動くため fallback で機能している (= task #19)。
+        // 詳細は `docs/issue/2026-05-27-tx-lock-unlock-cli-subcommands.md` 参照。
+        "send" | "detach" | "tx" | "lock" | "unlock" => Command::Error(format!(
             "subcommand `{head}` is reserved but not yet implemented"
         )),
         other => Command::Help {
@@ -3202,8 +3213,10 @@ mod tests {
     #[test]
     fn reserved_subcommands_return_error() {
         // attach / list / kill / status / tail / wait は実装済 (= 別 test)。
-        // `send` / `detach` はまだ reserved。
-        for name in ["send", "detach"] {
+        // `send` / `detach` は旧 leaf 設計の reserved。
+        // `tx` / `lock` / `unlock` は DR-0006 §7 の lock 制御 CLI、protocol 層は
+        // 実装済だが CLI subcommand 本体は未実装 (= `docs/issue/2026-05-27-tx-lock-unlock-cli-subcommands.md`)。
+        for name in ["send", "detach", "tx", "lock", "unlock"] {
             match parse_args(&args(&[name])) {
                 Command::Error(msg) => assert!(msg.contains(name), "msg = {msg}"),
                 other => panic!("expected Error for `{name}`, got {other:?}"),
