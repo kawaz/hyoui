@@ -23,43 +23,58 @@
 
 ## 優先 (= 必須完了後、順次)
 
-### [[DR-0013]] Phase B (= screen 基盤の拡張)
+### [[DR-0013]] Phase B 残項目
 
-- input bytes log 実装 (= primary buffer 用 bounded ring buffer、`daemon/screen/input_log.rs`、50-80 行) + resize replay
-- 既存 `crates/hyoui/src/scrollback.rs` を vt100 wrapper に置換 (= 二重管理排除、`last_evicted_age` 補完 counter)
-- debug / inspection protocol (= `ScreenDumpRequest` / `ScreenDumpResponse` / `StateSnapshotRequest` / `StateSnapshotResponse`)
-- [[DR-0008]] cap flag 追加 (= `screen-dump-v1` / `state-snapshot-v1`)
-- structured snapshot 圧縮 wrapper (= `daemon/screen/snapshot.rs`、空 cell skip + 属性 bit pack + Color variant 整数化、200-300 行)
+完了済 (2026-05-27 nonstop session):
+
+- [x] input bytes log 実装 (= primary buffer 用 bounded ring buffer、`daemon/screen/input_log.rs`) + resize replay
+- [x] debug / inspection protocol (= `ScreenDumpRequest` / `ScreenDumpResponse` / `StateSnapshotRequest` / `StateSnapshotResponse`)
+- [x] [[DR-0008]] cap flag 追加 (= `screen-dump-v1` / `state-snapshot-v1`)
+- [x] structured snapshot 圧縮 wrapper (= `daemon/screen/snapshot.rs`、空 cell skip + 属性 bit pack + Color variant 整数化)
+- [x] stalled sequence 5s reset (= health check、parser internal buffer clear)
+
+未着手 (= 順次):
+
+- 既存 `crates/hyoui/src/scrollback.rs` の vt100 wrapper 置換は **見送り** (= byte-base tail 専用層として責務分離した、[[DR-0013]] §8 Update)
+- `last_evicted_age` 補完 counter (= vt100 内蔵 ring が無効化されている間は未配線、Phase C)
 - per-line SequenceNo + pull 型 protocol (= `DirtyLinesNotify` / `GetLinesRequest` / `GetLinesResponse`)
 - PDU serial 番号導入 (= out-of-order tolerant + RTT 計測)
 
 出典: [[DR-0013]] §3-§11, Implementation Phase B
 
-### state-based 上位機能 (= screen 基盤が前提)
+### state-based 上位機能 (完了済 2026-05-27)
 
-- **wait** (= state-based、scrollback 誤マッチ解消、現在 visible に対する match を L1 で実現)
-- **tail** (= state-based、chunk 境界保持 / ANSI strip 境界跨ぎ正規化を state 経由で自然解消)
-- **snapshot** (= state-based、`hyoui screen dump` / `hyoui screen snapshot` の CLI 露出)
+- [x] **wait** (= state-based、scrollback 誤マッチ解消、現在 visible に対する match。`cli/wait_core.rs` が `screen.snapshot.request` を polling して visible cells から text 構築 → regex match)
+- [x] **snapshot** (= state-based、`hyoui screen dump` / `hyoui screen snapshot` の CLI 露出、[[DR-0006]] §10)
+- tail (= byte-base 維持、state-based wait / snapshot との棲み分けを [[DR-0006]] §11.4 で明示)
 
-### input family 整理 (= [[DR-0010]] §1 正本)
+### input family 整理 (完了済 2026-05-27)
 
-- spec syntax 統一: `text:` / `file:` / `hex:` / `paste:` / `wait:` / `wait-idle:` prefix
-- `hyoui input text|keys|paste <session> <spec>...`
-- bracketed paste auto detect (= direct と paste 系の prefix 分け)
-- multi-line script を 1 paste block で送る経路
+- [x] spec syntax 統一: `text:` / `hex:` / `file:` / `paste:` / `key:` / `wait:` / `wait-idle:` prefix
+- [x] `hyoui input <session> <spec>...` (= leaf 廃止、1 leaf に集約、[[DR-0006]] §8.1)
+- [x] bracketed paste は prefix で明示 (= `text:` direct / `paste:` bracketed、[[DR-0006]] §8.3)
+- [x] multi-line script を 1 paste block で送る経路 (= `paste:$(cat script.py)`)
+- [x] `file:` 入力の size / type validation
+- [x] key alias (= Unicode key alias + typo suggest、[[DR-0006]] §8.4)
+- [x] spec prefix typo suggest (= edit-distance ベース)
+- multi-modifier (= Ctrl-Shift-A 等) は terminal capability negotiation が必要、`追加予定` へ
 
-### lock / tx (= input family の primitive)
+### lock / tx (完了済 2026-05-27)
 
-- `hyoui lock acquire <session> [--timeout-* ...] [--mode wait|fail]`
-- `hyoui lock release <session> [--token T | --force]`
-- `hyoui lock tx <session> [--timeout-* ...] -- cmd args...`
-- wait queue 実装 (= 旧 v0.1.x で「即 Denied 返却」だった部分の proper 化)
-- `HYOUI_LOCK_TOKEN` の自動継承 (= tx の子に注入、全自動操作系コマンドが自動継承)
+- [x] `hyoui lock acquire <session> [--timeout-* ...] [--mode wait|fail]`
+- [x] `hyoui lock release <session> [--token T | --force]`
+- `hyoui lock tx <session> [--timeout-* ...] -- cmd args...` は **subcommand 予約済 + 起票済**、本実装は別 task (= `docs/issue/` 参照)
+- [x] `HYOUI_LOCK_TOKEN` の自動継承 (= `--lock-token` 未指定時に env から拾う)
+- wait queue 実装 (= 旧 v0.1.x で「即 Denied 返却」だった部分の proper 化) は別 task
+
+### completion / UX
+
+- [x] shell completion (= `hyoui completion <shell>`、screen + input subcommands + spec prefix 補完)
 
 ### `wait` の chunk boundary 跨ぎ needle miss 修正
 
-- 現状 best-effort、状態保持型 strip + match に置換 (= R4-H3)
-- screen state 経由になれば多くは自然解消、残課題は別途
+- screen state 経由 (= state-based wait) になり **自然解消** (= cell 単位で text 化されるので chunk 境界の概念が消える)
+- tail 側の strip carry は R4-H3 として別 task に残る
 
 ## 追加予定 (= 順序定めず、必要が出たら検討)
 
@@ -94,7 +109,7 @@
 - **observability** (= [[DR-0011]] Phase A 以降、tracing instrument、status --metrics、detached child log file + hyoui logs)
 - **signal wire name 化** ([[DR-0012]] 完了後の整理、cross-OS serve gateway 対応の前提)
 - **itumono skill 改修** (= `/tmp` → `docs/REVIEW-BACKLOG.md` 規約への移管、別 PR で実施)
-- **[[DR-0006]] §8/§9 改訂** (= wait / snapshot を state-based に書き直し、別 DR or DR-0006 内 sub-section 改訂で対応)
+- ~~**[[DR-0006]] §8/§9 改訂**~~ (完了済 2026-05-27、§8 input family / §9 wait / §10 snapshot / §11 tail を state-based に書き直し済、旧仕様は Archive section に保全)
 - **detach key sequence の customize** (= `--detach-prefix` env / option で `Ctrl-A D` 固定を解除)
 - **attach subcommand 専用 `--help`** (= detach key 動作・mode 説明を専用 help に書く)
 
