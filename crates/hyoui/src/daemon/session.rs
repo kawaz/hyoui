@@ -21,14 +21,15 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
 use crate::Error;
+use crate::cli::{OnChildSuspend, OnParentSuspend};
 #[cfg_attr(not(test), allow(unused_imports))]
 use crate::protocol::Mode;
 use crate::protocol::messages::{LeaderNotify, ModeChange};
 use crate::protocol::{ControlMessage, Frame};
 use crate::scrollback::Scrollback;
 use crate::sys::{
-    FdExt, Pty, SelfPipe, UnixSock, install_self_pipe, poll::PollFlags, poll::PollOutcome,
-    poll::poll, pty::Spawned, register_self_pipe,
+    FdExt, Pty, SelfPipe, UnixSock, install_default, install_self_pipe, poll::PollFlags,
+    poll::PollOutcome, poll::poll, pty::Spawned, raise, register_self_pipe,
 };
 
 use super::DaemonConfig;
@@ -40,7 +41,9 @@ use super::broadcast::{
 };
 use super::control::{ClientFrameOutcome, FrameOrError, handle_client_frame};
 use super::lock::{SessionState, elevate_next_leader};
-use super::pty::{ALIVE_RETRY_INTERVAL, ChildLifecycle, ChildState, STOPPED_POLL_INTERVAL};
+use super::pty::{
+    ALIVE_RETRY_INTERVAL, ChildLifecycle, ChildState, ChildTransition, STOPPED_POLL_INTERVAL,
+};
 use super::screen::{ScreenState, StalledOutcome, check_stalled};
 
 /// R5-H7: send `sig` to the child's whole process group instead of only the
@@ -142,10 +145,16 @@ struct SigchldOwner {
 }
 
 /// Attempt to acquire SIGCHLD self-pipe ownership for this serve. Returns
-/// `Some` on success (= SIGCHLD will deliver into `pipe`), `None` if either
-/// the lock is taken by another concurrent serve in this process or the
-/// self-pipe / sigaction install fails. The `None` path is non-fatal — the
-/// caller falls back to the legacy 500ms polling.
+/// `Some` on success (= SIGCHLD / SIGTSTP / SIGCONT will deliver into `pipe`),
+/// `None` if either the lock is taken by another concurrent serve in this
+/// process or the self-pipe / sigaction install fails. The `None` path is
+/// non-fatal — the caller falls back to the legacy 500ms polling.
+///
+/// DR-0001 軸 1/2 配線: 同 self-pipe に **SIGTSTP / SIGCONT も register** する。
+/// signal handler は signum を 1 byte 書き、serve_loop が drain 時に signum で
+/// 分岐して `OnChildSuspend` / `OnParentSuspend` policy を発火させる。
+/// SIGTSTP と SIGCONT のハンドラ install に失敗しても fatal にせず best-effort で
+/// 進める (= 既存 SIGCHLD のみで動く既存挙動を維持)。
 fn acquire_sigchld_selfpipe() -> Option<SigchldOwner> {
     let guard = match SIGCHLD_SELFPIPE_LOCK.try_lock() {
         Ok(g) => g,
@@ -157,10 +166,24 @@ fn acquire_sigchld_selfpipe() -> Option<SigchldOwner> {
         // pipe drops here, clearing SELFPIPE_WRITE_FD; guard released too.
         return None;
     }
+    // DR-0001 軸 2 (SIGTSTP) + invariant 回復 (SIGCONT) を同 self-pipe に乗せる。
+    // best-effort: install 失敗時は当該 signal の policy が動かないだけで、
+    // SIGCHLD 経路 (= 軸 1 既存配線) は維持される。
+    let _ = register_self_pipe(Signal::SIGTSTP);
+    let _ = register_self_pipe(Signal::SIGCONT);
     Some(SigchldOwner {
         pipe,
         _guard: guard,
     })
+}
+
+/// `SigchldOwner` を drop した後に SIGTSTP / SIGCONT の disposition を default に
+/// 戻す helper。`SelfPipe` drop が `SELFPIPE_WRITE_FD` をクリアするので、handler
+/// が late delivery で stale fd を触ることはないが、`sigaction` が install された
+/// ままだと test 終了後にも process-wide で残留する。clean up を明示する。
+fn release_suspend_signal_handlers() {
+    let _ = install_default(Signal::SIGTSTP);
+    let _ = install_default(Signal::SIGCONT);
 }
 use super::tail::{broadcast_tail_end_to_followers, tail_end_reason_from_outcome};
 
@@ -360,7 +383,15 @@ impl Session {
         // Drop the SIGCHLD self-pipe explicitly before any further cleanup so
         // the global `SELFPIPE_WRITE_FD` is cleared and a subsequent serve in
         // the same process can claim the slot.
+        let had_owner = sigchld_owner.is_some();
         drop(sigchld_owner);
+        // DR-0001 軸 1/2 配線で install した SIGTSTP / SIGCONT handler を default
+        // に戻す。SIGCHLD は既存配線 (R5-H6) と整合するため install_default は
+        // しない (= test 終了後に同 disposition が残留することを許容、handler 自体は
+        // SELFPIPE_WRITE_FD == -1 で write skip するため副作用なし)。
+        if had_owner {
+            release_suspend_signal_handlers();
+        }
 
         // tail follow subscriber へ TailEnd を 1 発投げてから cleanup する。
         // 終了理由の導出 (= ChildExited / ClientCancel / Error は送らない) と
@@ -549,6 +580,125 @@ fn detect_and_warn_stalled(screen_state: &mut ScreenState, warned: &mut bool) {
     }
 }
 
+/// DR-0001 軸 2 + invariant 回復: self-pipe から drain した signal byte 列を
+/// 走査し、SIGTSTP / SIGCONT に対応する policy を発火する。
+///
+/// - **SIGTSTP** (= 親 daemon が外部から `kill -TSTP <pid>` 等で suspend 要求):
+///   `OnParentSuspend` に従い、`Transparent` なら子 pgrp に SIGSTOP を投げて
+///   から親自身に `raise(SIGSTOP)`、`Decouple` なら親だけ `raise(SIGSTOP)`。
+///   `raise(SIGSTOP)` は kernel に処理させるため、handler 内ではなく serve_loop
+///   コンテキスト (= 同期 path) で呼ぶ。
+/// - **SIGCONT** (= 外側 `fg` 等で親が再開した):
+///   DR-0001 §invariant 回復ルール: 子が STOPPED なら `killpg(child, SIGCONT)`
+///   を送って復帰させる (= 「親 fg かつ子 stop」禁則の論理的解消)。
+///
+/// SIGCHLD バイトは本 helper では処理しない (= caller 側で `lifecycle.poll_with_transition`
+/// を介して transition 判定 → `handle_child_transition` に流す)。
+///
+/// 戻り値 `Some(RelayOutcome)` は serve_loop を即時終了させる場合のみ (= 現在は
+/// 該当なし。将来 SIGTERM 経路を統合した場合の余地)。
+fn handle_suspend_signals(
+    drained: &[u8],
+    child: Pid,
+    config: &DaemonConfig,
+    _lifecycle: &mut ChildLifecycle,
+) -> Option<RelayOutcome> {
+    for &b in drained {
+        let sig_i32 = b as i32;
+        if sig_i32 == Signal::SIGTSTP as i32 {
+            // 軸 2: 親 daemon 自身に届いた SIGTSTP。policy に応じて子を一緒に
+            // 止めるか/止めないか分岐し、最後に親自身を SIGSTOP で stop させる。
+            match config.on_parent_suspend {
+                OnParentSuspend::Transparent => {
+                    // 子 pgrp に SIGSTOP (catch 不可で確実に届く)。orphan group
+                    // でも SIGSTOP は discard されない。
+                    let _ = kill_pgrp(child, Signal::SIGSTOP);
+                }
+                OnParentSuspend::Decouple => {
+                    // 子は何もしない (= 走り続ける)。
+                }
+            }
+            // 親自身を停止。SIGSTOP は catch 不可なので、SIGTSTP ハンドラが
+            // self-pipe に流した後で安全に raise できる (= self-pipe handler 内
+            // ではない同期 path)。
+            let _ = raise(Signal::SIGSTOP);
+            // SIGSTOP/SIGCONT で復帰した時点で本 path から抜け serve_loop に戻る。
+            // 復帰後は self-pipe に SIGCONT byte が積まれているはずで、次 iteration
+            // で `handle_suspend_signals` が invariant 回復を担う。
+        } else if sig_i32 == Signal::SIGCONT as i32 {
+            // invariant 回復 (DR-0001 §invariant): 親が再開した時、子が STOPPED
+            // なら必ず SIGCONT を送って復帰させる。`waitpid(WNOHANG | WUNTRACED |
+            // WCONTINUED)` で transient 状態を取り出し、Stopped ならば SIGCONT。
+            // ※ ChildLifecycle の latch (= self.stopped) を信用するより、確実に
+            // waitpid で確認する方が安全 (= 既に外部 SIGCONT で復帰済の場合に
+            // 二重送信しないため)。
+            let flags = WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED;
+            if let Ok(status) = waitpid(child, Some(flags)) {
+                let is_stopped = matches!(status, WaitStatus::Stopped(_, _));
+                if is_stopped {
+                    let _ = kill_pgrp(child, Signal::SIGCONT);
+                }
+                // Continued / Exited / StillAlive は何もしない (= 不要)。
+                // lifecycle 側の latch 更新も次の `poll_with_transition` で
+                // 整合する (= 本 helper の waitpid で transition を 1 度 drain
+                // した場合は lifecycle が次回 StillAlive を見るが、latch は
+                // 「serve_loop 観測時点で stopped かどうか」を更新する責務に
+                // とどめる)。
+            }
+        }
+        // SIGCHLD / 他の signum はここでは処理しない (= caller 側 lifecycle
+        // 経路で transition を取り出す)。
+    }
+    None
+}
+
+/// DR-0001 軸 1: `lifecycle.poll_with_transition` が **新規** `Stopped` transition
+/// を観測した瞬間に呼ばれる。policy に応じて Follow / AutoResume を発火する。
+///
+/// - **`OnChildSuspend::AutoResume`**: 子 pgrp に即 `SIGCONT` を送って復帰
+///   (= 子の suspend を一切許さない、poc3 nosuspend 相当)。
+/// - **`OnChildSuspend::Follow`**: 親自身に `SIGSTOP` を `raise`。親が STOPPED に
+///   なると外側 shell の job control が親を bg/fg 制御に組み込み、`fg` で揃って
+///   復帰する。復帰時は SIGCONT byte が self-pipe に乗って `handle_suspend_signals`
+///   が invariant 回復で子も SIGCONT する。
+///
+/// `Continued` / `Exited` transition は (現状) 単に通知するだけで policy 発火なし。
+/// `Exited` の場合は caller 側 (`lifecycle.poll_with_transition` の返り `ChildState`)
+/// が `RelayOutcome::ChildExited` で serve_loop を抜けるので、本 helper は `None`。
+fn handle_child_transition(
+    transition: ChildTransition,
+    child: Pid,
+    config: &DaemonConfig,
+) -> Option<RelayOutcome> {
+    match transition {
+        ChildTransition::Stopped => {
+            match config.on_child_suspend {
+                OnChildSuspend::AutoResume => {
+                    // 子 pgrp に SIGCONT。orphan group 関係なく届く (= 送る側に
+                    // orphan discard は適用されない)。
+                    let _ = kill_pgrp(child, Signal::SIGCONT);
+                }
+                OnChildSuspend::Follow => {
+                    // 親自身に SIGSTOP raise。kernel が catch 不可な SIGSTOP を
+                    // 処理して親を STOPPED にする。外側 shell に制御が戻り、
+                    // ユーザの `fg` で親 + 子 (invariant 回復経由) が揃って復帰。
+                    let _ = raise(Signal::SIGSTOP);
+                }
+            }
+            None
+        }
+        ChildTransition::Continued => {
+            // 単に lifecycle の latch が clear されただけ。policy 発火なし。
+            None
+        }
+        ChildTransition::Exited(_) => {
+            // caller が `ChildState::Exited` で既に serve_loop を畳むため、本 helper
+            // からの早期 return は不要。
+            None
+        }
+    }
+}
+
 /// serve loop の本体。`Session::serve` から切り出して所有権整理を平坦化。
 #[allow(clippy::too_many_arguments)]
 fn serve_loop(
@@ -649,14 +799,26 @@ fn serve_loop(
             }
             Ok(PollOutcome::Interrupted) => {
                 drop(poll_fds);
-                // R5-H6: SIGCHLD may have arrived; drain self-pipe + check
-                // child state. EINTR alone (without self-pipe ready) still
-                // benefits from the same drain (= no-op if empty).
+                // R5-H6 + DR-0001 軸 1/2: SIGCHLD / SIGTSTP / SIGCONT may have
+                // arrived. Drain self-pipe + dispatch policy. EINTR alone
+                // (without self-pipe ready) still benefits from the same drain
+                // (= no-op if empty).
                 if let Some(sp) = sigchld_pipe {
-                    let _ = sp.drain();
+                    let drained = sp.drain().unwrap_or_default();
+                    if let Some(outcome) =
+                        handle_suspend_signals(&drained, child, config, &mut lifecycle)
+                    {
+                        return outcome;
+                    }
                 }
-                if let ChildState::Exited(code) = lifecycle.poll(child) {
+                let (state, transition) = lifecycle.poll_with_transition(child);
+                if let ChildState::Exited(code) = state {
                     return RelayOutcome::ChildExited(code);
+                }
+                if let Some(t) = transition {
+                    if let Some(outcome) = handle_child_transition(t, child, config) {
+                        return outcome;
+                    }
                 }
                 continue;
             }
@@ -728,17 +890,28 @@ fn serve_loop(
         );
         detect_and_warn_stalled(screen_state, &mut stalled_warned);
 
-        // R5-H6: SIGCHLD wake-up handling. Drain the self-pipe to clear
-        // pending signal bytes, then run `lifecycle.poll(child)` to pick up
-        // any STOP / CONT / exit transition that just happened. If the child
-        // exited, return immediately so callers (= scrollback / tail) finish
-        // promptly (= no 500ms `STOPPED_POLL_INTERVAL` latency).
+        // R5-H6 + DR-0001 軸 1/2: SIGCHLD / SIGTSTP / SIGCONT wake-up handling.
+        // Drain the self-pipe + dispatch each signal byte. SIGTSTP / SIGCONT が
+        // 入っていれば軸 2 / invariant 回復 policy をここで発火させる。
+        // SIGCHLD については従来通り lifecycle.poll で transition を取り出し、
+        // 軸 1 policy (= Stopped transition 観測時の Follow/AutoResume) を発火。
         if sigchld_ready {
             if let Some(sp) = sigchld_pipe {
-                let _ = sp.drain();
+                let drained = sp.drain().unwrap_or_default();
+                if let Some(outcome) =
+                    handle_suspend_signals(&drained, child, config, &mut lifecycle)
+                {
+                    return outcome;
+                }
             }
-            if let ChildState::Exited(code) = lifecycle.poll(child) {
+            let (state, transition) = lifecycle.poll_with_transition(child);
+            if let ChildState::Exited(code) = state {
                 return RelayOutcome::ChildExited(code);
+            }
+            if let Some(t) = transition {
+                if let Some(outcome) = handle_child_transition(t, child, config) {
+                    return outcome;
+                }
             }
         }
 
@@ -779,17 +952,25 @@ fn serve_loop(
         if pty_ready {
             let mut buf = [0u8; 8192];
             match pty.master_fd().read_some(&mut buf) {
-                Ok(0) => match lifecycle.poll(child) {
-                    ChildState::Exited(code) => return RelayOutcome::ChildExited(code),
-                    ChildState::Stopped => {
-                        // R4-H14: SIGTSTP'd 子で master EOF/POLLHUP が連続する間の
-                        // busy-wait 回避。SIGCONT が来るまで 500ms 単位で待機。
-                        std::thread::sleep(STOPPED_POLL_INTERVAL);
+                Ok(0) => {
+                    let (state, transition) = lifecycle.poll_with_transition(child);
+                    if let Some(t) = transition {
+                        if let Some(outcome) = handle_child_transition(t, child, config) {
+                            return outcome;
+                        }
                     }
-                    ChildState::Alive => {
-                        std::thread::sleep(ALIVE_RETRY_INTERVAL);
+                    match state {
+                        ChildState::Exited(code) => return RelayOutcome::ChildExited(code),
+                        ChildState::Stopped => {
+                            // R4-H14: SIGTSTP'd 子で master EOF/POLLHUP が連続する間の
+                            // busy-wait 回避。SIGCONT が来るまで 500ms 単位で待機。
+                            std::thread::sleep(STOPPED_POLL_INTERVAL);
+                        }
+                        ChildState::Alive => {
+                            std::thread::sleep(ALIVE_RETRY_INTERVAL);
+                        }
                     }
-                },
+                }
                 Ok(n) => {
                     // scrollback に push してから broadcast (subscription 種類で encoding 分岐)
                     let now = Instant::now();
@@ -817,15 +998,23 @@ fn serve_loop(
                         }
                     }
                 }
-                Err(Error::Errno(nix::errno::Errno::EIO)) => match lifecycle.poll(child) {
-                    ChildState::Exited(code) => return RelayOutcome::ChildExited(code),
-                    ChildState::Stopped => {
-                        std::thread::sleep(STOPPED_POLL_INTERVAL);
+                Err(Error::Errno(nix::errno::Errno::EIO)) => {
+                    let (state, transition) = lifecycle.poll_with_transition(child);
+                    if let Some(t) = transition {
+                        if let Some(outcome) = handle_child_transition(t, child, config) {
+                            return outcome;
+                        }
                     }
-                    ChildState::Alive => {
-                        std::thread::sleep(ALIVE_RETRY_INTERVAL);
+                    match state {
+                        ChildState::Exited(code) => return RelayOutcome::ChildExited(code),
+                        ChildState::Stopped => {
+                            std::thread::sleep(STOPPED_POLL_INTERVAL);
+                        }
+                        ChildState::Alive => {
+                            std::thread::sleep(ALIVE_RETRY_INTERVAL);
+                        }
                     }
-                },
+                }
                 Err(Error::Errno(nix::errno::Errno::EAGAIN)) => {}
                 Err(e) => return RelayOutcome::Error(e),
             }
