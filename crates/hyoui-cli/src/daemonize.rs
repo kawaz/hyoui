@@ -12,6 +12,7 @@ use std::os::fd::IntoRawFd;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 
+use hyoui::cli::{OnChildSuspend, OnParentSuspend};
 use hyoui::daemon::{DaemonConfig, Session};
 use nix::sys::stat::Mode;
 
@@ -21,12 +22,15 @@ use crate::socket_path;
 ///
 /// 子 daemon process を spawn し、socket bind 完了 (= ready pipe からの 1 byte)
 /// を待ってから親は exit。stdout に socket path を 1 行出力する。
+#[allow(clippy::too_many_arguments)]
 pub fn run_detached_parent(
     session_id_override: Option<String>,
     socket_override: Option<String>,
     cols: u16,
     rows: u16,
     until: Option<String>,
+    on_child_suspend: OnChildSuspend,
+    on_parent_suspend: OnParentSuspend,
     cmd: Vec<String>,
 ) -> ExitCode {
     let session_id = session_id_override.unwrap_or_else(socket_path::auto_session_id);
@@ -72,6 +76,16 @@ pub fn run_detached_parent(
             child.arg(format!("--until={needle}"));
         }
     }
+    // DR-0001 軸 1/2: suspend policy を daemon 子に伝搬 (= 親で preset + override
+    // 解決済の値をそのまま渡す)。文字列値は CLI parse 表記と一致させて round-trip。
+    child.arg(format!(
+        "--on-child-suspend={}",
+        child_suspend_str(on_child_suspend)
+    ));
+    child.arg(format!(
+        "--on-parent-suspend={}",
+        parent_suspend_str(on_parent_suspend)
+    ));
     child.arg("--");
     for c in cmd {
         child.arg(c);
@@ -124,6 +138,10 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
     let mut rows: u16 = 24;
     let mut ready_fd: Option<i32> = None;
     let mut until: Option<String> = None;
+    // DR-0001 軸 1/2: parent から伝搬される suspend policy。default は interactive
+    // preset と揃える (= 親が値を渡し忘れた場合のフォールバック)。
+    let mut on_child_suspend = OnChildSuspend::Follow;
+    let mut on_parent_suspend = OnParentSuspend::Transparent;
     let mut cmd: Vec<String> = Vec::new();
     let mut in_cmd = false;
     for arg in args {
@@ -148,6 +166,16 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
         } else if let Some(v) = arg.strip_prefix("--until=") {
             // R5-FB1: 親から渡された needle pattern
             until = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--on-child-suspend=") {
+            // DR-0001 軸 1: 親 RunConfig から伝搬。未知値はフォールバック既定値を維持。
+            if let Some(p) = parse_child_suspend(v) {
+                on_child_suspend = p;
+            }
+        } else if let Some(v) = arg.strip_prefix("--on-parent-suspend=") {
+            // DR-0001 軸 2: 親 RunConfig から伝搬。未知値はフォールバック既定値を維持。
+            if let Some(p) = parse_parent_suspend(v) {
+                on_parent_suspend = p;
+            }
         }
     }
 
@@ -184,6 +212,9 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
             dcfg.until = Some(needle);
         }
     }
+    // DR-0001 軸 1/2 を daemon に配線。
+    dcfg.on_child_suspend = on_child_suspend;
+    dcfg.on_parent_suspend = on_parent_suspend;
 
     let session = match Session::start(dcfg) {
         Ok(s) => s,
@@ -205,5 +236,47 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
     match session.serve() {
         Ok(_code) => ExitCode::SUCCESS,
         Err(_) => ExitCode::from(1),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DR-0001 軸 1/2: parent ↔ detached child 間で suspend policy 値を文字列経由で
+// 受け渡しするための helper。CLI parse 表記 (`follow|auto-resume` /
+// `transparent|decouple`) と round-trip する。
+// ---------------------------------------------------------------------------
+
+fn child_suspend_str(v: OnChildSuspend) -> &'static str {
+    match v {
+        OnChildSuspend::Follow => "follow",
+        OnChildSuspend::AutoResume => "auto-resume",
+        // `#[non_exhaustive]` のため wildcard 必須。未知 variant が増えたときは
+        // 親 round-trip 経路の保守的フォールバックとして interactive default
+        // (= `follow`) に揃える。
+        _ => "follow",
+    }
+}
+
+fn parent_suspend_str(v: OnParentSuspend) -> &'static str {
+    match v {
+        OnParentSuspend::Transparent => "transparent",
+        OnParentSuspend::Decouple => "decouple",
+        // 同上: 未知 variant のフォールバックは interactive default。
+        _ => "transparent",
+    }
+}
+
+fn parse_child_suspend(s: &str) -> Option<OnChildSuspend> {
+    match s {
+        "follow" => Some(OnChildSuspend::Follow),
+        "auto-resume" => Some(OnChildSuspend::AutoResume),
+        _ => None,
+    }
+}
+
+fn parse_parent_suspend(s: &str) -> Option<OnParentSuspend> {
+    match s {
+        "transparent" => Some(OnParentSuspend::Transparent),
+        "decouple" => Some(OnParentSuspend::Decouple),
+        _ => None,
     }
 }

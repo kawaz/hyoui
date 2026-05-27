@@ -235,6 +235,8 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
             cols,
             rows,
             cfg.until.clone(),
+            cfg.on_child_suspend,
+            cfg.on_parent_suspend,
             cfg.command,
         );
     }
@@ -270,6 +272,10 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
             dcfg.until = Some(needle);
         }
     }
+    // DR-0001 軸 1/2: cli で parse + preset 解決済の suspend policy を daemon に渡す。
+    // (旧版は RunConfig 構造体に格納されるだけで daemon に伝わっていなかった)。
+    dcfg.on_child_suspend = cfg.on_child_suspend;
+    dcfg.on_parent_suspend = cfg.on_parent_suspend;
 
     let session = match Session::start(dcfg) {
         Ok(s) => s,
