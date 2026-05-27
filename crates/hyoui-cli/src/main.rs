@@ -930,9 +930,7 @@ fn wait_command(cfg: WaitConfig) -> ExitCode {
         wait_core::WaitOutcome::DaemonError(msg) => {
             eprintln!("hyoui: wait: daemon error: {msg}");
             if msg.contains("state-snapshot-v1") {
-                eprintln!(
-                    "       daemon が `state-snapshot-v1` cap をサポートしていません。"
-                );
+                eprintln!("       daemon が `state-snapshot-v1` cap をサポートしていません。");
                 eprintln!("       daemon を新しいバージョンに更新してください。");
             }
             ExitCode::from(3)
@@ -1292,10 +1290,6 @@ fn input_command(cmd: InputCommand) -> ExitCode {
         print_session_required("input");
         return ExitCode::from(2);
     }
-    // timeout は wait/wait-idle 系で意味を持つ (= task #17)。本 task の bytes 送信
-    // handler では未使用。
-    let _ = cmd.timeout;
-
     if cmd.specs.is_empty() {
         eprintln!("hyoui: input: spec list が空です (内部 invariant 違反)");
         return ExitCode::from(2);
@@ -1329,9 +1323,16 @@ fn input_command(cmd: InputCommand) -> ExitCode {
         }
     };
 
+    // wait の per-spec timeout は `cmd.timeout` を使う (= input 全体 timeout
+    // ではなく、各 wait/wait-idle spec それぞれに適用する)。default 5s なので
+    // 永久 wait したい場合は `--timeout=<長め>` を明示する。
+    let wait_timeout = Some(cmd.timeout);
+    let poll_interval =
+        wait_core::poll_interval_from_env().unwrap_or(wait_core::DEFAULT_POLL_INTERVAL);
+
     // 3. 各 spec を順に dispatch。最初の失敗で abort。
     for (idx, spec) in cmd.specs.iter().enumerate() {
-        match dispatch_spec(spec, &mut conn) {
+        match dispatch_spec(spec, &mut conn, wait_timeout, poll_interval) {
             Ok(()) => {}
             Err(msg) => {
                 eprintln!("hyoui: input: spec[{idx}]: {msg}");
@@ -1345,36 +1346,66 @@ fn input_command(cmd: InputCommand) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// 1 つの [`InputSpec`] を bytes 化し daemon に raw_data frame で送る。
-///
-/// handler 本体は [`input_handlers`] module、本関数は variant → handler の
-/// dispatch + `conn.send_raw_bytes` 呼び出しを担う。
+/// 1 つの [`InputSpec`] を実行する。bytes 系 spec (text/hex/file/paste/key) は
+/// handler が bytes 化 → `send_raw_bytes`、wait 系 (wait/wait-idle) は
+/// [`wait_core`] による client-side polling を行う (DR-0006 §9.2 input family)。
 ///
 /// # Errors
 ///
 /// - handler が validation で reject (= paste の終端 nest、key の不明名等)
 /// - `send_raw_bytes` の I/O 失敗
-fn dispatch_spec(spec: &InputSpec, conn: &mut ClientConnection) -> Result<(), String> {
-    let bytes: Vec<u8> = match spec {
-        InputSpec::Text(s) => input_handlers::handle_text(s),
-        InputSpec::Hex(b) => input_handlers::handle_hex(b),
-        InputSpec::File(p) => input_handlers::handle_file(p)?,
-        InputSpec::Paste(s) => input_handlers::handle_paste(s)?,
-        InputSpec::Key(name) => input_handlers::handle_key(name)?,
-        InputSpec::Wait(_) => {
-            return Err("wait: handler not yet implemented (= task #17 で配線予定)".to_string());
+/// - wait 系: regex compile / timeout / daemon error
+fn dispatch_spec(
+    spec: &InputSpec,
+    conn: &mut ClientConnection,
+    wait_timeout: Option<std::time::Duration>,
+    poll_interval: std::time::Duration,
+) -> Result<(), String> {
+    match spec {
+        // bytes 系: handler が bytes 化、send_raw_bytes で daemon に流す。
+        InputSpec::Text(s) => send_bytes(conn, input_handlers::handle_text(s)),
+        InputSpec::Hex(b) => send_bytes(conn, input_handlers::handle_hex(b)),
+        InputSpec::File(p) => send_bytes(conn, input_handlers::handle_file(p)?),
+        InputSpec::Paste(s) => send_bytes(conn, input_handlers::handle_paste(s)?),
+        InputSpec::Key(name) => send_bytes(conn, input_handlers::handle_key(name)?),
+        // wait 系: client-side state polling。bytes 送信は伴わない。
+        InputSpec::Wait(pattern) => {
+            match wait_core::wait_for_pattern(conn, pattern, wait_timeout, poll_interval) {
+                wait_core::WaitOutcome::Matched => Ok(()),
+                wait_core::WaitOutcome::Timeout => {
+                    Err(format!("wait: timeout (pattern={pattern:?})"))
+                }
+                wait_core::WaitOutcome::IoError(m) => Err(format!("wait: I/O error: {m}")),
+                wait_core::WaitOutcome::InvalidPattern(m) => {
+                    Err(format!("wait: invalid pattern: {m}"))
+                }
+                wait_core::WaitOutcome::DaemonError(m) => Err(format!("wait: daemon error: {m}")),
+            }
         }
-        InputSpec::WaitIdle(_) => {
-            return Err(
-                "wait-idle: handler not yet implemented (= task #17 で配線予定)".to_string(),
-            );
+        InputSpec::WaitIdle(duration) => {
+            match wait_core::wait_for_idle(conn, *duration, wait_timeout, poll_interval) {
+                wait_core::WaitOutcome::Matched => Ok(()),
+                wait_core::WaitOutcome::Timeout => {
+                    Err(format!("wait-idle: timeout (idle_for={duration:?})"))
+                }
+                wait_core::WaitOutcome::IoError(m) => Err(format!("wait-idle: I/O error: {m}")),
+                wait_core::WaitOutcome::InvalidPattern(m) => {
+                    // wait-idle 経路では regex compile は走らないので到達しない想定。
+                    Err(format!("wait-idle: invalid pattern (unexpected): {m}"))
+                }
+                wait_core::WaitOutcome::DaemonError(m) => {
+                    Err(format!("wait-idle: daemon error: {m}"))
+                }
+            }
         }
         // `InputSpec` is `#[non_exhaustive]`; future variants surface as a generic
         // skew error so older binaries report clearly.
-        _ => {
-            return Err("unsupported InputSpec variant (binary/library version skew)".to_string());
-        }
-    };
+        _ => Err("unsupported InputSpec variant (binary/library version skew)".to_string()),
+    }
+}
+
+/// bytes 系 spec の共通 helper (= raw_data frame で送信)。
+fn send_bytes(conn: &mut ClientConnection, bytes: Vec<u8>) -> Result<(), String> {
     conn.send_raw_bytes(&bytes)
         .map_err(|e| format!("daemon への bytes 送信失敗: {e}"))
 }
@@ -1851,6 +1882,242 @@ mod tests {
         let kill = hyoui::protocol::messages::Kill { signal: None };
         let _ = conn.send_control(&ControlMessage::Kill(kill));
         drop(conn);
+        let _ = daemon_handle.join();
+    }
+
+    /// state-based wait の integration test (DR-0006 §9)。
+    ///
+    /// 子が "READY" を画面出力するまで `wait_command` が block し、出現後に
+    /// 成功 (= ExitCode::SUCCESS) で返ることを確認する。子は sleep 中に出力
+    /// するので polling が実際に動いていることも合わせて検証される。
+    #[test]
+    fn wait_command_matches_visible_state_pattern() {
+        use hyoui::cli::WaitConfig;
+
+        let sock_dir = make_0700_dir();
+        let sock_path = sock_dir.path().join("wait-match.sock");
+        let sock_for_daemon = sock_path.clone();
+
+        // 子: 200ms 待ってから "READY" を 1 行出力、その後 30 秒 sleep。
+        // wait 起動時点 (= sleep 待ちより前) では READY がまだ無いので、
+        // polling が回って 200ms 経過後に match する経路を踏む。
+        let daemon_handle = std::thread::spawn(move || {
+            let cfg = DaemonConfig::new(
+                "wait-match-test",
+                sock_for_daemon,
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "sleep 0.2; printf 'READY\\n'; sleep 30".into(),
+                ],
+            );
+            let session = Session::start(cfg).expect("daemon start");
+            session.serve()
+        });
+
+        // listener bind 完了 + handshake 受付待ち
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let cfg = WaitConfig {
+            socket: Some(sock_path.to_string_lossy().into_owned()),
+            session_id: None,
+            pattern: "READY".into(),
+            timeout_ms: Some(5_000),
+            poll_interval_ms: Some(50),
+        };
+        let start = std::time::Instant::now();
+        let exit = wait_command(cfg);
+        let elapsed = start.elapsed();
+
+        // ExitCode::SUCCESS (0) を期待。
+        let exit_dbg = format!("{exit:?}");
+        assert!(
+            exit_dbg.contains("ExitCode(unix_exit_status(0))")
+                || exit_dbg.contains("SUCCESS")
+                || exit_dbg.contains("0"),
+            "wait_command should succeed when pattern appears; got {exit_dbg}, elapsed={elapsed:?}"
+        );
+        // 5s timeout より十分前に成立しているはず。
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "wait should match quickly after READY appears, but took {elapsed:?}"
+        );
+
+        // cleanup: kill して daemon thread を終わらせる
+        let kill_opts = AttachOptions {
+            mode: Mode::Ro,
+            ..AttachOptions::default()
+        };
+        if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
+            let kill = hyoui::protocol::messages::Kill { signal: None };
+            let _ = conn.send_control(&ControlMessage::Kill(kill));
+            drop(conn);
+        }
+        let _ = daemon_handle.join();
+    }
+
+    /// state-based wait の timeout 経路。pattern が永遠に出ない子に対して
+    /// `--timeout=300ms` で起動 → 300ms ちょい後に exit code 1 (= Timeout)。
+    #[test]
+    fn wait_command_times_out_when_pattern_never_appears() {
+        use hyoui::cli::WaitConfig;
+
+        let sock_dir = make_0700_dir();
+        let sock_path = sock_dir.path().join("wait-timeout.sock");
+        let sock_for_daemon = sock_path.clone();
+
+        let daemon_handle = std::thread::spawn(move || {
+            let cfg = DaemonConfig::new(
+                "wait-timeout-test",
+                sock_for_daemon,
+                // 完全に静かな子: 何も出力せずに sleep
+                vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+            );
+            let session = Session::start(cfg).expect("daemon start");
+            session.serve()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let cfg = WaitConfig {
+            socket: Some(sock_path.to_string_lossy().into_owned()),
+            session_id: None,
+            pattern: "NEVER_SHOWS_UP".into(),
+            timeout_ms: Some(300),
+            poll_interval_ms: Some(50),
+        };
+        let start = std::time::Instant::now();
+        let exit = wait_command(cfg);
+        let elapsed = start.elapsed();
+
+        let exit_dbg = format!("{exit:?}");
+        // exit code 1 (Timeout) を期待。
+        assert!(
+            exit_dbg.contains("(1)") || exit_dbg.contains("ExitCode(unix_exit_status(1))"),
+            "wait_command should time out with exit 1; got {exit_dbg}"
+        );
+        // 300ms timeout を尊重しつつ、polling の最終 sleep 分のずれを許容 (= 1.5s 程度の余裕)。
+        assert!(
+            elapsed >= std::time::Duration::from_millis(280)
+                && elapsed < std::time::Duration::from_millis(2_500),
+            "expected timeout near 300ms, got {elapsed:?}"
+        );
+
+        // cleanup
+        let kill_opts = AttachOptions {
+            mode: Mode::Ro,
+            ..AttachOptions::default()
+        };
+        if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
+            let kill = hyoui::protocol::messages::Kill { signal: None };
+            let _ = conn.send_control(&ControlMessage::Kill(kill));
+            drop(conn);
+        }
+        let _ = daemon_handle.join();
+    }
+
+    /// input family の `wait:<pattern>` spec 経路 (DR-0006 §9.2)。
+    /// `hyoui input` の dispatch_spec から `wait_core::wait_for_pattern` が
+    /// 呼ばれ、子が pattern を出力したら次 spec に進むことを確認する。
+    #[test]
+    fn input_dispatch_wait_spec_proceeds_after_match() {
+        use hyoui::cli::{InputCommand, InputSpec};
+
+        let sock_dir = make_0700_dir();
+        let sock_path = sock_dir.path().join("input-wait.sock");
+        let sock_for_daemon = sock_path.clone();
+
+        // 子: すぐに "GO" を出力 → wait:GO は即 match
+        let daemon_handle = std::thread::spawn(move || {
+            let cfg = DaemonConfig::new(
+                "input-wait-test",
+                sock_for_daemon,
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf 'GO'; sleep 30".into(),
+                ],
+            );
+            let session = Session::start(cfg).expect("daemon start");
+            session.serve()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let cmd = InputCommand {
+            socket: Some(sock_path.to_string_lossy().into_owned()),
+            session_id: None,
+            specs: vec![InputSpec::Wait("GO".into())],
+            timeout: std::time::Duration::from_secs(3),
+        };
+        let start = std::time::Instant::now();
+        let exit = input_command(cmd);
+        let elapsed = start.elapsed();
+        let exit_dbg = format!("{exit:?}");
+        assert!(
+            exit_dbg.contains("SUCCESS") || exit_dbg.contains("(0)"),
+            "input wait spec should succeed; got {exit_dbg}, elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "wait:GO should match quickly; took {elapsed:?}"
+        );
+
+        let kill_opts = AttachOptions {
+            mode: Mode::Ro,
+            ..AttachOptions::default()
+        };
+        if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
+            let kill = hyoui::protocol::messages::Kill { signal: None };
+            let _ = conn.send_control(&ControlMessage::Kill(kill));
+            drop(conn);
+        }
+        let _ = daemon_handle.join();
+    }
+
+    /// input family の `wait-idle:<duration>` spec 経路 (DR-0006 §9.2)。
+    /// 静かな子に対し short idle 期間で成立することを確認 (= Phase A1 で
+    /// SequenceNo 観察により実装)。
+    #[test]
+    fn input_dispatch_wait_idle_spec_succeeds_on_quiet_child() {
+        use hyoui::cli::{InputCommand, InputSpec};
+
+        let sock_dir = make_0700_dir();
+        let sock_path = sock_dir.path().join("input-wait-idle.sock");
+        let sock_for_daemon = sock_path.clone();
+
+        // 完全に静かな子。最初の output 反映後は seqno が動かない。
+        let daemon_handle = std::thread::spawn(move || {
+            let cfg = DaemonConfig::new(
+                "input-wait-idle-test",
+                sock_for_daemon,
+                vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+            );
+            let session = Session::start(cfg).expect("daemon start");
+            session.serve()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let cmd = InputCommand {
+            socket: Some(sock_path.to_string_lossy().into_owned()),
+            session_id: None,
+            specs: vec![InputSpec::WaitIdle(std::time::Duration::from_millis(200))],
+            timeout: std::time::Duration::from_secs(3),
+        };
+        let exit = input_command(cmd);
+        let exit_dbg = format!("{exit:?}");
+        assert!(
+            exit_dbg.contains("SUCCESS") || exit_dbg.contains("(0)"),
+            "wait-idle should succeed on quiet child; got {exit_dbg}"
+        );
+
+        let kill_opts = AttachOptions {
+            mode: Mode::Ro,
+            ..AttachOptions::default()
+        };
+        if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
+            let kill = hyoui::protocol::messages::Kill { signal: None };
+            let _ = conn.send_control(&ControlMessage::Kill(kill));
+            drop(conn);
+        }
         let _ = daemon_handle.join();
     }
 

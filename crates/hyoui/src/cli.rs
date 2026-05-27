@@ -844,8 +844,7 @@ fn parse_wait(args: &[String]) -> Command {
     let (session_id, pattern) = match (socket.is_some(), positionals.len()) {
         (true, 0) => {
             return Command::Error(
-                "wait: pattern が必要です。例: `hyoui wait --socket=<path> 'Continue\\?'`"
-                    .into(),
+                "wait: pattern が必要です。例: `hyoui wait --socket=<path> 'Continue\\?'`".into(),
             );
         }
         (true, 1) => (None, positionals.pop().expect("non-empty")),
@@ -3223,11 +3222,7 @@ mod tests {
 
     #[test]
     fn parse_wait_with_socket_only() {
-        match parse_args(&args(&[
-            "wait",
-            "--socket=/tmp/foo.sock",
-            "Continue\\?",
-        ])) {
+        match parse_args(&args(&["wait", "--socket=/tmp/foo.sock", "Continue\\?"])) {
             Command::Wait(cfg) => {
                 assert_eq!(cfg.session_id, None);
                 assert_eq!(cfg.socket.as_deref(), Some("/tmp/foo.sock"));
@@ -3675,7 +3670,11 @@ mod tests {
             (HelpTopic::Status, "hyoui status", &["OUTPUT", "child-pid"]),
             (HelpTopic::Tail, "hyoui tail", &["--follow", "--since"]),
             // DR-0006 §9 改訂後: PATTERN / --poll-interval が新ヘルプに含まれる
-            (HelpTopic::Wait, "hyoui wait", &["PATTERN", "--poll-interval"]),
+            (
+                HelpTopic::Wait,
+                "hyoui wait",
+                &["PATTERN", "--poll-interval"],
+            ),
             (
                 HelpTopic::Completion,
                 "hyoui completion",

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use hyoui::client::ClientConnection;
 use hyoui::protocol::ControlMessage;
 use hyoui::protocol::messages::{
-    ErrorCode, ErrorMessage, SnapshotComponent, StateSnapshotRequest, StateSnapshotResponse,
+    ErrorMessage, SnapshotComponent, StateSnapshotRequest, StateSnapshotResponse,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -92,9 +92,11 @@ pub struct SnapshotCell {
     #[serde(default, rename = "t")]
     pub text: String,
     /// 属性 bit pack (= 本 module では未使用、forward-compat 用に保持)。
+    #[allow(dead_code)]
     #[serde(default, rename = "a")]
     pub attrs: u8,
     /// 全角先頭 cell flag (= 本 module では未使用、forward-compat 用に保持)。
+    #[allow(dead_code)]
     #[serde(default, rename = "w")]
     pub wide: bool,
 }
@@ -399,7 +401,13 @@ mod tests {
         let s = SnapshotCells {
             rows: 3,
             cols: 6,
-            cells: vec![cell(0, 0, "f"), cell(1, 0, "B"), cell(1, 1, "A"), cell(1, 2, "R"), cell(2, 0, "x")],
+            cells: vec![
+                cell(0, 0, "f"),
+                cell(1, 0, "B"),
+                cell(1, 1, "A"),
+                cell(1, 2, "R"),
+                cell(2, 0, "x"),
+            ],
         };
         let text = s.to_text();
         // 中央行が "BAR" で始まるかは multiline `^` で見られる。
@@ -411,8 +419,14 @@ mod tests {
     fn poll_interval_string_parses_ms() {
         // env を直接触ると hyoui-cli の `unsafe_code = "forbid"` lint で
         // コンパイル不能。文字列 → Duration の純粋 helper を直接 test する。
-        assert_eq!(parse_poll_interval_ms("250"), Some(Duration::from_millis(250)));
-        assert_eq!(parse_poll_interval_ms(" 1500 "), Some(Duration::from_millis(1500)));
+        assert_eq!(
+            parse_poll_interval_ms("250"),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            parse_poll_interval_ms(" 1500 "),
+            Some(Duration::from_millis(1500))
+        );
         assert_eq!(parse_poll_interval_ms("abc"), None);
         assert_eq!(parse_poll_interval_ms(""), None);
     }
@@ -424,7 +438,9 @@ mod tests {
         // ここでは regex compile 部分の動作を直接確認する代わりに、コア
         // ロジック (= Regex::new) を経由しないと InvalidPattern にならない
         // という前提を別経路で test。
-        let result = Regex::new("(?m)[unbalanced");
+        // (clippy::invalid_regex を避けるため、構築は実行時 String 経由)
+        let pattern = format!("(?m){}", "[unbalanced");
+        let result = Regex::new(&pattern);
         assert!(result.is_err());
     }
 }
