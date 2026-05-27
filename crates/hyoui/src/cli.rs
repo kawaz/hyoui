@@ -116,6 +116,14 @@ pub enum HelpTopic {
     ScreenSnapshot,
     /// Help for the `completion` subcommand.
     Completion,
+    /// Help for the `lock` parent subcommand (= 子: `acquire` / `release`)。
+    Lock,
+    /// Help for the `lock acquire` subcommand (= DR-0006 §7)。
+    LockAcquire,
+    /// Help for the `lock release` subcommand (= DR-0006 §7)。
+    LockRelease,
+    /// Help for the `unlock` subcommand (= release の alias、DR-0006 §7)。
+    Unlock,
     /// User invoked an unknown subcommand; render top-level help with note.
     UnknownSubcommand(String),
 }
@@ -418,6 +426,64 @@ pub enum ScreenCommand {
     Snapshot(ScreenSnapshotConfig),
 }
 
+/// `lock acquire` subcommand の `--mode` 選択肢 (= DR-0006 §7)。
+///
+/// 取得時に他者保持中だった場合の挙動を切替える。default は `Wait` (= 取得できるまで
+/// block)。DR-0006 §7 では default を明示していないが、wrapper として「待つ」が
+/// 直感的かつ「失敗で即 exit」より誤動作が少ない (= fail mode は明示 opt-in)。
+///
+/// **MVP 注意**: daemon 側 wait queue は未実装 (`LockAcquire { wait: true }` でも
+/// `Denied` が返る)。CLI 側で `Denied` を受けたら短時間 sleep + retry することで
+/// "wait" semantics を擬似的に実現する (= polling 戦略、`--timeout` 内に成功するまで
+/// retry を続ける)。`fail` mode は 1 回送って終わり。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum LockMode {
+    /// 他者保持中なら polling で待ち続ける (default、`--timeout` を超えたら timeout 扱い)。
+    #[default]
+    Wait,
+    /// 他者保持中なら即 fail で exit 1。
+    Fail,
+}
+
+/// `lock acquire <session>` subcommand configuration (= DR-0006 §7)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockAcquireConfig {
+    /// Target socket path (explicit) または session_id から resolve。
+    pub socket: Option<String>,
+    /// Target session id。
+    pub session_id: Option<String>,
+    /// `--mode=wait|fail` (= default Wait)。fail = 即時 fail、wait = polling retry。
+    pub mode: LockMode,
+    /// `--timeout=<dur>` (= acquire 全体 timeout、`None` なら無限 wait)。
+    /// wait mode 時のみ意味あり (fail mode は単発 send なので即決)。
+    pub timeout_ms: Option<u64>,
+}
+
+/// `lock release <session> --token=<T>` / `unlock <session> --token=<T>` の共通 configuration
+/// (= DR-0006 §7)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockReleaseConfig {
+    /// Target socket path (explicit) または session_id から resolve。
+    pub socket: Option<String>,
+    /// Target session id。
+    pub session_id: Option<String>,
+    /// `--token=<T>` の値 (`HYOUI_LOCK_TOKEN` env fallback あり、parser 段では None 可、
+    /// CLI dispatcher 側で env を読む)。CLI flag で空文字列は parser 段で reject。
+    pub token: Option<String>,
+}
+
+/// `lock` 親 subcommand の子 dispatch (= DR-0006 §7)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LockCommand {
+    /// `lock acquire <session>` — token を取得、stdout に出力 + connection を保持して
+    /// SIGINT/SIGTERM/stdin EOF まで block。
+    Acquire(LockAcquireConfig),
+    /// `lock release <session> --token=<T>` — 既存 lock を release。
+    Release(LockReleaseConfig),
+}
+
 /// Result of parsing argv (excluding argv[0]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -452,6 +518,16 @@ pub enum Command {
     /// 実装するため、CLI parse は成功するが [`InputSpec`] dispatcher は
     /// `bail!("... not yet implemented")` を返す。
     Input(InputCommand),
+    /// `lock` 親 subcommand (= DR-0006 §7、自動操作排他の低レベル primitive)。
+    ///
+    /// 子: `acquire` / `release`。`tx` (= 子 process 起動と lock を組み合わせる
+    /// wrapper) は別 task。
+    Lock(LockCommand),
+    /// `unlock <session> --token=<T>` — `lock release` の alias (= DR-0006 §7)。
+    ///
+    /// 完全に同じ意味の subcommand を別名でも露出する: 「取得は `lock acquire`、
+    /// 解放は `unlock`」という命名が直感的なため。
+    Unlock(LockReleaseConfig),
     /// Print a completion script for the given shell.
     Completion {
         /// Target shell.
@@ -498,20 +574,18 @@ pub fn parse_args(args: &[String]) -> Command {
         "wait" => parse_wait(rest),
         "screen" => parse_screen(rest),
         "input" => parse_input(rest),
+        "lock" => parse_lock(rest),
+        "unlock" => parse_unlock(rest),
         "completion" => parse_completion(rest),
         // Reserved for future stages.
         //
         // `send` / `detach` は旧 leaf 設計の名残として予約。
         //
-        // `tx` / `lock` / `unlock` は DR-0006 §7 で確定済みの自動操作排他 subcommand。
-        // protocol 層 (= `LockAcquire` / `LockResponse` / `LockRelease` message と
-        // `LockDenied` / `LockNotHeld` error code、daemon の `handle_lock_acquire` /
-        // `handle_lock_release` handler) は既に実装済だが、これら CLI subcommand 本体
-        // (= token 生成 / 子 process 起動 + env 注入 / refcount / timeout 管理) は
-        // 未実装。MVP では子側で `--lock-token=<T>` flag または `HYOUI_LOCK_TOKEN`
-        // env を渡せば lock 配下で動くため fallback で機能している (= task #19)。
+        // `tx` は DR-0006 §7 の自動操作排他 wrapper (= 子 process 起動 + env 注入 +
+        // 子 exit で自動 unlock)。`lock` / `unlock` は実装済 (= task #20)、tx 本体は
+        // `--process-bound` 等の daemon-side 機能が要るので別 task に切り出し中。
         // 詳細は `docs/issue/2026-05-27-tx-lock-unlock-cli-subcommands.md` 参照。
-        "send" | "detach" | "tx" | "lock" | "unlock" => Command::Error(format!(
+        "send" | "detach" | "tx" => Command::Error(format!(
             "subcommand `{head}` is reserved but not yet implemented"
         )),
         other => Command::Help {
@@ -1322,6 +1396,10 @@ pub fn usage(topic: &HelpTopic) -> String {
         HelpTopic::ScreenDump => usage_screen_dump(),
         HelpTopic::ScreenSnapshot => usage_screen_snapshot(),
         HelpTopic::Input => usage_input(),
+        HelpTopic::Lock => usage_lock(),
+        HelpTopic::LockAcquire => usage_lock_acquire(),
+        HelpTopic::LockRelease => usage_lock_release(),
+        HelpTopic::Unlock => usage_unlock(),
         HelpTopic::Completion => usage_completion(),
     }
 }
@@ -1840,6 +1918,163 @@ fn default_snapshot_include() -> Vec<SnapshotCliComponent> {
     ]
 }
 
+/// `lock` 親 subcommand の dispatcher (= DR-0006 §7)。
+///
+/// 引数なし / `--help` / `-h` は親 help を出す (= cli-design-preferences の
+/// 「引数なし実行時は --help を表示」「子・孫ネスト可」)。最初の positional を
+/// 子 subcommand 名として扱い、`acquire` / `release` 以外は UnknownSubcommand 扱い。
+fn parse_lock(args: &[String]) -> Command {
+    if args.is_empty() {
+        return Command::Help {
+            topic: HelpTopic::Lock,
+        };
+    }
+    let head = args[0].as_str();
+    match head {
+        "--help" | "-h" => Command::Help {
+            topic: HelpTopic::Lock,
+        },
+        "acquire" => parse_lock_acquire(&args[1..]),
+        "release" => parse_lock_release(&args[1..]),
+        other if other.starts_with('-') => Command::Error(format!("lock: unknown option: {other}")),
+        other => {
+            // edit distance 1 以下で acquire / release を suggest する。
+            let base = format!("lock: unknown subcommand `{other}` (supported: acquire, release)");
+            match suggest_closest(other, ["acquire", "release"]) {
+                Some(s) => Command::Error(format!("{base} (did you mean `lock {s}`?)")),
+                None => Command::Error(base),
+            }
+        }
+    }
+}
+
+/// `lock acquire <session> [--mode=wait|fail] [--timeout=<dur>]` parser。
+///
+/// 受理する options:
+/// - `--socket=<path>` — session_id の代替 (= shared helper)
+/// - `--mode=wait|fail` (= default wait)
+/// - `--timeout=<dur>` — acquire 全体 timeout (= 未指定なら無限 wait、wait mode のみ意味)
+#[allow(clippy::result_large_err)]
+fn parse_lock_acquire(args: &[String]) -> Command {
+    let mut mode = LockMode::default();
+    let mut timeout_ms: Option<u64> = None;
+    let res = parse_session_targeted(
+        "lock acquire",
+        args,
+        HelpTopic::LockAcquire,
+        |opt, value| match opt {
+            "--mode" => {
+                let v = value.ok_or_else(|| {
+                    Command::Error("lock acquire: --mode requires a value".into())
+                })?;
+                match v.as_str() {
+                    "wait" => {
+                        mode = LockMode::Wait;
+                        Ok(true)
+                    }
+                    "fail" => {
+                        mode = LockMode::Fail;
+                        Ok(true)
+                    }
+                    other => Err(Command::Error(format!(
+                        "lock acquire: --mode must be `wait` or `fail`, got {other:?}"
+                    ))),
+                }
+            }
+            "--timeout" => {
+                let v = value.ok_or_else(|| {
+                    Command::Error("lock acquire: --timeout requires a value".into())
+                })?;
+                let ms = parse_duration_ms(&v)
+                    .map_err(|e| Command::Error(format!("lock acquire: --timeout: {e}")))?;
+                timeout_ms = Some(ms);
+                Ok(true)
+            }
+            other => Err(Command::Error(format!(
+                "lock acquire: unknown option: {other}"
+            ))),
+        },
+    );
+    match res {
+        Ok((socket, session_id)) => Command::Lock(LockCommand::Acquire(LockAcquireConfig {
+            socket,
+            session_id,
+            mode,
+            timeout_ms,
+        })),
+        Err(c) => c,
+    }
+}
+
+/// `lock release <session> --token=<T>` parser。
+///
+/// 受理する options:
+/// - `--socket=<path>` — session_id の代替 (= shared helper)
+/// - `--token=<T>` — release 対象の token (`HYOUI_LOCK_TOKEN` env fallback あり、CLI 段では
+///   None 可 / dispatcher が env を読む)。flag 指定値が空文字なら parser 段で reject。
+#[allow(clippy::result_large_err)]
+fn parse_lock_release(args: &[String]) -> Command {
+    let mut token: Option<String> = None;
+    let res = parse_session_targeted(
+        "lock release",
+        args,
+        HelpTopic::LockRelease,
+        |opt, value| match opt {
+            "--token" => {
+                let v = value.ok_or_else(|| {
+                    Command::Error("lock release: --token requires a value".into())
+                })?;
+                if v.is_empty() {
+                    return Err(Command::Error(
+                        "lock release: --token requires a non-empty value".into(),
+                    ));
+                }
+                token = Some(v);
+                Ok(true)
+            }
+            other => Err(Command::Error(format!(
+                "lock release: unknown option: {other}"
+            ))),
+        },
+    );
+    match res {
+        Ok((socket, session_id)) => Command::Lock(LockCommand::Release(LockReleaseConfig {
+            socket,
+            session_id,
+            token,
+        })),
+        Err(c) => c,
+    }
+}
+
+/// `unlock <session> --token=<T>` parser (= `lock release` の alias、DR-0006 §7)。
+#[allow(clippy::result_large_err)]
+fn parse_unlock(args: &[String]) -> Command {
+    let mut token: Option<String> = None;
+    let res = parse_session_targeted("unlock", args, HelpTopic::Unlock, |opt, value| match opt {
+        "--token" => {
+            let v =
+                value.ok_or_else(|| Command::Error("unlock: --token requires a value".into()))?;
+            if v.is_empty() {
+                return Err(Command::Error(
+                    "unlock: --token requires a non-empty value".into(),
+                ));
+            }
+            token = Some(v);
+            Ok(true)
+        }
+        other => Err(Command::Error(format!("unlock: unknown option: {other}"))),
+    });
+    match res {
+        Ok((socket, session_id)) => Command::Unlock(LockReleaseConfig {
+            socket,
+            session_id,
+            token,
+        }),
+        Err(c) => c,
+    }
+}
+
 fn parse_completion(args: &[String]) -> Command {
     if args.is_empty() {
         return Command::Error("completion requires a shell name (bash|zsh|fish)".into());
@@ -1897,10 +2132,12 @@ fn usage_top(unknown: Option<&str>) -> String {
             wait        Wait until predicate (text/pattern/idle) matches\n    \
             screen      Dump / inspect virtual screen state (subcommands: dump)\n    \
             input       Send input via spec list (DR-0006 §8; text:/key:/wait: ...)\n    \
+            lock        Acquire / release a session lock (DR-0006 §7)\n    \
+            unlock      Release a session lock (= `lock release` alias)\n    \
             completion  Print a shell completion script (bash|zsh|fish)\n\
         \n\
         RESERVED (not yet implemented):\n    \
-            send, detach   将来 protocol 拡張用に予約\n\
+            send, detach, tx   将来 protocol 拡張用に予約\n\
         \n\
         GLOBAL OPTIONS:\n    \
             -h, --help     Show this help and exit\n    \
@@ -2299,6 +2536,158 @@ fn usage_screen_snapshot() -> String {
             hyoui screen dump <id>       visible bytes dump (ANSI / binary / CBOR)\n    \
             hyoui wait <id> ...          状態条件を待つ\n    \
             hyoui tail <id>              bytes stream を流す\n",
+    )
+}
+
+fn usage_lock() -> String {
+    String::from(
+        "hyoui lock — acquire / release a session lock (DR-0006 §7)\n\
+        \n\
+        USAGE:\n    \
+            hyoui lock <subcommand> [options]\n\
+        \n\
+        SUBCOMMANDS:\n    \
+            acquire     Acquire a lock, print token to stdout, hold connection\n    \
+            release     Release a lock by token\n\
+        \n\
+        OPTIONS:\n    \
+            -h, --help      Show this help and exit\n\
+        \n\
+        RELATED:\n    \
+            hyoui unlock <id> --token=<T>   Same as `lock release`\n    \
+            hyoui input <id> --lock-token=<T> ...   Use the token to run input under lock\n\
+        \n\
+        Run `hyoui lock <subcommand> --help` for per-subcommand help.\n",
+    )
+}
+
+fn usage_lock_acquire() -> String {
+    String::from(
+        "hyoui lock acquire — acquire a session lock (DR-0006 §7)\n\
+        \n\
+        USAGE:\n    \
+            hyoui lock acquire <session-id> [options]\n    \
+            hyoui lock acquire --socket=<path> [options]\n\
+        \n\
+        OPTIONS:\n    \
+            --socket PATH       Explicit socket path (alternative to session-id)\n    \
+            --mode wait|fail    Behavior when another holder exists (default: wait)\n                        \
+                wait — keep polling until acquired or --timeout expires\n                        \
+                fail — exit 1 immediately when denied\n    \
+            --timeout DUR       Overall acquire timeout (= 未指定なら無限 wait、wait mode のみ意味)\n    \
+            -h, --help          Show this help and exit\n\
+        \n\
+        BEHAVIOR (= 重要):\n    \
+            daemon 側は client が socket を保持している間だけ lock を維持する。\n    \
+            `lock acquire` は token を **stdout に 1 行 print** した後、\n    \
+            **connection を保持して block する** (SIGINT/SIGTERM/stdin EOF まで)。\n    \
+            シグナル受信 / stdin EOF で `LockRelease` を送って exit 0 する。\n    \
+            \n    \
+            wrap した子 process が exit するまで lock を保持するパターンは:\n              \
+                TOKEN=$(hyoui lock acquire demo & echo $! > /tmp/lockpid; \\\n                   \
+                    wait $(cat /tmp/lockpid))      # ← stdin pipe + EOF 戦略\n              \
+                hyoui input demo --lock-token=$TOKEN text:hello\n              \
+                kill -TERM $(cat /tmp/lockpid)     # 解放\n    \
+            \n    \
+            将来 `hyoui tx <id> -- cmd...` (= 別 task) では子 process exit で\n    \
+            自動 unlock + token 注入が完結する (= こちらの方が UX が良い)。\n\
+        \n\
+        OUTPUT:\n    \
+            stdout: 取得 token (= 32 文字 hex、1 行)\n    \
+            block 中は stderr のみに hint を 1 行出す (= ユーザに「block 中」と知らせる)\n\
+        \n\
+        DURATION FORMAT (kawaz/timespec.mbt 仕様 + sub-ms 拡張):\n    \
+            短形 ns/us/μs/ms/s/m/h/d/w または長形 second(s)/minute(s)/hour(s)/\n    \
+            day(s)/week(s)。decimal (1.5h)、underscore (1_000ms)、連結 (1h30m)、\n    \
+            加減 (1d-4h)。bare 数字 / 年 (y) / 月 (M) は **error**。\n\
+        \n\
+        EXIT CODE:\n    \
+            0   取得 → release まで完走\n    \
+            1   timeout / fail mode で denied / I/O / daemon error\n\
+        \n\
+        EXAMPLES:\n    \
+            hyoui lock acquire demo                          # block で取得 (Ctrl-C で release)\n    \
+            hyoui lock acquire demo --mode=fail              # 他者保持中なら即 fail\n    \
+            hyoui lock acquire demo --timeout=10s            # 10 秒以内に取れなければ timeout\n\
+        \n\
+        RELATED:\n    \
+            hyoui lock release <id> --token=<T>   Release the lock\n    \
+            hyoui unlock <id> --token=<T>          Same as `lock release`\n",
+    )
+}
+
+fn usage_lock_release() -> String {
+    String::from(
+        "hyoui lock release — release a session lock by token (DR-0006 §7)\n\
+        \n\
+        USAGE:\n    \
+            hyoui lock release <session-id> --token=<T>\n    \
+            hyoui lock release --socket=<path> --token=<T>\n\
+        \n\
+        OPTIONS:\n    \
+            --socket PATH   Explicit socket path (alternative to session-id)\n    \
+            --token TOKEN   Lock token to release (required; env HYOUI_LOCK_TOKEN fallback)\n    \
+            -h, --help      Show this help and exit\n\
+        \n\
+        BEHAVIOR (= 重要):\n    \
+            daemon 側は **holder client (= 取得時の connection) からの release のみ** \n    \
+            accept する (= token 一致だけでは release できない、holder 照合あり)。\n    \
+            したがって本 subcommand は **同 process 内で acquire → release する** \n    \
+            か、acquire の block を SIGTERM で起こす運用とは別経路。\n    \
+            \n    \
+            別 process から release を要求して daemon が `lock.not-held` を返した場合は\n    \
+            stderr に hint を出して exit 1 する: 「acquire process を SIGTERM で起こす」\n    \
+            ことを促す。\n\
+        \n\
+        ENVIRONMENT:\n    \
+            HYOUI_LOCK_TOKEN    --token 未指定時の fallback token\n\
+        \n\
+        EXIT CODE:\n    \
+            0   release 成功\n    \
+            1   token mismatch / not holder / I/O / daemon error\n    \
+            2   引数不足 (token も env も無し / session id も socket も無し)\n\
+        \n\
+        EXAMPLES:\n    \
+            hyoui lock release demo --token=abcd1234...      # explicit token\n    \
+            HYOUI_LOCK_TOKEN=$TOKEN hyoui lock release demo  # env から token\n\
+        \n\
+        RELATED:\n    \
+            hyoui lock acquire <id>                Acquire a lock\n    \
+            hyoui unlock <id> --token=<T>          Same operation, alias\n",
+    )
+}
+
+fn usage_unlock() -> String {
+    String::from(
+        "hyoui unlock — release a session lock (= `lock release` alias、DR-0006 §7)\n\
+        \n\
+        USAGE:\n    \
+            hyoui unlock <session-id> --token=<T>\n    \
+            hyoui unlock --socket=<path> --token=<T>\n\
+        \n\
+        OPTIONS:\n    \
+            --socket PATH   Explicit socket path (alternative to session-id)\n    \
+            --token TOKEN   Lock token to release (required; env HYOUI_LOCK_TOKEN fallback)\n    \
+            -h, --help      Show this help and exit\n\
+        \n\
+        本 subcommand は `hyoui lock release` と全く同じ意味で、命名の好みで使い分ける\n\
+        (= 「取得は lock acquire、解放は unlock」の対称形が直感的なため別名で露出)。\n\
+        \n\
+        ENVIRONMENT:\n    \
+            HYOUI_LOCK_TOKEN    --token 未指定時の fallback token\n\
+        \n\
+        EXIT CODE:\n    \
+            0   release 成功\n    \
+            1   token mismatch / not holder / I/O / daemon error\n    \
+            2   引数不足\n\
+        \n\
+        EXAMPLES:\n    \
+            hyoui unlock demo --token=abcd1234...            # explicit token\n    \
+            HYOUI_LOCK_TOKEN=$TOKEN hyoui unlock demo        # env から token\n\
+        \n\
+        RELATED:\n    \
+            hyoui lock acquire <id>                Acquire a lock\n    \
+            hyoui lock release <id> --token=<T>    Same operation\n",
     )
 }
 
@@ -3406,9 +3795,10 @@ mod tests {
     fn reserved_subcommands_return_error() {
         // attach / list / kill / status / tail / wait は実装済 (= 別 test)。
         // `send` / `detach` は旧 leaf 設計の reserved。
-        // `tx` / `lock` / `unlock` は DR-0006 §7 の lock 制御 CLI、protocol 層は
-        // 実装済だが CLI subcommand 本体は未実装 (= `docs/issue/2026-05-27-tx-lock-unlock-cli-subcommands.md`)。
-        for name in ["send", "detach", "tx", "lock", "unlock"] {
+        // `tx` は DR-0006 §7 の wrapper、別 task で実装中。
+        // `lock` / `unlock` は task #20 で実装済 (= `parse_lock_*` がある)、本テストでは
+        // 「引数なしで Error にならない (= Help か Error)」を別 test で確認するため除外。
+        for name in ["send", "detach", "tx"] {
             match parse_args(&args(&[name])) {
                 Command::Error(msg) => assert!(msg.contains(name), "msg = {msg}"),
                 other => panic!("expected Error for `{name}`, got {other:?}"),
@@ -5342,5 +5732,246 @@ mod tests {
             text.contains("input"),
             "top usage should list input subcommand"
         );
+    }
+
+    // -------- `lock` / `unlock` subcommand (= DR-0006 §7、task #20) --------
+
+    #[test]
+    fn parse_lock_no_args_shows_help() {
+        // `hyoui lock` 単体は親 help を出す (= cli-design-preferences の
+        // 「引数なし実行時は --help を表示」)。
+        match parse_args(&args(&["lock"])) {
+            Command::Help {
+                topic: HelpTopic::Lock,
+            } => {}
+            other => panic!("expected Help(Lock), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lock_help_flag_shows_help() {
+        match parse_args(&args(&["lock", "--help"])) {
+            Command::Help {
+                topic: HelpTopic::Lock,
+            } => {}
+            other => panic!("expected Help(Lock), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lock_acquire_basic() {
+        match parse_args(&args(&["lock", "acquire", "demo"])) {
+            Command::Lock(LockCommand::Acquire(cfg)) => {
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert!(cfg.socket.is_none());
+                assert_eq!(cfg.mode, LockMode::Wait); // default
+                assert_eq!(cfg.timeout_ms, None);
+            }
+            other => panic!("expected Lock(Acquire), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lock_acquire_mode_fail() {
+        match parse_args(&args(&["lock", "acquire", "demo", "--mode=fail"])) {
+            Command::Lock(LockCommand::Acquire(cfg)) => {
+                assert_eq!(cfg.mode, LockMode::Fail);
+            }
+            other => panic!("expected Lock(Acquire), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lock_acquire_mode_wait_explicit() {
+        match parse_args(&args(&["lock", "acquire", "demo", "--mode=wait"])) {
+            Command::Lock(LockCommand::Acquire(cfg)) => {
+                assert_eq!(cfg.mode, LockMode::Wait);
+            }
+            other => panic!("expected Lock(Acquire), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lock_acquire_mode_invalid_errors() {
+        match parse_args(&args(&["lock", "acquire", "demo", "--mode=block"])) {
+            Command::Error(msg) => assert!(msg.contains("--mode"), "got: {msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lock_acquire_timeout() {
+        match parse_args(&args(&["lock", "acquire", "demo", "--timeout=5s"])) {
+            Command::Lock(LockCommand::Acquire(cfg)) => {
+                assert_eq!(cfg.timeout_ms, Some(5_000));
+            }
+            other => panic!("expected Lock(Acquire), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lock_acquire_timeout_bare_number_errors() {
+        // 単位なしは parse_duration_ms で reject される
+        match parse_args(&args(&["lock", "acquire", "demo", "--timeout=5"])) {
+            Command::Error(msg) => assert!(msg.contains("--timeout"), "got: {msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lock_acquire_socket_alternative() {
+        match parse_args(&args(&["lock", "acquire", "--socket=/tmp/x.sock"])) {
+            Command::Lock(LockCommand::Acquire(cfg)) => {
+                assert_eq!(cfg.socket.as_deref(), Some("/tmp/x.sock"));
+                assert!(cfg.session_id.is_none());
+            }
+            other => panic!("expected Lock(Acquire), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lock_acquire_unknown_option_errors() {
+        match parse_args(&args(&["lock", "acquire", "demo", "--bogus=1"])) {
+            Command::Error(msg) => assert!(msg.contains("unknown option"), "got: {msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lock_release_basic() {
+        match parse_args(&args(&["lock", "release", "demo", "--token=abc123"])) {
+            Command::Lock(LockCommand::Release(cfg)) => {
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.token.as_deref(), Some("abc123"));
+            }
+            other => panic!("expected Lock(Release), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lock_release_token_missing_is_allowed_at_parse() {
+        // token は parser 段では optional (= env fallback あり)。dispatcher 側で
+        // env を読んでもなお None なら exit 2 で reject する。
+        match parse_args(&args(&["lock", "release", "demo"])) {
+            Command::Lock(LockCommand::Release(cfg)) => {
+                assert!(cfg.token.is_none());
+            }
+            other => panic!("expected Lock(Release), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lock_release_empty_token_rejected() {
+        match parse_args(&args(&["lock", "release", "demo", "--token="])) {
+            Command::Error(msg) => assert!(msg.contains("--token"), "got: {msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lock_release_separated_token() {
+        // `--token VALUE` (= space-separated) も accept する
+        match parse_args(&args(&["lock", "release", "demo", "--token", "tok-xyz"])) {
+            Command::Lock(LockCommand::Release(cfg)) => {
+                assert_eq!(cfg.token.as_deref(), Some("tok-xyz"));
+            }
+            other => panic!("expected Lock(Release), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lock_unknown_subcommand_suggests() {
+        // `lock acqire` (= typo) を `lock acquire` に suggest する
+        match parse_args(&args(&["lock", "acqire", "demo"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("acqire"), "got: {msg}");
+                assert!(
+                    msg.contains("did you mean") && msg.contains("acquire"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unlock_basic() {
+        match parse_args(&args(&["unlock", "demo", "--token=tok"])) {
+            Command::Unlock(cfg) => {
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.token.as_deref(), Some("tok"));
+            }
+            other => panic!("expected Unlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unlock_token_missing_is_allowed_at_parse() {
+        match parse_args(&args(&["unlock", "demo"])) {
+            Command::Unlock(cfg) => {
+                assert!(cfg.token.is_none());
+            }
+            other => panic!("expected Unlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unlock_empty_token_rejected() {
+        match parse_args(&args(&["unlock", "demo", "--token="])) {
+            Command::Error(msg) => assert!(msg.contains("--token"), "got: {msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unlock_unknown_option_errors() {
+        match parse_args(&args(&["unlock", "demo", "--bogus"])) {
+            Command::Error(msg) => assert!(msg.contains("unknown option"), "got: {msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unlock_no_session_or_socket_errors() {
+        match parse_args(&args(&["unlock"])) {
+            Command::Error(msg) => assert!(
+                msg.contains("session id") || msg.contains("socket"),
+                "got: {msg}"
+            ),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_lock_topic_is_renderable() {
+        let text = usage(&HelpTopic::Lock);
+        assert!(text.contains("acquire"));
+        assert!(text.contains("release"));
+    }
+
+    #[test]
+    fn usage_lock_acquire_mentions_mode_and_timeout() {
+        let text = usage(&HelpTopic::LockAcquire);
+        assert!(text.contains("--mode"));
+        assert!(text.contains("--timeout"));
+    }
+
+    #[test]
+    fn usage_lock_release_mentions_token() {
+        let text = usage(&HelpTopic::LockRelease);
+        assert!(text.contains("--token"));
+    }
+
+    #[test]
+    fn usage_unlock_mentions_token() {
+        let text = usage(&HelpTopic::Unlock);
+        assert!(text.contains("--token"));
+    }
+
+    #[test]
+    fn usage_top_lists_lock_and_unlock() {
+        let text = usage(&HelpTopic::Top);
+        assert!(text.contains("lock"));
+        assert!(text.contains("unlock"));
     }
 }
