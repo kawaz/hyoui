@@ -28,9 +28,8 @@
 //! を行う:
 //!
 //! - `send_control` / `broadcast_control`: writer queue 経由の 1 client / 全 client 送信
-//! - `handle_wait_request` / `handle_tail_request`: predicate / subscription
-//!   セットアップ (= 本 module からは cap check 後に呼ぶだけ、本体は Phase E で
-//!   wait.rs / tail.rs に分離予定)
+//! - `handle_tail_request`: subscription セットアップ (= 本 module からは
+//!   cap check 後に呼ぶだけ)
 //! - [`super::lock`] の `generate_lock_token` / `SessionState`
 //!
 //! frame I/O や PTY write の I/O 部分は `session.rs::serve_loop` 側に残る (= 本
@@ -44,7 +43,7 @@ use crate::protocol::messages::{
     ClientInfo, ErrorCode, ErrorMessage, LockResponse, LockResult, ModeChange, ScreenBufferKind,
     ScreenCursorSnap, ScreenDumpRequest, ScreenDumpResponse, ScreenModeSnap, ScreenWindowSize,
     SessionMode, SnapshotComponent, StateSnapshotRequest, StateSnapshotResponse, StatusResponse,
-    TailRequest, WaitRequest,
+    TailRequest,
 };
 use crate::protocol::{ControlMessage, Frame, Mode, TYPE_CBOR_CONTROL, TYPE_RAW_DATA};
 use crate::scrollback::Scrollback;
@@ -59,7 +58,6 @@ use super::screen::{
 };
 use super::session::RelayOutcome;
 use super::tail::handle_tail_request;
-use super::wait::{PendingWait, handle_wait_request};
 
 // === Tunables ===
 
@@ -109,7 +107,6 @@ pub(super) fn handle_client_frame(
     scrollback: &Scrollback,
     screen_state: &mut ScreenState,
     config: &DaemonConfig,
-    pending_waits: &mut Vec<PendingWait>,
 ) -> ClientFrameOutcome {
     match frame.ty {
         TYPE_RAW_DATA => {
@@ -170,7 +167,6 @@ pub(super) fn handle_client_frame(
                 scrollback,
                 screen_state,
                 config,
-                pending_waits,
             )
         }
         _ => ClientFrameOutcome::DropClient,
@@ -184,8 +180,8 @@ pub(super) fn handle_client_frame(
 /// 旧実装の 311 行単一 `match` を、kind ごとの `handle_*` 関数 +
 /// 共通 cap_check / mode_check helper (= [`ensure_cap`] / [`ensure_rw_mode`] /
 /// [`ensure_leader`]) に分解した。各 handler は self-contained で、引数を
-/// 通じて必要な state (`SessionState`, `ClientHandle` slice, scrollback, config,
-/// pending_waits) を受け取る。
+/// 通じて必要な state (`SessionState`, `ClientHandle` slice, scrollback, config)
+/// を受け取る。
 ///
 /// Phase 10-11 の state 更新と broadcast を担う。
 #[allow(clippy::too_many_arguments)]
@@ -199,7 +195,6 @@ pub(super) fn handle_control_message(
     scrollback: &Scrollback,
     screen_state: &mut ScreenState,
     config: &DaemonConfig,
-    pending_waits: &mut Vec<PendingWait>,
 ) -> ClientFrameOutcome {
     match msg {
         ControlMessage::Detach(d) => handle_detach_target(idx, d, clients),
@@ -210,9 +205,6 @@ pub(super) fn handle_control_message(
         ControlMessage::LockRelease(rel) => handle_lock_release(idx, rel, clients, state),
         ControlMessage::TailRequest(req) => {
             handle_tail_request_dispatch(idx, req, clients, scrollback)
-        }
-        ControlMessage::WaitRequest(req) => {
-            handle_wait_request_dispatch(idx, req, clients, pending_waits)
         }
         ControlMessage::StatusQuery(_) => {
             handle_status_query(child, idx, clients, state, scrollback, config)
@@ -236,7 +228,6 @@ pub(super) fn handle_control_message(
         | ControlMessage::StatusResponse(_)
         | ControlMessage::TailData(_)
         | ControlMessage::TailEnd(_)
-        | ControlMessage::WaitResult(_)
         | ControlMessage::ScreenDumpResponse(_)
         | ControlMessage::StateSnapshotResponse(_) => reject_unexpected_kind(idx, clients),
     }
@@ -661,26 +652,6 @@ fn handle_tail_request_dispatch(
         return ClientFrameOutcome::Continue;
     }
     handle_tail_request(idx, req, clients, scrollback);
-    ClientFrameOutcome::Continue
-}
-
-/// `ControlMessage::WaitRequest` の cap check + handler 呼び出し。
-fn handle_wait_request_dispatch(
-    idx: usize,
-    req: WaitRequest,
-    clients: &mut [ClientHandle],
-    pending_waits: &mut Vec<PendingWait>,
-) -> ClientFrameOutcome {
-    if ensure_cap(
-        &clients[idx],
-        "wait-l0",
-        "wait.request requires `wait-l0` cap",
-    )
-    .is_err()
-    {
-        return ClientFrameOutcome::Continue;
-    }
-    handle_wait_request(idx, req, clients, pending_waits);
     ClientFrameOutcome::Continue
 }
 

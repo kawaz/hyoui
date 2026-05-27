@@ -13,7 +13,9 @@
 //!   (= `Session::run`、R4-M1 で撤去済、Phase 9 で完全置換)
 //! - [x] Phase 9: multi-attach + bounded mpsc (backpressure DR-0008 §8.2) ← 現役
 //! - [x] Phase 10: lock + leader + mode change (wait queue 未実装、wait=true でも Denied)
-//! - [x] Phase 11: status / tail / wait (text/pattern/idle predicates、subscription 切替)
+//! - [x] Phase 11: status / tail (subscription 切替)
+//!   - 旧 wait protocol (scrollback regex 経路) は DR-0006 §9 改訂で廃止、
+//!     state-based wait (CLI 側の state polling) に移行済み
 //!
 //! ## 関連
 //!
@@ -30,7 +32,6 @@ mod pty;
 mod screen;
 mod session;
 mod tail;
-mod wait;
 
 pub use config::DaemonConfig;
 pub use session::Session;

@@ -163,9 +163,6 @@ fn acquire_sigchld_selfpipe() -> Option<SigchldOwner> {
     })
 }
 use super::tail::{broadcast_tail_end_to_followers, tail_end_reason_from_outcome};
-use super::wait::{
-    PendingWait, check_wait_timeouts, compute_wait_poll_timeout, update_waits_on_master_bytes,
-};
 
 /// daemon 1 つ分の起動済 session。
 ///
@@ -332,7 +329,6 @@ impl Session {
             0,
             config.screen_input_log_bytes,
         );
-        let mut pending_waits: Vec<PendingWait> = Vec::new();
         // DEC sync update 同期中に attach が発生した場合の deferred redraw 用。
         // sync が終了するまで redraw 送信を保留し、次の iteration で flush する
         // (DR-0013 §6 + alacritty `event_loop.rs:166` pattern)。
@@ -358,7 +354,6 @@ impl Session {
             &mut scrollback,
             &mut screen_state,
             &mut pending_redraws,
-            &mut pending_waits,
             sigchld_owner.as_ref().map(|o| &o.pipe),
         );
 
@@ -567,7 +562,6 @@ fn serve_loop(
     scrollback: &mut Scrollback,
     screen_state: &mut ScreenState,
     pending_redraws: &mut Vec<u64>,
-    pending_waits: &mut Vec<PendingWait>,
     sigchld_pipe: Option<&SelfPipe>,
 ) -> RelayOutcome {
     // DR-0013 §5: stalled sequence の 5s timeout 検出は per-loop で行う。
@@ -613,9 +607,8 @@ fn serve_loop(
 
         // R4-C3: pending handshake がある間は poll timeout を 50ms 以下に抑える。
         // 完了通知 (mpsc) は fd-poll では検出できないため、短い周期で try_recv する
-        // 必要がある。timeout だけ走る無駄サイクルを避けるため、pending が無い場合は
-        // 通常通り wait のスケジュールで眠る。
-        let mut poll_timeout = compute_wait_poll_timeout(pending_waits);
+        // 必要がある。pending が無い場合は無限 block (= 別 fd の POLLIN で起きる)。
+        let mut poll_timeout = PollTimeout::NONE;
         if !pending_handshakes.is_empty() {
             const HANDSHAKE_POLL_CAP_MS: u16 = 50;
             let cap = PollTimeout::from(HANDSHAKE_POLL_CAP_MS);
@@ -669,8 +662,6 @@ fn serve_loop(
             }
             Ok(PollOutcome::Timeout) => {
                 drop(poll_fds);
-                // wait deadline / idle 経過チェック
-                check_wait_timeouts(pending_waits, clients);
                 process_pending_handshakes(
                     &mut pending_handshakes,
                     config,
@@ -702,7 +693,6 @@ fn serve_loop(
                 indices_to_drop.dedup();
                 for idx in indices_to_drop.into_iter().rev() {
                     let ch = clients.remove(idx);
-                    pending_waits.retain(|w| w.client_id != ch.id);
                     // ClientHandle::Drop が writer_tx close + reader shutdown +
                     // writer_thread join を一括実行 (R5-H18)。
                     drop(ch);
@@ -813,8 +803,6 @@ fn serve_loop(
                     // feed 後に stalled-warn flag を解除 (= 次回 5s 経過時に再警告可)
                     stalled_warned = false;
                     overflow_ids.extend(broadcast_master_bytes(clients, &buf[..n], now));
-                    // pending waits に新規 bytes を流し込み、match 確認
-                    update_waits_on_master_bytes(pending_waits, clients, &buf[..n], now);
                     // R5-FB1: `--until PATTERN` match 検査。一致した瞬間に
                     // 子 process group へ SIGTERM を投げて session 終了させる。
                     // (broadcast / scrollback の後で match 判定するのは、最後の
@@ -885,7 +873,6 @@ fn serve_loop(
                         scrollback,
                         screen_state,
                         config,
-                        pending_waits,
                     ) {
                         ClientFrameOutcome::Continue => {}
                         ClientFrameOutcome::DropClient => indices_to_drop.push(idx),
@@ -915,8 +902,6 @@ fn serve_loop(
                 state.lock_holder = None;
                 state.lock_token = None;
             }
-            // pending waits も remove (= client が消えたら wait は cancel 同等)
-            pending_waits.retain(|w| w.client_id != ch.id);
             // ClientHandle::Drop が writer_tx close + reader shutdown +
             // writer_thread join を一括実行 (R5-H18)。backpressure 超過時の
             // writer_pump が write_all で block 中でも shutdown で即 error 化される。
@@ -1026,7 +1011,7 @@ mod tests {
     use super::super::lock::{generate_lock_token, should_assign_leader};
     use super::*;
     use crate::protocol::messages::{
-        Detach, DetachTarget, ErrorCode, Kill, LockResult, SessionMode, TailEndReason, WaitOutcome,
+        Detach, DetachTarget, ErrorCode, Kill, LockResult, SessionMode, TailEndReason,
     };
     use crate::protocol::{
         HandshakeRequest, HandshakeResponse, MVP_CAPS, TYPE_CBOR_CONTROL, TYPE_RAW_DATA,
@@ -2340,246 +2325,11 @@ mod tests {
         let _ = handle.join().expect("daemon thread");
     }
 
-    // ---- Phase 11c: wait.request ----
-
-    /// Phase 11c: wait.request(text) は新規 master 出力に target が含まれたら Matched。
-    #[test]
-    fn serve_wait_text_predicate_matches() {
-        use crate::protocol::messages::{WaitMatchOptions, WaitPredicate, WaitRequest};
-
-        let cmd = vec!["/bin/sh".into(), "-c".into(), "cat".into()];
-        let (_, sock_path, _dir, handle) = {
-            let dir = make_temp_socket_dir();
-            let sock_path = dir.path().join("test.sock");
-            let cfg = DaemonConfig::new("demo", sock_path.clone(), cmd);
-            let session = Session::start(cfg).expect("start");
-            let h = std::thread::spawn(move || session.serve());
-            ("demo".to_string(), sock_path, dir, h)
-        };
-
-        let mut s1 = client_connect_with_retry(&sock_path);
-        let _ = do_client_handshake(&mut s1);
-        let _ = Frame::decode_from(&mut s1).expect("leader.notify");
-
-        // wait.request: text "READY"
-        Frame::cbor_control(
-            ControlMessage::WaitRequest(WaitRequest {
-                predicate: WaitPredicate::Text {
-                    value: "READY".into(),
-                },
-                timeout_ms: Some(5_000),
-                options: WaitMatchOptions::default(),
-            })
-            .encode_to_vec()
-            .expect("encode"),
-        )
-        .encode_to(&mut s1)
-        .expect("send");
-        s1.flush().expect("flush");
-
-        // cat に "READY\n" を送り込む → cat が echo → master → wait scan で match
-        Frame::raw_data(b"READY\n".to_vec())
-            .encode_to(&mut s1)
-            .expect("send");
-        s1.flush().expect("flush");
-
-        // wait.result(Matched) を期待
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if std::time::Instant::now() > deadline {
-                panic!("timed out waiting for WaitResult");
-            }
-            match next_control(&mut s1) {
-                ControlMessage::WaitResult(wr) => {
-                    assert_eq!(wr.outcome, WaitOutcome::Matched);
-                    break;
-                }
-                _ => continue,
-            }
-        }
-
-        // cleanup
-        Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
-        )
-        .encode_to(&mut s1)
-        .expect("send");
-        s1.flush().expect("flush");
-        let _ = handle.join().expect("daemon thread");
-    }
-
-    /// Phase 11c: wait.request(idle) は master 出力が idle_ms 間無いと Matched。
-    #[test]
-    fn serve_wait_idle_predicate_matches() {
-        use crate::protocol::messages::{WaitMatchOptions, WaitPredicate, WaitRequest};
-
-        // 子は出力しない (sleep だけ) → idle がすぐ成立する
-        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
-
-        let mut s1 = client_connect_with_retry(&sock_path);
-        let _ = do_client_handshake(&mut s1);
-        let _ = Frame::decode_from(&mut s1).expect("leader.notify");
-
-        // idle 100ms wait
-        Frame::cbor_control(
-            ControlMessage::WaitRequest(WaitRequest {
-                predicate: WaitPredicate::Idle { ms: 100 },
-                timeout_ms: Some(5_000),
-                options: WaitMatchOptions::default(),
-            })
-            .encode_to_vec()
-            .expect("encode"),
-        )
-        .encode_to(&mut s1)
-        .expect("send");
-        s1.flush().expect("flush");
-
-        let start = std::time::Instant::now();
-        let result = next_control(&mut s1);
-        let elapsed = start.elapsed();
-        match result {
-            ControlMessage::WaitResult(wr) => {
-                assert_eq!(wr.outcome, WaitOutcome::Matched);
-            }
-            o => panic!("expected WaitResult, got {o:?}"),
-        }
-        // R4-H5: 下限は 50ms に緩めた (旧 80ms / 要求 idle_ms = 100ms に対して 80%)。
-        // 「daemon が idle 待ちをそれなりにやった」ことを確認する sanity check で
-        // あり、CI 高負荷下で daemon の timer 解像度が荒くなった場合に false-fail
-        // する余地を減らすため (= 要求 idle_ms = 100ms に対し 50% を下限)。
-        assert!(
-            elapsed >= Duration::from_millis(50),
-            "idle should wait noticeably (allowing for jitter), got {elapsed:?}"
-        );
-
-        // cleanup
-        Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
-        )
-        .encode_to(&mut s1)
-        .expect("send");
-        s1.flush().expect("flush");
-        let _ = handle.join().expect("daemon thread");
-    }
-
-    /// Phase 11c: wait.request の timeout は WaitResult(Timeout) を返す。
-    #[test]
-    fn serve_wait_timeout_returns_timeout_outcome() {
-        use crate::protocol::messages::{WaitMatchOptions, WaitPredicate, WaitRequest};
-
-        // 子は何も出力しない sleep → text "NEVER" は決して来ない → timeout
-        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
-
-        let mut s1 = client_connect_with_retry(&sock_path);
-        let _ = do_client_handshake(&mut s1);
-        let _ = Frame::decode_from(&mut s1).expect("leader.notify");
-
-        Frame::cbor_control(
-            ControlMessage::WaitRequest(WaitRequest {
-                predicate: WaitPredicate::Text {
-                    value: "NEVER".into(),
-                },
-                timeout_ms: Some(200),
-                options: WaitMatchOptions::default(),
-            })
-            .encode_to_vec()
-            .expect("encode"),
-        )
-        .encode_to(&mut s1)
-        .expect("send");
-        s1.flush().expect("flush");
-
-        let start = std::time::Instant::now();
-        match next_control(&mut s1) {
-            ControlMessage::WaitResult(wr) => assert_eq!(wr.outcome, WaitOutcome::Timeout),
-            o => panic!("expected WaitResult, got {o:?}"),
-        }
-        let elapsed = start.elapsed();
-        // R4-H5: 下限は 100ms に緩めた (旧 150ms / 要求 timeout = 200ms に対して 75%)。
-        // 「daemon が timeout 待ちをそれなりにやった」ことを確認する sanity check で、
-        // CI 高負荷下で daemon の timer 解像度が荒くなった場合に false-fail する
-        // 余地を減らすため (= 要求 timeout = 200ms に対し 50% を下限)。
-        assert!(
-            elapsed >= Duration::from_millis(100),
-            "should wait around 200ms, got {elapsed:?}"
-        );
-
-        // cleanup
-        Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
-        )
-        .encode_to(&mut s1)
-        .expect("send");
-        s1.flush().expect("flush");
-        let _ = handle.join().expect("daemon thread");
-    }
-
-    /// Phase 11c: wait.request(pattern) regex match。
-    #[test]
-    fn serve_wait_pattern_predicate_matches() {
-        use crate::protocol::messages::{WaitMatchOptions, WaitPredicate, WaitRequest};
-
-        let cmd = vec!["/bin/sh".into(), "-c".into(), "cat".into()];
-        let (_, sock_path, _dir, handle) = {
-            let dir = make_temp_socket_dir();
-            let sock_path = dir.path().join("test.sock");
-            let cfg = DaemonConfig::new("demo", sock_path.clone(), cmd);
-            let session = Session::start(cfg).expect("start");
-            let h = std::thread::spawn(move || session.serve());
-            ("demo".to_string(), sock_path, dir, h)
-        };
-        let mut s1 = client_connect_with_retry(&sock_path);
-        let _ = do_client_handshake(&mut s1);
-        let _ = Frame::decode_from(&mut s1).expect("leader.notify");
-
-        // pattern: r"ITEM-\d+"
-        Frame::cbor_control(
-            ControlMessage::WaitRequest(WaitRequest {
-                predicate: WaitPredicate::Pattern {
-                    regex: r"ITEM-\d+".into(),
-                },
-                timeout_ms: Some(5_000),
-                options: WaitMatchOptions::default(),
-            })
-            .encode_to_vec()
-            .expect("encode"),
-        )
-        .encode_to(&mut s1)
-        .expect("send");
-        s1.flush().expect("flush");
-
-        Frame::raw_data(b"prefix ITEM-42 suffix\n".to_vec())
-            .encode_to(&mut s1)
-            .expect("send");
-        s1.flush().expect("flush");
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if std::time::Instant::now() > deadline {
-                panic!("timed out");
-            }
-            if let ControlMessage::WaitResult(wr) = next_control(&mut s1) {
-                assert_eq!(wr.outcome, WaitOutcome::Matched);
-                break;
-            }
-        }
-
-        Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
-        )
-        .encode_to(&mut s1)
-        .expect("send");
-        s1.flush().expect("flush");
-        let _ = handle.join().expect("daemon thread");
-    }
+    // ---- Phase 11c: wait.request 廃止 (DR-0006 §9 改訂) ----
+    // 旧 scrollback regex 経路の wait protocol layer は削除済。state-based
+    // wait は CLI 側で screen.snapshot.request を polling する形に再実装され、
+    // daemon protocol 層には wait 関連の message / handler / pending_waits は
+    // 残らない。
 
     /// Phase 11b: tail.request(follow=true) は subscription を TailFollow に
     /// 切り替え、以降の master 出力は TailData として届く。
@@ -2975,67 +2725,8 @@ mod tests {
 
     // ---- Round2 fixes: regress confirmations ----
 
-    /// Round2 #1: 空 Text predicate を送ると `wait.invalid-text` error が返り、
-    /// daemon は panic せず session 継続。
-    #[test]
-    fn serve_wait_empty_text_predicate_rejected() {
-        use crate::protocol::messages::{WaitMatchOptions, WaitPredicate, WaitRequest};
-
-        let cmd = vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            "printf hello; sleep 30".into(),
-        ];
-        let dir = make_temp_socket_dir();
-        let sock_path = dir.path().join("test.sock");
-        let cfg = DaemonConfig::new("demo", sock_path.clone(), cmd);
-        let session = Session::start(cfg).expect("start");
-        let handle = std::thread::spawn(move || session.serve());
-
-        let mut s = client_connect_with_retry(&sock_path);
-        let _ = do_client_handshake(&mut s);
-        let _ = Frame::decode_from(&mut s).expect("leader.notify");
-
-        Frame::cbor_control(
-            ControlMessage::WaitRequest(WaitRequest {
-                predicate: WaitPredicate::Text {
-                    value: String::new(),
-                },
-                timeout_ms: Some(1000),
-                options: WaitMatchOptions::default(),
-            })
-            .encode_to_vec()
-            .expect("encode"),
-        )
-        .encode_to(&mut s)
-        .expect("send");
-        s.flush().expect("flush");
-
-        // Error を待つ (raw_data frame は skip)
-        let mut got_error = false;
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while std::time::Instant::now() < deadline {
-            match next_control(&mut s) {
-                ControlMessage::Error(e) => {
-                    assert_eq!(e.code, ErrorCode::WaitInvalidText);
-                    got_error = true;
-                    break;
-                }
-                _ => continue,
-            }
-        }
-        assert!(got_error, "expected wait.invalid-text error");
-
-        Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
-        )
-        .encode_to(&mut s)
-        .expect("send");
-        s.flush().expect("flush");
-        let _ = handle.join().expect("daemon thread");
-    }
+    // Round2 #1: 空 Text predicate reject 試験は wait protocol layer 削除に伴い廃止
+    // (DR-0006 §9 改訂、state-based wait に移行)。
 
     /// Round2 #3: LockAcquire(wait=true) で holder ありの場合、
     /// **1 frame だけ** (LockResponse Denied) を返す (= Error と LockResponse の
