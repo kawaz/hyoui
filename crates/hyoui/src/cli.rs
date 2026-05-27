@@ -233,34 +233,32 @@ pub struct TailConfig {
     pub last_bytes: Option<u64>,
 }
 
-/// `wait` subcommand の predicate (Phase 11)。CLI 表記から daemon protocol の
-/// `WaitPredicate` に対応する。
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum WaitCliPredicate {
-    /// `text:<str>` (= 部分文字列マッチ)。
-    Text(String),
-    /// `pattern:<regex>`。
-    Pattern(String),
-    /// `wait-idle:<ms>` or `wait:<ms>` (= 静寂 ms)。
-    Idle(u64),
-}
-
-/// `wait` subcommand configuration (Phase 11)。
+/// `wait` subcommand configuration (DR-0006 §9 state-based)。
+///
+/// DR-0006 §9 改訂後 ([[DR-0013]] §9 連動) で wait は **visible state regex match**
+/// に再定義された。旧 `text:` / `pattern:` / `wait-idle:` prefix と
+/// `--strip-escapes` / `--newline-convert-lf` / `--raw` は **廃止**。subcommand
+/// は **regex pattern を 1 つ** だけ受け取り、`hyoui wait <session> <pattern>` の
+/// 形で起動する (= input family の `wait:<pattern>` と同じ意味)。
+///
+/// `wait-idle:<duration>` は input family 経由 (= `hyoui input <session>
+/// wait-idle:500ms ...`) でのみ利用可能 (DR-0006 §9.2 表)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaitConfig {
     /// Target socket path (explicit) または session_id から resolve。
     pub socket: Option<String>,
     /// Target session id。
     pub session_id: Option<String>,
-    /// 待ち条件 (= `text:` / `pattern:` / `wait[-idle]:`)。
-    pub predicate: WaitCliPredicate,
-    /// `--timeout=<ms>` (絶対 timeout)、`None` なら無限。
+    /// regex pattern (= visible state に対する正規表現)。空文字列は parser 段で
+    /// reject。multiline mode は実行側 (= `wait_core::wait_for_pattern`) で default
+    /// ON にする。
+    pub pattern: String,
+    /// `--timeout=<dur>` (絶対 timeout)、`None` なら無限 wait。
     pub timeout_ms: Option<u64>,
-    /// `--no-strip-escapes` で options.strip_escapes = false (default true)。
-    pub strip_escapes: bool,
-    /// `--newline-convert-lf` で CRLF → LF 正規化。
-    pub newline_convert_lf: bool,
+    /// `--poll-interval=<dur>` (= snapshot polling 周期)、`None` なら default
+    /// (100ms)。`HYOUI_WAIT_POLL_MS` 環境変数の override は CLI 引数指定が
+    /// 無いときのみ効く (= 引数優先)。
+    pub poll_interval_ms: Option<u64>,
 }
 
 /// `screen dump` subcommand の format 選択肢 (= DR-0006 §10.2)。
@@ -779,10 +777,8 @@ fn parse_tail(args: &[String]) -> Command {
 }
 
 fn parse_wait(args: &[String]) -> Command {
-    let mut predicate: Option<WaitCliPredicate> = None;
     let mut timeout_ms: Option<u64> = None;
-    let mut strip_escapes = true;
-    let mut newline_convert_lf = false;
+    let mut poll_interval_ms: Option<u64> = None;
     let mut socket: Option<String> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut i = 0usize;
@@ -793,6 +789,10 @@ fn parse_wait(args: &[String]) -> Command {
         let value: Option<String> = match inline_value {
             Some(v) => Some(v),
             None => {
+                // 次 arg を value 候補にするのは `--key value` の形だけ。
+                // regex pattern が `-` で始まることはほぼ無いが、念のため `--`
+                // から始まらない次 arg だけ value 候補にする (= screen dump 等
+                // 既存 pattern と整合)。
                 if i + 1 < args.len() && !args[i + 1].starts_with("--") {
                     consumed_extra = true;
                     Some(args[i + 1].clone())
@@ -818,15 +818,14 @@ fn parse_wait(args: &[String]) -> Command {
                 },
                 None => return Command::Error("wait: --timeout requires a value".into()),
             },
-            "--no-strip-escapes" => {
-                strip_escapes = false;
-                consumed_extra = false;
-            }
-            "--newline-convert-lf" => {
-                newline_convert_lf = true;
-                consumed_extra = false;
-            }
-            other if other.starts_with('-') => {
+            "--poll-interval" => match value {
+                Some(v) => match parse_duration_ms(&v) {
+                    Ok(ms) => poll_interval_ms = Some(ms),
+                    Err(e) => return Command::Error(format!("wait: --poll-interval: {e}")),
+                },
+                None => return Command::Error("wait: --poll-interval requires a value".into()),
+            },
+            other if other.starts_with("--") => {
                 return Command::Error(format!("wait: unknown option: {other}"));
             }
             _ => {
@@ -839,84 +838,63 @@ fn parse_wait(args: &[String]) -> Command {
             i += 1;
         }
     }
-    // positionals: 1 つは session_id、もう 1 つ (or 1 つだけ) が predicate。
-    // 順序は session_id → predicate / predicate (--socket 使うとき) のいずれか。
-    // predicate は "text:" / "pattern:" / "wait:" / "wait-idle:" prefix で識別。
-    let mut session_id: Option<String> = None;
-    for p in positionals {
-        match parse_wait_predicate(&p) {
-            Ok(Some(pred)) => {
-                if predicate.is_some() {
-                    return Command::Error("wait: predicate specified more than once".into());
-                }
-                predicate = Some(pred);
-            }
-            Ok(None) => {
-                if session_id.is_some() {
-                    return Command::Error(format!("wait: unexpected argument: {p}"));
-                }
-                // R5-AUD-C2: positional session_id を validate (= path traversal 早期 reject)
-                if let Err(e) = validate_session_id(&p) {
-                    return Command::Error(format!("wait: {e}"));
-                }
-                session_id = Some(p);
-            }
-            Err(e) => {
-                return Command::Error(format!("wait: predicate `{p}`: {e}"));
-            }
-        }
-    }
-    let predicate = match predicate {
-        Some(p) => p,
-        None => {
+    // positionals: --socket あり → 1 つだけ (= pattern)、--socket なし → 2 つ
+    // (= session_id, pattern)。前者で 0 個は pattern 不在で error、後者で
+    // 1 個だけ場合は session_id を validate して pattern 不在 error。
+    let (session_id, pattern) = match (socket.is_some(), positionals.len()) {
+        (true, 0) => {
             return Command::Error(
-                "wait: predicate (text:.. / pattern:.. / wait[-idle]:..) required".into(),
+                "wait: pattern が必要です。例: `hyoui wait --socket=<path> 'Continue\\?'`"
+                    .into(),
             );
         }
+        (true, 1) => (None, positionals.pop().expect("non-empty")),
+        (true, _) => {
+            return Command::Error(format!(
+                "wait: 余分な positional 引数: {:?}",
+                &positionals[1..]
+            ));
+        }
+        (false, 0) => {
+            return Command::Error(
+                "wait: session id と pattern が必要です。\
+                 例: `hyoui wait <session-id> 'Continue\\?' --timeout=5s` / \
+                 `hyoui list` で session 一覧を確認できます"
+                    .into(),
+            );
+        }
+        (false, 1) => {
+            // session_id だけある状態 → pattern が無い
+            return Command::Error(
+                "wait: pattern が必要です。例: `hyoui wait <session-id> 'Continue\\?'`".into(),
+            );
+        }
+        (false, 2) => {
+            let pattern = positionals.pop().expect("non-empty");
+            let sid = positionals.pop().expect("non-empty");
+            // R5-AUD-C2: positional session_id を validate (= path traversal 早期 reject)
+            if let Err(e) = validate_session_id(&sid) {
+                return Command::Error(format!("wait: {e}"));
+            }
+            (Some(sid), pattern)
+        }
+        (false, _) => {
+            return Command::Error(format!(
+                "wait: 余分な positional 引数: {:?}",
+                &positionals[2..]
+            ));
+        }
     };
-    if session_id.is_none() && socket.is_none() {
-        return Command::Error(
-            "wait: session id (positional) または --socket=<path> が必要です。\
-             例: `hyoui wait <session-id> text:READY --timeout=5s` / `hyoui list` で session 一覧を確認できます"
-                .into(),
-        );
+    if pattern.is_empty() {
+        return Command::Error("wait: pattern が空文字列です (= 正規表現が必要)".into());
     }
     Command::Wait(WaitConfig {
         socket,
         session_id,
-        predicate,
+        pattern,
         timeout_ms,
-        strip_escapes,
-        newline_convert_lf,
+        poll_interval_ms,
     })
-}
-
-/// `text:<str>` / `pattern:<regex>` / `wait:<dur>` / `wait-idle:<dur>` の
-/// CLI prefix を [`WaitCliPredicate`] に変換。
-///
-/// 戻り値:
-/// - `Ok(Some(pred))`: 認識済 prefix + valid payload
-/// - `Ok(None)`: prefix にマッチしない (= caller は positional session_id 扱い)
-/// - `Err(msg)`: prefix にマッチしたが payload (= duration) の parse 失敗
-///   (= Round2 #9: 旧版は `.ok()` で潰して silently None だったため、user が
-///   単位なし `wait-idle:500` 等を渡したとき「unexpected argument」という誤メッセージ
-///   が出た。明示 Err で `parse_duration_ms` の本来の error message を上位に伝える)
-fn parse_wait_predicate(s: &str) -> Result<Option<WaitCliPredicate>, String> {
-    if let Some(rest) = s.strip_prefix("text:") {
-        return Ok(Some(WaitCliPredicate::Text(rest.to_string())));
-    }
-    if let Some(rest) = s.strip_prefix("pattern:") {
-        return Ok(Some(WaitCliPredicate::Pattern(rest.to_string())));
-    }
-    let idle_rest = s
-        .strip_prefix("wait-idle:")
-        .or_else(|| s.strip_prefix("wait:"));
-    if let Some(rest) = idle_rest {
-        return parse_duration_ms(rest)
-            .map(|ms| Some(WaitCliPredicate::Idle(ms)))
-            .map_err(|e| format!("invalid duration in predicate: {e}"));
-    }
-    Ok(None)
 }
 
 /// 期間文字列を ms に変換する (kawaz/timespec.mbt の duration parser を参考)。
@@ -2045,23 +2023,29 @@ fn usage_tail() -> String {
 
 fn usage_wait() -> String {
     String::from(
-        "hyoui wait — wait until predicate matches\n\
+        "hyoui wait — wait until visible screen state matches a regex (DR-0006 §9)\n\
         \n\
         USAGE:\n    \
-            hyoui wait <session-id> <predicate> [options]\n    \
-            hyoui wait --socket=<path> <predicate> [options]\n\
+            hyoui wait <session-id> <pattern> [options]\n    \
+            hyoui wait --socket=<path> <pattern> [options]\n\
         \n\
-        PREDICATES:\n    \
-            text:<str>          substring 一致 (literal match)\n    \
-            pattern:<regex>     regex 一致 (regex crate、unicode-perl features)\n    \
-            wait-idle:<dur>     <dur> 静寂で成立 (= 子の master 出力が無い時間)\n    \
-            wait:<dur>          wait-idle のエイリアス\n\
+        PATTERN:\n    \
+            正規表現 (regex crate、unicode-perl features)。multiline mode は default\n    \
+            ON (= `^`/`$` は行頭/行末で効く)。case-insensitive にするなら `(?i)...`。\n    \
+            substring が欲しいときは `\\Q...\\E` で literal にする。\n\
+        \n\
+        MATCH SCOPE:\n    \
+            daemon の **現在 visible cells** を行 join した text に対して match。\n    \
+            scrollback / 過去 redraw / ANSI escape は対象外 (= cell 化済の text のみ)。\n    \
+            `wait-idle:<duration>` は本 subcommand では受け付けず、`hyoui input <id>\n    \
+            wait-idle:500ms ...` のように **input family 経由** で利用する (DR-0006\n    \
+            §9.2)。\n\
         \n\
         OPTIONS:\n    \
             --socket PATH         Explicit socket path (alternative to session-id)\n    \
             --timeout DUR         絶対 timeout。**指定なしは無限 wait**\n    \
-            --no-strip-escapes    マッチ前に ANSI escape を strip しない (default は strip)\n    \
-            --newline-convert-lf  CRLF → LF 正規化\n    \
+            --poll-interval DUR   snapshot polling 周期 (default 100ms)。\n                      \
+                                  環境変数 `HYOUI_WAIT_POLL_MS` でも override 可。\n    \
             -h, --help            Show this help and exit\n\
         \n\
         DURATION FORMAT (kawaz/timespec.mbt 仕様 + sub-ms 拡張):\n    \
@@ -2072,16 +2056,14 @@ fn usage_wait() -> String {
         \n\
         EXIT CODE:\n    \
             0   Matched\n    \
-            1   Timeout\n    \
-            2   Cancelled (= client detach / connection lost)\n    \
-            3   ChildExited (= 子 PTY が条件未達のまま exit)\n    \
-            ※ 旧版は ChildExited を 130 にしていたが、慣例 (128+SIGINT) と衝突\n      \
-            するため 3 に変更\n\
+            1   Timeout / I/O error\n    \
+            2   Cancelled / invalid usage\n    \
+            3   regex compile / daemon error\n\
         \n\
         EXAMPLES:\n    \
-            hyoui wait demo text:READY --timeout=5s\n    \
-            hyoui wait demo pattern:'ITEM-\\d+' --timeout=30s\n    \
-            hyoui wait demo wait-idle:500ms\n",
+            hyoui wait demo 'READY' --timeout=5s\n    \
+            hyoui wait demo 'ITEM-\\d+' --timeout=30s\n    \
+            hyoui wait demo '(?m)^Continue\\?' --poll-interval=50ms\n",
     )
 }
 
@@ -3207,14 +3189,71 @@ mod tests {
     }
 
     #[test]
-    fn parse_wait_text_predicate() {
-        match parse_args(&args(&["wait", "demo", "text:READY", "--timeout=5s"])) {
+    fn parse_wait_regex_pattern() {
+        // DR-0006 §9 改訂後: subcommand は <pattern> を直接 regex として扱う
+        // (= 旧 `text:` / `pattern:` / `wait-idle:` prefix は廃止)
+        match parse_args(&args(&["wait", "demo", "READY", "--timeout=5s"])) {
             Command::Wait(cfg) => {
                 assert_eq!(cfg.session_id.as_deref(), Some("demo"));
-                assert_eq!(cfg.predicate, WaitCliPredicate::Text("READY".into()));
+                assert_eq!(cfg.pattern, "READY");
                 assert_eq!(cfg.timeout_ms, Some(5_000));
+                assert_eq!(cfg.poll_interval_ms, None);
             }
             other => panic!("expected Wait, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_wait_with_poll_interval() {
+        match parse_args(&args(&[
+            "wait",
+            "demo",
+            "ITEM-\\d+",
+            "--timeout=30s",
+            "--poll-interval=50ms",
+        ])) {
+            Command::Wait(cfg) => {
+                assert_eq!(cfg.pattern, "ITEM-\\d+");
+                assert_eq!(cfg.timeout_ms, Some(30_000));
+                assert_eq!(cfg.poll_interval_ms, Some(50));
+            }
+            other => panic!("expected Wait, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_wait_with_socket_only() {
+        match parse_args(&args(&[
+            "wait",
+            "--socket=/tmp/foo.sock",
+            "Continue\\?",
+        ])) {
+            Command::Wait(cfg) => {
+                assert_eq!(cfg.session_id, None);
+                assert_eq!(cfg.socket.as_deref(), Some("/tmp/foo.sock"));
+                assert_eq!(cfg.pattern, "Continue\\?");
+            }
+            other => panic!("expected Wait, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_wait_rejects_empty_pattern() {
+        match parse_args(&args(&["wait", "demo", ""])) {
+            Command::Error(msg) => assert!(msg.contains("pattern"), "got msg={msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_wait_rejects_legacy_strip_escapes_flag() {
+        // DR-0006 §9 改訂で `--no-strip-escapes` は廃止 → unknown option として error
+        match parse_args(&args(&["wait", "demo", "READY", "--no-strip-escapes"])) {
+            Command::Error(msg) => assert!(
+                msg.contains("--no-strip-escapes"),
+                "expected unknown option message, got {msg}"
+            ),
+            other => panic!("expected Error, got {other:?}"),
         }
     }
 
@@ -3399,29 +3438,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_wait_idle_predicate() {
+    fn parse_wait_idle_only_via_input_family() {
+        // wait-idle は subcommand から取り除かれ、input family 経由のみ。
+        // ここでは subcommand 側で "wait-idle:500ms" を pattern として regex 扱い
+        // しても error にならない (= regex として有効な文字列なので pattern として
+        // 受け取られる)。意味としては「文字列 'wait-idle:500ms' が画面に出るまで
+        // 待つ」になり、ユーザの意図とずれる可能性はあるが parse 層で弾く方針は
+        // 取らない (= regex は任意文字列を許容する)。
         match parse_args(&args(&["wait", "demo", "wait-idle:500ms"])) {
             Command::Wait(cfg) => {
-                assert_eq!(cfg.predicate, WaitCliPredicate::Idle(500));
+                assert_eq!(cfg.pattern, "wait-idle:500ms");
             }
             other => panic!("expected Wait, got {other:?}"),
         }
     }
 
     #[test]
-    fn parse_wait_pattern_predicate() {
-        match parse_args(&args(&["wait", "demo", "pattern:ITEM-\\d+"])) {
-            Command::Wait(cfg) => {
-                assert_eq!(cfg.predicate, WaitCliPredicate::Pattern("ITEM-\\d+".into()));
-            }
-            other => panic!("expected Wait, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_wait_missing_predicate_errors() {
+    fn parse_wait_missing_pattern_errors() {
         match parse_args(&args(&["wait", "demo"])) {
-            Command::Error(msg) => assert!(msg.contains("predicate")),
+            Command::Error(msg) => assert!(msg.contains("pattern"), "got msg={msg}"),
             other => panic!("expected Error, got {other:?}"),
         }
     }
@@ -3639,7 +3674,8 @@ mod tests {
             (HelpTopic::Kill, "hyoui kill", &["--signal", "SIGTERM"]),
             (HelpTopic::Status, "hyoui status", &["OUTPUT", "child-pid"]),
             (HelpTopic::Tail, "hyoui tail", &["--follow", "--since"]),
-            (HelpTopic::Wait, "hyoui wait", &["PREDICATES", "wait-idle"]),
+            // DR-0006 §9 改訂後: PATTERN / --poll-interval が新ヘルプに含まれる
+            (HelpTopic::Wait, "hyoui wait", &["PATTERN", "--poll-interval"]),
             (
                 HelpTopic::Completion,
                 "hyoui completion",

@@ -19,15 +19,13 @@ use std::process::ExitCode;
 use hyoui::cli::{
     AttachConfig, Command, HelpTopic, InputCommand, InputSpec, KillConfig, ListConfig,
     ScreenCommand, ScreenDumpCliFormat, ScreenDumpCliLayer, ScreenDumpConfig, ScreenSnapshotConfig,
-    SnapshotCliComponent, StatusConfig, TailConfig, WaitCliPredicate, WaitConfig, parse_args,
-    usage,
+    SnapshotCliComponent, StatusConfig, TailConfig, WaitConfig, parse_args, usage,
 };
 use hyoui::client::{AttachOptions, ClientConnection};
 use hyoui::daemon::{DaemonConfig, Session};
 use hyoui::protocol::messages::{
     DumpRect, ScreenDumpFormat, ScreenDumpLayer, ScreenDumpRequest, SnapshotComponent,
-    StateSnapshotRequest, StatusQuery, TailRequest, WaitMatchOptions, WaitOutcome, WaitPredicate,
-    WaitRequest,
+    StateSnapshotRequest, StatusQuery, TailRequest,
 };
 use hyoui::protocol::{ControlMessage, Mode};
 use hyoui::sys::{enter_raw, is_tty};
@@ -872,27 +870,35 @@ fn tail_command(cfg: TailConfig) -> ExitCode {
     }
 }
 
-/// `wait` subcommand: connect → handshake (ro) → wait.request → outcome に応じた exit。
+/// `wait` subcommand: state-based polling で visible cells の regex match を待つ
+/// (DR-0006 §9 改訂後の実装)。
+///
+/// 旧 wait (= daemon に `WaitRequest` を送って scrollback bytes regex で判定する
+/// 方式) は廃止。client 側で `StateSnapshotRequest` を polling し、cells を行 join
+/// した text に対して match する形に置き換え済 ([[wait_core]] が共通実装)。
 ///
 /// exit code:
 /// - 0: Matched
-/// - 1: Timeout
-/// - 2: Cancelled (= client detach 等)
-/// - 3: ChildExited (= 子 PTY が exit、condition 未達のまま session 終了)
-///
-/// 注: 旧版は 130 (= 128 + SIGINT) を ChildExited に割り当てていたが、shell
-/// 慣例で 130 は「Ctrl-C で中断」を意味するため scripting で `$? -eq 130` を
-/// 「interrupt」と読む既存パターンと衝突する。3 は POSIX application-defined
-/// 範囲なので副作用なし。
+/// - 1: Timeout / I/O error / connect error
+/// - 2: Cancelled / invalid usage (= regex compile 失敗等)
+/// - 3: daemon error (= `state-snapshot-v1` cap 未対応 / unexpected response 等)
 fn wait_command(cfg: WaitConfig) -> ExitCode {
     let sock = match resolve_target_socket("wait", cfg.socket.as_deref(), cfg.session_id.as_deref())
     {
         Ok(p) => p,
         Err(code) => return code,
     };
+    // wait は read-only attach で十分 (= snapshot 取得のみ、daemon に bytes を
+    // 送らない)。MVP_CAPS を要求して `state-snapshot-v1` を intersect する。
     let opts = AttachOptions {
         mode: Mode::Ro,
-        ..AttachOptions::default()
+        caps: hyoui::protocol::MVP_CAPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
+        exclusive: false,
+        detach_others: false,
     };
     // R5-FB4: socket 不存在系 errno は短時間 retry。
     let mut conn = match connect_with_retry(&sock, opts) {
@@ -902,67 +908,34 @@ fn wait_command(cfg: WaitConfig) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let predicate = match cfg.predicate {
-        WaitCliPredicate::Text(s) => WaitPredicate::Text { value: s },
-        WaitCliPredicate::Pattern(r) => WaitPredicate::Pattern { regex: r },
-        WaitCliPredicate::Idle(ms) => WaitPredicate::Idle { ms },
-        // `WaitCliPredicate` is `#[non_exhaustive]`; the parser only emits
-        // known variants today, so an unknown one indicates a library/binary
-        // version skew.
-        _ => {
-            eprintln!("hyoui: wait: unsupported predicate variant (binary/library version skew)");
-            return ExitCode::from(2);
+
+    // poll interval: CLI > env > default。
+    let interval = match cfg.poll_interval_ms {
+        Some(ms) => std::time::Duration::from_millis(ms),
+        None => wait_core::poll_interval_from_env().unwrap_or(wait_core::DEFAULT_POLL_INTERVAL),
+    };
+    let timeout = cfg.timeout_ms.map(std::time::Duration::from_millis);
+
+    match wait_core::wait_for_pattern(&mut conn, &cfg.pattern, timeout, interval) {
+        wait_core::WaitOutcome::Matched => ExitCode::SUCCESS,
+        wait_core::WaitOutcome::Timeout => ExitCode::from(1),
+        wait_core::WaitOutcome::IoError(msg) => {
+            eprintln!("hyoui: wait: {msg}");
+            ExitCode::from(1)
         }
-    };
-    let req = WaitRequest {
-        predicate,
-        timeout_ms: cfg.timeout_ms,
-        options: WaitMatchOptions {
-            strip_escapes: cfg.strip_escapes,
-            newline_convert_lf: cfg.newline_convert_lf,
-        },
-    };
-    if let Err(e) = conn.send_control(&ControlMessage::WaitRequest(req)) {
-        eprintln!("hyoui: wait: send 失敗: {e}");
-        return ExitCode::from(1);
-    }
-    loop {
-        let msg = match conn.recv_control(None) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("hyoui: wait: recv 失敗: {e}");
-                return ExitCode::from(1);
-            }
-        };
-        match msg {
-            ControlMessage::WaitResult(wr) => {
-                return match wr.outcome {
-                    WaitOutcome::Matched => ExitCode::SUCCESS,
-                    WaitOutcome::Timeout => ExitCode::from(1),
-                    WaitOutcome::Cancelled => ExitCode::from(2),
-                    WaitOutcome::ChildExited => ExitCode::from(3),
-                    // `WaitOutcome` is `#[non_exhaustive]`; treat unknown
-                    // future variants as a generic failure.
-                    _ => {
-                        eprintln!(
-                            "hyoui: wait: unknown outcome variant (binary/library version skew)"
-                        );
-                        ExitCode::from(1)
-                    }
-                };
-            }
-            ControlMessage::Error(e) => {
+        wait_core::WaitOutcome::InvalidPattern(msg) => {
+            eprintln!("hyoui: wait: invalid pattern: {msg}");
+            ExitCode::from(2)
+        }
+        wait_core::WaitOutcome::DaemonError(msg) => {
+            eprintln!("hyoui: wait: daemon error: {msg}");
+            if msg.contains("state-snapshot-v1") {
                 eprintln!(
-                    "hyoui: wait: daemon error: code={} message={}",
-                    e.code, e.message
+                    "       daemon が `state-snapshot-v1` cap をサポートしていません。"
                 );
-                return ExitCode::from(1);
+                eprintln!("       daemon を新しいバージョンに更新してください。");
             }
-            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
-            other => {
-                eprintln!("hyoui: wait: unexpected response: {other:?}");
-                return ExitCode::from(1);
-            }
+            ExitCode::from(3)
         }
     }
 }
