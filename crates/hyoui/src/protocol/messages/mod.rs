@@ -40,7 +40,6 @@ mod lock;
 mod screen;
 mod status;
 mod tail;
-mod wait;
 
 pub use control::{Resize, Signal};
 pub use error::{ErrorCode, ErrorMessage};
@@ -59,7 +58,6 @@ pub use screen::{
 };
 pub use status::{ClientInfo, StatusQuery, StatusResponse};
 pub use tail::{TailData, TailEnd, TailEndReason, TailRequest};
-pub use wait::{WaitMatchOptions, WaitOutcome, WaitPredicate, WaitRequest, WaitResult};
 
 /// CBOR control message の全 kind を包む tagged enum。
 ///
@@ -128,14 +126,6 @@ pub enum ControlMessage {
     /// `kind = "tail.end"` — daemon → client、tail 終了通知。
     #[serde(rename = "tail.end")]
     TailEnd(TailEnd),
-
-    /// `kind = "wait.request"` — client → daemon、出力条件待ち。
-    #[serde(rename = "wait.request")]
-    WaitRequest(WaitRequest),
-
-    /// `kind = "wait.result"` — daemon → client、条件成立 / timeout / cancel。
-    #[serde(rename = "wait.result")]
-    WaitResult(WaitResult),
 
     /// `kind = "detach"` — client → daemon、自身 (or `others`/`all`) を detach。
     #[serde(rename = "detach")]
@@ -455,69 +445,6 @@ mod tests {
             let msg = ControlMessage::TailEnd(TailEnd { reason });
             assert_eq!(roundtrip(&msg), msg);
         }
-    }
-
-    #[test]
-    fn wait_request_text_roundtrip() {
-        let msg = ControlMessage::WaitRequest(WaitRequest {
-            predicate: WaitPredicate::Text {
-                value: "ready>".into(),
-            },
-            timeout_ms: Some(10_000),
-            options: WaitMatchOptions {
-                strip_escapes: true,
-                newline_convert_lf: false,
-            },
-        });
-        assert_eq!(roundtrip(&msg), msg);
-    }
-
-    #[test]
-    fn wait_request_pattern_roundtrip() {
-        let msg = ControlMessage::WaitRequest(WaitRequest {
-            predicate: WaitPredicate::Pattern {
-                regex: r"^\$\s+$".into(),
-            },
-            timeout_ms: None,
-            options: WaitMatchOptions::default(),
-        });
-        assert_eq!(roundtrip(&msg), msg);
-    }
-
-    #[test]
-    fn wait_request_idle_roundtrip() {
-        let msg = ControlMessage::WaitRequest(WaitRequest {
-            predicate: WaitPredicate::Idle { ms: 500 },
-            timeout_ms: Some(30_000),
-            options: WaitMatchOptions::default(),
-        });
-        assert_eq!(roundtrip(&msg), msg);
-    }
-
-    #[test]
-    fn wait_match_options_default_matches_documented_values() {
-        // R4-C6: `WaitMatchOptions::default()` の戻り値が doc コメント
-        // (strip_escapes = true / newline_convert_lf = false) および CLI 既定値と
-        // 一致することを保証する。`#[derive(Default)]` だと strip_escapes が false に
-        // なるため、手動 impl Default で揃えている。
-        let opts = WaitMatchOptions::default();
-        assert!(
-            opts.strip_escapes,
-            "strip_escapes default must be true (matches doc and CLI default)"
-        );
-        assert!(
-            !opts.newline_convert_lf,
-            "newline_convert_lf default must be false (matches doc and CLI default)"
-        );
-    }
-
-    #[test]
-    fn wait_result_roundtrip() {
-        let msg = ControlMessage::WaitResult(WaitResult {
-            outcome: WaitOutcome::Matched,
-            matched_offset: Some(42),
-        });
-        assert_eq!(roundtrip(&msg), msg);
     }
 
     #[test]
