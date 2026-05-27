@@ -443,4 +443,68 @@ mod tests {
         let result = Regex::new(&pattern);
         assert!(result.is_err());
     }
+
+    /// QA edge: rows>0 / cols>0 でも cells が完全に空なら、空 row が `\n` で
+    /// 結合された text が返る (= 各 row は trim_end で空 string になる)。
+    /// 空行が正しく描画されることを保護する (= DR-0006 §9.5 multiline `^$` の
+    /// 想定挙動)。
+    #[test]
+    fn to_text_all_empty_yields_blank_lines() {
+        let s = SnapshotCells {
+            rows: 3,
+            cols: 5,
+            cells: vec![],
+        };
+        // 3 row、全空 → "" + "\n" + "" + "\n" + "" = "\n\n"
+        assert_eq!(s.to_text(), "\n\n");
+    }
+
+    /// QA edge: 同じ (r, c) に複数 cell entry が来た場合、後勝ち (= 上書き) が
+    /// 期待される。daemon が dedupe する保証はないので CLI 側で defensive に
+    /// 後勝ち動作することを保護する。
+    #[test]
+    fn to_text_duplicate_position_last_wins() {
+        let s = SnapshotCells {
+            rows: 1,
+            cols: 3,
+            cells: vec![cell(0, 0, "a"), cell(0, 0, "Z")],
+        };
+        assert_eq!(s.to_text(), "Z");
+    }
+
+    /// QA edge: 多 byte 文字 (= 日本語、wide) が text に含まれた状態で regex
+    /// match できる (= grapheme cluster の状態のまま `regex` crate が扱える)。
+    /// state-based wait の Unicode 対応保護。
+    #[test]
+    fn to_text_supports_japanese_regex_match() {
+        let s = SnapshotCells {
+            rows: 1,
+            cols: 6,
+            cells: vec![cell(0, 0, "確"), cell(0, 1, "認")],
+        };
+        let text = s.to_text();
+        // `(?u)` を付けなくても regex crate の default は Unicode-aware
+        let re = Regex::new(r"確認").unwrap();
+        assert!(re.is_match(&text), "text={text:?}");
+    }
+
+    /// QA edge: poll-interval 0 ms は parse 成功 (= helper の責務は単純な
+    /// `Duration::from_millis`)。実利用時の clamp (= 最低 1ms) は
+    /// `wait_for_pattern` 内 `poll_interval.max(Duration::from_millis(1))` で
+    /// 担保されるため、本 helper が `0` を accept しても上位で守られる。
+    #[test]
+    fn parse_poll_interval_ms_accepts_zero() {
+        assert_eq!(parse_poll_interval_ms("0"), Some(Duration::from_millis(0)));
+    }
+
+    /// QA edge: 負値 / 浮動小数 / 単位付き (= `1s`) は ms 単位の符号無し整数
+    /// 想定外なので None を返す。CLI 側で env 変数経由の不正値が default に
+    /// 落ちる安全動作を保護する。
+    #[test]
+    fn parse_poll_interval_ms_rejects_non_integer() {
+        assert_eq!(parse_poll_interval_ms("-1"), None);
+        assert_eq!(parse_poll_interval_ms("1.5"), None);
+        assert_eq!(parse_poll_interval_ms("1s"), None);
+        assert_eq!(parse_poll_interval_ms("100ms"), None);
+    }
 }
