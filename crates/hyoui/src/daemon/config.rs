@@ -40,6 +40,25 @@ pub struct DaemonConfig {
     /// vt100 `set_size` の truncate だけが効く挙動になる)。
     pub screen_input_log_bytes: usize,
 
+    /// vt100 内蔵 scrollback ring の **行数上限** (DR-0013 §8 + §8 Update)。
+    ///
+    /// rows-base 層 (= cell 単位アクセス用) のみに影響する。`scrollback_bytes`
+    /// (= byte-base 層、tail timestamp filter 用) とは責務分離されており、両者は
+    /// 別 layer として並行運用する (§8 Update)。
+    ///
+    /// `screen.dump --layer=scrollback` / `--layer=both` で過去 row を取り出す際の
+    /// 上限がこの値。`0` を渡すと scrollback は無効 (= 過去 row は保存されない、
+    /// `screen.dump --layer=scrollback` は空配列を返す)。
+    ///
+    /// 既定 1000 行。典型 TUI app (例: 80×24 で 60 行応答が visible からスクロール
+    /// アウト) を救うのに十分なサイズ。過大設定は cell grid メモリを増やすため、
+    /// rows × cols 比例の消費に注意 (= 200 cols × 10000 行 ≒ 2M cells)。
+    ///
+    /// 設計判断: bytes ベース換算は **採用しない** (= cell byte 数は UTF-8 + style
+    /// overhead で大きく揺れる、`scrollback_bytes / (cols * 4)` 等の換算は根拠が
+    /// 脆い、§8 Update)。rows ベース直接指定で vt100 API と整合させる。
+    pub screen_vt100_scrollback_rows: usize,
+
     /// 1 client への broadcast queue の上限 byte 数 (DR-0008 §8.2 backpressure)。
     /// 既定 8 MiB。超過時はその client を `error` kind=`backpressure.disconnect` で
     /// notify → close する。
@@ -90,7 +109,8 @@ impl DaemonConfig {
     /// 既定値で `DaemonConfig` を組み立てる helper。
     ///
     /// `scrollback_bytes = 1 MiB`、`screen_input_log_bytes = 1 MiB`、
-    /// `client_buffer_bytes = 8 MiB`、`cols × rows = 80 × 24`。
+    /// `screen_vt100_scrollback_rows = 1000` 行、`client_buffer_bytes = 8 MiB`、
+    /// `cols × rows = 80 × 24`。
     pub fn new(session_id: impl Into<String>, socket_path: PathBuf, cmd: Vec<String>) -> Self {
         Self {
             session_id: session_id.into(),
@@ -100,6 +120,7 @@ impl DaemonConfig {
             rows: 24,
             scrollback_bytes: 1024 * 1024,
             screen_input_log_bytes: 1024 * 1024,
+            screen_vt100_scrollback_rows: 1000,
             client_buffer_bytes: 8 * 1024 * 1024,
             expected_token: None,
             until: None,
@@ -129,6 +150,7 @@ mod tests {
         assert_eq!(cfg.rows, 24);
         assert_eq!(cfg.scrollback_bytes, 1024 * 1024);
         assert_eq!(cfg.screen_input_log_bytes, 1024 * 1024); // DR-0013 §7 既定 1 MiB
+        assert_eq!(cfg.screen_vt100_scrollback_rows, 1000); // DR-0013 §8 既定 1000 行
         assert_eq!(cfg.client_buffer_bytes, 8 * 1024 * 1024); // DR-0008 §8.2 既定
     }
 

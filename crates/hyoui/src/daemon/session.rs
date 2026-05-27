@@ -343,13 +343,15 @@ impl Session {
         //
         // `screen_input_log_bytes` で primary buffer 用 input log の容量を渡し、
         // resize 時の replay 救済策 (DR-0013 §7) を有効化する。byte-base scrollback
-        // (= Scrollback) と rows-base scrollback (= vt100 内蔵 ring) は責務分離方針
-        // のため、scrollback_len は 0 のまま (= vt100 内蔵 ring 無効、cell 単位の
-        // scrollback access は Phase C で別途配線)。
+        // (= `Scrollback`) と rows-base scrollback (= vt100 内蔵 ring) は責務分離方針
+        // のため両者は別 layer として並存し、rows-base 側は
+        // `config.screen_vt100_scrollback_rows` で容量を指定する (= DR-0013 §8 Update
+        // 配線、Phase C スコープの「scrollback 内蔵 ring を必要時に配線」を本タスクで
+        // 実施)。
         let mut screen_state = ScreenState::with_input_log_capacity(
             config.rows,
             config.cols,
-            0,
+            config.screen_vt100_scrollback_rows,
             config.screen_input_log_bytes,
         );
         // DEC sync update 同期中に attach が発生した場合の deferred redraw 用。

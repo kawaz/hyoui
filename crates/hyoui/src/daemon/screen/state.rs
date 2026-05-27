@@ -64,6 +64,11 @@ const SYNC_SCAN_CARRY_LEN: usize = 7;
 /// broadcast / wait / tail に流れる (= DR-0013 §1「raw byte の直接 broadcast はしない」)。
 pub(crate) struct ScreenState {
     parser: vt100::Parser,
+    /// `Parser::new` 時に渡した scrollback ring の行数上限 (= rows-base 層、DR-0013 §8)。
+    /// vt100 0.16 では `Parser` から `scrollback_len` を引き出す public API が無いため、
+    /// `reset` / `resize` で新 Parser を組み直す際に同値を渡し直すために覚えておく。
+    /// 0 を渡せば scrollback 無効 (= 過去 row は保存されない)。
+    scrollback_len: usize,
     /// 最後に `process` で bytes を feed した時刻。stalled 判定に使う。
     last_feed_at: Instant,
     /// DEC sync update (`\x1b[?2026h` ... `\x1b[?2026l`) の同期中フラグ。
@@ -113,6 +118,7 @@ impl ScreenState {
     ) -> Self {
         Self {
             parser: vt100::Parser::new(rows, cols, scrollback_len),
+            scrollback_len,
             last_feed_at: Instant::now(),
             sync_in_progress: false,
             sync_scan_carry: Vec::with_capacity(SYNC_SCAN_CARRY_LEN),
@@ -247,11 +253,10 @@ impl ScreenState {
 
     /// 内部 parser を新規構築して partial sequence buffer を捨てる。
     ///
-    /// `scrollback_len` は **元の Parser と同じ値** を保持し続けたいが、vt100 0.16
-    /// では `Parser` から `scrollback_len` を引き出す public API が無い。本実装では
-    /// `new` / `with_input_log_capacity` で渡された値を覚えていないため、reset 時は
-    /// 0 を渡す (= scrollback 機能は失われる、reset 後の挙動は debug 用途中心の
-    /// 想定)。完全 reset しても困らない設計の積み重ねが前提。
+    /// `scrollback_len` は **元の Parser と同じ値** を保持し続ける (= `Self` の
+    /// `scrollback_len` フィールドに記録済の値を新 Parser に渡し直す)。これにより
+    /// reset 後も `screen.dump --layer=scrollback` は config 通りの容量で動作する
+    /// (= ただし reset で過去 cell は捨てられるので scrollback は 0 行から再蓄積)。
     ///
     /// reset 後の `last_feed_at` は now、`sync_in_progress` / `sync_scan_carry` /
     /// `consecutive_stalled_detects` も 0 / 空に戻る。`current_seqno` も 0 から
@@ -259,7 +264,7 @@ impl ScreenState {
     /// 一緒に clear する (= replay 用 byte も無効と扱う)。
     pub(crate) fn reset(&mut self) {
         let (rows, cols) = self.size();
-        self.parser = vt100::Parser::new(rows, cols, 0);
+        self.parser = vt100::Parser::new(rows, cols, self.scrollback_len);
         self.last_feed_at = Instant::now();
         self.sync_in_progress = false;
         self.sync_scan_carry.clear();
@@ -292,7 +297,10 @@ impl ScreenState {
     /// - `current_seqno` は **保持** (= incremental sync の連続性、resize で乱さない)。
     pub(crate) fn resize(&mut self, rows: u16, cols: u16) {
         let was_alt = self.parser.screen().alternate_screen();
-        let mut new_parser = vt100::Parser::new(rows, cols, 0);
+        // 新 Parser にも同じ scrollback_len を渡す (= reset と同じ方針、
+        // resize 後も scrollback 機能を保つ。過去 cell は input_log 経由で
+        // primary 中なら replay されるため、scrollback への蓄積もそこから再構築される)
+        let mut new_parser = vt100::Parser::new(rows, cols, self.scrollback_len);
 
         if was_alt {
             // alt mode フラグだけ復元 (= cells は子側 redraw に任せる)
@@ -335,6 +343,59 @@ impl ScreenState {
             }
             out.push(row);
         }
+        out
+    }
+
+    /// scrollback ring に貯まっている過去行を **古い→新しい** の順で iter する
+    /// (DR-0013 §8 Phase C 配線)。
+    ///
+    /// 動作原理 (vt100 0.16 の API 制約による):
+    /// 1. 現在の `scrollback()` offset を保存
+    /// 2. `set_scrollback(usize::MAX)` で最大値にすると、内部で
+    ///    `min(rows, scrollback.len())` で clamp される。直後に `scrollback()` を読めば
+    ///    実 scrollback ring の行数 (= `total_sb`) が得られる
+    /// 3. offset を `total_sb, total_sb-1, ..., 1` の順に set し、各時点で viewport
+    ///    の row 0 (= viewport top に panic-out した scrollback の該当行) を読む
+    /// 4. 最後に元の offset を復元 (= 副作用を残さない)
+    ///
+    /// `scrollback_len == 0` または ring が空なら空 Vec を返す。
+    ///
+    /// `&mut self` を要求するのは vt100 `set_scrollback` が `&mut Screen` を要求する
+    /// ため。論理的には read-only 操作 (= 元の offset を復元するので state 不変)
+    /// だが、API 制約上 mutable 借用が必要。
+    ///
+    /// 計算量: `O(total_sb × cols)`。default 1000 行 × 80 cols = 80k cell read で
+    /// debug 用途には十分な性能。hot loop には乗せない。
+    pub(crate) fn snapshot_scrollback_rows(&mut self) -> Vec<Vec<RowCellSnap>> {
+        if self.scrollback_len == 0 {
+            return Vec::new();
+        }
+        let (_, cols) = self.size();
+        // 元の offset を退避
+        let saved_offset = self.parser.screen().scrollback();
+        // 最大値を渡して実 scrollback ring 行数を測る (= clamp 後の offset を読む)
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+        let total_sb = self.parser.screen().scrollback();
+        if total_sb == 0 {
+            // ring が空。元 offset (= 0) のままで離脱。
+            self.parser.screen_mut().set_scrollback(saved_offset);
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(total_sb);
+        // 古い → 新しい順: offset = total_sb (= 最も古い scrollback 行が row 0 に来る)
+        // から offset = 1 (= 最新 scrollback 行が row 0 に来る) まで降順 iterate。
+        for offset in (1..=total_sb).rev() {
+            self.parser.screen_mut().set_scrollback(offset);
+            let scr = self.parser.screen();
+            let mut row = Vec::with_capacity(cols as usize);
+            for c in 0..cols {
+                let cell_info = scr.cell(0, c).map(RowCellSnap::from_cell).unwrap_or_default();
+                row.push(cell_info);
+            }
+            out.push(row);
+        }
+        // 元 offset を復元 (= 他の screen 操作が依存する可能性に備え副作用を残さない)
+        self.parser.screen_mut().set_scrollback(saved_offset);
         out
     }
 
@@ -787,6 +848,127 @@ mod tests {
         let before = s.current_seqno();
         s.process(&big);
         assert_eq!(s.current_seqno(), before + 1);
+    }
+
+    /// `scrollback_len = 0` (= scrollback 無効) では `snapshot_scrollback_rows` は
+    /// 常に空 Vec を返す (= panic / clamp 計算で副作用を起こさない保護)。
+    #[test]
+    fn snapshot_scrollback_rows_empty_when_scrollback_disabled() {
+        let mut s = ScreenState::new(3, 10, 0);
+        // 大量出力で visible からスクロールアウトさせる。scrollback_len=0 なので
+        // ring 自体が無い (= 過去 row は失われる)。
+        for i in 0..20 {
+            s.process(format!("L{i}\r\n").as_bytes());
+        }
+        let sb = s.snapshot_scrollback_rows();
+        assert!(sb.is_empty(), "scrollback disabled must return empty Vec");
+    }
+
+    /// `scrollback_len > 0` + 大量出力で visible からスクロールアウトした行が、
+    /// `snapshot_scrollback_rows` で **古い → 新しい** 順に取り出せる。
+    #[test]
+    fn snapshot_scrollback_rows_returns_old_lines_in_chronological_order() {
+        // viewport 3 行、scrollback_len=10 行、cols=10。"L0\r\n"..."L19\r\n" を流すと
+        // 末尾の `\r\n` の分で cursor が次の空行へ進み、visible は (L18, L19, _) の 3 行
+        // を持つ。それ以前は scrollback ring に **新しい順** で貯まる
+        // (= ring 容量 10 を超えると古い行が evict される)。
+        let mut s = ScreenState::new(3, 10, 10);
+        for i in 0..20 {
+            s.process(format!("L{i}\r\n").as_bytes());
+        }
+        let sb = s.snapshot_scrollback_rows();
+        // scrollback ring の容量 10 で cap される。
+        assert!(
+            !sb.is_empty(),
+            "scrollback should contain old lines (got 0 rows)"
+        );
+        assert!(
+            sb.len() <= 10,
+            "scrollback row count must be capped by scrollback_len (got {})",
+            sb.len()
+        );
+
+        // 各行の cell から「先頭の非空文字を連結した文字列」を組み立てて中身を確認。
+        let row_to_str = |row: &Vec<RowCellSnap>| -> String {
+            row.iter()
+                .map(|c| {
+                    if c.contents.is_empty() {
+                        ' '.to_string()
+                    } else {
+                        c.contents.clone()
+                    }
+                })
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        let texts: Vec<String> = sb.iter().map(row_to_str).collect();
+        // 古い → 新しい順。最後の scrollback 行 (= texts[last]) は visible 直前 = "L17"
+        // (= visible は L18/L19/空行)。
+        assert_eq!(
+            texts.last().map(|s| s.as_str()),
+            Some("L17"),
+            "last scrollback row should be L17 (visible は L18/L19/空): texts={texts:?}"
+        );
+        // 最初の scrollback 行 (= texts[0]) は ring 内最古。ring=10 行なので
+        // texts[0] = "L8" (= L8..L17 の 10 行が ring 内、L0..L7 は evict 済み)。
+        assert_eq!(
+            texts.first().map(|s| s.as_str()),
+            Some("L8"),
+            "oldest scrollback row should be L8: texts={texts:?}"
+        );
+    }
+
+    /// `snapshot_scrollback_rows` は副作用を残さない (= 呼出し前後で
+    /// `screen().scrollback()` offset が同値、visible 行も変化なし)。
+    #[test]
+    fn snapshot_scrollback_rows_has_no_side_effect_on_offset() {
+        let mut s = ScreenState::new(3, 10, 10);
+        for i in 0..15 {
+            s.process(format!("L{i}\r\n").as_bytes());
+        }
+        // 呼出し前の offset (= 通常 0、現在 viewport を見ている状態) を退避
+        let before = s.screen().scrollback();
+        let _sb = s.snapshot_scrollback_rows();
+        let after = s.screen().scrollback();
+        assert_eq!(
+            before, after,
+            "snapshot_scrollback_rows must restore the scrollback offset"
+        );
+        // 復元後の visible 0 行目は "L12" (= 末尾 3 行 L12/L13/L14 が visible)
+        let scr = s.screen();
+        let row0_first_char = scr.cell(0, 0).map(|c| c.contents().to_string()).unwrap_or_default();
+        assert_eq!(
+            row0_first_char, "L",
+            "visible row0 should still start with 'L' (got {row0_first_char:?})"
+        );
+    }
+
+    /// `reset` 後も `scrollback_len` が保持され、新たな出力で scrollback が再構築される。
+    #[test]
+    fn reset_preserves_scrollback_len() {
+        let mut s = ScreenState::new(3, 10, 5);
+        for i in 0..10 {
+            s.process(format!("L{i}\r\n").as_bytes());
+        }
+        assert!(
+            !s.snapshot_scrollback_rows().is_empty(),
+            "reset 前は scrollback あり"
+        );
+        s.reset();
+        // reset 直後は scrollback は空 (= 過去 cell は捨てられる)
+        assert!(
+            s.snapshot_scrollback_rows().is_empty(),
+            "reset 直後の scrollback は空"
+        );
+        // 再度大量出力すれば scrollback に再蓄積される (= scrollback_len は保持されている)
+        for i in 0..10 {
+            s.process(format!("R{i}\r\n").as_bytes());
+        }
+        assert!(
+            !s.snapshot_scrollback_rows().is_empty(),
+            "reset 後も scrollback_len が保持されて再蓄積される"
+        );
     }
 
     /// QA edge: stalled detect の counter が `note_stalled_outcome(false)` で
