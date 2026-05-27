@@ -2210,6 +2210,78 @@ mod tests {
         let _ = daemon_handle.join();
     }
 
+    /// daemon を起動して大量出力させ、`screen dump --layer=scrollback --format=text/plain`
+    /// で visible からスクロールアウトした marker が取り出せることを CLI 経路で確認する。
+    ///
+    /// daemon-level の同等 test (= `serve_screen_dump_scrollback_text_plain_returns_old_marker`)
+    /// で protocol レベルの検証は済んでいるため、ここでは CLI dispatch が
+    /// `--layer=scrollback` を正しく protocol に渡し、payload が file 経由で取り出せる
+    /// 経路の retrogression を防ぐ。
+    #[test]
+    fn screen_dump_command_layer_scrollback_returns_scrolled_out_marker() {
+        use hyoui::daemon::{DaemonConfig, Session};
+
+        let sock_dir = make_0700_dir();
+        let sock_path = sock_dir.path().join("dump-scrollback.sock");
+        let out_path = sock_dir.path().join("dump-scrollback.out");
+
+        // SCROLLED_OUT_HEAD → 50 行ダミー → VISIBLE_TAIL 構成 (= viewport 24 行を超えて
+        // 確実に SCROLLED_OUT_HEAD が scrollback に押し出される)。
+        let sock_for_daemon = sock_path.clone();
+        let daemon_handle = std::thread::spawn(move || {
+            let cfg = DaemonConfig::new(
+                "screen-dump-scrollback-test",
+                sock_for_daemon,
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf 'SCROLLED_OUT_HEAD\\n'; for i in $(seq 1 50); do printf 'L%d\\n' $i; done; \
+                     printf 'VISIBLE_TAIL\\n'; sleep 30"
+                        .into(),
+                ],
+            );
+            let session = Session::start(cfg).expect("daemon start");
+            session.serve()
+        });
+
+        // 子の全出力が screen state に反映されるまで少し長めに待つ (= 50 行 + 2 marker)
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        let cfg = ScreenDumpConfig {
+            socket: Some(sock_path.to_string_lossy().into_owned()),
+            session_id: None,
+            format: ScreenDumpCliFormat::TextPlain,
+            layer: ScreenDumpCliLayer::Scrollback,
+            rect: None,
+            output: Some(out_path.to_string_lossy().into_owned()),
+            timeout_ms: 5_000,
+        };
+        let _exit = screen_dump_command(cfg);
+
+        let got = std::fs::read(&out_path).expect("read output");
+        let text = std::str::from_utf8(&got).expect("utf8");
+        assert!(
+            text.contains("SCROLLED_OUT_HEAD"),
+            "scrollback dump should contain SCROLLED_OUT_HEAD (= スクロールアウトした marker): {text:?}"
+        );
+        assert!(
+            !text.contains("VISIBLE_TAIL"),
+            "scrollback dump should NOT contain VISIBLE_TAIL (= まだ visible): {text:?}"
+        );
+
+        // cleanup
+        let kill_opts = AttachOptions {
+            mode: Mode::Ro,
+            ..AttachOptions::default()
+        };
+        if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
+            let kill = hyoui::protocol::messages::Kill { signal: None };
+            let _ = conn.send_control(&ControlMessage::Kill(kill));
+            drop(conn);
+        }
+        let _ = daemon_handle.join();
+    }
+
     /// `write_screen_snapshot_payload` の file 出力経路を確認。
     /// stdout 経路はそのままだと captured 出来ないため file 経由で代用 (= dump と同じ pattern)。
     #[test]

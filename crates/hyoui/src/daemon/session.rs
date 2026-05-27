@@ -3460,6 +3460,142 @@ mod tests {
         let _ = handle.join().expect("daemon thread");
     }
 
+    /// `screen.dump.request` (layer=scrollback, format=text/plain) を送ると、
+    /// 大量出力で visible からスクロールアウトした過去 marker が payload に含まれ、
+    /// 同 marker は visible (= 通常の dump) には含まれないことを確認する。
+    ///
+    /// 設計検証: DR-0013 §8 + §8 Update で「rows-base scrollback ring を Phase C で
+    /// 配線」とされた scrollback layer の機能配線テスト。peer issue
+    /// (= claude TUI で長文応答が visible からスクロールアウト) の use case が
+    /// scrollback layer 経由で解決できることをエンドツーエンドで保証する。
+    #[test]
+    fn serve_screen_dump_scrollback_text_plain_returns_old_marker() {
+        use crate::protocol::messages::{
+            ScreenDumpFormat as ProtoDumpFormat, ScreenDumpLayer as ProtoDumpLayer,
+            ScreenDumpRequest,
+        };
+        // viewport 24 行に対し 60 行出力する子コマンド: SCROLLED_OUT_HEAD は最初に出るので
+        // 確実に visible からスクロールアウト、VISIBLE_TAIL は最後に出るので visible に残る。
+        let cmd = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            // SCROLLED_OUT_HEAD → 50 行ダミー → VISIBLE_TAIL の構成。
+            // viewport 24 行なら SCROLLED_OUT_HEAD は確実に scrollback に押し出される。
+            "printf 'SCROLLED_OUT_HEAD\\n'; for i in $(seq 1 50); do printf 'L%d\\n' $i; done; \
+             printf 'VISIBLE_TAIL\\n'; sleep 30"
+                .into(),
+        ];
+        let (_, sock_path, _dir, handle) = spawn_serve_thread(cmd);
+
+        let mut s = client_connect_with_retry(&sock_path);
+        let _r = do_client_handshake(&mut s);
+        let _ = Frame::decode_from(&mut s).expect("leader.notify");
+        // VISIBLE_TAIL が出るまで待って、子の全出力が screen state に反映されたことを保証。
+        read_until_contains(&mut s, b"VISIBLE_TAIL");
+
+        // 1) layer=visible: SCROLLED_OUT_HEAD は含まれない (= スクロールアウト確認)
+        let req_visible = ControlMessage::ScreenDumpRequest(ScreenDumpRequest {
+            format: ProtoDumpFormat::TextPlain,
+            layer: ProtoDumpLayer::Visible,
+            rect: None,
+            serial: Some(1),
+        });
+        Frame::cbor_control(req_visible.encode_to_vec().expect("encode"))
+            .encode_to(&mut s)
+            .expect("send");
+        s.flush().expect("flush");
+        let visible_payload = match next_control(&mut s) {
+            ControlMessage::ScreenDumpResponse(resp) => {
+                assert_eq!(resp.serial, Some(1));
+                resp.payload
+            }
+            o => panic!("expected ScreenDumpResponse, got {o:?}"),
+        };
+        let visible_text = std::str::from_utf8(&visible_payload).expect("utf8");
+        assert!(
+            visible_text.contains("VISIBLE_TAIL"),
+            "visible should contain VISIBLE_TAIL: {visible_text:?}"
+        );
+        assert!(
+            !visible_text.contains("SCROLLED_OUT_HEAD"),
+            "visible should NOT contain SCROLLED_OUT_HEAD (it should have scrolled out): {visible_text:?}"
+        );
+
+        // 2) layer=scrollback: SCROLLED_OUT_HEAD が含まれる、VISIBLE_TAIL は含まれない
+        let req_sb = ControlMessage::ScreenDumpRequest(ScreenDumpRequest {
+            format: ProtoDumpFormat::TextPlain,
+            layer: ProtoDumpLayer::Scrollback,
+            rect: None,
+            serial: Some(2),
+        });
+        Frame::cbor_control(req_sb.encode_to_vec().expect("encode"))
+            .encode_to(&mut s)
+            .expect("send");
+        s.flush().expect("flush");
+        let sb_payload = match next_control(&mut s) {
+            ControlMessage::ScreenDumpResponse(resp) => {
+                assert_eq!(resp.serial, Some(2));
+                resp.payload
+            }
+            o => panic!("expected ScreenDumpResponse, got {o:?}"),
+        };
+        let sb_text = std::str::from_utf8(&sb_payload).expect("utf8");
+        assert!(
+            sb_text.contains("SCROLLED_OUT_HEAD"),
+            "scrollback should contain SCROLLED_OUT_HEAD: {sb_text:?}"
+        );
+        assert!(
+            !sb_text.contains("VISIBLE_TAIL"),
+            "scrollback should NOT contain VISIBLE_TAIL (still in visible): {sb_text:?}"
+        );
+
+        // 3) layer=both: 両方含まれる
+        let req_both = ControlMessage::ScreenDumpRequest(ScreenDumpRequest {
+            format: ProtoDumpFormat::TextPlain,
+            layer: ProtoDumpLayer::Both,
+            rect: None,
+            serial: Some(3),
+        });
+        Frame::cbor_control(req_both.encode_to_vec().expect("encode"))
+            .encode_to(&mut s)
+            .expect("send");
+        s.flush().expect("flush");
+        let both_payload = match next_control(&mut s) {
+            ControlMessage::ScreenDumpResponse(resp) => {
+                assert_eq!(resp.serial, Some(3));
+                resp.payload
+            }
+            o => panic!("expected ScreenDumpResponse, got {o:?}"),
+        };
+        let both_text = std::str::from_utf8(&both_payload).expect("utf8");
+        assert!(
+            both_text.contains("SCROLLED_OUT_HEAD"),
+            "both should contain SCROLLED_OUT_HEAD: {both_text:?}"
+        );
+        assert!(
+            both_text.contains("VISIBLE_TAIL"),
+            "both should contain VISIBLE_TAIL: {both_text:?}"
+        );
+        // SCROLLED_OUT_HEAD は VISIBLE_TAIL より前 (= 時系列順、scrollback 先)
+        let pos_head = both_text.find("SCROLLED_OUT_HEAD").expect("head present");
+        let pos_tail = both_text.find("VISIBLE_TAIL").expect("tail present");
+        assert!(
+            pos_head < pos_tail,
+            "SCROLLED_OUT_HEAD must precede VISIBLE_TAIL in both layer (chronological): {both_text:?}"
+        );
+
+        // cleanup
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signal: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s)
+        .expect("send");
+        s.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
     /// `screen.snapshot.request` を送ると include 指定された component だけが
     /// `Some(...)` で返り、未指定の component は `None` のまま。
     #[test]
