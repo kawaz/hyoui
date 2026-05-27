@@ -2,8 +2,13 @@
 
 > [English](./DESIGN.md) | 日本語
 
-v0.1.0 時点の **現実装** の説明。設計判断の背景・経緯は `docs/decisions/` の DR
-を参照。本ドキュメントは「いま動いているもの」をドメインとアーキテクチャの 2 軸で記す。
+**現実装** の説明（v0.1.x 系 + [[DR-0013]] Phase A/B 反映後）。設計判断の背景・経緯は
+`docs/decisions/` の DR を参照。本ドキュメントは「いま動いているもの」をドメインと
+アーキテクチャの 2 軸で記す。
+
+> [[DR-0013]] (2026-05-27) で daemon に screen emulator (vt100 crate ベース) を
+> 導入し、wait / snapshot / dump / lock / input family が state-based 基盤に乗った。
+> 本 DESIGN は state-based 仕様を正本として記述する。
 
 ## 1. ドメイン
 
@@ -45,23 +50,40 @@ crates/
   hyoui/            # library crate (= 全コア機能)
     src/
       lib.rs        # re-export
-      cli.rs        # CLI parser (subcommand 分岐、引数解析)
+      cli/          # CLI parser + 各 subcommand handler
+        mod.rs
+        input.rs    # hyoui input (= spec parser、text/hex/file/paste/key/wait*)
+        wait_core.rs # state-based wait polling (= snapshot 発火 + cells → text 構築)
+        ...
       daemon/       # daemon (= session 1 つを抱える server)
         mod.rs
-        config.rs   # session config (socket path, scrollback size, ...)
+        config.rs   # session config (socket path, scrollback size, screen sizes)
         session.rs  # Session::serve = multi-attach + broadcast + control plane
+        screen/     # vt100 ScreenState wrapper (DR-0013)
+          mod.rs
+          state.rs       # VirtualScreen (vt100::Parser を抱える正本)
+          input_log.rs   # primary 用 bounded ring (resize replay)
+          snapshot.rs    # 構造化 snapshot wrapper (CBOR 圧縮)
+        control.rs  # control message dispatcher
+        broadcast.rs # writer pump + backpressure + ClientHandle
+        accept.rs   # handshake worker pool
+        wait.rs     # state polling 補助 (= snapshot 発火 trigger / poll interval)
+        tail.rs     # tail subscription
+        lock.rs     # SessionState + leader cascade
+        pty.rs      # child lifecycle
       client/       # client (= daemon に attach する側)
         mod.rs
-        attach.rs   # ClientConnection (handshake + raw I/O + detach prefix)
+        attach.rs   # ClientConnection (handshake + raw I/O + detach prefix + raw bytes 送信)
       protocol/     # wire protocol
         mod.rs
         frame.rs    # u32 size + u8 type + body の framing
         caps.rs     # capability negotiation (MVP_CAPS, intersect)
-        messages/   # CBOR control message types (handshake, lock, tail, wait, ...)
+        messages/   # CBOR control message types (handshake, lock, tail, screen.dump,
+                    #   screen.snapshot, ...)
         transports/ # Transport trait + UnixStreamTransport
-      scrollback.rs # ring buffer (timestamped chunks、tail/wait のデータソース)
-      strip.rs      # ANSI escape sequence strip (wait の text match 用)
-      observer.rs   # legacy interface (v0.0.0 名残、削除候補)
+      scrollback.rs # byte-base ring buffer (= tail の since/last_bytes 用、
+                    #   timestamp filter / 受信時刻順、DR-0013 §8 Update で責務分離)
+      strip.rs      # ANSI escape sequence strip (= tail --strip 用、wait は state 経由で escape 不在)
       sys/          # unsafe を集約
         raw.rs      # forkpty / login_tty (子プロセス起動)
         signal.rs   # sigaction 登録、self-pipe
@@ -77,6 +99,8 @@ crates/
       socket_path.rs # socket dir resolver (XDG / TMPDIR)
       completion.rs # shell completion stub
 ```
+
+daemon module の責務分割は [[DR-0009]]、screen 配下は [[DR-0013]] が正本。
 
 `#![forbid(unsafe_code)]` は `hyoui-cli` 全体に、`hyoui` lib では `sys/raw.rs` と
 `sys/signal.rs` の 2 ファイルに `unsafe` を封じ込め（残部は nix 安全 API のみ）。
@@ -101,27 +125,45 @@ Control message body (type=0x01) = CBOR map { "kind": "<dotted.name>", ...payloa
 
 - **wire 外枠 (size + type + body) は永久固定**。breaking change は別 socket path で fork
 - 制御メッセージは CBOR map で **未知 field は ignore**、cap flags で「相手が話せるか」交渉
-- v0.1.0 cap 集合: `["data", "lock", "tail-v1", "screen-dump-v1", "state-snapshot-v1"]`
-- wait は **state-based** (= cap なし、CLI 側で `screen.snapshot.request` を polling)。
-  旧 `wait.request` / `wait.result` (scrollback regex 経路、`wait-l0` cap) は
-  DR-0006 §9 改訂で廃止
+- v0.1.x cap 集合: `["data", "lock", "tail-v1", "screen-dump-v1", "state-snapshot-v1"]`
+- wait は **state-based** (= 専用 cap / kind なし、CLI 側 `cli/wait_core.rs` が
+  `screen.snapshot.request` を polling して visible cells から text を組み立て regex match)。
+  旧 `wait.request` / `wait.result` kind と `wait-l0` cap、`wait.*` error code は
+  [[DR-0006]] §9 + [[DR-0013]] §9 への移行で wire / 実装ともに削除済
 
-### 2.3 daemon (`crates/hyoui/src/daemon/session.rs`)
+### 2.3 daemon (`crates/hyoui/src/daemon/`)
 
-`Session::serve` がメインループ。責務:
+`Session::serve` がメインループ。[[DR-0009]] で 9 module に責務分割済 (= `session.rs`
+は orchestrator、`pty.rs` / `accept.rs` / `broadcast.rs` / `control.rs` / `lock.rs` /
+`wait.rs` / `tail.rs` / `screen/`)。責務:
 
-- **PTY 管理**: master fd を `set_nonblocking(true)`、read で raw bytes を取り出す
-- **client 管理**: socket accept、handshake (cap negotiation + mode + token 検証)、
+- **PTY 管理** (`pty.rs`): master fd を `set_nonblocking(true)`、read で raw bytes を取り出す
+- **screen state 正本管理** (`screen/`、[[DR-0013]] Phase A/B):
+  - 子 PTY bytes を `vt100::Parser::process` に feed (= byte broadcast 前段で正本化)
+  - `VirtualScreen` wrapper が cell grid / cursor / mode / alt screen 切替 / scrollback
+    (= rows-base ring) を保持
+  - attach handshake 時に `state_formatted()` + alt mode prepend で **redraw bytes** を
+    1 frame 送信 (= claude TUI 等の alt screen 常駐アプリの観戦が綺麗に再現される)
+  - primary buffer 用 **input bytes log** (= bounded ring、default 1 MiB) で resize replay
+  - DEC sync update (`?2026h`) hook + 5s stalled sequence reset (= health check)
+- **client 管理** (`accept.rs`): socket accept、handshake (cap negotiation + mode + token 検証)、
   `ClientHandle` 群を保持
-- **broadcast**: master → 各 client、subscription (Raw / TailFollow) に応じて encoding を分岐、
-  strip_ansi の真偽でキャッシュを 2 個分け再 encode を回避
+- **broadcast** (`broadcast.rs`): master → 各 client、subscription (Raw / TailFollow) に応じて
+  encoding を分岐、strip_ansi の真偽でキャッシュを 2 個分け再 encode を回避
 - **multiplex**: 各 client → master (rw のみ書き込み許可、ro は silently drop)
-- **leader 管理**: rw 新 client に leader 不在時のみ自動委譲、leader detach 時は次の rw に cascade
-- **lock state machine**: `SessionState { lock_holder, lock_token }`、token + holder 一致で release
-- **scrollback**: `Scrollback::new(config.scrollback_bytes)` を所有、master read 直後に push
-- **pending waits**: `Vec<PendingWait>` を serve_loop で保持、master bytes 着信ごとに scan
-- **backpressure**: `Arc<AtomicUsize> queued_bytes` で byte 単位 cap、超過時 `backpressure.disconnect`
-  を送って当該 client を `shutdown(Both)` で drop
+- **leader 管理** (`lock.rs`): rw 新 client に leader 不在時のみ自動委譲、leader detach 時は
+  次の rw に cascade
+- **lock state machine** (`lock.rs`): `SessionState { lock_holder, lock_token }`、
+  token + holder 一致で release
+- **scrollback** (`scrollback.rs`、byte-base): `Scrollback::new(config.scrollback_bytes)` を
+  所有、master read 直後に push。tail コマンド (= `--since` / `--last-bytes`) 専用層
+- **state-based wait 補助** (`wait.rs`): master bytes 着信を trigger にして snapshot 発火 /
+  poll interval 算出。L0 wait protocol (= `wait.request`/`wait.result` kind) は廃止済、
+  実体は CLI 側 (`cli/wait_core.rs`) の polling
+- **structured snapshot / dump** ([[DR-0013]] §9): `screen.dump.request` / `screen.snapshot.request`
+  の handler、`screen/snapshot.rs` の CBOR 圧縮 wrapper を経由
+- **backpressure** (`broadcast.rs`): `Arc<AtomicUsize> queued_bytes` で byte 単位 cap、
+  超過時 `backpressure.disconnect` を送って当該 client を `shutdown(Both)` で drop
 
 子プロセス起動は forkpty + login_tty ([[DR-0003]])。`posix_spawn` は controlling terminal を
 取れないため不採用。
@@ -132,14 +174,17 @@ Control message body (type=0x01) = CBOR map { "kind": "<dotted.name>", ...payloa
 
 - handshake.request 送信 (caps / mode / token / exclusive / detach-others)
 - handshake.response 受信、`session_id` / `client_id` / `leader` / `mode` を確定
+- attach handshake 直後に daemon から送られる **redraw bytes frame** ([[DR-0013]] §4) を
+  stdout に書き出すだけで detach 時の画面を完全復元
 - stdin → frame writer (`type=0x00 raw data`)
 - frame reader → stdout
 - **detach prefix state machine**: `Ctrl-A D` で client 自身を detach、
   `Ctrl-A Ctrl-A` で literal Ctrl-A を子に送る、`Ctrl-A <他>` は両捨て (screen 慣例)
-- 1-shot CLI (`status` / `tail` / `wait` / `kill` / `list`) 用に `recv_frame()` /
-  `recv_control(buffer_raw_data)` を提供
+- 1-shot CLI (`input` / `screen dump` / `screen snapshot` / `tail` / `wait` /
+  `lock` / `kill` / `list` / `status`) 用に `recv_frame()` / `recv_control(buffer_raw_data)` /
+  `send_raw_bytes()` を提供
 
-### 2.5 scrollback (`crates/hyoui/src/scrollback.rs`)
+### 2.5 byte-base scrollback (`crates/hyoui/src/scrollback.rs`)
 
 ```rust
 struct OutputChunk { timestamp: Instant, bytes: Vec<u8> }
@@ -151,18 +196,36 @@ last_evicted_ts: Option<Instant>
 - `--since DUR` は内部フィルタ、`last_evicted_ts >= since_start` なら不完全
 - `--since-strict` で不完全を非 0 exit に
 - default 4 MiB（claude / TUI 主用途想定）
+- **用途**: `hyoui tail` 専用 (= timestamp filter / 受信時刻順)。`since_ms` / `--since-strict` /
+  `--last-bytes` の byte-base 意味論を保つために維持
+- vt100 内蔵 ring (= cell rows-base、§2.8 参照) とは責務分離 ([[DR-0013]] §8 Update)
 
-### 2.6 strip (`crates/hyoui/src/strip.rs`)
+### 2.6 rows-base screen state (`crates/hyoui/src/daemon/screen/`)
+
+[[DR-0013]] Phase A/B で導入された **vt100 ScreenState wrapper** が daemon 側の正本。
+
+- `state.rs::VirtualScreen` が `vt100::Parser` (+ `Screen`) を抱える
+- 子 PTY bytes は **必ず Parser 経由**で state に反映 (= 生 byte の直接 broadcast はしない)
+- API 提供: cell grid / cursor / mode flags (= alt screen / app_keypad / bracketed_paste 等) /
+  scrollback offset / window_size / `state_formatted()`
+- attach handshake 時に `state_formatted()` + alt mode prepend → 1 frame の redraw bytes として送出
+- `input_log.rs`: primary buffer 用 bounded ring (= default 1 MiB)、resize 時に新 Parser を
+  作り直して replay (= vt100 の `set_size` truncate-only 制約への補完策)
+- `snapshot.rs`: 構造化 state を CBOR で送る圧縮 wrapper (= sparse cells / Color variant 整数化 /
+  attribute bit pack)
+
+### 2.7 strip (`crates/hyoui/src/strip.rs`)
 
 ANSI escape sequence (CSI / OSC / DCS / single char) state machine による strip。
-wait の `--text` / `--pattern` で text match する際の前処理。詳細は
-`docs/findings/2026-05-26-ansi-strip.md`。
 
-- 装飾除去と改行変換は **別レイヤ** ([[DR-0006]] §11 で確定)
+- **現用途**: `hyoui tail --strip` (= byte stream を grep / script で扱う時の前処理)
+- 旧用途 (= wait の `--text` / `--pattern` 前処理) は state-based 移行で不要に。
+  wait は cell 化後の text を見るので escape は元から不在 ([[DR-0006]] §9.1)
+- 装飾除去と改行変換は **別レイヤ** ([[DR-0006]] §11.1 で確定)
 - 装飾除去は ANSI escape のみ、BEL / BS / TAB / LF / CR は残す
-- 改行変換は別 flag (`--newline-convert=preserve|lf|crlf`) で wait / tail 個別指定
+- 改行変換は別 flag (`--newline-convert=preserve|lf|crlf`) で tail 個別指定
 
-### 2.7 sys モジュール
+### 2.8 sys モジュール
 
 unsafe を `sys/raw.rs` (forkpty / login_tty / TIOCSWINSZ) と `sys/signal.rs` (sigaction
 / self-pipe) の 2 ファイルに封じ込め。`sys/socket.rs` で perm 0600 / dir 0700 enforce、
@@ -180,14 +243,32 @@ unsafe を `sys/raw.rs` (forkpty / login_tty / TIOCSWINSZ) と `sys/signal.rs` (
 [Unix socket]
    ↑↓
 [hyoui daemon (Session::serve)]
-   ↑↓ master fd read/write
+   ↑↓ master fd read → vt100::Parser::process → state 反映
+   ↑↓ master fd write
 [forkpty master FD]
    ↑↓ PTY
 [child process]
 ```
 
-control plane (lock / resize / signal / handshake / ...) は同じ socket を type=0x01
-CBOR frame で multiplex。
+control plane (lock / resize / signal / handshake / screen.dump / screen.snapshot / ...)
+は同じ socket を type=0x01 CBOR frame で multiplex。
+
+### 3.1.1 attach handshake の redraw 復元 ([[DR-0013]] §4 Phase A)
+
+```
+[client] handshake.request (caps, mode, token)
+   ↓
+[daemon] handshake.response (session_id, client_id, caps 確定)
+   ↓
+[daemon] alt mode 復元 sequence (= ?1049h 等) を prepend
+   + VirtualScreen::state_formatted()  // = grid から ANSI 再構築
+   + 末尾に cursor 位置の明示再描画 \x1b[<y>;<x>H
+   ↓ 1 frame (type=0x00) として送出
+[client] stdout に流すだけで detach 時の画面が完全復元
+```
+
+claude TUI 等の **alt screen 常駐アプリの観戦が綺麗に再現される** のはこの redraw 経路に
+よる。子 PTY 側に再描画を要求しないので、子から見て attach は完全透過。
 
 ### 3.2 multi-attach の broadcast
 
@@ -264,16 +345,20 @@ OS 機能に対する依存と既知のポータビリティギャップ:
 - VERSION file 1 つ + Cargo.toml workspace.package.version を `pkf run bump-version` で同期
 - `main` への push が release.yml の trigger（VERSION 変更を検知）
 - workflow が tag + GH Release を自動作成（[release-flow-awareness](../../) ルール参照）
-- v0.1.0 = 2026-05-27 release 済、208 tests pass
+- v0.1.0 = 2026-05-27 release 済、208 tests pass。以降は [[DR-0013]] Phase A/B 反映に
+  伴い incremental に minor bump。バージョン区切りで scope を切る運用は廃止 (= `docs/ROADMAP.md`
+  が正本、[[DR-0007]] Update 参照)
 
 ## 7. 関連文書
 
 | カテゴリ | 場所 | 内容 |
 |---|---|---|
 | 思想 | [[DR-0005]] | hyoui の方向性（外側自動操作主軸、TUI multiplexer ではない） |
-| CLI 全体仕様 | [[DR-0006]] | 動作モデル、自動操作 API、排他制御 |
-| MVP scope | [[DR-0007]] | v0.1.0 / v0.2.0 / v0.3.0+ の段階リリース |
+| CLI 全体仕様 | [[DR-0006]] | 動作モデル、自動操作 API、排他制御 (§8-§11 state-based) |
+| MVP scope | [[DR-0007]] | 段階リリース戦略 (version 区切りは廃止、ROADMAP が正本) |
 | protocol | [[DR-0008]] | wire format、cap flags、transport 抽象 |
+| screen emulator | [[DR-0013]] | daemon = screen state 正本、attach 復元、state-based 基盤 |
+| session 分割 | [[DR-0009]] | daemon/session.rs の 9 module 化 |
 | jobcontrol | [[DR-0001]] | bg/fg 2 軸設計、SIGTSTP/SIGCONT 精密制御 |
 | 言語選定 | [[DR-0003]] | Rust 一本化、forkpty + login_tty |
 | CLI 形 | [[DR-0004]] | subcommand 採用判断 |
