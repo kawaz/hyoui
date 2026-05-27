@@ -292,10 +292,97 @@ pub(crate) fn handle_key(name: &str) -> Result<Vec<u8>, String> {
         return Ok(bytes.to_vec());
     }
 
-    Err(format!(
+    // task #22: edit distance 1 以下で類似 key 名を suggest。
+    // 候補は基本名 (= ASCII alias) のみ。Unicode alias は提案しない (= ユーザに
+    // ASCII 名で覚えてもらうほうが grep / completion で扱いやすい)。
+    let base = format!(
         "key: 未知のキー名 {name:?} (= サポート: Enter/Tab/Esc/Backspace/Delete/Space/\
          Up/Down/Left/Right/Home/End/PageUp/PageDown/F1..F12/C-<char>/M-<char>)"
-    ))
+    );
+    if let Some(suggested) = suggest_key_name(name) {
+        return Err(format!("{base} (did you mean `{suggested}`?)"));
+    }
+    Err(base)
+}
+
+/// `handle_key` 用の typo suggester (= ASCII case-insensitive Levenshtein 距離 1)。
+///
+/// `cli::suggest_closest` と同じ方針だが、key 名候補が key handler 固有なので
+/// ここに専用 helper を置く (= cli の `INPUT_SPEC_PREFIXES` と並列の構造)。
+fn suggest_key_name(name: &str) -> Option<&'static str> {
+    /// `handle_key` がサポートする ASCII alias 一覧 (= suggest 用、Unicode は含めない)。
+    const KEY_NAME_CANDIDATES: &[&str] = &[
+        "Enter",
+        "Return",
+        "Tab",
+        "Esc",
+        "Escape",
+        "Backspace",
+        "Delete",
+        "Space",
+        "Up",
+        "Down",
+        "Left",
+        "Right",
+        "Home",
+        "End",
+        "PageUp",
+        "PageDown",
+        "F1",
+        "F2",
+        "F3",
+        "F4",
+        "F5",
+        "F6",
+        "F7",
+        "F8",
+        "F9",
+        "F10",
+        "F11",
+        "F12",
+    ];
+    let input_lower = name.to_ascii_lowercase();
+    let mut best: Option<(&'static str, usize)> = None;
+    for cand in KEY_NAME_CANDIDATES {
+        let cand_lower = cand.to_ascii_lowercase();
+        let d = ascii_ci_levenshtein(&input_lower, &cand_lower);
+        if d == 0 || d > 1 {
+            continue;
+        }
+        match best {
+            None => best = Some((cand, d)),
+            Some((_, b)) if d < b => best = Some((cand, d)),
+            _ => {}
+        }
+    }
+    best.map(|(c, _)| c)
+}
+
+/// 1 次元 DP の Levenshtein 距離 (= ASCII 専用、cli::levenshtein_ascii_ci と同じ実装)。
+fn ascii_ci_levenshtein(a: &str, b: &str) -> usize {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let (m, n) = (a.len(), b.len());
+    if m.abs_diff(n) > 2 {
+        return usize::MAX;
+    }
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0usize; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
 }
 
 /// modifier prefix を `C-` / `M-` に正規化する。
@@ -319,6 +406,25 @@ fn normalize_modifier_prefix(name: &str) -> String {
     }
     if let Some(rest) = name.strip_prefix('^') {
         return format!("C-{rest}");
+    }
+    // task #22: Unicode 修飾 alias (DR-0006 §8.4)。
+    // `⌃` = Ctrl、`⌥`/`⎇` = Alt/Option/Meta。modifier の直後に区切り `-`/`+` を
+    // 任意で許す (= `⌃-X` / `⌃X` / `⌃+X` を全て `C-X` に正規化)。
+    // `⌘` (Command)、`⇧` (Shift)、`❖`/`Win` (Super) は MVP 未対応 — そのまま素通し
+    // して下流の named_key_bytes / ctrl_byte で reject させる。
+    if let Some(rest) = name.strip_prefix('⌃') {
+        let rest = rest
+            .strip_prefix('-')
+            .or_else(|| rest.strip_prefix('+'))
+            .unwrap_or(rest);
+        return format!("C-{rest}");
+    }
+    if let Some(rest) = name.strip_prefix('⌥').or_else(|| name.strip_prefix('⎇')) {
+        let rest = rest
+            .strip_prefix('-')
+            .or_else(|| rest.strip_prefix('+'))
+            .unwrap_or(rest);
+        return format!("M-{rest}");
     }
     if let Some(rest) = lower
         .strip_prefix("alt-")
@@ -383,25 +489,29 @@ fn ctrl_byte(rest: &str) -> Option<u8> {
 }
 
 /// 名前付き key (= 修飾なし) を escape sequence に変換。case-insensitive。
+///
+/// task #22 で DR-0006 §8.4 の Unicode alias (= `↩` / `⏎` / `⎋` 等) を追加した。
+/// Unicode は to_ascii_lowercase で変化しないので、ASCII alias と同じ match arm に
+/// そのまま列挙できる (= match は code-point 単位、大小は ASCII 範囲のみ判定)。
 fn named_key_bytes(name: &str) -> Option<&'static [u8]> {
     match name.to_ascii_lowercase().as_str() {
-        // 単一バイト
-        "enter" | "return" | "ret" => Some(b"\r"),
-        "tab" => Some(b"\t"),
-        "esc" | "escape" => Some(b"\x1b"),
-        "backspace" | "bs" => Some(b"\x7f"),
-        "delete" | "del" => Some(b"\x1b[3~"),
-        "space" | "sp" => Some(b" "),
-        // 矢印 (= CSI sequence)
-        "up" => Some(b"\x1b[A"),
-        "down" => Some(b"\x1b[B"),
-        "right" => Some(b"\x1b[C"),
-        "left" => Some(b"\x1b[D"),
+        // 単一バイト (= Unicode alias 含む、DR-0006 §8.4)
+        "enter" | "return" | "ret" | "↩" | "⏎" => Some(b"\r"),
+        "tab" | "⇥" => Some(b"\t"),
+        "esc" | "escape" | "⎋" => Some(b"\x1b"),
+        "backspace" | "bs" | "⌫" => Some(b"\x7f"),
+        "delete" | "del" | "⌦" => Some(b"\x1b[3~"),
+        "space" | "sp" | "␣" => Some(b" "),
+        // 矢印 (= CSI sequence)。Unicode 矢印 alias を同居。
+        "up" | "↑" => Some(b"\x1b[A"),
+        "down" | "↓" => Some(b"\x1b[B"),
+        "right" | "→" => Some(b"\x1b[C"),
+        "left" | "←" => Some(b"\x1b[D"),
         // navigation
-        "home" => Some(b"\x1b[H"),
-        "end" => Some(b"\x1b[F"),
-        "pageup" | "pgup" | "page-up" => Some(b"\x1b[5~"),
-        "pagedown" | "pgdn" | "page-down" => Some(b"\x1b[6~"),
+        "home" | "⤒" => Some(b"\x1b[H"),
+        "end" | "⤓" => Some(b"\x1b[F"),
+        "pageup" | "pgup" | "page-up" | "⇞" => Some(b"\x1b[5~"),
+        "pagedown" | "pgdn" | "page-down" | "⇟" => Some(b"\x1b[6~"),
         // Function keys: F1-F4 は SS3 (= ESC O P/Q/R/S)、F5-F12 は CSI ~ 形式
         "f1" => Some(b"\x1bOP"),
         "f2" => Some(b"\x1bOQ"),
@@ -573,6 +683,88 @@ mod tests {
     fn key_empty_rejected() {
         let err = handle_key("").unwrap_err();
         assert!(err.contains("空"), "got: {err}");
+    }
+
+    // --- task #22: Unicode key alias (DR-0006 §8.4) ---
+
+    #[test]
+    fn key_unicode_alias_enter() {
+        assert_eq!(handle_key("↩").unwrap(), b"\r");
+        assert_eq!(handle_key("⏎").unwrap(), b"\r");
+    }
+
+    #[test]
+    fn key_unicode_alias_esc_backspace_delete() {
+        assert_eq!(handle_key("⎋").unwrap(), b"\x1b");
+        assert_eq!(handle_key("⌫").unwrap(), b"\x7f");
+        assert_eq!(handle_key("⌦").unwrap(), b"\x1b[3~");
+    }
+
+    #[test]
+    fn key_unicode_alias_tab_and_space() {
+        assert_eq!(handle_key("⇥").unwrap(), b"\t");
+        assert_eq!(handle_key("␣").unwrap(), b" ");
+    }
+
+    #[test]
+    fn key_unicode_alias_arrows() {
+        assert_eq!(handle_key("↑").unwrap(), b"\x1b[A");
+        assert_eq!(handle_key("↓").unwrap(), b"\x1b[B");
+        assert_eq!(handle_key("→").unwrap(), b"\x1b[C");
+        assert_eq!(handle_key("←").unwrap(), b"\x1b[D");
+    }
+
+    #[test]
+    fn key_unicode_alias_navigation() {
+        assert_eq!(handle_key("⤒").unwrap(), b"\x1b[H");
+        assert_eq!(handle_key("⤓").unwrap(), b"\x1b[F");
+        assert_eq!(handle_key("⇞").unwrap(), b"\x1b[5~");
+        assert_eq!(handle_key("⇟").unwrap(), b"\x1b[6~");
+    }
+
+    #[test]
+    fn key_unicode_ctrl_modifier() {
+        // `⌃X` = `C-X` = SOH (= 0x18)
+        assert_eq!(handle_key("⌃X").unwrap(), vec![0x18]);
+        // separator あり / なし両対応
+        assert_eq!(handle_key("⌃-a").unwrap(), vec![0x01]);
+        assert_eq!(handle_key("⌃+a").unwrap(), vec![0x01]);
+    }
+
+    #[test]
+    fn key_unicode_alt_modifier() {
+        // `⌥x` = `M-x` = ESC + 'x'
+        assert_eq!(handle_key("⌥x").unwrap(), vec![0x1b, b'x']);
+        // `⎇x` も同じく Alt として正規化
+        assert_eq!(handle_key("⎇x").unwrap(), vec![0x1b, b'x']);
+    }
+
+    #[test]
+    fn key_unicode_unsupported_modifiers_rejected() {
+        // `⌘` (Command) は MVP 未対応 → そのまま素通しして named/ctrl で reject。
+        let err = handle_key("⌘x").unwrap_err();
+        assert!(err.contains("未知のキー名"), "got: {err}");
+    }
+
+    // --- task #22: key 名 typo suggest ---
+
+    #[test]
+    fn key_typo_suggests_enter() {
+        let err = handle_key("Entr").unwrap_err();
+        assert!(err.contains("did you mean `Enter`"), "got: {err}");
+    }
+
+    #[test]
+    fn key_typo_suggests_backspace() {
+        let err = handle_key("Backspce").unwrap_err();
+        assert!(err.contains("did you mean `Backspace`"), "got: {err}");
+    }
+
+    #[test]
+    fn key_far_typo_no_suggest() {
+        // 距離 2 以上は suggest しない (= 誤候補を増やさない方針)
+        let err = handle_key("xyzzy").unwrap_err();
+        assert!(!err.contains("did you mean"), "got: {err}");
     }
 
     // --- file ---
