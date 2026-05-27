@@ -34,6 +34,7 @@ use hyoui::sys::{enter_raw, is_tty};
 
 mod completion;
 mod daemonize;
+mod input_handlers;
 mod socket_path;
 
 /// R5-FB4: socket connect の短時間 retry。
@@ -1294,40 +1295,69 @@ fn write_screen_snapshot_payload(payload: &[u8], output: Option<&str>) -> ExitCo
     }
 }
 
-/// `hyoui input <session> <spec>...` subcommand (= DR-0006 §8、task #15)。
+/// `hyoui input <session> <spec>...` subcommand (= DR-0006 §8、task #16)。
 ///
-/// 本タスクでは parser + dispatcher 骨格のみ。各 spec の実際の送信処理は
-/// 別 task で配線する:
-/// - text / hex / file / paste / key — task #16
-/// - wait / wait-idle — task #17
+/// 各 spec を出現順に評価し、handler が返した bytes を daemon の master PTY に
+/// `raw_data` frame で流す。
 ///
-/// 現状の挙動: socket path resolve → connect/handshake は **skip** し、spec 配列を
-/// 順に [`dispatch_spec`] に渡す。dispatch_spec は全 variant で `not yet implemented`
-/// stderr を出して exit 1。最初の spec で fail するため後続 spec は走らない。
+/// 採用経路: **既存 raw bytes 経路** (= 新規 protocol message を増やさない)。
+/// daemon 側の `TYPE_RAW_DATA` frame handler が body を master fd に write する
+/// (= attach 中の Rw client が stdin に打鍵したのと完全同一の流路)。これにより:
+/// - protocol level の変更なし (= cap negotiation 不要)
+/// - daemon 側の追加 handler 不要
+/// - 互換性問題なし
 ///
-/// session_id 形式の validate は parser 側 (= `validate_session_id`) で済んでいる。
-/// `--socket=<path>` 経路で session_id 省略時も spec list は parser で必須化済。
+/// 失敗時の挙動: 最初に失敗した spec で即 abort + exit 1。後続 spec は実行しない
+/// (= partial execution は MVP scope 外、DR-0006 §8.6 の atomicity 方針と整合)。
+///
+/// **wait / wait-idle は task #17 の scope**。本 task では到達したら明示 error。
 fn input_command(cmd: InputCommand) -> ExitCode {
-    // socket path resolve (= 後の task でこの connection を再利用)。本タスクでは
-    // dispatch_spec が即 bail するため connect 試行はしないが、socket / session_id
-    // どちらか必須の guard だけは保持する (= 早期 fail で UX を保つ)。
+    // socket path 解決。session_id / --socket どちらかが必須 (= 通常 parser 段で
+    // 確定済だが defense-in-depth)。
     if cmd.socket.is_none() && cmd.session_id.is_none() {
-        // 通常 parser 側で reject されるはずだが defense-in-depth。
         print_session_required("input");
         return ExitCode::from(2);
     }
-    // timeout は task #16/#17 で handler に渡す。本タスクでは未使用 (= `_` で握り潰し)。
+    // timeout は wait/wait-idle 系で意味を持つ (= task #17)。本 task の bytes 送信
+    // handler では未使用。
     let _ = cmd.timeout;
 
     if cmd.specs.is_empty() {
-        // 通常 parser 側で reject されるはず。
         eprintln!("hyoui: input: spec list が空です (内部 invariant 違反)");
         return ExitCode::from(2);
     }
 
-    // 各 spec を順に dispatch。最初の bail で exit 1 する (= 部分実行も MVP scope 外)。
+    // 1. socket path resolve。
+    let sock =
+        match resolve_target_socket("input", cmd.socket.as_deref(), cmd.session_id.as_deref()) {
+            Ok(p) => p,
+            Err(code) => return code,
+        };
+
+    // 2. attach (= Rw mode で連結)。raw_data frame の書き込みは Rw client のみ
+    //    daemon が master fd に流す (= Ro は silently drop される)。
+    //    HYOUI_LOCK_TOKEN は env から取る (= attach/kill と同じ pattern)。
+    let opts = AttachOptions {
+        mode: Mode::Rw,
+        caps: hyoui::protocol::MVP_CAPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
+        exclusive: false,
+        detach_others: false,
+    };
+    let mut conn = match connect_with_retry(&sock, opts) {
+        Ok(c) => c,
+        Err(e) => {
+            print_connect_failure("input", &sock, &e);
+            return ExitCode::from(1);
+        }
+    };
+
+    // 3. 各 spec を順に dispatch。最初の失敗で abort。
     for (idx, spec) in cmd.specs.iter().enumerate() {
-        match dispatch_spec(spec) {
+        match dispatch_spec(spec, &mut conn) {
             Ok(()) => {}
             Err(msg) => {
                 eprintln!("hyoui: input: spec[{idx}]: {msg}");
@@ -1335,45 +1365,44 @@ fn input_command(cmd: InputCommand) -> ExitCode {
             }
         }
     }
+
+    // 4. 接続 close (= drop で socket close、daemon は client 切断として処理)。
+    drop(conn);
     ExitCode::SUCCESS
 }
 
-/// 1 つの [`InputSpec`] を daemon に送信する dispatcher (= 本タスクでは bail のみ)。
+/// 1 つの [`InputSpec`] を bytes 化し daemon に raw_data frame で送る。
 ///
-/// 各 prefix の handler は別 task で実装する。本タスクでは spec の variant 別に
-/// 「未実装」メッセージを返すだけ。これにより、CLI parse は成功するが実際の動作は
-/// 「task #16/#17 で配線する」と明示できる (= 早期 visibility for downstream)。
+/// handler 本体は [`input_handlers`] module、本関数は variant → handler の
+/// dispatch + `conn.send_raw_bytes` 呼び出しを担う。
 ///
-/// 返り値:
-/// - `Ok(())` — 送信完了 (= 本タスクでは到達不能)
-/// - `Err(msg)` — handler 未実装 / 送信失敗の human-readable reason
-fn dispatch_spec(spec: &InputSpec) -> Result<(), String> {
-    match spec {
-        InputSpec::Text(_) => {
-            Err("text: handler not yet implemented (= task #16 で配線予定)".to_string())
-        }
-        InputSpec::Hex(_) => {
-            Err("hex: handler not yet implemented (= task #16 で配線予定)".to_string())
-        }
-        InputSpec::File(_) => Err(
-            "file: handler not yet implemented (= task #16 / path validation は #21)".to_string(),
-        ),
-        InputSpec::Paste(_) => {
-            Err("paste: handler not yet implemented (= task #16 で配線予定)".to_string())
-        }
-        InputSpec::Key(_) => {
-            Err("key: handler not yet implemented (= task #16 で配線予定)".to_string())
-        }
+/// # Errors
+///
+/// - handler が validation で reject (= paste の終端 nest、key の不明名等)
+/// - `send_raw_bytes` の I/O 失敗
+fn dispatch_spec(spec: &InputSpec, conn: &mut ClientConnection) -> Result<(), String> {
+    let bytes: Vec<u8> = match spec {
+        InputSpec::Text(s) => input_handlers::handle_text(s),
+        InputSpec::Hex(b) => input_handlers::handle_hex(b),
+        InputSpec::File(p) => input_handlers::handle_file(p)?,
+        InputSpec::Paste(s) => input_handlers::handle_paste(s)?,
+        InputSpec::Key(name) => input_handlers::handle_key(name)?,
         InputSpec::Wait(_) => {
-            Err("wait: handler not yet implemented (= task #17 で配線予定)".to_string())
+            return Err("wait: handler not yet implemented (= task #17 で配線予定)".to_string());
         }
         InputSpec::WaitIdle(_) => {
-            Err("wait-idle: handler not yet implemented (= task #17 で配線予定)".to_string())
+            return Err(
+                "wait-idle: handler not yet implemented (= task #17 で配線予定)".to_string(),
+            );
         }
         // `InputSpec` is `#[non_exhaustive]`; future variants surface as a generic
         // skew error so older binaries report clearly.
-        _ => Err("unsupported InputSpec variant (binary/library version skew)".to_string()),
-    }
+        _ => {
+            return Err("unsupported InputSpec variant (binary/library version skew)".to_string());
+        }
+    };
+    conn.send_raw_bytes(&bytes)
+        .map_err(|e| format!("daemon への bytes 送信失敗: {e}"))
 }
 
 #[cfg(test)]
@@ -1740,6 +1769,114 @@ mod tests {
             let _ = conn.send_control(&ControlMessage::Kill(kill));
             drop(conn);
         }
+        let _ = daemon_handle.join();
+    }
+
+    /// daemon spawn + `ClientConnection::send_raw_bytes` の smoke test。
+    ///
+    /// handler の bytes 化検証は `input_handlers::tests` (= 24 件) で済んでおり、
+    /// 本 test は CLI 層の wiring (= `dispatch_spec` → `send_raw_bytes` →
+    /// daemon の `TYPE_RAW_DATA` 経路 → master PTY) が壊れていないことを
+    /// 「send 後に daemon が disconnect せず、screen.dump も response を返す」
+    /// で間接確認する。
+    ///
+    /// 子が echo する内容を screen から読み戻す形の test は別途必要だが、
+    /// 既存 daemon test (`crates/hyoui/src/daemon/session.rs` の
+    /// `serve_screen_dump_*` 群) で raw_data 経路の検証は protocol レベルで
+    /// 済んでおり、CLI 側からは「送信 API が成立 + 後続 control が動く」で
+    /// 十分。
+    #[test]
+    fn send_raw_bytes_does_not_disconnect_daemon() {
+        use hyoui::daemon::{DaemonConfig, Session};
+        use hyoui::protocol::messages::{
+            ScreenDumpFormat as ProtoDumpFormat, ScreenDumpLayer as ProtoDumpLayer,
+            ScreenDumpRequest,
+        };
+        use std::time::Duration;
+
+        let sock_dir = make_0700_dir();
+        let sock_path = sock_dir.path().join("input-int.sock");
+
+        // 子: 30 秒スリープする静かな子 (= 既存 screen_dump test と同じ pattern)。
+        // bytes を送っても echo は出ないが、daemon が disconnect しないことを
+        // 確認するには十分。
+        let sock_for_daemon = sock_path.clone();
+        let daemon_handle = std::thread::spawn(move || {
+            let cfg = DaemonConfig::new(
+                "input-int-test",
+                sock_for_daemon,
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf 'READY'; sleep 30".into(),
+                ],
+            );
+            let session = Session::start(cfg).expect("daemon start");
+            session.serve()
+        });
+
+        // listener bind + 子の "READY" が screen state に反映されるまで少し待つ。
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Rw client として attach。MVP_CAPS を要求して handshake 通す。
+        let opts = AttachOptions {
+            mode: Mode::Rw,
+            caps: hyoui::protocol::MVP_CAPS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            ..AttachOptions::default()
+        };
+        let mut conn = connect_with_retry(&sock_path, opts).expect("attach Rw");
+
+        // 1. text bytes 送信 (= input_handlers::handle_text 経路と同等)
+        conn.send_raw_bytes(b"HELLO_TXT")
+            .expect("send_raw_bytes text");
+        // 2. paste wrap (= handle_paste 経路と同等)
+        conn.send_raw_bytes(b"\x1b[200~PASTE\x1b[201~")
+            .expect("send_raw_bytes paste");
+        // 3. key sequence (= handle_key("Enter") = "\r")
+        conn.send_raw_bytes(b"\r").expect("send_raw_bytes enter");
+        // 4. hex bytes (= handle_hex)
+        conn.send_raw_bytes(&[0x1b, 0x5b, 0x41])
+            .expect("send_raw_bytes hex");
+
+        // raw_data 送信後でも screen.dump が response を返せる (= daemon が
+        // disconnect していない、protocol violation を起こしていない)。
+        let req = ScreenDumpRequest {
+            format: ProtoDumpFormat::Ansi,
+            layer: ProtoDumpLayer::Visible,
+            rect: None,
+            serial: Some(1),
+        };
+        conn.send_control(&ControlMessage::ScreenDumpRequest(req))
+            .expect("send screen.dump request");
+
+        // ModeChange/LeaderNotify を skip しつつ ScreenDumpResponse を待つ。
+        let mut got_response = false;
+        for _ in 0..10 {
+            match conn.recv_control(None) {
+                Ok(ControlMessage::ScreenDumpResponse(r)) => {
+                    assert!(
+                        !r.payload.is_empty(),
+                        "screen.dump response payload must not be empty after raw bytes"
+                    );
+                    got_response = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("daemon disconnected after raw bytes: {e}"),
+            }
+        }
+        assert!(
+            got_response,
+            "expected ScreenDumpResponse after sending raw bytes via CLI handler path"
+        );
+
+        // cleanup: kill 送って thread を終わらせる。
+        let kill = hyoui::protocol::messages::Kill { signal: None };
+        let _ = conn.send_control(&ControlMessage::Kill(kill));
+        drop(conn);
         let _ = daemon_handle.join();
     }
 
