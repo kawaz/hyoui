@@ -48,6 +48,9 @@ pub(crate) enum ScreenDumpFormat {
     Json,
     /// 構造化 cells を CBOR で返す (= 機械処理)。
     Cbor,
+    /// ANSI escape は strip するが、cell の空白 (= padding) と行構造はそのまま
+    /// 保持した plaintext (= TUI 自動処理用、claude TUI PoC feedback)。
+    TextPlain,
 }
 
 /// `ScreenDumpRequest.layer` の選択肢 (DR-0013 §9)。
@@ -250,6 +253,7 @@ pub(crate) fn build_screen_dump(
                 .map_err(|_| ScreenDumpError::EncodeFailed)?;
             Ok(buf)
         }
+        ScreenDumpFormat::TextPlain => Ok(build_text_plain(state)),
     }
 }
 
@@ -276,6 +280,45 @@ fn build_plain_text(state: &ScreenState) -> Vec<u8> {
         // 末尾空白を trim
         let trimmed = line.trim_end_matches(' ');
         out.extend_from_slice(trimmed.as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+/// `TextPlain` format の plaintext 出力 (= ANSI escape 除去 + cell 空白 / 行末空白
+/// 保持 + 改行 + attribute 無視)。claude TUI PoC feedback への対応。
+///
+/// `build_plain_text` (= `Binary` format) との差分:
+/// - 行末空白を **trim しない** (= 元の盤面の padding を温存する)
+/// - 結果として、各 row は「viewport の cols 数」分の char + 改行で出力される
+///   (= wide char 継続 cell の skip 分を除く)
+///
+/// TUI app (例: claude TUI のステータスバー + 入力欄構成) は「描かれていない領域は
+/// 空白」という前提で盤面を組むため、本 format で行構造をそのまま保持しないと
+/// 「ほぼ空に見える」状態になる。本 format は装飾なしで盤面の見た目を再現する。
+fn build_text_plain(state: &ScreenState) -> Vec<u8> {
+    let (rows, cols) = state.size();
+    let mut out = Vec::with_capacity(rows as usize * (cols as usize + 1));
+    let visible = state.snapshot_visible_rows();
+    for row in visible.iter() {
+        let mut line = String::with_capacity(cols as usize);
+        for cell in row.iter() {
+            if cell.is_wide_continuation {
+                // wide char (例: 全角) の継続 cell は飛ばす。先頭 cell の contents
+                // が 2 col 幅の文字 ("あ" 等) を 1 度に保持しているため、それで
+                // viewport 上の 2 col 分の表示が再現される。
+                continue;
+            }
+            if cell.contents.is_empty() {
+                // 空 cell (= 描画されていない padding 領域) は半角空白で埋める。
+                // これにより TUI の「行末まで空白で埋めた状態」が出力に保存される。
+                line.push(' ');
+            } else {
+                line.push_str(&cell.contents);
+            }
+        }
+        // `build_plain_text` と違い、行末空白を **trim しない** (= 行構造保持)。
+        out.extend_from_slice(line.as_bytes());
         out.push(b'\n');
     }
     out
@@ -369,6 +412,66 @@ mod tests {
         let text = std::str::from_utf8(&out).expect("utf8");
         assert!(text.contains("hi"));
         assert!(text.contains("hello"));
+    }
+
+    #[test]
+    fn dump_text_plain_preserves_row_padding() {
+        // 3x10 viewport に "hi" を 1 行目だけ書く。`TextPlain` は cell の空白を
+        // 保持するため、各 row は cols=10 の char 列 + 改行で出力される。
+        let mut s = ScreenState::new(3, 10, 0);
+        s.process(b"hi");
+        let out = build_screen_dump(&s, ScreenDumpFormat::TextPlain, ScreenDumpLayer::Visible)
+            .expect("ok");
+        let text = std::str::from_utf8(&out).expect("utf8");
+        // 期待: "hi" + 8 spaces + "\n" + 10 spaces + "\n" + 10 spaces + "\n"
+        let expected = format!(
+            "hi{}\n{}\n{}\n",
+            " ".repeat(8),
+            " ".repeat(10),
+            " ".repeat(10)
+        );
+        assert_eq!(
+            text, expected,
+            "text-plain must preserve row padding + newlines"
+        );
+        // 行数 = rows
+        assert_eq!(text.matches('\n').count(), 3);
+    }
+
+    #[test]
+    fn dump_text_plain_has_no_ansi_escapes() {
+        // 装飾を意図的に発行 (= ESC[31m 赤色 + ESC[1m bold)、`TextPlain` は escape
+        // を含まないことを確認する。
+        let mut s = ScreenState::new(2, 6, 0);
+        s.process(b"\x1b[1;31mERR\x1b[0m");
+        let out = build_screen_dump(&s, ScreenDumpFormat::TextPlain, ScreenDumpLayer::Visible)
+            .expect("ok");
+        // ESC (0x1b) は 1 byte も含まれてはいけない
+        assert!(
+            !out.contains(&0x1b),
+            "text-plain must strip ANSI escapes, got: {:?}",
+            std::str::from_utf8(&out).unwrap_or("<invalid utf8>")
+        );
+        let text = std::str::from_utf8(&out).expect("utf8");
+        assert!(
+            text.starts_with("ERR"),
+            "visible chars must be preserved: {text:?}"
+        );
+    }
+
+    #[test]
+    fn dump_text_plain_handles_wide_char_continuation() {
+        // 全角文字 "あ" (= 2 col 幅) を入れて、継続 cell が空白で埋まらず
+        // 文字列が正しく 1 つだけ出ることを確認。
+        // 2x6 viewport: "あa" は 3 col (= 2+1) 使い、残り 3 col は空白。
+        let mut s = ScreenState::new(2, 6, 0);
+        s.process("あa".as_bytes());
+        let out = build_screen_dump(&s, ScreenDumpFormat::TextPlain, ScreenDumpLayer::Visible)
+            .expect("ok");
+        let text = std::str::from_utf8(&out).expect("utf8");
+        // 1 行目 = "あa" + 3 spaces + "\n"、2 行目 = 6 spaces + "\n"
+        let expected = format!("あa{}\n{}\n", " ".repeat(3), " ".repeat(6));
+        assert_eq!(text, expected);
     }
 
     #[test]

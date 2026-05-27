@@ -22,6 +22,17 @@ pub enum ScreenDumpFormat {
     Json,
     /// CBOR encode された structured snapshot。
     Cbor,
+    /// ANSI escape は strip するが、cell の空白 (= padding) と行構造はそのまま
+    /// 保持した plaintext (= TUI app の自動処理用、claude TUI PoC feedback)。
+    ///
+    /// `Binary` との差分: `Binary` は各 row の末尾空白を trim する (= grep 向け)
+    /// ため、ステータスバー + 入力欄しか描かない TUI の状態だと「行構造が消えて
+    /// 結果がほぼ空に見える」問題が出る。`TextPlain` は cell 単位の visible char
+    /// を空白埋めで保持し、行末空白も維持するので、TUI の盤面状態を「装飾なしで
+    /// そのまま」読める形にする。
+    ///
+    /// wire encoding は `kebab-case` で `"text-plain"`。
+    TextPlain,
 }
 
 /// `screen.dump.request` の `layer` 選択肢。
@@ -349,5 +360,39 @@ mod tests {
             serial: Some(99),
         };
         assert_eq!(roundtrip(&resp), resp);
+    }
+
+    #[test]
+    fn dump_format_text_plain_roundtrip() {
+        // 新規 variant が CBOR encode → decode を通って同じ値に戻ることを確認
+        // (= wire format 互換性: `kebab-case` で `"text-plain"` として encode される)
+        let req = ScreenDumpRequest {
+            format: ScreenDumpFormat::TextPlain,
+            layer: ScreenDumpLayer::Visible,
+            rect: None,
+            serial: Some(11),
+        };
+        assert_eq!(roundtrip(&req), req);
+    }
+
+    #[test]
+    fn dump_format_text_plain_serializes_as_kebab_case() {
+        // wire 上の string 表現を直接確認 (= forward-compat。`"text-plain"` 以外で
+        // encode されていると client/daemon バージョン skew で取りこぼす)。
+        let req = ScreenDumpRequest {
+            format: ScreenDumpFormat::TextPlain,
+            layer: ScreenDumpLayer::Visible,
+            rect: None,
+            serial: None,
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&req, &mut buf).expect("encode");
+        // CBOR diag では map なので bytes 検索で "text-plain" が含まれることだけ確認。
+        // (binary でも UTF-8 文字列はそのまま埋め込まれる)
+        let needle = b"text-plain";
+        assert!(
+            buf.windows(needle.len()).any(|w| w == needle),
+            "wire payload must contain `text-plain` string, got: {buf:?}"
+        );
     }
 }

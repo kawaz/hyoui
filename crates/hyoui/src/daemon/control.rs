@@ -724,11 +724,16 @@ fn handle_screen_dump_request(
     {
         return ClientFrameOutcome::Continue;
     }
+    // 同 crate 内では `#[non_exhaustive]` が wildcard を作らないため、全 variant を
+    // 列挙する (= 将来 variant 追加時に match exhaustiveness で気付く)。クレート外
+    // からの version skew は protocol 層の `decode_from` 段階で reject されるため、
+    // ここに「未知 variant」は到達しない。
     let format = match req.format {
         crate::protocol::messages::ScreenDumpFormat::Ansi => InternalDumpFormat::Ansi,
         crate::protocol::messages::ScreenDumpFormat::Binary => InternalDumpFormat::Binary,
         crate::protocol::messages::ScreenDumpFormat::Json => InternalDumpFormat::Json,
         crate::protocol::messages::ScreenDumpFormat::Cbor => InternalDumpFormat::Cbor,
+        crate::protocol::messages::ScreenDumpFormat::TextPlain => InternalDumpFormat::TextPlain,
     };
     let layer = match req.layer {
         crate::protocol::messages::ScreenDumpLayer::Visible => InternalDumpLayer::Visible,
