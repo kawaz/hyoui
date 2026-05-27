@@ -4,6 +4,10 @@
 - Date: 2026-05-27
 - Related: [[DR-0007]] (MVP / 段階リリース), [[DR-0008]] (protocol 設計、部分上書き), [[DR-0010]] (v0.2.0 scope), R5-POSIX-C1, R5-C4
 
+## Update (2026-05-27): version 区切り廃止
+
+[[DR-0013]] 起票に伴い、本 DR で言及している version 区切り (= v0.1.x / v0.2.0 等) は廃止。scope の正本は [`docs/ROADMAP.md`](../ROADMAP.md) (= 4 層列挙型) を参照。signal wire name 化の方針自体は維持、ROADMAP `追加予定` に登録。
+
 ## Context
 
 R5 (POSIX 委員) レビュー指摘 R5-POSIX-C1 / R5-C4:

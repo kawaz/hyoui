@@ -4,6 +4,10 @@
 - Date: 2026-05-26（v0.1.0 リリース後に re-scope: 2026-05-27）
 - Related: DR-0005 (思想), DR-0006 (CLI ground rules), DR-0008 (protocol)
 
+## Update (2026-05-27): version 区切り廃止
+
+[[DR-0013]] 起票に伴い、本 DR で言及している version 区切り (= v0.1.x / v0.2.0 等) は廃止。scope の正本は [`docs/ROADMAP.md`](../ROADMAP.md) (= 4 層列挙型) を参照。
+
 ## Context
 
 [[DR-0006]] で確定した API surface は大きい。一気に v0.1.0 で全部出すと開発工数が膨大、

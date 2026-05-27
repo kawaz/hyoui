@@ -4,6 +4,18 @@
 - Date: 2026-05-26
 - Related: DR-0005 (思想)、DR-0006 (CLI ground rules)、DR-0007 (MVP scope)、PoC 01-08 findings (特に [[2026-05-26-fd-passing-vs-stream]]、[[2026-05-26-multi-attach]]、[[2026-05-26-lock-token-env]])
 
+## Update (2026-05-27): [[DR-0013]] で structured state access message + cap flag を追加
+
+[[DR-0013]] §10 で以下を追加:
+
+- `ScreenDumpRequest` / `ScreenDumpResponse` (= cap flag `screen-dump-v1`)
+- `StateSnapshotRequest` / `StateSnapshotResponse` (= cap flag `state-snapshot-v1`)
+- Phase B 移行時に `dirty-lines-v1` (= per-line SequenceNo + pull 型 protocol、`DirtyLinesNotify` / `GetLinesRequest` / `GetLinesResponse`)
+
+既存 raw bytes layer (= TYPE_RAW_DATA) は維持、TYPE_CBOR_CONTROL 経由で新 message 追加。cap flag negotiation は本 DR の既存機構を活用、breaking change なし (= 既存 client は新 message を見ない、cap flag で gating)。
+
+PDU serial 番号 (= wezterm `codec/src/lib.rs:67` パターン、out-of-order tolerant + RTT 計測) を CBOR control message に入れる検討は Phase B の実装で確定。
+
 ## Context
 
 [[DR-0006]] で「protocol は transport (Unix socket / TCP / WebSocket) から独立」と宣言。PoC 04 ([[2026-05-26-fd-passing-vs-stream]]) で SCM_RIGHTS 不採用 = stream 中継一本化を確定。本 DR は **wire format / 制御メッセージのモデル / handshake / capability negotiation / transport 抽象** をゼロベースで設計する。

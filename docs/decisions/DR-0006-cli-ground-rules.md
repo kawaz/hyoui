@@ -2,7 +2,13 @@
 
 - Status: Active
 - Date: 2026-05-26
-- Related: DR-0001 (jobcontrol 2 軸), DR-0004 (CLI subcommand 採用), DR-0005 (外側自動操作主軸), DR-0007 (MVP scope)
+- Related: DR-0001 (jobcontrol 2 軸), DR-0004 (CLI subcommand 採用), DR-0005 (外側自動操作主軸), DR-0007 (MVP scope), DR-0013 (screen emulator、§8/§9 改訂前提)
+
+## Update (2026-05-27): §8/§9 は要改訂
+
+[[DR-0013]] で wait / snapshot が state-based に再定義される (= daemon = screen state 正本、現在 visible に対する match を L1 で実現)。本 DR §8 (= wait) / §9 (= snapshot) は別途改訂 task で書き直す。それまでは本記述は historical reference として扱う。
+
+ROADMAP `追加予定` に「[[DR-0006]] §8/§9 改訂」として登録済。
 
 ## Context
 

@@ -5,6 +5,10 @@
 - Related: [[DR-0005]] (思想), [[DR-0006]] (CLI ground rules), [[DR-0007]] (MVP scope と段階リリース), [[DR-0008]] (protocol), [[DR-0009]] (session.rs 分割 = instrument 挿入位置)
 - Backlog 解消: R5-H1 (= 観測手段ゼロ) を本 DR で扱う。R5-H8 (runbook) は本 DR の成果物を前提とする後続 task
 
+## Update (2026-05-27): version 区切り廃止
+
+[[DR-0013]] 起票に伴い、本 DR で言及している version 区切り (= v0.1.x / v0.2.0 等) は廃止。scope の正本は [`docs/ROADMAP.md`](../ROADMAP.md) (= 4 層列挙型) を参照。observability 戦略自体は維持、ROADMAP `追加予定` に登録。
+
 ## Context
 
 `crates/hyoui/src/daemon/*` 全体に `tracing::` / `log::` の使用が**ゼロ**である。detach した daemon の stderr は `daemonize.rs:75` で `Stdio::null()` に捨てられ、handshake reject / backpressure / writer dead / panic stack のいずれも記録されない。これは v0.1.x の「最小核」方針 (= [[DR-0007]]) では許容できた状態だが、以下の三点で v0.2.0 着手前に解消すべき問題になっている:

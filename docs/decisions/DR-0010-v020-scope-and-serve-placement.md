@@ -4,6 +4,16 @@
 - Date: 2026-05-27
 - Related: [[DR-0005]] (思想), [[DR-0006]] (CLI ground rules), [[DR-0007]] (MVP scope), R5-H4, R5-H5
 
+## Update (2026-05-27): version 区切り廃止
+
+[[DR-0013]] 起票に伴い、本 DR で言及している version 区切り (= v0.1.x / v0.2.0 等) は廃止。scope の正本は [`docs/ROADMAP.md`](../ROADMAP.md) (= 4 層列挙型) を参照。
+
+### scope の status
+
+- **input family 整理 (= text:/file:/hex:/paste: spec 統一)**: 正本維持。ROADMAP `優先` に登録
+- **serve 別 repo**: 正本維持。ROADMAP `追加予定` に登録
+- **version 区切り (= 旧 v0.2.0 scope)**: 廃止 (= 上記)
+
 ## Context
 
 Round 5 (R5-Classic) で以下 2 点が指摘された:
