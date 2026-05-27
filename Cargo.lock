@@ -181,6 +181,8 @@ dependencies = [
  "ciborium",
  "hyoui",
  "nix",
+ "regex",
+ "serde",
  "tempfile",
 ]
 

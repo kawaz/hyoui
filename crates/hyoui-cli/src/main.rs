@@ -36,6 +36,7 @@ mod completion;
 mod daemonize;
 mod input_handlers;
 mod socket_path;
+mod wait_core;
 
 /// R5-FB4: socket connect の短時間 retry。
 ///

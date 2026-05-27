@@ -18,6 +18,12 @@ nix = { workspace = true }
 # `screen snapshot` subcommand が `StateSnapshotResponse` を独立した CBOR root
 # として出力するため、CBOR serialize の primitive を直接利用する (= DR-0013 §9)。
 ciborium = { workspace = true }
+# `wait` subcommand と `input` family の `wait:<pattern>` spec で visible state
+# の正規表現マッチに用いる (= DR-0006 §9 state-based wait)。
+regex = { workspace = true }
+# `wait_core` の内部 CBOR デコード型 (= daemon の `ScreenSnapshot` 鏡像) を
+# serde::Deserialize で取り回すために必要。
+serde = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
