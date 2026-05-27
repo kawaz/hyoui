@@ -35,6 +35,23 @@ pub(super) enum ChildState {
     Stopped,
 }
 
+/// DR-0001 軸 1: 子の **新規 state transition イベント** (= `waitpid` で初めて
+/// 取り出した遷移)。latch された状態とは別物で、軸 1 policy の発火判定に使う。
+///
+/// `ChildState` は「現在の latched 状態」を返すため、loop で何度呼んでも
+/// `Stopped` のままになる (= SIGCONT を毎周送ってしまう)。本 enum は新規 transition
+/// のみを 1 度返し、以降は `None`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChildTransition {
+    /// 子が新しく STOPPED 状態に遷移した (= 軸 1 policy を発火させる)。
+    Stopped,
+    /// 子が STOPPED 状態から復帰した (= invariant 回復の確認用、外部介入で
+    /// SIGCONT が送られた場合の log/trace 用途)。
+    Continued,
+    /// 子が exit した。`Some(code)` が判明している場合のみ含む。
+    Exited(Option<i32>),
+}
+
 /// 子の lifecycle 追跡 (R4-H14)。
 ///
 /// `waitpid` の Stopped / Continued は **state transition でしか報告されない**
@@ -54,42 +71,78 @@ pub(super) struct ChildLifecycle {
 }
 
 impl ChildLifecycle {
+    /// `poll_with_transition` の latched state だけを返す薄い wrapper。
+    /// transition 情報を必要としない呼び出し元 (= test 内 helper 等) 向け。
+    ///
+    /// 通常の serve_loop 配線では transition を policy 発火に使うため、
+    /// 直接 `poll_with_transition` を呼ぶこと。
+    #[cfg(test)]
+    pub(super) fn poll(&mut self, child: Pid) -> ChildState {
+        self.poll_with_transition(child).0
+    }
+
     /// `waitpid(WNOHANG | WUNTRACED | WCONTINUED)` で子の状態 transition を拾い、
-    /// 累積状態を踏まえて [`ChildState`] を返す。
+    /// 累積状態を踏まえて `(state, transition)` を返す。
+    ///
+    /// 返り値 `.1` (= `Option<ChildTransition>`) は `waitpid` が今回呼び出しで
+    /// **初めて** 取り出した遷移のみ `Some` (= `WaitStatus::Stopped` /
+    /// `Continued` / `Exited` を初めて drain した瞬間)。`StillAlive` や
+    /// transient error では `None`。caller はこの transition を見て軸 1
+    /// policy (= `OnChildSuspend::Follow` で `raise(SIGSTOP)` / `AutoResume`
+    /// で `killpg(child, SIGCONT)`) を発火させる。
     ///
     /// 旧 `child_actually_exited` 単体関数からの差し替え。state を持つので
     /// caller は `ChildLifecycle` インスタンスを 1 つ loop 全体で使い回す。
-    pub(super) fn poll(&mut self, child: Pid) -> ChildState {
+    ///
+    /// 通常の latched state だけを返す path は廃止 (= 毎周期で `Stopped` を
+    /// 返してしまい、policy 側で何度も SIGCONT を投げる事故の温床になる)。
+    /// caller は本 method の返り値 `.1` を毎回 `Some` 判定し、必要なら policy
+    /// を発火させる。
+    pub(super) fn poll_with_transition(
+        &mut self,
+        child: Pid,
+    ) -> (ChildState, Option<ChildTransition>) {
         let flags = WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED;
         match waitpid(child, Some(flags)) {
-            Ok(WaitStatus::Exited(_, code)) => ChildState::Exited(Some(code)),
-            Ok(WaitStatus::Signaled(_, sig, _)) => ChildState::Exited(Some(128 + (sig as i32))),
+            Ok(WaitStatus::Exited(_, code)) => (
+                ChildState::Exited(Some(code)),
+                Some(ChildTransition::Exited(Some(code))),
+            ),
+            Ok(WaitStatus::Signaled(_, sig, _)) => {
+                let code = 128 + (sig as i32);
+                (
+                    ChildState::Exited(Some(code)),
+                    Some(ChildTransition::Exited(Some(code))),
+                )
+            }
             Ok(WaitStatus::Stopped(_, _)) => {
                 self.stopped = true;
-                ChildState::Stopped
+                (ChildState::Stopped, Some(ChildTransition::Stopped))
             }
             Ok(WaitStatus::Continued(_)) => {
                 self.stopped = false;
-                ChildState::Alive
+                (ChildState::Alive, Some(ChildTransition::Continued))
             }
             Ok(WaitStatus::StillAlive) => {
-                // No new transition; report the latched state.
-                if self.stopped {
+                // No new transition; report the latched state without a transition event.
+                let state = if self.stopped {
                     ChildState::Stopped
                 } else {
                     ChildState::Alive
-                }
+                };
+                (state, None)
             }
             // ptrace event 等の wildcard (= `ptrace` feature 有効時) を defensively alive 扱い
             #[allow(unreachable_patterns)]
-            Ok(_) => ChildState::Alive,
+            Ok(_) => (ChildState::Alive, None),
             Err(_) => {
                 // transient error (= ECHILD で reap 済の可能性等)。state を維持。
-                if self.stopped {
+                let state = if self.stopped {
                     ChildState::Stopped
                 } else {
                     ChildState::Alive
-                }
+                };
+                (state, None)
             }
         }
     }

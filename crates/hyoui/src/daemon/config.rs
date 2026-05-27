@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use crate::cli::{OnChildSuspend, OnParentSuspend};
+
 /// daemon 1 つ分の起動設定。
 ///
 /// `cmd` で指定した process を子 PTY として spawn し、`socket_path` で
@@ -65,6 +67,23 @@ pub struct DaemonConfig {
     /// 一致させたい場合は v0.2.0 で `wait --pattern` 経路を使う想定 (= 本機能は
     /// `run` から手早く使うための簡易 needle match)。
     pub until: Option<String>,
+
+    /// DR-0001 軸 1: 子が STOPPED 状態になったときの親 daemon の挙動。
+    ///
+    /// - [`OnChildSuspend::Follow`]: 親自身に `SIGSTOP` を `raise` し、外側 shell に
+    ///   制御を返す (= invariant「親 fg なら子 fg」を維持しながら、ユーザの
+    ///   `fg` を待つ形で両者停止)。
+    /// - [`OnChildSuspend::AutoResume`]: 子 pgrp に即 `SIGCONT` を送って復帰させる
+    ///   (= 子の suspend を一切許さない、poc3 `nosuspend` 相当)。
+    pub on_child_suspend: OnChildSuspend,
+
+    /// DR-0001 軸 2: 親 daemon が外部から SIGTSTP を受信したときの子の挙動。
+    ///
+    /// - [`OnParentSuspend::Transparent`]: 子 pgrp に `SIGSTOP` を送ってから、親も
+    ///   `SIGSTOP` を `raise` (= 親子ペアで停止)。
+    /// - [`OnParentSuspend::Decouple`]: 親だけ `SIGSTOP` を `raise`、子はそのまま
+    ///   走らせる (= headless バッチで親を止めても子のジョブを進めたいとき)。
+    pub on_parent_suspend: OnParentSuspend,
 }
 
 impl DaemonConfig {
@@ -84,6 +103,12 @@ impl DaemonConfig {
             client_buffer_bytes: 8 * 1024 * 1024,
             expected_token: None,
             until: None,
+            // 既定は CLI 層の `Mode::Interactive` preset と揃える (DR-0001 §デフォルト)。
+            // `hyoui-cli` の `run_command` / `__daemonize-run` 経由なら `RunConfig` から
+            // 上書きされる。直接 `DaemonConfig::new` を使う test 経路にも妥当な既定を
+            // 与えるため、ここで明示する。
+            on_child_suspend: OnChildSuspend::Follow,
+            on_parent_suspend: OnParentSuspend::Transparent,
         }
     }
 }
