@@ -493,6 +493,17 @@ impl ClientConnection {
         Ok(())
     }
 
+    /// reader 側 socket の borrowed fd を返す (= `poll(2)` で readiness を取る用途)。
+    ///
+    /// 用途: `lock acquire` のように **block しつつ別 fd (= self-pipe / stdin) と
+    /// 並行 poll したい** 場合に、内部の reader fd へアクセスするための accessor。
+    /// 返却 fd への直接 `read(2)` は `recv_control` / `recv_frame` の frame 境界を
+    /// 破壊するので **読み出してはならない** (= readiness 観測のみ)。
+    pub fn reader_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.reader.as_fd()
+    }
+
     /// 任意の `ControlMessage` を daemon に送る (= Resize / Signal / Kill / Detach 等)。
     ///
     /// `run` の外から (= signal handler や別 thread から) 呼ぶ用途。MVP では同期

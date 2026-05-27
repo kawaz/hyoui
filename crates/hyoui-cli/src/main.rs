@@ -18,7 +18,8 @@ use std::process::ExitCode;
 
 use hyoui::cli::{
     AttachConfig, Command, HelpTopic, InputCommand, InputSpec, KillConfig, ListConfig,
-    ScreenCommand, ScreenDumpCliFormat, ScreenDumpCliLayer, ScreenDumpConfig, ScreenSnapshotConfig,
+    LockAcquireConfig, LockCommand, LockMode, LockReleaseConfig, ScreenCommand,
+    ScreenDumpCliFormat, ScreenDumpCliLayer, ScreenDumpConfig, ScreenSnapshotConfig,
     SnapshotCliComponent, StatusConfig, TailConfig, WaitConfig, parse_args, usage,
 };
 use hyoui::client::{AttachOptions, ClientConnection};
@@ -181,6 +182,21 @@ fn main() -> ExitCode {
         },
 
         Command::Input(cmd) => input_command(cmd),
+
+        Command::Lock(sub) => match sub {
+            LockCommand::Acquire(cfg) => lock_acquire_command(cfg),
+            LockCommand::Release(cfg) => lock_release_command("lock release", cfg),
+            // `LockCommand` is `#[non_exhaustive]`; future variants surface as
+            // a generic skew error so older binaries report clearly.
+            _ => {
+                eprintln!(
+                    "hyoui: lock: unsupported lock subcommand variant (binary/library version skew)"
+                );
+                ExitCode::from(2)
+            }
+        },
+
+        Command::Unlock(cfg) => lock_release_command("unlock", cfg),
 
         Command::Completion { shell } => {
             print!("{}", completion::script(shell));
@@ -1364,6 +1380,396 @@ fn input_command(cmd: InputCommand) -> ExitCode {
     // 4. 接続 close (= drop で socket close、daemon は client 切断として処理)。
     drop(conn);
     ExitCode::SUCCESS
+}
+
+// =============================================================================
+// lock subcommand dispatchers (DR-0006 §7、task #20)
+// =============================================================================
+
+/// `hyoui lock acquire <session>` の dispatcher (= DR-0006 §7)。
+///
+/// 取得シーケンス:
+/// 1. socket connect + handshake (= Rw mode、lock cap)
+/// 2. `LockAcquire { wait, ... }` を送る。`Acquired` 受信 → token を stdout に 1 行 print。
+///    `Denied` 受信 → `--mode=fail` なら exit 1、`--mode=wait` なら短時間 sleep して
+///    `--timeout` 内で再送 (polling)。MVP daemon は wait queue 未実装 (= wait=true でも
+///    Denied) なので CLI 側 polling で擬似 wait semantics を実現する。
+/// 3. 取得後は **connection を保持して block**: stdin / socket / self-pipe (SIGINT/SIGTERM)
+///    を poll で並行監視し、いずれかが「終了 signal」を出すまで wait。
+/// 4. 終了 signal: stdin EOF / SIGINT / SIGTERM / socket close / mode.change(Locked→Rw 等の異常)
+///    を検知したら `LockRelease` を送って exit 0。socket がすでに切れていれば daemon が
+///    auto-release するので best-effort で OK。
+fn lock_acquire_command(cfg: LockAcquireConfig) -> ExitCode {
+    use std::time::{Duration, Instant};
+
+    let sock = match resolve_target_socket(
+        "lock acquire",
+        cfg.socket.as_deref(),
+        cfg.session_id.as_deref(),
+    ) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    // lock 取得には Rw mode が必要 (= daemon::control::handle_lock_acquire の
+    // `Mode::Ro` reject path)。lock cap は MVP_CAPS に含まれているのでそのまま使う。
+    let opts = AttachOptions {
+        mode: Mode::Rw,
+        caps: hyoui::protocol::MVP_CAPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        // 既存 lock holder の token を流すと自分も lock holder 扱いで認証されるが、
+        // 本 subcommand 自身が **新たに lock を取る** 入口なので、env の HYOUI_LOCK_TOKEN
+        // は handshake に流さない (= 新規 holder として認証されるため token=None 推奨)。
+        // ただし daemon 側 expected_token が設定されている場合は handshake が落ちるので
+        // その場合は env から token を取り込んで認証通過させる必要がある。両立のため
+        // env がある時のみ流す (= holder 確定後の自分の token は別途取り直す)。
+        token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
+        exclusive: false,
+        detach_others: false,
+    };
+    let mut conn = match connect_with_retry(&sock, opts) {
+        Ok(c) => c,
+        Err(e) => {
+            print_connect_failure("lock acquire", &sock, &e);
+            return ExitCode::from(1);
+        }
+    };
+
+    // handshake 直後に daemon から flush される leader.notify などの broadcast 系を
+    // 飲み込む必要は無い (= recv_control は frame 境界で stop するので、後段で
+    // 「待っている response」を取りに行く時に紛れる)。実装簡略化のため、後段の
+    // recv loop 側で「期待外の message は捨てる」方式を取る。
+
+    // wait/timeout 戦略の polling 間隔。DR には明示が無いので 100ms 固定 (= 短すぎず
+    // 長すぎず、ユーザの体感応答 < 0.1s)。将来は env で調整可能にする余地あり。
+    const POLL_INTERVAL: Duration = Duration::from_millis(100);
+    let deadline: Option<Instant> = cfg
+        .timeout_ms
+        .map(|ms| Instant::now() + Duration::from_millis(ms));
+
+    // 取得 loop。
+    let acquired_token = loop {
+        let body =
+            hyoui::protocol::ControlMessage::LockAcquire(hyoui::protocol::messages::LockAcquire {
+                // wait の意味は daemon に伝えるが、MVP daemon は wait=true を queue 化
+                // していないので Denied が返ることを前提に CLI 側 polling で wait する。
+                // wait=true は将来 daemon 側 queue 実装で意味を持つ前向き signal。
+                wait: matches!(cfg.mode, LockMode::Wait),
+                timeout_abs_ms: cfg.timeout_ms,
+                timeout_idle_ms: None,
+                process_bound: false,
+            });
+        if let Err(e) = conn.send_control(&body) {
+            eprintln!("hyoui: lock acquire: send 失敗: {e}");
+            return ExitCode::from(1);
+        }
+        // response 待ち (frame 1 つ)。期待外の broadcast (mode.change 等) は捨てる。
+        let response = loop {
+            match conn.recv_control(None) {
+                Ok(hyoui::protocol::ControlMessage::LockResponse(lr)) => break lr,
+                Ok(hyoui::protocol::ControlMessage::Error(em)) => {
+                    eprintln!(
+                        "hyoui: lock acquire: daemon error: {} ({:?})",
+                        em.message, em.code
+                    );
+                    return ExitCode::from(1);
+                }
+                // mode.change / leader.notify 等は捨てて再受信
+                Ok(_) => continue,
+                Err(e) => {
+                    eprintln!("hyoui: lock acquire: recv 失敗: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+        };
+        match response.result {
+            hyoui::protocol::messages::LockResult::Acquired => {
+                break response.token.unwrap_or_default();
+            }
+            hyoui::protocol::messages::LockResult::Queued => {
+                // 将来 daemon が queue 実装した場合に来る path。CLI は単に response が
+                // 再送されてくるのを待つ (= 再 LockAcquire は送らない)。
+                // 簡略化のため本 MVP では Queued が来たら polling と同じ扱いで sleep + 再送する。
+                if let Some(dl) = deadline {
+                    if Instant::now() >= dl {
+                        eprintln!("hyoui: lock acquire: timeout (queued path)");
+                        return ExitCode::from(1);
+                    }
+                }
+                std::thread::sleep(POLL_INTERVAL);
+                continue;
+            }
+            hyoui::protocol::messages::LockResult::Denied => match cfg.mode {
+                LockMode::Fail => {
+                    eprintln!(
+                        "hyoui: lock acquire: denied (= 他者が lock 保持中、--mode=fail で即時 fail)"
+                    );
+                    return ExitCode::from(1);
+                }
+                LockMode::Wait => {
+                    if let Some(dl) = deadline {
+                        if Instant::now() >= dl {
+                            eprintln!("hyoui: lock acquire: timeout");
+                            return ExitCode::from(1);
+                        }
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                    continue;
+                }
+                // `LockMode` is `#[non_exhaustive]`; future variants surface as a
+                // generic skew error so older binaries report clearly.
+                _ => {
+                    eprintln!("hyoui: lock acquire: unknown --mode variant (binary/library skew)");
+                    return ExitCode::from(1);
+                }
+            },
+            hyoui::protocol::messages::LockResult::Timeout => {
+                eprintln!("hyoui: lock acquire: daemon timeout");
+                return ExitCode::from(1);
+            }
+            // `LockResult` is `#[non_exhaustive]`; treat unknown as failure (skew)
+            _ => {
+                eprintln!("hyoui: lock acquire: unknown LockResult variant (binary/library skew)");
+                return ExitCode::from(1);
+            }
+        }
+    };
+
+    // 取得済: token を stdout に 1 行 print + flush。shell capture (`$(hyoui lock acquire ...)`)
+    // 用に確実に flush しておく。
+    println!("{acquired_token}");
+    if let Err(e) = std::io::stdout().flush() {
+        eprintln!("hyoui: lock acquire: stdout flush 失敗: {e}");
+        // flush 失敗は重大ではない (= token は出力済の可能性)、続行
+        let _ = e;
+    }
+    eprintln!(
+        "hyoui: lock acquire: lock を保持中。Ctrl-C / SIGTERM / stdin EOF で release します。"
+    );
+
+    // block phase: stdin / socket / self-pipe を poll で並行監視。
+    // self-pipe を install して SIGINT/SIGTERM を捕る。
+    let pipe: hyoui::sys::SelfPipe = match hyoui::sys::install_self_pipe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("hyoui: lock acquire: self-pipe 作成失敗: {e} (続行、Ctrl-C は効きません)");
+            // self-pipe が作れなくても lock 解放はしないと困るので、明示的に release を試みて exit。
+            let _ = conn.send_control(&hyoui::protocol::ControlMessage::LockRelease(
+                hyoui::protocol::messages::LockRelease {
+                    token: acquired_token.clone(),
+                },
+            ));
+            drop(conn);
+            return ExitCode::from(1);
+        }
+    };
+    for sig in [
+        nix::sys::signal::Signal::SIGINT,
+        nix::sys::signal::Signal::SIGTERM,
+        nix::sys::signal::Signal::SIGHUP,
+    ] {
+        if let Err(e) = hyoui::sys::register_self_pipe(sig) {
+            eprintln!("hyoui: lock acquire: signal {sig:?} register 失敗: {e} (続行)");
+        }
+    }
+
+    let exit_code = wait_until_release_signal(&mut conn, &pipe);
+
+    // 解放: socket がまだ生きていれば LockRelease を best-effort で送る (= daemon は
+    // socket disconnect でも auto-release するが、明示的に release した方が綺麗で速い)。
+    let release_msg =
+        hyoui::protocol::ControlMessage::LockRelease(hyoui::protocol::messages::LockRelease {
+            token: acquired_token,
+        });
+    let _ = conn.send_control(&release_msg);
+    drop(conn);
+    let _ = pipe; // explicit drop (= 順序を明確にするだけ)
+
+    exit_code
+}
+
+/// `lock_acquire_command` の block phase: signal / stdin EOF / socket close を待つ。
+///
+/// poll で socket / stdin / self-pipe を並行監視し、最初に「終了」を示した fd の
+/// 種別に応じて `ExitCode` を返す:
+/// - SIGINT / SIGTERM / SIGHUP: 通常終了 (0)
+/// - stdin EOF (= POLLHUP): 通常終了 (0)
+/// - socket close (= POLLHUP on socket): 通常終了 (0、daemon 側 close は abnormal でも
+///   release は完了させた扱い)
+/// - I/O error: 1
+fn wait_until_release_signal(conn: &mut ClientConnection, pipe: &hyoui::sys::SelfPipe) -> ExitCode {
+    use hyoui::sys::poll::{PollFlags, PollOutcome, poll};
+    use nix::poll::{PollFd, PollTimeout};
+    use std::io::Read;
+    use std::os::fd::AsFd;
+
+    let stdin = std::io::stdin();
+    loop {
+        let socket_fd = conn.reader_fd();
+        let stdin_fd = stdin.as_fd();
+        let pipe_fd = pipe.read.as_fd();
+        let mut fds = [
+            PollFd::new(socket_fd, PollFlags::POLLIN),
+            PollFd::new(stdin_fd, PollFlags::POLLIN),
+            PollFd::new(pipe_fd, PollFlags::POLLIN),
+        ];
+        match poll(&mut fds, PollTimeout::NONE) {
+            Ok(PollOutcome::Ready(_)) => {}
+            Ok(PollOutcome::Interrupted) | Ok(PollOutcome::Timeout) => continue,
+            // `PollOutcome` is `#[non_exhaustive]`; future variants treated as benign
+            // continue (= 再 poll で確実な outcome を取り直す)。
+            Ok(_) => continue,
+            Err(e) => {
+                eprintln!("hyoui: lock acquire: poll 失敗: {e}");
+                return ExitCode::from(1);
+            }
+        }
+        let sock_re = fds[0].revents().unwrap_or(PollFlags::empty());
+        let stdin_re = fds[1].revents().unwrap_or(PollFlags::empty());
+        let pipe_re = fds[2].revents().unwrap_or(PollFlags::empty());
+        let _ = fds;
+
+        // self-pipe: signal 受信。drain して exit。
+        if pipe_re.contains(PollFlags::POLLIN) {
+            let _ = pipe.drain(); // best-effort
+            return ExitCode::SUCCESS;
+        }
+        // socket: daemon からの broadcast (mode.change 等) は飲み込む。close なら exit。
+        if sock_re.contains(PollFlags::POLLIN) {
+            match conn.recv_control(None) {
+                Ok(_) => continue, // broadcast を 1 つ捨てる
+                Err(_) => {
+                    // socket close / decode error → daemon 側で session 終了
+                    return ExitCode::SUCCESS;
+                }
+            }
+        } else if sock_re.contains(PollFlags::POLLHUP) || sock_re.contains(PollFlags::POLLERR) {
+            return ExitCode::SUCCESS;
+        }
+        // stdin: EOF を検知したら exit。pipe input の場合は stdin POLLIN が立つので
+        // 1 byte 読んで EOF (= read 0) なら終了扱い。tty stdin の場合は普通 POLLIN は
+        // 立たないので無視で OK。
+        if stdin_re.contains(PollFlags::POLLIN) {
+            let mut buf = [0u8; 64];
+            match stdin.lock().read(&mut buf) {
+                Ok(0) => return ExitCode::SUCCESS, // EOF
+                Ok(_) => {
+                    // stdin に何か届いたが lock acquire は中身を使わない (= 単に EOF 検知のため)。
+                    // 続行して次の poll iteration で再度待つ。
+                }
+                Err(e) => {
+                    eprintln!("hyoui: lock acquire: stdin read 失敗: {e}");
+                    return ExitCode::SUCCESS; // 解放だけは確実に行うため 0 で抜ける
+                }
+            }
+        } else if stdin_re.contains(PollFlags::POLLHUP) {
+            return ExitCode::SUCCESS;
+        }
+    }
+}
+
+/// `hyoui lock release <session> --token=<T>` / `hyoui unlock <session> --token=<T>` の dispatcher。
+///
+/// 共通実装。`cmd_label` は error message 出力時に subcommand 名を出し分けるための文字列
+/// (= `"lock release"` または `"unlock"`)。
+///
+/// **重要な制約** (= daemon-side semantics):
+/// daemon は `holder client (= 取得時の同 connection) からの release のみ` accept する
+/// (= [`crate::daemon::control::handle_lock_release`] が `state.lock_holder == Some(ch_id)`
+/// と token 一致の両方を要求する)。本 CLI は新規 connection で release を送るため、
+/// 別 process からの release は **必ず `LockNotHeld` で reject される**。
+/// その場合は stderr に hint を出して exit 1 する。
+fn lock_release_command(cmd_label: &str, cfg: LockReleaseConfig) -> ExitCode {
+    // token の解決: --token flag > HYOUI_LOCK_TOKEN env。両方未指定なら exit 2 で reject。
+    let token = match cfg
+        .token
+        .clone()
+        .or_else(|| std::env::var("HYOUI_LOCK_TOKEN").ok())
+    {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            eprintln!("hyoui: {cmd_label}: --token=<T> または環境変数 HYOUI_LOCK_TOKEN が必要です");
+            return ExitCode::from(2);
+        }
+    };
+    let sock =
+        match resolve_target_socket(cmd_label, cfg.socket.as_deref(), cfg.session_id.as_deref()) {
+            Ok(p) => p,
+            Err(code) => return code,
+        };
+    // release は新規 connection で送るため、daemon 側 holder 照合で必ず通らない。
+    // それでも protocol 的に正しく `LockRelease` を送って `lock.not-held` error を観測し、
+    // ユーザに明確な hint を返すのが現状の MVP 実装での誠実な挙動。
+    // (= 将来 daemon が token-based release を実装したらこの hint は不要になる)
+    let opts = AttachOptions {
+        mode: Mode::Rw,
+        caps: hyoui::protocol::MVP_CAPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        token: Some(token.clone()),
+        exclusive: false,
+        detach_others: false,
+    };
+    let mut conn = match connect_with_retry(&sock, opts) {
+        Ok(c) => c,
+        Err(e) => {
+            print_connect_failure(cmd_label, &sock, &e);
+            return ExitCode::from(1);
+        }
+    };
+    let body =
+        hyoui::protocol::ControlMessage::LockRelease(hyoui::protocol::messages::LockRelease {
+            token: token.clone(),
+        });
+    if let Err(e) = conn.send_control(&body) {
+        eprintln!("hyoui: {cmd_label}: send 失敗: {e}");
+        return ExitCode::from(1);
+    }
+    // response 待ち。`LockRelease` への 1 件目 control message を見る:
+    // - mode.change(Rw, lock_holder=None) なら成功 (= broadcast、release accept)
+    // - Error(LockNotHeld) なら failed (= 新規 connection なので daemon は holder mismatch で reject)
+    // - その他は不明 → 失敗扱い
+    let result = loop {
+        match conn.recv_control(None) {
+            Ok(hyoui::protocol::ControlMessage::ModeChange(mc)) => {
+                if matches!(mc.session_mode, hyoui::protocol::messages::SessionMode::Rw)
+                    && mc.lock_holder.is_none()
+                {
+                    break Ok(());
+                }
+                continue; // 関係ない mode.change は捨てて再受信
+            }
+            Ok(hyoui::protocol::ControlMessage::Error(em)) => {
+                break Err((em.code, em.message));
+            }
+            // leader.notify 等は捨てる
+            Ok(_) => continue,
+            Err(e) => {
+                eprintln!("hyoui: {cmd_label}: recv 失敗: {e}");
+                drop(conn);
+                return ExitCode::from(1);
+            }
+        }
+    };
+    drop(conn);
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err((code, message)) => {
+            eprintln!("hyoui: {cmd_label}: daemon error: {message} ({code:?})");
+            if matches!(code, hyoui::protocol::messages::ErrorCode::LockNotHeld) {
+                eprintln!(
+                    "       hint: lock は **取得時の同 connection** からのみ release できます。"
+                );
+                eprintln!(
+                    "             別 process で `hyoui lock acquire` を実行中なら、その process に"
+                );
+                eprintln!("             SIGTERM / SIGINT を送って解放してください。");
+            }
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// 1 つの [`InputSpec`] を実行する。bytes 系 spec (text/hex/file/paste/key) は
