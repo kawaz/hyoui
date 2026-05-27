@@ -843,31 +843,45 @@ mod tests {
 
     #[test]
     fn run_returns_when_daemon_closes() {
-        // /bin/true は即 exit → daemon の Session::serve も即終了 → client run も EOF
-        // で抜ける
-        let true_path = if std::path::Path::new("/usr/bin/true").exists() {
-            "/usr/bin/true"
-        } else {
-            "/bin/true"
-        };
-        let (_dir, handle, conn) = spawn_daemon_and_connect_client(vec![true_path.into()]);
+        // R5: 旧版は `/bin/true` の即 exit で daemon を畳んで socket close を
+        // 誘発していたが、`/bin/true` が serve_loop 起動前後に exit する race で
+        // listener が早期 drop され、client の `connect` 50 retry × 10ms 内に
+        // handshake が成立できず panic する flaky があった (= "test result:
+        // FAILED ... finished in 0.63s" 失敗パターン、bg 負荷下で再現)。
+        //
+        // 本 test の主旨は「daemon が socket を close した瞬間に client.run が
+        // 正常 return する」こと。child 即 exit に頼らず、`sleep 30` で daemon
+        // を一時的に生かして確実に connect/handshake を成立させた上で、
+        // `Kill` control message を送って明示的に daemon を畳む。socket close
+        // が起きるのは結局 daemon thread 終了時の `drop(listener)` 時点なので
+        // 検証意図は変わらない。
+        let (_dir, handle, mut conn) =
+            spawn_daemon_and_connect_client(vec!["/bin/sleep".into(), "30".into()]);
+
+        // daemon に Kill を送る (DR-0012: signal=None で default SIGTERM)。
+        // 受信した daemon は child に SIGTERM → reap → serve_loop 終了 →
+        // listener / socket close → client.run が socket EOF を観測して
+        // Ok(()) で抜ける、という経路。
+        conn.send_control(&ControlMessage::Kill(crate::protocol::messages::Kill {
+            signal: None,
+        }))
+        .expect("send kill");
 
         // stdin 側は pipe の read 端 (= write 端を即 close で EOF 状態)。
-        // poll が成立し、stdin_revents=POLLHUP or stdin EOF で run が抜ける。
+        // ただし本 test の終了条件は socket EOF 側であり、stdin EOF は副次的。
         let (rd, wr) = nix::unistd::pipe().expect("pipe");
         drop(wr);
         let mut stdin = std::fs::File::from(rd);
         let mut stdout = Vec::<u8>::new();
         let result = conn.run(&mut stdin, &mut stdout);
-        assert!(result.is_ok());
+        assert!(
+            result.is_ok(),
+            "run must return Ok on daemon close: {result:?}"
+        );
         let exit = handle.join().expect("daemon thread").expect("daemon run");
-        // race: 子 /bin/true 即 exit と client 側 stdin EOF → socket close の
-        // どちらが先に daemon に検知されるかでこの値が変わる:
-        // - 子 exit 検知が先 → ChildExited → exit 0
-        // - client EOF が先 → ClientDetachedOrKilled → SIGTERM → exit 0 or 143
-        //   (kill 時点で既に死んでれば 0、生きてれば 143)
-        // 本 test は「client.run が socket EOF で正常 return」のみ重要なので
-        // exit value は許容範囲を広く取る。
+        // SIGTERM kill → shell convention で 128 + SIGTERM(15) = 143。
+        // race で child が SIGTERM 前に exit していれば 0 もありうるが、
+        // `/bin/sleep 30` は明確に alive なので 143 が期待値。緩衝として 0 も許容。
         assert!(exit == 0 || exit == 143, "expected 0 or 143, got {exit}");
     }
 }
