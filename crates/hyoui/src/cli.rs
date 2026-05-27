@@ -4319,6 +4319,48 @@ mod tests {
         }
     }
 
+    /// QA edge: comma 連続 (= `Cells,,Cursor`) は途中に空要素が混じる形。
+    /// 既存 `parse_screen_snapshot_include_dedupe` は dedupe を扱うが、空要素
+    /// 単体に関する明示的 reject は別系統 (= `empty component in ...`) なので
+    /// 別 test として保護する。
+    #[test]
+    fn parse_screen_snapshot_include_consecutive_commas_errors() {
+        match parse_args(&args(&[
+            "screen",
+            "snapshot",
+            "demo",
+            "--include=Cells,,Cursor",
+        ])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("empty"), "msg: {msg}");
+            }
+            other => panic!("expected Error for consecutive commas, got {other:?}"),
+        }
+    }
+
+    /// QA edge: underscore 区切り (= `window_size`) も hyphen と等価に accept。
+    /// `parse_snapshot_include` の `chars().filter(c != '-' && c != '_')` 経路を保護。
+    #[test]
+    fn parse_screen_snapshot_include_accepts_underscore_form() {
+        match parse_args(&args(&[
+            "screen",
+            "snapshot",
+            "demo",
+            "--include=window_size,sequence_no",
+        ])) {
+            Command::Screen(ScreenCommand::Snapshot(cfg)) => {
+                assert_eq!(
+                    cfg.include,
+                    vec![
+                        SnapshotCliComponent::WindowSize,
+                        SnapshotCliComponent::SequenceNo,
+                    ]
+                );
+            }
+            other => panic!("expected Screen::Snapshot, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_screen_snapshot_format_cbor_default() {
         match parse_args(&args(&["screen", "snapshot", "demo", "--format=cbor"])) {
@@ -4553,6 +4595,42 @@ mod tests {
         match parse_args(&args(&["screen", "dump", "demo", "--rect=0,1,abc,24"])) {
             Command::Error(msg) => assert!(msg.contains("u16") || msg.contains("invalid")),
             other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// QA edge: 全ゼロ rect (= `0,0,0,0`) は構文上 valid。w=0/h=0 = 空 rect の
+    /// forward-compat 動作確認 (= daemon 側 ignore が想定挙動、CLI 段では reject しない)。
+    #[test]
+    fn parse_screen_dump_rect_all_zero_ok() {
+        match parse_args(&args(&["screen", "dump", "demo", "--rect=0,0,0,0"])) {
+            Command::Screen(ScreenCommand::Dump(cfg)) => {
+                let r = cfg.rect.expect("rect should be set");
+                assert_eq!((r.x, r.y, r.w, r.h), (0, 0, 0, 0));
+            }
+            other => panic!("expected Screen::Dump, got {other:?}"),
+        }
+    }
+
+    /// QA edge: u16 上限 (= 65535) を超える値は明示的に error。overflow 経路を
+    /// 確認しておく (= 黙って wrap-around しない安全網)。
+    #[test]
+    fn parse_screen_dump_rect_overflow_u16_errors() {
+        match parse_args(&args(&["screen", "dump", "demo", "--rect=0,0,80,99999"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("u16") || msg.contains("invalid"), "msg: {msg}");
+            }
+            other => panic!("expected Error for overflow, got {other:?}"),
+        }
+    }
+
+    /// QA edge: 負の値は u16 parse で reject される (= 符号付きにしていない確認)。
+    #[test]
+    fn parse_screen_dump_rect_negative_errors() {
+        match parse_args(&args(&["screen", "dump", "demo", "--rect=-1,0,80,24"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("u16") || msg.contains("invalid"), "msg: {msg}");
+            }
+            other => panic!("expected Error for negative value, got {other:?}"),
         }
     }
 
