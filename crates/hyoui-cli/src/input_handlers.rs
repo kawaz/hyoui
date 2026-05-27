@@ -573,6 +573,27 @@ mod tests {
         );
     }
 
+    /// QA edge: paste 中身に bracketed paste **開始** マーカー (= `ESC[200~`)
+    /// が含まれるのは reject **しない**。終端 (= `ESC[201~`) のみが nest 不能
+    /// として reject 対象 (= 子側で `ESC[200~` が来ても無害、現在 paste mode の
+    /// 上書きにしかならない)。仕様確認のための保護 test。
+    #[test]
+    fn paste_accepts_embedded_start_marker() {
+        let got = handle_paste("before\x1b[200~after").expect("accept");
+        // 開始マーカーは中身として透過、外側で再度 ESC[200~/ESC[201~ で wrap される
+        assert_eq!(&got[..6], b"\x1b[200~");
+        assert!(got.ends_with(b"\x1b[201~"));
+        assert!(got.windows(6).any(|w| w == b"\x1b[200~"));
+    }
+
+    /// QA edge: paste 中身に改行が含まれる (= multi-line) 場合、bytes そのまま
+    /// 透過される。`--line-ending=preserve` (default) の動作確認。
+    #[test]
+    fn paste_preserves_newlines() {
+        let got = handle_paste("line1\nline2\nline3").expect("wrap");
+        assert_eq!(got, b"\x1b[200~line1\nline2\nline3\x1b[201~");
+    }
+
     // --- key: ctrl ---
     #[test]
     fn key_ctrl_lowercase_letters() {
@@ -677,6 +698,29 @@ mod tests {
         // C-M-x (Ctrl-Alt-X)
         let err = handle_key("C-M-x").unwrap_err();
         assert!(err.contains("複合 modifier"), "got: {err}");
+    }
+
+    /// QA edge: modifier だけで key 部が空 (= `C-`、`M-`) は意味のない入力。
+    /// 暗黙の panic ではなく error として返ることを保護する (= `ctrl_byte("")` /
+    /// `M-` 経路の防御確認)。
+    #[test]
+    fn key_modifier_without_keyname_rejected() {
+        let err = handle_key("C-").unwrap_err();
+        assert!(
+            err.contains("Ctrl key") || err.contains("未知"),
+            "got: {err}"
+        );
+        let err = handle_key("M-").unwrap_err();
+        assert!(err.contains("M-") || err.contains("空"), "got: {err}");
+    }
+
+    /// QA edge: trailing whitespace を含む key 名 (= `"Enter "`) は trim せず
+    /// 未知扱いとして error (= 規範: ユーザ責任で正規化させる、暗黙 trim しない)。
+    #[test]
+    fn key_trailing_whitespace_rejected() {
+        // 末尾 space つき → named_key_bytes が見つけられず未知扱い
+        let err = handle_key("Enter ").unwrap_err();
+        assert!(err.contains("未知のキー名"), "got: {err}");
     }
 
     #[test]
