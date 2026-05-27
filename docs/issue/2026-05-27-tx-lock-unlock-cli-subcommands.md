@@ -1,10 +1,37 @@
 # Feature: tx / lock / unlock CLI subcommand 実装 (DR-0006 §7)
 
-- Status: Open (= 実装待ち、本 nonstop session の task #20 から切り出し)
+- Status: Partially Done (= `lock acquire` / `lock release` / `unlock` は実装完了、
+  `tx` のみ残置)
 - Date: 2026-05-27
 - Priority: Mid (= MVP の自動操作排他は env fallback で機能しているが、外側 wrapper の標準入口が無いと UX が固い)
 - 関連 DR: [[DR-0006]] §7 (Lock + tx 仕様正本)、[[DR-0006]] §8.5 (input family との関係)
 - 関連 task: #19 (= `--lock-token` flag + env fallback 配線済) の後続
+
+## 進捗
+
+### Done (= 本コミット群で完了)
+
+- `hyoui lock acquire <session> [--mode=wait|fail] [--timeout=<dur>]`
+- `hyoui lock release <session> --token=<T>` (= `HYOUI_LOCK_TOKEN` env fallback あり)
+- `hyoui unlock <session> --token=<T>` (= `lock release` alias)
+- parser unit test (= cli.rs に追加、20+ ケース)
+- integration test (= `crates/hyoui-cli/tests/lock_cli.rs`、6 ケース)
+
+採用 default + open question への解答:
+
+| 項目 | 採用 | 根拠 |
+|---|---|---|
+| `--mode` default | `wait` | 「待つ」が直感的、`fail` は明示 opt-in (DR-0006 §7 では未明示) |
+| `lock acquire` の生存戦略 | **block until SIGINT/SIGTERM/stdin EOF** | daemon は disconnect で auto-release するため、acquire を短命にすると token が即無効化される (= 開いた途端閉じる)。block 中は connection を保持しつつ token を stdout に print、シグナルや stdin EOF で release |
+| daemon-side timeout / refcount / process-bound | **未実装のまま** | `LockAcquire` 内の `timeout_abs_ms` / `timeout_idle_ms` / `process_bound` field は daemon が `let _ = req;` で受け流すだけ。timer thread の新規追加は本 task の scope 外。CLI 側 polling で `--timeout` semantics を擬似実現 |
+| wait queue (= `LockResult::Queued`) | **未実装のまま** | daemon は `wait=true` でも `Denied` を返す。CLI は `Denied` を見たら `--mode=wait` なら 100ms sleep して再送 polling |
+| 別 process からの release | **daemon が holder client 照合で reject (LockNotHeld)** | `handle_lock_release` が `state.lock_holder == Some(ch_id)` を要求するため、新規 connection からの release は通らない。CLI は hint を出して exit 1 (= holder process に SIGTERM を促す) |
+
+### Remaining (= 別 task)
+
+- `hyoui tx <name> [--timeout-* ...] -- cmd args...`
+  - 子 process 起動 + env `HYOUI_LOCK_TOKEN` 注入 + 子 exit で auto-unlock
+  - `--process-bound` (= 子 PID 紐付け auto-release) は daemon-side timer/refcount が要るので並行 task
 
 ## 背景
 
@@ -31,11 +58,9 @@ hyoui unlock <name> [--token T | --force]
 
 未実装 (= 本 issue で扱う):
 
-- `Command` enum に `Tx` / `Lock` / `Unlock` variant が **無い**
-- `parse_args` の match arm に `"tx"` / `"lock"` / `"unlock"` が **無い**。
-  `"send"` / `"detach"` は "reserved but not yet implemented" として明示されているが、
-  tx/lock/unlock は予約すらされていない
-- `hyoui-cli/src/main.rs` 側 dispatch も対応する handler 関数なし
+- ~~`Command` enum に `Tx` / `Lock` / `Unlock` variant が **無い**~~ ← `Lock` / `Unlock` は **実装済 (本コミット)**、`Tx` のみ残置
+- ~~`parse_args` の match arm に `"tx"` / `"lock"` / `"unlock"` が **無い**~~ ← `"lock"` / `"unlock"` は **配線済 (本コミット)**、`"tx"` のみ reserved 残置
+- ~~`hyoui-cli/src/main.rs` 側 dispatch も対応する handler 関数なし~~ ← `lock_acquire_command` / `lock_release_command` 実装済 (本コミット)、`tx_command` のみ未実装
 
 つまり「子側で `--lock-token`/env を使えば lock 配下で動ける」ところまでは出来ているが、
 **外側で lock を取って子を起こす wrapper 入口** がまだ無い。MVP では tx の代わりに
