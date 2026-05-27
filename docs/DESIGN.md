@@ -2,10 +2,15 @@
 
 > English | [日本語](./DESIGN-ja.md)
 
-This document describes the **current implementation** as of v0.1.0. The
-background, alternatives, and reasoning behind each decision live in
-`docs/decisions/`. This document focuses on "what is running" along the two
-axes of domain and architecture.
+This document describes the **current implementation** (v0.1.x line, with
+[[DR-0013]] Phase A/B reflected). Background, alternatives, and reasoning for
+each decision live in `docs/decisions/`. This document focuses on "what is
+running" along the two axes of domain and architecture.
+
+> [[DR-0013]] (2026-05-27) introduced a screen emulator (based on the `vt100`
+> crate) inside the daemon, putting wait / snapshot / dump / lock / the input
+> family onto a state-based foundation. This DESIGN treats the state-based
+> spec as canonical.
 
 ## 1. Domain
 
@@ -28,7 +33,7 @@ multiplexer.
 | **leader** | The representative client used for TIOCSWINSZ in a session (auto-granted to one of the rw clients) |
 | **mode** | Client operating mode (`rw` / `ro` / `rw-no-leader`) |
 | **lock** | Exclusive-acquisition state, identified by a token (for atomic automation) |
-| **scrollback** | A ring buffer of past output (data source for tail / wait) |
+| **scrollback** | A byte-base ring buffer of past output (data source for `tail`; see §2.5 for how it now coexists with the row-base screen state) |
 
 Vocabulary follows the "industry standard" choice in DR-0008 §4. The concept
 model is close to abduco / shpool.
@@ -54,23 +59,41 @@ crates/
   hyoui/            # library crate (all core functionality)
     src/
       lib.rs        # re-exports
-      cli.rs        # CLI parser (subcommand dispatch, argument parsing)
+      cli/          # CLI parser + per-subcommand handlers
+        mod.rs
+        input.rs    # hyoui input (= spec parser; text/hex/file/paste/key/wait*)
+        wait_core.rs # state-based wait polling (snapshot trigger + cells → text)
+        ...
       daemon/       # daemon side (server holding one session)
         mod.rs
-        config.rs   # session config (socket path, scrollback size, ...)
+        config.rs   # session config (socket path, scrollback size, screen sizes)
         session.rs  # Session::serve = multi-attach + broadcast + control plane
+        screen/     # vt100 ScreenState wrapper (DR-0013)
+          mod.rs
+          state.rs       # VirtualScreen (owns vt100::Parser as the canonical state)
+          input_log.rs   # bounded ring for primary buffer (resize replay)
+          snapshot.rs    # structured snapshot wrapper (CBOR compression)
+        control.rs  # control message dispatcher
+        broadcast.rs # writer pump + backpressure + ClientHandle
+        accept.rs   # handshake worker pool
+        wait.rs     # state polling helpers (snapshot trigger / poll interval)
+        tail.rs     # tail subscription
+        lock.rs     # SessionState + leader cascade
+        pty.rs      # child lifecycle
       client/       # client side (connects to the daemon)
         mod.rs
-        attach.rs   # ClientConnection (handshake + raw I/O + detach prefix)
+        attach.rs   # ClientConnection (handshake + raw I/O + detach prefix + raw bytes send)
       protocol/     # wire protocol
         mod.rs
         frame.rs    # u32 size + u8 type + body framing
         caps.rs     # capability negotiation (MVP_CAPS, intersect)
-        messages/   # CBOR control message types (handshake, lock, tail, wait, ...)
+        messages/   # CBOR control message types (handshake, lock, tail,
+                    #   screen.dump, screen.snapshot, ...)
         transports/ # Transport trait + UnixStreamTransport
-      scrollback.rs # ring buffer of timestamped chunks (tail/wait data source)
-      strip.rs      # ANSI escape sequence stripper (for wait text match)
-      observer.rs   # legacy interface (v0.0.0 vestige, removal candidate)
+      scrollback.rs # byte-base ring buffer (`hyoui tail` only: since / last_bytes
+                    #   semantics with receive-time ordering; see DR-0013 §8 Update)
+      strip.rs      # ANSI escape sequence stripper (used by `tail --strip`; wait
+                    #   no longer needs it since the state already holds cell text)
       sys/          # all unsafe is concentrated here
         raw.rs      # forkpty / login_tty (child process spawn)
         signal.rs   # sigaction, self-pipe
@@ -86,6 +109,9 @@ crates/
       socket_path.rs # socket directory resolver (XDG / TMPDIR)
       completion.rs # shell completion stub
 ```
+
+The daemon module split is canonical in [[DR-0009]]; the `screen/` subtree is
+canonical in [[DR-0013]].
 
 `#![forbid(unsafe_code)]` is applied to the entire `hyoui-cli` crate. In the
 `hyoui` library, `unsafe` is confined to `sys/raw.rs` and `sys/signal.rs`
@@ -113,33 +139,59 @@ Control message body (type=0x01) = CBOR map { "kind": "<dotted.name>", ...payloa
   breaking changes use a separate socket path (fork)
 - Control messages are CBOR maps where **unknown fields are ignored**;
   cap flags negotiate "what the peer can speak"
-- v0.1.0 cap set: `["data", "lock", "tail-v1", "screen-dump-v1", "state-snapshot-v1"]`
-- Wait is **state-based** (= no cap; CLI side polls `screen.snapshot.request`).
-  The legacy `wait.request` / `wait.result` path (scrollback regex, `wait-l0`
-  cap) was removed per the DR-0006 §9 revision.
+- v0.1.x cap set: `["data", "lock", "tail-v1", "screen-dump-v1", "state-snapshot-v1"]`
+- Wait is **state-based** (no dedicated cap or kind; the CLI side
+  `cli/wait_core.rs` polls `screen.snapshot.request`, rebuilds text from the
+  visible cells, and runs the regex). The legacy `wait.request` /
+  `wait.result` kinds, the `wait-l0` cap, and the `wait.*` error codes were
+  removed from both wire and implementation when DR-0006 §9 and DR-0013 §9
+  landed.
 
-### 2.3 Daemon (`crates/hyoui/src/daemon/session.rs`)
+### 2.3 Daemon (`crates/hyoui/src/daemon/`)
 
-`Session::serve` is the main loop. Responsibilities:
+`Session::serve` is the main loop. [[DR-0009]] split the responsibilities
+across nine modules — `session.rs` is now the orchestrator, with `pty.rs` /
+`accept.rs` / `broadcast.rs` / `control.rs` / `lock.rs` / `wait.rs` /
+`tail.rs` / `screen/` underneath. Responsibilities:
 
-- **PTY management**: master fd set to `set_nonblocking(true)`, raw bytes read out
-- **Client management**: socket accept, handshake (cap negotiation + mode +
-  token verification), maintains the list of `ClientHandle`
-- **Broadcast**: master → each client, encoding branches on subscription
-  (Raw / TailFollow), encoded payload cached per `strip_ansi` boolean to avoid
-  re-encoding
+- **PTY management** (`pty.rs`): the master fd is `set_nonblocking(true)`;
+  read pulls out raw bytes
+- **Screen state as the canonical source** (`screen/`, [[DR-0013]] Phase A/B):
+  - child PTY bytes are fed through `vt100::Parser::process` *before* any
+    broadcast (the state is the source of truth, not the raw stream)
+  - the `VirtualScreen` wrapper holds the cell grid / cursor / mode flags /
+    alt-screen switching / scrollback (row-base ring)
+  - on attach handshake, the daemon sends a single frame of **redraw bytes**
+    built from `state_formatted()` + alt-mode prepend, so the client's screen
+    is fully restored even for alt-screen-resident apps like `claude` TUI
+  - a bounded **input bytes log** (default 1 MiB) backs the primary buffer so
+    that a resize can rebuild a fresh parser and replay
+  - DEC synchronized-update (`?2026h`) hook + a 5 s stalled-sequence reset
+    serve as health checks
+- **Client management** (`accept.rs`): socket accept + handshake (cap
+  negotiation + mode + token verification), and the list of `ClientHandle`s
+- **Broadcast** (`broadcast.rs`): master → each client; encoding branches on
+  subscription (`Raw` / `TailFollow`); two encoded-payload caches keyed by
+  `strip_ansi` avoid re-encoding for clients sharing a subscription
 - **Multiplex**: each client → master (rw only; ro is silently dropped)
-- **Leader management**: a new rw client becomes leader only when none exists;
-  on leader detach the role cascades to the next rw client
-- **Lock state machine**: `SessionState { lock_holder, lock_token }`;
+- **Leader management** (`lock.rs`): a new rw client becomes leader only when
+  none exists; on leader detach the role cascades to the next rw client
+- **Lock state machine** (`lock.rs`): `SessionState { lock_holder, lock_token }`;
   release succeeds only when token + holder both match
-- **Scrollback**: owns `Scrollback::new(config.scrollback_bytes)`; pushed
-  immediately after each master read
-- **Pending waits**: a `Vec<PendingWait>` held by the serve loop, scanned on
-  every incoming master byte
-- **Backpressure**: `Arc<AtomicUsize> queued_bytes` enforces a per-byte cap;
-  on overflow an `error` with kind `backpressure.disconnect` is sent and the
-  client is `shutdown(Both)` and marked for removal
+- **Byte-base scrollback** (`scrollback.rs`): owns
+  `Scrollback::new(config.scrollback_bytes)`; pushed immediately after each
+  master read. Dedicated to the `hyoui tail` command (`--since` /
+  `--last-bytes`)
+- **State-based wait helpers** (`wait.rs`): incoming master bytes trigger
+  snapshot polling and compute the poll interval. The legacy L0 wait protocol
+  (`wait.request` / `wait.result` kinds) was removed; the actual matching
+  lives in the CLI (`cli/wait_core.rs`)
+- **Structured snapshot / dump** ([[DR-0013]] §9): handlers for
+  `screen.dump.request` / `screen.snapshot.request`, routed through the CBOR
+  compression wrapper in `screen/snapshot.rs`
+- **Backpressure** (`broadcast.rs`): `Arc<AtomicUsize> queued_bytes` enforces
+  a per-byte cap; on overflow an `error` with kind `backpressure.disconnect`
+  is sent and the client is `shutdown(Both)` and marked for removal
 
 Child process startup uses forkpty + login_tty ([[DR-0003]]); `posix_spawn` is
 rejected because it cannot acquire a controlling terminal.
@@ -148,17 +200,22 @@ rejected because it cannot acquire a controlling terminal.
 
 `ClientConnection::run` is the main loop. Responsibilities:
 
-- Sends handshake.request (caps / mode / token / exclusive / detach-others)
-- Receives handshake.response, settles `session_id` / `client_id` / `leader` / `mode`
+- Sends `handshake.request` (caps / mode / token / exclusive / detach-others)
+- Receives `handshake.response`, settles `session_id` / `client_id` /
+  `leader` / `mode`
+- Right after the handshake, writes the daemon's **redraw bytes frame**
+  ([[DR-0013]] §4) directly to stdout — that single frame fully restores the
+  pre-detach screen
 - stdin → frame writer (`type=0x00` raw data)
 - frame reader → stdout
 - **Detach prefix state machine**: `Ctrl-A D` detaches the client itself,
   `Ctrl-A Ctrl-A` sends a literal Ctrl-A to the child, `Ctrl-A <other>` is
   discarded (screen convention)
-- For one-shot CLIs (`status` / `tail` / `wait` / `kill` / `list`) the connection
-  exposes `recv_frame()` / `recv_control(buffer_raw_data)`
+- For one-shot CLIs (`input` / `screen dump` / `screen snapshot` / `tail` /
+  `wait` / `lock` / `kill` / `list` / `status`) the connection exposes
+  `recv_frame()` / `recv_control(buffer_raw_data)` / `send_raw_bytes()`
 
-### 2.5 Scrollback (`crates/hyoui/src/scrollback.rs`)
+### 2.5 Byte-base scrollback (`crates/hyoui/src/scrollback.rs`)
 
 ```rust
 struct OutputChunk { timestamp: Instant, bytes: Vec<u8> }
@@ -172,25 +229,51 @@ last_evicted_ts: Option<Instant>
   the result is incomplete
 - `--since-strict` turns incomplete results into a non-zero exit
 - Default: 4 MiB (chosen for claude / TUI workloads)
+- **Purpose**: this is the data source for `hyoui tail` only — its
+  receive-time ordering and timestamp filter make `since_ms` /
+  `--since-strict` / `--last-bytes` meaningful
+- Responsibility-separated from the vt100 internal ring (the row-base cell
+  layer in §2.6); see [[DR-0013]] §8 Update
 
-### 2.6 Strip (`crates/hyoui/src/strip.rs`)
+### 2.6 Row-base screen state (`crates/hyoui/src/daemon/screen/`)
 
-State-machine-based stripper for ANSI escape sequences (CSI / OSC / DCS /
-single-char). Used as preprocessing for wait's `--text` / `--pattern` matching.
-See `docs/findings/2026-05-26-ansi-strip.md` for details.
+The **vt100 ScreenState wrapper** introduced in [[DR-0013]] Phase A/B is the
+daemon's canonical screen representation.
 
-- Decoration stripping and newline conversion are kept as **separate layers**
-  ([[DR-0006]] §11)
+- `state.rs::VirtualScreen` owns a `vt100::Parser` (+ `Screen`)
+- Child PTY bytes are **always routed through the Parser** before any
+  broadcast (no direct raw-byte broadcast)
+- Exposed API: cell grid / cursor / mode flags (alt screen / app_keypad /
+  bracketed_paste / ...) / scrollback offset / window size / `state_formatted()`
+- On attach handshake, `state_formatted()` plus an alt-mode prepend become a
+  single redraw frame sent to the client
+- `input_log.rs`: bounded ring for the primary buffer (default 1 MiB); on
+  resize, a fresh parser is created and the log is replayed (this works
+  around vt100's `set_size` being truncate-only)
+- `snapshot.rs`: structured-state CBOR wrapper with sparse cells, Color
+  variant packed as an integer, and attribute bit packing for size
+
+### 2.7 Strip (`crates/hyoui/src/strip.rs`)
+
+State-machine ANSI escape sequence stripper (CSI / OSC / DCS / single-char).
+
+- **Current use**: `hyoui tail --strip` — preprocessing for piping the byte
+  stream into `grep` / scripts
+- The old use (preprocessing for wait's `--text` / `--pattern`) is gone:
+  state-based wait operates on text already extracted from cells, where
+  escapes simply do not exist ([[DR-0006]] §9.1)
+- Decoration stripping and newline conversion stay as **separate layers**
+  ([[DR-0006]] §11.1)
 - Stripping only removes ANSI escapes; BEL / BS / TAB / LF / CR are preserved
-- Newline conversion is a separate flag (`--newline-convert=preserve|lf|crlf`),
-  available on wait and tail independently
+- Newline conversion is a separate flag (`--newline-convert=preserve|lf|crlf`)
+  on the tail side
 
-### 2.7 sys module
+### 2.8 sys module
 
-All `unsafe` is confined to `sys/raw.rs` (forkpty / login_tty / TIOCSWINSZ) and
-`sys/signal.rs` (sigaction / self-pipe). `sys/socket.rs` enforces perm 0600 /
-dir 0700, `sys/poll.rs` wraps poll(2) type-safely, `sys/clock.rs` provides
-Instant ↔ epoch ms.
+All `unsafe` is confined to `sys/raw.rs` (forkpty / login_tty / TIOCSWINSZ)
+and `sys/signal.rs` (sigaction / self-pipe). `sys/socket.rs` enforces perm
+0600 / dir 0700, `sys/poll.rs` wraps poll(2) type-safely, `sys/clock.rs`
+provides Instant ↔ epoch ms.
 
 ## 3. Data flow
 
@@ -204,14 +287,34 @@ Instant ↔ epoch ms.
 [Unix socket]
    ↑↓
 [hyoui daemon (Session::serve)]
-   ↑↓ master fd read/write
+   ↑↓ master fd read → vt100::Parser::process → state update
+   ↑↓ master fd write
 [forkpty master FD]
    ↑↓ PTY
 [child process]
 ```
 
-The control plane (lock / resize / signal / handshake / ...) is multiplexed
-on the same socket as `type=0x01` CBOR frames.
+The control plane (lock / resize / signal / handshake / screen.dump /
+screen.snapshot / ...) is multiplexed on the same socket as `type=0x01` CBOR
+frames.
+
+### 3.1.1 Attach handshake redraw restore ([[DR-0013]] §4 Phase A)
+
+```
+[client] handshake.request (caps, mode, token)
+   ↓
+[daemon] handshake.response (session_id, client_id, settled caps)
+   ↓
+[daemon] alt-mode restore sequence (?1049h, etc.) prepended
+   + VirtualScreen::state_formatted()  // ANSI rebuilt from the grid
+   + explicit cursor reposition \x1b[<y>;<x>H appended
+   ↓ sent as one frame (type=0x00)
+[client] writes the frame to stdout — the pre-detach screen is fully restored
+```
+
+This is why **observing alt-screen-resident apps like `claude` TUI works
+cleanly after attach** — the child PTY is never asked to redraw, so the child
+sees attach as fully transparent.
 
 ### 3.2 Multi-attach broadcast
 
@@ -292,21 +395,26 @@ Adding a new OS starts from a fresh DR-0003-style decision record.
 
 ## 6. Release management
 
-- The single VERSION file plus `Cargo.toml [workspace.package].version` are kept
-  in sync by `pkf run bump-version`
-- A push to `main` triggers release.yml (detected by VERSION change)
+- The single VERSION file plus `Cargo.toml [workspace.package].version` are
+  kept in sync by `pkf run bump-version`
+- A push to `main` triggers `release.yml` (detected by VERSION change)
 - The workflow itself creates the tag and the GH Release (see the
   `release-flow-awareness` rule)
-- v0.1.0 was released on 2026-05-27 with 208 tests passing
+- v0.1.0 was released on 2026-05-27 with 208 tests passing. Subsequent
+  releases are incremental minor bumps as [[DR-0013]] Phase A/B and the
+  state-based revisions land. The version-segmented scope model has been
+  retired; `docs/ROADMAP.md` is canonical for scope (see [[DR-0007]] Update).
 
 ## 7. Related documents
 
 | Category | Location | Content |
 |---|---|---|
 | Philosophy | [[DR-0005]] | hyoui's direction (outside-driven automation, not a multiplexer) |
-| CLI spec | [[DR-0006]] | Operational model, automation APIs, exclusion |
-| MVP scope | [[DR-0007]] | v0.1.0 / v0.2.0 / v0.3.0+ staged release |
+| CLI spec | [[DR-0006]] | Operational model, automation APIs, exclusion (§8-§11 state-based) |
+| MVP scope | [[DR-0007]] | Staged release strategy (version segments retired; ROADMAP is canonical) |
 | Protocol | [[DR-0008]] | Wire format, cap flags, transport abstraction |
+| Screen emulator | [[DR-0013]] | Daemon = canonical screen state, attach restore, state-based foundation |
+| Session split | [[DR-0009]] | daemon/session.rs split into nine modules |
 | Job control | [[DR-0001]] | bg/fg two-axis, precise SIGTSTP/SIGCONT |
 | Language | [[DR-0003]] | Rust-only, forkpty + login_tty |
 | CLI shape | [[DR-0004]] | Subcommand approach |
