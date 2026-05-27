@@ -216,7 +216,15 @@ pub struct StatusConfig {
     pub format: StatusFormat,
 }
 
-/// `tail` subcommand configuration (Phase 11)。
+/// `tail` subcommand configuration (DR-0006 §11)。
+///
+/// DR-0013 §8 Update (2026-05-27) の責務分離方針で、tail は **byte-base scrollback
+/// layer (= `scrollback.rs`)** に対する raw bytes stream client として位置づけられた
+/// (= state-based の `wait` / `screen dump` / `screen snapshot` とは別 layer)。
+/// timestamp filter (= `--since` / `--since-strict`) も byte-base scrollback 上で動作する。
+///
+/// 用途は **log / script monitor**、**asciinema record の前段**、**daemon に届く生 bytes
+/// の debug 確認** など。画面 mirror 用途は `hyoui attach --read-only` を使う (= DR §11.3)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TailConfig {
     /// Target socket path (explicit) または session_id から resolve。
@@ -225,11 +233,14 @@ pub struct TailConfig {
     pub session_id: Option<String>,
     /// `--follow` で daemon が live stream を継続送信。
     pub follow: bool,
-    /// `--strip-ansi` で daemon 側で escape を strip 済の TailData を流す。
+    /// `--strip-ansi` (alias: `--strip`) で daemon 側で escape を strip 済の TailData を流す。
     pub strip_ansi: bool,
-    /// `--since=<ms>` (= 過去 ms 以内の chunk を bundle)、`None` なら全体。
+    /// `--since=<DUR>` (= 過去 DUR 以内の chunk を bundle)、`None` なら全体。
     pub since_ms: Option<u64>,
-    /// `--last-bytes=<n>` (= 末尾 n bytes に絞る)、`None` なら制限なし。
+    /// `--since-strict` (= since 範囲が scrollback ring buffer から evict 済の場合に
+    /// `TailEnd(BufferTruncated)` で exit 非 0)、`since_ms` と組み合わせて使う。
+    pub since_strict: bool,
+    /// `--last-bytes=<n>` (alias: `--last`、= 末尾 n bytes に絞る)、`None` なら制限なし。
     pub last_bytes: Option<u64>,
 }
 
@@ -735,13 +746,15 @@ fn parse_tail(args: &[String]) -> Command {
     let mut follow = false;
     let mut strip_ansi = false;
     let mut since_ms: Option<u64> = None;
+    let mut since_strict = false;
     let mut last_bytes: Option<u64> = None;
     let res = parse_session_targeted("tail", args, HelpTopic::Tail, |opt, value| match opt {
         "--follow" => {
             follow = true;
             Ok(false)
         }
-        "--strip-ansi" => {
+        // DR-0006 §11 では `--strip`、現状実装は `--strip-ansi`。両対応 (= 後方互換 + DR 整合)。
+        "--strip" | "--strip-ansi" => {
             strip_ansi = true;
             Ok(false)
         }
@@ -752,26 +765,36 @@ fn parse_tail(args: &[String]) -> Command {
             since_ms = Some(ms);
             Ok(true)
         }
-        "--last-bytes" => {
-            let v = value
-                .ok_or_else(|| Command::Error("tail: --last-bytes requires a value".into()))?;
+        "--since-strict" => {
+            since_strict = true;
+            Ok(false)
+        }
+        // DR-0006 §11 では `--last`、現状実装は `--last-bytes`。両対応 (= 後方互換 + DR 整合)。
+        "--last" | "--last-bytes" => {
+            let v = value.ok_or_else(|| Command::Error(format!("tail: {opt} requires a value")))?;
             let n = v
                 .parse::<u64>()
-                .map_err(|_| Command::Error(format!("tail: --last-bytes: bad number: {v}")))?;
+                .map_err(|_| Command::Error(format!("tail: {opt}: bad number: {v}")))?;
             last_bytes = Some(n);
             Ok(true)
         }
         other => Err(Command::Error(format!("tail: unknown option: {other}"))),
     });
     match res {
-        Ok((socket, session_id)) => Command::Tail(TailConfig {
-            socket,
-            session_id,
-            follow,
-            strip_ansi,
-            since_ms,
-            last_bytes,
-        }),
+        Ok((socket, session_id)) => {
+            if since_strict && since_ms.is_none() {
+                return Command::Error("tail: --since-strict requires --since=<DUR>".into());
+            }
+            Command::Tail(TailConfig {
+                socket,
+                session_id,
+                follow,
+                strip_ansi,
+                since_ms,
+                since_strict,
+                last_bytes,
+            })
+        }
         Err(c) => c,
     }
 }
@@ -1979,7 +2002,12 @@ fn usage_status() -> String {
 
 fn usage_tail() -> String {
     String::from(
-        "hyoui tail — stream scrollback / live output\n\
+        "hyoui tail — stream raw bytes from daemon (DR-0006 §11)\n\
+        \n\
+        daemon の byte-base scrollback layer + 現在の子 PTY bytes stream を生のまま流す\n\
+        (= DR-0013 §8 責務分離。state-based の wait/screen dump/screen snapshot とは別 layer)。\n\
+        用途: log/script monitor、asciinema record の前段、debug。\n\
+        画面 mirror 用途には使わない (= ANSI 再演で崩壊する。代わりに `hyoui attach --read-only`)。\n\
         \n\
         USAGE:\n    \
             hyoui tail <session-id> [options]\n    \
@@ -1988,9 +2016,10 @@ fn usage_tail() -> String {
         OPTIONS:\n    \
             --socket PATH        Explicit socket path (alternative to session-id)\n    \
             --follow             子 PTY exit / TailEnd まで stream を継続する\n    \
-            --strip-ansi         ANSI escape を strip 済の bytes を受け取る (best-effort)\n    \
+            --strip              ANSI escape を strip 済の bytes を受け取る (= `--strip-ansi` alias)\n    \
             --since DUR          過去 DUR 以内の chunk のみ流す。単位必須 (例: 500ms / 2s / 1m)\n    \
-            --last-bytes N       末尾 N bytes に絞る\n    \
+            --since-strict       --since の範囲が scrollback から evict 済なら exit 非 0\n    \
+            --last N             末尾 N bytes に絞る (= `--last-bytes` alias)\n    \
             -h, --help           Show this help and exit\n\
         \n\
         DURATION FORMAT (kawaz/timespec.mbt 仕様 + sub-ms 拡張):\n    \
@@ -2005,17 +2034,19 @@ fn usage_tail() -> String {
             ため対応せず。\n\
         \n\
         EXIT CODE:\n    \
-            0   正常終了 (= TailEnd 受信 or socket close)\n    \
-            1   connect / I/O 失敗\n\
+            0   正常終了 (= TailEnd Eof / ChildExited 受信 or socket close)\n    \
+            1   connect / I/O 失敗、または --since-strict で since 範囲が evict 済\n\
         \n\
         EXAMPLES:\n    \
             hyoui tail demo                       # 全 scrollback 1 度だけ流して exit\n    \
             hyoui tail demo --follow              # live stream を継続\n    \
             hyoui tail demo --since=10s           # 過去 10 秒分\n    \
-            hyoui tail demo --last-bytes=8192     # 末尾 8 KiB\n\
+            hyoui tail demo --since=10s --since-strict   # 10 秒が evict 済なら exit 非 0\n    \
+            hyoui tail demo --last=8192           # 末尾 8 KiB\n\
         \n\
         RELATED:\n    \
-            hyoui wait <id> ...       条件達成まで block (= polling 代替)\n    \
+            hyoui wait <id> ...       条件達成まで block (= state-based、画面 visible match)\n    \
+            hyoui screen dump <id>    現在 visible を 1 度 dump (= state-based)\n    \
             hyoui status <id>         clients / lock 状態を 1 度取得\n",
     )
 }
@@ -3182,7 +3213,57 @@ mod tests {
                 assert_eq!(cfg.session_id.as_deref(), Some("demo"));
                 assert!(cfg.follow);
                 assert_eq!(cfg.since_ms, Some(1_000));
+                assert!(!cfg.since_strict);
             }
+            other => panic!("expected Tail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_tail_with_since_strict() {
+        // DR-0006 §11: `--since-strict` で scrollback 不足を検知 → exit 非 0
+        match parse_args(&args(&["tail", "demo", "--since=10s", "--since-strict"])) {
+            Command::Tail(cfg) => {
+                assert_eq!(cfg.since_ms, Some(10_000));
+                assert!(cfg.since_strict);
+            }
+            other => panic!("expected Tail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_tail_since_strict_requires_since() {
+        // `--since-strict` 単独は意味を成さない (= filter する範囲が無い)。error 推奨。
+        match parse_args(&args(&["tail", "demo", "--since-strict"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("--since-strict"), "got msg={msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_tail_strip_dr_alias() {
+        // DR-0006 §11 では `--strip`。現状実装は `--strip-ansi`。両 alias 動作確認。
+        match parse_args(&args(&["tail", "demo", "--strip"])) {
+            Command::Tail(cfg) => assert!(cfg.strip_ansi),
+            other => panic!("expected Tail, got {other:?}"),
+        }
+        match parse_args(&args(&["tail", "demo", "--strip-ansi"])) {
+            Command::Tail(cfg) => assert!(cfg.strip_ansi),
+            other => panic!("expected Tail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_tail_last_dr_alias() {
+        // DR-0006 §11 では `--last N`。現状実装は `--last-bytes N`。両 alias 動作確認。
+        match parse_args(&args(&["tail", "demo", "--last=4096"])) {
+            Command::Tail(cfg) => assert_eq!(cfg.last_bytes, Some(4096)),
+            other => panic!("expected Tail, got {other:?}"),
+        }
+        match parse_args(&args(&["tail", "demo", "--last-bytes=4096"])) {
+            Command::Tail(cfg) => assert_eq!(cfg.last_bytes, Some(4096)),
             other => panic!("expected Tail, got {other:?}"),
         }
     }

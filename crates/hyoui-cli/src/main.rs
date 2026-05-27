@@ -810,7 +810,7 @@ fn tail_command(cfg: TailConfig) -> ExitCode {
     };
     let req = TailRequest {
         since_ms: cfg.since_ms,
-        since_strict: false,
+        since_strict: cfg.since_strict,
         follow: cfg.follow,
         strip_ansi: cfg.strip_ansi,
         last_bytes: cfg.last_bytes,
@@ -844,22 +844,27 @@ fn tail_command(cfg: TailConfig) -> ExitCode {
                     }
                     ControlMessage::TailEnd(te) => {
                         // H4: 終了理由を stderr に明示 (= `| tee log` 等でログから
-                        // どの理由で stream が止まったかを知れるようにする)
+                        // どの理由で stream が止まったかを知れるようにする)。
+                        // DR-0006 §11: `--since-strict` で BufferTruncated を受けたら
+                        // exit 非 0 (= since 範囲が scrollback ring から evict 済)。
                         use hyoui::protocol::messages::TailEndReason;
-                        let reason_str = match te.reason {
-                            TailEndReason::Eof => "eof (= scrollback flush done)",
-                            TailEndReason::BufferTruncated => {
-                                "buffer-truncated (= since range evicted from ring buffer)"
+                        let (reason_str, exit_code) = match te.reason {
+                            TailEndReason::Eof => {
+                                ("eof (= scrollback flush done)", ExitCode::SUCCESS)
                             }
-                            TailEndReason::ClientCancel => "client-cancel",
-                            TailEndReason::ChildExited => "child-exited",
+                            TailEndReason::BufferTruncated => (
+                                "buffer-truncated (= since range evicted from ring buffer)",
+                                ExitCode::from(1),
+                            ),
+                            TailEndReason::ClientCancel => ("client-cancel", ExitCode::SUCCESS),
+                            TailEndReason::ChildExited => ("child-exited", ExitCode::SUCCESS),
                             // `TailEndReason` is `#[non_exhaustive]`; future
                             // variants surface as "unknown" so logging stays
                             // readable on version skew.
-                            _ => "unknown",
+                            _ => ("unknown", ExitCode::SUCCESS),
                         };
                         eprintln!("hyoui: tail: stream ended ({reason_str})");
-                        return ExitCode::SUCCESS;
+                        return exit_code;
                     }
                     ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
                     _ => continue,
