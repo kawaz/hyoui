@@ -52,6 +52,10 @@ hyoui は **PTY を介在させるが、その上の semantics には介入し�
 - [ ] **介入箇所が kernel / PTY / shell の標準機能でできることを再発明していないか?**
   (= 例: 子の SIGCHLD 受信は親プロセスの kernel 標準機能、新 protocol で監視 message を流すのは再発明)
 - [ ] **新 protocol message を増やすなら、その必然性を DR に書けるか?** (= cap flag 追加は重い判断)
+- [ ] **partial state を hyoui の裁量で破棄する介入か?** = 子の bytes / signal /
+  process state を「壊れている」「異常」と hyoui が判定して情報を捨てる介入の場合、
+  その判定基準が DR で明示されているか、より保守的な選択肢 (= warn のみ / 手動 reset)
+  を提供しているか
 
 ### 検証主義 (= 推測で実装しない、サンプル 1 で判断しない)
 
@@ -126,6 +130,10 @@ DR-0013 完了で screen dump / snapshot / tail / wait 等の **観測道具が�
 2. **claude TUI サンプル 1 で原因断定** (= vim / less / bash / cat 等で検証せず推測で結論)
 3. **「マトリクス検証は別 task」と先送り** (= 修正前にマトリクスを埋めず、自分の仮説を信じて
    実装に進んだ)
+4. **partial state を hyoui の裁量で「broken」判定して自動破棄** (= 例: stalled
+   sequence の 3 連続自動 reset で vt100 state を捨てる、子側で OSC52 paste や DCS
+   sixel の途中だった場合に情報損失) = warn default + 手動 reset CLI への退避、
+   自動破棄が必要なら判定基準を DR に明示
 
 ## 関連
 

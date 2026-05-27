@@ -172,6 +172,23 @@ handoff sketch §6 で挙げていた「flush 課題」は emulator 採用で**�
   stream で parser が永久に partial 状態に閉じ込められるのを防ぐ)
 - timeout 発火時は warn ログ + parser internal buffer clear (= 過去 byte は捨てる)
 
+#### Update (2026-05-27, post-DR-0014 audit): partial state 自動破棄の保守化
+
+Phase B 実装で「stalled 5s × 3 連続 → 自動 reset」とした (= partial sequence を
+vt100 state ごと捨てる強い介入)。DR-0014 制定後の self-audit
+(= `docs/findings/2026-05-27-self-audit-after-dr-0014.md` Item 4) で
+「partial state を裁量で破棄する介入」として識別、以下に補強:
+
+- **判定基準の明示**: 3 連続検知は「typical SGR/CSI sequence は 1-30 bytes、5 秒で
+  完結しないのは真に異常」という仮定に基づく。OSC52 (clipboard) の base64 巨大 paste
+  / DCS sixel 部分送信 / ネスト sync update 等、子は正常だが時間がかかるケースで
+  false-positive リスクあり
+- **false-positive 対策**: `HYOUI_STALLED_AUTO_RESET=0` で default OFF 化を将来検討
+  (= 別 task)、または warn のみ + 手動 reset CLI 提供
+- **マトリクス検証要否**: 巨大 OSC52 paste / DCS sixel / ネスト sync update での
+  false-positive 検証を DR-0014 マトリクス verification に登録 (= cell 候補リスト
+  あり、audit findings 参照)
+
 ### 6. alternate screen hook
 
 vt100 が `?1049h` / `?1049l` / `?1047h` / `?1047l` / `?47h` / `?47l` を内部処理する。
@@ -224,6 +241,23 @@ tmux の `window-size` option (= `smallest` / `largest` / `manual` / `latest`) �
 - observe mode (= §12) client は計算から除外
 - MVP は `smallest` 固定で実装、設定で 4 モード化は Phase C
 - size 変更時は **全 client に同じ grid を送る** (= 個別 viewport は持たない、zellij pattern)
+
+#### Update (2026-05-27, post-DR-0014 audit): resize race の spec
+
+primary buffer 用 input bytes log で resize 時 replay する設計だが、以下 race を
+spec として明示する (= `docs/findings/2026-05-27-self-audit-after-dr-0014.md` Item 5):
+
+- **同時 attach race**: resize と同じタイミングで新 client が attach した場合、
+  attach 復元 redraw は **resize 完了後の新 size** で生成される必要がある (= 旧 size
+  で生成 → resize → 旧 cell が arrange 不能、を防ぐ)。実装上は resize completion を
+  flag で gate
+- **input log 上限到達 race**: log capacity 1 MiB 直前で resize → replay 時に log が
+  既に古い byte を evict 済の場合、復元できる範囲は log 残存分のみ。これは仕様上の
+  限界として明示 (= log size を増やすか、resize 後の画面が部分的に欠ける)
+- **alt screen 中の resize**: alt 中は子に WINCH のみ、primary log への影響なし
+  (= alt 中 push してないので)。alt → primary 復帰時は子側で再描画想定
+
+これらは DR-0014 マトリクス verification の cell 候補。
 
 ### 8. scrollback 管理
 

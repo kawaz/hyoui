@@ -51,6 +51,15 @@ Terminal multiplexer ではない (= tmux/screen の代替ではない)。
 | hyoui 出力履歴 | `hyoui tail <session> --last-bytes=N --since-strict` |
 | shell jobs | `jobs -l` |
 
+### partial state を扱う実装の規律
+
+stalled / reset / 自動破棄系の実装 (= state を「壊れている」と判定して捨てる) は
+特に慎重に扱う:
+- default は **warn のみ + 手動操作** (= 自動破棄しない)
+- 自動破棄が必要なら判定基準を DR に明示 + マトリクス検証で false-positive 検証
+- 例: OSC52 巨大 paste / DCS sixel 部分送信 / ネスト sync update など、
+  「子は正常だが時間がかかっている」ケースを false-positive で破棄しない
+
 ## Anti-patterns (= DR-0014 §Anti-patterns、繰り返し禁止)
 
 実際にやらかした anti-pattern。今後 self-check で弾く:
