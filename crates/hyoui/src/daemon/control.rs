@@ -707,13 +707,18 @@ fn reject_unexpected_kind(idx: usize, clients: &[ClientHandle]) -> ClientFrameOu
 ///
 /// - cap `screen-dump-v1` が必要
 /// - format = json は format-not-implemented を返す (= MVP scope 外)
-/// - layer = scrollback / both は layer-not-implemented を返す
-/// - rect は受信するが現状全画面のみ対応 (= 無視)
+/// - layer = scrollback / both は config の `screen_vt100_scrollback_rows` に従って
+///   `daemon/screen/snapshot.rs` の `build_screen_dump` で配線済
+/// - rect は受信するが現状全画面のみ対応 (= 無視、forward-compat field)
+///
+/// `&mut ScreenState` を要求する理由: scrollback layer 抽出のため vt100
+/// `set_scrollback` を一時的に操作する必要があり、論理的には副作用なしだが
+/// API 制約で mutable 借用が必要 (= [`super::screen::snapshot::build_screen_dump`] 参照)。
 fn handle_screen_dump_request(
     idx: usize,
     req: ScreenDumpRequest,
     clients: &mut [ClientHandle],
-    screen_state: &ScreenState,
+    screen_state: &mut ScreenState,
 ) -> ClientFrameOutcome {
     if ensure_cap(
         &clients[idx],
@@ -756,16 +761,6 @@ fn handle_screen_dump_request(
                 ControlMessage::Error(ErrorMessage {
                     code: ErrorCode::ProtocolMalformed,
                     message: "screen.dump format not implemented in MVP (json)".into(),
-                    details: None,
-                }),
-            );
-        }
-        Err(super::screen::snapshot::ScreenDumpError::LayerNotImplemented(_)) => {
-            let _ = send_control(
-                &clients[idx],
-                ControlMessage::Error(ErrorMessage {
-                    code: ErrorCode::ProtocolMalformed,
-                    message: "screen.dump layer not implemented in MVP (scrollback / both)".into(),
                     details: None,
                 }),
             );

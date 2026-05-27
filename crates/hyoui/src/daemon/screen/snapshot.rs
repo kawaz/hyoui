@@ -59,9 +59,9 @@ pub(crate) enum ScreenDumpFormat {
 pub(crate) enum ScreenDumpLayer {
     /// 現在 visible な viewport のみ。
     Visible,
-    /// scrollback 全行のみ (= visible より過去)。Phase B では vt100 内蔵 scrollback
-    /// が `Parser::new(_, _, 0)` で無効化されているため、空配列が返る (= 設計上の
-    /// 制約、Phase C で配線)。
+    /// scrollback 全行のみ (= visible より過去)。Phase C で vt100 内蔵 scrollback ring を
+    /// `config.screen_vt100_scrollback_rows` (default 1000 行) 経由で配線済。
+    /// `screen_vt100_scrollback_rows == 0` 設定なら空 payload が返る。
     Scrollback,
     /// scrollback + visible の連結。
     Both,
@@ -220,119 +220,255 @@ fn is_default_cell(cell: &RowCellSnap) -> bool {
 
 /// `ScreenDumpRequest` を処理して bytes を組み立てる。
 ///
-/// format に応じて:
-/// - `Ansi`: `state_formatted()` (alt mode prepend は含めない、redraw.rs と区別)
-/// - `Binary`: cells を空白除去 + attribute 無視で plaintext 化
-/// - `Json`: `build_screen_snapshot` を `serde_json` 相当で encode … と言いたいが
-///   hyoui は serde_json を持たないため、`ciborium` で CBOR diag (= text) を吐く
-///   代わりに `Json` は **未実装** として `ProtocolMalformed` 相当を caller 側で
-///   返す (= MVP scope 外)
-/// - `Cbor`: `build_screen_snapshot` を CBOR encode した bytes
+/// format × layer の dispatch:
 ///
-/// `layer` は本 phase では `Visible` のみ実装。`Scrollback` / `Both` は caller 側で
-/// 拒否する (= cap flag で gating した上で、未実装 layer は error 返却)。
+/// | format | Visible | Scrollback | Both |
+/// |--------|---------|------------|------|
+/// | Ansi | `state_formatted()` | scrollback rows を ANSI escape で再構築 | scrollback + visible 連結 |
+/// | Binary | 空白除去 plaintext | scrollback の空白除去 plaintext | 連結 |
+/// | TextPlain | cell 空白 + 行末空白保持 | scrollback の cell 空白 + 行末空白保持 | 連結 |
+/// | Cbor | `ScreenSnapshot` (cells = visible) | `ScreenSnapshot` (cells = scrollback) | `ScreenSnapshot` (cells = scrollback + visible) |
+/// | Json | 未実装 (= `FormatNotImplemented`) | 同左 | 同左 |
+///
+/// - `Both` layer は scrollback rows を **先頭** に、visible rows を後続に置く形で連結する
+///   (= 古い → 新しい時系列順を維持)。
+/// - Cbor の `cells` 座標は連結後の行を 0-origin で振り直す (= caller は単一 grid として扱える)。
+///
+/// `&mut ScreenState` を要求するのは scrollback rows を抽出するために vt100
+/// `set_scrollback` を一時的に呼ぶ必要があるため (= 副作用は内部で復元するので
+/// 論理的には state 不変、API 制約上のみ mutable 借用)。
 ///
 /// 戻り値は `Result<Vec<u8>, ScreenDumpError>`。caller が error を error.* 経由で
 /// client に通知する。
 pub(crate) fn build_screen_dump(
-    state: &ScreenState,
+    state: &mut ScreenState,
     format: ScreenDumpFormat,
     layer: ScreenDumpLayer,
 ) -> Result<Vec<u8>, ScreenDumpError> {
-    if layer != ScreenDumpLayer::Visible {
-        return Err(ScreenDumpError::LayerNotImplemented(layer));
+    // Json はどの layer でも MVP scope 外 (= 早期 return で他の分岐を簡素化)。
+    if matches!(format, ScreenDumpFormat::Json) {
+        return Err(ScreenDumpError::FormatNotImplemented(format));
     }
-    match format {
-        ScreenDumpFormat::Ansi => Ok(state.state_formatted()),
-        ScreenDumpFormat::Binary => Ok(build_plain_text(state)),
-        ScreenDumpFormat::Json => Err(ScreenDumpError::FormatNotImplemented(format)),
-        ScreenDumpFormat::Cbor => {
-            let snap = build_screen_snapshot(state);
-            let mut buf = Vec::new();
-            ciborium::ser::into_writer(&snap, &mut buf)
-                .map_err(|_| ScreenDumpError::EncodeFailed)?;
-            Ok(buf)
+    // Cbor は format 全体で 1 つの ScreenSnapshot を組み立てる (= layer 別に cells を差し替え)。
+    if matches!(format, ScreenDumpFormat::Cbor) {
+        let snap = build_layered_snapshot(state, layer);
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&snap, &mut buf).map_err(|_| ScreenDumpError::EncodeFailed)?;
+        return Ok(buf);
+    }
+    // text 系 (Ansi / Binary / TextPlain) の layer 別 dispatch。
+    match layer {
+        ScreenDumpLayer::Visible => match format {
+            ScreenDumpFormat::Ansi => Ok(state.state_formatted()),
+            ScreenDumpFormat::Binary => Ok(build_plain_text_from_rows(
+                &state.snapshot_visible_rows(),
+                /* trim_trailing = */ true,
+            )),
+            ScreenDumpFormat::TextPlain => Ok(build_plain_text_from_rows(
+                &state.snapshot_visible_rows(),
+                /* trim_trailing = */ false,
+            )),
+            // Cbor / Json は上で処理済 (= unreachable)
+            ScreenDumpFormat::Cbor | ScreenDumpFormat::Json => unreachable!(),
+        },
+        ScreenDumpLayer::Scrollback => {
+            let sb_rows = state.snapshot_scrollback_rows();
+            match format {
+                ScreenDumpFormat::Ansi => Ok(rows_to_ansi(&sb_rows)),
+                ScreenDumpFormat::Binary => Ok(build_plain_text_from_rows(&sb_rows, true)),
+                ScreenDumpFormat::TextPlain => Ok(build_plain_text_from_rows(&sb_rows, false)),
+                ScreenDumpFormat::Cbor | ScreenDumpFormat::Json => unreachable!(),
+            }
         }
-        ScreenDumpFormat::TextPlain => Ok(build_text_plain(state)),
+        ScreenDumpLayer::Both => {
+            let sb_rows = state.snapshot_scrollback_rows();
+            let visible_rows = state.snapshot_visible_rows();
+            let mut combined = sb_rows;
+            combined.extend(visible_rows);
+            match format {
+                ScreenDumpFormat::Ansi => Ok(rows_to_ansi(&combined)),
+                ScreenDumpFormat::Binary => Ok(build_plain_text_from_rows(&combined, true)),
+                ScreenDumpFormat::TextPlain => Ok(build_plain_text_from_rows(&combined, false)),
+                ScreenDumpFormat::Cbor | ScreenDumpFormat::Json => unreachable!(),
+            }
+        }
     }
 }
 
-/// `Binary` format の plaintext 出力 (= 空白除去 + 改行 + attribute 無視)。
+/// layer 別に cells を差し替えた `ScreenSnapshot` を組み立てる (= Cbor 用)。
 ///
-/// 各 row を「末尾空白を trim して `\n` 区切り」で連結。grep 等の用途に最適化。
-fn build_plain_text(state: &ScreenState) -> Vec<u8> {
-    let (rows, cols) = state.size();
-    let mut out = Vec::with_capacity(rows as usize * cols as usize);
-    let visible = state.snapshot_visible_rows();
-    for row in visible.iter() {
-        let mut line = String::with_capacity(cols as usize);
-        for cell in row.iter() {
-            if cell.is_wide_continuation {
-                // 全角継続は飛ばす (= 先頭 cell の contents が `あ` 等で 1 度に追記済)
+/// - `Visible`: 既存 `build_screen_snapshot` と等価 (visible viewport の cells)
+/// - `Scrollback`: scrollback rows を cells に置く。`rows` field は実 scrollback 行数
+///   (= 表示用 viewport size とは別)
+/// - `Both`: scrollback + visible 連結。座標は 0-origin で振り直す
+///
+/// cursor / mode / buffer / current_seqno は **常に現在の state** を反映する
+/// (= 過去の state ではない、scrollback 中の cursor 履歴は vt100 が持たない)。
+fn build_layered_snapshot(state: &mut ScreenState, layer: ScreenDumpLayer) -> ScreenSnapshot {
+    let (visible_rows_size, cols) = state.size();
+    let cursor_snap = state.snapshot_cursor();
+    let mode_snap = state.snapshot_mode();
+    let seqno = state.current_seqno();
+
+    let rows_data: Vec<Vec<RowCellSnap>> = match layer {
+        ScreenDumpLayer::Visible => state.snapshot_visible_rows(),
+        ScreenDumpLayer::Scrollback => state.snapshot_scrollback_rows(),
+        ScreenDumpLayer::Both => {
+            let sb_rows = state.snapshot_scrollback_rows();
+            let visible_rows = state.snapshot_visible_rows();
+            let mut combined = sb_rows;
+            combined.extend(visible_rows);
+            combined
+        }
+    };
+    let total_rows: u16 = u16::try_from(rows_data.len()).unwrap_or(u16::MAX);
+    // viewport rows は `Visible` layer の場合だけ実 viewport size、それ以外は
+    // 実際に出力する行数を rows field に載せる (= caller が cells の座標範囲を
+    // この値で解釈できるようにするため)。
+    let rows_field = match layer {
+        ScreenDumpLayer::Visible => visible_rows_size,
+        _ => total_rows,
+    };
+
+    let mut cells = Vec::new();
+    for (r_idx, row) in rows_data.iter().enumerate() {
+        for (c_idx, cell) in row.iter().enumerate() {
+            if is_default_cell(cell) {
                 continue;
             }
+            cells.push(CellPos {
+                r: r_idx as u16,
+                c: c_idx as u16,
+                cell: CellSnapshot {
+                    text: cell.contents.clone(),
+                    attrs: cell.attrs,
+                    wide: cell.is_wide,
+                },
+            });
+        }
+    }
+    ScreenSnapshot {
+        rows: rows_field,
+        cols,
+        cursor: CursorSnapshot {
+            row: cursor_snap.row,
+            col: cursor_snap.col,
+            visible: cursor_snap.visible,
+        },
+        mode: ModeSnapshot {
+            alternate_screen: mode_snap.alternate_screen,
+            application_keypad: mode_snap.application_keypad,
+            application_cursor: mode_snap.application_cursor,
+            bracketed_paste: mode_snap.bracketed_paste,
+            hide_cursor: mode_snap.hide_cursor,
+        },
+        cells,
+        buffer: if mode_snap.alternate_screen {
+            BufferKind::Alternate
+        } else {
+            BufferKind::Primary
+        },
+        current_seqno: seqno,
+    }
+}
+
+/// rows × cols の cell grid を ANSI escape sequence 化する (= scrollback / both layer 用)。
+///
+/// vt100 `state_formatted()` は内部 grid 全体に対する formatted output だが、
+/// scrollback offset を切り替えての formatted 出力 API は vt100 0.16 では公開されて
+/// いない。本実装では各 cell の SGR 属性を `\x1b[` escape で再構築し、行末に `\r\n` を
+/// 入れて連結する。
+///
+/// 制限: SGR の **bold / italic / underline / inverse** のみ反映。色情報は
+/// `RowCellSnap` が保持していないため落とす (= MVP scope。色を完全に保持したい
+/// なら snapshot 経路の cbor を使う想定)。caller が `cat` で再生したときに装飾は
+/// 落ちて見えるが、文字列内容は正しく再現される。
+fn rows_to_ansi(rows: &[Vec<RowCellSnap>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    // cursor を 1,1 に移して描画開始 (= state_formatted() に近い前置き)。
+    out.extend_from_slice(b"\x1b[H");
+    let mut prev_attrs: u8 = 0;
+    for row in rows.iter() {
+        for cell in row.iter() {
+            if cell.is_wide_continuation {
+                continue; // 先頭 cell が 2 col 分の contents を持つので skip
+            }
+            // SGR change が必要なら escape を吐く
+            if cell.attrs != prev_attrs {
+                out.extend_from_slice(b"\x1b[0m"); // reset
+                if cell.attrs & 1 != 0 {
+                    out.extend_from_slice(b"\x1b[1m"); // bold
+                }
+                if cell.attrs & (1 << 1) != 0 {
+                    out.extend_from_slice(b"\x1b[3m"); // italic
+                }
+                if cell.attrs & (1 << 2) != 0 {
+                    out.extend_from_slice(b"\x1b[4m"); // underline
+                }
+                if cell.attrs & (1 << 3) != 0 {
+                    out.extend_from_slice(b"\x1b[7m"); // inverse
+                }
+                prev_attrs = cell.attrs;
+            }
             if cell.contents.is_empty() {
-                line.push(' ');
+                out.push(b' ');
             } else {
-                line.push_str(&cell.contents);
+                out.extend_from_slice(cell.contents.as_bytes());
             }
         }
-        // 末尾空白を trim
-        let trimmed = line.trim_end_matches(' ');
-        out.extend_from_slice(trimmed.as_bytes());
-        out.push(b'\n');
+        out.extend_from_slice(b"\r\n");
+    }
+    if prev_attrs != 0 {
+        out.extend_from_slice(b"\x1b[0m"); // 末尾の attr reset
     }
     out
 }
 
-/// `TextPlain` format の plaintext 出力 (= ANSI escape 除去 + cell 空白 / 行末空白
-/// 保持 + 改行 + attribute 無視)。claude TUI PoC feedback への対応。
+/// 与えられた rows × cols の cell grid を plaintext 化する。
 ///
-/// `build_plain_text` (= `Binary` format) との差分:
-/// - 行末空白を **trim しない** (= 元の盤面の padding を温存する)
-/// - 結果として、各 row は「viewport の cols 数」分の char + 改行で出力される
-///   (= wide char 継続 cell の skip 分を除く)
+/// - `trim_trailing = true` (= `Binary` format): 各 row の末尾空白を trim する
+///   (= grep 向けの空白除去)
+/// - `trim_trailing = false` (= `TextPlain` format): 行末空白を保持する
+///   (= TUI 盤面の padding をそのまま温存)
 ///
-/// TUI app (例: claude TUI のステータスバー + 入力欄構成) は「描かれていない領域は
-/// 空白」という前提で盤面を組むため、本 format で行構造をそのまま保持しないと
-/// 「ほぼ空に見える」状態になる。本 format は装飾なしで盤面の見た目を再現する。
-fn build_text_plain(state: &ScreenState) -> Vec<u8> {
-    let (rows, cols) = state.size();
-    let mut out = Vec::with_capacity(rows as usize * (cols as usize + 1));
-    let visible = state.snapshot_visible_rows();
-    for row in visible.iter() {
-        let mut line = String::with_capacity(cols as usize);
+/// 全 row に共通: 空 cell は半角 space、wide 継続 cell は skip、改行で行分け。
+fn build_plain_text_from_rows(rows: &[Vec<RowCellSnap>], trim_trailing: bool) -> Vec<u8> {
+    let est_cols = rows.first().map(|r| r.len()).unwrap_or(0);
+    let mut out = Vec::with_capacity(rows.len() * (est_cols + 1));
+    for row in rows.iter() {
+        let mut line = String::with_capacity(est_cols);
         for cell in row.iter() {
             if cell.is_wide_continuation {
-                // wide char (例: 全角) の継続 cell は飛ばす。先頭 cell の contents
-                // が 2 col 幅の文字 ("あ" 等) を 1 度に保持しているため、それで
-                // viewport 上の 2 col 分の表示が再現される。
                 continue;
             }
             if cell.contents.is_empty() {
-                // 空 cell (= 描画されていない padding 領域) は半角空白で埋める。
-                // これにより TUI の「行末まで空白で埋めた状態」が出力に保存される。
                 line.push(' ');
             } else {
                 line.push_str(&cell.contents);
             }
         }
-        // `build_plain_text` と違い、行末空白を **trim しない** (= 行構造保持)。
-        out.extend_from_slice(line.as_bytes());
+        if trim_trailing {
+            let trimmed = line.trim_end_matches(' ');
+            out.extend_from_slice(trimmed.as_bytes());
+        } else {
+            out.extend_from_slice(line.as_bytes());
+        }
         out.push(b'\n');
     }
     out
 }
 
 /// `build_screen_dump` の error。
+///
+/// 注: `LayerNotImplemented` variant は Phase B 時代に scrollback/both を未実装で
+/// 返すために存在したが、Phase C で配線完了して不要になったため削除済 (= 全 layer
+/// が dispatch されるため layer 起因の error は発生しない、format 起因の error と
+/// encode 失敗のみが残る)。
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ScreenDumpError {
-    /// 未実装の format。
+    /// 未実装の format (= `Json`)。
     #[error("dump format not implemented: {0:?}")]
     FormatNotImplemented(ScreenDumpFormat),
-    /// 未実装の layer。
-    #[error("dump layer not implemented: {0:?}")]
-    LayerNotImplemented(ScreenDumpLayer),
     /// CBOR encode 失敗。
     #[error("dump cbor encode failed")]
     EncodeFailed,
@@ -395,8 +531,8 @@ mod tests {
     fn dump_ansi_returns_state_formatted() {
         let mut s = ScreenState::new(5, 40, 0);
         s.process(b"hi");
-        let out =
-            build_screen_dump(&s, ScreenDumpFormat::Ansi, ScreenDumpLayer::Visible).expect("ok");
+        let out = build_screen_dump(&mut s, ScreenDumpFormat::Ansi, ScreenDumpLayer::Visible)
+            .expect("ok");
         // ANSI dump は state_formatted の raw bytes (= ESC で始まる)
         assert!(out.starts_with(b"\x1b"));
     }
@@ -406,8 +542,8 @@ mod tests {
         let mut s = ScreenState::new(3, 10, 0);
         s.process(b"hi\r\n");
         s.process(b"hello");
-        let out =
-            build_screen_dump(&s, ScreenDumpFormat::Binary, ScreenDumpLayer::Visible).expect("ok");
+        let out = build_screen_dump(&mut s, ScreenDumpFormat::Binary, ScreenDumpLayer::Visible)
+            .expect("ok");
         // plain text 経路: trim 済の "hi\nhello\n\n"
         let text = std::str::from_utf8(&out).expect("utf8");
         assert!(text.contains("hi"));
@@ -420,8 +556,9 @@ mod tests {
         // 保持するため、各 row は cols=10 の char 列 + 改行で出力される。
         let mut s = ScreenState::new(3, 10, 0);
         s.process(b"hi");
-        let out = build_screen_dump(&s, ScreenDumpFormat::TextPlain, ScreenDumpLayer::Visible)
-            .expect("ok");
+        let out =
+            build_screen_dump(&mut s, ScreenDumpFormat::TextPlain, ScreenDumpLayer::Visible)
+                .expect("ok");
         let text = std::str::from_utf8(&out).expect("utf8");
         // 期待: "hi" + 8 spaces + "\n" + 10 spaces + "\n" + 10 spaces + "\n"
         let expected = format!(
@@ -444,8 +581,9 @@ mod tests {
         // を含まないことを確認する。
         let mut s = ScreenState::new(2, 6, 0);
         s.process(b"\x1b[1;31mERR\x1b[0m");
-        let out = build_screen_dump(&s, ScreenDumpFormat::TextPlain, ScreenDumpLayer::Visible)
-            .expect("ok");
+        let out =
+            build_screen_dump(&mut s, ScreenDumpFormat::TextPlain, ScreenDumpLayer::Visible)
+                .expect("ok");
         // ESC (0x1b) は 1 byte も含まれてはいけない
         assert!(
             !out.contains(&0x1b),
@@ -466,8 +604,9 @@ mod tests {
         // 2x6 viewport: "あa" は 3 col (= 2+1) 使い、残り 3 col は空白。
         let mut s = ScreenState::new(2, 6, 0);
         s.process("あa".as_bytes());
-        let out = build_screen_dump(&s, ScreenDumpFormat::TextPlain, ScreenDumpLayer::Visible)
-            .expect("ok");
+        let out =
+            build_screen_dump(&mut s, ScreenDumpFormat::TextPlain, ScreenDumpLayer::Visible)
+                .expect("ok");
         let text = std::str::from_utf8(&out).expect("utf8");
         // 1 行目 = "あa" + 3 spaces + "\n"、2 行目 = 6 spaces + "\n"
         let expected = format!("あa{}\n{}\n", " ".repeat(3), " ".repeat(6));
@@ -478,8 +617,8 @@ mod tests {
     fn dump_cbor_encodes_snapshot() {
         let mut s = ScreenState::new(5, 40, 0);
         s.process(b"hi");
-        let out =
-            build_screen_dump(&s, ScreenDumpFormat::Cbor, ScreenDumpLayer::Visible).expect("ok");
+        let out = build_screen_dump(&mut s, ScreenDumpFormat::Cbor, ScreenDumpLayer::Visible)
+            .expect("ok");
         // 復号して内容を確認
         let snap: ScreenSnapshot = ciborium::de::from_reader(out.as_slice()).expect("decode");
         assert_eq!(snap.cells.len(), 2);
@@ -487,8 +626,8 @@ mod tests {
 
     #[test]
     fn dump_json_returns_not_implemented() {
-        let s = ScreenState::new(5, 40, 0);
-        let err = build_screen_dump(&s, ScreenDumpFormat::Json, ScreenDumpLayer::Visible)
+        let mut s = ScreenState::new(5, 40, 0);
+        let err = build_screen_dump(&mut s, ScreenDumpFormat::Json, ScreenDumpLayer::Visible)
             .expect_err("must error");
         match err {
             ScreenDumpError::FormatNotImplemented(ScreenDumpFormat::Json) => {}
@@ -496,14 +635,142 @@ mod tests {
         }
     }
 
+    /// scrollback_len=0 (= scrollback 無効) で `--layer=scrollback` を呼ぶと、
+    /// text 系 (Ansi/Binary/TextPlain) は空 payload、Cbor は cells が空の Snapshot
+    /// を返す (= error にはならない、設定上 scrollback を取らない構成への配慮)。
     #[test]
-    fn dump_scrollback_layer_returns_not_implemented() {
-        let s = ScreenState::new(5, 40, 0);
-        let err = build_screen_dump(&s, ScreenDumpFormat::Cbor, ScreenDumpLayer::Scrollback)
-            .expect_err("must error");
-        match err {
-            ScreenDumpError::LayerNotImplemented(ScreenDumpLayer::Scrollback) => {}
-            other => panic!("unexpected: {other:?}"),
+    fn dump_scrollback_empty_when_scrollback_disabled() {
+        let mut s = ScreenState::new(3, 10, 0);
+        for i in 0..20 {
+            s.process(format!("L{i}\r\n").as_bytes());
+        }
+        // text-plain は空 string (= 0 行) を返す
+        let out = build_screen_dump(&mut s, ScreenDumpFormat::TextPlain, ScreenDumpLayer::Scrollback)
+            .expect("ok");
+        assert!(
+            out.is_empty(),
+            "scrollback disabled must return empty payload, got: {:?}",
+            std::str::from_utf8(&out)
+        );
+        // cbor も cells が空、rows=0
+        let cbor = build_screen_dump(&mut s, ScreenDumpFormat::Cbor, ScreenDumpLayer::Scrollback)
+            .expect("ok");
+        let snap: ScreenSnapshot = ciborium::de::from_reader(cbor.as_slice()).expect("decode");
+        assert_eq!(snap.cells.len(), 0);
+        assert_eq!(snap.rows, 0);
+    }
+
+    /// `--layer=scrollback` で text/plain format を呼ぶと、visible からスクロールアウトした
+    /// 過去 marker が含まれ、新しいほど後方に並ぶ (= 古い → 新しい順)。
+    #[test]
+    fn dump_scrollback_text_plain_returns_old_rows() {
+        let mut s = ScreenState::new(3, 10, 10);
+        for i in 0..15 {
+            s.process(format!("L{i}\r\n").as_bytes());
+        }
+        // visible は L13/L14/空、scrollback には L3..L12 が貯まる想定 (= 10 行 ring)。
+        let out = build_screen_dump(&mut s, ScreenDumpFormat::TextPlain, ScreenDumpLayer::Scrollback)
+            .expect("ok");
+        let text = std::str::from_utf8(&out).expect("utf8");
+        assert!(
+            text.contains("L3"),
+            "scrollback should include old marker L3, got: {text:?}"
+        );
+        assert!(
+            text.contains("L12"),
+            "scrollback should include latest scrollback row L12, got: {text:?}"
+        );
+        // visible 側の L13/L14 は scrollback には含まれない
+        assert!(
+            !text.contains("L13"),
+            "L13 should be visible, not scrollback, got: {text:?}"
+        );
+        // 古い → 新しい順なので L3 が L12 より先に現れる
+        let pos_l3 = text.find("L3").expect("L3 present");
+        let pos_l12 = text.find("L12").expect("L12 present");
+        assert!(
+            pos_l3 < pos_l12,
+            "L3 should appear before L12 (chronological order): {text:?}"
+        );
+    }
+
+    /// `--layer=scrollback --format=ansi` で payload を吐くと、ANSI escape を含み
+    /// 過去 marker も含まれる。
+    #[test]
+    fn dump_scrollback_ansi_format() {
+        let mut s = ScreenState::new(3, 10, 10);
+        for i in 0..15 {
+            s.process(format!("L{i}\r\n").as_bytes());
+        }
+        let out =
+            build_screen_dump(&mut s, ScreenDumpFormat::Ansi, ScreenDumpLayer::Scrollback)
+                .expect("ok");
+        // 先頭は cursor home escape `\x1b[H`
+        assert!(
+            out.starts_with(b"\x1b[H"),
+            "ANSI scrollback should start with cursor home, got first bytes: {:?}",
+            &out[..out.len().min(8)]
+        );
+        // L3 marker を含む
+        assert!(
+            out.windows(b"L3".len()).any(|w| w == b"L3"),
+            "ANSI scrollback should contain L3 marker"
+        );
+    }
+
+    /// `--layer=both` は scrollback + visible を連結する。古い scrollback rows が先、
+    /// 新しい visible rows が後。
+    #[test]
+    fn dump_both_concatenates_scrollback_and_visible() {
+        let mut s = ScreenState::new(3, 10, 10);
+        for i in 0..15 {
+            s.process(format!("L{i}\r\n").as_bytes());
+        }
+        let out = build_screen_dump(&mut s, ScreenDumpFormat::TextPlain, ScreenDumpLayer::Both)
+            .expect("ok");
+        let text = std::str::from_utf8(&out).expect("utf8");
+        // scrollback (L3..L12) + visible (L13, L14, _) の全 marker が含まれる
+        for marker in ["L3", "L12", "L13", "L14"] {
+            assert!(
+                text.contains(marker),
+                "both should contain {marker}, got: {text:?}"
+            );
+        }
+        // L3 (= scrollback 最古) が L14 (= visible 最新) より前に来る
+        let pos_l3 = text.find("L3").expect("L3 present");
+        let pos_l14 = text.find("L14").expect("L14 present");
+        assert!(
+            pos_l3 < pos_l14,
+            "scrollback L3 should appear before visible L14 (chronological order): {text:?}"
+        );
+        // 行数 = scrollback (10) + visible (3) = 13 行
+        assert_eq!(
+            text.matches('\n').count(),
+            13,
+            "both layer should output scrollback_rows + visible_rows lines, got: {text:?}"
+        );
+    }
+
+    /// `--layer=both --format=cbor` は scrollback + visible の cells を 1 つの
+    /// `ScreenSnapshot` に連結し、座標は連結後の 0-origin で振り直される。
+    #[test]
+    fn dump_both_cbor_uses_unified_coords() {
+        let mut s = ScreenState::new(3, 10, 10);
+        for i in 0..15 {
+            s.process(format!("L{i}\r\n").as_bytes());
+        }
+        let out =
+            build_screen_dump(&mut s, ScreenDumpFormat::Cbor, ScreenDumpLayer::Both).expect("ok");
+        let snap: ScreenSnapshot = ciborium::de::from_reader(out.as_slice()).expect("decode");
+        // rows field は scrollback (10) + visible (3) = 13 行を反映
+        assert_eq!(snap.rows, 13, "both layer rows should be sb + visible");
+        // cells には L3..L14 marker の "L" / 数字 cell が含まれる
+        let text: String = snap.cells.iter().map(|cp| cp.cell.text.as_str()).collect();
+        for marker_char in ["L", "3", "4", "5"] {
+            assert!(
+                text.contains(marker_char),
+                "cells should include marker char {marker_char}, got: {text:?}"
+            );
         }
     }
 }
