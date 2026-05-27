@@ -15,6 +15,9 @@ path = "src/main.rs"
 [dependencies]
 hyoui = { path = "../hyoui", version = "0.1" }
 nix = { workspace = true }
+# `screen snapshot` subcommand が `StateSnapshotResponse` を独立した CBOR root
+# として出力するため、CBOR serialize の primitive を直接利用する (= DR-0013 §9)。
+ciborium = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -178,6 +178,7 @@ dependencies = [
 name = "hyoui-cli"
 version = "0.1.15"
 dependencies = [
+ "ciborium",
  "hyoui",
  "nix",
  "tempfile",

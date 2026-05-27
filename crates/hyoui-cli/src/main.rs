@@ -18,14 +18,15 @@ use std::process::ExitCode;
 
 use hyoui::cli::{
     AttachConfig, Command, HelpTopic, KillConfig, ListConfig, ScreenCommand, ScreenDumpCliFormat,
-    ScreenDumpCliLayer, ScreenDumpConfig, StatusConfig, TailConfig, WaitCliPredicate, WaitConfig,
-    parse_args, usage,
+    ScreenDumpCliLayer, ScreenDumpConfig, ScreenSnapshotConfig, SnapshotCliComponent, StatusConfig,
+    TailConfig, WaitCliPredicate, WaitConfig, parse_args, usage,
 };
 use hyoui::client::{AttachOptions, ClientConnection};
 use hyoui::daemon::{DaemonConfig, Session};
 use hyoui::protocol::messages::{
-    DumpRect, ScreenDumpFormat, ScreenDumpLayer, ScreenDumpRequest, StatusQuery, TailRequest,
-    WaitMatchOptions, WaitOutcome, WaitPredicate, WaitRequest,
+    DumpRect, ScreenDumpFormat, ScreenDumpLayer, ScreenDumpRequest, SnapshotComponent,
+    StateSnapshotRequest, StatusQuery, TailRequest, WaitMatchOptions, WaitOutcome, WaitPredicate,
+    WaitRequest,
 };
 use hyoui::protocol::{ControlMessage, Mode};
 use hyoui::sys::{enter_raw, is_tty};
@@ -167,6 +168,7 @@ fn main() -> ExitCode {
 
         Command::Screen(sub) => match sub {
             ScreenCommand::Dump(cfg) => screen_dump_command(cfg),
+            ScreenCommand::Snapshot(cfg) => screen_snapshot_command(cfg),
             // `ScreenCommand` is `#[non_exhaustive]`; future variants surface as
             // a generic skew error so older binaries report clearly.
             _ => {
@@ -1115,6 +1117,180 @@ fn write_screen_dump_payload(payload: &[u8], output: Option<&str>) -> ExitCode {
     }
 }
 
+/// `screen snapshot <session>` subcommand (= DR-0013 §9 + DR-0006 §10.3)。
+///
+/// connect → handshake (cap=`state-snapshot-v1`) → `screen.snapshot.request` 送信
+/// → `screen.snapshot.response` を受信して CBOR encoded bytes を stdout
+/// (or `--output` file) に書き出す。
+///
+/// daemon が `state-snapshot-v1` を intersect しない場合、`screen.snapshot.request`
+/// を送ると daemon が `error` (= `unsupported-capability`) を返す。これは
+/// `ControlMessage::Error` 経路で受け取り、stderr に表示して exit 1。
+///
+/// `--format=json` は MVP scope 外 (= daemon 未実装)。CLI 段では cli.rs で
+/// 受理するが、wire 上は cbor で送って payload をそのまま流す
+/// (= json encoder は後段 task で実装)。
+fn screen_snapshot_command(cfg: ScreenSnapshotConfig) -> ExitCode {
+    let sock = match resolve_target_socket(
+        "screen snapshot",
+        cfg.socket.as_deref(),
+        cfg.session_id.as_deref(),
+    ) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+
+    // CLI 表現 → protocol 表現の変換 (= 1:1 mapping、`Style` のみ protocol に
+    // 対応 variant が無いので skip)。
+    let mut include: Vec<SnapshotComponent> = Vec::with_capacity(cfg.include.len());
+    for c in &cfg.include {
+        let mapped = match *c {
+            SnapshotCliComponent::Cells => Some(SnapshotComponent::Cells),
+            SnapshotCliComponent::Cursor => Some(SnapshotComponent::Cursor),
+            SnapshotCliComponent::Mode => Some(SnapshotComponent::Mode),
+            SnapshotCliComponent::Scrollback => Some(SnapshotComponent::Scrollback),
+            SnapshotCliComponent::WindowSize => Some(SnapshotComponent::WindowSize),
+            SnapshotCliComponent::Buffer => Some(SnapshotComponent::Buffer),
+            SnapshotCliComponent::SequenceNo => Some(SnapshotComponent::SequenceNo),
+            // `Style` は protocol layer に variant が無い (= MVP scope 外)。CLI 段で
+            // 受理しても wire には送らず無視する (= 早期 fail させず forward-compat)。
+            SnapshotCliComponent::Style => None,
+            // `SnapshotCliComponent` is `#[non_exhaustive]`; future variants surface
+            // as a binary/library version skew rather than silent fallback.
+            _ => {
+                eprintln!(
+                    "hyoui: screen snapshot: unsupported include variant (binary/library version skew)"
+                );
+                return ExitCode::from(2);
+            }
+        };
+        if let Some(m) = mapped {
+            include.push(m);
+        }
+    }
+    if include.is_empty() {
+        eprintln!(
+            "hyoui: screen snapshot: --include に protocol で送信可能な component が 1 つも含まれていません"
+        );
+        eprintln!(
+            "       valid: Cells / Cursor / Mode / Scrollback / WindowSize / Buffer / SequenceNo"
+        );
+        return ExitCode::from(2);
+    }
+
+    // handshake では MVP_CAPS を全部要求する (= 既存 screen dump と同じ pattern)。
+    // `state-snapshot-v1` も MVP_CAPS に含まれているため daemon と intersect する。
+    let opts = AttachOptions {
+        mode: Mode::Ro,
+        token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
+        ..AttachOptions::default()
+    };
+    let mut conn = match connect_with_retry(&sock, opts) {
+        Ok(c) => c,
+        Err(e) => {
+            print_connect_failure("screen snapshot", &sock, &e);
+            return ExitCode::from(1);
+        }
+    };
+
+    let req = StateSnapshotRequest {
+        include,
+        serial: Some(1),
+    };
+    if let Err(e) = conn.send_control(&ControlMessage::StateSnapshotRequest(req)) {
+        eprintln!("hyoui: screen snapshot: send 失敗: {e}");
+        return ExitCode::from(1);
+    }
+
+    // NOTE: `--timeout=<ms>` (= cfg.timeout_ms) は CLI 層で parse 済だが、現状の
+    // `ClientConnection::recv_control` は blocking で socket-level read timeout を
+    // 露出していない (= screen dump と同じ事情)。daemon は `screen.snapshot.request`
+    // を受けたら即同期で `screen.snapshot.response` を返すため実害はほぼ無い。
+    // timeout 配線は別 task で `ClientConnection::set_read_timeout` を生やす。
+    let _ = cfg.timeout_ms;
+    // `--format=json` は受理するが現状 daemon は CBOR しか返さないため、CLI は
+    // 受信した response を CBOR で再 encode して書き出す (= forward-compat、別 task
+    // で json encoder を入れたらここで分岐する)。
+    let _ = cfg.format;
+    loop {
+        let msg = match conn.recv_control(None) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("hyoui: screen snapshot: recv 失敗: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        match msg {
+            ControlMessage::StateSnapshotResponse(resp) => {
+                // response 全体を CBOR で再 encode して payload として書き出す
+                // (= 各 component の値が partial で入っているので、構造ごと
+                // 別 tool に渡せる形が便利、ControlMessage 全体ではなく中身の
+                // `StateSnapshotResponse` を独立した CBOR root として出力)。
+                let mut buf = Vec::new();
+                if let Err(e) = ciborium::ser::into_writer(&resp, &mut buf) {
+                    eprintln!("hyoui: screen snapshot: response の再 encode 失敗: {e}");
+                    return ExitCode::from(1);
+                }
+                return write_screen_snapshot_payload(&buf, cfg.output.as_deref());
+            }
+            ControlMessage::Error(e) => {
+                eprintln!(
+                    "hyoui: screen snapshot: daemon error: code={:?} message={}",
+                    e.code, e.message
+                );
+                if e.message.contains("state-snapshot-v1") {
+                    eprintln!("       daemon が `state-snapshot-v1` cap をサポートしていません。");
+                    eprintln!("       daemon を新しいバージョンに更新してください。");
+                }
+                if e.message.contains("scrollback") {
+                    eprintln!(
+                        "       scrollback component は Phase B では未実装です (= Phase C 配線予定)。"
+                    );
+                    eprintln!("       `--include` から `Scrollback` を外して再実行してください。");
+                }
+                return ExitCode::from(1);
+            }
+            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+            other => {
+                eprintln!("hyoui: screen snapshot: unexpected response: {other:?}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+}
+
+/// `screen snapshot` の payload を stdout または `--output=<path>` に書き出す。
+/// 構造は `write_screen_dump_payload` と同じだが、stderr メッセージで command 名を
+/// 区別するため別関数にしている。
+fn write_screen_snapshot_payload(payload: &[u8], output: Option<&str>) -> ExitCode {
+    match output {
+        Some(path) => match std::fs::File::create(path) {
+            Ok(mut f) => match f.write_all(payload).and_then(|()| f.flush()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("hyoui: screen snapshot: 書き出し失敗 ({path}): {e}");
+                    ExitCode::from(1)
+                }
+            },
+            Err(e) => {
+                eprintln!("hyoui: screen snapshot: file open 失敗 ({path}): {e}");
+                ExitCode::from(1)
+            }
+        },
+        None => {
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            match lock.write_all(payload).and_then(|()| lock.flush()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("hyoui: screen snapshot: stdout 書き出し失敗: {e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1373,6 +1549,103 @@ mod tests {
         );
 
         // cleanup: daemon に kill 送って thread を終わらせる
+        let kill_opts = AttachOptions {
+            mode: Mode::Ro,
+            ..AttachOptions::default()
+        };
+        if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
+            let kill = hyoui::protocol::messages::Kill { signal: None };
+            let _ = conn.send_control(&ControlMessage::Kill(kill));
+            drop(conn);
+        }
+        let _ = daemon_handle.join();
+    }
+
+    /// `write_screen_snapshot_payload` の file 出力経路を確認。
+    /// stdout 経路はそのままだと captured 出来ないため file 経由で代用 (= dump と同じ pattern)。
+    #[test]
+    fn write_screen_snapshot_payload_writes_to_file() {
+        let dir = make_0700_dir();
+        let out = dir.path().join("snap.cbor");
+        let payload = b"\xa1\x66cursor\xa3\x63row\x03\x63col\x05\x67visible\xf5"; // arbitrary CBOR bytes
+        let out_str = out.to_str().expect("path utf8").to_string();
+        let code = write_screen_snapshot_payload(payload, Some(&out_str));
+        let _ = code;
+        let got = std::fs::read(&out).expect("read back");
+        assert_eq!(got, payload);
+    }
+
+    /// daemon を起動して `screen snapshot --include=Cursor,Mode,WindowSize` を
+    /// 実行、CBOR encoded `StateSnapshotResponse` が file に書かれるところまで
+    /// 通すスモークテスト。
+    ///
+    /// protocol レベルの確認は daemon test (= `handle_state_snapshot_request`)
+    /// で済んでいるので、ここでは CLI dispatch が正しく `StateSnapshotRequest` を
+    /// 送って、response の payload が file 経由で取り出せて、しかも CBOR として
+    /// decode 可能 (= 構造が壊れていない) を確認する。
+    #[test]
+    fn screen_snapshot_command_writes_response_payload_to_file() {
+        use hyoui::daemon::{DaemonConfig, Session};
+        use hyoui::protocol::messages::StateSnapshotResponse;
+
+        let sock_dir = make_0700_dir();
+        let sock_path = sock_dir.path().join("snap-test.sock");
+        let out_path = sock_dir.path().join("snap.cbor");
+
+        let sock_for_daemon = sock_path.clone();
+        let daemon_handle = std::thread::spawn(move || {
+            let cfg = DaemonConfig::new(
+                "screen-snapshot-test",
+                sock_for_daemon,
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf 'SMOKE'; sleep 30".into(),
+                ],
+            );
+            let session = Session::start(cfg).expect("daemon start");
+            session.serve()
+        });
+
+        // daemon listener bind + 子の "SMOKE" 出力が反映されるまで少し待つ。
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let cfg = ScreenSnapshotConfig {
+            socket: Some(sock_path.to_string_lossy().into_owned()),
+            session_id: None,
+            include: vec![
+                SnapshotCliComponent::Cursor,
+                SnapshotCliComponent::Mode,
+                SnapshotCliComponent::WindowSize,
+                SnapshotCliComponent::Buffer,
+                SnapshotCliComponent::SequenceNo,
+            ],
+            format: hyoui::cli::ScreenSnapshotCliFormat::Cbor,
+            output: Some(out_path.to_string_lossy().into_owned()),
+            timeout_ms: 5_000,
+        };
+        let _exit = screen_snapshot_command(cfg);
+
+        let got = std::fs::read(&out_path).expect("read output");
+        assert!(!got.is_empty(), "snapshot payload must not be empty");
+        // CBOR として decode 可能か検証 (= ciborium 経由で StateSnapshotResponse に復元)
+        let decoded: StateSnapshotResponse =
+            ciborium::de::from_reader(got.as_slice()).expect("decode response");
+        // 要求した component が乗ってきているかを確認 (= Cells は要求していないので None)
+        assert!(decoded.cursor.is_some(), "cursor should be included");
+        assert!(decoded.mode.is_some(), "mode should be included");
+        assert!(
+            decoded.window_size.is_some(),
+            "window_size should be included"
+        );
+        assert!(decoded.buffer.is_some(), "buffer should be included");
+        assert!(
+            decoded.sequence_no.is_some(),
+            "sequence_no should be included"
+        );
+        assert!(decoded.cells.is_none(), "cells must not be included");
+
+        // cleanup: kill 送って thread を終わらせる
         let kill_opts = AttachOptions {
             mode: Mode::Ro,
             ..AttachOptions::default()

@@ -103,6 +103,8 @@ pub enum HelpTopic {
     Screen,
     /// Help for the `screen dump` subcommand (= DR-0006 §10.2)。
     ScreenDump,
+    /// Help for the `screen snapshot` subcommand (= DR-0006 §10.3 / DR-0013 §9)。
+    ScreenSnapshot,
     /// Help for the `completion` subcommand.
     Completion,
     /// User invoked an unknown subcommand; render top-level help with note.
@@ -326,12 +328,76 @@ pub struct ScreenDumpConfig {
     pub timeout_ms: u64,
 }
 
+/// `screen snapshot` subcommand の include 選択肢 (= DR-0006 §10.3 / DR-0013 §9)。
+///
+/// protocol 層の [`SnapshotComponent`] と 1:1 対応。CLI 段では `--include` の
+/// comma-separated 値として受理する (= `Cells,Cursor,Mode,...`)。case-insensitive。
+///
+/// [`SnapshotComponent`]: crate::protocol::messages::SnapshotComponent
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum SnapshotCliComponent {
+    /// cell grid (= sparse CBOR encoded `ScreenSnapshot.cells`)。
+    Cells,
+    /// cursor 位置 + visibility。
+    Cursor,
+    /// mode flag (= alt / app_keypad / cursor / bracketed_paste / hide_cursor)。
+    Mode,
+    /// style (= MVP scope 外、forward-compat slot)。protocol 層に variant が無い
+    /// ため `--include=style` は CLI 段では受理するが、wire 送信時に他 component
+    /// と並んで送ることはない (= 単独指定は警告対象、現状は noop 扱い)。
+    Style,
+    /// scrollback rows (= 未実装、daemon は `protocol-malformed` を返す)。
+    Scrollback,
+    /// viewport size (rows × cols)。
+    WindowSize,
+    /// 現在 buffer kind (primary or alternate)。
+    Buffer,
+    /// SequenceNo (= current_seqno、incremental sync 連携用)。
+    SequenceNo,
+}
+
+/// `screen snapshot <session>` subcommand configuration (= DR-0013 §9 + DR-0006 §10.3)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenSnapshotConfig {
+    /// Target socket path (explicit) または session_id から resolve。
+    pub socket: Option<String>,
+    /// Target session id。
+    pub session_id: Option<String>,
+    /// `--include=Cells,Cursor,...` (= comma-separated)、default は全 component。
+    /// Vec はそのまま wire の `include: Vec<SnapshotComponent>` に流す。
+    pub include: Vec<SnapshotCliComponent>,
+    /// `--format=cbor|json` (= default cbor)。`json` は MVP scope 外で daemon は
+    /// 無視するが、CLI は wire に格別の追加情報を送らずそのまま cbor を返す。
+    pub format: ScreenSnapshotCliFormat,
+    /// `--output=<path>` (= 未指定なら stdout)。
+    pub output: Option<String>,
+    /// `--timeout=<ms>` (= response 受信 timeout、default 5000ms)。
+    pub timeout_ms: u64,
+}
+
+/// `screen snapshot` の format 選択肢 (= DR-0006 §10.3)。
+///
+/// 現状 MVP では `cbor` のみ実装。`json` は forward-compat 用 (= daemon 側
+/// 未実装、CLI 段では受理するが wire 上は cbor として送る)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ScreenSnapshotCliFormat {
+    /// CBOR encoded `StateSnapshotResponse` (= 機械処理、default)。
+    #[default]
+    Cbor,
+    /// JSON encoded (= forward-compat、現状 daemon 未実装で wire には cbor を送る)。
+    Json,
+}
+
 /// `screen` 親 subcommand の子 dispatch (= DR-0006 §10.1)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ScreenCommand {
     /// `screen dump <session>` (= visible bytes dump)。
     Dump(ScreenDumpConfig),
+    /// `screen snapshot <session>` (= structured state query)。
+    Snapshot(ScreenSnapshotConfig),
 }
 
 /// Result of parsing argv (excluding argv[0]).
@@ -1226,6 +1292,7 @@ pub fn usage(topic: &HelpTopic) -> String {
         HelpTopic::Wait => usage_wait(),
         HelpTopic::Screen => usage_screen(),
         HelpTopic::ScreenDump => usage_screen_dump(),
+        HelpTopic::ScreenSnapshot => usage_screen_snapshot(),
         HelpTopic::Completion => usage_completion(),
     }
 }
@@ -1444,15 +1511,12 @@ fn parse_screen(args: &[String]) -> Command {
             topic: HelpTopic::Screen,
         },
         "dump" => parse_screen_dump(&args[1..]),
-        // 将来 `screen snapshot` を追加する slot。今は未実装で reserved 扱い。
-        "snapshot" => {
-            Command::Error("screen snapshot: 未実装 (= 別 task で配線予定、DR-0006 §10.3)".into())
-        }
+        "snapshot" => parse_screen_snapshot(&args[1..]),
         other if other.starts_with('-') => {
             Command::Error(format!("screen: unknown option: {other}"))
         }
         other => Command::Error(format!(
-            "screen: unknown subcommand `{other}` (supported: dump)"
+            "screen: unknown subcommand `{other}` (supported: dump, snapshot)"
         )),
     }
 }
@@ -1593,6 +1657,153 @@ fn parse_screen_dump_rect(s: &str) -> Result<ScreenDumpCliRect, String> {
         w: vals[2],
         h: vals[3],
     })
+}
+
+/// `screen snapshot <session>` parser (= DR-0013 §9 + DR-0006 §10.3)。
+///
+/// 受理する options:
+/// - `--socket=<path>` — session_id の代替 (= shared helper)
+/// - `--include=<set>` — comma-separated component 集合 (= default 全部)
+/// - `--format=cbor|json` (= default cbor、json は MVP scope 外で wire 上は cbor)
+/// - `--output=<path>` — stdout の代わりに file へ書き出し
+/// - `--timeout=<ms>` — response 受信 timeout (= default 5000ms)
+#[allow(clippy::result_large_err)]
+fn parse_screen_snapshot(args: &[String]) -> Command {
+    let mut include: Option<Vec<SnapshotCliComponent>> = None;
+    let mut format = ScreenSnapshotCliFormat::default();
+    let mut output: Option<String> = None;
+    let mut timeout_ms: u64 = 5_000;
+    let res = parse_session_targeted(
+        "screen snapshot",
+        args,
+        HelpTopic::ScreenSnapshot,
+        |opt, value| match opt {
+            "--include" => {
+                let v = value.ok_or_else(|| {
+                    Command::Error("screen snapshot: --include requires a value".into())
+                })?;
+                let parsed = parse_snapshot_include(&v)
+                    .map_err(|e| Command::Error(format!("screen snapshot: --include: {e}")))?;
+                include = Some(parsed);
+                Ok(true)
+            }
+            "--format" => {
+                let v = value.ok_or_else(|| {
+                    Command::Error("screen snapshot: --format requires a value".into())
+                })?;
+                match v.as_str() {
+                    "cbor" => {
+                        format = ScreenSnapshotCliFormat::Cbor;
+                        Ok(true)
+                    }
+                    "json" => {
+                        // MVP scope 外。CLI 段では受理するが daemon は cbor で返すため
+                        // 実質 cbor と同じ wire 動作。後段 task で json encoder を入れる。
+                        format = ScreenSnapshotCliFormat::Json;
+                        Ok(true)
+                    }
+                    other => Err(Command::Error(format!(
+                        "screen snapshot: --format must be `cbor`|`json`, got {other:?}"
+                    ))),
+                }
+            }
+            "--output" => {
+                let v = value.ok_or_else(|| {
+                    Command::Error("screen snapshot: --output requires a value".into())
+                })?;
+                output = Some(v);
+                Ok(true)
+            }
+            "--timeout" => {
+                let v = value.ok_or_else(|| {
+                    Command::Error("screen snapshot: --timeout requires a value".into())
+                })?;
+                let ms = parse_duration_ms(&v)
+                    .map_err(|e| Command::Error(format!("screen snapshot: --timeout: {e}")))?;
+                timeout_ms = ms;
+                Ok(true)
+            }
+            other => Err(Command::Error(format!(
+                "screen snapshot: unknown option: {other}"
+            ))),
+        },
+    );
+    match res {
+        Ok((socket, session_id)) => {
+            let include = include.unwrap_or_else(default_snapshot_include);
+            Command::Screen(ScreenCommand::Snapshot(ScreenSnapshotConfig {
+                socket,
+                session_id,
+                include,
+                format,
+                output,
+                timeout_ms,
+            }))
+        }
+        Err(c) => c,
+    }
+}
+
+/// `--include=<set>` の `<set>` を `Vec<SnapshotCliComponent>` に変換する。
+///
+/// 受理する形式: comma-separated (= `Cells,Cursor,Mode`)。前後 whitespace は trim、
+/// 大文字小文字は case-insensitive (= `cells` / `CELLS` / `Cells` 全部 OK)。
+/// 重複指定は dedupe する (= 最終 Vec で順序は維持しつつ unique 化)。
+/// 不明な component 名は error。
+///
+/// 受理する名前 (= `SnapshotComponent` と 1:1):
+/// `cells` / `cursor` / `mode` / `style` / `scrollback` / `window-size` / `windowsize`
+/// / `buffer` / `sequence-no` / `sequenceno`。`-` は省略可 (= ハイフン無しの形も accept、
+/// CBOR の kebab-case ↔ camelCase / lower 連結を吸収)。
+fn parse_snapshot_include(s: &str) -> Result<Vec<SnapshotCliComponent>, String> {
+    if s.trim().is_empty() {
+        return Err("empty include set (= 最低 1 つ component を指定してください)".into());
+    }
+    let mut out: Vec<SnapshotCliComponent> = Vec::new();
+    for raw in s.split(',') {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(format!("empty component in {s:?}"));
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let normalized: String = lower.chars().filter(|c| *c != '-' && *c != '_').collect();
+        let comp = match normalized.as_str() {
+            "cells" => SnapshotCliComponent::Cells,
+            "cursor" => SnapshotCliComponent::Cursor,
+            "mode" => SnapshotCliComponent::Mode,
+            "style" => SnapshotCliComponent::Style,
+            "scrollback" => SnapshotCliComponent::Scrollback,
+            "windowsize" => SnapshotCliComponent::WindowSize,
+            "buffer" => SnapshotCliComponent::Buffer,
+            "sequenceno" => SnapshotCliComponent::SequenceNo,
+            other => {
+                return Err(format!(
+                    "unknown component {other:?} (valid: Cells / Cursor / Mode / Style / Scrollback / WindowSize / Buffer / SequenceNo)"
+                ));
+            }
+        };
+        if !out.contains(&comp) {
+            out.push(comp);
+        }
+    }
+    Ok(out)
+}
+
+/// `--include` 未指定時の default (= `Scrollback` 以外を全て選択)。
+///
+/// `Scrollback` を default に含めない理由: daemon が `protocol-malformed` を返す
+/// (= Phase B 時点で未実装、`handle_state_snapshot_request` 参照)。default で
+/// 巻き込んで失敗させると UX が崩れるため、明示的に `--include=Scrollback` で
+/// 指定したときだけ送る形にする (= 早期 fail で daemon の実装状況を露呈)。
+fn default_snapshot_include() -> Vec<SnapshotCliComponent> {
+    vec![
+        SnapshotCliComponent::Cells,
+        SnapshotCliComponent::Cursor,
+        SnapshotCliComponent::Mode,
+        SnapshotCliComponent::WindowSize,
+        SnapshotCliComponent::Buffer,
+        SnapshotCliComponent::SequenceNo,
+    ]
 }
 
 fn parse_completion(args: &[String]) -> Command {
@@ -1937,10 +2148,8 @@ fn usage_screen() -> String {
             hyoui screen <subcommand> [options]\n\
         \n\
         SUBCOMMANDS:\n    \
-            dump        Dump visible (or scrollback) bytes (= ANSI / binary / CBOR)\n\
-        \n\
-        RESERVED (not yet implemented):\n    \
-            snapshot    structured state query (= DR-0006 §10.3、別 task で配線)\n\
+            dump        Dump visible (or scrollback) bytes (= ANSI / binary / CBOR)\n    \
+            snapshot    Structured state query (= DR-0006 §10.3 / DR-0013 §9)\n\
         \n\
         OPTIONS:\n    \
             -h, --help      Show this help and exit\n\
@@ -1990,7 +2199,50 @@ fn usage_screen_dump() -> String {
             hyoui screen dump demo --format=binary | grep ERROR\n\
         \n\
         RELATED:\n    \
-            hyoui screen snapshot <id>   構造化 state query (= 未実装、別 task)\n    \
+            hyoui screen snapshot <id>   構造化 state query (= CBOR encoded StateSnapshotResponse)\n    \
+            hyoui wait <id> ...          状態条件を待つ\n    \
+            hyoui tail <id>              bytes stream を流す\n",
+    )
+}
+
+fn usage_screen_snapshot() -> String {
+    String::from(
+        "hyoui screen snapshot — structured screen state snapshot (DR-0013 §9 + DR-0006 §10.3)\n\
+        \n\
+        USAGE:\n    \
+            hyoui screen snapshot <session-id> [options]\n    \
+            hyoui screen snapshot --socket=<path> [options]\n\
+        \n\
+        OPTIONS:\n    \
+            --socket PATH       Explicit socket path (alternative to session-id)\n    \
+            --include SET       Components (comma-separated, case-insensitive; default: all)\n                        \
+                Cells, Cursor, Mode, Style, Scrollback, WindowSize, Buffer, SequenceNo\n                        \
+                (Scrollback は daemon 側で未実装 → 明示指定すると error)\n    \
+            --format FMT        Output format (default: cbor)\n                        \
+                cbor — CBOR encoded StateSnapshotResponse\n                        \
+                json — forward-compat (= 現状 daemon 未実装、wire 上は cbor)\n    \
+            --output PATH       書き出し先 (= 未指定なら stdout)\n    \
+            --timeout DUR       response 受信 timeout (= default 5s。DUR 形式: 5s/500ms/...)\n    \
+            -h, --help          Show this help and exit\n\
+        \n\
+        ENVIRONMENT:\n    \
+            HYOUI_LOCK_TOKEN    lock token を env で渡す (= handshake.token)\n\
+        \n\
+        EXIT CODE:\n    \
+            0   正常終了 (= response 受信、payload を出力済)\n    \
+            1   connect / I/O / daemon error (= daemon が unsupported-capability\n        \
+                や protocol-malformed を返す場合も含む)\n    \
+            2   引数不足 / 未知 option / 未知 component\n\
+        \n\
+        EXAMPLES:\n    \
+            hyoui screen snapshot demo                                 # 全 component の CBOR snapshot\n    \
+            hyoui screen snapshot demo --include=Cursor,Mode           # cursor + mode のみ\n    \
+            hyoui screen snapshot demo --include=cells,window-size     # case-insensitive\n    \
+            hyoui screen snapshot demo --output=snap.cbor              # ファイル保存\n    \
+            hyoui screen snapshot demo --timeout=2s                    # response 待ち 2s\n\
+        \n\
+        RELATED:\n    \
+            hyoui screen dump <id>       visible bytes dump (ANSI / binary / CBOR)\n    \
             hyoui wait <id> ...          状態条件を待つ\n    \
             hyoui tail <id>              bytes stream を流す\n",
     )
@@ -3223,13 +3475,243 @@ mod tests {
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // DR-0013 §9 + DR-0006 §10.3: `screen snapshot` subcommand parser tests
+    // ─────────────────────────────────────────────────────────────────────
+
     #[test]
-    fn parse_screen_snapshot_reserved() {
-        // snapshot は別 task 予定なので Error で reject (= 早期 fail)。
+    fn parse_screen_snapshot_default_include_and_format() {
         match parse_args(&args(&["screen", "snapshot", "demo"])) {
-            Command::Error(msg) => assert!(msg.contains("未実装") || msg.contains("snapshot")),
-            other => panic!("expected Error for snapshot, got {other:?}"),
+            Command::Screen(ScreenCommand::Snapshot(cfg)) => {
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert!(cfg.socket.is_none());
+                // default include: Cells, Cursor, Mode, WindowSize, Buffer, SequenceNo
+                // (Scrollback は意図的に除外)
+                assert!(cfg.include.contains(&SnapshotCliComponent::Cells));
+                assert!(cfg.include.contains(&SnapshotCliComponent::Cursor));
+                assert!(cfg.include.contains(&SnapshotCliComponent::Mode));
+                assert!(cfg.include.contains(&SnapshotCliComponent::WindowSize));
+                assert!(cfg.include.contains(&SnapshotCliComponent::Buffer));
+                assert!(cfg.include.contains(&SnapshotCliComponent::SequenceNo));
+                assert!(!cfg.include.contains(&SnapshotCliComponent::Scrollback));
+                assert_eq!(cfg.format, ScreenSnapshotCliFormat::Cbor);
+                assert!(cfg.output.is_none());
+                assert_eq!(cfg.timeout_ms, 5_000);
+            }
+            other => panic!("expected Screen::Snapshot, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_screen_snapshot_help_flag() {
+        match parse_args(&args(&["screen", "snapshot", "--help"])) {
+            Command::Help { topic } => assert_eq!(topic, HelpTopic::ScreenSnapshot),
+            other => panic!("expected Help::ScreenSnapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_snapshot_include_subset() {
+        match parse_args(&args(&[
+            "screen",
+            "snapshot",
+            "demo",
+            "--include=Cursor,Mode",
+        ])) {
+            Command::Screen(ScreenCommand::Snapshot(cfg)) => {
+                assert_eq!(
+                    cfg.include,
+                    vec![SnapshotCliComponent::Cursor, SnapshotCliComponent::Mode]
+                );
+            }
+            other => panic!("expected Screen::Snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_snapshot_include_case_insensitive() {
+        // 大小文字混在 / kebab / 連結を吸収
+        match parse_args(&args(&[
+            "screen",
+            "snapshot",
+            "demo",
+            "--include=cells,WINDOW-SIZE,sequenceno",
+        ])) {
+            Command::Screen(ScreenCommand::Snapshot(cfg)) => {
+                assert_eq!(
+                    cfg.include,
+                    vec![
+                        SnapshotCliComponent::Cells,
+                        SnapshotCliComponent::WindowSize,
+                        SnapshotCliComponent::SequenceNo,
+                    ]
+                );
+            }
+            other => panic!("expected Screen::Snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_snapshot_include_dedupe() {
+        match parse_args(&args(&[
+            "screen",
+            "snapshot",
+            "demo",
+            "--include=Cells,Cells,cursor,CELLS",
+        ])) {
+            Command::Screen(ScreenCommand::Snapshot(cfg)) => {
+                assert_eq!(
+                    cfg.include,
+                    vec![SnapshotCliComponent::Cells, SnapshotCliComponent::Cursor]
+                );
+            }
+            other => panic!("expected Screen::Snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_snapshot_include_unknown_errors() {
+        match parse_args(&args(&[
+            "screen",
+            "snapshot",
+            "demo",
+            "--include=Cells,foobar",
+        ])) {
+            Command::Error(msg) => {
+                assert!(
+                    msg.contains("foobar") || msg.contains("unknown"),
+                    "msg: {msg}"
+                )
+            }
+            other => panic!("expected Error for unknown component, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_snapshot_include_empty_errors() {
+        match parse_args(&args(&["screen", "snapshot", "demo", "--include="])) {
+            Command::Error(msg) => {
+                assert!(
+                    msg.contains("empty") || msg.contains("include"),
+                    "msg: {msg}"
+                )
+            }
+            other => panic!("expected Error for empty include, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_snapshot_format_cbor_default() {
+        match parse_args(&args(&["screen", "snapshot", "demo", "--format=cbor"])) {
+            Command::Screen(ScreenCommand::Snapshot(cfg)) => {
+                assert_eq!(cfg.format, ScreenSnapshotCliFormat::Cbor);
+            }
+            other => panic!("expected Screen::Snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_snapshot_format_json_accepted() {
+        match parse_args(&args(&["screen", "snapshot", "demo", "--format=json"])) {
+            Command::Screen(ScreenCommand::Snapshot(cfg)) => {
+                assert_eq!(cfg.format, ScreenSnapshotCliFormat::Json);
+            }
+            other => panic!("expected Screen::Snapshot for --format=json, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_snapshot_format_invalid_errors() {
+        match parse_args(&args(&["screen", "snapshot", "demo", "--format=xml"])) {
+            Command::Error(msg) => assert!(msg.contains("xml")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_snapshot_output_option() {
+        match parse_args(&args(&[
+            "screen",
+            "snapshot",
+            "demo",
+            "--output=/tmp/snap.cbor",
+        ])) {
+            Command::Screen(ScreenCommand::Snapshot(cfg)) => {
+                assert_eq!(cfg.output.as_deref(), Some("/tmp/snap.cbor"));
+            }
+            other => panic!("expected Screen::Snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_snapshot_timeout_option() {
+        match parse_args(&args(&["screen", "snapshot", "demo", "--timeout=2s"])) {
+            Command::Screen(ScreenCommand::Snapshot(cfg)) => {
+                assert_eq!(cfg.timeout_ms, 2_000);
+            }
+            other => panic!("expected Screen::Snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_snapshot_socket_alternative() {
+        match parse_args(&args(&["screen", "snapshot", "--socket=/tmp/x.sock"])) {
+            Command::Screen(ScreenCommand::Snapshot(cfg)) => {
+                assert_eq!(cfg.socket.as_deref(), Some("/tmp/x.sock"));
+                assert!(cfg.session_id.is_none());
+            }
+            other => panic!("expected Screen::Snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_snapshot_requires_session_or_socket() {
+        match parse_args(&args(&["screen", "snapshot"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("session") || msg.contains("socket"))
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_snapshot_unknown_option_errors() {
+        match parse_args(&args(&["screen", "snapshot", "demo", "--bogus"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("bogus") || msg.contains("screen snapshot"))
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_snapshot_rejects_invalid_session_id() {
+        match parse_args(&args(&["screen", "snapshot", "../foo"])) {
+            Command::Error(_) => {}
+            other => panic!("expected Error for invalid session_id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_screen_lists_snapshot_subcommand() {
+        let text = usage(&HelpTopic::Screen);
+        assert!(text.contains("snapshot"));
+    }
+
+    #[test]
+    fn usage_screen_snapshot_lists_options() {
+        let text = usage(&HelpTopic::ScreenSnapshot);
+        assert!(text.contains("hyoui screen snapshot"));
+        assert!(text.contains("--include"));
+        assert!(text.contains("--format"));
+        assert!(text.contains("--output"));
+        assert!(text.contains("--timeout"));
+        assert!(text.contains("Cells"));
+        assert!(text.contains("Cursor"));
+        assert!(text.contains("Mode"));
+        assert!(text.contains("WindowSize"));
+        assert!(text.contains("Buffer"));
+        assert!(text.contains("SequenceNo"));
     }
 
     #[test]
