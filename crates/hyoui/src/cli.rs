@@ -156,6 +156,14 @@ pub struct RunConfig {
     pub on_child_suspend: OnChildSuspend,
     /// Action when the parent is suspended (preset by mode unless overridden).
     pub on_parent_suspend: OnParentSuspend,
+    /// vt100 内蔵 scrollback ring の **行数上限** (= DR-0013 §8 + §8 Update)。
+    ///
+    /// `screen dump --layer={scrollback,both}` / `screen snapshot` で過去 row を
+    /// 取り出す際の最大行数。`None` (= 未指定) なら DaemonConfig の既定値 1000 行が
+    /// 使われる。`--scrollback-rows=<N>` flag or `HYOUI_SCROLLBACK_ROWS=<N>` env で
+    /// override 可能。`0` を渡すと scrollback を完全無効化する (= 過去 row は保存
+    /// されない、低メモリ運用)。
+    pub scrollback_rows: Option<usize>,
     /// argv of the child command.
     pub command: Vec<String>,
 }
@@ -1443,6 +1451,7 @@ fn parse_run(args: &[String]) -> Command {
     let mut command: Vec<String> = Vec::new();
     let mut detached = false;
     let mut session: Option<String> = None;
+    let mut scrollback_rows: Option<usize> = None;
 
     let mut i = 0usize;
     let mut in_command = false;
@@ -1563,6 +1572,17 @@ fn parse_run(args: &[String]) -> Command {
                 }
                 None => return Command::Error("--session requires a value".into()),
             },
+            "--scrollback-rows" => match value.as_deref() {
+                Some(v) => match v.parse::<usize>() {
+                    Ok(n) => scrollback_rows = Some(n),
+                    Err(e) => {
+                        return Command::Error(format!(
+                            "--scrollback-rows: 非負整数を指定してください: {e} (got {v:?})"
+                        ));
+                    }
+                },
+                None => return Command::Error("--scrollback-rows requires a value".into()),
+            },
             other => return Command::Error(format!("unknown option: {other}")),
         }
 
@@ -1603,6 +1623,7 @@ fn parse_run(args: &[String]) -> Command {
         session,
         on_child_suspend: final_child_suspend,
         on_parent_suspend: final_parent_suspend,
+        scrollback_rows,
         command,
     })
 }
@@ -2182,12 +2203,17 @@ fn usage_run() -> String {
             --on-parent-suspend=transparent|decouple\n                                  \
                 Action when the parent is stopped\n                                  \
                 (default: transparent; headless: decouple)\n    \
+            --scrollback-rows N           vt100 内蔵 scrollback ring 行数上限\n                                  \
+                (= screen dump --layer=scrollback / --layer=both で\n                                  \
+                取り出せる過去 row の最大数、default 1000、0 で無効)\n    \
             -h, --help                    Show this help and exit\n\
         \n\
         ENVIRONMENT:\n    \
-            SHELL            Fallback command when none is given (legacy)\n    \
-            XDG_RUNTIME_DIR  Base directory for the auto-generated socket path\n    \
-            TMPDIR           Socket path base when XDG_RUNTIME_DIR is unset\n\
+            SHELL                  Fallback command when none is given (legacy)\n    \
+            XDG_RUNTIME_DIR        Base directory for the auto-generated socket path\n    \
+            TMPDIR                 Socket path base when XDG_RUNTIME_DIR is unset\n    \
+            HYOUI_SCROLLBACK_ROWS  --scrollback-rows と同じ値を env で渡す\n                                   \
+                (--scrollback-rows 指定時は flag 優先)\n\
         \n\
         DURATION FORMAT (kawaz/timespec.mbt 仕様 + sub-ms 拡張):\n    \
             短形 ns/us/μs/ms/s/m/h/d/w または長形 second(s)/minute(s)/hour(s)/\n    \
@@ -2479,9 +2505,13 @@ fn usage_screen_dump() -> String {
                              (alias: text, plain)\n                        \
                 (json は MVP scope 外 / 別 task)\n    \
             --layer LAYER       Layer (default: visible)\n                        \
-                visible    — 現在 viewport (= MVP 唯一の実装済)\n                        \
-                scrollback — 過去のみ (= forward-compat、daemon 側未実装)\n                        \
-                both       — scrollback + visible (= 同上)\n    \
+                visible    — 現在 viewport\n                        \
+                scrollback — 過去 rows のみ (= 古い → 新しい順、\n                                     \
+                             format=ansi/binary/text-plain/cbor 対応)\n                        \
+                both       — scrollback + visible 連結 (= 同順、Cbor は連結後\n                                     \
+                             0-origin 座標に振り直し)\n                        \
+                (scrollback / both は daemon の --scrollback-rows 設定 (default 1000)\n                         \
+                 に従って rows が cap される。0 設定なら空 payload)\n    \
             --rect X,Y,W,H      矩形指定 (forward-compat: daemon 現状無視)\n    \
             --output PATH       書き出し先 (= 未指定なら stdout)\n    \
             --timeout DUR       response 受信 timeout (= default 5s。DUR 形式: 5s/500ms/...)\n    \
@@ -4471,6 +4501,42 @@ mod tests {
                     assert_eq!(cfg.session.as_deref(), Some(sid));
                 }
                 other => panic!("expected Run for valid session_id {sid:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// DR-0013 §8: `--scrollback-rows=<N>` 受理。`--scrollback-rows=0` も
+    /// 受理 (= scrollback 完全無効化用)。
+    #[test]
+    fn parse_run_accepts_scrollback_rows() {
+        match parse_args(&args(&["run", "--scrollback-rows=500", "--", "true"])) {
+            Command::Run(cfg) => assert_eq!(cfg.scrollback_rows, Some(500)),
+            other => panic!("expected Run, got {other:?}"),
+        }
+        match parse_args(&args(&["run", "--scrollback-rows=0", "--", "true"])) {
+            Command::Run(cfg) => assert_eq!(cfg.scrollback_rows, Some(0)),
+            other => panic!("expected Run for --scrollback-rows=0, got {other:?}"),
+        }
+        // 未指定なら None (= DaemonConfig 既定値を維持)
+        match parse_args(&args(&["run", "--", "true"])) {
+            Command::Run(cfg) => assert_eq!(cfg.scrollback_rows, None),
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    /// 非数値 / 負数を渡すと Error。
+    #[test]
+    fn parse_run_rejects_invalid_scrollback_rows() {
+        for bad in ["abc", "-1", "1.5"] {
+            let arg = format!("--scrollback-rows={bad}");
+            match parse_args(&args(&["run", &arg, "--", "true"])) {
+                Command::Error(msg) => {
+                    assert!(
+                        msg.contains("scrollback-rows"),
+                        "error should mention scrollback-rows: {msg}"
+                    );
+                }
+                other => panic!("expected Error for --scrollback-rows={bad}, got {other:?}"),
             }
         }
     }

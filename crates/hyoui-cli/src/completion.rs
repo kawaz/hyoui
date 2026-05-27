@@ -136,7 +136,7 @@ _hyoui() {
                     COMPREPLY=( $(compgen -W "transparent decouple" -- "$cur") ); return 0 ;;
                 --socket)
                     _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                --timeout|--idle-timeout|--until|--size|--cols|--rows)
+                --timeout|--idle-timeout|--until|--size|--cols|--rows|--scrollback-rows)
                     return 0 ;;
             esac
             case "$cur" in
@@ -147,7 +147,7 @@ _hyoui() {
                 --on-parent-suspend=*)
                     COMPREPLY=( $(compgen -W "transparent decouple" -- "${cur#*=}") ); return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--mode --socket --timeout --idle-timeout --until --on-child-suspend --on-parent-suspend --size --cols --rows --help -h --" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--mode --socket --timeout --idle-timeout --until --on-child-suspend --on-parent-suspend --scrollback-rows --size --cols --rows --help -h --" -- "$cur") )
             return 0 ;;
         completion)
             COMPREPLY=( $(compgen -W "bash zsh fish --help -h" -- "$cur") )
@@ -392,6 +392,7 @@ _hyoui_run() {
         '--rows=[Virtual screen rows]:rows:' \
         '--on-child-suspend=[Action when child is stopped]:action:(follow auto-resume)' \
         '--on-parent-suspend=[Action when parent is stopped]:action:(transparent decouple)' \
+        '--scrollback-rows=[vt100 scrollback ring max rows (default 1000)]:rows:' \
         '(-h --help)'{-h,--help}'[Show help]' \
         '*::child command:_normal'
 }
@@ -503,6 +504,7 @@ complete -c hyoui -n '__hyoui_using_subcommand run' -l cols              -x     
 complete -c hyoui -n '__hyoui_using_subcommand run' -l rows              -x                              -d 'Virtual screen rows'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l on-child-suspend  -x -a 'follow auto-resume'      -d 'Action when child is stopped'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l on-parent-suspend -x -a 'transparent decouple'    -d 'Action when parent is stopped'
+complete -c hyoui -n '__hyoui_using_subcommand run' -l scrollback-rows   -x                              -d 'vt100 scrollback ring max rows (default 1000)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -s h -l help                                          -d 'Show help and exit'
 
 # `hyoui completion` options.

@@ -225,7 +225,26 @@ fn main() -> ExitCode {
 /// 2. daemon thread を spawn (= accept + relay)
 /// 3. main thread が attach client として接続、stdin/stdout を中継
 /// 4. daemon thread を join、その exit code を返す
+/// `--scrollback-rows` flag (CLI) と `HYOUI_SCROLLBACK_ROWS` env を解決する。
+///
+/// 優先順位 (高 → 低):
+/// 1. `--scrollback-rows=<N>` flag (= `cfg.scrollback_rows` が `Some(N)`)
+/// 2. `HYOUI_SCROLLBACK_ROWS=<N>` env
+/// 3. `None` (= DaemonConfig の既定値 1000 行を維持)
+///
+/// env が空文字列 / parse 不能なら `None` 同等 (= 既定値維持)。
+fn resolve_scrollback_rows(cfg_value: Option<usize>) -> Option<usize> {
+    if let Some(n) = cfg_value {
+        return Some(n);
+    }
+    match std::env::var("HYOUI_SCROLLBACK_ROWS") {
+        Ok(v) if !v.is_empty() => v.parse::<usize>().ok(),
+        _ => None,
+    }
+}
+
 fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
+    let scrollback_rows = resolve_scrollback_rows(cfg.scrollback_rows);
     if cfg.detached {
         let cols = u16::try_from(cfg.cols).unwrap_or(80);
         let rows = u16::try_from(cfg.rows).unwrap_or(24);
@@ -237,6 +256,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
             cfg.until.clone(),
             cfg.on_child_suspend,
             cfg.on_parent_suspend,
+            scrollback_rows,
             cfg.command,
         );
     }
@@ -276,6 +296,12 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     // (旧版は RunConfig 構造体に格納されるだけで daemon に伝わっていなかった)。
     dcfg.on_child_suspend = cfg.on_child_suspend;
     dcfg.on_parent_suspend = cfg.on_parent_suspend;
+    // DR-0013 §8 + §8 Update: vt100 内蔵 scrollback ring の行数上限を CLI/env で
+    // override。`resolve_scrollback_rows` が cfg / env 順で解決し、None なら
+    // DaemonConfig の既定値 1000 行を維持する。
+    if let Some(n) = scrollback_rows {
+        dcfg.screen_vt100_scrollback_rows = n;
+    }
 
     let session = match Session::start(dcfg) {
         Ok(s) => s,

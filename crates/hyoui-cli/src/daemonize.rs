@@ -31,6 +31,7 @@ pub fn run_detached_parent(
     until: Option<String>,
     on_child_suspend: OnChildSuspend,
     on_parent_suspend: OnParentSuspend,
+    scrollback_rows: Option<usize>,
     cmd: Vec<String>,
 ) -> ExitCode {
     let session_id = session_id_override.unwrap_or_else(socket_path::auto_session_id);
@@ -86,6 +87,11 @@ pub fn run_detached_parent(
         "--on-parent-suspend={}",
         parent_suspend_str(on_parent_suspend)
     ));
+    // DR-0013 §8 + §8 Update: scrollback rows を daemon 子に伝搬。
+    // 未指定 (= None) なら flag は渡さず子側の既定 (= DaemonConfig 既定値 1000) が使われる。
+    if let Some(n) = scrollback_rows {
+        child.arg(format!("--scrollback-rows={n}"));
+    }
     child.arg("--");
     for c in cmd {
         child.arg(c);
@@ -142,6 +148,8 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
     // preset と揃える (= 親が値を渡し忘れた場合のフォールバック)。
     let mut on_child_suspend = OnChildSuspend::Follow;
     let mut on_parent_suspend = OnParentSuspend::Transparent;
+    // DR-0013 §8: parent から伝搬される scrollback rows。None なら DaemonConfig 既定値を維持。
+    let mut scrollback_rows: Option<usize> = None;
     let mut cmd: Vec<String> = Vec::new();
     let mut in_cmd = false;
     for arg in args {
@@ -176,6 +184,9 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
             if let Some(p) = parse_parent_suspend(v) {
                 on_parent_suspend = p;
             }
+        } else if let Some(v) = arg.strip_prefix("--scrollback-rows=") {
+            // DR-0013 §8: 親 RunConfig から伝搬。parse 失敗時は既定値維持。
+            scrollback_rows = v.parse::<usize>().ok();
         }
     }
 
@@ -215,6 +226,10 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
     // DR-0001 軸 1/2 を daemon に配線。
     dcfg.on_child_suspend = on_child_suspend;
     dcfg.on_parent_suspend = on_parent_suspend;
+    // DR-0013 §8 + §8 Update: scrollback rows 上限を daemon に配線。
+    if let Some(n) = scrollback_rows {
+        dcfg.screen_vt100_scrollback_rows = n;
+    }
 
     let session = match Session::start(dcfg) {
         Ok(s) => s,
