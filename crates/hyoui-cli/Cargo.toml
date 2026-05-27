@@ -27,6 +27,8 @@ serde = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# integration tests (tests/lock_cli.rs) で nix::sys::signal::kill を使う
+nix = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"
