@@ -18,6 +18,11 @@
 任意のコマンドを PTY の中で起動し、内側からは透過的に振る舞いながら、
 **外側から監視・自動操作するための足場**を提供する。
 
+daemon は子 PTY を [`vt100`](https://docs.rs/vt100) ベースの screen emulator で
+解釈し、**screen state の正本を持つ**。これによって attach 復元 (= alt screen
+常駐 TUI の観戦も含む)、wait の現在 visible state に対する match、structured
+snapshot などが安定して動作する ([[DR-0013]])。
+
 ## Who is hyoui for?
 
 「ターミナルの中で生活する」ツールではなく、「外側から駆動する」ツール。
@@ -28,7 +33,7 @@
 - **長時間走る LLM / REPL / TUI セッションに attach し直したい**:
   夜走らせた `claude` セッションに朝スマホから ssh で繋ぎ直す、など
 - **テスト・運用スクリプトから interactive command を expect 的に駆動したい**:
-  入力注入 (`send`) と出力待ち (`wait`) を CLI 一本でやりたい
+  入力注入と現在画面に対する出力待ちを CLI 一本でやりたい
 
 逆に「`Ctrl-b` を押して画面を分割して人間が生活する」用途は tmux / zellij の仕事。
 hyoui は **tmux の中で動かす** 想定。
@@ -43,8 +48,11 @@ gateway 経由で外側から制御** する。
 主な用途:
 
 - long-running な対話プロセス（例: `claude` / REPL / `ssh` / TUI app）を起動して、
-  あとから何度でも attach / detach する
-- CI / スクリプトから入力注入と出力待ちで自動操作する（`send` / `wait`、v0.2.0+ で本格化）
+  あとから何度でも attach / detach する。attach 時は daemon が screen state から
+  画面を再描画するので、alt screen 常駐の TUI も画面崩壊なしで再現される
+- CI / スクリプトから入力注入と出力待ちで自動操作する（`hyoui input` の
+  `text:` / `key:` / `paste:` / `wait:` / `wait-idle:` spec、`hyoui wait`、
+  `hyoui screen dump` / `screen snapshot`、`hyoui lock` / `tx`）
 - 複数 client で同じセッションを共有する（pair-programming、観戦、人手介入）
 
 ## Installation
@@ -113,16 +121,64 @@ hyoui attach "$SESS" --mode=ro
 hyoui kill "$SESS"
 ```
 
-### 主な subcommand (v0.1.0)
+attach は daemon の screen state から 1 frame で画面を再描画する
+([[DR-0013]] §4 Phase A) ので、claude TUI のような alt screen 常駐アプリも
+detach 直前の状態が綺麗に復元される。
+
+### 自動操作: input / wait / screen / lock
+
+```bash
+# direct text と key の組み合わせ
+hyoui input "$SESS" "text:ls -la" "key:Enter"
+
+# 現在 visible state に対する match 待ち (= 過去 redraw の誤マッチが起きない)
+hyoui input "$SESS" "wait:^Continue\\?" "key:Enter"
+
+# binary 制御文字 (= ESC[A = Up arrow)
+hyoui input "$SESS" "hex:1b5b41"
+
+# multi-line script を bracketed paste で
+hyoui input "$SESS" "paste:$(cat script.py)"
+
+# 単独 wait (= timeout / print 制御つき)
+hyoui wait "$SESS" "^\\$" --timeout=10s --print=line
+
+# 画面 dump (= ANSI bytes、terminal で cat 再生可)
+hyoui screen dump "$SESS"
+hyoui screen dump "$SESS" --layer=both --rect=0,0,80,5
+
+# 構造化 snapshot (= JSON、jq で処理しやすい)
+hyoui screen snapshot "$SESS" --include=Cursor
+hyoui screen snapshot "$SESS" --include=Cells,Cursor,Mode | jq '.cursor'
+
+# 排他取得 (= 他 client が強制 ro、自分は leader 強制昇格)
+hyoui lock acquire "$SESS" --timeout-idle=30s
+hyoui lock release "$SESS"
+
+# transactional な排他 (= 子プロセスに HYOUI_LOCK_TOKEN を注入、子 exit で自動解放)
+hyoui lock tx "$SESS" -- hyoui input "$SESS" "wait:^Prompt>" "text:..." "key:Enter"
+
+# raw bytes を grep / 保存したい時は tail
+hyoui tail "$SESS" --since-strict --last-bytes=4096
+```
+
+### 主な subcommand
 
 | コマンド | 用途 |
 |---|---|
 | `hyoui run [--detached] [--session=ID] [--size=COLSxROWS] -- cmd args...` | PTY 起動・daemon 化 |
-| `hyoui attach <session> \| --socket=PATH [--mode=rw\|ro\|rw-no-leader] [--exclusive] [--detach-others]` | 入出力中継 |
+| `hyoui attach <session> [--mode=rw\|ro\|rw-no-leader]` | 入出力中継 (= screen state から画面復元) |
 | `hyoui list` | アクティブ session を列挙 |
 | `hyoui kill <session> [--signum=N]` | 子に signal 送出（default SIGTERM） |
+| `hyoui input <session> <spec>...` | 入力注入 (= `text:` / `hex:` / `file:` / `paste:` / `key:` / `wait:` / `wait-idle:` spec) |
+| `hyoui wait <session> <pattern>` | 現在 visible state に対する regex match 待ち |
+| `hyoui screen dump <session>` | 画面 ANSI dump (= terminal で cat 再生可) |
+| `hyoui screen snapshot <session>` | 構造化 state snapshot (= JSON / CBOR) |
+| `hyoui lock acquire\|release\|tx <session>` | 排他制御 (= 自動操作の atomic 性) |
+| `hyoui tail <session>` | raw bytes stream (= log / grep / asciinema 前段) |
 
-詳細仕様は [`docs/DESIGN.md`](./docs/DESIGN.md) と [`docs/decisions/INDEX.md`](./docs/decisions/INDEX.md) を参照。
+詳細仕様は [`docs/DESIGN.md`](./docs/DESIGN.md) と
+[`docs/decisions/INDEX.md`](./docs/decisions/INDEX.md) を参照。
 
 ### Detach key
 
@@ -149,19 +205,24 @@ hyoui は **terminal multiplexer ではない**。「人が中で生活する系
 | | hyoui | abduco / dtach | shpool | Pexpect / Expect | ttyd / gotty | asciinema |
 |---|---|---|---|---|---|---|
 | 1 daemon 1 session モデル | ◯ | ◯ | ◯ | × | × | × |
-| 外側 CLI からの入力注入 | **first-class**（v0.2.0+） | × | × | library から call | ブラウザ経由 | 録画のみ |
-| 外側からの出力待ち | **first-class**（`wait` / `tail`） | × | × | `expect()` | × | × |
-| 録画 / replay | v0.2.0+ で計画 | × | × | × | × | 中心機能 |
-| HTTP / ブラウザ gateway | v0.2.0+ で計画（`serve`） | × | × | × | 中心機能 | replay のみ |
+| daemon が screen state 正本 | **◯** (vt100 base) | × | × | × | × | × |
+| 外側 CLI からの入力注入 | **first-class** (`input` family) | × | × | library から call | ブラウザ経由 | 録画のみ |
+| 現在 visible state に対する待ち合わせ | **first-class** (`wait` state-based) | × | × | `expect()` (= 子 PTY stream regex) | × | × |
+| 構造化 snapshot / dump | **first-class** (`screen dump` / `screen snapshot`) | × | × | × | × | × |
+| 録画 / replay | 追加予定 | × | × | × | × | 中心機能 |
+| HTTP / ブラウザ gateway | 追加予定 (= `kawaz/hyoui-serve`) | × | × | × | 中心機能 | replay のみ |
 | daemon ライフサイクル | 起動と同時、子 exit で終了 | session manager 型 | 永続 server | 子と心中 | server 型 | N/A |
 
-要するに「**1 daemon 1 session の透過 PTY ラッパー** に対して、**外側から自動操作するための
-CLI / HTTP API** を first-class で乗せる」のが hyoui の独自ポジション。
+要するに「**1 daemon 1 session の透過 PTY ラッパー** に対して、**daemon 側で
+screen state を正本管理**し、**外側から自動操作するための CLI / HTTP API** を
+first-class で乗せる」のが hyoui の独自ポジション。
 abduco / dtach は外側操作 API が無く、shpool は server 永続型、ttyd はブラウザ前提、
 expect は library。「`expect` の使いやすさ」「`abduco` の attach 体験」「`ttyd` の遠隔操作」
 の 3 つを CLI 一本で揃えるのが目標。
 
-詳しい思想は [DR-0005](./docs/decisions/DR-0005-design-philosophy-external-automation.md) を参照。
+詳しい思想は [DR-0005](./docs/decisions/DR-0005-design-philosophy-external-automation.md)、
+screen state 正本化と attach 復元の仕組みは
+[DR-0013](./docs/decisions/DR-0013-screen-emulator-and-attach-stability.md) を参照。
 
 ## 名前について
 
@@ -171,19 +232,25 @@ expect は library。「`expect` の使いやすさ」「`abduco` の attach 体
 
 ## Status
 
-v0.1.x = **外側 API 確立期**。`run` / `attach` / `list` / `kill` + multi-attach +
-protocol cap negotiation までが安定動作。
+v0.1.x = **外側 API 確立期**。
+
+- `run` / `attach` / `list` / `kill` + multi-attach + protocol cap negotiation:
+  v0.1.0 で安定動作
+- screen emulator 採用 + attach handshake redraw + state-based wait /
+  snapshot / dump: [[DR-0013]] Phase A/B で完了 (= **claude TUI 観戦 / 自動操作
+  の核となる機能が動作する状態**)
+- input family (= `text:` / `hex:` / `file:` / `paste:` / `key:` / `wait:` /
+  `wait-idle:` spec) と lock / tx の本実装も完了済
 
 **production readiness**:
 
 - 動作確認済 platform: Linux x86_64 / aarch64, macOS Intel / Apple Silicon
 - breaking change policy: **v0.x の間は minor bump で breaking 可**
   （API が固まるまで snake oil を売らない方針）
-- production 利用: **v0.1.x はまだ非推奨**。kawaz 自身が `claude` 駆動の
-  daily-driver として使用 (= eat your own dogfood) しているが、業務運用には
-  self-test 推奨
-- **production stable は v0.2.0+ 予定**: `serve` gateway 公開と自動操作 API
-  (`send` / `keys` / `paste` / `wait` / `tail` / `lock` / `tx`) の確立が条件
+- production 利用: kawaz 自身が `claude` 駆動の daily-driver として使用
+  (= eat your own dogfood)。業務運用にはまだ self-test 推奨
+- **production stable の目安**: `serve` gateway (= 別 repo `kawaz/hyoui-serve`)
+  公開と remaining 機能 (= record / replay、observability、L2 wait 等) の確立後
 
 ロードマップ詳細: [`docs/ROADMAP.md`](./docs/ROADMAP.md)。
 
