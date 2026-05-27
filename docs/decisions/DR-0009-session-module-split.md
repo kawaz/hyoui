@@ -2,8 +2,16 @@
 
 - Status: Active (Phase A-E 完了 2026-05-27、Phase F は別 task)
 - Date: 2026-05-27
-- Related: [[DR-0005]] (思想), [[DR-0006]] (CLI ground rules), [[DR-0007]] (MVP scope), [[DR-0008]] (protocol)
+- Related: [[DR-0005]] (思想), [[DR-0006]] (CLI ground rules), [[DR-0007]] (MVP scope), [[DR-0008]] (protocol), [[DR-0013]] (screen emulator、state-based wait で `wait.rs` は state polling 補助層に縮退)
 - Backlog 解消: R4-H6 (session.rs 責務集約)、R4-M2 (handle_control_message 311 行) を本 DR で扱う
+
+## Update (2026-05-27): wait module 責務は state-based 移行後に縮退
+
+Phase E で `wait.rs` を切り出した時点では daemon 側に `wait.request` / `wait.result` の handler (= `handle_wait_request_with_cap` 等) が存在したが、[[DR-0006]] §9 改訂 + [[DR-0013]] state-based 基盤に伴い、daemon 側 wait kind の handler 群は **削除済**。
+
+現状の wait は CLI 側 (`crates/hyoui/src/cli/wait_core.rs`) が `screen.snapshot.request` を polling する形になっており、daemon 側 `wait.rs` には `update_waits_on_master_bytes` / `compute_wait_poll_timeout` 等の **state polling 補助 (= snapshot 発火 trigger / poll interval 算出) のみが残る形に縮退**している。
+
+本 DR §Phase E / §dispatcher 化 の擬似 code (= `ControlMessage::WaitRequest(r) => handle_wait_request_with_cap(...)`) は本 DR 起票時点 (Phase E 完了直後) のスナップショットとして historical reference 扱い。現行 dispatcher の wait kind 該当 arm は削除済。
 
 ## Context
 

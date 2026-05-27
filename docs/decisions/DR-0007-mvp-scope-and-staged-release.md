@@ -8,6 +8,10 @@
 
 [[DR-0013]] 起票に伴い、本 DR で言及している version 区切り (= v0.1.x / v0.2.0 等) は廃止。scope の正本は [`docs/ROADMAP.md`](../ROADMAP.md) (= 4 層列挙型) を参照。
 
+## Update (2026-05-27、後段): wait L0 protocol 言及は historical reference
+
+[[DR-0013]] / [[DR-0006]] §9 で wait を **state-based** (= 現在 visible state に対する match、CLI 側で `screen.snapshot.request` を polling) に移行済。本 DR 内の `wait-l0` cap への言及 (§v0.2.0 cap flag 一覧 / §Rejected alternatives) は historical reference として保持するが、実装上は廃止済。新規 wait の正本仕様は [[DR-0006]] §9 + [[DR-0013]] §9。
+
 ## Context
 
 [[DR-0006]] で確定した API surface は大きい。一気に v0.1.0 で全部出すと開発工数が膨大、

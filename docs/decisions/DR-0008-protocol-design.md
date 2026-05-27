@@ -16,6 +16,14 @@
 
 PDU serial 番号 (= wezterm `codec/src/lib.rs:67` パターン、out-of-order tolerant + RTT 計測) を CBOR control message に入れる検討は Phase B の実装で確定。
 
+## Update (2026-05-27、後段): wait L0 protocol を削除 (state-based に移行)
+
+[[DR-0006]] §9 改訂 + [[DR-0013]] state-based 基盤に伴い、本 DR §2 kind 一覧の `wait.request` / `wait.result`、§2.3 `handshake.request.caps` 例の `wait-l0`、error code 表の `wait.*` 3 種は **wire / 実装ともに削除済**。
+
+新 wait は [[DR-0013]] §9 の `StateSnapshotRequest` / `StateSnapshotResponse` (= cap flag `state-snapshot-v1`) を CLI 側 (`hyoui wait` / `hyoui input "wait:..."`) が polling する形に統一。daemon 側に専用 `wait.*` kind は持たない。
+
+本 DR §2.2 / §2.3 / error code 表 / §未確定事項 等に残る `wait.request` / `wait.result` / `wait-l0` / `wait.*` 言及は historical reference として保全する (= 過去仕様の経緯追跡用)。**現行 wire / cap 集合は本 DESIGN 文書 §2.2 の v0.1.0 cap セット (`data` / `lock` / `tail-v1` / `screen-dump-v1` / `state-snapshot-v1`) が正本**。
+
 ## Context
 
 [[DR-0006]] で「protocol は transport (Unix socket / TCP / WebSocket) から独立」と宣言。PoC 04 ([[2026-05-26-fd-passing-vs-stream]]) で SCM_RIGHTS 不採用 = stream 中継一本化を確定。本 DR は **wire format / 制御メッセージのモデル / handshake / capability negotiation / transport 抽象** をゼロベースで設計する。
