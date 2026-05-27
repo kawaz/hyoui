@@ -2380,6 +2380,12 @@ pub struct InputCommand {
     pub specs: Vec<InputSpec>,
     /// Per-spec timeout (= default 5s、特に `wait:` / `wait-idle:` で意味を持つ)。
     pub timeout: Duration,
+    /// `--lock-token=<T>` で明示指定された lock token (DR-0006 §6 / §8.5)。
+    ///
+    /// `Some` なら handshake.token としてそのまま流す (= env 値より優先)。
+    /// `None` のときは実行段で `HYOUI_LOCK_TOKEN` 環境変数を読む (= 既存挙動)。
+    /// flag 優先 / env fallback で「auto 継承」と「明示上書き」を両立する。
+    pub lock_token: Option<String>,
 }
 
 /// [`InputSpec`] のパース結果 (= prefix で type 判別、payload validate)。
@@ -2496,6 +2502,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
 fn parse_input(args: &[String]) -> Command {
     let mut socket: Option<String> = None;
     let mut timeout_ms: u64 = 5_000;
+    let mut lock_token: Option<String> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut i = 0usize;
     while i < args.len() {
@@ -2535,6 +2542,20 @@ fn parse_input(args: &[String]) -> Command {
                     Err(e) => return Command::Error(format!("input: --timeout: {e}")),
                 },
                 None => return Command::Error("input: --timeout requires a value".into()),
+            },
+            // DR-0006 §6 / §8.5: 明示 lock token を CLI 引数で渡す。
+            // env `HYOUI_LOCK_TOKEN` より優先 (= flag 指定で env を上書き)。
+            // 値の検証は handshake で daemon が行うので CLI 段では空文字のみ reject。
+            "--lock-token" => match value {
+                Some(v) => {
+                    if v.is_empty() {
+                        return Command::Error(
+                            "input: --lock-token requires a non-empty value".into(),
+                        );
+                    }
+                    lock_token = Some(v);
+                }
+                None => return Command::Error("input: --lock-token requires a value".into()),
             },
             other if other.starts_with("--") => {
                 return Command::Error(format!("input: unknown option: {other}"));
@@ -2609,6 +2630,7 @@ fn parse_input(args: &[String]) -> Command {
         session_id,
         specs,
         timeout: Duration::from_millis(timeout_ms),
+        lock_token,
     })
 }
 
@@ -2632,10 +2654,12 @@ fn usage_input() -> String {
         OPTIONS:\n    \
             --socket PATH      Explicit socket path (alternative to session-id)\n    \
             --timeout DUR      Per-spec timeout (default: 5s; DUR 形式は下記参照)\n    \
+            --lock-token T     明示 lock token (= env HYOUI_LOCK_TOKEN より優先、DR-0006 §8.5)\n    \
             -h, --help         Show this help and exit\n\
         \n\
         ENVIRONMENT:\n    \
-            HYOUI_LOCK_TOKEN   lock token を env で渡す (= handshake.token)\n\
+            HYOUI_LOCK_TOKEN   lock token を env で渡す (= handshake.token)。\n                       \
+                               --lock-token flag 指定時は無視される\n\
         \n\
         DURATION FORMAT (kawaz/timespec.mbt 仕様 + sub-ms 拡張):\n    \
             短形 ns/us/μs/ms/s/m/h/d/w または長形 second(s)/minute(s)/hour(s)/\n    \
@@ -4681,6 +4705,68 @@ mod tests {
         match parse_args(&args(&["input", "demo", "--bogus=1", "text:x"])) {
             Command::Error(msg) => {
                 assert!(msg.contains("unknown option"), "got: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    // -------- --lock-token (DR-0006 §6 / §8.5) --------
+
+    #[test]
+    fn parse_input_lock_token_inline() {
+        match parse_args(&args(&["input", "demo", "--lock-token=tok-abc", "text:x"])) {
+            Command::Input(cmd) => {
+                assert_eq!(cmd.lock_token.as_deref(), Some("tok-abc"));
+            }
+            other => panic!("expected Input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_lock_token_separated() {
+        // `--lock-token VALUE` (= space-separated) も accept する
+        match parse_args(&args(&[
+            "input",
+            "demo",
+            "--lock-token",
+            "tok-xyz",
+            "text:x",
+        ])) {
+            Command::Input(cmd) => {
+                assert_eq!(cmd.lock_token.as_deref(), Some("tok-xyz"));
+            }
+            other => panic!("expected Input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_lock_token_default_is_none() {
+        match parse_args(&args(&["input", "demo", "text:x"])) {
+            Command::Input(cmd) => {
+                assert_eq!(cmd.lock_token, None);
+            }
+            other => panic!("expected Input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_lock_token_empty_value_errors() {
+        match parse_args(&args(&["input", "demo", "--lock-token=", "text:x"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("--lock-token"), "got: {msg}");
+                assert!(msg.contains("non-empty"), "got: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_lock_token_missing_value_errors() {
+        // 末尾に flag だけ置いて value 候補がない → error
+        match parse_args(&args(&["input", "demo", "text:x", "--lock-token"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("--lock-token"), "got: {msg}");
+                assert!(msg.contains("requires a value"), "got: {msg}");
             }
             other => panic!("expected Error, got {other:?}"),
         }

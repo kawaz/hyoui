@@ -1309,14 +1309,22 @@ fn input_command(cmd: InputCommand) -> ExitCode {
 
     // 2. attach (= Rw mode で連結)。raw_data frame の書き込みは Rw client のみ
     //    daemon が master fd に流す (= Ro は silently drop される)。
-    //    HYOUI_LOCK_TOKEN は env から取る (= attach/kill と同じ pattern)。
+    //    Lock token は DR-0006 §6 / §8.5 に従い flag 優先 + env fallback で解決:
+    //    - `--lock-token=<T>` が指定されていれば、その値を handshake.token に流す
+    //    - flag 未指定なら `HYOUI_LOCK_TOKEN` env を読む (= 既存 auto 継承挙動)
+    //    flag 優先により「親 (= tx) が export した env を子 input が上書き指定したい」
+    //    といったケースに対応する。空 string の flag は parser 段で reject 済。
+    let token = cmd
+        .lock_token
+        .clone()
+        .or_else(|| std::env::var("HYOUI_LOCK_TOKEN").ok());
     let opts = AttachOptions {
         mode: Mode::Rw,
         caps: hyoui::protocol::MVP_CAPS
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
-        token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
+        token,
         exclusive: false,
         detach_others: false,
     };
@@ -2052,6 +2060,7 @@ mod tests {
             session_id: None,
             specs: vec![InputSpec::Wait("GO".into())],
             timeout: std::time::Duration::from_secs(3),
+            lock_token: None,
         };
         let start = std::time::Instant::now();
         let exit = input_command(cmd);
@@ -2106,6 +2115,7 @@ mod tests {
             session_id: None,
             specs: vec![InputSpec::WaitIdle(std::time::Duration::from_millis(200))],
             timeout: std::time::Duration::from_secs(3),
+            lock_token: None,
         };
         let exit = input_command(cmd);
         let exit_dbg = format!("{exit:?}");
