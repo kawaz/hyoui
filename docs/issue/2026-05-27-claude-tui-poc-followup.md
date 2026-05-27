@@ -1,6 +1,6 @@
 # claude TUI 自動操作 PoC からのフィードバック (dump plain-text format + scrollback layer)
 
-- Status: Partially Done (= 要望 1 対応済、要望 2 / 副次要望は別 issue で継続)
+- Status: Done (= 要望 1 + 要望 2 対応済、副次要望のみ別 issue で継続)
 - Date: 2026-05-27
 - Priority: Middle
 - 発見元: claude-cmux-msg main 側で `hyoui input + wait + screen dump` を使って claude TUI を実機操作した PoC
@@ -11,8 +11,15 @@
   protocol enum + daemon dispatch + CLI 受理 + test を実装。
   alias 3 種 (`text` / `text/plain` / `plain`) を受理、行末空白保持 + ANSI escape strip
   の仕様で TUI 盤面状態をそのまま読める形に。
-  要望 2 (scrollback layer) と副次要望 (wait alternation) は別 issue / 別 task で
-  検討継続。
+- 2026-05-28: **要望 2 (= `--layer=scrollback` / `--layer=both` 実装) 対応済**。
+  vt100 内蔵 scrollback ring を `DaemonConfig.screen_vt100_scrollback_rows`
+  (default 1000 行) で配線し、`build_screen_dump` を `&mut ScreenState` に変えて
+  `set_scrollback` 経由で過去 row を抽出。layer × format の 9 通り全 dispatch を
+  実装 (= Visible/Scrollback/Both × Ansi/Binary/TextPlain、Cbor は連結 grid)。
+  CLI に `--scrollback-rows=<N>` flag + `HYOUI_SCROLLBACK_ROWS` env 追加。
+  daemon test + CLI test で SCROLLED_OUT_HEAD marker が scrollback layer から
+  取り出せることを E2E 確認済。
+  副次要望 (wait alternation) は別 issue / 別 task で検討継続。
 
 ## PoC サマリ
 
@@ -70,26 +77,42 @@ hyoui screen snapshot <sid> --include Cells  # CBOR 構造化
 
 現状の説明 `binary — 空白除去 + 改行 plaintext (= grep 用)` は明確だが、「grep 用」と言いつつ TUI 状態判定では結構痛い (= `wait` で `--pattern` 渡したい時に行マッチが効きにくい）。新 format 追加と合わせて、help の使い分け説明も整理したい。
 
-## 要望 2: `screen dump --layer scrollback` の実装 (or 別経路)
+## 要望 2: `screen dump --layer scrollback` の実装 (or 別経路) [Done 2026-05-28]
 
-現状:
+実装済 (2026-05-28):
 
 ```
-hyoui screen dump <sid> --layer scrollback
-→ ProtocolMalformed message=screen.dump layer not implemented in MVP (scrollback / both)
+hyoui screen dump <sid> --layer scrollback             # 過去 row のみ (古い → 新しい順)
+hyoui screen dump <sid> --layer both                   # scrollback + visible 連結
+hyoui run --scrollback-rows=2000 -- claude-tui ...     # ring 容量を override
+HYOUI_SCROLLBACK_ROWS=2000 hyoui run -- ...             # env 経由でも可
 ```
 
-**use case**: claude TUI で長文応答 (50 行超) が出ると visible 40 行から **スクロールアウトして見えない**。例:
+format ごとの対応 (= 全 9 通り dispatch 済):
 
-- claude に「DR-0010 を要約して詳細に説明して」と振ると 60+ 行の応答 → visible 40 行には末尾しか残らない
-- 自動化スクリプトで応答全文を取りたいのに、上端から消えた部分が読めない
+| format | Visible | Scrollback | Both |
+|--------|---------|------------|------|
+| ansi | `state_formatted()` | rows を ANSI escape で再構築 (SGR のみ) | 連結 |
+| binary | 空白除去 plaintext | 同 (scrollback rows) | 連結 |
+| text-plain | 行末空白保持 plaintext | 同 (scrollback rows) | 連結 |
+| cbor | `ScreenSnapshot` (cells = visible) | cells = scrollback rows | cells = scrollback + visible、0-origin で再番号付け |
 
-代替案 (現状の workaround):
+実装メモ:
 
-- `hyoui tail <sid>` で raw byte stream を流して自前で vt100 emulator 通す (= csa の jsonl 経路でなく hyoui tail を vt100 で再構成) → 二重 emulator は不毛
-- claude TUI 側で `--size=120x200` のように **rows を最初から大きく取る** (= スクロール発生させない) → 実用上はこれが回避策、ただし daemon 側 grid memory が rows × cols 比例で増える
+- `DaemonConfig.screen_vt100_scrollback_rows` default 1000 行 (= 典型 TUI app の 60-行応答 + 余裕)
+- ring 容量を超えると古い行から evict (vt100 標準挙動)
+- `build_screen_dump` を `&mut ScreenState` に変更 (= vt100 `set_scrollback` の API 制約、論理的には副作用なし)
+- daemon test + CLI test で SCROLLED_OUT_HEAD marker が scrollback layer から取れることを保護
 
-実装は DR-0013 で API 設計済 (`--layer scrollback / both`) なので、優先度を上げて欲しい。少なくとも「visible より上に N 行の最近 scrollback だけ取れる」(= `--layer scrollback --last-rows 100` 的な) でも実用上助かる。
+**use case**: claude TUI で長文応答 (50 行超) が出ると visible 40 行から **スクロールアウトして見えない** → 解決済。
+`--layer=scrollback` で過去 row を取り出せる、`--layer=both` なら scrollback + visible を 1 度に取れる。
+
+旧 workaround (= `--size=120x200` で rows を盛る、`hyoui tail` を再 emulate) は scrollback layer で代替可能。
+
+未対応 (= 別 task に分離):
+
+- `--last-rows N` (= scrollback の末尾 N 行だけ取る) は MVP 未実装。`--rect=` honor とセットで別 task。
+- ANSI dump 中の色情報 (= `RowCellSnap` が SGR の bold/italic/underline/inverse しか保持しないため、scrollback の ANSI 再構築では色は落ちる)。色を完全保持したければ Cbor 経路を使う。
 
 ## 副次的要望 (小)
 

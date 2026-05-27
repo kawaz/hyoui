@@ -556,9 +556,12 @@ mod tests {
         // 保持するため、各 row は cols=10 の char 列 + 改行で出力される。
         let mut s = ScreenState::new(3, 10, 0);
         s.process(b"hi");
-        let out =
-            build_screen_dump(&mut s, ScreenDumpFormat::TextPlain, ScreenDumpLayer::Visible)
-                .expect("ok");
+        let out = build_screen_dump(
+            &mut s,
+            ScreenDumpFormat::TextPlain,
+            ScreenDumpLayer::Visible,
+        )
+        .expect("ok");
         let text = std::str::from_utf8(&out).expect("utf8");
         // 期待: "hi" + 8 spaces + "\n" + 10 spaces + "\n" + 10 spaces + "\n"
         let expected = format!(
@@ -581,9 +584,12 @@ mod tests {
         // を含まないことを確認する。
         let mut s = ScreenState::new(2, 6, 0);
         s.process(b"\x1b[1;31mERR\x1b[0m");
-        let out =
-            build_screen_dump(&mut s, ScreenDumpFormat::TextPlain, ScreenDumpLayer::Visible)
-                .expect("ok");
+        let out = build_screen_dump(
+            &mut s,
+            ScreenDumpFormat::TextPlain,
+            ScreenDumpLayer::Visible,
+        )
+        .expect("ok");
         // ESC (0x1b) は 1 byte も含まれてはいけない
         assert!(
             !out.contains(&0x1b),
@@ -604,9 +610,12 @@ mod tests {
         // 2x6 viewport: "あa" は 3 col (= 2+1) 使い、残り 3 col は空白。
         let mut s = ScreenState::new(2, 6, 0);
         s.process("あa".as_bytes());
-        let out =
-            build_screen_dump(&mut s, ScreenDumpFormat::TextPlain, ScreenDumpLayer::Visible)
-                .expect("ok");
+        let out = build_screen_dump(
+            &mut s,
+            ScreenDumpFormat::TextPlain,
+            ScreenDumpLayer::Visible,
+        )
+        .expect("ok");
         let text = std::str::from_utf8(&out).expect("utf8");
         // 1 行目 = "あa" + 3 spaces + "\n"、2 行目 = 6 spaces + "\n"
         let expected = format!("あa{}\n{}\n", " ".repeat(3), " ".repeat(6));
@@ -645,8 +654,12 @@ mod tests {
             s.process(format!("L{i}\r\n").as_bytes());
         }
         // text-plain は空 string (= 0 行) を返す
-        let out = build_screen_dump(&mut s, ScreenDumpFormat::TextPlain, ScreenDumpLayer::Scrollback)
-            .expect("ok");
+        let out = build_screen_dump(
+            &mut s,
+            ScreenDumpFormat::TextPlain,
+            ScreenDumpLayer::Scrollback,
+        )
+        .expect("ok");
         assert!(
             out.is_empty(),
             "scrollback disabled must return empty payload, got: {:?}",
@@ -669,8 +682,12 @@ mod tests {
             s.process(format!("L{i}\r\n").as_bytes());
         }
         // visible は L13/L14/空、scrollback には L3..L12 が貯まる想定 (= 10 行 ring)。
-        let out = build_screen_dump(&mut s, ScreenDumpFormat::TextPlain, ScreenDumpLayer::Scrollback)
-            .expect("ok");
+        let out = build_screen_dump(
+            &mut s,
+            ScreenDumpFormat::TextPlain,
+            ScreenDumpLayer::Scrollback,
+        )
+        .expect("ok");
         let text = std::str::from_utf8(&out).expect("utf8");
         assert!(
             text.contains("L3"),
@@ -702,9 +719,8 @@ mod tests {
         for i in 0..15 {
             s.process(format!("L{i}\r\n").as_bytes());
         }
-        let out =
-            build_screen_dump(&mut s, ScreenDumpFormat::Ansi, ScreenDumpLayer::Scrollback)
-                .expect("ok");
+        let out = build_screen_dump(&mut s, ScreenDumpFormat::Ansi, ScreenDumpLayer::Scrollback)
+            .expect("ok");
         // 先頭は cursor home escape `\x1b[H`
         assert!(
             out.starts_with(b"\x1b[H"),

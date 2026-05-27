@@ -27,7 +27,7 @@ hyoui の設計判断記録一覧。ファイル名は `DR-NNNN-title.md`（4 �
 | [DR-0010](./DR-0010-v020-scope-and-serve-placement.md) | N/A (= ROADMAP) | v0.2.0 scope re-scope + serve gateway 配置判断 (= subcommand 11→7、serve を別 repo 切り出し、DR-0007 部分上書き) |
 | [DR-0011](./DR-0011-observability-strategy.md) | ⬜ 未実装 | observability 戦略 (= tracing 採用、Phase A 以降、v0.2.0 serve gateway 前提) |
 | [DR-0012](./DR-0012-signal-wire-name-not-number.md) | 🟡 部分実装 | signal wire を u8 number から signal name string に変更 (v0.2.0 breaking change) |
-| [DR-0013](./DR-0013-screen-emulator-and-attach-stability.md) | 🟡 部分実装 (Phase A/B 完了、Phase C 未) | screen emulator + attach/detach 安定化 + データモデル統一 (vt100 採用、daemon = screen state 正本化) |
+| [DR-0013](./DR-0013-screen-emulator-and-attach-stability.md) | 🟡 部分実装 (Phase A/B + scrollback layer 完了、Phase C 残: observe mode / multi-client resize モード / reflow / zstd 等) | screen emulator + attach/detach 安定化 + データモデル統一 (vt100 採用、daemon = screen state 正本化) |
 | [DR-0014](./DR-0014-transparency-and-empirical-verification.md) | N/A (= プロセス) | 透過原則の徹底と検証主義 (= self-check リスト、マトリクス検証主義、ドッグフーディング、CLAUDE.md 経由で常時参照) |
 
 ## Archived

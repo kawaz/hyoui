@@ -218,19 +218,13 @@ fn main() -> ExitCode {
     }
 }
 
-/// `hyoui run` の主要ロジック。
-///
-/// 同 process 内で:
-/// 1. 子 PTY 用 daemon session を起動 (= listener bind 完了)
-/// 2. daemon thread を spawn (= accept + relay)
-/// 3. main thread が attach client として接続、stdin/stdout を中継
-/// 4. daemon thread を join、その exit code を返す
 /// `--scrollback-rows` flag (CLI) と `HYOUI_SCROLLBACK_ROWS` env を解決する。
 ///
 /// 優先順位 (高 → 低):
-/// 1. `--scrollback-rows=<N>` flag (= `cfg.scrollback_rows` が `Some(N)`)
-/// 2. `HYOUI_SCROLLBACK_ROWS=<N>` env
-/// 3. `None` (= DaemonConfig の既定値 1000 行を維持)
+///
+/// - `--scrollback-rows=<N>` flag (= `cfg.scrollback_rows` が `Some(N)`)
+/// - `HYOUI_SCROLLBACK_ROWS=<N>` env
+/// - `None` (= DaemonConfig の既定値 1000 行を維持)
 ///
 /// env が空文字列 / parse 不能なら `None` 同等 (= 既定値維持)。
 fn resolve_scrollback_rows(cfg_value: Option<usize>) -> Option<usize> {
@@ -243,6 +237,13 @@ fn resolve_scrollback_rows(cfg_value: Option<usize>) -> Option<usize> {
     }
 }
 
+/// `hyoui run` の主要ロジック。
+///
+/// 同 process 内で:
+/// 1. 子 PTY 用 daemon session を起動 (= listener bind 完了)
+/// 2. daemon thread を spawn (= accept + relay)
+/// 3. main thread が attach client として接続、stdin/stdout を中継
+/// 4. daemon thread を join、その exit code を返す
 fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     let scrollback_rows = resolve_scrollback_rows(cfg.scrollback_rows);
     if cfg.detached {

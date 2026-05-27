@@ -36,7 +36,7 @@
 未着手 (= 順次):
 
 - 既存 `crates/hyoui/src/scrollback.rs` の vt100 wrapper 置換は **見送り** (= byte-base tail 専用層として責務分離した、[[DR-0013]] §8 Update)
-- `last_evicted_age` 補完 counter (= vt100 内蔵 ring が無効化されている間は未配線、Phase C)
+- `last_evicted_age` 補完 counter (= 2026-05-28 で vt100 内蔵 ring は配線済 (default 1000 行) になったが、本 counter は未配線。incremental sync で「いつ scrollback から行が evict されたか」を caller が確認したくなった段階で実装)
 - per-line SequenceNo + pull 型 protocol (= `DirtyLinesNotify` / `GetLinesRequest` / `GetLinesResponse`)
 - PDU serial 番号導入 (= out-of-order tolerant + RTT 計測)
 
@@ -80,9 +80,17 @@
 
 ### [[DR-0013]] Phase C (= 優先度低めだが記録)
 
+完了済:
+
+- [x] **scrollback layer dump** (2026-05-28、`hyoui screen dump --layer={scrollback,both}` 配線、`DaemonConfig.screen_vt100_scrollback_rows` default 1000 行、`--scrollback-rows` / `HYOUI_SCROLLBACK_ROWS` で override 可)
+
+未着手:
+
 - **observe mode** (= `--no-resize-propagate`、子に WINCH 送らず daemon screen state を native size で表示、観戦 / 複数 client 異サイズの reflow 戦争回避)
 - **multi-client resize モード config 化** (= tmux pattern の `smallest` / `largest` / `manual` / `latest` 4 モード、MVP は `smallest` 固定)
 - **scrollback の真の reflow 実装** (= vt100 内蔵以上の品質が必要になったら、tmux pattern に拡張)
+- **scrollback dump の `--last-rows N` / `--rect` honor** (= 末尾 N 行だけ取る、矩形領域指定の honor、別 task)
+- **scrollback ANSI dump の色保持** (= 現状 SGR bold/italic/underline/inverse のみ、色情報は落ちる。完全保持したい場合は Cbor 経路を使う)
 - **zstd 圧縮** (= `redraw_bytes` 32 bytes 超で、Phase B 負荷測定後)
 - **libghostty-vt swap 評価** (= C API stable + semver annotate + 標準 allocator 対応になれば swap 候補)
 - **vt100 fork vendor 戦略** (= bus factor 対策、abandon 時に hyoui workspace に vendor する手順を準備)

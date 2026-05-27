@@ -389,7 +389,10 @@ impl ScreenState {
             let scr = self.parser.screen();
             let mut row = Vec::with_capacity(cols as usize);
             for c in 0..cols {
-                let cell_info = scr.cell(0, c).map(RowCellSnap::from_cell).unwrap_or_default();
+                let cell_info = scr
+                    .cell(0, c)
+                    .map(RowCellSnap::from_cell)
+                    .unwrap_or_default();
                 row.push(cell_info);
             }
             out.push(row);
@@ -937,7 +940,10 @@ mod tests {
         );
         // 復元後の visible 0 行目は "L12" (= 末尾 3 行 L12/L13/L14 が visible)
         let scr = s.screen();
-        let row0_first_char = scr.cell(0, 0).map(|c| c.contents().to_string()).unwrap_or_default();
+        let row0_first_char = scr
+            .cell(0, 0)
+            .map(|c| c.contents().to_string())
+            .unwrap_or_default();
         assert_eq!(
             row0_first_char, "L",
             "visible row0 should still start with 'L' (got {row0_first_char:?})"
