@@ -464,6 +464,35 @@ impl ClientConnection {
         }
     }
 
+    /// 任意の bytes 列を **raw_data frame** として daemon に送る (= `hyoui input`
+    /// 系の text/hex/file/paste/key の bytes 経路で使う)。
+    ///
+    /// daemon は受け取った raw_data frame の body を master PTY にそのまま書き込む
+    /// (= `daemon::control::handle_client_frame` の `TYPE_RAW_DATA` 分岐)。
+    /// したがって本 method は子 PTY に入力を流し込む primitive として機能する。
+    ///
+    /// 1 frame の上限は protocol 層の `MAX_FRAME_SIZE` (= 16 MiB - 1)。本 method は
+    /// 渡された bytes 全体を 1 frame で送る (= size 制御は caller 側の責務、
+    /// 大きい場合は事前に chunk 分割する)。空 bytes は何もせず `Ok(())`。
+    ///
+    /// # Errors
+    ///
+    /// I/O / frame size 超過は [`Error`] で返す。mode が `Ro` の client から呼んでも
+    /// daemon 側で silently drop される (= 本 method では検出できない)。
+    pub fn send_raw_bytes(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        Frame::raw_data(bytes.to_vec())
+            .encode_to(&mut self.writer)
+            .map_err(|e| match e {
+                FrameError::Io(io) => Error::Io(io),
+                FrameError::Protocol(_) => Error::Invalid("raw_data frame protocol error"),
+            })?;
+        self.writer.flush().map_err(Error::Io)?;
+        Ok(())
+    }
+
     /// 任意の `ControlMessage` を daemon に送る (= Resize / Signal / Kill / Detach 等)。
     ///
     /// `run` の外から (= signal handler や別 thread から) 呼ぶ用途。MVP では同期
