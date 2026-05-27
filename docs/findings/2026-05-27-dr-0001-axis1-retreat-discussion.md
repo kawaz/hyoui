@@ -29,10 +29,16 @@ DR-0005 で「外側自動操作主軸、TUI multiplexer ではない」と思�
 子の self-SIGTSTP の必要性は本質的に薄い。「外側から detach / kill / lock」が
 input/lock family + screen で揃っていれば操作軸として十分。
 
-## 実用的な示唆 / 提案
+## 視点の整理 (= 採用判断は kawaz、現状未定)
 
-### A. peer 推奨: 軸 1 撤退 + 軸 2 残す (= 最小撤退案)
+> **重要 (kawaz 指示、2026-05-27)**: peer 視点 (= a822a3d2) は **headless ユーザの
+> 立場からの意見**であり、人間が interactive で使う際の使い勝手判断は **未定**。
+> 本 finding は判断材料の整理のみで、**「推奨/非推奨」の決定は行わない**。
+> kawaz が説明 + 使い勝手確認を経て、明日以降に判断する。
 
+### A. 軸 1 撤退案 (= peer 視点)
+
+提案:
 - **軸 1 を設計から外す**: 子 self-SIGTSTP は POSIX_SPAWN_SETSID と本質的に両立しない、
   ハック的回避より撤退が筋
 - **軸 2 のみ残す**: 親 self-SIGTSTP / decouple は外側スクリプトから親 hyoui プロセスを
@@ -40,29 +46,44 @@ input/lock family + screen で揃っていれば操作軸として十分。
 - **interactive 人間 attach の Ctrl-Z 挙動** が必要なら別ルート (= attach client 側の
   signal handling) で実装
 
-理由:
+peer 視点での根拠:
 - lean 思想 (= 余分な機能を持たない) と整合
 - POSIX_SPAWN_SETSID を維持できる (= multi-attach / daemon detach 他要件との整合)
-- 「外側操作軸」の本筋に集中できる
+- peer の use case (= headless 中心) では軸 1 発火条件なし
 
-### B. 別解: POSIX_SPAWN_SETSID をやめる
+**未検討の論点 (= kawaz 判断時に要確認)**:
+- interactive 人間 attach の Ctrl-Z 体験の使い勝手 (= peer は use case 外で判断材料持たず)
+- 「別ルート (= attach client 側 signal handling)」の具体実装と現実性
+- DR-0001 起票時 (= 2026-05-21 journal `bootstrap`) に想定したシナリオがどこまで失われるか
 
-子を親と同じ session group に置く選択肢もある。
-ただし:
-- multi-attach / daemon detach の他要件と衝突する可能性高
-- 別の前提崩壊を引き起こす確率高
-- DR-0003 で「PTY 制御端末持つために必須」と決めた経緯あり、再評価コスト大
+### B. POSIX_SPAWN_SETSID 自体を変える案
 
-→ peer は **非推奨**。
+子を親と同じ session group に置く選択肢:
+- multi-attach / daemon detach の他要件と衝突する可能性
+- 別の前提崩壊リスク
+- DR-0003 で「PTY 制御端末持つために必須」と決めた経緯あり、再評価コスト
 
-### C. 第三の道: 軸 1 を「外側からの signal forward」として再定義
+→ 影響範囲が大きい、慎重判断要。
 
-agent (= 私) の補足案:
+### C. 軸 1 を「外側からの signal forward」として再定義する案
+
+agent (= Claude) の補足:
 - 軸 1 を「子が自分で SIGTSTP」ではなく「**子に対して SIGTSTP を送るユーザ要求があった場合**」と
   再定義する
 - 例: `hyoui send-signal <session> --signal=TSTP` を新設、daemon が `killpg(child_pgid, SIGTSTP)`
-- ただし orphan group への SIGTSTP は kernel discard なので、これも実効性なし
-- → 同じく実装不可、撤退が筋
+- ただし orphan group への SIGTSTP は kernel discard なので、**実効性なし**
+- → 撤退と同じ結論に至る
+
+### D. 軸 1 を現状維持で「kernel discard を許容」案
+
+検討漏れの選択肢:
+- 軸 1 仕様を維持しつつ、orphan group での kernel discard 挙動を仕様として明文化
+- claude TUI のような「自分で suspend message を出して raise(SIGTSTP) する」プログラムには
+  follow が機能しない (= 当該プログラムが kernel 仕様を assume してる前提が崩れる)、
+  これを「OS 仕様の限界」として hyoui の責任範囲から外す
+- DR-0001 §仕様の限界に annotate 追加
+- メリット: 設計を変えずに「期待値を下げる」だけで済む
+- デメリット: interactive 体験の使い勝手は改善されない
 
 ## 関連する claude TUI 動作の解釈
 
@@ -78,14 +99,17 @@ cast 解析 (= `claude2.cast` t=10.86) で claude TUI が
 - 直接 claude 起動 (= claude1.cast) では shell の中の子なので orphan ではなく、
   SIGTSTP が正常 fire、shell が suspended job として認識する
 
-→ 軸 1 撤退判断と矛盾しない。むしろ claude TUI の suspended message 出力は
-「user 期待 vs OS 仕様」の乖離を product 側が緩和しようとしている artifact と見ることもできる。
+→ claude TUI の suspended message 出力は「user 期待 vs OS 仕様」の乖離を product 側が
+緩和しようとしている artifact と見ることができる。各案 A-D のどれを採るかとは独立の現象。
 
-## kawaz 判断項目
+## kawaz 判断項目 (= 採用判断は未定、判断材料の整理)
 
-1. **軸 1 撤退 採否**: peer 推奨案 A を採用するか
-2. **DR-0001 改訂方針**: 軸 1 撤退なら DR-0001 を sub-DR or Update annotate で書き直す
-3. **DR-0005 との整合確認**: 「外側自動操作主軸」思想と軸 1 撤退が整合するか再確認
+1. **軸 1 の扱い**: A 撤退 / B POSIX_SPAWN_SETSID 変更 / C 外側 signal forward 再定義 /
+   D 現状維持 + 仕様限界明文化、のどれを採るか (= 現状未定、kawaz が説明 + 使い勝手確認を経て判断)
+2. **DR-0001 改訂方針**: 採用案に応じて DR-0001 を sub-DR or Update annotate で書き直す
+3. **DR-0005 との整合確認**: 「外側自動操作主軸」思想と各案の整合性
+4. **interactive 人間 attach の Ctrl-Z 体験**: hyoui の責任範囲か対象外か (= peer 視点では
+   別ルート提案、kawaz 視点の検討必要)
 4. **軸 2 (= 親 self-SIGTSTP) の実装着手判断**: peer は「価値あり」とするが、実装の優先度判断
 5. **interactive 人間 attach の Ctrl-Z 挙動**: 別ルート (= attach client 側 signal handling)
    を設ける必要があるか、または「hyoui は外側自動操作主軸なので interactive Ctrl-Z は対象外」と
