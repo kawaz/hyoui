@@ -78,16 +78,25 @@ impl ScreenState {
     }
 
     /// 0-origin cursor position `(row, col)`。
+    ///
+    /// Phase A 時点では caller は無いが、Phase B の structured snapshot / debug
+    /// inspection (DR-0013 §9) で expose 予定のため API として保持する。
+    #[allow(dead_code)]
     pub(crate) fn cursor_position(&self) -> (u16, u16) {
         self.parser.screen().cursor_position()
     }
 
     /// cursor が可視か (`?25h` で true、`?25l` で false)。
+    ///
+    /// Phase B の structured snapshot 用 (DR-0013 §9)。
+    #[allow(dead_code)]
     pub(crate) fn cursor_visible(&self) -> bool {
         !self.parser.screen().hide_cursor()
     }
 
     /// viewport size `(rows, cols)`。
+    ///
+    /// Phase A では `reset` で内部利用、Phase B の snapshot でも expose 予定。
     pub(crate) fn size(&self) -> (u16, u16) {
         self.parser.screen().size()
     }
@@ -118,6 +127,10 @@ impl ScreenState {
     /// + DR-0013 task A-8)。
     ///
     /// reset 後の `last_feed_at` は now、`sync_in_progress` は false に戻る。
+    ///
+    /// Phase A の health check は detect only (= warn のみ) で reset を呼ばない。
+    /// Phase B で stalled 時の挙動を再検討する際に呼出側を実装する予定。
+    #[allow(dead_code)]
     pub(crate) fn reset(&mut self) {
         let (rows, cols) = self.size();
         // scrollback_len は vt100 0.16 では Parser::new 時に決定し、Parser から

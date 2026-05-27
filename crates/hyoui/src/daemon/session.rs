@@ -41,6 +41,7 @@ use super::broadcast::{
 use super::control::{ClientFrameOutcome, FrameOrError, handle_client_frame};
 use super::lock::{SessionState, elevate_next_leader};
 use super::pty::{ALIVE_RETRY_INTERVAL, ChildLifecycle, ChildState, STOPPED_POLL_INTERVAL};
+use super::screen::{ScreenState, StalledOutcome, check_stalled};
 
 /// R5-H7: send `sig` to the child's whole process group instead of only the
 /// session-leader PID, so descendants that the shell may have backgrounded
@@ -315,7 +316,19 @@ impl Session {
         let mut next_client_id: u64 = 0;
         let mut state = SessionState::default();
         let mut scrollback = Scrollback::new(config.scrollback_bytes);
+        // DR-0013 Phase A: daemon が screen state の正本を保持する。
+        // 子 PTY bytes は本 state に流し込んでから broadcast / wait / tail に
+        // 配る。attach 復元時は `build_attach_redraw` で生成した sequence を
+        // 新 client に送る。
+        // scrollback_len は Phase A では 0 (= vt100 内蔵 ring は未使用)。
+        // Phase B で `crates/hyoui/src/scrollback.rs` 統合時に
+        // `config.scrollback_bytes` 由来の値を渡す設計に置き換える (§8)。
+        let mut screen_state = ScreenState::new(config.rows, config.cols, 0);
         let mut pending_waits: Vec<PendingWait> = Vec::new();
+        // DEC sync update 同期中に attach が発生した場合の deferred redraw 用。
+        // sync が終了するまで redraw 送信を保留し、次の iteration で flush する
+        // (DR-0013 §6 + alacritty `event_loop.rs:166` pattern)。
+        let mut pending_redraws: Vec<u64> = Vec::new();
 
         // R5-H6: Try to acquire process-wide SIGCHLD self-pipe ownership.
         // The `Some` branch installs SIGCHLD → self-pipe so `poll(2)` wakes
@@ -335,6 +348,8 @@ impl Session {
             config,
             &mut state,
             &mut scrollback,
+            &mut screen_state,
+            &mut pending_redraws,
             &mut pending_waits,
             sigchld_owner.as_ref().map(|o| &o.pipe),
         );
@@ -470,6 +485,47 @@ impl Drop for Session {
     }
 }
 
+/// DR-0013 §6 Phase A: DEC sync update 終了で `pending_redraws` を flush する。
+///
+/// `screen_state.sync_in_progress()` が false に戻った瞬間、保留中の client_id に
+/// 対して `send_attach_redraw` 相当を実行する。enqueue 失敗時は当該 client_id を
+/// `overflow_ids` に積み、caller が drop する。
+fn flush_pending_redraws_if_sync_over(
+    clients: &[ClientHandle],
+    screen_state: &ScreenState,
+    pending_redraws: &mut Vec<u64>,
+    overflow_ids: &mut Vec<u64>,
+) {
+    if screen_state.sync_in_progress() || pending_redraws.is_empty() {
+        return;
+    }
+    // sync が解けた → 全 pending を flush する
+    let ids: Vec<u64> = std::mem::take(pending_redraws);
+    for id in ids {
+        if let Some(ch) = clients.iter().find(|c| c.id == id) {
+            super::accept::send_attach_redraw(ch, screen_state, overflow_ids);
+        }
+        // client が既に居ない場合は黙って drop (= overflow 経路で先に切られた等)
+    }
+}
+
+/// DR-0013 §5 Phase A: stalled sequence の 5s 検出。Phase A は warn のみで state
+/// は保持する保守的方針。連続 warn を抑えるため `warned` flag を caller が保持し、
+/// feed 復帰で reset する設計。
+fn detect_and_warn_stalled(screen_state: &ScreenState, warned: &mut bool) {
+    if *warned {
+        return;
+    }
+    if check_stalled(screen_state, Instant::now()) == StalledOutcome::Detected {
+        // Phase A: warn-level log のみ (= stderr に 1 行)。observability は
+        // DR-0011 で本格化される予定なので、ここでは最小限の通知に留める。
+        eprintln!(
+            "[hyoui daemon] warn: vt100 parser stalled (no feed for >= 5s, may have partial sequence pending)"
+        );
+        *warned = true;
+    }
+}
+
 /// serve loop の本体。`Session::serve` から切り出して所有権整理を平坦化。
 #[allow(clippy::too_many_arguments)]
 fn serve_loop(
@@ -481,9 +537,15 @@ fn serve_loop(
     config: &DaemonConfig,
     state: &mut SessionState,
     scrollback: &mut Scrollback,
+    screen_state: &mut ScreenState,
+    pending_redraws: &mut Vec<u64>,
     pending_waits: &mut Vec<PendingWait>,
     sigchld_pipe: Option<&SelfPipe>,
 ) -> RelayOutcome {
+    // DR-0013 §5: stalled sequence の 5s timeout 検出は per-loop で行う。
+    // 連続して warn を撒かないよう、検出後は flag を立てて feed が来るまで
+    // 黙る (= 1 度 detect したら次の feed まで再 detect しない方針)。
+    let mut stalled_warned = false;
     // R4-C3: 別 thread で進行中の handshake worker 群。worker が `do_handshake_stage`
     // を完了すると `rx` に Ok/Err が流れる。本 vector は serve_loop が所有し、各
     // iteration で try_recv で完了したものを引き取って `clients` に integrate する。
@@ -588,7 +650,19 @@ fn serve_loop(
                     clients,
                     state,
                     &mut overflow_ids,
+                    screen_state,
+                    pending_redraws,
                 );
+                // DR-0013 §5 + §6 Phase A:
+                // - sync 終了で pending redraw を flush
+                // - 5s stalled detect (Phase A は warn のみ)
+                flush_pending_redraws_if_sync_over(
+                    clients,
+                    screen_state,
+                    pending_redraws,
+                    &mut overflow_ids,
+                );
+                detect_and_warn_stalled(screen_state, &mut stalled_warned);
                 // 後段の drop 処理 (overflow / dead) を共通化するため
                 let mut indices_to_drop: Vec<usize> = Vec::new();
                 for id in overflow_ids.drain(..) {
@@ -623,7 +697,18 @@ fn serve_loop(
             clients,
             state,
             &mut overflow_ids,
+            screen_state,
+            pending_redraws,
         );
+        // DR-0013 §5 + §6 Phase A: sync 終了で pending redraw を flush、
+        // stalled detect は per-iteration で 1 回行う。
+        flush_pending_redraws_if_sync_over(
+            clients,
+            screen_state,
+            pending_redraws,
+            &mut overflow_ids,
+        );
+        detect_and_warn_stalled(screen_state, &mut stalled_warned);
 
         // R5-H6: SIGCHLD wake-up handling. Drain the self-pipe to clear
         // pending signal bytes, then run `lifecycle.poll(child)` to pick up
@@ -691,6 +776,14 @@ fn serve_loop(
                     // scrollback に push してから broadcast (subscription 種類で encoding 分岐)
                     let now = Instant::now();
                     scrollback.push(now, buf[..n].to_vec());
+                    // DR-0013 §3: bytes は本 wrapper を経由してから broadcast へ。
+                    // sync_in_progress / cell / cursor / mode 等の state を更新する。
+                    // Phase A では既存 broadcast / wait / tail との **併存**で、
+                    // 生 bytes も従来通り流す (= breaking 回避、§10)。
+                    // Phase B で生 byte broadcast を state-driven に置換する。
+                    screen_state.process(&buf[..n]);
+                    // feed 後に stalled-warn flag を解除 (= 次回 5s 経過時に再警告可)
+                    stalled_warned = false;
                     overflow_ids.extend(broadcast_master_bytes(clients, &buf[..n], now));
                     // pending waits に新規 bytes を流し込み、match 確認
                     update_waits_on_master_bytes(pending_waits, clients, &buf[..n], now);
@@ -1278,10 +1371,33 @@ mod tests {
             .expect("write handshake");
         stream.flush().expect("flush");
         let resp_frame = Frame::decode_from(stream).expect("decode response");
-        match ControlMessage::decode_from(resp_frame.body.as_slice()).expect("decode cbor") {
-            ControlMessage::HandshakeResponse(r) => r,
-            other => panic!("unexpected: {other:?}"),
-        }
+        let resp =
+            match ControlMessage::decode_from(resp_frame.body.as_slice()).expect("decode cbor") {
+                ControlMessage::HandshakeResponse(r) => r,
+                other => panic!("unexpected: {other:?}"),
+            };
+        // DR-0013 §4 Phase A: handshake response 直後に daemon が
+        // attach 復元用 raw_data frame を 1 つ送る。test code は control を
+        // 期待するので、redraw frame を 1 個読み捨てる。
+        discard_attach_redraw(stream);
+        resp
+    }
+
+    /// DR-0013 §4 Phase A test helper:
+    /// 手動 handshake する test (= `do_client_handshake` を使わない経路) でも
+    /// handshake response の直後に attach 復元用 raw_data frame が 1 つ来るため、
+    /// それを読み捨てるための共通ヘルパ。raw frame でなければ panic (= 順序仮定
+    /// 違反のサイン)。Phase A の `build_attach_redraw` は primary 空画面でも
+    /// `\x1b[?1049l` prepend + state_formatted の最小 sequence を必ず返すため、
+    /// 「frame が来ない」case は無い前提。
+    fn discard_attach_redraw(stream: &mut UnixStream) {
+        let f = Frame::decode_from(stream).expect("attach redraw frame");
+        assert_eq!(
+            f.ty,
+            crate::protocol::TYPE_RAW_DATA,
+            "expected attach redraw raw_data frame after handshake response, got ty={}",
+            f.ty
+        );
     }
 
     // ---- Phase 9 (Session::serve) tests ----
@@ -1885,6 +2001,160 @@ mod tests {
         .encode_to(&mut s1)
         .expect("send");
         s1.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    // ---- DR-0013 Phase A: attach redraw integration ----
+
+    /// DR-0013 §4 Phase A integration test:
+    /// 子 PTY が "ATTACH_TEST_OK" を出力した後に **新規** client が attach した時、
+    /// daemon は handshake response 直後に `state_formatted()` 由来の redraw を
+    /// 1 frame で送る。redraw 内に "ATTACH_TEST_OK" が含まれていれば、画面状態が
+    /// 正本化されていることが確認できる (= "attach がほぼ機能しない" の解消)。
+    ///
+    /// 旧実装 (= screen state 不在) では client は子 PTY の現状画面を取れず、
+    /// 子 (= claude TUI 等) が再描画してくれるまで blank だった。本テストが pass
+    /// することは Phase A の最重要 acceptance criterion。
+    #[test]
+    fn serve_attach_redraw_includes_pre_attach_output() {
+        // bash で固有 marker を出してから 30 秒 sleep。1st client は marker を
+        // 読み取って detach、2nd client は attach 直後の redraw に marker が
+        // 含まれることを確認する。
+        let cmd = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf 'ATTACH_TEST_OK\\r\\n'; sleep 30".into(),
+        ];
+        let (_, sock_path, _dir, handle) = spawn_serve_thread(cmd);
+
+        // 1st client: marker を読み取って detach
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let _r1 = do_client_handshake(&mut s1);
+        // leader.notify を discard
+        let _ = Frame::decode_from(&mut s1).expect("s1 leader.notify");
+        // 子の output を marker が来るまで待つ (= screen state に反映される時間も稼ぐ)
+        read_until_contains(&mut s1, b"ATTACH_TEST_OK");
+        // 1st client は drop (= detach)、daemon は state を保持し続ける
+        drop(s1);
+
+        // daemon が detach を観測して state が安定するまで短時間待機。
+        std::thread::sleep(Duration::from_millis(100));
+
+        // 2nd client: 新規 attach。do_client_handshake が attach redraw raw_data
+        // frame を 1 つ読み捨てているので、その frame body 内に marker が含まれて
+        // いるかを確認するため、本 test では handshake response の直後の frame を
+        // 自前で取り出す形に分解する。
+        let mut s2 = client_connect_with_retry(&sock_path);
+        // handshake は手動で送って response と redraw を別々に取る。
+        let req = ControlMessage::HandshakeRequest(HandshakeRequest {
+            caps: MVP_CAPS.iter().map(|s| s.to_string()).collect(),
+            mode: Mode::Rw,
+            exclusive: false,
+            detach_others: false,
+            token: None,
+        });
+        Frame::cbor_control(req.encode_to_vec().expect("encode"))
+            .encode_to(&mut s2)
+            .expect("send handshake");
+        s2.flush().expect("flush");
+        // handshake response
+        let resp_frame = Frame::decode_from(&mut s2).expect("response");
+        match ControlMessage::decode_from(resp_frame.body.as_slice()).expect("decode") {
+            ControlMessage::HandshakeResponse(_) => {}
+            o => panic!("expected HandshakeResponse, got {o:?}"),
+        }
+        // attach redraw (raw_data): body 内に marker が含まれることを assert
+        let redraw_frame = Frame::decode_from(&mut s2).expect("redraw");
+        assert_eq!(
+            redraw_frame.ty,
+            crate::protocol::TYPE_RAW_DATA,
+            "expected attach redraw raw_data frame"
+        );
+        assert!(
+            redraw_frame
+                .body
+                .windows(b"ATTACH_TEST_OK".len())
+                .any(|w| w == b"ATTACH_TEST_OK"),
+            "redraw bytes should contain pre-attach marker; got {:?}",
+            String::from_utf8_lossy(&redraw_frame.body)
+        );
+
+        // cleanup: s2 から kill 送信 → daemon 終了
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signal: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s2)
+        .expect("send");
+        s2.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// DR-0013 §4 Phase A: alt screen 中の attach 復元。
+    /// 子 PTY が alt screen に入って描画した状態で 2nd client が attach した時、
+    /// redraw の冒頭が `\x1b[?1049h` で始まり (= PoC §2 で発覚した alt flag 欠落
+    /// 補完の検証)、続く state_formatted で画面内容も復元される。
+    #[test]
+    fn serve_attach_redraw_preserves_alt_screen_flag() {
+        let cmd = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            // alt screen に入って "ALT_MARKER" を描画してから 30 秒 sleep。
+            // printf で alt screen on (= \033[?1049h)、その後 marker。
+            "printf '\\033[?1049hALT_MARKER\\r\\n'; sleep 30".into(),
+        ];
+        let (_, sock_path, _dir, handle) = spawn_serve_thread(cmd);
+
+        // 1st client: marker を読み取って detach。
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let _r1 = do_client_handshake(&mut s1);
+        let _ = Frame::decode_from(&mut s1).expect("s1 leader.notify");
+        read_until_contains(&mut s1, b"ALT_MARKER");
+        drop(s1);
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        // 2nd client: 新規 attach。
+        let mut s2 = client_connect_with_retry(&sock_path);
+        let req = ControlMessage::HandshakeRequest(HandshakeRequest {
+            caps: MVP_CAPS.iter().map(|s| s.to_string()).collect(),
+            mode: Mode::Rw,
+            exclusive: false,
+            detach_others: false,
+            token: None,
+        });
+        Frame::cbor_control(req.encode_to_vec().expect("encode"))
+            .encode_to(&mut s2)
+            .expect("send handshake");
+        s2.flush().expect("flush");
+        let _ = Frame::decode_from(&mut s2).expect("response");
+        let redraw_frame = Frame::decode_from(&mut s2).expect("redraw");
+        assert_eq!(redraw_frame.ty, crate::protocol::TYPE_RAW_DATA);
+        // 冒頭が `\x1b[?1049h` で始まる (= alt flag 補完が wrapper で 1 行追加されている)
+        assert!(
+            redraw_frame.body.starts_with(b"\x1b[?1049h"),
+            "alt screen redraw should start with ?1049h, got: {:?}",
+            String::from_utf8_lossy(&redraw_frame.body[..redraw_frame.body.len().min(32)])
+        );
+        // marker も含まれる (= state_formatted が cell 内容を保持)
+        assert!(
+            redraw_frame
+                .body
+                .windows(b"ALT_MARKER".len())
+                .any(|w| w == b"ALT_MARKER"),
+            "redraw bytes should contain alt screen marker"
+        );
+
+        // cleanup
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signal: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s2)
+        .expect("send");
+        s2.flush().expect("flush");
         let _ = handle.join().expect("daemon thread");
     }
 
@@ -2546,6 +2816,7 @@ mod tests {
         Frame::cbor_control(body).encode_to(&mut s2).expect("send");
         s2.flush().expect("flush");
         let _ = Frame::decode_from(&mut s2).expect("handshake response"); // discard
+        discard_attach_redraw(&mut s2);
         Frame::cbor_control(
             ControlMessage::Kill(Kill { signal: None })
                 .encode_to_vec()
@@ -2830,6 +3101,7 @@ mod tests {
         Frame::cbor_control(body).encode_to(&mut s2).expect("send");
         s2.flush().expect("flush");
         let _ = Frame::decode_from(&mut s2).expect("s2 handshake resp");
+        discard_attach_redraw(&mut s2);
 
         // s2 (RwNoLeader) が Kill 試行 → mode.not-allowed
         Frame::cbor_control(
@@ -2982,6 +3254,7 @@ mod tests {
         Frame::cbor_control(body).encode_to(&mut s2).expect("send");
         s2.flush().expect("flush");
         let _ = Frame::decode_from(&mut s2).expect("s2 handshake resp"); // discard
+        discard_attach_redraw(&mut s2);
 
         // s2 (Ro) が LockAcquire 送信 → mode.not-allowed
         Frame::cbor_control(

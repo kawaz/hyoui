@@ -41,9 +41,11 @@ use crate::sys::UnixSock;
 
 use super::DaemonConfig;
 use super::broadcast::{
-    ClientHandle, SharedBytes, Subscription, broadcast_control, send_control, writer_pump,
+    ClientHandle, SharedBytes, Subscription, broadcast_control, enqueue_for_client, send_control,
+    writer_pump,
 };
 use super::lock::{SessionState, should_assign_leader};
+use super::screen::{ScreenState, build_attach_redraw};
 
 /// R4-C3: handshake (= 1 client の HandshakeRequest 受信 + token 検証) を完了
 /// させるまでの上限時間。これを超過した pending handshake は socket close して
@@ -343,6 +345,13 @@ fn finalize_accepted_client(
 ///   worker thread が `set_read_timeout` で抜け次第 close する)。
 ///
 /// drop すべきものは即除去するため `Vec::retain_mut` で in-place 更新する。
+///
+/// DR-0013 §4 Phase A: new client を整列した直後に
+/// [`build_attach_redraw`] で生成した raw bytes を送って画面を復元する。
+/// `screen_state.sync_in_progress()` が true (= DEC sync update 中) の場合は
+/// 即時 redraw を送らず、`pending_redraws` に client_id を積んで sync 終了後
+/// に caller (= `serve_loop`) が flush する。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn process_pending_handshakes(
     pending_handshakes: &mut Vec<PendingHandshake>,
     config: &DaemonConfig,
@@ -350,6 +359,8 @@ pub(super) fn process_pending_handshakes(
     clients: &mut Vec<ClientHandle>,
     state: &mut SessionState,
     overflow_ids: &mut Vec<u64>,
+    screen_state: &ScreenState,
+    pending_redraws: &mut Vec<u64>,
 ) {
     // 完了 / 失敗 / timeout の 3 状態に分岐して 1 つずつ処理する。
     let mut i = 0;
@@ -372,6 +383,18 @@ pub(super) fn process_pending_handshakes(
                         if let Some(mc) = mode_change_for_locked.as_ref() {
                             // accept した client に「現在 lock 中」を通知
                             let _ = send_control(&accepted.handle, ControlMessage::ModeChange(*mc));
+                        }
+                        // DR-0013 §4 Phase A: handshake response 送信完了直後に
+                        // screen state からの redraw bytes を当該 client にだけ
+                        // 送る。生 byte は raw_data frame (= TYPE_RAW_DATA) で送る
+                        // ため、client 側は通常 attach フローでそのまま stdout に
+                        // 流せば detach 時の画面が復元される (§4 + §10)。
+                        if screen_state.sync_in_progress() {
+                            // sync 中は中途半端な state を送らない (§6)。
+                            // sync 終了後に caller が flush する。
+                            pending_redraws.push(new_id);
+                        } else {
+                            send_attach_redraw(&accepted.handle, screen_state, overflow_ids);
                         }
                         clients.push(accepted.handle);
                         if became_leader {
@@ -412,6 +435,33 @@ pub(super) fn process_pending_handshakes(
                 pending_handshakes.remove(i);
             }
         }
+    }
+}
+
+/// DR-0013 §4 Phase A: 1 client に attach 復元用 redraw bytes を 1 つの
+/// `TYPE_RAW_DATA` frame で送る。
+///
+/// `build_attach_redraw` で alt mode prepend + `state_formatted` を組み立てた
+/// bytes を raw_data frame に詰めて enqueue する (= 通常 broadcast の生 byte
+/// 経路と同じ frame type)。enqueue が overflow / writer dead だった場合は
+/// 当該 client_id を `overflow_ids` に積み、caller が drop する設計。
+pub(super) fn send_attach_redraw(
+    ch: &ClientHandle,
+    screen_state: &ScreenState,
+    overflow_ids: &mut Vec<u64>,
+) {
+    let bytes = build_attach_redraw(screen_state);
+    if bytes.is_empty() {
+        return;
+    }
+    let mut frame_bytes = Vec::new();
+    if Frame::raw_data(bytes).encode_to(&mut frame_bytes).is_err() {
+        return;
+    }
+    let payload: SharedBytes = Arc::new(frame_bytes);
+    match enqueue_for_client(ch, payload) {
+        super::broadcast::EnqueueOutcome::Sent => {}
+        _ => overflow_ids.push(ch.id),
     }
 }
 
