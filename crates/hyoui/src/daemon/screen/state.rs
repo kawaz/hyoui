@@ -758,4 +758,60 @@ mod tests {
         // かつ alt 文字は新 Parser に流していない)
         assert_eq!(scr.cell(0, 0).unwrap().contents(), "");
     }
+
+    /// QA edge: input log capacity が 0 でも resize が panic しない (= replay
+    /// 元 buffer が空のまま新 Parser を作るだけ)。capacity 0 = 「log を取らない」
+    /// 設定の安全性を保護する。
+    #[test]
+    fn resize_with_zero_capacity_input_log_does_not_panic() {
+        let mut s = ScreenState::with_input_log_capacity(5, 80, 0, 0);
+        assert_eq!(s.input_log_capacity(), 0);
+        s.process(b"hello world");
+        assert_eq!(s.input_log_len(), 0, "0-capacity log never accumulates");
+
+        // resize は input log replay が no-op になるだけで panic しない
+        s.resize(5, 40);
+        assert_eq!(s.size(), (5, 40));
+        // log が空なので新 Parser の cell も空
+        let scr = s.screen();
+        assert_eq!(scr.cell(0, 0).unwrap().contents(), "");
+    }
+
+    /// QA edge: 巨大 chunk (= 64KB の連続入力) を 1 度に process しても
+    /// `current_seqno` は 1 しか進まない (= bytes 数ではなく call 回数で
+    /// increment される仕様の保護)。state-based wait-idle の挙動前提。
+    #[test]
+    fn process_large_chunk_advances_seqno_by_one() {
+        let mut s = ScreenState::new(24, 80, 100);
+        let big = vec![b'.'; 64 * 1024];
+        let before = s.current_seqno();
+        s.process(&big);
+        assert_eq!(s.current_seqno(), before + 1);
+    }
+
+    /// QA edge: stalled detect の counter が `note_stalled_outcome(false)` で
+    /// 確実に 0 に reset され、その後再度 3 連続検知でも閾値判定が成立すること
+    /// (= state を持ち越して誤動作しない保護)。既存 test は 1 サイクルのみで
+    /// 「再利用」を確認していなかったため補強。
+    #[test]
+    fn stalled_counter_resets_and_retriggers_after_healthy() {
+        let mut s = ScreenState::new(5, 40, 100);
+        // 1 サイクル目: 3 連続で閾値達成
+        assert_eq!(s.note_stalled_outcome(true), None);
+        assert_eq!(s.note_stalled_outcome(true), None);
+        assert_eq!(
+            s.note_stalled_outcome(true),
+            Some(StalledAction::ResetRequested)
+        );
+        // healthy で reset
+        assert_eq!(s.note_stalled_outcome(false), None);
+        assert_eq!(s.consecutive_stalled_detects(), 0);
+        // 2 サイクル目: 再度 3 連続で閾値判定が成立する
+        assert_eq!(s.note_stalled_outcome(true), None);
+        assert_eq!(s.note_stalled_outcome(true), None);
+        assert_eq!(
+            s.note_stalled_outcome(true),
+            Some(StalledAction::ResetRequested)
+        );
+    }
 }
