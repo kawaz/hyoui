@@ -1544,9 +1544,14 @@ fn parse_screen(args: &[String]) -> Command {
         other if other.starts_with('-') => {
             Command::Error(format!("screen: unknown option: {other}"))
         }
-        other => Command::Error(format!(
-            "screen: unknown subcommand `{other}` (supported: dump, snapshot)"
-        )),
+        other => {
+            // task #22: dump/snapshot に対する edit distance 1 以下の suggest。
+            let base = format!("screen: unknown subcommand `{other}` (supported: dump, snapshot)");
+            match suggest_closest(other, ["dump", "snapshot"]) {
+                Some(s) => Command::Error(format!("{base} (did you mean `screen {s}`?)")),
+                None => Command::Error(base),
+            }
+        }
     }
 }
 
@@ -1867,7 +1872,14 @@ fn parse_completion(args: &[String]) -> Command {
 fn usage_top(unknown: Option<&str>) -> String {
     let mut out = String::new();
     if let Some(name) = unknown {
-        out.push_str(&format!("error: unknown subcommand `{name}`\n\n"));
+        // task #22: edit distance 1 以下で類似 subcommand を suggest する。
+        // 候補は既存 + reserved を含めた `TOP_LEVEL_SUBCOMMANDS` の全項目。
+        match suggest_closest(name, TOP_LEVEL_SUBCOMMANDS.iter().copied()) {
+            Some(s) => out.push_str(&format!(
+                "error: unknown subcommand `{name}` (did you mean `{s}`?)\n\n"
+            )),
+            None => out.push_str(&format!("error: unknown subcommand `{name}`\n\n")),
+        }
     }
     out.push_str(
         "hyoui — terminal-aware process proxy\n\
@@ -2462,12 +2474,18 @@ pub fn parse_input_spec(s: &str) -> Result<InputSpec, String> {
                 .map_err(|e| format!("wait-idle: invalid duration {value:?}: {e}"))?;
             Ok(InputSpec::WaitIdle(Duration::from_millis(ms)))
         }
-        // 不明な prefix。helpful な hint を出す (= edit distance による suggest は
-        // 本タスクの scope 外、別 task #22 で UX 向上として配線可能)。
-        other => Err(format!(
-            "unknown spec prefix {other:?}, expected one of: \
-             text, hex, file, paste, key, wait, wait-idle"
-        )),
+        // 不明な prefix。edit distance 1 以下の候補があれば suggest を添える
+        // (= task #22、UX 改善)。
+        other => {
+            let base = format!(
+                "unknown spec prefix {other:?}, expected one of: \
+                 text, hex, file, paste, key, wait, wait-idle"
+            );
+            match suggest_closest(other, INPUT_SPEC_PREFIXES.iter().copied()) {
+                Some(s) => Err(format!("{base} (did you mean `{s}:`?)")),
+                None => Err(base),
+            }
+        }
     }
 }
 
@@ -2877,6 +2895,105 @@ pub fn validate_session_id(session_id: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
+// =============================================================================
+// Typo suggest helpers
+// =============================================================================
+
+/// 既知 候補のうち、`input` に最も近いものを Levenshtein 距離 1 以下で返す。
+///
+/// UX 視点で「edit distance 1 のみ」に絞る (= task #22 方針):
+/// 距離 2 以上を suggest すると誤候補が増えてユーザがかえって混乱する。
+/// 1 文字違い (typo / 大小ミス / 1 文字脱落 or 余分) のみを救う。
+///
+/// 比較は **ASCII 大小無視** で行う (= `Tex` → `text`、`Entr` → `Enter`)。
+/// 距離 0 (= 大小無視で一致) は **suggest 対象外** (= 呼び出し側で完全一致を
+/// 先に試した後の fallback 用)。
+pub(crate) fn suggest_closest<'a, I>(input: &str, candidates: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let input_lower = input.to_ascii_lowercase();
+    let mut best: Option<(&str, usize)> = None;
+    for cand in candidates {
+        let dist = levenshtein_ascii_ci(&input_lower, cand);
+        if dist == 0 {
+            // 大小無視で一致するなら suggest としては弱い (= 呼び出し側が
+            // 既に完全一致を試して落ちた後の fallback なので、ここに来た時点で
+            // ASCII case-insensitive 比較で同一になる候補は事実上「自分自身」
+            // か、handler 側で別途処理されるはずの値)。
+            continue;
+        }
+        if dist > 1 {
+            continue;
+        }
+        match best {
+            None => best = Some((cand, dist)),
+            Some((_, b)) if dist < b => best = Some((cand, dist)),
+            _ => {}
+        }
+    }
+    best.map(|(c, _)| c)
+}
+
+/// ASCII case-insensitive Levenshtein 距離 (= 早期 cutoff 2 で打ち切り)。
+///
+/// 短い文字列 (= subcommand / spec prefix / key 名) 専用の小さな実装。
+/// 文字列長が `cutoff + 1` 以上離れていれば即 `usize::MAX` 相当で返す。
+/// 内部は 1 次元 DP (= rolling) で空間 O(min(m,n))。
+fn levenshtein_ascii_ci(a_lower: &str, b: &str) -> usize {
+    let a = a_lower.as_bytes();
+    // b は呼び出し側で固定 candidate なので、ここで lower-case 化のため to_owned。
+    let b_lower = b.to_ascii_lowercase();
+    let b = b_lower.as_bytes();
+    let (m, n) = (a.len(), b.len());
+    if m.abs_diff(n) > 2 {
+        return usize::MAX;
+    }
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+    // 1 次元 DP。
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0usize; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
+/// `input` spec の prefix 一覧 (= edit distance 比較対象)。
+const INPUT_SPEC_PREFIXES: &[&str] = &["text", "hex", "file", "paste", "key", "wait", "wait-idle"];
+
+/// 既知の top-level subcommand 一覧 (= unknown subcommand 時の suggest 用)。
+///
+/// reserved (`send` / `detach` / `tx` / `lock` / `unlock`) も含める
+/// (= 「予約済」と気づかせるほうが UX 改善になる)。
+pub(crate) const TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
+    "run",
+    "attach",
+    "list",
+    "kill",
+    "status",
+    "tail",
+    "wait",
+    "screen",
+    "input",
+    "completion",
+    "send",
+    "detach",
+    "tx",
+    "lock",
+    "unlock",
+];
 
 // =============================================================================
 // Tests
@@ -4670,6 +4787,96 @@ mod tests {
     fn parse_input_spec_missing_colon_errors() {
         let err = parse_input_spec("hello").unwrap_err();
         assert!(err.contains("missing prefix"), "got: {err}");
+    }
+
+    // -------- task #22: typo suggest (edit distance 1) --------
+
+    #[test]
+    fn parse_input_spec_typo_suggests_text() {
+        // `tex:` → `text:`
+        let err = parse_input_spec("tex:hello").unwrap_err();
+        assert!(err.contains("did you mean `text:`"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_input_spec_typo_suggests_paste() {
+        // `pase:` → `paste:`
+        let err = parse_input_spec("pase:hello").unwrap_err();
+        assert!(err.contains("did you mean `paste:`"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_input_spec_typo_suggests_wait_idle() {
+        // `wait-idl:` → `wait-idle:`
+        let err = parse_input_spec("wait-idl:500ms").unwrap_err();
+        assert!(err.contains("did you mean `wait-idle:`"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_input_spec_far_typo_no_suggest() {
+        // 距離 2 以上は suggest しない (= 誤候補を増やさない方針)
+        let err = parse_input_spec("frobnicate:foo").unwrap_err();
+        assert!(!err.contains("did you mean"), "got: {err}");
+        // ただし base メッセージは出る
+        assert!(err.contains("unknown spec prefix"), "got: {err}");
+    }
+
+    #[test]
+    fn suggest_closest_returns_none_for_empty_candidates() {
+        let v: Vec<&str> = vec![];
+        assert_eq!(suggest_closest("foo", v), None);
+    }
+
+    #[test]
+    fn suggest_closest_skips_exact_match() {
+        // 距離 0 (= 大小無視で一致) は呼び出し側で既に試した前提なので skip。
+        assert_eq!(
+            suggest_closest("TEXT", ["text", "hex"]).map(str::to_string),
+            None
+        );
+    }
+
+    #[test]
+    fn suggest_closest_handles_case_insensitive() {
+        // `Entr` (= 4 chars) と `Enter` (= 5 chars) は 1 文字脱落の typo。
+        assert_eq!(
+            suggest_closest("Entr", ["Enter", "Esc", "Tab"]),
+            Some("Enter")
+        );
+    }
+
+    #[test]
+    fn parse_args_unknown_subcommand_suggests_close_match() {
+        // `snapsht` → `snapshot` ではなく、top-level subcommand 一覧で suggest。
+        // top-level に `snapshot` は無いので、これは suggest 出ない (= screen の子)。
+        // 代わりに「`statu` → `status`」で suggest が出るかを確認。
+        match parse_args(&args(&["statu"])) {
+            Command::Help {
+                topic: HelpTopic::UnknownSubcommand(name),
+            } => {
+                assert_eq!(name, "statu");
+                let text = usage(&HelpTopic::UnknownSubcommand(name));
+                assert!(
+                    text.contains("did you mean `status`"),
+                    "expected suggest, got: {text}"
+                );
+            }
+            other => panic!("expected UnknownSubcommand Help, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_unknown_subcommand_suggests_close_match() {
+        // `snapsht` → `snapshot`
+        match parse_args(&args(&["screen", "snapsht"])) {
+            Command::Error(msg) => {
+                assert!(
+                    msg.contains("did you mean `screen snapshot`"),
+                    "expected suggest, got: {msg}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     // -------- parse_args / parse_input (= subcommand integration) --------
