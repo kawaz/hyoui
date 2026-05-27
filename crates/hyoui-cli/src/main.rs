@@ -1344,8 +1344,15 @@ fn input_command(cmd: InputCommand) -> ExitCode {
         wait_core::poll_interval_from_env().unwrap_or(wait_core::DEFAULT_POLL_INTERVAL);
 
     // 3. 各 spec を順に dispatch。最初の失敗で abort。
+    //    `cmd.max_file_bytes` は CLI flag / env / default で解決済 (= parser 段)。
     for (idx, spec) in cmd.specs.iter().enumerate() {
-        match dispatch_spec(spec, &mut conn, wait_timeout, poll_interval) {
+        match dispatch_spec(
+            spec,
+            &mut conn,
+            wait_timeout,
+            poll_interval,
+            cmd.max_file_bytes,
+        ) {
             Ok(()) => {}
             Err(msg) => {
                 eprintln!("hyoui: input: spec[{idx}]: {msg}");
@@ -1373,12 +1380,13 @@ fn dispatch_spec(
     conn: &mut ClientConnection,
     wait_timeout: Option<std::time::Duration>,
     poll_interval: std::time::Duration,
+    max_file_bytes: u64,
 ) -> Result<(), String> {
     match spec {
         // bytes 系: handler が bytes 化、send_raw_bytes で daemon に流す。
         InputSpec::Text(s) => send_bytes(conn, input_handlers::handle_text(s)),
         InputSpec::Hex(b) => send_bytes(conn, input_handlers::handle_hex(b)),
-        InputSpec::File(p) => send_bytes(conn, input_handlers::handle_file(p)?),
+        InputSpec::File(p) => send_bytes(conn, input_handlers::handle_file(p, max_file_bytes)?),
         InputSpec::Paste(s) => send_bytes(conn, input_handlers::handle_paste(s)?),
         InputSpec::Key(name) => send_bytes(conn, input_handlers::handle_key(name)?),
         // wait 系: client-side state polling。bytes 送信は伴わない。
@@ -2061,6 +2069,7 @@ mod tests {
             specs: vec![InputSpec::Wait("GO".into())],
             timeout: std::time::Duration::from_secs(3),
             lock_token: None,
+            max_file_bytes: hyoui::cli::DEFAULT_INPUT_MAX_FILE_BYTES,
         };
         let start = std::time::Instant::now();
         let exit = input_command(cmd);
@@ -2116,6 +2125,7 @@ mod tests {
             specs: vec![InputSpec::WaitIdle(std::time::Duration::from_millis(200))],
             timeout: std::time::Duration::from_secs(3),
             lock_token: None,
+            max_file_bytes: hyoui::cli::DEFAULT_INPUT_MAX_FILE_BYTES,
         };
         let exit = input_command(cmd);
         let exit_dbg = format!("{exit:?}");

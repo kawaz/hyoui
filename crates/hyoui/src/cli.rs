@@ -2397,6 +2397,17 @@ pub struct InputCommand {
     /// `None` のときは実行段で `HYOUI_LOCK_TOKEN` 環境変数を読む (= 既存挙動)。
     /// flag 優先 / env fallback で「auto 継承」と「明示上書き」を両立する。
     pub lock_token: Option<String>,
+    /// `file:` spec の 1 file あたり最大読み込み bytes (= task #21 セキュリティ視点)。
+    ///
+    /// 解決優先順 (= CLI 共通の flag > env > default):
+    /// - `--max-file-bytes=<N>` (= 本フィールドに直接入る)
+    /// - 環境変数 `HYOUI_MAX_FILE_BYTES` (= parser 段で読み込んで本フィールドに入れる)
+    /// - default 16 MiB (= [`crate::cli::DEFAULT_INPUT_MAX_FILE_BYTES`])
+    ///
+    /// `0` は **無制限**扱い (= DR-0006 §8.6 の方針、巨大 file を許す代わりに
+    /// memory 枯渇リスクは user 責任)。`file:` 以外の spec は size 制約なし
+    /// (= argv 上限が implicit な上限) なので本値は無視される。
+    pub max_file_bytes: u64,
 }
 
 /// [`InputSpec`] のパース結果 (= prefix で type 判別、payload validate)。
@@ -2514,6 +2525,10 @@ fn parse_input(args: &[String]) -> Command {
     let mut socket: Option<String> = None;
     let mut timeout_ms: u64 = 5_000;
     let mut lock_token: Option<String> = None;
+    // task #21: `file:` spec の 1 file あたり最大 bytes。
+    // 優先順: --max-file-bytes flag > HYOUI_MAX_FILE_BYTES env > default。
+    // env は flag 未指定時のみ参照する (= flag 優先で env を上書きできる)。
+    let mut max_file_bytes: Option<u64> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut i = 0usize;
     while i < args.len() {
@@ -2567,6 +2582,24 @@ fn parse_input(args: &[String]) -> Command {
                     lock_token = Some(v);
                 }
                 None => return Command::Error("input: --lock-token requires a value".into()),
+            },
+            // task #21: `file:` spec の 1 file あたり最大 bytes (= 16 MiB default)。
+            // 0 = 無制限、それ以外は u64。humanize 形式 ("16M" 等) は別 task。
+            // 解決優先順は (1) flag > (2) HYOUI_MAX_FILE_BYTES env > (3) default。
+            // env fallback は本 match 後に max_file_bytes が None なら適用する。
+            "--max-file-bytes" => match value {
+                Some(v) => {
+                    let n = v.parse::<u64>().map_err(|_| {
+                        Command::Error(format!("input: --max-file-bytes: invalid u64 value {v:?}"))
+                    });
+                    match n {
+                        Ok(n) => max_file_bytes = Some(n),
+                        Err(e) => return e,
+                    }
+                }
+                None => {
+                    return Command::Error("input: --max-file-bytes requires a value".into());
+                }
             },
             other if other.starts_with("--") => {
                 return Command::Error(format!("input: unknown option: {other}"));
@@ -2636,12 +2669,34 @@ fn parse_input(args: &[String]) -> Command {
         }
     }
 
+    // task #21: max_file_bytes 解決。flag > env > default の優先順。
+    // env パース失敗時は CLI Error にせず、warning を stderr に出して default に
+    // fallback する (= 既存 env で起動している他 session を巻き込まないため、
+    // env の typo を fatal にしない方針)。CLI flag のパース失敗は fatal。
+    let max_file_bytes = match max_file_bytes {
+        Some(n) => n,
+        None => match std::env::var("HYOUI_MAX_FILE_BYTES") {
+            Ok(v) => match v.parse::<u64>() {
+                Ok(n) => n,
+                Err(_) => {
+                    eprintln!(
+                        "hyoui: warning: HYOUI_MAX_FILE_BYTES={v:?} is not a valid u64; \
+                         falling back to default ({DEFAULT_INPUT_MAX_FILE_BYTES} bytes)"
+                    );
+                    DEFAULT_INPUT_MAX_FILE_BYTES
+                }
+            },
+            Err(_) => DEFAULT_INPUT_MAX_FILE_BYTES,
+        },
+    };
+
     Command::Input(InputCommand {
         socket,
         session_id,
         specs,
         timeout: Duration::from_millis(timeout_ms),
         lock_token,
+        max_file_bytes,
     })
 }
 
@@ -2666,11 +2721,16 @@ fn usage_input() -> String {
             --socket PATH      Explicit socket path (alternative to session-id)\n    \
             --timeout DUR      Per-spec timeout (default: 5s; DUR 形式は下記参照)\n    \
             --lock-token T     明示 lock token (= env HYOUI_LOCK_TOKEN より優先、DR-0006 §8.5)\n    \
+            --max-file-bytes N file: spec の 1 file あたり最大 bytes (default 16777216 = 16 MiB、\n                       \
+                               0 で無制限、env HYOUI_MAX_FILE_BYTES より優先、DR-0006 §8.6)\n    \
             -h, --help         Show this help and exit\n\
         \n\
         ENVIRONMENT:\n    \
             HYOUI_LOCK_TOKEN   lock token を env で渡す (= handshake.token)。\n                       \
-                               --lock-token flag 指定時は無視される\n\
+                               --lock-token flag 指定時は無視される\n    \
+            HYOUI_MAX_FILE_BYTES file: spec の 1 file あたり最大 bytes を env で渡す。\n                       \
+                               --max-file-bytes flag 指定時は無視される。parse 失敗時は\n                       \
+                               warning を出して default に fallback\n\
         \n\
         DURATION FORMAT (kawaz/timespec.mbt 仕様 + sub-ms 拡張):\n    \
             短形 ns/us/μs/ms/s/m/h/d/w または長形 second(s)/minute(s)/hour(s)/\n    \
@@ -2761,6 +2821,21 @@ fn split_eq(arg: &str) -> (String, Option<String>) {
 /// `PATH_MAX` を割ることはまずないが、上限を切ることで CBOR / ANSI escape
 /// 等の異常入力経路を早期 reject する (R5-AUD-C2 path traversal 対策)。
 pub const MAX_SESSION_ID_LEN: usize = 64;
+
+/// `hyoui input <session> file:<path>` の 1 file あたり default 上限 (= 16 MiB)。
+///
+/// DR-0006 §8.6 の「default 16MB」に従う (= MiB / MB を 1024^2 として扱う、
+/// 厳密 IEC 表記)。CLI 側 (= [`InputCommand::max_file_bytes`]) は次の優先順で
+/// この値を override する:
+///
+/// 1. `--max-file-bytes=<N>` (CLI flag)
+/// 2. 環境変数 `HYOUI_MAX_FILE_BYTES`
+/// 3. 本 default
+///
+/// `0` を渡すと無制限扱い。`hyoui-cli` の `input_handlers::handle_file` 側に
+/// 同じ値の `DEFAULT_MAX_FILE_BYTES` がある (= handler 内 test 用)。両者は
+/// 同期しているが parser 段ではこちらを使う。
+pub const DEFAULT_INPUT_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// `session_id` を path traversal / 制御文字 / 過長から守る whitelist validator。
 ///
@@ -4784,6 +4859,136 @@ mod tests {
             other => panic!("expected Error, got {other:?}"),
         }
     }
+
+    // --- task #21: --max-file-bytes / HYOUI_MAX_FILE_BYTES ---
+
+    /// flag 未指定 / env 未設定 → default 16 MiB が入る。
+    /// env を確実に未設定にするため、test 内で remove_var しておく
+    /// (= 並列 test との race を避けるため `MAX_FILE_BYTES_ENV_GUARD` で直列化)。
+    #[test]
+    fn parse_input_max_file_bytes_default() {
+        let _g = MAX_FILE_BYTES_ENV_GUARD.lock().unwrap();
+        // SAFETY: env 操作は test 内のみ、guard で並列 test と直列化
+        unsafe {
+            std::env::remove_var("HYOUI_MAX_FILE_BYTES");
+        }
+        match parse_args(&args(&["input", "demo", "text:x"])) {
+            Command::Input(cmd) => {
+                assert_eq!(cmd.max_file_bytes, DEFAULT_INPUT_MAX_FILE_BYTES);
+            }
+            other => panic!("expected Input, got {other:?}"),
+        }
+    }
+
+    /// `--max-file-bytes=N` で override。
+    #[test]
+    fn parse_input_max_file_bytes_flag() {
+        match parse_args(&args(&["input", "demo", "--max-file-bytes=4096", "text:x"])) {
+            Command::Input(cmd) => {
+                assert_eq!(cmd.max_file_bytes, 4096);
+            }
+            other => panic!("expected Input, got {other:?}"),
+        }
+    }
+
+    /// `--max-file-bytes=0` は無制限扱い (= u64 値そのまま保持、handler 側で
+    /// 0 を「無制限」として扱う)。
+    #[test]
+    fn parse_input_max_file_bytes_zero_unlimited() {
+        match parse_args(&args(&["input", "demo", "--max-file-bytes=0", "text:x"])) {
+            Command::Input(cmd) => {
+                assert_eq!(cmd.max_file_bytes, 0);
+            }
+            other => panic!("expected Input, got {other:?}"),
+        }
+    }
+
+    /// 非数値 / 負値は parse error (= u64 範囲外)。
+    #[test]
+    fn parse_input_max_file_bytes_invalid_errors() {
+        match parse_args(&args(&["input", "demo", "--max-file-bytes=abc", "text:x"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("--max-file-bytes"), "got: {msg}");
+                assert!(msg.contains("invalid u64"), "got: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        match parse_args(&args(&["input", "demo", "--max-file-bytes=-1", "text:x"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("--max-file-bytes"), "got: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// env `HYOUI_MAX_FILE_BYTES` で override (= flag 未指定時に有効)。
+    /// 並列 test との race を避けるため `MAX_FILE_BYTES_ENV_GUARD` で直列化。
+    #[test]
+    fn parse_input_max_file_bytes_env_fallback() {
+        let _g = MAX_FILE_BYTES_ENV_GUARD.lock().unwrap();
+        // SAFETY: env 操作は test 内のみ、guard で並列 test と直列化
+        unsafe {
+            std::env::set_var("HYOUI_MAX_FILE_BYTES", "65536");
+        }
+        let res = parse_args(&args(&["input", "demo", "text:x"]));
+        // 後始末を確実に
+        // SAFETY: 同上
+        unsafe {
+            std::env::remove_var("HYOUI_MAX_FILE_BYTES");
+        }
+        match res {
+            Command::Input(cmd) => {
+                assert_eq!(cmd.max_file_bytes, 65536);
+            }
+            other => panic!("expected Input, got {other:?}"),
+        }
+    }
+
+    /// flag が env より優先 (= flag 指定で env を上書き)。
+    #[test]
+    fn parse_input_max_file_bytes_flag_overrides_env() {
+        let _g = MAX_FILE_BYTES_ENV_GUARD.lock().unwrap();
+        // SAFETY: 同上
+        unsafe {
+            std::env::set_var("HYOUI_MAX_FILE_BYTES", "99999");
+        }
+        let res = parse_args(&args(&["input", "demo", "--max-file-bytes=4096", "text:x"]));
+        // SAFETY: 同上
+        unsafe {
+            std::env::remove_var("HYOUI_MAX_FILE_BYTES");
+        }
+        match res {
+            Command::Input(cmd) => {
+                assert_eq!(cmd.max_file_bytes, 4096);
+            }
+            other => panic!("expected Input, got {other:?}"),
+        }
+    }
+
+    /// env が parse 不能 → warning を出して default に fallback (= fatal でない)。
+    #[test]
+    fn parse_input_max_file_bytes_env_invalid_falls_back_to_default() {
+        let _g = MAX_FILE_BYTES_ENV_GUARD.lock().unwrap();
+        // SAFETY: 同上
+        unsafe {
+            std::env::set_var("HYOUI_MAX_FILE_BYTES", "not-a-number");
+        }
+        let res = parse_args(&args(&["input", "demo", "text:x"]));
+        // SAFETY: 同上
+        unsafe {
+            std::env::remove_var("HYOUI_MAX_FILE_BYTES");
+        }
+        match res {
+            Command::Input(cmd) => {
+                assert_eq!(cmd.max_file_bytes, DEFAULT_INPUT_MAX_FILE_BYTES);
+            }
+            other => panic!("expected Input, got {other:?}"),
+        }
+    }
+
+    /// env を触る test を直列化するための Mutex。
+    /// `HYOUI_MAX_FILE_BYTES` を set/remove する test 同士の race を防ぐ。
+    static MAX_FILE_BYTES_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn parse_input_unknown_spec_prefix_errors() {

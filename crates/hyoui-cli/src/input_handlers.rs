@@ -13,16 +13,49 @@
 //!
 //! 例外 (= 別 task で実装):
 //! - `wait:` / `wait-idle:` は本 module の対象外 (= task #17、別 control message)
-//! - `file:` の path validation (= task #21) も範囲外、bare な `std::fs::read`
+//!
+//! ## task #21 (= file: spec の path validation / セキュリティ視点)
+//!
+//! 本 module の [`handle_file`] は task #21 でセキュリティ視点の防御を追加した。
+//! 脅威モデルと採用した防御方針:
+//!
+//! - daemon 側は client が送る bytes をそのまま PTY に流すだけで、file path
+//!   そのものを daemon に渡さない (= path 解釈は **client 側** で完結する)
+//! - したがって elevated 権限の daemon に任意 path を読ませる経路は最初から
+//!   無い。本 task の脅威モデルは下記 4 つに絞った:
+//!   1. 巨大 file 誤指定 → daemon に超大 bytes を送って memory 枯渇 DoS
+//!   2. typo で sensitive file (= `/etc/passwd` 等) を誤って送信
+//!   3. symlink traversal による意図しない path 到達
+//!   4. device file (= `/dev/zero` 等) を読んで無限 loop
+//!
+//! 採用した防御:
+//!
+//! - **size 上限**: default 16 MiB、`--max-file-bytes` / `HYOUI_MAX_FILE_BYTES`
+//!   で override。metadata で事前判定 (= 巨大 file を読み始めてから止める動きを
+//!   避ける)。symlink follow した先の size を見る (= `fs::metadata`)
+//! - **regular file 限定**: directory / device / socket / fifo は reject。
+//!   symlink は **follow した結果が regular file ならば accept** (= 安全側)。
+//!   `stdin` (= `-`) は file type check の対象外 (= pipe / tty を許す)
+//! - **空 file の warning**: bytes を 1 byte も送らないので意図に反する可能性が
+//!   ある。stderr に warning を出して **続行** (= UX 優先、abort はしない)
+//!
+//! 採用見送り (= 別 task で検討):
+//!
+//! - sensitive path (= `/etc/`, `~/.ssh/` 等) の warning: 誤検知が多く UX 悪化
+//!   懸念。task #22 で UX 整備と合わせて検討
+//! - path canonicalization の error message への露出: debug log 経路で逆に
+//!   情報漏洩リスクがあるので、error message には元の path のみを残す
 
 use std::io::Read;
 use std::path::Path;
 
-/// `file:` 経路で 1 度に読み込む最大 size。
+/// `file:` 経路で 1 度に読み込む最大 size の default。
 ///
-/// DR-0006 §8.6 で「default 16MB、0 で無制限」とされているが、本 task では
-/// override flag を露出しない最小実装。`--max-file-bytes` 等の CLI 引数を
-/// 受ける形は別 task (= #21 path validation と同じ tranche) で配線する。
+/// DR-0006 §8.6 の「default 16MB」に従い 16 MiB を採用。CLI 段では
+/// [`hyoui::cli::DEFAULT_INPUT_MAX_FILE_BYTES`] を使って解決済の値を
+/// [`handle_file`] に渡すため、本定数は **test 専用**として残してある
+/// (= 両者は同期している、handler 単体テストで実値を書きたくないため)。
+#[cfg(test)]
 pub(crate) const DEFAULT_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// `text:<string>` を bytes 化。
@@ -45,50 +78,116 @@ pub(crate) fn handle_hex(bytes: &[u8]) -> Vec<u8> {
 /// `file:<path>` を読み込んで bytes 化。
 ///
 /// `path == "-"` (= stdin) のときは stdin から bytes を読み切る。それ以外は
-/// 通常 file として読み込む。size 上限 `DEFAULT_MAX_FILE_BYTES` を超える場合は
-/// error (= atomic 保証、1 byte も送らずに失敗)。
+/// 通常 file として読み込む。
 ///
-/// **path validation は task #21 の scope**。本 handler は bare な
-/// `std::fs::read` 同等 (= symlink follow、相対 path 許容)。
+/// task #21 (= path validation セキュリティ視点) で以下の防御を追加:
+///
+/// - **size 上限**: `max_bytes` 引数を超える file は read 前に reject (= metadata
+///   の size を先に見て、巨大 file を読み始めてから止める動きを回避)。`max_bytes
+///   == 0` のときは無制限扱い。stdin 経路でも同じ上限を適用する
+/// - **regular file 限定**: directory / device / socket / fifo は reject。
+///   symlink は OS が follow した結果の metadata で判定するため、target が
+///   regular file ならば accept (= 安全側、無限 read 可能な device は弾く)
+/// - **空 file の warning**: stderr に warning を出して bytes は空のまま続行
+///   (= UX 優先、abort しない)
+///
+/// stdin (= `-`) は file type check の対象外 (= pipe / tty / regular file 何でも
+/// 来うる)。size 上限のみ適用。
 ///
 /// # Errors
 ///
-/// - path が存在しない / 読み取り権限がない → "file: read 失敗: ..."
-/// - size 上限超過 → "file: size 上限 ... を超えています ..."
+/// - path が存在しない / 読み取り権限がない → "file: metadata 取得失敗 ..."
+/// - directory / device / socket / fifo → "file: '<path>' は regular file ではありません ..."
+/// - size 上限超過 → "file: '<path>': size <N> exceeds limit <M> bytes"
 /// - stdin 読み取り失敗 → "file: stdin 読み取り失敗: ..."
-pub(crate) fn handle_file(path: &Path) -> Result<Vec<u8>, String> {
+/// - stdin の入力 size 超過 → "file: stdin の入力 size が上限 <M> bytes を超えています"
+pub(crate) fn handle_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
     if path.as_os_str() == "-" {
         // stdin を完全に読み切る (= EOF まで)。size 上限を超えたら error。
+        // max_bytes == 0 は「無制限」扱い (= take せず全部読む)。
         let mut buf = Vec::new();
         let mut handle = std::io::stdin().lock();
-        // take(N+1) で「N byte 読み切れたら確実に over」と判定できる。
-        let max = DEFAULT_MAX_FILE_BYTES;
-        let mut limited = (&mut handle).take(max.saturating_add(1));
-        limited
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("file: stdin 読み取り失敗: {e}"))?;
-        if buf.len() as u64 > max {
-            return Err(format!(
-                "file: stdin の入力 size が上限 {max} bytes を超えています"
-            ));
+        if max_bytes == 0 {
+            handle
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("file: stdin 読み取り失敗: {e}"))?;
+        } else {
+            // take(N+1) で「N byte 読み切れたら確実に over」と判定できる。
+            let mut limited = (&mut handle).take(max_bytes.saturating_add(1));
+            limited
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("file: stdin 読み取り失敗: {e}"))?;
+            if buf.len() as u64 > max_bytes {
+                return Err(format!(
+                    "file: stdin の入力 size が上限 {max_bytes} bytes を超えています"
+                ));
+            }
+        }
+        if buf.is_empty() {
+            eprintln!("hyoui: warning: file:- (stdin) is empty, nothing to send");
         }
         return Ok(buf);
     }
 
-    // 通常 file。先に metadata で size を見て上限を超えていれば read せず error
-    // (= 大きい file を全部読んでから捨てる動きを避ける)。symlink 先の size を
-    // 見るため `metadata` (= follow) を使う。`std::fs::read` も follow なので
-    // 挙動を揃える。
+    // 通常 file。`metadata` は symlink を follow するので「symlink → regular file」
+    // は accept、「symlink → directory」「symlink → device」は file_type で
+    // reject される。先に metadata で type / size を見て、巨大 file を読み始めて
+    // から止める動きを避ける。
     let meta = std::fs::metadata(path)
         .map_err(|e| format!("file: metadata 取得失敗 ({}): {e}", path.display()))?;
-    let size = meta.len();
-    if size > DEFAULT_MAX_FILE_BYTES {
+
+    // file type 検証 (= regular file のみ accept)。directory / block / char /
+    // socket / fifo は read しても意味がない or 危険なので reject。
+    // (= `/dev/zero` のような char device を読み始めると無限 loop で size 制限が
+    // 効くまで CPU を焼く可能性がある)
+    if !meta.is_file() {
+        let kind = describe_file_type(&meta);
         return Err(format!(
-            "file: size 上限 {DEFAULT_MAX_FILE_BYTES} bytes を超えています (file size: {size}, path: {})",
+            "file: '{}' は regular file ではありません ({kind})",
             path.display()
         ));
     }
-    std::fs::read(path).map_err(|e| format!("file: read 失敗 ({}): {e}", path.display()))
+
+    let size = meta.len();
+    if max_bytes > 0 && size > max_bytes {
+        return Err(format!(
+            "file: '{}': size {size} exceeds limit {max_bytes} bytes",
+            path.display()
+        ));
+    }
+
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("file: read 失敗 ({}): {e}", path.display()))?;
+
+    if bytes.is_empty() {
+        eprintln!(
+            "hyoui: warning: file '{}' is empty, nothing to send",
+            path.display()
+        );
+    }
+
+    Ok(bytes)
+}
+
+/// `fs::Metadata` から file type の人間が読める短い説明を返す。
+///
+/// `is_file()` で reject されたときの error message に含めて、ユーザが原因を
+/// 把握できるようにする (= "not a regular file" だけだと debug しにくい)。
+fn describe_file_type(meta: &std::fs::Metadata) -> &'static str {
+    let ft = meta.file_type();
+    if ft.is_dir() {
+        "directory"
+    } else if ft.is_symlink() {
+        // metadata() は follow するので通常ここには来ないが、symlink_metadata
+        // 経由で来る将来拡張のために残す
+        "symlink"
+    } else {
+        // unix の char / block / socket / fifo を細分化したいが、std::fs::FileType
+        // の public API には Unix 固有の判定 (= `FileTypeExt::is_block_device` 等)
+        // が必要で、import が複雑になる。MVP は "special file" でまとめる。
+        // (= 「regular file じゃない」が伝わればユーザは path を見直せる)
+        "special file (device/socket/fifo etc.)"
+    }
 }
 
 /// bracketed paste の開始 / 終了 sequence。DEC モード `?2004` の paste mode。
@@ -483,7 +582,7 @@ mod tests {
         let path = dir.path().join("payload.bin");
         let content = b"hello\nworld\n";
         std::fs::write(&path, content).expect("write");
-        let got = handle_file(&path).expect("read");
+        let got = handle_file(&path, DEFAULT_MAX_FILE_BYTES).expect("read");
         assert_eq!(got, content);
     }
 
@@ -491,7 +590,7 @@ mod tests {
     fn file_missing_returns_error() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let path = dir.path().join("nonexistent");
-        let err = handle_file(&path).unwrap_err();
+        let err = handle_file(&path, DEFAULT_MAX_FILE_BYTES).unwrap_err();
         assert!(
             err.contains("metadata 取得失敗") || err.contains("read 失敗"),
             "got: {err}"
@@ -507,7 +606,96 @@ mod tests {
         let f = std::fs::File::create(&path).expect("create");
         f.set_len(DEFAULT_MAX_FILE_BYTES + 1).expect("set_len");
         drop(f);
-        let err = handle_file(&path).unwrap_err();
-        assert!(err.contains("size 上限"), "got: {err}");
+        let err = handle_file(&path, DEFAULT_MAX_FILE_BYTES).unwrap_err();
+        assert!(err.contains("exceeds limit"), "got: {err}");
+    }
+
+    /// task #21: `--max-file-bytes` で override されたときに、default より小さい
+    /// 上限でも reject されることを確認。CLI flag 経路の動作保証。
+    #[test]
+    fn file_custom_max_bytes_rejected() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("small");
+        std::fs::write(&path, b"hello world\n").expect("write"); // 12 bytes
+        // 上限 8 bytes だと「12 > 8」で reject。
+        let err = handle_file(&path, 8).unwrap_err();
+        assert!(err.contains("exceeds limit 8"), "got: {err}");
+    }
+
+    /// task #21: `max_bytes == 0` は無制限扱い (= size check を skip)。
+    #[test]
+    fn file_zero_max_bytes_unlimited() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("small");
+        std::fs::write(&path, b"any content").expect("write");
+        let got = handle_file(&path, 0).expect("read");
+        assert_eq!(got, b"any content");
+    }
+
+    /// task #21: directory を file: で指定したら error。
+    #[test]
+    fn file_directory_rejected() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let err = handle_file(dir.path(), DEFAULT_MAX_FILE_BYTES).unwrap_err();
+        assert!(err.contains("regular file ではありません"), "got: {err}");
+        assert!(err.contains("directory"), "got: {err}");
+    }
+
+    /// task #21: symlink to regular file は accept (= follow した先が regular なら OK)。
+    #[cfg(unix)]
+    #[test]
+    fn file_symlink_to_regular_file_accepted() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, b"via symlink").expect("write");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let got = handle_file(&link, DEFAULT_MAX_FILE_BYTES).expect("read");
+        assert_eq!(got, b"via symlink");
+    }
+
+    /// task #21: symlink to directory は reject (= follow した先が directory)。
+    #[cfg(unix)]
+    #[test]
+    fn file_symlink_to_directory_rejected() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let target_dir = dir.path().join("subdir");
+        std::fs::create_dir(&target_dir).expect("mkdir");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target_dir, &link).expect("symlink");
+        let err = handle_file(&link, DEFAULT_MAX_FILE_BYTES).unwrap_err();
+        assert!(err.contains("regular file ではありません"), "got: {err}");
+    }
+
+    /// task #21: device file (= /dev/null) は reject。
+    /// /dev/null は char device で、socket でも fifo でもないが metadata.is_file()
+    /// が false になる代表例。CI / 開発環境で確実に存在する。
+    #[cfg(unix)]
+    #[test]
+    fn file_device_file_rejected() {
+        let path = Path::new("/dev/null");
+        // /dev/null が読めない環境では skip (= 一部の sandbox 等)
+        if std::fs::metadata(path).is_err() {
+            return;
+        }
+        let err = handle_file(path, DEFAULT_MAX_FILE_BYTES).unwrap_err();
+        assert!(err.contains("regular file ではありません"), "got: {err}");
+    }
+
+    /// task #21: 空 file は warning を出して bytes 空で続行する (= abort しない)。
+    /// warning 文言の検証は stderr capture が必要だが、本 test では「error にならず
+    /// 空 Vec が返る」ことだけを確認する (= warning は副作用、handler の戻り値で
+    /// 表現しない方針)。
+    #[test]
+    fn file_empty_returns_empty_bytes_without_error() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("empty");
+        std::fs::write(&path, b"").expect("write");
+        let got = handle_file(&path, DEFAULT_MAX_FILE_BYTES).expect("read");
+        assert!(
+            got.is_empty(),
+            "expected empty bytes, got {} bytes",
+            got.len()
+        );
     }
 }
