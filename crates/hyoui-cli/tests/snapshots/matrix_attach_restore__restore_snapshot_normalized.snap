@@ -1,0 +1,8 @@
+---
+source: crates/hyoui-cli/tests/matrix_attach_restore.rs
+assertion_line: 217
+expression: normalized
+---
+[?25h[m[H[Jmarker A
+marker B
+>[?1l[?2004l
