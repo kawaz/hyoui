@@ -18,6 +18,7 @@ hyoui の設計判断記録一覧。ファイル名は `DR-NNNN-title.md`（4 �
 - [DR-0011](./DR-0011-observability-strategy.md) — observability 戦略 (= R5-H1 解消方針、tracing 採用、Phase A: log instrument / Phase B: status --metrics / Phase C: detached child log file + hyoui logs、v0.2.0 serve gateway 前提)
 - [DR-0012](./DR-0012-signal-wire-name-not-number.md) — signal wire を u8 number から signal name string に変更 (= R5-POSIX-C1 / R5-C4 解消、DR-0008 §protocol 部分上書き、v0.2.0 breaking change、cross-OS serve gateway 対応)
 - [DR-0013](./DR-0013-screen-emulator-and-attach-stability.md) — screen emulator + attach/detach 安定化 + データモデル統一 (= vt100 採用、daemon = screen state 正本化、Phase A push 型 redraw + Phase B pull 型 SequenceNo、reflow truncate を input bytes log 再 feed で吸収、debug/snapshot protocol 追加、DR-0008 連動)
+- [DR-0014](./DR-0014-transparency-and-empirical-verification.md) — 透過原則の徹底と検証主義 (= 介入判断 self-check リスト、マトリクス検証主義、ドッグフーディング、anti-pattern「監視 + 新 protocol 発明」「サンプル 1 断定」「マトリクス先送り」を明示禁止、CLAUDE.md 経由で常時参照)
 
 ## Archived
 
