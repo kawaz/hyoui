@@ -41,8 +41,10 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
 use crate::protocol::messages::{
-    ClientInfo, ErrorCode, ErrorMessage, LockResponse, LockResult, ModeChange, SessionMode,
-    StatusResponse, TailRequest, WaitRequest,
+    ClientInfo, ErrorCode, ErrorMessage, LockResponse, LockResult, ModeChange, ScreenBufferKind,
+    ScreenCursorSnap, ScreenDumpRequest, ScreenDumpResponse, ScreenModeSnap, ScreenWindowSize,
+    SessionMode, SnapshotComponent, StateSnapshotRequest, StateSnapshotResponse, StatusResponse,
+    TailRequest, WaitRequest,
 };
 use crate::protocol::{ControlMessage, Frame, Mode, TYPE_CBOR_CONTROL, TYPE_RAW_DATA};
 use crate::scrollback::Scrollback;
@@ -51,6 +53,10 @@ use crate::sys::{FdExt, Pty};
 use super::DaemonConfig;
 use super::broadcast::{ClientHandle, broadcast_control, send_control};
 use super::lock::{SessionState, generate_lock_token};
+use super::screen::{
+    ScreenDumpFormat as InternalDumpFormat, ScreenDumpLayer as InternalDumpLayer, ScreenState,
+    build_screen_dump, build_screen_snapshot,
+};
 use super::session::RelayOutcome;
 use super::tail::handle_tail_request;
 use super::wait::{PendingWait, handle_wait_request};
@@ -101,6 +107,7 @@ pub(super) fn handle_client_frame(
     clients: &mut [ClientHandle],
     state: &mut SessionState,
     scrollback: &Scrollback,
+    screen_state: &mut ScreenState,
     config: &DaemonConfig,
     pending_waits: &mut Vec<PendingWait>,
 ) -> ClientFrameOutcome {
@@ -161,6 +168,7 @@ pub(super) fn handle_client_frame(
                 clients,
                 state,
                 scrollback,
+                screen_state,
                 config,
                 pending_waits,
             )
@@ -189,6 +197,7 @@ pub(super) fn handle_control_message(
     clients: &mut [ClientHandle],
     state: &mut SessionState,
     scrollback: &Scrollback,
+    screen_state: &mut ScreenState,
     config: &DaemonConfig,
     pending_waits: &mut Vec<PendingWait>,
 ) -> ClientFrameOutcome {
@@ -196,7 +205,7 @@ pub(super) fn handle_control_message(
         ControlMessage::Detach(d) => handle_detach_target(idx, d, clients),
         ControlMessage::Kill(k) => handle_kill(child, idx, k, clients),
         ControlMessage::Signal(s) => handle_signal(child, idx, s, clients),
-        ControlMessage::Resize(r) => handle_resize(pty, idx, r, clients),
+        ControlMessage::Resize(r) => handle_resize(pty, idx, r, clients, screen_state),
         ControlMessage::LockAcquire(req) => handle_lock_acquire(idx, req, clients, state),
         ControlMessage::LockRelease(rel) => handle_lock_release(idx, rel, clients, state),
         ControlMessage::TailRequest(req) => {
@@ -207,6 +216,12 @@ pub(super) fn handle_control_message(
         }
         ControlMessage::StatusQuery(_) => {
             handle_status_query(child, idx, clients, state, scrollback, config)
+        }
+        ControlMessage::ScreenDumpRequest(req) => {
+            handle_screen_dump_request(idx, req, clients, screen_state)
+        }
+        ControlMessage::StateSnapshotRequest(req) => {
+            handle_state_snapshot_request(idx, req, clients, screen_state)
         }
         // daemon → client 方向のはずの message が client → daemon に来た or 未実装 kind。
         // DR-0008 §3.2 「未知 kind は decode error」だが、ここに来るのは serde で既知
@@ -221,7 +236,9 @@ pub(super) fn handle_control_message(
         | ControlMessage::StatusResponse(_)
         | ControlMessage::TailData(_)
         | ControlMessage::TailEnd(_)
-        | ControlMessage::WaitResult(_) => reject_unexpected_kind(idx, clients),
+        | ControlMessage::WaitResult(_)
+        | ControlMessage::ScreenDumpResponse(_)
+        | ControlMessage::StateSnapshotResponse(_) => reject_unexpected_kind(idx, clients),
     }
 }
 
@@ -438,11 +455,15 @@ fn handle_signal(
 }
 
 /// `ControlMessage::Resize` を処理する (DR-0008 §2.3: leader 限定)。
+///
+/// PTY 側の TIOCSWINSZ に加え、DR-0013 Phase B から **ScreenState 側も同期 resize**
+/// する (= input log replay で primary buffer の cell grid を再構築、§7)。
 fn handle_resize(
     pty: &Pty,
     idx: usize,
     r: crate::protocol::messages::Resize,
     clients: &mut [ClientHandle],
+    screen_state: &mut ScreenState,
 ) -> ClientFrameOutcome {
     if ensure_leader(&clients[idx], "resize requires leader role").is_err() {
         return ClientFrameOutcome::Continue;
@@ -456,6 +477,10 @@ fn handle_resize(
     let cols = r.cols.clamp(COLS_MIN, COLS_MAX);
     let rows = r.rows.clamp(ROWS_MIN, ROWS_MAX);
     let _ = pty.resize(cols, rows);
+    // DR-0013 Phase B §7: ScreenState 側も同サイズに揃え、input log を新 Parser に
+    // replay する (primary buffer 中は cell が再構築、alt screen 中は子側 redraw を
+    // 期待して flag のみ復元)。
+    screen_state.resize(rows, cols);
     ClientFrameOutcome::Continue
 }
 
@@ -704,5 +729,210 @@ fn reject_unexpected_kind(idx: usize, clients: &[ClientHandle]) -> ClientFrameOu
             details: None,
         }),
     );
+    ClientFrameOutcome::Continue
+}
+
+/// `ControlMessage::ScreenDumpRequest` を処理する (DR-0013 §9)。
+///
+/// - cap `screen-dump-v1` が必要
+/// - format = json は format-not-implemented を返す (= MVP scope 外)
+/// - layer = scrollback / both は layer-not-implemented を返す
+/// - rect は受信するが現状全画面のみ対応 (= 無視)
+fn handle_screen_dump_request(
+    idx: usize,
+    req: ScreenDumpRequest,
+    clients: &mut [ClientHandle],
+    screen_state: &ScreenState,
+) -> ClientFrameOutcome {
+    if ensure_cap(
+        &clients[idx],
+        "screen-dump-v1",
+        "screen.dump.request requires `screen-dump-v1` cap",
+    )
+    .is_err()
+    {
+        return ClientFrameOutcome::Continue;
+    }
+    let format = match req.format {
+        crate::protocol::messages::ScreenDumpFormat::Ansi => InternalDumpFormat::Ansi,
+        crate::protocol::messages::ScreenDumpFormat::Binary => InternalDumpFormat::Binary,
+        crate::protocol::messages::ScreenDumpFormat::Json => InternalDumpFormat::Json,
+        crate::protocol::messages::ScreenDumpFormat::Cbor => InternalDumpFormat::Cbor,
+    };
+    let layer = match req.layer {
+        crate::protocol::messages::ScreenDumpLayer::Visible => InternalDumpLayer::Visible,
+        crate::protocol::messages::ScreenDumpLayer::Scrollback => InternalDumpLayer::Scrollback,
+        crate::protocol::messages::ScreenDumpLayer::Both => InternalDumpLayer::Both,
+    };
+    match build_screen_dump(screen_state, format, layer) {
+        Ok(payload) => {
+            let _ = send_control(
+                &clients[idx],
+                ControlMessage::ScreenDumpResponse(ScreenDumpResponse {
+                    payload,
+                    serial: req.serial,
+                }),
+            );
+        }
+        Err(super::screen::snapshot::ScreenDumpError::FormatNotImplemented(_)) => {
+            let _ = send_control(
+                &clients[idx],
+                ControlMessage::Error(ErrorMessage {
+                    code: ErrorCode::ProtocolMalformed,
+                    message: "screen.dump format not implemented in MVP (json)".into(),
+                    details: None,
+                }),
+            );
+        }
+        Err(super::screen::snapshot::ScreenDumpError::LayerNotImplemented(_)) => {
+            let _ = send_control(
+                &clients[idx],
+                ControlMessage::Error(ErrorMessage {
+                    code: ErrorCode::ProtocolMalformed,
+                    message: "screen.dump layer not implemented in MVP (scrollback / both)".into(),
+                    details: None,
+                }),
+            );
+        }
+        Err(super::screen::snapshot::ScreenDumpError::EncodeFailed) => {
+            let _ = send_control(
+                &clients[idx],
+                ControlMessage::Error(ErrorMessage {
+                    code: ErrorCode::InternalError,
+                    message: "screen.dump cbor encode failed".into(),
+                    details: None,
+                }),
+            );
+        }
+    }
+    ClientFrameOutcome::Continue
+}
+
+/// `ControlMessage::StateSnapshotRequest` を処理する (DR-0013 §9)。
+///
+/// - cap `state-snapshot-v1` が必要
+/// - include が空なら ProtocolMalformed
+/// - 各 component を ScreenState から引いて Response を組み立てる
+fn handle_state_snapshot_request(
+    idx: usize,
+    req: StateSnapshotRequest,
+    clients: &mut [ClientHandle],
+    screen_state: &ScreenState,
+) -> ClientFrameOutcome {
+    if ensure_cap(
+        &clients[idx],
+        "state-snapshot-v1",
+        "screen.snapshot.request requires `state-snapshot-v1` cap",
+    )
+    .is_err()
+    {
+        return ClientFrameOutcome::Continue;
+    }
+    if req.include.is_empty() {
+        let _ = send_control(
+            &clients[idx],
+            ControlMessage::Error(ErrorMessage {
+                code: ErrorCode::ProtocolMalformed,
+                message: "screen.snapshot.request requires at least one include component".into(),
+                details: None,
+            }),
+        );
+        return ClientFrameOutcome::Continue;
+    }
+    let want = |c: SnapshotComponent| req.include.contains(&c);
+
+    let mode_snap_internal = screen_state.snapshot_mode();
+    let cursor_snap_internal = screen_state.snapshot_cursor();
+    let (rows, cols) = screen_state.size();
+
+    let cells_payload = if want(SnapshotComponent::Cells) {
+        let snap = build_screen_snapshot(screen_state);
+        let mut buf = Vec::new();
+        match ciborium::ser::into_writer(&snap, &mut buf) {
+            Ok(()) => Some(buf),
+            Err(_) => {
+                let _ = send_control(
+                    &clients[idx],
+                    ControlMessage::Error(ErrorMessage {
+                        code: ErrorCode::InternalError,
+                        message: "snapshot cells cbor encode failed".into(),
+                        details: None,
+                    }),
+                );
+                return ClientFrameOutcome::Continue;
+            }
+        }
+    } else {
+        None
+    };
+
+    let cursor_field = if want(SnapshotComponent::Cursor) {
+        Some(ScreenCursorSnap {
+            row: cursor_snap_internal.row,
+            col: cursor_snap_internal.col,
+            visible: cursor_snap_internal.visible,
+        })
+    } else {
+        None
+    };
+
+    let mode_field = if want(SnapshotComponent::Mode) {
+        Some(ScreenModeSnap {
+            alternate_screen: mode_snap_internal.alternate_screen,
+            application_keypad: mode_snap_internal.application_keypad,
+            application_cursor: mode_snap_internal.application_cursor,
+            bracketed_paste: mode_snap_internal.bracketed_paste,
+            hide_cursor: mode_snap_internal.hide_cursor,
+        })
+    } else {
+        None
+    };
+
+    let window_field = if want(SnapshotComponent::WindowSize) {
+        Some(ScreenWindowSize { rows, cols })
+    } else {
+        None
+    };
+
+    let buffer_field = if want(SnapshotComponent::Buffer) {
+        Some(if mode_snap_internal.alternate_screen {
+            ScreenBufferKind::Alternate
+        } else {
+            ScreenBufferKind::Primary
+        })
+    } else {
+        None
+    };
+
+    let seq_field = if want(SnapshotComponent::SequenceNo) {
+        Some(screen_state.current_seqno())
+    } else {
+        None
+    };
+
+    // scrollback は Phase B では未実装 → include されていたら error
+    if want(SnapshotComponent::Scrollback) {
+        let _ = send_control(
+            &clients[idx],
+            ControlMessage::Error(ErrorMessage {
+                code: ErrorCode::ProtocolMalformed,
+                message: "snapshot component `scrollback` not implemented in MVP".into(),
+                details: None,
+            }),
+        );
+        return ClientFrameOutcome::Continue;
+    }
+
+    let resp = StateSnapshotResponse {
+        cells: cells_payload,
+        cursor: cursor_field,
+        mode: mode_field,
+        scrollback: None,
+        window_size: window_field,
+        buffer: buffer_field,
+        sequence_no: seq_field,
+        serial: req.serial,
+    };
+    let _ = send_control(&clients[idx], ControlMessage::StateSnapshotResponse(resp));
     ClientFrameOutcome::Continue
 }

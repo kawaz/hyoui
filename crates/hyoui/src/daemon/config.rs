@@ -24,7 +24,19 @@ pub struct DaemonConfig {
     pub rows: u16,
 
     /// scrollback ring buffer の上限 byte 数 (= `src/scrollback.rs` 使用)。
+    ///
+    /// DR-0013 §8 の方針整理: scrollback は **byte-base** (= `Scrollback`) と
+    /// **rows-base** (= vt100 内蔵 ring) の 2 層に分けて並行運用する。byte-base 層は
+    /// tail コマンドの `since_ms` / `last_bytes` 等 timestamp-base API の前提を担い、
+    /// rows-base 層は cell 単位の構造化 access に使う。byte-base 層を rows-base に
+    /// 置換すると tail の意味論が壊れるため、置換ではなく **責務分離** を採用。
+    /// `scrollback_bytes` はこの byte-base 層の上限を設定する。
     pub scrollback_bytes: usize,
+
+    /// primary buffer 用 input bytes log (= resize 救済策) の上限 byte 数。
+    /// DR-0013 §7。0 を渡すと log を無効化 (= resize 時の replay は no-op、
+    /// vt100 `set_size` の truncate だけが効く挙動になる)。
+    pub screen_input_log_bytes: usize,
 
     /// 1 client への broadcast queue の上限 byte 数 (DR-0008 §8.2 backpressure)。
     /// 既定 8 MiB。超過時はその client を `error` kind=`backpressure.disconnect` で
@@ -58,7 +70,8 @@ pub struct DaemonConfig {
 impl DaemonConfig {
     /// 既定値で `DaemonConfig` を組み立てる helper。
     ///
-    /// `scrollback_bytes = 1 MiB`、`client_buffer_bytes = 8 MiB`、`cols × rows = 80 × 24`。
+    /// `scrollback_bytes = 1 MiB`、`screen_input_log_bytes = 1 MiB`、
+    /// `client_buffer_bytes = 8 MiB`、`cols × rows = 80 × 24`。
     pub fn new(session_id: impl Into<String>, socket_path: PathBuf, cmd: Vec<String>) -> Self {
         Self {
             session_id: session_id.into(),
@@ -67,6 +80,7 @@ impl DaemonConfig {
             cols: 80,
             rows: 24,
             scrollback_bytes: 1024 * 1024,
+            screen_input_log_bytes: 1024 * 1024,
             client_buffer_bytes: 8 * 1024 * 1024,
             expected_token: None,
             until: None,
@@ -89,6 +103,7 @@ mod tests {
         assert_eq!(cfg.cols, 80);
         assert_eq!(cfg.rows, 24);
         assert_eq!(cfg.scrollback_bytes, 1024 * 1024);
+        assert_eq!(cfg.screen_input_log_bytes, 1024 * 1024); // DR-0013 §7 既定 1 MiB
         assert_eq!(cfg.client_buffer_bytes, 8 * 1024 * 1024); // DR-0008 §8.2 既定
     }
 

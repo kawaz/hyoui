@@ -17,7 +17,16 @@ use std::collections::BTreeSet;
 /// - `"lock"`: `lock.*` + `leader.notify` + `mode.change` messages
 /// - `"tail-v1"`: `tail.*` messages (`-v1` は schema breaking change の余地)
 /// - `"wait-l0"`: `wait.*` messages の L0 述語 (text/pattern/idle)。L1+ は別 cap
-pub const MVP_CAPS: &[&str] = &["data", "lock", "tail-v1", "wait-l0"];
+/// - `"screen-dump-v1"`: `screen.dump.*` messages (DR-0013 §9、debug / 自動 test 用)
+/// - `"state-snapshot-v1"`: `screen.snapshot.*` messages (DR-0013 §9、構造化 state)
+pub const MVP_CAPS: &[&str] = &[
+    "data",
+    "lock",
+    "tail-v1",
+    "wait-l0",
+    "screen-dump-v1",
+    "state-snapshot-v1",
+];
 
 /// 2 つの cap 集合の intersect を取って `Vec<String>` で返す。
 ///

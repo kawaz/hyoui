@@ -3,24 +3,38 @@
 //! DR-0013 §3 で確定した wrapper module の中核。`Parser::process` で子 PTY bytes を
 //! state に流し込み、`Screen` 経由で cell / cursor / mode 等を expose する。
 //!
-//! Phase A の責務は最小限:
+//! Phase A の責務:
 //!
 //! 1. 子 PTY bytes を 1 度だけ feed する経路を提供する (= `process`)
-//! 2. attach 復元用の sequence を組み立てるための primitive を expose (= `redraw_sequence`,
+//! 2. attach 復元用の sequence を組み立てるための primitive を expose (= `state_formatted`,
 //!    `alternate_screen`, `cursor_position`, `cursor_visible`, `size`)
 //! 3. DEC sync update (`?2026h` / `?2026l`) の同期中フラグを保持し、redraw の deferred
 //!    判定に使う (= `sync_in_progress`)
 //! 4. stalled sequence 検出用に `last_feed_at: Instant` を保持し、5 秒経過判定 (`is_stalled`)
 //!    と内部 buffer reset (`reset_stalled`) を提供する
 //!
-//! Phase B での追加予定 (= 本 module の責務には含めない):
+//! Phase B 追加分:
 //!
-//! - input bytes log (= resize 救済策、§7)
-//! - structured snapshot (= §11)
-//! - last_evicted_age 補完 counter (= §8)
-//! - per-line SequenceNo (= §4 Phase B)
+//! - **input bytes log の統合** (= [`super::input_log::InputLog`]、resize 救済策、§7):
+//!   `process` 内で primary buffer 中のみ push、alt mode 切替で hook、`resize` で
+//!   新 Parser を組み立てて replay
+//! - **DEC sync chunk 跨ぎ対応**: `process` 間の境界で `\x1b[?2026` の partial を
+//!   carry する (= chunk 末尾 8 bytes を `sync_scan_carry` に保持して次 chunk と連結
+//!   して走査)
+//! - **stalled reset 判定**: connector が `note_stalled_outcome` で 3 回連続 detect を
+//!   観測したら `reset` を呼ぶ判断ができるよう、connector に counter API を提供する
+//! - **`current_seqno`** (= byte feed 毎 increment、Phase B incremental sync の土台、§4)
+//!
+//! 持ち越し (Phase C 以降):
+//!
+//! - structured snapshot (= §11) は [`super::snapshot`] が担当 (本 module は cell
+//!   iter / cursor / mode の getter のみ提供)
+//! - per-line SequenceNo の真の活用は incremental sync 本体 (DirtyLinesNotify /
+//!   GetLines) と一緒に実装、ここでは counter フィールドのみ用意
 
 use std::time::{Duration, Instant};
+
+use super::input_log::InputLog;
 
 /// stalled sequence reset の閾値。tmux `input.c` 標準と揃える (= 5 秒)。
 ///
@@ -29,12 +43,25 @@ use std::time::{Duration, Instant};
 /// parser が永久に partial 状態に閉じ込められるのを防ぐ (DR-0013 §5)。
 pub(crate) const STALLED_RESET_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// stalled detect が **連続** で何回観測されたら自動 reset するかの閾値。
+///
+/// `STALLED_RESET_TIMEOUT * STALLED_RESET_CONSECUTIVE_DETECTS` 経過しても新 byte が
+/// 来ない broken stream 状態でだけ reset するため、誤発火耐性が高い。
+///
+/// 3 回 (= 15 秒) を採用: Phase A は warn のみ、本値で初めて自動 reset まで進む。
+pub(crate) const STALLED_RESET_CONSECUTIVE_DETECTS: u32 = 3;
+
+/// DEC sync update の chunk 跨ぎ検出用 carry の最大長 (= 検索 needle `\x1b[?2026h` /
+/// `\x1b[?2026l` は 8 byte なので、`needle.len() - 1 = 7` byte 残せば次 chunk で
+/// 確実に matching を継続できる)。
+const SYNC_SCAN_CARRY_LEN: usize = 7;
+
 /// daemon が保持する screen state の正本 wrapper。
 ///
 /// vt100 `Parser` (= `Screen` を内包) をそのまま正本にし、hyoui 側の責務 (= sync
-/// flag / stalled timer / 補完 hook) を追加 layer として持つ。`process` は 1 度
-/// だけ呼び、子 PTY bytes は本 wrapper を経由してから broadcast / wait / tail に
-/// 流れる (= DR-0013 §1「raw byte の直接 broadcast はしない」)。
+/// flag / stalled timer / 補完 hook / input bytes log / SequenceNo) を追加 layer
+/// として持つ。`process` は 1 度だけ呼び、子 PTY bytes は本 wrapper を経由してから
+/// broadcast / wait / tail に流れる (= DR-0013 §1「raw byte の直接 broadcast はしない」)。
 pub(crate) struct ScreenState {
     parser: vt100::Parser,
     /// 最後に `process` で bytes を feed した時刻。stalled 判定に使う。
@@ -46,30 +73,82 @@ pub(crate) struct ScreenState {
     /// 設計とし、中途半端な state の redraw を send しない (= DR-0013 §6 + alacritty
     /// `event_loop.rs:166` pattern)。
     sync_in_progress: bool,
+    /// 直前 chunk 末尾 (高々 `SYNC_SCAN_CARRY_LEN` byte) を持ち越して、`\x1b[?2026h/l`
+    /// が chunk 境界に跨った場合の取りこぼしを防ぐ (DR-0013 task A-7 持ち越し解消)。
+    sync_scan_carry: Vec<u8>,
+    /// primary buffer 中の子 PTY bytes を bounded ring に貯める resize 救済策。
+    /// `process` 内で primary 中のみ push、`resize` で新 Parser に replay する。
+    input_log: InputLog,
+    /// `process` 毎に増える monotonic counter (DR-0013 §4 Phase B incremental sync
+    /// の土台、§10 PDU serial と同期しない別 layer の SequenceNo)。本 phase ではフィー
+    /// ルドの導入のみで、DirtyLinesNotify / GetLines の本体は Phase C 以降。
+    current_seqno: u64,
+    /// 連続 stalled detect 回数 (= caller が `note_stalled_outcome` で更新)。
+    /// `STALLED_RESET_CONSECUTIVE_DETECTS` 到達で自動 reset を実行する判断材料。
+    consecutive_stalled_detects: u32,
 }
 
 impl ScreenState {
-    /// rows × cols viewport、scrollback_len 行 ring の new state を作る。
+    /// rows × cols viewport、scrollback_len 行 ring、input log は **無効** (= capacity 0)
+    /// の new state を作る。
     ///
+    /// input_log capacity を指定したい場合は [`Self::with_input_log_capacity`] を使う。
     /// `vt100::Parser::new` をそのまま呼ぶ薄い factory。`last_feed_at` は now で
     /// 初期化し、初期状態では sync flag は off。
+    ///
+    /// 本 factory は test と health.rs 専用 (= production code は input_log capacity を
+    /// 指定する `with_input_log_capacity` を使う)。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(rows: u16, cols: u16, scrollback_len: usize) -> Self {
+        Self::with_input_log_capacity(rows, cols, scrollback_len, 0)
+    }
+
+    /// rows × cols viewport、scrollback_len 行 ring、input_log capacity 指定で
+    /// new state を作る。
+    pub(crate) fn with_input_log_capacity(
+        rows: u16,
+        cols: u16,
+        scrollback_len: usize,
+        input_log_capacity: usize,
+    ) -> Self {
         Self {
             parser: vt100::Parser::new(rows, cols, scrollback_len),
             last_feed_at: Instant::now(),
             sync_in_progress: false,
+            sync_scan_carry: Vec::with_capacity(SYNC_SCAN_CARRY_LEN),
+            input_log: InputLog::new(input_log_capacity),
+            current_seqno: 0,
+            consecutive_stalled_detects: 0,
         }
     }
 
     /// 子 PTY 出力 bytes を vt100 parser に流し込む。
     ///
-    /// DEC sync update (`?2026h`/`l`) の検出は本関数内で行う (= bytes を走査して
-    /// 該当 sequence の出現で `sync_in_progress` を更新する)。vt100 0.16 は本 mode を
-    /// 内部処理しないため、wrapper 側で hook する必要がある。
+    /// 1. vt100 Parser に feed
+    /// 2. `last_feed_at` を now に更新
+    /// 3. DEC sync update (`?2026h` / `?2026l`) を carry + 新 bytes で走査して
+    ///    `sync_in_progress` を更新 (= chunk 跨ぎでも取りこぼさない)
+    /// 4. alt screen flag の値変化を input log に伝播
+    /// 5. primary buffer 中なら input log に push (= resize 救済策、§7)
+    /// 6. `current_seqno` を increment (= Phase B incremental sync の SequenceNo 土台)
+    /// 7. 連続 stalled detect counter を 0 にリセット (= 新 byte が来た = 健全)
     pub(crate) fn process(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
         self.parser.process(bytes);
         self.last_feed_at = Instant::now();
-        update_sync_flag(&mut self.sync_in_progress, bytes);
+        self.consecutive_stalled_detects = 0;
+        // DEC sync update の状態更新。carry を新 bytes の前に連結してから走査し、
+        // 次回 chunk のため末尾 SYNC_SCAN_CARRY_LEN bytes を保持する。
+        update_sync_flag_with_carry(&mut self.sync_in_progress, &mut self.sync_scan_carry, bytes);
+        // alt screen flag を input_log に同期。`Screen::alternate_screen()` の
+        // 値変化は本 process 内で起こりうるので、毎回 set する (= 同値 set は no-op)。
+        let alt = self.parser.screen().alternate_screen();
+        self.input_log.set_alt_mode(alt);
+        // primary buffer 中なら log に push。alt 中は InputLog 側で skip される。
+        self.input_log.push(bytes);
+        self.current_seqno = self.current_seqno.wrapping_add(1);
     }
 
     /// 現在 alt screen (`?1049h` / `?47h` / `?1047h`) に居るか。
@@ -119,26 +198,167 @@ impl ScreenState {
         now.duration_since(self.last_feed_at) >= STALLED_RESET_TIMEOUT
     }
 
+    /// 現在 SequenceNo (DR-0013 §4 Phase B incremental sync 土台)。
+    ///
+    /// `process` の各 chunk 終了時にチェックして「自分が持つ since_seqno との差」
+    /// から dirty 量を概算する用途。`u64::wrapping_add` で 64bit 一周しても
+    /// 健全動作 (= 実運用で reach 不可能だが defense-in-depth)。
+    pub(crate) fn current_seqno(&self) -> u64 {
+        self.current_seqno
+    }
+
+    /// input_log 内に保持されている byte 数 (= debug / metrics 用)。
+    #[cfg(test)]
+    pub(crate) fn input_log_len(&self) -> usize {
+        self.input_log.len()
+    }
+
+    /// input_log に capacity を指定する factory が使われたかの確認用 (test only)。
+    #[cfg(test)]
+    pub(crate) fn input_log_capacity(&self) -> usize {
+        self.input_log.capacity()
+    }
+
+    /// connector が stalled detect 結果を本 state に通知する。
+    ///
+    /// `Detected` を **連続で** `STALLED_RESET_CONSECUTIVE_DETECTS` 回受け取ったら
+    /// `Some(StalledAction::ResetRequested)` を返す。`Healthy` を 1 度でも受けたら
+    /// counter をリセットする。caller は `ResetRequested` を受けたら `reset()` を
+    /// 呼ぶ判断ができる (DR-0013 §5 Phase B の自動 reset 判定)。
+    pub(crate) fn note_stalled_outcome(&mut self, is_detected: bool) -> Option<StalledAction> {
+        if is_detected {
+            self.consecutive_stalled_detects = self.consecutive_stalled_detects.saturating_add(1);
+            if self.consecutive_stalled_detects >= STALLED_RESET_CONSECUTIVE_DETECTS {
+                Some(StalledAction::ResetRequested)
+            } else {
+                None
+            }
+        } else {
+            self.consecutive_stalled_detects = 0;
+            None
+        }
+    }
+
+    /// 現在の連続 stalled detect 回数 (= test / metrics 用)。
+    #[cfg(test)]
+    pub(crate) fn consecutive_stalled_detects(&self) -> u32 {
+        self.consecutive_stalled_detects
+    }
+
     /// 内部 parser を新規構築して partial sequence buffer を捨てる。
     ///
-    /// 現在の `Screen` state (= cells / cursor / mode 等) は失われるため、Phase A
-    /// では「呼出側が判断したときに使う最終手段」として提供する。Phase A 既定の
-    /// health check は warn log のみで state は保持する保守的方針 (= DR-0013 §5
-    /// + DR-0013 task A-8)。
+    /// `scrollback_len` は **元の Parser と同じ値** を保持し続けたいが、vt100 0.16
+    /// では `Parser` から `scrollback_len` を引き出す public API が無い。本実装では
+    /// `new` / `with_input_log_capacity` で渡された値を覚えていないため、reset 時は
+    /// 0 を渡す (= scrollback 機能は失われる、reset 後の挙動は debug 用途中心の
+    /// 想定)。完全 reset しても困らない設計の積み重ねが前提。
     ///
-    /// reset 後の `last_feed_at` は now、`sync_in_progress` は false に戻る。
-    ///
-    /// Phase A の health check は detect only (= warn のみ) で reset を呼ばない。
-    /// Phase B で stalled 時の挙動を再検討する際に呼出側を実装する予定。
-    #[allow(dead_code)]
+    /// reset 後の `last_feed_at` は now、`sync_in_progress` / `sync_scan_carry` /
+    /// `consecutive_stalled_detects` も 0 / 空に戻る。`current_seqno` も 0 から
+    /// やり直す (= incremental sync は次の since_seqno=0 から再開)。input_log は
+    /// 一緒に clear する (= replay 用 byte も無効と扱う)。
     pub(crate) fn reset(&mut self) {
         let (rows, cols) = self.size();
-        // scrollback_len は vt100 0.16 では Parser::new 時に決定し、Parser から
-        // 引き出す公開 API が無いため、現実装では既定値 (= 0) を渡す。Phase B で
-        // scrollback 統合する際は DaemonConfig 経由で揃える設計に切替える。
         self.parser = vt100::Parser::new(rows, cols, 0);
         self.last_feed_at = Instant::now();
         self.sync_in_progress = false;
+        self.sync_scan_carry.clear();
+        self.consecutive_stalled_detects = 0;
+        self.current_seqno = 0;
+        // input_log は capacity を維持しつつ中身だけ捨てる。
+        // (alt mode flag も primary 開始に戻す = reset 直後は primary 前提)
+        self.input_log.set_alt_mode(false);
+        // VecDeque を drain で空にする (= public clear が test only なので直接操作)
+        let cap = self.input_log.capacity();
+        self.input_log = InputLog::new(cap);
+    }
+
+    /// viewport を `(rows, cols)` に変更し、input log を新 Parser に replay する。
+    ///
+    /// vt100 `Parser::set_size` は **truncate のみで真の reflow なし** のため、
+    /// 本 wrapper では「新 Parser を作って input_log を再 feed」する設計に倒す
+    /// (DR-0013 §7)。
+    ///
+    /// 設計判断:
+    /// - alt screen 中 (= `alternate_screen() == true`) は input_log replay しない
+    ///   (= alt 中の bytes は log に push されていないため意味なし)。新 Parser だけ
+    ///   作って alt mode 復元 sequence (`\x1b[?1049h`) を流し込む。子側で
+    ///   再描画させるのが PTY 接続の自然な挙動。
+    /// - primary buffer 中なら input_log の bytes を新 Parser に process する。
+    ///   capacity 内の最新 bytes 列が cell grid + cursor + mode に再構築される。
+    /// - `sync_in_progress` / `sync_scan_carry` は新 Parser に合わせて clear。
+    ///   replay 中に `?2026h` を踏めば再度 detect される。
+    /// - `last_feed_at` は now (= resize 時刻)、stalled counter は 0。
+    /// - `current_seqno` は **保持** (= incremental sync の連続性、resize で乱さない)。
+    pub(crate) fn resize(&mut self, rows: u16, cols: u16) {
+        let was_alt = self.parser.screen().alternate_screen();
+        let mut new_parser = vt100::Parser::new(rows, cols, 0);
+
+        if was_alt {
+            // alt mode フラグだけ復元 (= cells は子側 redraw に任せる)
+            new_parser.process(b"\x1b[?1049h");
+            self.input_log.set_alt_mode(true);
+        } else if !self.input_log.is_empty() {
+            let replay = self.input_log.drain_for_replay();
+            new_parser.process(&replay);
+            self.input_log.set_alt_mode(false);
+        }
+
+        self.parser = new_parser;
+        self.last_feed_at = Instant::now();
+        self.sync_in_progress = false;
+        self.sync_scan_carry.clear();
+        self.consecutive_stalled_detects = 0;
+    }
+
+    /// 過去 row へのアクセス用に scrollback offset 付き行を iter する (DR-0013 §8)。
+    ///
+    /// vt100 0.16 では `Screen::scrollback()` (= offset getter) と `Screen::set_scrollback`
+    /// (= offset setter) しか提供されないため、本 wrapper では「指定 offset を一時的に
+    /// set して contents 取得 → 元に戻す」流れで row iter を実現する。Phase C で
+    /// debug/inspection 経由で row 単位の差分送出が必要になった際の primitive。
+    ///
+    /// 本実装は debug snapshot からのみ呼ばれる想定で、hot loop には乗らない
+    /// (= O(rows × cols) の cell copy で十分)。
+    pub(crate) fn snapshot_visible_rows(&self) -> Vec<Vec<RowCellSnap>> {
+        let (rows, cols) = self.size();
+        let mut out = Vec::with_capacity(rows as usize);
+        let scr = self.parser.screen();
+        for r in 0..rows {
+            let mut row = Vec::with_capacity(cols as usize);
+            for c in 0..cols {
+                let cell_info = scr
+                    .cell(r, c)
+                    .map(RowCellSnap::from_cell)
+                    .unwrap_or_default();
+                row.push(cell_info);
+            }
+            out.push(row);
+        }
+        out
+    }
+
+    /// cursor shape など mode 系の情報を取りまとめて返す。
+    pub(crate) fn snapshot_cursor(&self) -> CursorSnap {
+        let scr = self.parser.screen();
+        let (row, col) = scr.cursor_position();
+        CursorSnap {
+            row,
+            col,
+            visible: !scr.hide_cursor(),
+        }
+    }
+
+    /// mode 系の情報をまとめて返す (= alt / app_keypad / bracketed_paste 等)。
+    pub(crate) fn snapshot_mode(&self) -> ModeSnap {
+        let scr = self.parser.screen();
+        ModeSnap {
+            alternate_screen: scr.alternate_screen(),
+            application_keypad: scr.application_keypad(),
+            application_cursor: scr.application_cursor(),
+            bracketed_paste: scr.bracketed_paste(),
+            hide_cursor: scr.hide_cursor(),
+        }
     }
 
     /// テスト用に内部 `Screen` を直接覗く。本 module 外には公開しない。
@@ -148,26 +368,110 @@ impl ScreenState {
     }
 }
 
+/// `note_stalled_outcome` の戻り値 (= caller が判断材料にする action 種別)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StalledAction {
+    /// 連続 detect 数が閾値に達したので reset が推奨される。caller (= session)
+    /// が `reset()` を呼ぶか、追加の log だけに留めるか判断する。
+    ResetRequested,
+}
+
+/// 1 cell 分の snapshot data (= debug / snapshot protocol 用)。Phase B では
+/// `snapshot.rs` の圧縮 wrapper が本構造を更に圧縮するため、ここでは生情報を保持。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct RowCellSnap {
+    /// cell の表示文字列 (combining char / 全角を保つため `String`)。
+    pub contents: String,
+    /// 全角 cell の先頭か (`true` なら is_wide)。
+    pub is_wide: bool,
+    /// 全角 cell の継続 cell か (`true` なら is_wide_continuation)。
+    pub is_wide_continuation: bool,
+    /// bold / italic / underline 等のフラグ pack (= bit 0 bold / 1 italic /
+    /// 2 underline / 3 inverse)。Phase B では bool 個別保持ではなく u8 で
+    /// 4 フラグだけまとめる (snapshot wrapper 側で詳細を圧縮するため)。
+    pub attrs: u8,
+}
+
+impl RowCellSnap {
+    fn from_cell(cell: &vt100::Cell) -> Self {
+        let mut attrs = 0u8;
+        if cell.bold() {
+            attrs |= 1;
+        }
+        if cell.italic() {
+            attrs |= 1 << 1;
+        }
+        if cell.underline() {
+            attrs |= 1 << 2;
+        }
+        if cell.inverse() {
+            attrs |= 1 << 3;
+        }
+        Self {
+            contents: cell.contents().to_string(),
+            is_wide: cell.is_wide(),
+            is_wide_continuation: cell.is_wide_continuation(),
+            attrs,
+        }
+    }
+}
+
+/// cursor 状態の snapshot。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CursorSnap {
+    pub row: u16,
+    pub col: u16,
+    pub visible: bool,
+}
+
+/// mode flag の snapshot (= alt / app_keypad / cursor / bracketed_paste / hide_cursor)。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ModeSnap {
+    pub alternate_screen: bool,
+    pub application_keypad: bool,
+    pub application_cursor: bool,
+    pub bracketed_paste: bool,
+    pub hide_cursor: bool,
+}
+
 /// `bytes` 中の DEC sync update (`\x1b[?2026h` / `\x1b[?2026l`) を検出し、
-/// `flag` を更新する。最後に検出した状態を flag に反映する (= 1 chunk 内に複数
-/// 出現があれば最終結果を採用)。
+/// `flag` を更新する (chunk 跨ぎ対応 wrapper)。
 ///
-/// 完全な CSI parser を書かず、`\x1b[?2026h` / `\x1b[?2026l` の固定 byte 列を
-/// substring search するだけの素朴実装。partial sequence が chunk 境界に跨ると
-/// 検出を取りこぼす可能性があるが、Phase A では「同期中の attach は次の sync 終了
-/// まで blocking」程度のシンプル実装で OK な範囲 (= DR-0013 task A-7)。
-fn update_sync_flag(flag: &mut bool, bytes: &[u8]) {
+/// 動作:
+/// 1. carry (= 前 chunk 末尾の最大 `SYNC_SCAN_CARRY_LEN` byte) と新 bytes を連結
+/// 2. 連結 buffer に対し最終出現位置で flag 更新
+/// 3. carry を新 buffer の末尾 (高々 `SYNC_SCAN_CARRY_LEN` byte) に更新
+///
+/// これで `\x1b[?2026h` / `\x1b[?2026l` (= 8 byte) が chunk 境界に分断されても、
+/// 直前 carry + 新 bytes の連結 buffer 内に完全 needle が必ず含まれる
+/// (= 8 byte needle の 7 byte までを前 chunk に持っている状態でも次 chunk 1 byte で
+/// 完成)。
+fn update_sync_flag_with_carry(flag: &mut bool, carry: &mut Vec<u8>, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
     const ON: &[u8] = b"\x1b[?2026h";
     const OFF: &[u8] = b"\x1b[?2026l";
-    // 最終出現を採用するため、bytes を 1 度走査して on/off の最後の位置を比較する。
-    let last_on = find_last_subseq(bytes, ON);
-    let last_off = find_last_subseq(bytes, OFF);
+
+    // 連結 buffer を組み立てる。carry は短く高々 7 byte、bytes は chunk size
+    // (典型 8 KiB) なので Vec 1 つで OK。
+    let mut combined = Vec::with_capacity(carry.len() + bytes.len());
+    combined.extend_from_slice(carry);
+    combined.extend_from_slice(bytes);
+
+    let last_on = find_last_subseq(&combined, ON);
+    let last_off = find_last_subseq(&combined, OFF);
     match (last_on, last_off) {
         (None, None) => {}
         (Some(_), None) => *flag = true,
         (None, Some(_)) => *flag = false,
         (Some(a), Some(b)) => *flag = a > b,
     }
+
+    // 次回 chunk のため、末尾 SYNC_SCAN_CARRY_LEN byte を carry に持ち越す。
+    let keep = combined.len().min(SYNC_SCAN_CARRY_LEN);
+    carry.clear();
+    carry.extend_from_slice(&combined[combined.len() - keep..]);
 }
 
 /// `haystack` 中の `needle` の最後の出現位置を返す素朴 search。`needle` が空なら
@@ -334,5 +638,124 @@ mod tests {
         let c = s.screen().cell(0, 0).unwrap();
         assert_eq!(c.contents(), "");
         assert!(!s.sync_in_progress());
+        assert_eq!(s.consecutive_stalled_detects(), 0);
+        assert_eq!(s.current_seqno(), 0);
+    }
+
+    /// DEC sync update が **chunk 境界に跨る** 場合でも carry 経由で検出できる。
+    /// 旧 Phase A 実装は素朴 substring search で chunk 跨ぎを取りこぼしていた
+    /// (DR-0013 task A-7 持ち越し)。
+    #[test]
+    fn sync_update_flag_handles_chunk_boundary() {
+        let mut s = ScreenState::new(5, 40, 100);
+        // 8 byte needle `\x1b[?2026h` を 5 byte + 3 byte に分割
+        s.process(b"\x1b[?20"); // partial 5 byte
+        assert!(!s.sync_in_progress(), "partial alone must not flip flag");
+        s.process(b"26h"); // 残り 3 byte → carry と連結して完全 match
+        assert!(s.sync_in_progress(), "carry should reconstruct ON");
+
+        // OFF も同様に分割
+        s.process(b"some draws");
+        assert!(s.sync_in_progress());
+        s.process(b"\x1b[?2026"); // 7 byte
+        assert!(s.sync_in_progress());
+        s.process(b"l"); // 残り 1 byte
+        assert!(!s.sync_in_progress(), "OFF reconstructed across chunks");
+    }
+
+    /// 連続 stalled detect が閾値に達したら `ResetRequested` を返す。
+    /// Healthy を 1 度受けると counter は reset される。
+    #[test]
+    fn note_stalled_outcome_counts_consecutive_detects() {
+        let mut s = ScreenState::new(5, 40, 100);
+        assert_eq!(s.note_stalled_outcome(true), None);
+        assert_eq!(s.note_stalled_outcome(true), None);
+        // 3 回目で閾値到達
+        assert_eq!(
+            s.note_stalled_outcome(true),
+            Some(StalledAction::ResetRequested)
+        );
+        // Healthy で counter リセット
+        assert_eq!(s.note_stalled_outcome(false), None);
+        assert_eq!(s.consecutive_stalled_detects(), 0);
+        // 再度 detect 1 回では requested にならない
+        assert_eq!(s.note_stalled_outcome(true), None);
+    }
+
+    /// `process` の度に `current_seqno` が increment される。
+    #[test]
+    fn current_seqno_increments_per_process() {
+        let mut s = ScreenState::new(5, 40, 100);
+        assert_eq!(s.current_seqno(), 0);
+        s.process(b"a");
+        assert_eq!(s.current_seqno(), 1);
+        s.process(b"b");
+        assert_eq!(s.current_seqno(), 2);
+        // 空 bytes は SequenceNo を進めない
+        s.process(b"");
+        assert_eq!(s.current_seqno(), 2);
+    }
+
+    /// input log capacity を指定した state で primary buffer 中の bytes が log に
+    /// 保持される。alt screen 中は log に push されない。
+    #[test]
+    fn input_log_records_primary_bytes_only() {
+        let mut s = ScreenState::with_input_log_capacity(5, 40, 100, 1024);
+        assert_eq!(s.input_log_capacity(), 1024);
+        s.process(b"hello");
+        assert_eq!(s.input_log_len(), 5);
+
+        // alt screen に入る → 以降の bytes は log に push されない
+        s.process(b"\x1b[?1049h"); // 8 byte の `?1049h` も含め、alt 切替前の bytes は log に入る
+        let len_after_alt_enter = s.input_log_len();
+        s.process(b"alt-text");
+        assert_eq!(
+            s.input_log_len(),
+            len_after_alt_enter,
+            "alt screen bytes must not extend log"
+        );
+
+        // primary に戻ると再度 push される
+        s.process(b"\x1b[?1049l");
+        s.process(b"+more");
+        assert!(s.input_log_len() > len_after_alt_enter);
+    }
+
+    /// resize は primary buffer 中なら input log を新 Parser に replay する。
+    #[test]
+    fn resize_replays_primary_input_log() {
+        let mut s = ScreenState::with_input_log_capacity(5, 80, 0, 1024);
+        s.process(b"hello world");
+        let pre_size = s.size();
+        assert_eq!(pre_size, (5, 80));
+
+        // 縮小 → 拡大しても "hello world" が cell に再構築される
+        s.resize(5, 40);
+        assert_eq!(s.size(), (5, 40));
+        // 新 Parser に input log が流し込まれるので cell に文字が乗る
+        let scr = s.screen();
+        // "hello world" は最大 11 cell、cell(0, 0) は 'h'
+        assert_eq!(scr.cell(0, 0).unwrap().contents(), "h");
+        assert_eq!(scr.cell(0, 10).unwrap().contents(), "d");
+    }
+
+    /// alt screen 中の resize は input log を流し込まず、alt mode 復元 sequence だけ
+    /// 新 Parser に feed する (= 子側 redraw に任せる方針)。
+    #[test]
+    fn resize_in_alt_screen_does_not_replay_log() {
+        let mut s = ScreenState::with_input_log_capacity(10, 80, 0, 1024);
+        s.process(b"primary text");
+        s.process(b"\x1b[?1049h"); // alt 進入
+        s.process(b"alt-content");
+
+        s.resize(10, 40);
+        // alt mode は保持
+        assert!(s.alternate_screen());
+        // 新 Parser には primary の文字も alt の文字も入っていない
+        // (= 子側 redraw 期待で空のまま)
+        let scr = s.screen();
+        // alt 直後の cell は空 (= alt 進入で clear されたあとなので primary 文字は無い、
+        // かつ alt 文字は新 Parser に流していない)
+        assert_eq!(scr.cell(0, 0).unwrap().contents(), "");
     }
 }

@@ -28,9 +28,22 @@
 //! - debug / inspection protocol (= §9) + DR-0008 cap flag negotiation (§10)
 
 pub(crate) mod health;
+pub(crate) mod input_log;
 pub(crate) mod redraw;
+pub(crate) mod snapshot;
 pub(crate) mod state;
 
 pub(crate) use health::{StalledOutcome, check_stalled};
 pub(crate) use redraw::build_attach_redraw;
+pub(crate) use snapshot::{
+    ScreenDumpFormat, ScreenDumpLayer, build_screen_dump, build_screen_snapshot,
+};
+// ScreenSnapshot は session.rs の test (CBOR decode で確認) で参照する。test では
+// `crate::daemon::screen::snapshot::ScreenSnapshot` フルパス経由でも届くが、
+// session.rs の既存スタイルに合わせて re-export しておく。
+#[cfg(test)]
+pub(crate) use snapshot::ScreenSnapshot;
+// snapshot::ScreenDumpError は control.rs 側 module path で参照する想定
+// (= `super::screen::snapshot::ScreenDumpError`)。daemon/screen/snapshot.rs が
+// pub(crate) なので path 経由でアクセスできる。
 pub(crate) use state::ScreenState;

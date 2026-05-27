@@ -37,6 +37,7 @@ mod error;
 mod handshake;
 mod lifecycle;
 mod lock;
+mod screen;
 mod status;
 mod tail;
 mod wait;
@@ -49,6 +50,12 @@ pub use handshake::{
 pub use lifecycle::{Detach, DetachTarget, Kill};
 pub use lock::{
     LeaderNotify, LockAcquire, LockRelease, LockResponse, LockResult, ModeChange, SessionMode,
+};
+pub use screen::{
+    BufferKind as ScreenBufferKind, CursorSnap as ScreenCursorSnap, DumpRect,
+    ModeSnap as ScreenModeSnap, ScreenDumpFormat, ScreenDumpLayer, ScreenDumpRequest,
+    ScreenDumpResponse, SnapshotComponent, StateSnapshotRequest, StateSnapshotResponse,
+    WindowSize as ScreenWindowSize,
 };
 pub use status::{ClientInfo, StatusQuery, StatusResponse};
 pub use tail::{TailData, TailEnd, TailEndReason, TailRequest};
@@ -137,6 +144,24 @@ pub enum ControlMessage {
     /// `kind = "kill"` — client → daemon、子に signal → daemon exit。
     #[serde(rename = "kill")]
     Kill(Kill),
+
+    /// `kind = "screen.dump.request"` — client → daemon、画面 bytes を取得
+    /// (DR-0013 §9、cap `screen-dump-v1` 要)。
+    #[serde(rename = "screen.dump.request")]
+    ScreenDumpRequest(ScreenDumpRequest),
+
+    /// `kind = "screen.dump.response"` — daemon → client、画面 bytes 返却。
+    #[serde(rename = "screen.dump.response")]
+    ScreenDumpResponse(ScreenDumpResponse),
+
+    /// `kind = "screen.snapshot.request"` — client → daemon、構造化 state 取得
+    /// (DR-0013 §9、cap `state-snapshot-v1` 要)。
+    #[serde(rename = "screen.snapshot.request")]
+    StateSnapshotRequest(StateSnapshotRequest),
+
+    /// `kind = "screen.snapshot.response"` — daemon → client、構造化 state 返却。
+    #[serde(rename = "screen.snapshot.response")]
+    StateSnapshotResponse(StateSnapshotResponse),
 }
 
 /// CBOR control message の encode/decode error。

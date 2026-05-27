@@ -60,7 +60,9 @@ pub struct TailEnd {
 ///
 /// `Vec<u8>` を serde の default で扱うと array<u8> (CBOR major 4) になるが、
 /// terminal stream は byte string (CBOR major 2) として扱う方が自然。
-mod serde_bytes {
+/// `screen.rs` の `ScreenDumpResponse.payload` も同じ encoding を使うため
+/// `pub(super)` で兄弟 module から見えるようにする。
+pub(super) mod serde_bytes {
     use serde::{Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {

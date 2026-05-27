@@ -316,14 +316,22 @@ impl Session {
         let mut next_client_id: u64 = 0;
         let mut state = SessionState::default();
         let mut scrollback = Scrollback::new(config.scrollback_bytes);
-        // DR-0013 Phase A: daemon が screen state の正本を保持する。
+        // DR-0013 Phase B: daemon が screen state の正本を保持する。
         // 子 PTY bytes は本 state に流し込んでから broadcast / wait / tail に
         // 配る。attach 復元時は `build_attach_redraw` で生成した sequence を
         // 新 client に送る。
-        // scrollback_len は Phase A では 0 (= vt100 内蔵 ring は未使用)。
-        // Phase B で `crates/hyoui/src/scrollback.rs` 統合時に
-        // `config.scrollback_bytes` 由来の値を渡す設計に置き換える (§8)。
-        let mut screen_state = ScreenState::new(config.rows, config.cols, 0);
+        //
+        // `screen_input_log_bytes` で primary buffer 用 input log の容量を渡し、
+        // resize 時の replay 救済策 (DR-0013 §7) を有効化する。byte-base scrollback
+        // (= Scrollback) と rows-base scrollback (= vt100 内蔵 ring) は責務分離方針
+        // のため、scrollback_len は 0 のまま (= vt100 内蔵 ring 無効、cell 単位の
+        // scrollback access は Phase C で別途配線)。
+        let mut screen_state = ScreenState::with_input_log_capacity(
+            config.rows,
+            config.cols,
+            0,
+            config.screen_input_log_bytes,
+        );
         let mut pending_waits: Vec<PendingWait> = Vec::new();
         // DEC sync update 同期中に attach が発生した場合の deferred redraw 用。
         // sync が終了するまで redraw 送信を保留し、次の iteration で flush する
@@ -509,20 +517,40 @@ fn flush_pending_redraws_if_sync_over(
     }
 }
 
-/// DR-0013 §5 Phase A: stalled sequence の 5s 検出。Phase A は warn のみで state
-/// は保持する保守的方針。連続 warn を抑えるため `warned` flag を caller が保持し、
-/// feed 復帰で reset する設計。
-fn detect_and_warn_stalled(screen_state: &ScreenState, warned: &mut bool) {
-    if *warned {
-        return;
-    }
-    if check_stalled(screen_state, Instant::now()) == StalledOutcome::Detected {
-        // Phase A: warn-level log のみ (= stderr に 1 行)。observability は
-        // DR-0011 で本格化される予定なので、ここでは最小限の通知に留める。
+/// DR-0013 §5 Phase B: stalled sequence の 5s 検出と自動 reset 判定。
+///
+/// 動作 (DR-0013 task A-8 解消):
+/// - `check_stalled` で Detected/Healthy を取得
+/// - `ScreenState::note_stalled_outcome` で連続 detect counter を進める
+/// - 連続 3 回 (= 15s) detect されると `StalledAction::ResetRequested` が返るので
+///   `ScreenState::reset` を呼び、警告 log を出す
+/// - 既存 `warned` flag は「同じ detect cycle で warn を 1 度だけ出す」用途、
+///   feed 復帰 (= note が Healthy 受信で counter リセット) で再 warn 可能になる
+fn detect_and_warn_stalled(screen_state: &mut ScreenState, warned: &mut bool) {
+    let outcome = check_stalled(screen_state, Instant::now());
+    let detected = matches!(outcome, StalledOutcome::Detected);
+    let action = screen_state.note_stalled_outcome(detected);
+    if detected && !*warned {
         eprintln!(
             "[hyoui daemon] warn: vt100 parser stalled (no feed for >= 5s, may have partial sequence pending)"
         );
         *warned = true;
+    }
+    if action.is_some() {
+        // DR-0013 §5 Phase B: 連続 detect 上限到達 → 自動 reset。state を捨てる
+        // (= cells / cursor / mode 全消し) が、broken stream からの復旧を優先する。
+        eprintln!(
+            "[hyoui daemon] warn: vt100 parser stalled for {} consecutive checks; resetting screen state",
+            super::screen::state::STALLED_RESET_CONSECUTIVE_DETECTS
+        );
+        screen_state.reset();
+        // reset 後は note の counter も 0 になっている (reset 内で初期化済)。
+        // warn flag も解除して、次サイクル以降の detect で新 warn を許可する。
+        *warned = false;
+    }
+    if !detected {
+        // feed 復帰時に warn flag をリセット (= 次回 stalled で改めて warn できる)
+        *warned = false;
     }
 }
 
@@ -855,6 +883,7 @@ fn serve_loop(
                         clients,
                         state,
                         scrollback,
+                        screen_state,
                         config,
                         pending_waits,
                     ) {
@@ -3424,6 +3453,294 @@ mod tests {
         .encode_to(&mut attached[0])
         .expect("send kill");
         attached[0].flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    // ───── DR-0013 Phase B: screen.dump / screen.snapshot ─────
+
+    /// `screen.dump.request` (format=ansi, layer=visible) を送ると
+    /// `screen.dump.response` が ANSI bytes で返る + serial が echo される。
+    #[test]
+    fn serve_screen_dump_ansi_returns_state_formatted() {
+        use crate::protocol::messages::{
+            ScreenDumpFormat as ProtoDumpFormat, ScreenDumpLayer as ProtoDumpLayer,
+            ScreenDumpRequest,
+        };
+        let cmd = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf 'DUMPMARK\\r\\n'; sleep 30".into(),
+        ];
+        let (_, sock_path, _dir, handle) = spawn_serve_thread(cmd);
+
+        let mut s = client_connect_with_retry(&sock_path);
+        let _r = do_client_handshake(&mut s);
+        let _ = Frame::decode_from(&mut s).expect("leader.notify");
+        read_until_contains(&mut s, b"DUMPMARK");
+
+        // screen.dump.request (format=ansi, layer=visible, serial=42)
+        let req = ControlMessage::ScreenDumpRequest(ScreenDumpRequest {
+            format: ProtoDumpFormat::Ansi,
+            layer: ProtoDumpLayer::Visible,
+            rect: None,
+            serial: Some(42),
+        });
+        Frame::cbor_control(req.encode_to_vec().expect("encode"))
+            .encode_to(&mut s)
+            .expect("send");
+        s.flush().expect("flush");
+
+        let msg = next_control(&mut s);
+        match msg {
+            ControlMessage::ScreenDumpResponse(resp) => {
+                assert_eq!(resp.serial, Some(42));
+                // ANSI dump は `\x1b` で始まる + marker を含む
+                assert!(resp.payload.starts_with(b"\x1b"), "expected ANSI prefix");
+                assert!(
+                    resp.payload.windows(8).any(|w| w == b"DUMPMARK"),
+                    "dump should contain DUMPMARK marker"
+                );
+            }
+            o => panic!("expected ScreenDumpResponse, got {o:?}"),
+        }
+
+        // cleanup
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signal: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s)
+        .expect("send");
+        s.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// `screen.dump.request` (format=cbor) を送ると CBOR encoded `ScreenSnapshot`
+    /// が returns され、decode して内容が確認できる。
+    #[test]
+    fn serve_screen_dump_cbor_returns_encoded_snapshot() {
+        use crate::daemon::screen::ScreenSnapshot;
+        use crate::protocol::messages::{
+            ScreenDumpFormat as ProtoDumpFormat, ScreenDumpLayer as ProtoDumpLayer,
+            ScreenDumpRequest,
+        };
+        let cmd = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf 'CBORDUMP'; sleep 30".into(),
+        ];
+        let (_, sock_path, _dir, handle) = spawn_serve_thread(cmd);
+
+        let mut s = client_connect_with_retry(&sock_path);
+        let _r = do_client_handshake(&mut s);
+        let _ = Frame::decode_from(&mut s).expect("leader.notify");
+        read_until_contains(&mut s, b"CBORDUMP");
+
+        let req = ControlMessage::ScreenDumpRequest(ScreenDumpRequest {
+            format: ProtoDumpFormat::Cbor,
+            layer: ProtoDumpLayer::Visible,
+            rect: None,
+            serial: None,
+        });
+        Frame::cbor_control(req.encode_to_vec().expect("encode"))
+            .encode_to(&mut s)
+            .expect("send");
+        s.flush().expect("flush");
+
+        let msg = next_control(&mut s);
+        match msg {
+            ControlMessage::ScreenDumpResponse(resp) => {
+                assert!(resp.serial.is_none());
+                // CBOR decode して ScreenSnapshot を取り出す
+                let snap: ScreenSnapshot =
+                    ciborium::de::from_reader(resp.payload.as_slice()).expect("decode snap");
+                // 80x24 default
+                assert_eq!(snap.cols, 80);
+                assert_eq!(snap.rows, 24);
+                // current_seqno は 1 以上 (= byte feed があった)
+                assert!(snap.current_seqno >= 1);
+                // CBORDUMP の各文字が cells に含まれる
+                let texts: String = snap.cells.iter().map(|cp| cp.cell.text.as_str()).collect();
+                assert!(texts.contains("CBORDUMP"), "snapshot cells text: {texts}");
+            }
+            o => panic!("expected ScreenDumpResponse, got {o:?}"),
+        }
+
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signal: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s)
+        .expect("send");
+        s.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// `screen.snapshot.request` を送ると include 指定された component だけが
+    /// `Some(...)` で返り、未指定の component は `None` のまま。
+    #[test]
+    fn serve_state_snapshot_returns_requested_components_only() {
+        use crate::protocol::messages::{
+            ScreenBufferKind, SnapshotComponent, StateSnapshotRequest,
+        };
+        let (_, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut s = client_connect_with_retry(&sock_path);
+        let _r = do_client_handshake(&mut s);
+        let _ = Frame::decode_from(&mut s).expect("leader.notify");
+
+        let req = ControlMessage::StateSnapshotRequest(StateSnapshotRequest {
+            include: vec![
+                SnapshotComponent::Cursor,
+                SnapshotComponent::Mode,
+                SnapshotComponent::WindowSize,
+                SnapshotComponent::Buffer,
+                SnapshotComponent::SequenceNo,
+            ],
+            serial: Some(7),
+        });
+        Frame::cbor_control(req.encode_to_vec().expect("encode"))
+            .encode_to(&mut s)
+            .expect("send");
+        s.flush().expect("flush");
+
+        let msg = next_control(&mut s);
+        match msg {
+            ControlMessage::StateSnapshotResponse(resp) => {
+                assert_eq!(resp.serial, Some(7));
+                // 未指定 → None
+                assert!(resp.cells.is_none(), "cells must be None");
+                assert!(resp.scrollback.is_none(), "scrollback must be None");
+                // 指定 → Some
+                assert!(resp.cursor.is_some(), "cursor must be Some");
+                assert!(resp.mode.is_some(), "mode must be Some");
+                assert!(resp.window_size.is_some(), "window_size must be Some");
+                assert_eq!(resp.buffer, Some(ScreenBufferKind::Primary));
+                assert!(resp.sequence_no.is_some(), "sequence_no must be Some");
+                let ws = resp.window_size.unwrap();
+                assert_eq!(ws.rows, 24);
+                assert_eq!(ws.cols, 80);
+            }
+            o => panic!("expected StateSnapshotResponse, got {o:?}"),
+        }
+
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signal: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s)
+        .expect("send");
+        s.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// `screen.snapshot.request` で `include` が空なら ProtocolMalformed を返す。
+    #[test]
+    fn serve_state_snapshot_empty_include_is_rejected() {
+        use crate::protocol::messages::StateSnapshotRequest;
+        let (_, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut s = client_connect_with_retry(&sock_path);
+        let _r = do_client_handshake(&mut s);
+        let _ = Frame::decode_from(&mut s).expect("leader.notify");
+
+        let req = ControlMessage::StateSnapshotRequest(StateSnapshotRequest {
+            include: vec![],
+            serial: None,
+        });
+        Frame::cbor_control(req.encode_to_vec().expect("encode"))
+            .encode_to(&mut s)
+            .expect("send");
+        s.flush().expect("flush");
+
+        let msg = next_control(&mut s);
+        match msg {
+            ControlMessage::Error(e) => {
+                assert_eq!(e.code, ErrorCode::ProtocolMalformed);
+            }
+            o => panic!("expected Error(ProtocolMalformed), got {o:?}"),
+        }
+
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signal: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s)
+        .expect("send");
+        s.flush().expect("flush");
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// `screen.dump.request` を cap negotiation せずに送ると
+    /// `unsupported-capability` を返す。client は handshake で screen-dump-v1 を
+    /// 含めなければ MVP_CAPS から除外されて intersect される。
+    #[test]
+    fn serve_screen_dump_without_cap_is_rejected() {
+        use crate::protocol::messages::{
+            ScreenDumpFormat as ProtoDumpFormat, ScreenDumpLayer as ProtoDumpLayer,
+            ScreenDumpRequest,
+        };
+        let (_, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        // handshake は data + lock のみ (= screen-dump-v1 を要求しない)
+        let mut s = client_connect_with_retry(&sock_path);
+        let req = ControlMessage::HandshakeRequest(HandshakeRequest {
+            caps: vec!["data".into(), "lock".into()],
+            mode: Mode::Rw,
+            exclusive: false,
+            detach_others: false,
+            token: None,
+        });
+        Frame::cbor_control(req.encode_to_vec().expect("encode"))
+            .encode_to(&mut s)
+            .expect("send");
+        s.flush().expect("flush");
+        // handshake.response を取り出して intersect が data + lock のみであることを確認
+        let resp_frame = Frame::decode_from(&mut s).expect("response");
+        match ControlMessage::decode_from(resp_frame.body.as_slice()).expect("decode") {
+            ControlMessage::HandshakeResponse(r) => {
+                assert!(r.caps.iter().any(|c| c == "data"));
+                assert!(r.caps.iter().any(|c| c == "lock"));
+                assert!(!r.caps.iter().any(|c| c == "screen-dump-v1"));
+            }
+            o => panic!("expected HandshakeResponse, got {o:?}"),
+        }
+        discard_attach_redraw(&mut s);
+
+        // leader.notify を drain (= 1st client は leader=true で broadcast を受ける)
+        let _ = Frame::decode_from(&mut s).expect("leader.notify");
+
+        // screen.dump.request 送信 → unsupported-capability
+        let dreq = ControlMessage::ScreenDumpRequest(ScreenDumpRequest {
+            format: ProtoDumpFormat::Ansi,
+            layer: ProtoDumpLayer::Visible,
+            rect: None,
+            serial: None,
+        });
+        Frame::cbor_control(dreq.encode_to_vec().expect("encode"))
+            .encode_to(&mut s)
+            .expect("send");
+        s.flush().expect("flush");
+        let msg = next_control(&mut s);
+        match msg {
+            ControlMessage::Error(e) => {
+                assert_eq!(e.code, ErrorCode::UnsupportedCapability);
+            }
+            o => panic!("expected unsupported-capability Error, got {o:?}"),
+        }
+
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill { signal: None })
+                .encode_to_vec()
+                .expect("encode"),
+        )
+        .encode_to(&mut s)
+        .expect("send");
+        s.flush().expect("flush");
         let _ = handle.join().expect("daemon thread");
     }
 }
