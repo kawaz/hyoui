@@ -983,6 +983,7 @@ fn screen_dump_command(cfg: ScreenDumpConfig) -> ExitCode {
         ScreenDumpCliFormat::Ansi => ScreenDumpFormat::Ansi,
         ScreenDumpCliFormat::Binary => ScreenDumpFormat::Binary,
         ScreenDumpCliFormat::Cbor => ScreenDumpFormat::Cbor,
+        ScreenDumpCliFormat::TextPlain => ScreenDumpFormat::TextPlain,
         // `ScreenDumpCliFormat` is `#[non_exhaustive]`; treat unknown variants as
         // a binary/library version skew rather than silently degrading.
         _ => {
@@ -2095,6 +2096,76 @@ mod tests {
         );
 
         // cleanup: daemon に kill 送って thread を終わらせる
+        let kill_opts = AttachOptions {
+            mode: Mode::Ro,
+            ..AttachOptions::default()
+        };
+        if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
+            let kill = hyoui::protocol::messages::Kill { signal: None };
+            let _ = conn.send_control(&ControlMessage::Kill(kill));
+            drop(conn);
+        }
+        let _ = daemon_handle.join();
+    }
+
+    /// daemon を起動して `screen dump --format=text/plain` を実行、payload に
+    /// 子の marker 出力が含まれ、ANSI escape (= 0x1b バイト) が一切含まれない
+    /// ことを確認するスモークテスト (= CLI 層の TextPlain wiring + daemon 側
+    /// build_text_plain dispatch の retrogression 検知)。
+    #[test]
+    fn screen_dump_command_text_plain_returns_visible_chars_without_ansi() {
+        use hyoui::daemon::{DaemonConfig, Session};
+
+        let sock_dir = make_0700_dir();
+        let sock_path = sock_dir.path().join("dump-text-plain.sock");
+        let out_path = sock_dir.path().join("dump-text-plain.out");
+
+        // daemon spawn (= 子は marker "MARKER" を出して sleep 待機)。
+        let sock_for_daemon = sock_path.clone();
+        let daemon_handle = std::thread::spawn(move || {
+            let cfg = DaemonConfig::new(
+                "screen-dump-text-plain-test",
+                sock_for_daemon,
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf 'MARKER'; sleep 30".into(),
+                ],
+            );
+            let session = Session::start(cfg).expect("daemon start");
+            session.serve()
+        });
+
+        // daemon の listener + 子の最初の出力が screen state に反映されるまで待つ
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let cfg = ScreenDumpConfig {
+            socket: Some(sock_path.to_string_lossy().into_owned()),
+            session_id: None,
+            format: ScreenDumpCliFormat::TextPlain,
+            layer: ScreenDumpCliLayer::Visible,
+            rect: None,
+            output: Some(out_path.to_string_lossy().into_owned()),
+            timeout_ms: 5_000,
+        };
+        let _exit = screen_dump_command(cfg);
+
+        let got = std::fs::read(&out_path).expect("read output");
+        assert!(!got.is_empty(), "text/plain dump payload must not be empty");
+        // marker 文字列が含まれる (= 子の出力が cell 化されて TextPlain に乗っている)
+        assert!(
+            got.windows(b"MARKER".len()).any(|w| w == b"MARKER"),
+            "text/plain payload should contain MARKER: {:?}",
+            std::str::from_utf8(&got).unwrap_or("<invalid utf8>")
+        );
+        // ANSI escape (= 0x1b) は一切含まれない (= 装飾 strip 済)
+        assert!(
+            !got.contains(&0x1b),
+            "text/plain payload must not contain ANSI escape: {:?}",
+            std::str::from_utf8(&got).unwrap_or("<invalid utf8>")
+        );
+
+        // cleanup
         let kill_opts = AttachOptions {
             mode: Mode::Ro,
             ..AttachOptions::default()

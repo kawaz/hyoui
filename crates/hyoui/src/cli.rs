@@ -283,9 +283,10 @@ pub struct WaitConfig {
 /// `screen dump` subcommand の format 選択肢 (= DR-0006 §10.2)。
 ///
 /// protocol 層の `ScreenDumpFormat` と 1:1 対応。CLI 段で `--format=ansi` /
-/// `--format=binary` / `--format=cbor` を受理する。`--format=json` は protocol
-/// 上は予約 variant だが daemon が `format-not-implemented` を返す MVP scope 外
-/// なので CLI 段でも reject する (= 早期 fail で誤入力を見つける)。
+/// `--format=binary` / `--format=cbor` / `--format=text/plain` を受理する。
+/// `--format=json` は protocol 上は予約 variant だが daemon が
+/// `format-not-implemented` を返す MVP scope 外なので CLI 段でも reject する
+/// (= 早期 fail で誤入力を見つける)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ScreenDumpCliFormat {
@@ -296,6 +297,11 @@ pub enum ScreenDumpCliFormat {
     Binary,
     /// CBOR encode された structured `ScreenSnapshot` (= 機械処理 / debug)。
     Cbor,
+    /// 装飾なし + cell 空白 / 行構造保持の plaintext (= TUI 自動処理用、
+    /// claude TUI PoC feedback)。`Binary` と違い行末空白を trim せず、
+    /// viewport の盤面状態を装飾だけ抜いた形で出力する。
+    /// CLI 受理 alias: `text` / `text/plain` / `plain`。
+    TextPlain,
 }
 
 /// `screen dump` subcommand の layer 選択肢 (= DR-0006 §10.2)。
@@ -1668,13 +1674,19 @@ fn parse_screen_dump(args: &[String]) -> Command {
                         format = ScreenDumpCliFormat::Cbor;
                         Ok(true)
                     }
+                    // TextPlain は 3 alias を受理 (= primary name は MIME 風の
+                    // "text/plain"、短縮形 "text" / "plain" も同義)。
+                    "text" | "text/plain" | "plain" => {
+                        format = ScreenDumpCliFormat::TextPlain;
+                        Ok(true)
+                    }
                     "json" => Err(Command::Error(
                         "screen dump: --format=json は MVP scope 外 (= 別 task)。\
-                         ansi / binary / cbor を使ってください"
+                         ansi / binary / cbor / text/plain を使ってください"
                             .into(),
                     )),
                     other => Err(Command::Error(format!(
-                        "screen dump: --format must be `ansi`|`binary`|`cbor`, got {other:?}"
+                        "screen dump: --format must be `ansi`|`binary`|`cbor`|`text/plain`, got {other:?}"
                     ))),
                 }
             }
@@ -2460,9 +2472,11 @@ fn usage_screen_dump() -> String {
         OPTIONS:\n    \
             --socket PATH       Explicit socket path (alternative to session-id)\n    \
             --format FMT        Output format (default: ansi)\n                        \
-                ansi   — raw ANSI bytes (= terminal で cat 再生可)\n                        \
-                binary — 空白除去 + 改行 plaintext (= grep 用)\n                        \
-                cbor   — CBOR encoded ScreenSnapshot (= 機械処理)\n                        \
+                ansi       — raw ANSI bytes (= terminal で cat 再生可)\n                        \
+                binary     — 空白除去 + 改行 plaintext (= grep 用)\n                        \
+                cbor       — CBOR encoded ScreenSnapshot (= 機械処理)\n                        \
+                text/plain — 装飾なし + cell 空白 / 行構造保持 (= TUI 自動処理用)\n                        \
+                             (alias: text, plain)\n                        \
                 (json は MVP scope 外 / 別 task)\n    \
             --layer LAYER       Layer (default: visible)\n                        \
                 visible    — 現在 viewport (= MVP 唯一の実装済)\n                        \
@@ -4903,6 +4917,39 @@ mod tests {
                 }
                 other => panic!("expected Screen::Dump for format={s}, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn parse_screen_dump_format_text_plain() {
+        // primary name = MIME 風の "text/plain"
+        match parse_args(&args(&["screen", "dump", "demo", "--format=text/plain"])) {
+            Command::Screen(ScreenCommand::Dump(cfg)) => {
+                assert_eq!(cfg.format, ScreenDumpCliFormat::TextPlain);
+            }
+            other => panic!("expected Screen::Dump for --format=text/plain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_dump_format_text_alias() {
+        // alias = "text" 短縮
+        match parse_args(&args(&["screen", "dump", "demo", "--format=text"])) {
+            Command::Screen(ScreenCommand::Dump(cfg)) => {
+                assert_eq!(cfg.format, ScreenDumpCliFormat::TextPlain);
+            }
+            other => panic!("expected Screen::Dump for --format=text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_screen_dump_format_plain_alias() {
+        // alias = "plain" 短縮
+        match parse_args(&args(&["screen", "dump", "demo", "--format=plain"])) {
+            Command::Screen(ScreenCommand::Dump(cfg)) => {
+                assert_eq!(cfg.format, ScreenDumpCliFormat::TextPlain);
+            }
+            other => panic!("expected Screen::Dump for --format=plain, got {other:?}"),
         }
     }
 
