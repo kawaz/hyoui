@@ -56,6 +56,10 @@ hyoui は **PTY を介在させるが、その上の semantics には介入し�
   process state を「壊れている」「異常」と hyoui が判定して情報を捨てる介入の場合、
   その判定基準が DR で明示されているか、より保守的な選択肢 (= warn のみ / 手動 reset)
   を提供しているか
+- [ ] **既存 DR で justify された機能のうち、未実装のものはないか?** = 本セッションで
+  新規介入を入れる前に、まず docs/decisions/INDEX.md を 30 秒眺めて「DR で約束した機能で
+  実装が抜けているもの」を確認する。新規介入より既存 DR の実装漏れ修復が優先 (= 撤退判断は
+  最後の手段、最初に疑うのは「実装漏れ」)
 
 ### 検証主義 (= 推測で実装しない、サンプル 1 で判断しない)
 
@@ -71,6 +75,16 @@ hyoui は **PTY を介在させるが、その上の semantics には介入し�
   - shell jobs: `jobs -l`、`fg` / `bg` 復帰可否
 - **サンプル数の原則**: 1 つの app (= 例: claude TUI) で見えた挙動を一般化しない。**最低 3 種類**
   (= TUI alt screen 系 / line-oriented 系 / interactive REPL 系 等の異なる category) で検証する
+
+### コードと DR の双方向整合性
+
+self-check は「新規介入を入れる側」だけでなく「設計済の未実装を発見する側」も必要:
+
+- **A 方向 (= 新規介入 → DR 確認)**: 通常の self-check (= 5/6/7 項目目)
+- **B 方向 (= DR → コード確認)**: DR-NNNN を Read で開いたら、その「Decision」「Implementation
+  phases」に書かれた機能が `crates/` 下の **どの module で実装されているか** を grep で確認
+- どちらの方向も等しく重要。本セッションで Claude が DR-0001 軸 1/2 の実装漏れに長期間気付かなかった
+  のは、A 方向の self-check しか持っていなかったため
 
 ### 道具揃った段階の運用 (= ドッグフーディング)
 
@@ -134,6 +148,10 @@ DR-0013 完了で screen dump / snapshot / tail / wait 等の **観測道具が�
    sequence の 3 連続自動 reset で vt100 state を捨てる、子側で OSC52 paste や DCS
    sixel の途中だった場合に情報損失) = warn default + 手動 reset CLI への退避、
    自動破棄が必要なら判定基準を DR に明示
+5. **DR 起票で満足、実装は別 task として先送りして忘れる** (= DR-0001 軸 1/2 は 2026-05-21 起票 +
+   shimux/poc003 で実装済 + Rust 一本化時に「smoke 未実施 = 残課題」明文化 + 2026-05-26 議論で
+   「未実装オプション」認知、しかし 5 日放置で 2026-05-27 のマトリクス検証まで誰も気付かなかった
+   経緯あり) = DR 起票時に同時に「impl issue」を起票して紐付け、定期的に INDEX で確認する
 
 ## 関連
 

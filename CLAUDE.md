@@ -30,6 +30,8 @@ Terminal multiplexer ではない (= tmux/screen の代替ではない)。
 - [ ] **kernel / PTY / shell の標準機能を再発明していないか?** (= SIGCHLD 受信 / PTY line discipline /
   shell job control 等)
 - [ ] **新 protocol message / cap flag 追加なら、必然性を DR に書けるか?**
+- [ ] **既存 DR で justify された機能のうち、未実装のものはないか?** = 新規介入より既存 DR の
+  実装漏れ修復が優先 (= 撤退判断は最後の手段)
 
 ## 検証主義 (= DR-0014 §検証主義)
 
@@ -59,6 +61,12 @@ stalled / reset / 自動破棄系の実装 (= state を「壊れている」と�
 - 自動破棄が必要なら判定基準を DR に明示 + マトリクス検証で false-positive 検証
 - 例: OSC52 巨大 paste / DCS sixel 部分送信 / ネスト sync update など、
   「子は正常だが時間がかかっている」ケースを false-positive で破棄しない
+
+### コードと DR の双方向整合性
+
+- A 方向 (= 新規介入 → DR justify 確認): 通常の self-check
+- B 方向 (= DR → 実装エビデンス確認): INDEX を眺める、各 DR の機能を grep で実装箇所特定する
+- 本リポでは過去に DR-0001 軸 1/2 が 6 日放置されたことあり、双方向整合性が重要
 
 ## Anti-patterns (= DR-0014 §Anti-patterns、繰り返し禁止)
 
