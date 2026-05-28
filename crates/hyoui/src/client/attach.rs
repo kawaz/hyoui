@@ -297,7 +297,7 @@ impl ClientConnection {
         mut self,
         stdin: &mut R,
         stdout: &mut W,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<i32>, Error> {
         // 万一 caller が事前 validate を忘れていた場合の defense-in-depth。
         // 通常は CLI が attach 開始前に明示 validate して exit する (H3)。
         let detach_prefix = resolve_detach_prefix_from_env()
@@ -328,27 +328,59 @@ impl ClientConnection {
                     Ok(frame) => match frame.ty {
                         TYPE_RAW_DATA => {
                             if stdout.write_all(&frame.body).is_err() {
-                                return Ok(());
+                                return Ok(None);
                             }
                             let _ = stdout.flush();
                         }
                         TYPE_CBOR_CONTROL => {
-                            // MVP: control message は warn 出さず無視 (= daemon → client
-                            // は error / mode.change / leader.notify 等が来るが Phase A2
-                            // では未処理)
+                            // DR-0015: daemon → client 方向の control message を
+                            // 取り出して処理する。
+                            // - SessionExitNotify: 子 PTY exit を受けて run loop を抜ける
+                            //   (= caller が exit_status を取り出す経路は run の戻り値で
+                            //   伝える。簡素化のため Ok(()) で抜けて caller 側で
+                            //   `session_exit_status` field を読む形)
+                            // - SessionChildStoppedNotify: 子 self-stop を受けて
+                            //   self を `raise(SIGSTOP)` する (= follow policy 簡易実装、
+                            //   policy override は次の改修で `--on-child-suspend` flag に)
+                            // - 他 (= leader.notify / mode.change / error 等) は無視
+                            match ControlMessage::decode_from(frame.body.as_slice()) {
+                                Ok(ControlMessage::SessionExitNotify(notify)) => {
+                                    return Ok(Some(notify.exit_status));
+                                }
+                                Ok(ControlMessage::SessionChildStoppedNotify(_)) => {
+                                    // follow policy: client 自身を SIGSTOP で止める。
+                                    // 復帰時は loop に戻り、子を起こす resume.request を送る。
+                                    let _ =
+                                        nix::sys::signal::raise(nix::sys::signal::Signal::SIGSTOP);
+                                    // 復帰後 (= 外側 fg で client が起き上がった): daemon に
+                                    // 子も起こすよう要求。
+                                    let resume = ControlMessage::SessionChildResumeRequest(
+                                        crate::protocol::messages::SessionChildResumeRequest::default(),
+                                    );
+                                    if let Ok(body) = resume.encode_to_vec() {
+                                        let _ =
+                                            Frame::cbor_control(body).encode_to(&mut self.writer);
+                                        let _ = self.writer.flush();
+                                    }
+                                }
+                                Ok(_) => { /* 他 control message は無視 (= 既存 MVP 挙動) */
+                                }
+                                Err(_) => { /* decode 失敗は無視 (= forward-compat、未知 kind) */
+                                }
+                            }
                         }
                         _ => return Err(Error::Invalid("unknown frame type from daemon")),
                     },
                     Err(FrameError::Protocol(ProtocolError::UnexpectedEof(_))) => {
                         // daemon が close → 正常終了
-                        return Ok(());
+                        return Ok(None);
                     }
                     Err(_) => return Err(Error::Invalid("protocol error from daemon")),
                 }
             } else if sock_revents.contains(PollFlags::POLLHUP)
                 || sock_revents.contains(PollFlags::POLLERR)
             {
-                return Ok(());
+                return Ok(None);
             }
 
             // stdin → socket: raw data frame で送る
@@ -371,7 +403,7 @@ impl ClientConnection {
                             // 不要 (= 子が EOT を見て read EOF → 普通に exit、
                             // daemon の `master_fd::read_some` が 0 → 終了経路)。
                         }
-                        return Ok(());
+                        return Ok(None);
                     }
                     Ok(n) => {
                         // detach prefix が disabled (= env HYOUI_DETACH_PREFIX=none) なら
@@ -392,13 +424,13 @@ impl ClientConnection {
                                     let _ = Frame::cbor_control(body).encode_to(&mut self.writer);
                                     let _ = self.writer.flush();
                                 }
-                                return Ok(());
+                                return Ok(None);
                             }
                             if let DetachAction::Forward(forward_bytes) = action {
                                 if !forward_bytes.is_empty() {
                                     let frame = Frame::raw_data(forward_bytes);
                                     if frame.encode_to(&mut self.writer).is_err() {
-                                        return Ok(());
+                                        return Ok(None);
                                     }
                                 }
                             }
@@ -406,15 +438,15 @@ impl ClientConnection {
                             // detach key 無効 → 全 bytes をそのまま forward
                             let frame = Frame::raw_data(buf[..n].to_vec());
                             if frame.encode_to(&mut self.writer).is_err() {
-                                return Ok(());
+                                return Ok(None);
                             }
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => return Ok(()),
+                    Err(_) => return Ok(None),
                 }
             } else if stdin_revents.contains(PollFlags::POLLHUP) {
-                return Ok(());
+                return Ok(None);
             }
         }
     }

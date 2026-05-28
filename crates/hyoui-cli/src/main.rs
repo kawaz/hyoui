@@ -442,25 +442,34 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
         }
         None => conn.run(&mut stdin_file, &mut stdout),
     };
-    if let Err(e) = run_result {
-        eprintln!("hyoui: client run エラー: {e}");
-    }
+    // DR-0015 §2.1: `run` の戻り値で `Some(exit_status)` が来たら、それは
+    // session.exit.notify (= 子 PTY exit code) を受信したことを示す。
+    // daemon thread の join 結果より session.exit.notify を優先する
+    // (= daemon の internal exit code と shell convention の exit-status は同じ値の想定)。
+    let session_exit_status = match run_result {
+        Ok(Some(status)) => Some(status),
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("hyoui: client run エラー: {e}");
+            None
+        }
+    };
 
     // daemon thread の終了を待って exit code を取る
-    match daemon_handle.join() {
-        Ok(Ok(code)) => {
-            let masked = u8::try_from(code & 0xFF).unwrap_or(255);
-            ExitCode::from(masked)
-        }
+    let daemon_exit_code = match daemon_handle.join() {
+        Ok(Ok(code)) => Some(code),
         Ok(Err(e)) => {
             eprintln!("hyoui: daemon 実行エラー: {e}");
-            ExitCode::from(1)
+            None
         }
         Err(_) => {
             eprintln!("hyoui: daemon thread panic");
-            ExitCode::from(1)
+            None
         }
-    }
+    };
+    let final_code = session_exit_status.or(daemon_exit_code).unwrap_or(1);
+    let masked = u8::try_from(final_code & 0xFF).unwrap_or(255);
+    ExitCode::from(masked)
 }
 
 /// `hyoui attach <session>` の主要ロジック。
@@ -574,7 +583,12 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         None => conn.run(&mut stdin_file, &mut stdout),
     };
     match run_result {
-        Ok(()) => ExitCode::SUCCESS,
+        // DR-0015 §2.1: session.exit.notify 受信時は exit-status をそのまま伝搬。
+        Ok(Some(status)) => {
+            let masked = u8::try_from(status & 0xFF).unwrap_or(255);
+            ExitCode::from(masked)
+        }
+        Ok(None) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("hyoui: attach 実行エラー: {e}");
             ExitCode::from(1)
