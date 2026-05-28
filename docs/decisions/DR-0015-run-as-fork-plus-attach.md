@@ -355,7 +355,8 @@ hyoui run -- cmd
 - daemon startup error を親 client に詳細伝達する経路が無い
 - 「とりあえず親も attach」では起動 race / error 経路が脆い
 
-→ protocol 新 message + socketpair handshake は最小限の追加
+→ protocol 新 message (= `session.exit.notify` 等) は最小限の追加。起動 handshake は
+OS 標準機能 (= ready pipe + stderr inherit) で済むため新 message 不要 (= §2.3.5)
 
 ### (c) `--detached` を default にしない (= flag 有無で path 分岐維持)
 
@@ -370,23 +371,32 @@ hyoui run -- cmd
 
 ### 実装への波及
 
-- `hyoui-cli/src/main.rs::run_command` の構造大改修 (= 現状 100+ 行のロジックを fork + attach の合成に書き換え)
-- `hyoui-cli/src/daemonize.rs::run_detached_parent` を ready pipe → socketpair handshake に変更、ready 通知に startup metadata を含める形に拡張
-- `hyoui/src/daemon/session.rs::serve_loop` に `session.exit.notify` broadcast を追加 (= 子 exit 観測直後)
-- `hyoui/src/protocol/messages/` に `SessionExitNotify` 構造体追加
-- `hyoui/src/protocol/messages/mod.rs::ControlMessage` enum に新 variant 追加
+- `hyoui-cli/src/main.rs::run_command` を **wrapper 数十行に圧縮** (= exec attach pattern、§1):
+  - non-detached 時は `daemonize::run_detached_parent` 相当を spawn → ready 待ち
+    → `exec("hyoui attach <session>")` で自プロセス置換
+  - 既存の `Session::start` + `thread::spawn` + `daemon_handle.join()` の同プロセス
+    経路は削除
+- `hyoui-cli/src/daemonize.rs::run_detached_parent` は **現行のまま維持** (= ready pipe
+  1 byte 通知 + stderr inherit、新 protocol message 不要、§2.3.5)
+- `hyoui/src/daemon/session.rs::serve_loop` に `session.exit.notify` broadcast を追加
+  (= 子 exit 観測直後、buffer drain 後)
+- `hyoui/src/protocol/messages/` に `SessionExitNotify` / `SessionChildStoppedNotify` /
+  `SessionChildResumeRequest` の 3 構造体追加 (= 起動 handshake message は不要)
+- `hyoui/src/protocol/messages/mod.rs::ControlMessage` enum に新 variant 3 個追加
 - `hyoui/src/daemon/config.rs` から `on_suspend` / `on_resume` field 削除
-- `hyoui-cli/src/main.rs::TeeWriter` (= debug dump) は client process でそのまま再利用
-- `hyoui/src/sys/tty.rs::TtyGuard` の `suspend()` / `resume()` API は client process で使う (= 維持)
-- attach client (= run の親 / 単独 attach 両方) の SIGTSTP/SIGCONT handler を新規実装 (= sigaction + self-pipe、async-signal-safe 範囲)
+- `hyoui-cli/src/main.rs::TeeWriter` (= debug dump) は attach client でそのまま再利用
+- `hyoui/src/sys/tty.rs::TtyGuard` の `suspend()` / `resume()` API は attach client で
+  使う (= 維持)
+- attach client (= run 経路の ex-parent / 単独 attach 両方) の SIGTSTP/SIGCONT handler
+  を新規実装 (= sigaction + self-pipe、async-signal-safe 範囲)
 
 ### 廃棄するもの
 
 - DaemonConfig.on_suspend / on_resume callback (= Issue #1 修正の経路、本 DR で不要に)
 - Arc<Mutex<Option<TtyGuard>>> 共有経路
 - `hyoui run` の同プロセス daemon thread spawn 経路
-- 旧 ready pipe (1 byte) の単純化前提のコード
 - 同プロセス前提の smoke / matrix test fixture (= 丸ごと再構築)
+- OnParentSuspend enum / `--on-parent-suspend` flag (= §2.3 軸 2 廃止)
 
 ### 関連 DR 整理
 
@@ -471,7 +481,7 @@ hyoui run -- cmd
 - DR-0005 — 思想 (= 透明性最優先、本 DR は role 分離で透明性を強化)
 - DR-0001 — jobcontrol 2 軸 (= client process 側 SIGTSTP/SIGCONT 実装の根拠)
 - DR-0007 — MVP scope (= 本 DR で部分覆し)
-- DR-0008 — protocol design (= 本 DR で新 message + socketpair handshake 追加)
+- DR-0008 — protocol design (= 本 DR で新 message 3 個追加、起動 handshake は OS 標準で完結)
 - DR-0009 — session 分割 (= 影響なし)
 - DR-0014 — 透過原則 + 検証主義 (= 本 DR の self-check 通過)
 - Issue #1 (termios 復元) — 本 DR 実装フェーズで修正経路を変更
