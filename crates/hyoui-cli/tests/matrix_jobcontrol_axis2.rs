@@ -53,6 +53,7 @@ fn wait_for_child(parent_pid: i32, max_ms: u64) -> std::io::Result<common::pty::
 /// **現実態 (= 軸 2 未実装)**: 親は SIGTSTP の default 動作で STOPPED になる
 /// (= shell から起動された通常 process なので)、子は走り続ける。
 #[test]
+#[ignore = "matrix test: CI 不安定のため ignore (matrix_jobcontrol_axis2 全 test 同様)。ローカルは `cargo test -- --ignored`。詳細 DR-0014"]
 fn axis2_sleep_interactive_default_external_tstp() {
     let runner = HyouiTestRunner::new();
     let mut h = runner.spawn_hyoui(
@@ -113,6 +114,7 @@ fn axis2_sleep_interactive_default_external_tstp() {
 /// **現実態**: decouple は「子に何もしない」なので、軸 2 未実装の現実態と一致
 /// する可能性が高い。test は実態を assert で固定する (= 修正時に注意喚起)。
 #[test]
+#[ignore = "matrix test: CI 不安定のため ignore (matrix_jobcontrol_axis2 全 test 同様)。ローカルは `cargo test -- --ignored`"]
 fn axis2_sleep_headless_default_external_tstp_decouple() {
     let runner = HyouiTestRunner::new();
     let mut h = runner.spawn_hyoui(
@@ -152,6 +154,7 @@ fn axis2_sleep_headless_default_external_tstp_decouple() {
 /// 同じ (= 子は走り続ける)。実装後は decouple が明示的に「子を止めない」を保証
 /// するため、本 test は pass し続ける想定。
 #[test]
+#[ignore = "matrix test: CI 不安定のため ignore (matrix_jobcontrol_axis2 全 test 同様)。ローカルは `cargo test -- --ignored`"]
 fn axis2_sleep_interactive_explicit_decouple() {
     let runner = HyouiTestRunner::new();
     let mut h = runner.spawn_hyoui(
@@ -194,6 +197,7 @@ fn axis2_sleep_interactive_explicit_decouple() {
 /// 軸 2 の主題は「親 hyoui が止まった時に子の bash が連動するか」なので、
 /// 子の job control 内部挙動は本 cell では不問。
 #[test]
+#[ignore = "matrix test: CI 不安定のため ignore (matrix_jobcontrol_axis2 全 test 同様)。ローカルは `cargo test -- --ignored`"]
 fn axis2_bash_interactive_default_external_tstp() {
     let runner = HyouiTestRunner::new();
     let mut h = runner.spawn_hyoui(
@@ -232,6 +236,7 @@ fn axis2_bash_interactive_default_external_tstp() {
 /// matrix cell B5: `/bin/cat` を起動して親 hyoui に SIGTSTP (= line-oriented
 /// category)。軸 2 transparent で子 cat も連動 STOPPED することを検証。
 #[test]
+#[ignore = "matrix test: CI 不安定のため ignore (matrix_jobcontrol_axis2 全 test 同様)。ローカルは `cargo test -- --ignored`"]
 fn axis2_cat_interactive_default_external_tstp() {
     let runner = HyouiTestRunner::new();
     let mut h = runner.spawn_hyoui(

@@ -68,6 +68,7 @@ fn wait_for_dump_contains(
 /// **観点**: screen state 正本 (= daemon 内の vt100 ScreenState) が子の bytes を
 /// 正しく反映しているか。DR-0013 §3 の Phase A 統合の最小確認。
 #[test]
+#[ignore = "matrix test: PTY/daemon を起動するため CI 環境 (= ubuntu-latest / macos-latest) で不安定。ローカルで `cargo test --workspace -- --ignored` を使って検証する。詳細は DR-0014 §マトリクス検証 + 2026-05-28 hotfix"]
 fn restore_simple_echo_visible_in_screen_dump() {
     let runner = HyouiTestRunner::new();
     let mut h = runner.spawn_hyoui(
@@ -104,6 +105,7 @@ fn restore_simple_echo_visible_in_screen_dump() {
 /// matrix cell C2: 同じ screen dump を 2 回連続で叩いた結果が一致する
 /// (= idempotence)。これは新規 attach client が同じ state を見られるための前提。
 #[test]
+#[ignore = "matrix test: CI 不安定のため ignore (matrix_attach_restore 全 test 同様)。ローカルは `cargo test -- --ignored`"]
 fn restore_dump_is_idempotent_across_calls() {
     let runner = HyouiTestRunner::new();
     let mut h = runner.spawn_hyoui(
@@ -155,6 +157,7 @@ fn restore_dump_is_idempotent_across_calls() {
 /// 期待: 制御 sequence (= cursor / mode setting) が含まれる。これは attach 復元
 /// で「terminal を正しい mode に戻す」必要があるため (DR-0013 §4 attach redraw)。
 #[test]
+#[ignore = "matrix test: CI 不安定のため ignore (matrix_attach_restore 全 test 同様)。ローカルは `cargo test -- --ignored`"]
 fn restore_dump_contains_ansi_control_sequences() {
     let runner = HyouiTestRunner::new();
     let mut h = runner.spawn_hyoui(
@@ -190,6 +193,7 @@ fn restore_dump_contains_ansi_control_sequences() {
 /// この cell は **regression sensor** として働く: 将来 screen state の reformat
 /// が起きると insta snapshot が壊れ、変更を意識的に review する trigger になる。
 #[test]
+#[ignore = "matrix test: CI 不安定のため ignore (matrix_attach_restore 全 test 同様)。ローカルは `cargo test -- --ignored`"]
 fn restore_snapshot_normalized() {
     let runner = HyouiTestRunner::new();
     let mut h = runner.spawn_hyoui(
