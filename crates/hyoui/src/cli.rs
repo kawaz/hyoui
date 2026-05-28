@@ -54,15 +54,9 @@ pub enum OnChildSuspend {
     AutoResume,
 }
 
-/// Behavior when the parent process is suspended (receives SIGTSTP).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum OnParentSuspend {
-    /// Stop the child group first, then stop the parent.
-    Transparent,
-    /// Stop only the parent; leave the child running.
-    Decouple,
-}
+// DR-0015 §2.3: `OnParentSuspend` enum / `--on-parent-suspend` flag 廃止。
+// 新構成では attach client が外部 SIGTSTP を受けても daemon は無関係 (= 旧
+// `decouple` 相当の動作のみ、policy 選択肢自体が不要)。
 
 /// Shell whose completion script is being requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,9 +147,9 @@ pub struct RunConfig {
     /// socket path 自動解決にもこの値が入る。
     pub session: Option<String>,
     /// Action when the child is suspended (preset by mode unless overridden).
+    /// DR-0015 §2.2: attach client が SessionChildStoppedNotify 受信時に発動する
+    /// policy。daemon には伝わらない (= client local)。
     pub on_child_suspend: OnChildSuspend,
-    /// Action when the parent is suspended (preset by mode unless overridden).
-    pub on_parent_suspend: OnParentSuspend,
     /// vt100 内蔵 scrollback ring の **行数上限** (= DR-0013 §8 + §8 Update)。
     ///
     /// `screen dump --layer={scrollback,both}` / `screen snapshot` で過去 row を
@@ -1467,7 +1461,6 @@ fn parse_run(args: &[String]) -> Command {
     let mut until: Option<String> = None;
     let mut socket: Option<String> = None;
     let mut on_child_suspend: Option<OnChildSuspend> = None;
-    let mut on_parent_suspend: Option<OnParentSuspend> = None;
     let mut command: Vec<String> = Vec::new();
     let mut detached = false;
     let mut session: Option<String> = None;
@@ -1573,14 +1566,7 @@ fn parse_run(args: &[String]) -> Command {
                 }
                 None => return Command::Error("--on-child-suspend requires a value".into()),
             },
-            "--on-parent-suspend" => match value.as_deref() {
-                Some("transparent") => on_parent_suspend = Some(OnParentSuspend::Transparent),
-                Some("decouple") => on_parent_suspend = Some(OnParentSuspend::Decouple),
-                Some(other) => {
-                    return Command::Error(format!("invalid --on-parent-suspend value: {other}"));
-                }
-                None => return Command::Error("--on-parent-suspend requires a value".into()),
-            },
+            // DR-0015 §2.3: `--on-parent-suspend` 廃止 (= 軸 2 廃止)。
             "--detached" => {
                 detached = true;
                 consumed_extra = false; // bool flag は次 arg を食わない
@@ -1634,10 +1620,6 @@ fn parse_run(args: &[String]) -> Command {
         Mode::Headless => OnChildSuspend::AutoResume,
         Mode::Interactive => OnChildSuspend::Follow,
     });
-    let final_parent_suspend = on_parent_suspend.unwrap_or(match mode {
-        Mode::Headless => OnParentSuspend::Decouple,
-        Mode::Interactive => OnParentSuspend::Transparent,
-    });
 
     // Virtual size: default to 80x24 when unspecified.
     let cols = explicit_cols.unwrap_or(80);
@@ -1654,7 +1636,6 @@ fn parse_run(args: &[String]) -> Command {
         detached,
         session,
         on_child_suspend: final_child_suspend,
-        on_parent_suspend: final_parent_suspend,
         scrollback_rows,
         debug_dump_server,
         debug_dump_client,
@@ -3524,7 +3505,6 @@ mod tests {
                 assert_eq!(cfg.command, vec!["echo".to_string(), "hello".to_string()]);
                 assert_eq!(cfg.mode, Mode::Interactive);
                 assert_eq!(cfg.on_child_suspend, OnChildSuspend::Follow);
-                assert_eq!(cfg.on_parent_suspend, OnParentSuspend::Transparent);
             }
             other => panic!("expected Run, got {other:?}"),
         }
@@ -3536,7 +3516,6 @@ mod tests {
             Command::Run(cfg) => {
                 assert_eq!(cfg.mode, Mode::Headless);
                 assert_eq!(cfg.on_child_suspend, OnChildSuspend::AutoResume);
-                assert_eq!(cfg.on_parent_suspend, OnParentSuspend::Decouple);
                 assert_eq!(cfg.cols, 80);
                 assert_eq!(cfg.rows, 24);
             }
@@ -3546,17 +3525,16 @@ mod tests {
 
     #[test]
     fn run_explicit_suspend_overrides_headless_preset() {
+        // DR-0015 §2.3: --on-parent-suspend は廃止、--on-child-suspend のみ override 可
         match parse_args(&args(&[
             "run",
             "--mode=headless",
             "--on-child-suspend=follow",
-            "--on-parent-suspend=transparent",
             "--",
             "cat",
         ])) {
             Command::Run(cfg) => {
                 assert_eq!(cfg.on_child_suspend, OnChildSuspend::Follow);
-                assert_eq!(cfg.on_parent_suspend, OnParentSuspend::Transparent);
             }
             other => panic!("expected Run, got {other:?}"),
         }
