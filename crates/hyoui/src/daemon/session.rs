@@ -559,18 +559,19 @@ fn detect_and_warn_stalled(screen_state: &mut ScreenState, warned: &mut bool) {
     let detected = matches!(outcome, StalledOutcome::Detected);
     let action = screen_state.note_stalled_outcome(detected);
     if detected && !*warned {
-        eprintln!(
-            "[hyoui daemon] warn: vt100 parser stalled (no feed for >= 5s, may have partial sequence pending)"
-        );
+        // Hotfix (透過原則違反 bug): daemon の stderr は非 detached 起動時に
+        // child PTY と同じ TTY に向いている (= 親 process 内で daemon thread が走る)
+        // ため、`eprintln!` で warning を出すと attach 中 client の画面に混入する。
+        // MVP では完全 silent 化して画面汚染を止める。stalled detect counter / 自動
+        // reset 機構自体は維持 (= 機能は失わない)。
+        // TODO: 別 channel (= XDG_STATE_HOME/hyoui/<session>.log 等の log file) に
+        // warning を出す経路を整備する。
         *warned = true;
     }
     if action.is_some() {
         // DR-0013 §5 Phase B: 連続 detect 上限到達 → 自動 reset。state を捨てる
         // (= cells / cursor / mode 全消し) が、broken stream からの復旧を優先する。
-        eprintln!(
-            "[hyoui daemon] warn: vt100 parser stalled for {} consecutive checks; resetting screen state",
-            super::screen::state::STALLED_RESET_CONSECUTIVE_DETECTS
-        );
+        // warning 表示は同上の理由で silent (TODO: log file 経路)。
         screen_state.reset();
         // reset 後は note の counter も 0 になっている (reset 内で初期化済)。
         // warn flag も解除して、次サイクル以降の detect で新 warn を許可する。
