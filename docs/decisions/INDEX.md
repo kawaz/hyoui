@@ -15,7 +15,7 @@ hyoui の設計判断記録一覧。ファイル名は `DR-NNNN-title.md`（4 �
 
 | DR | Status | 説明 |
 |---|---|---|
-| [DR-0001](./DR-0001-bgfg-jobcontrol-two-axis.md) | ✅ 実装済 (2026-05-27) | bg/fg ジョブ制御の 2 軸設計と invariant「親 fg ⇒ 子 fg」 (= 軸 1 follow/auto-resume + 軸 2 transparent/decouple + invariant 回復 SIGCONT handler を daemon 配線、matrix tests axis1=6 / axis2=5 cell pass) |
+| [DR-0001](./DR-0001-bgfg-jobcontrol-two-axis.md) | 🟡 軸 2 廃止 (DR-0015、2026-05-28) | bg/fg ジョブ制御 (= 軸 1 follow/auto-resume のみ維持、軸 2 transparent/decouple は DR-0015 で廃止。invariant は「子が死ねば全部 exit」の片方向に縮小) |
 | [DR-0002](./DR-0002-project-naming.md) | N/A (= 命名) | プロジェクト名 "hyoui"（憑依）の決定 |
 | [DR-0003](./DR-0003-rust-only-and-forkpty-login_tty.md) | ✅ 実装済 | Rust 一本化 (MoonBit 却下) と forkpty + login_tty 採用 |
 | [DR-0004](./DR-0004-cli-subcommand-design.md) | 🟡 部分実装 | CLI サブコマンド設計 (run / completion 実装済、将来枠 send/attach/status 未) |
@@ -29,6 +29,7 @@ hyoui の設計判断記録一覧。ファイル名は `DR-NNNN-title.md`（4 �
 | [DR-0012](./DR-0012-signal-wire-name-not-number.md) | 🟡 部分実装 | signal wire を u8 number から signal name string に変更 (v0.2.0 breaking change) |
 | [DR-0013](./DR-0013-screen-emulator-and-attach-stability.md) | 🟡 部分実装 (Phase A/B + scrollback layer 完了、Phase C 残: observe mode / multi-client resize モード / reflow / zstd 等) | screen emulator + attach/detach 安定化 + データモデル統一 (vt100 採用、daemon = screen state 正本化) |
 | [DR-0014](./DR-0014-transparency-and-empirical-verification.md) | N/A (= プロセス) | 透過原則の徹底と検証主義 (= self-check リスト、マトリクス検証主義、ドッグフーディング、CLAUDE.md 経由で常時参照) |
+| [DR-0015](./DR-0015-run-as-fork-plus-attach.md) | ⬜ 未実装 (Phase A-D) | `hyoui run` を fork daemon + attach client の合成に再定義、client/server 同居廃止 (= signal handling 単純化、Issue #1 / attach 派生 issue を統合吸収) |
 
 ## Archived
 

@@ -1,8 +1,30 @@
 # DR-0001: bg/fg ジョブ制御の 2 軸設計と invariant
 
-- Status: Active
-- Date: 2026-05-21
-- Related: docs/journal/2026-05-21-bootstrap.md, DR-0002 (ネーミング — 「一心同体」概念がこの設計と地続き)
+- Status: Active (= 軸 1 follow/auto-resume のみ。軸 2 transparent/decouple は [[DR-0015]] で廃止 2026-05-28)
+- Date: 2026-05-21 (= 初版) / 2026-05-28 (= 軸 2 廃止)
+- Related: docs/journal/2026-05-21-bootstrap.md, DR-0002 (ネーミング — 「一心同体」概念がこの設計と地続き), DR-0015 (= `hyoui run` の fork 化に伴い軸 2 廃止 + 軸 1 の実装方式変更)
+
+## Update (2026-05-28): 軸 2 廃止 + 軸 1 実装方式変更 (= [[DR-0015]])
+
+[[DR-0015]] で `hyoui run` を「fork daemon + attach client」の合成に再定義した結果:
+
+- **軸 2 (= 親 hyoui 外部 SIGTSTP 経路) 全廃止**: 新構成では daemon は別 process で常駐し、
+  「親 client process が外部 SIGTSTP で止まる」シナリオは単にその client 1 個が止まる
+  だけで子プロセスは無関係 (= 複数 attach 同時可能なので、1 client の生死が子に
+  波及するのは非対称・矛盾)。`OnParentSuspend` enum / `--on-parent-suspend` flag /
+  関連 handler 全削除。
+
+- **軸 1 (= 子 self-stop 経路) は維持、ただし実装方式が変更**:
+  旧版では daemon thread が SIGCHLD/SIGTSTP/SIGCONT を捕まえて同プロセス内 main thread
+  と協調していた。新版では daemon process が `waitpid(WUNTRACED)` で子 stopped を
+  観測 → `session.child.stopped.notify` を leader (= attach client) に送信 →
+  leader が follow/auto-resume policy を発動する。詳細は [[DR-0015]] §2.2。
+
+- **invariant の縮小**: 旧「親が死ねば子も、子が死ねば親も」(= 一蓮托生) は廃止。
+  新版は **「子が死ねば daemon + 全 client exit」のみ片方向**。親 attach client が
+  死んでも子は無関係 ([[DR-0015]] §2.3.1)。
+
+以下、本 DR 本文は **historical reference** として保全。現行仕様は [[DR-0015]] が正本。
 
 ## Context
 

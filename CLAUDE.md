@@ -17,6 +17,7 @@ Terminal multiplexer ではない (= tmux/screen の代替ではない)。
 | [DR-0001](docs/decisions/DR-0001-bgfg-jobcontrol-two-axis.md) | jobcontrol 2 軸 — 透過原則の例外として justify された介入の正本 |
 | [DR-0013](docs/decisions/DR-0013-screen-emulator-and-attach-stability.md) | screen state 正本化 — ドッグフーディング道具の整備 |
 | **[DR-0014](docs/decisions/DR-0014-transparency-and-empirical-verification.md)** | **本ルールの正本** — 透過原則の徹底 + 検証主義 + self-check |
+| **[DR-0015](docs/decisions/DR-0015-run-as-fork-plus-attach.md)** | **`hyoui run` 構造変更** — fork daemon + attach client 合成、client/server 同居廃止 |
 | [DR-0006](docs/decisions/DR-0006-cli-ground-rules.md) | CLI 設計 — input family / wait / screen / tail / lock |
 | [DR-0008](docs/decisions/DR-0008-protocol-design.md) | protocol — CBOR framing / cap flags |
 
