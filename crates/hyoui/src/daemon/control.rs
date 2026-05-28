@@ -215,6 +215,9 @@ pub(super) fn handle_control_message(
         ControlMessage::StateSnapshotRequest(req) => {
             handle_state_snapshot_request(idx, req, clients, screen_state)
         }
+        ControlMessage::SessionChildResumeRequest(_) => {
+            handle_session_child_resume_request(child, idx, clients)
+        }
         // daemon → client 方向のはずの message が client → daemon に来た or 未実装 kind。
         // DR-0008 §3.2 「未知 kind は decode error」だが、ここに来るのは serde で既知
         // variant なので decode 段階では catch されない。protocol violation として
@@ -229,8 +232,38 @@ pub(super) fn handle_control_message(
         | ControlMessage::TailData(_)
         | ControlMessage::TailEnd(_)
         | ControlMessage::ScreenDumpResponse(_)
-        | ControlMessage::StateSnapshotResponse(_) => reject_unexpected_kind(idx, clients),
+        | ControlMessage::StateSnapshotResponse(_)
+        | ControlMessage::SessionExitNotify(_)
+        | ControlMessage::SessionChildStoppedNotify(_) => reject_unexpected_kind(idx, clients),
     }
+}
+
+/// `session.child.resume.request` (DR-0015 §2.2、cap `child-state-v1`)。
+///
+/// leader が follow / auto-resume 政策の延長で「子を SIGCONT で起こせ」と daemon に
+/// 要求する経路。daemon は `killpg(child_pgid, SIGCONT)` で子 pgrp 全体に SIGCONT。
+///
+/// cap 未保持 client は `UnsupportedCapability` で reject (= leader 選定で本来弾かれる
+/// はずだが defense-in-depth)。
+fn handle_session_child_resume_request(
+    child: Pid,
+    idx: usize,
+    clients: &mut [ClientHandle],
+) -> ClientFrameOutcome {
+    let ch = &clients[idx];
+    if ensure_cap(
+        ch,
+        "child-state-v1",
+        "session.child.resume.request requires `child-state-v1`",
+    )
+    .is_err()
+    {
+        return ClientFrameOutcome::Continue;
+    }
+    // 子 pgrp に SIGCONT。DR-0001 §実装ノート「子は独立セッションリーダーなので
+    // 子の pgid == 子の pid」を踏襲。
+    let _ = nix::sys::signal::killpg(child, nix::sys::signal::Signal::SIGCONT);
+    ClientFrameOutcome::Continue
 }
 
 // === cap / mode 共通 helper ===

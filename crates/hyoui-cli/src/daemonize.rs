@@ -12,7 +12,6 @@ use std::os::fd::IntoRawFd;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 
-use hyoui::cli::{OnChildSuspend, OnParentSuspend};
 use hyoui::daemon::{DaemonConfig, Session};
 use nix::sys::stat::Mode;
 
@@ -29,8 +28,6 @@ pub fn run_detached_parent(
     cols: u16,
     rows: u16,
     until: Option<String>,
-    on_child_suspend: OnChildSuspend,
-    on_parent_suspend: OnParentSuspend,
     scrollback_rows: Option<usize>,
     debug_dump: Option<String>,
     cmd: Vec<String>,
@@ -78,16 +75,8 @@ pub fn run_detached_parent(
             child.arg(format!("--until={needle}"));
         }
     }
-    // DR-0001 軸 1/2: suspend policy を daemon 子に伝搬 (= 親で preset + override
-    // 解決済の値をそのまま渡す)。文字列値は CLI parse 表記と一致させて round-trip。
-    child.arg(format!(
-        "--on-child-suspend={}",
-        child_suspend_str(on_child_suspend)
-    ));
-    child.arg(format!(
-        "--on-parent-suspend={}",
-        parent_suspend_str(on_parent_suspend)
-    ));
+    // DR-0015: 軸 2 廃止 + 軸 1 policy は client 側で発動するため、daemon 子に
+    // jobcontrol policy を渡さない (= 旧 --on-child-suspend / --on-parent-suspend 廃止)。
     // DR-0013 §8 + §8 Update: scrollback rows を daemon 子に伝搬。
     // 未指定 (= None) なら flag は渡さず子側の既定 (= DaemonConfig 既定値 1000) が使われる。
     if let Some(n) = scrollback_rows {
@@ -151,10 +140,6 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
     let mut rows: u16 = 24;
     let mut ready_fd: Option<i32> = None;
     let mut until: Option<String> = None;
-    // DR-0001 軸 1/2: parent から伝搬される suspend policy。default は interactive
-    // preset と揃える (= 親が値を渡し忘れた場合のフォールバック)。
-    let mut on_child_suspend = OnChildSuspend::Follow;
-    let mut on_parent_suspend = OnParentSuspend::Transparent;
     // DR-0013 §8: parent から伝搬される scrollback rows。None なら DaemonConfig 既定値を維持。
     let mut scrollback_rows: Option<usize> = None;
     let mut debug_dump: Option<String> = None;
@@ -182,16 +167,6 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
         } else if let Some(v) = arg.strip_prefix("--until=") {
             // R5-FB1: 親から渡された needle pattern
             until = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--on-child-suspend=") {
-            // DR-0001 軸 1: 親 RunConfig から伝搬。未知値はフォールバック既定値を維持。
-            if let Some(p) = parse_child_suspend(v) {
-                on_child_suspend = p;
-            }
-        } else if let Some(v) = arg.strip_prefix("--on-parent-suspend=") {
-            // DR-0001 軸 2: 親 RunConfig から伝搬。未知値はフォールバック既定値を維持。
-            if let Some(p) = parse_parent_suspend(v) {
-                on_parent_suspend = p;
-            }
         } else if let Some(v) = arg.strip_prefix("--scrollback-rows=") {
             // DR-0013 §8: 親 RunConfig から伝搬。parse 失敗時は既定値維持。
             scrollback_rows = v.parse::<usize>().ok();
@@ -235,9 +210,7 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
             dcfg.until = Some(needle);
         }
     }
-    // DR-0001 軸 1/2 を daemon に配線。
-    dcfg.on_child_suspend = on_child_suspend;
-    dcfg.on_parent_suspend = on_parent_suspend;
+    // DR-0015: daemon は jobcontrol policy を持たない (= client 側発動)。
     // DR-0013 §8 + §8 Update: scrollback rows 上限を daemon に配線。
     if let Some(n) = scrollback_rows {
         dcfg.screen_vt100_scrollback_rows = n;
@@ -270,44 +243,6 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DR-0001 軸 1/2: parent ↔ detached child 間で suspend policy 値を文字列経由で
-// 受け渡しするための helper。CLI parse 表記 (`follow|auto-resume` /
-// `transparent|decouple`) と round-trip する。
-// ---------------------------------------------------------------------------
-
-fn child_suspend_str(v: OnChildSuspend) -> &'static str {
-    match v {
-        OnChildSuspend::Follow => "follow",
-        OnChildSuspend::AutoResume => "auto-resume",
-        // `#[non_exhaustive]` のため wildcard 必須。未知 variant が増えたときは
-        // 親 round-trip 経路の保守的フォールバックとして interactive default
-        // (= `follow`) に揃える。
-        _ => "follow",
-    }
-}
-
-fn parent_suspend_str(v: OnParentSuspend) -> &'static str {
-    match v {
-        OnParentSuspend::Transparent => "transparent",
-        OnParentSuspend::Decouple => "decouple",
-        // 同上: 未知 variant のフォールバックは interactive default。
-        _ => "transparent",
-    }
-}
-
-fn parse_child_suspend(s: &str) -> Option<OnChildSuspend> {
-    match s {
-        "follow" => Some(OnChildSuspend::Follow),
-        "auto-resume" => Some(OnChildSuspend::AutoResume),
-        _ => None,
-    }
-}
-
-fn parse_parent_suspend(s: &str) -> Option<OnParentSuspend> {
-    match s {
-        "transparent" => Some(OnParentSuspend::Transparent),
-        "decouple" => Some(OnParentSuspend::Decouple),
-        _ => None,
-    }
-}
+// DR-0015: suspend policy 値 round-trip helper (= child_suspend_str /
+// parent_suspend_str / parse_*) は廃止。policy は client 側で発動するため
+// daemon child に伝搬する必要なし。

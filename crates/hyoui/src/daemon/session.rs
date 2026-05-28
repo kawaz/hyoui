@@ -21,7 +21,8 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
 use crate::Error;
-use crate::cli::{OnChildSuspend, OnParentSuspend};
+// DR-0015: OnChildSuspend / OnParentSuspend は daemon 側で使わなくなった
+// (= client 側で policy 発動、daemon は新 message を中継するのみ)。
 #[cfg_attr(not(test), allow(unused_imports))]
 use crate::protocol::Mode;
 use crate::protocol::messages::{LeaderNotify, ModeChange};
@@ -29,7 +30,7 @@ use crate::protocol::{ControlMessage, Frame};
 use crate::scrollback::Scrollback;
 use crate::sys::{
     FdExt, Pty, SelfPipe, UnixSock, install_default, install_self_pipe, poll::PollFlags,
-    poll::PollOutcome, poll::poll, pty::Spawned, raise, register_self_pipe,
+    poll::PollOutcome, poll::poll, pty::Spawned, register_self_pipe,
 };
 
 use super::DaemonConfig;
@@ -37,7 +38,7 @@ use super::accept::{
     MAX_PENDING_HANDSHAKES, PendingHandshake, process_pending_handshakes, spawn_handshake_worker,
 };
 use super::broadcast::{
-    ClientHandle, MAX_CLIENTS_PER_DAEMON, broadcast_control, broadcast_master_bytes,
+    ClientHandle, MAX_CLIENTS_PER_DAEMON, broadcast_control, broadcast_master_bytes, send_control,
 };
 use super::control::{ClientFrameOutcome, FrameOrError, handle_client_frame};
 use super::lock::{SessionState, elevate_next_leader};
@@ -443,9 +444,28 @@ impl Session {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
+
+        // DR-0015 §2.1: 子 PTY exit を契機に session.exit.notify を **全 attached
+        // client に cap-aware broadcast**。buffer drain (= 上の per-client wait) の
+        // 後で送ることで、子最後の出力 + exit notify が前後する order を保証する。
+        // outcome から exit_status を組み立て、cap `session-exit-v1` を持つ client
+        // にだけ届く (= 旧 client は skip、未対応 client への decode error 回避)。
+        let exit_code = finalize_child(child, &outcome)?;
+        {
+            use crate::protocol::messages::SessionExitNotify;
+            let notify = ControlMessage::SessionExitNotify(SessionExitNotify {
+                exit_status: exit_code,
+                signal: None, // finalize_child 結果は 128+signum 数値化済、signal name は補足
+            });
+            let _overflow = super::broadcast::broadcast_control_with_cap(
+                &mut clients,
+                &notify,
+                "session-exit-v1",
+            );
+            // 送信後の overflow は client 切断扱いだが、ここは shutdown 直前なので無視。
+        }
         clients.clear();
 
-        let exit_code = finalize_child(child, &outcome)?;
         drop(listener);
         match outcome {
             RelayOutcome::ChildExited(_) | RelayOutcome::ClientDetachedOrKilled => Ok(exit_code),
@@ -621,68 +641,45 @@ fn detect_and_warn_stalled(screen_state: &mut ScreenState, warned: &mut bool) {
 ///
 /// 戻り値 `Some(RelayOutcome)` は serve_loop を即時終了させる場合のみ (= 現在は
 /// 該当なし。将来 SIGTERM 経路を統合した場合の余地)。
+/// DR-0015 §2.3: 軸 2 (= 親 hyoui 自身の外部 SIGTSTP 経路) は廃止。
+///
+/// 新構成では daemon process は常駐し、attach client process が外部 SIGTSTP を
+/// 受けて止まっても daemon は影響を受けない (= 別 process、socket は close されず
+/// 単に「その client が応答しなくなる」だけ)。よって daemon が自身に SIGTSTP を
+/// 受け取って処理する経路は本来不要。
+///
+/// ただし daemon 自身が `--detached` で fork され session leader として動く時、
+/// 親 (= attach client) からの SIGTSTP/SIGCONT は届かない (= 別 process group)。
+/// 残るのは「外部から `kill -TSTP <daemon-pid>` で daemon を直接止める」case のみで、
+/// これは管理者操作なので daemon は **default 動作 (= SIG_DFL で STOPPED)** で十分。
+///
+/// よって本 helper は SIGCONT 経路 (= daemon 自身が SIGCONT で復帰した時の子の
+/// invariant 回復) のみ残す。SIGTSTP 経路は handler を register していても何も
+/// しない (= 配信されたら kernel default で STOPPED に入る)。
 fn handle_suspend_signals(
     drained: &[u8],
     child: Pid,
-    config: &DaemonConfig,
+    _config: &DaemonConfig,
     _lifecycle: &mut ChildLifecycle,
 ) -> Option<RelayOutcome> {
     for &b in drained {
         let sig_i32 = b as i32;
-        if sig_i32 == Signal::SIGTSTP as i32 {
-            // 軸 2: 親 daemon 自身に届いた SIGTSTP。policy に応じて子を一緒に
-            // 止めるか/止めないか分岐し、最後に親自身を SIGSTOP で stop させる。
-            match config.on_parent_suspend {
-                OnParentSuspend::Transparent => {
-                    // 子 pgrp に SIGSTOP (catch 不可で確実に届く)。orphan group
-                    // でも SIGSTOP は discard されない。
-                    let _ = kill_pgrp(child, Signal::SIGSTOP);
-                }
-                OnParentSuspend::Decouple => {
-                    // 子は何もしない (= 走り続ける)。
-                }
-            }
-            // Issue #1: 親が STOPPED に入る **直前** に外側 TTY の termios を
-            // pre-raw に戻す。CLI process が保持する TtyGuard.suspend() への
-            // 橋渡し (= DaemonConfig::on_suspend、`daemon/config.rs`)。これを
-            // 忘れると外側 cmux / tmux / libghostty が raw mode の TTY に
-            // talk して freeze する。
-            if let Some(hook) = config.on_suspend.as_ref() {
-                hook();
-            }
-            // 親自身を停止。SIGSTOP は catch 不可なので、SIGTSTP ハンドラが
-            // self-pipe に流した後で安全に raise できる (= self-pipe handler 内
-            // ではない同期 path)。
-            let _ = raise(Signal::SIGSTOP);
-            // SIGSTOP/SIGCONT で復帰した時点で本 path から抜け serve_loop に戻る。
-            // 復帰後は外側 TTY を raw mode に戻す (= on_resume)。SIGCONT byte は
-            // 次 iteration で `handle_suspend_signals` が invariant 回復を担う。
-            if let Some(hook) = config.on_resume.as_ref() {
-                hook();
-            }
-        } else if sig_i32 == Signal::SIGCONT as i32 {
-            // invariant 回復 (DR-0001 §invariant): 親が再開した時、子が STOPPED
-            // なら必ず SIGCONT を送って復帰させる。`waitpid(WNOHANG | WUNTRACED |
-            // WCONTINUED)` で transient 状態を取り出し、Stopped ならば SIGCONT。
-            // ※ ChildLifecycle の latch (= self.stopped) を信用するより、確実に
-            // waitpid で確認する方が安全 (= 既に外部 SIGCONT で復帰済の場合に
-            // 二重送信しないため)。
+        if sig_i32 == Signal::SIGCONT as i32 {
+            // 外部 `kill -CONT <daemon-pid>` で daemon が再開した時、子が STOPPED
+            // なら一緒に起こす (= 防衛策、軸 2 廃止後も「daemon だけ動いて子 STOP」
+            // 状態を残さない)。
             let flags = WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED;
             if let Ok(status) = waitpid(child, Some(flags)) {
                 let is_stopped = matches!(status, WaitStatus::Stopped(_, _));
                 if is_stopped {
                     let _ = kill_pgrp(child, Signal::SIGCONT);
                 }
-                // Continued / Exited / StillAlive は何もしない (= 不要)。
-                // lifecycle 側の latch 更新も次の `poll_with_transition` で
-                // 整合する (= 本 helper の waitpid で transition を 1 度 drain
-                // した場合は lifecycle が次回 StillAlive を見るが、latch は
-                // 「serve_loop 観測時点で stopped かどうか」を更新する責務に
-                // とどめる)。
             }
         }
-        // SIGCHLD / 他の signum はここでは処理しない (= caller 側 lifecycle
-        // 経路で transition を取り出す)。
+        // SIGTSTP は無視 (= 軸 2 廃止、§2.3)。kernel default の STOPPED 動作に任せる。
+        // 万一 handler 経由で来た場合は何もしない (= 親 daemon が STOPPED に入る
+        // 経路は外部管理者操作のみ、子に介入しない)。
+        // SIGCHLD / 他の signum もここでは処理しない (= caller 側 lifecycle 経路)。
     }
     None
 }
@@ -700,49 +697,52 @@ fn handle_suspend_signals(
 /// `Continued` / `Exited` transition は (現状) 単に通知するだけで policy 発火なし。
 /// `Exited` の場合は caller 側 (`lifecycle.poll_with_transition` の返り `ChildState`)
 /// が `RelayOutcome::ChildExited` で serve_loop を抜けるので、本 helper は `None`。
-fn handle_child_transition(
-    transition: ChildTransition,
+/// DR-0015 §2.2: 子 stopped transition の新方針 handler。
+///
+/// daemon は **直接 raise(SIGSTOP) も親 termios も触らない**。代わりに leader
+/// (= rw + leader 取得 client) に `session.child.stopped.notify` を送って follow
+/// policy 決定を委ねる。leader が `child-state-v1` cap を持たない or leader 不在
+/// の場合は **auto-resume fallback** (= 即 `killpg(child, SIGCONT)`) で子を起こす。
+///
+/// 子の self-stop だけが本 path に来る (= DR-0015 §2.3 で軸 2 廃止のため daemon
+/// 自身が `killpg(child, SIGSTOP)` する経路は存在しない、衝突 origin 記録不要)。
+fn notify_child_stopped(
     child: Pid,
-    config: &DaemonConfig,
-) -> Option<RelayOutcome> {
-    match transition {
-        ChildTransition::Stopped => {
-            match config.on_child_suspend {
-                OnChildSuspend::AutoResume => {
-                    // 子 pgrp に SIGCONT。orphan group 関係なく届く (= 送る側に
-                    // orphan discard は適用されない)。
-                    let _ = kill_pgrp(child, Signal::SIGCONT);
-                }
-                OnChildSuspend::Follow => {
-                    // Issue #1: 親が STOPPED に入る直前に外側 TTY の termios を
-                    // pre-raw に戻す (= handle_suspend_signals 内 SIGTSTP 経路と
-                    // 同じ理由)。
-                    if let Some(hook) = config.on_suspend.as_ref() {
-                        hook();
-                    }
-                    // 親自身に SIGSTOP raise。kernel が catch 不可な SIGSTOP を
-                    // 処理して親を STOPPED にする。外側 shell に制御が戻り、
-                    // ユーザの `fg` で親 + 子 (invariant 回復経由) が揃って復帰。
-                    let _ = raise(Signal::SIGSTOP);
-                    // 復帰後 = raw mode を再設定。
-                    if let Some(hook) = config.on_resume.as_ref() {
-                        hook();
-                    }
-                }
-            }
-            None
-        }
-        ChildTransition::Continued => {
-            // 単に lifecycle の latch が clear されただけ。policy 発火なし。
-            None
-        }
-        ChildTransition::Exited(_) => {
-            // caller が `ChildState::Exited` で既に serve_loop を畳むため、本 helper
-            // からの早期 return は不要。
-            None
-        }
+    clients: &mut [ClientHandle],
+    signal_name: Option<&str>,
+) -> Vec<u64> {
+    use crate::protocol::messages::SessionChildStoppedNotify;
+    // leader を探す。複数 leader はあり得ない設計 (= broadcast.rs::elevate_next_leader)。
+    let leader_idx = clients.iter().position(|ch| ch.leader);
+    let Some(idx) = leader_idx else {
+        // leader 不在 = auto-resume fallback
+        let _ = kill_pgrp(child, Signal::SIGCONT);
+        return Vec::new();
+    };
+    // cap check: leader が `child-state-v1` 持たないなら fallback
+    if !clients[idx]
+        .negotiated_caps
+        .iter()
+        .any(|c| c == "child-state-v1")
+    {
+        let _ = kill_pgrp(child, Signal::SIGCONT);
+        return Vec::new();
+    }
+    // notify 送信 (= 単一 receiver、cap-aware broadcast helper を使うほどでもない)
+    let msg = ControlMessage::SessionChildStoppedNotify(SessionChildStoppedNotify {
+        pid: child.as_raw() as u32,
+        signal: signal_name.map(String::from),
+    });
+    if send_control(&clients[idx], msg) {
+        Vec::new()
+    } else {
+        vec![clients[idx].id]
     }
 }
+
+// `handle_child_transition` は DR-0015 §2.2 で廃止 (= callback inject 経路の入り口
+// だった)。新方針では `notify_child_stopped` を caller (= serve_loop) が直接呼ぶ。
+// transition::Stopped 以外 (Continued / Exited) は caller 側で処理する形に統一。
 
 /// serve loop の本体。`Session::serve` から切り出して所有権整理を平坦化。
 #[allow(clippy::too_many_arguments)]
@@ -864,8 +864,9 @@ fn serve_loop(
                     return RelayOutcome::ChildExited(code);
                 }
                 if let Some(t) = transition {
-                    if let Some(outcome) = handle_child_transition(t, child, config) {
-                        return outcome;
+                    if matches!(t, ChildTransition::Stopped) {
+                        let overflow = notify_child_stopped(child, clients, None);
+                        overflow_ids.extend(overflow);
                     }
                 }
                 continue;
@@ -957,8 +958,9 @@ fn serve_loop(
                 return RelayOutcome::ChildExited(code);
             }
             if let Some(t) = transition {
-                if let Some(outcome) = handle_child_transition(t, child, config) {
-                    return outcome;
+                if matches!(t, ChildTransition::Stopped) {
+                    let overflow = notify_child_stopped(child, clients, None);
+                    overflow_ids.extend(overflow);
                 }
             }
         }
@@ -1003,8 +1005,9 @@ fn serve_loop(
                 Ok(0) => {
                     let (state, transition) = lifecycle.poll_with_transition(child);
                     if let Some(t) = transition {
-                        if let Some(outcome) = handle_child_transition(t, child, config) {
-                            return outcome;
+                        if matches!(t, ChildTransition::Stopped) {
+                            let overflow = notify_child_stopped(child, clients, None);
+                            overflow_ids.extend(overflow);
                         }
                     }
                     match state {
@@ -1060,8 +1063,9 @@ fn serve_loop(
                 Err(Error::Errno(nix::errno::Errno::EIO)) => {
                     let (state, transition) = lifecycle.poll_with_transition(child);
                     if let Some(t) = transition {
-                        if let Some(outcome) = handle_child_transition(t, child, config) {
-                            return outcome;
+                        if matches!(t, ChildTransition::Stopped) {
+                            let overflow = notify_child_stopped(child, clients, None);
+                            overflow_ids.extend(overflow);
                         }
                     }
                     match state {

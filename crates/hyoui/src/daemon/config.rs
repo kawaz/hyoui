@@ -1,17 +1,6 @@
 //! daemon の起動 config (DR-0008 §Consequences)。
 
 use std::path::PathBuf;
-use std::sync::Arc;
-
-use crate::cli::{OnChildSuspend, OnParentSuspend};
-
-/// suspend / resume の前後 hook (DR-0001 jobcontrol 2 軸 + Issue #1: termios 復元)。
-///
-/// daemon thread が `raise(SIGSTOP)` する直前 (= [`DaemonConfig::on_suspend`]) /
-/// 復帰直後 (= [`DaemonConfig::on_resume`]) に呼ぶ callback。CLI process が
-/// 保持する [`crate::sys::TtyGuard`] の `suspend()` / `resume()` を thread 越しに
-/// 触らせるための薄い橋渡し。
-pub type SuspendHook = Arc<dyn Fn() + Send + Sync>;
 
 /// daemon 1 つ分の起動設定。
 ///
@@ -96,40 +85,6 @@ pub struct DaemonConfig {
     /// `run` から手早く使うための簡易 needle match)。
     pub until: Option<String>,
 
-    /// DR-0001 軸 1: 子が STOPPED 状態になったときの親 daemon の挙動。
-    ///
-    /// - [`OnChildSuspend::Follow`]: 親自身に `SIGSTOP` を `raise` し、外側 shell に
-    ///   制御を返す (= invariant「親 fg なら子 fg」を維持しながら、ユーザの
-    ///   `fg` を待つ形で両者停止)。
-    /// - [`OnChildSuspend::AutoResume`]: 子 pgrp に即 `SIGCONT` を送って復帰させる
-    ///   (= 子の suspend を一切許さない、poc3 `nosuspend` 相当)。
-    pub on_child_suspend: OnChildSuspend,
-
-    /// DR-0001 軸 2: 親 daemon が外部から SIGTSTP を受信したときの子の挙動。
-    ///
-    /// - [`OnParentSuspend::Transparent`]: 子 pgrp に `SIGSTOP` を送ってから、親も
-    ///   `SIGSTOP` を `raise` (= 親子ペアで停止)。
-    /// - [`OnParentSuspend::Decouple`]: 親だけ `SIGSTOP` を `raise`、子はそのまま
-    ///   走らせる (= headless バッチで親を止めても子のジョブを進めたいとき)。
-    pub on_parent_suspend: OnParentSuspend,
-
-    /// daemon が `raise(SIGSTOP)` する **直前** に呼ぶ hook。
-    ///
-    /// 典型用途: CLI process が保持する [`crate::sys::TtyGuard::suspend`] を呼んで
-    /// 外側 TTY を pre-raw 状態に戻す (= 外側 cmux / tmux / libghostty が STOPPED 中の
-    /// raw mode TTY に talk して freeze する事故を防ぐ、Issue #1 修正)。
-    ///
-    /// `None` なら no-op。
-    pub on_suspend: Option<SuspendHook>,
-
-    /// daemon が `raise(SIGSTOP)` から **復帰した直後** に呼ぶ hook。
-    ///
-    /// 典型用途: CLI process が保持する [`crate::sys::TtyGuard::resume`] を呼んで
-    /// 外側 TTY を再 raw 化する。`on_suspend` と対になる。
-    ///
-    /// `None` なら no-op。
-    pub on_resume: Option<SuspendHook>,
-
     /// `--debug-dump=<path>`: 子 PTY から daemon が受け取った raw bytes を append-only で
     /// 書き出す debug 用 dump file path。
     ///
@@ -162,10 +117,6 @@ impl std::fmt::Debug for DaemonConfig {
                 &self.expected_token.as_ref().map(|_| "<redacted>"),
             )
             .field("until", &self.until)
-            .field("on_child_suspend", &self.on_child_suspend)
-            .field("on_parent_suspend", &self.on_parent_suspend)
-            .field("on_suspend", &self.on_suspend.as_ref().map(|_| "<hook>"))
-            .field("on_resume", &self.on_resume.as_ref().map(|_| "<hook>"))
             .field("debug_dump_path", &self.debug_dump_path)
             .finish()
     }
@@ -190,14 +141,8 @@ impl DaemonConfig {
             client_buffer_bytes: 8 * 1024 * 1024,
             expected_token: None,
             until: None,
-            // 既定は CLI 層の `Mode::Interactive` preset と揃える (DR-0001 §デフォルト)。
-            // `hyoui-cli` の `run_command` / `__daemonize-run` 経由なら `RunConfig` から
-            // 上書きされる。直接 `DaemonConfig::new` を使う test 経路にも妥当な既定を
-            // 与えるため、ここで明示する。
-            on_child_suspend: OnChildSuspend::Follow,
-            on_parent_suspend: OnParentSuspend::Transparent,
-            on_suspend: None,
-            on_resume: None,
+            // DR-0015: daemon は jobcontrol policy を持たない (= client 側で発動)。
+            // 子 stopped 観測時は notify_child_stopped が cap-aware に leader へ通知する。
             debug_dump_path: None,
         }
     }

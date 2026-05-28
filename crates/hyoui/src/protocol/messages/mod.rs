@@ -38,6 +38,7 @@ mod handshake;
 mod lifecycle;
 mod lock;
 mod screen;
+mod session_lifecycle;
 mod status;
 mod tail;
 
@@ -55,6 +56,9 @@ pub use screen::{
     ModeSnap as ScreenModeSnap, ScreenDumpFormat, ScreenDumpLayer, ScreenDumpRequest,
     ScreenDumpResponse, SnapshotComponent, StateSnapshotRequest, StateSnapshotResponse,
     WindowSize as ScreenWindowSize,
+};
+pub use session_lifecycle::{
+    SessionChildResumeRequest, SessionChildStoppedNotify, SessionExitNotify,
 };
 pub use status::{ClientInfo, StatusQuery, StatusResponse};
 pub use tail::{TailData, TailEnd, TailEndReason, TailRequest};
@@ -152,6 +156,22 @@ pub enum ControlMessage {
     /// `kind = "screen.snapshot.response"` — daemon → client、構造化 state 返却。
     #[serde(rename = "screen.snapshot.response")]
     StateSnapshotResponse(StateSnapshotResponse),
+
+    /// `kind = "session.exit.notify"` — daemon → all clients、子 PTY exit 通知
+    /// (DR-0015 §2.1、cap `session-exit-v1` 要)。
+    #[serde(rename = "session.exit.notify")]
+    SessionExitNotify(SessionExitNotify),
+
+    /// `kind = "session.child.stopped.notify"` — daemon → leader、子 self-stop 通知
+    /// (DR-0015 §2.2、cap `child-state-v1` 要)。leader が follow / auto-resume policy
+    /// を発動する。
+    #[serde(rename = "session.child.stopped.notify")]
+    SessionChildStoppedNotify(SessionChildStoppedNotify),
+
+    /// `kind = "session.child.resume.request"` — leader → daemon、子 SIGCONT 要求
+    /// (DR-0015 §2.2、cap `child-state-v1` 要)。
+    #[serde(rename = "session.child.resume.request")]
+    SessionChildResumeRequest(SessionChildResumeRequest),
 }
 
 /// CBOR control message の encode/decode error。
@@ -469,6 +489,45 @@ mod tests {
 
         let default_kill = ControlMessage::Kill(Kill { signal: None });
         assert_eq!(roundtrip(&default_kill), default_kill);
+    }
+
+    #[test]
+    fn session_exit_notify_roundtrip() {
+        // DR-0015 §2.1: 通常 exit と signal 死亡の両方
+        let normal = ControlMessage::SessionExitNotify(SessionExitNotify {
+            exit_status: 0,
+            signal: None,
+        });
+        assert_eq!(roundtrip(&normal), normal);
+
+        let signaled = ControlMessage::SessionExitNotify(SessionExitNotify {
+            exit_status: 143, // 128 + SIGTERM
+            signal: Some("SIGTERM".into()),
+        });
+        assert_eq!(roundtrip(&signaled), signaled);
+    }
+
+    #[test]
+    fn session_child_stopped_notify_roundtrip() {
+        // DR-0015 §2.2: signal None / Some 両方
+        let with_signal = ControlMessage::SessionChildStoppedNotify(SessionChildStoppedNotify {
+            pid: 12345,
+            signal: Some("SIGTSTP".into()),
+        });
+        assert_eq!(roundtrip(&with_signal), with_signal);
+
+        let no_signal = ControlMessage::SessionChildStoppedNotify(SessionChildStoppedNotify {
+            pid: 42,
+            signal: None,
+        });
+        assert_eq!(roundtrip(&no_signal), no_signal);
+    }
+
+    #[test]
+    fn session_child_resume_request_roundtrip() {
+        // DR-0015 §2.2: payload 空
+        let msg = ControlMessage::SessionChildResumeRequest(SessionChildResumeRequest::default());
+        assert_eq!(roundtrip(&msg), msg);
     }
 
     #[test]

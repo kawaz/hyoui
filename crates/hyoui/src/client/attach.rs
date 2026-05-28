@@ -704,6 +704,8 @@ mod tests {
                 "tail-v1".into(),
                 "screen-dump-v1".into(),
                 "state-snapshot-v1".into(),
+                "session-exit-v1".into(),
+                "child-state-v1".into(),
             ]
         );
         assert!(conn.response.leader);

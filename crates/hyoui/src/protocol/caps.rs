@@ -20,12 +20,17 @@ use std::collections::BTreeSet;
 /// - `"tail-v1"`: `tail.*` messages (`-v1` は schema breaking change の余地)
 /// - `"screen-dump-v1"`: `screen.dump.*` messages (DR-0013 §9、debug / 自動 test 用)
 /// - `"state-snapshot-v1"`: `screen.snapshot.*` messages (DR-0013 §9、構造化 state)
+/// - `"session-exit-v1"`: `session.exit.notify` (DR-0015 §2.1、子 PTY exit code 伝搬)
+/// - `"child-state-v1"`: `session.child.stopped.notify` /
+///   `session.child.resume.request` (DR-0015 §2.2、軸 1 follow / auto-resume)
 pub const MVP_CAPS: &[&str] = &[
     "data",
     "lock",
     "tail-v1",
     "screen-dump-v1",
     "state-snapshot-v1",
+    "session-exit-v1",
+    "child-state-v1",
 ];
 
 /// 2 つの cap 集合の intersect を取って `Vec<String>` で返す。
@@ -75,6 +80,8 @@ mod tests {
         assert!(MVP_CAPS.contains(&"tail-v1"));
         assert!(MVP_CAPS.contains(&"screen-dump-v1"));
         assert!(MVP_CAPS.contains(&"state-snapshot-v1"));
+        assert!(MVP_CAPS.contains(&"session-exit-v1"));
+        assert!(MVP_CAPS.contains(&"child-state-v1"));
     }
 
     /// wait-l0 cap は DR-0006 §9 改訂 (state-based wait 移行) に伴い削除済。

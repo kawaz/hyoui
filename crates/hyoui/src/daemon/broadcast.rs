@@ -343,6 +343,51 @@ pub(super) fn broadcast_control(clients: &mut [ClientHandle], msg: &ControlMessa
     broadcast_bytes(clients, Arc::new(frame_bytes))
 }
 
+/// cap-aware 版 `broadcast_control` (DR-0015 §2.0)。
+///
+/// `negotiated_caps` に `required_cap` を含む client にだけ送信する。新 message を
+/// 未対応 client に送ると serde decode error になる (= 未知 kind は
+/// `ControlMessageError::Decode`) ため、cap-gated 配信が必須。
+///
+/// 戻り値: 送信先 client のうち overflow / writer dead で disconnect すべき
+/// `client_id` 一覧。cap 不足で skip した client は含まない。
+pub(super) fn broadcast_control_with_cap(
+    clients: &mut [ClientHandle],
+    msg: &ControlMessage,
+    required_cap: &str,
+) -> Vec<u64> {
+    let body = match msg.encode_to_vec() {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    let mut frame_bytes = Vec::new();
+    if Frame::cbor_control(body)
+        .encode_to(&mut frame_bytes)
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let payload = Arc::new(frame_bytes);
+    let mut overflow_ids: Vec<u64> = Vec::new();
+    for ch in clients.iter() {
+        // cap 不足 client は skip (= 旧 client / 別実装が新 message を受けて
+        // decode error にならないように)
+        if !ch.negotiated_caps.iter().any(|c| c == required_cap) {
+            continue;
+        }
+        match enqueue_for_client(ch, Arc::clone(&payload)) {
+            EnqueueOutcome::Sent => {}
+            EnqueueOutcome::Overflow => {
+                overflow_ids.push(ch.id);
+            }
+            EnqueueOutcome::WriterDead => {
+                overflow_ids.push(ch.id);
+            }
+        }
+    }
+    overflow_ids
+}
+
 /// daemon → client の writer pump (= per-thread)。
 ///
 /// `rx` から `Vec<u8>` を受け取って socket に write_all、送信完了で
