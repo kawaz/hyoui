@@ -32,6 +32,7 @@ pub fn run_detached_parent(
     on_child_suspend: OnChildSuspend,
     on_parent_suspend: OnParentSuspend,
     scrollback_rows: Option<usize>,
+    debug_dump: Option<String>,
     cmd: Vec<String>,
 ) -> ExitCode {
     let session_id = session_id_override.unwrap_or_else(socket_path::auto_session_id);
@@ -92,6 +93,12 @@ pub fn run_detached_parent(
     if let Some(n) = scrollback_rows {
         child.arg(format!("--scrollback-rows={n}"));
     }
+    // `--debug-dump=<path>` を daemon 子に伝搬。
+    if let Some(path) = debug_dump.as_deref() {
+        if !path.is_empty() {
+            child.arg(format!("--debug-dump={path}"));
+        }
+    }
     child.arg("--");
     for c in cmd {
         child.arg(c);
@@ -150,6 +157,7 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
     let mut on_parent_suspend = OnParentSuspend::Transparent;
     // DR-0013 §8: parent から伝搬される scrollback rows。None なら DaemonConfig 既定値を維持。
     let mut scrollback_rows: Option<usize> = None;
+    let mut debug_dump: Option<String> = None;
     let mut cmd: Vec<String> = Vec::new();
     let mut in_cmd = false;
     for arg in args {
@@ -187,6 +195,10 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
         } else if let Some(v) = arg.strip_prefix("--scrollback-rows=") {
             // DR-0013 §8: 親 RunConfig から伝搬。parse 失敗時は既定値維持。
             scrollback_rows = v.parse::<usize>().ok();
+        } else if let Some(v) = arg.strip_prefix("--debug-dump=") {
+            if !v.is_empty() {
+                debug_dump = Some(v.to_string());
+            }
         }
     }
 
@@ -229,6 +241,10 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
     // DR-0013 §8 + §8 Update: scrollback rows 上限を daemon に配線。
     if let Some(n) = scrollback_rows {
         dcfg.screen_vt100_scrollback_rows = n;
+    }
+    // `--debug-dump=<path>` を daemon に配線 (= 子 PTY raw bytes を file に append)。
+    if let Some(p) = debug_dump {
+        dcfg.debug_dump_path = Some(PathBuf::from(p));
     }
 
     let session = match Session::start(dcfg) {

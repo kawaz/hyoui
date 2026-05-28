@@ -129,6 +129,17 @@ pub struct DaemonConfig {
     ///
     /// `None` なら no-op。
     pub on_resume: Option<SuspendHook>,
+
+    /// `--debug-dump=<path>`: 子 PTY から daemon が受け取った raw bytes を append-only で
+    /// 書き出す debug 用 dump file path。
+    ///
+    /// - format: 純 raw bytes (= ANSI escape 込み)、`cat <path> > /dev/tty` で原寸再生可
+    /// - 用途: SIGTSTP / SIGCONT 等の境界で何 bytes が流れているか post-mortem する
+    ///   観測道具 (DR-0014 §道具揃った段階の運用、Issue #1 検証)
+    /// - daemon process 自身が file open / write_all。失敗時は stderr に 1 行 warn を
+    ///   出して dump を諦める (= session 自体は止めない)。
+    /// - `None` なら dump 無効 (= 既定)。
+    pub debug_dump_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for DaemonConfig {
@@ -155,6 +166,7 @@ impl std::fmt::Debug for DaemonConfig {
             .field("on_parent_suspend", &self.on_parent_suspend)
             .field("on_suspend", &self.on_suspend.as_ref().map(|_| "<hook>"))
             .field("on_resume", &self.on_resume.as_ref().map(|_| "<hook>"))
+            .field("debug_dump_path", &self.debug_dump_path)
             .finish()
     }
 }
@@ -186,6 +198,7 @@ impl DaemonConfig {
             on_parent_suspend: OnParentSuspend::Transparent,
             on_suspend: None,
             on_resume: None,
+            debug_dump_path: None,
         }
     }
 }

@@ -38,6 +38,48 @@ mod input_handlers;
 mod socket_path;
 mod wait_core;
 
+/// `--debug-dump-client=<path>` 経路で stdout に書く bytes を file にも複製する
+/// **Tee writer**。
+///
+/// - `a` (= stdout) を主、`b` (= file) は best-effort。`b` のエラーで stdout 中継を
+///   止めない (= debug dump の I/O error は session 継続を妨げない)。
+/// - `write()` の返値は a の write 量で確定 (= caller の partial write 判定が
+///   a の状態のみに依存)、b には同じ範囲を `write_all` で書く
+struct TeeWriter<A: std::io::Write, B: std::io::Write> {
+    primary: A,
+    dump: B,
+}
+
+impl<A: std::io::Write, B: std::io::Write> std::io::Write for TeeWriter<A, B> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.primary.write(buf)?;
+        // dump 側のエラーは飲み込む (= best-effort、stdout 中継を止めない)
+        let _ = self.dump.write_all(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        let r = self.primary.flush();
+        let _ = self.dump.flush();
+        r
+    }
+}
+
+/// `--debug-dump-client=<path>` を open する helper。失敗時は stderr に warn を
+/// 出して `None` を返し、dump を諦める (= session は止めない)。
+fn open_debug_dump(path: &str, role: &str) -> Option<std::fs::File> {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(f) => Some(f),
+        Err(e) => {
+            eprintln!("hyoui: --debug-dump-{role} open 失敗 (= path: {path}): {e} (dump 無効化)");
+            None
+        }
+    }
+}
+
 /// R5-FB4: socket connect の短時間 retry。
 ///
 /// `hyoui run --detached -- <cmd> &` の直後に `hyoui wait <session>` を叩く
@@ -248,6 +290,15 @@ fn resolve_scrollback_rows(cfg_value: Option<usize>) -> Option<usize> {
 fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     let scrollback_rows = resolve_scrollback_rows(cfg.scrollback_rows);
     if cfg.detached {
+        if cfg.debug_dump_client.is_some() {
+            // detached parent は client role を担わない (= 即 exit) ので
+            // `--debug-dump-client` は意味を成さない。silent ignore せず明示 reject。
+            eprintln!(
+                "hyoui: --debug-dump-client は --detached と併用できません \
+                 (= detached daemon に後から `hyoui attach --debug-dump-client=...` で接続する形を取ってください)"
+            );
+            return ExitCode::from(2);
+        }
         let cols = u16::try_from(cfg.cols).unwrap_or(80);
         let rows = u16::try_from(cfg.rows).unwrap_or(24);
         return daemonize::run_detached_parent(
@@ -259,6 +310,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
             cfg.on_child_suspend,
             cfg.on_parent_suspend,
             scrollback_rows,
+            cfg.debug_dump_server.clone(),
             cfg.command,
         );
     }
@@ -303,6 +355,10 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     // DaemonConfig の既定値 1000 行を維持する。
     if let Some(n) = scrollback_rows {
         dcfg.screen_vt100_scrollback_rows = n;
+    }
+    // `--debug-dump-server=<path>` の配線: 子 PTY raw bytes を file に append。
+    if let Some(ref path) = cfg.debug_dump_server {
+        dcfg.debug_dump_path = Some(std::path::PathBuf::from(path));
     }
 
     // Issue #1: daemon thread が `raise(SIGSTOP)` する前後で外側 TTY の termios を
@@ -400,7 +456,22 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
 
     // run の前に既に来ているかもしれない出力を流すため最初に flush
     let _ = stdout.flush();
-    let run_result = conn.run(&mut stdin_file, &mut stdout);
+    // `--debug-dump-client=<path>` 経路: client 受信 bytes を file にも複製。
+    // `run --detached` 経路は既に早期 return 済みなので、ここに来るのは非 detached のみ。
+    let client_dump = cfg
+        .debug_dump_client
+        .as_deref()
+        .and_then(|p| open_debug_dump(p, "client"));
+    let run_result = match client_dump {
+        Some(dump_file) => {
+            let mut tee = TeeWriter {
+                primary: stdout,
+                dump: dump_file,
+            };
+            conn.run(&mut stdin_file, &mut tee)
+        }
+        None => conn.run(&mut stdin_file, &mut stdout),
+    };
     if let Err(e) = run_result {
         eprintln!("hyoui: client run エラー: {e}");
     }
@@ -518,7 +589,21 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
     };
 
     let _ = stdout.flush();
-    match conn.run(&mut stdin_file, &mut stdout) {
+    let client_dump = cfg
+        .debug_dump_client
+        .as_deref()
+        .and_then(|p| open_debug_dump(p, "client"));
+    let run_result = match client_dump {
+        Some(dump_file) => {
+            let mut tee = TeeWriter {
+                primary: stdout,
+                dump: dump_file,
+            };
+            conn.run(&mut stdin_file, &mut tee)
+        }
+        None => conn.run(&mut stdin_file, &mut stdout),
+    };
+    match run_result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("hyoui: attach 実行エラー: {e}");

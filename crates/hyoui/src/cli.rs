@@ -164,6 +164,15 @@ pub struct RunConfig {
     /// override 可能。`0` を渡すと scrollback を完全無効化する (= 過去 row は保存
     /// されない、低メモリ運用)。
     pub scrollback_rows: Option<usize>,
+    /// `--debug-dump-server=<path>`: **server 側** (= 子 PTY → daemon) の経路を
+    /// 通った raw bytes を file に append。`daemon` が観測した最初の形 (= state
+    /// 正本化前) を残す。
+    pub debug_dump_server: Option<String>,
+    /// `--debug-dump-client=<path>`: **client 側** (= daemon → attach client) の
+    /// 経路で client process が受信した bytes を file に append。attach 復元
+    /// redraw / DR-0013 state-based 翻訳の結果を含む = 「ユーザの terminal が
+    /// 見ている形」が残る。
+    pub debug_dump_client: Option<String>,
     /// argv of the child command.
     pub command: Vec<String>,
 }
@@ -181,6 +190,9 @@ pub struct AttachConfig {
     pub exclusive: bool,
     /// `--detach-others` (= attach 時に他 client を奪取)。
     pub detach_others: bool,
+    /// `--debug-dump-client=<path>`: client 側受信 bytes を file に append (debug)。
+    /// `hyoui run` の同名 flag と同じ意味 (= attach 単体で使うときの名前統一)。
+    pub debug_dump_client: Option<String>,
 }
 
 /// `list` subcommand configuration (R5-H3)。
@@ -1321,6 +1333,7 @@ fn parse_attach(args: &[String]) -> Command {
         mode_str: None,
         exclusive: false,
         detach_others: false,
+        debug_dump_client: None,
     };
 
     let mut positionals: Vec<String> = Vec::new();
@@ -1362,6 +1375,13 @@ fn parse_attach(args: &[String]) -> Command {
                 cfg.detach_others = true;
                 consumed_extra = false;
             }
+            "--debug-dump-client" => match value {
+                Some(v) if !v.is_empty() => cfg.debug_dump_client = Some(v),
+                Some(_) => return Command::Error("--debug-dump-client: path が空です".into()),
+                None => {
+                    return Command::Error("--debug-dump-client requires a value".into());
+                }
+            },
             other if other.starts_with('-') => {
                 return Command::Error(format!("unknown attach option: {other}"));
             }
@@ -1452,6 +1472,8 @@ fn parse_run(args: &[String]) -> Command {
     let mut detached = false;
     let mut session: Option<String> = None;
     let mut scrollback_rows: Option<usize> = None;
+    let mut debug_dump_server: Option<String> = None;
+    let mut debug_dump_client: Option<String> = None;
 
     let mut i = 0usize;
     let mut in_command = false;
@@ -1583,6 +1605,16 @@ fn parse_run(args: &[String]) -> Command {
                 },
                 None => return Command::Error("--scrollback-rows requires a value".into()),
             },
+            "--debug-dump-server" => match value {
+                Some(v) if !v.is_empty() => debug_dump_server = Some(v),
+                Some(_) => return Command::Error("--debug-dump-server: path が空です".into()),
+                None => return Command::Error("--debug-dump-server requires a value".into()),
+            },
+            "--debug-dump-client" => match value {
+                Some(v) if !v.is_empty() => debug_dump_client = Some(v),
+                Some(_) => return Command::Error("--debug-dump-client: path が空です".into()),
+                None => return Command::Error("--debug-dump-client requires a value".into()),
+            },
             other => return Command::Error(format!("unknown option: {other}")),
         }
 
@@ -1624,6 +1656,8 @@ fn parse_run(args: &[String]) -> Command {
         on_child_suspend: final_child_suspend,
         on_parent_suspend: final_parent_suspend,
         scrollback_rows,
+        debug_dump_server,
+        debug_dump_client,
         command,
     })
 }
@@ -2206,6 +2240,10 @@ fn usage_run() -> String {
             --scrollback-rows N           vt100 内蔵 scrollback ring 行数上限\n                                  \
                 (= screen dump --layer=scrollback / --layer=both で\n                                  \
                 取り出せる過去 row の最大数、default 1000、0 で無効)\n    \
+            --debug-dump-server PATH      子 PTY → daemon の raw bytes を file に append\n                                  \
+                (state 翻訳前の bytes、ANSI escape 込み)\n    \
+            --debug-dump-client PATH      daemon → client の raw bytes を file に append\n                                  \
+                (state-based redraw / attach 復元込み = user の terminal 表示)\n    \
             -h, --help                    Show this help and exit\n\
         \n\
         ENVIRONMENT:\n    \

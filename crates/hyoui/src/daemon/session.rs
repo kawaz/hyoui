@@ -368,6 +368,26 @@ impl Session {
         // in concurrent test runs).
         let sigchld_owner = acquire_sigchld_selfpipe();
 
+        // Issue #1 + user request: `--debug-dump=<path>` で子 PTY からの raw bytes を
+        // append-only で file に書き出す。daemon process が直接 open / write し、
+        // failure 時は stderr に warn 1 行のみで dump を諦める (= session は止めない)。
+        let mut debug_dump_file: Option<std::fs::File> =
+            config.debug_dump_path.as_ref().and_then(|p| {
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                {
+                    Ok(f) => Some(f),
+                    Err(e) => {
+                        eprintln!(
+                            "hyoui: --debug-dump open 失敗 (= path: {p:?}): {e} (dump 無効化)"
+                        );
+                        None
+                    }
+                }
+            });
+
         let outcome = serve_loop(
             &pty,
             child,
@@ -380,6 +400,7 @@ impl Session {
             &mut screen_state,
             &mut pending_redraws,
             sigchld_owner.as_ref().map(|o| &o.pipe),
+            debug_dump_file.as_mut(),
         );
 
         // Drop the SIGCHLD self-pipe explicitly before any further cleanup so
@@ -737,7 +758,10 @@ fn serve_loop(
     screen_state: &mut ScreenState,
     pending_redraws: &mut Vec<u64>,
     sigchld_pipe: Option<&SelfPipe>,
+    debug_dump: Option<&mut std::fs::File>,
 ) -> RelayOutcome {
+    // debug_dump は loop 内で再借用するため局所変数に move する。
+    let mut debug_dump = debug_dump;
     // DR-0013 §5: stalled sequence の 5s timeout 検出は per-loop で行う。
     // 連続して warn を撒かないよう、検出後は flag を立てて feed が来るまで
     // 黙る (= 1 度 detect したら次の feed まで再 detect しない方針)。
@@ -996,6 +1020,17 @@ fn serve_loop(
                     }
                 }
                 Ok(n) => {
+                    // Issue #1 + user request: `--debug-dump` の raw bytes 書き出し。
+                    // 子 PTY からの bytes は scrollback / vt100 へ渡る **前** の生
+                    // chunk なので、ここで append すれば「daemon が観測した最初の
+                    // 形」が保存される (= state 経由の翻訳なし、ANSI escape も含む)。
+                    if let Some(f) = debug_dump.as_mut() {
+                        use std::io::Write as _;
+                        if let Err(e) = f.write_all(&buf[..n]) {
+                            eprintln!("hyoui: --debug-dump write 失敗: {e} (以後 dump 中止)");
+                            debug_dump = None;
+                        }
+                    }
                     // scrollback に push してから broadcast (subscription 種類で encoding 分岐)
                     let now = Instant::now();
                     scrollback.push(now, buf[..n].to_vec());
