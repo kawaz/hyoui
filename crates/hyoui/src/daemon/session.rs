@@ -466,10 +466,111 @@ impl Session {
         }
         clients.clear();
 
+        // DR-0015 Task 22 (linger pattern): 子 exit 直後に socket を即 unlink すると、
+        // run の親 attach (= exec attach pattern) が間に合わずに ENOENT で失敗する
+        // race が発生する (= 短命子 /bin/echo 等)。tmux / abduco 流の「子 exit 後も
+        // 短時間 attach 待ち」を実装。linger 期間 (= 2 秒) listener から 1 client だけ
+        // accept + handshake + SessionExitNotify 送信して終了。
+        //
+        // attach が来なくても linger 期間経過で socket close + daemon exit。既存 client
+        // が attach 済の場合も 2 秒延長されるが、SessionExitNotify は既に broadcast 済
+        // なので linger 中の通常 attach に対しても同じ exit_status を送る。
+        if matches!(outcome, RelayOutcome::ChildExited(_)) {
+            linger_for_late_attach(&listener, config, exit_code, &mut screen_state);
+        }
+
         drop(listener);
         match outcome {
             RelayOutcome::ChildExited(_) | RelayOutcome::ClientDetachedOrKilled => Ok(exit_code),
             RelayOutcome::Error(e) => Err(e),
+        }
+    }
+}
+
+/// DR-0015 Task 22: 子 PTY exit 後に短時間 attach を待つ linger helper。
+///
+/// `Session::serve` が `ChildExited` を観測した後、socket を即 unlink せず最大
+/// `LINGER_DURATION` (= 2 秒) listener から accept + handshake を継続する。
+/// 1 client が handshake 完了したら `SessionExitNotify` を送って即 break。
+/// timeout なら何もせず終了 (= 既存挙動と同じく socket close)。
+fn linger_for_late_attach(
+    listener: &UnixSock,
+    config: &DaemonConfig,
+    exit_status: i32,
+    screen_state: &mut ScreenState,
+) {
+    use crate::daemon::accept::{process_pending_handshakes, spawn_handshake_worker};
+    use crate::protocol::messages::SessionExitNotify;
+
+    const LINGER_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
+    const POLL_TIMEOUT_MS: u16 = 50;
+
+    let deadline = Instant::now() + LINGER_DURATION;
+    let mut pending_handshakes: Vec<PendingHandshake> = Vec::new();
+    let mut next_client_id: u64 = 0;
+    let mut clients: Vec<ClientHandle> = Vec::new();
+    let mut state = SessionState::default();
+    let mut overflow_ids: Vec<u64> = Vec::new();
+    let mut pending_redraws: Vec<u64> = Vec::new();
+
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+
+        // poll: listener (= 新 attach) + pending handshake 完了通知 (= mpsc は fd-poll
+        // できないので短い timeout で try_recv)
+        let listener_fd = listener.as_fd();
+        let mut poll_fds: Vec<PollFd> = vec![PollFd::new(listener_fd, PollFlags::POLLIN)];
+        let _ = poll(&mut poll_fds, PollTimeout::from(POLL_TIMEOUT_MS));
+
+        let listener_revents = poll_fds[0].revents().unwrap_or(PollFlags::empty());
+        drop(poll_fds);
+
+        // 新 attach の accept
+        if listener_revents.contains(PollFlags::POLLIN)
+            && clients.len() < MAX_CLIENTS_PER_DAEMON
+            && pending_handshakes.len() < MAX_PENDING_HANDSHAKES
+        {
+            if let Ok(pending) = spawn_handshake_worker(listener, config) {
+                pending_handshakes.push(pending);
+            }
+        }
+
+        // 完了済 handshake を回収
+        process_pending_handshakes(
+            &mut pending_handshakes,
+            config,
+            &mut next_client_id,
+            &mut clients,
+            &mut state,
+            &mut overflow_ids,
+            screen_state,
+            &mut pending_redraws,
+        );
+
+        // 1 client でも attach 完了したら SessionExitNotify を送って break。
+        if !clients.is_empty() {
+            let notify = ControlMessage::SessionExitNotify(SessionExitNotify {
+                exit_status,
+                signal: None,
+            });
+            let _ = super::broadcast::broadcast_control_with_cap(
+                &mut clients,
+                &notify,
+                "session-exit-v1",
+            );
+            // drain (= 全 client の queued_bytes が 0 になるまで短時間待つ)
+            let drain_deadline = Instant::now() + std::time::Duration::from_millis(200);
+            for ch in clients.iter() {
+                while ch.queued_bytes.load(std::sync::atomic::Ordering::Acquire) > 0
+                    && Instant::now() < drain_deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            clients.clear();
+            break;
         }
     }
 }
