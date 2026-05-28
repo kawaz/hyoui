@@ -62,6 +62,61 @@ impl<A: std::io::Write, B: std::io::Write> std::io::Write for TeeWriter<A, B> {
     }
 }
 
+/// DR-0015 §2.3: attach client process が外部 SIGTSTP / SIGCONT を受けた時の
+/// termios 復元 / 再 raw 化を専任する **signal monitor thread** を起動する。
+///
+/// `Arc<Mutex<TtyGuard>>` で TtyGuard を main thread と共有 (= `Termios` 内の
+/// `RefCell` が `!Sync` のため Arc 直接共有不可、Mutex で run-time sync)。
+/// `Arc<AtomicBool>` の shutdown flag で main 終了時に signal_thread を畳む
+/// (= 畳まないと Arc::drop で TtyGuard が drop されず termios 復元されない)。
+///
+/// signal handler 自体は self-pipe に signum を 1 byte 書くだけ (= async-signal-safe)。
+/// 本 thread が drain で取り出して同期 path で termios 操作 + `raise(SIGTSTP)`。
+fn install_attach_signal_thread(
+    guard: std::sync::Arc<std::sync::Mutex<hyoui::sys::TtyGuard>>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<std::thread::JoinHandle<()>, hyoui::sys::Error> {
+    use hyoui::sys::signal::{install_default, install_self_pipe, raise, register_self_pipe};
+    use nix::sys::signal::Signal;
+    use std::sync::atomic::Ordering;
+
+    let pipe = install_self_pipe()?;
+    register_self_pipe(Signal::SIGTSTP)?;
+    register_self_pipe(Signal::SIGCONT)?;
+
+    let handle = std::thread::spawn(move || {
+        loop {
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            let drained = match pipe.drain() {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            for &sig in &drained {
+                let signum = sig as i32;
+                if signum == Signal::SIGTSTP as i32 {
+                    // 外側 TTY を pre-raw に戻す → SIGTSTP を kernel default で処理させて
+                    // STOPPED へ。復帰時 (= SIGCONT 受信時) に raw 再設定。
+                    if let Ok(g) = guard.lock() {
+                        g.suspend();
+                    }
+                    let _ = install_default(Signal::SIGTSTP);
+                    let _ = raise(Signal::SIGTSTP);
+                    // STOPPED → SIGCONT で復帰。disposition を self-pipe に戻して raw 再設定。
+                    let _ = register_self_pipe(Signal::SIGTSTP);
+                    if let Ok(g) = guard.lock() {
+                        g.resume();
+                    }
+                }
+                // SIGCONT byte: process は既に kernel で起きてる、thread 内では no-op。
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    });
+    Ok(handle)
+}
+
 /// `--debug-dump-client=<path>` を open する helper。失敗時は stderr に warn を
 /// 出して `None` を返し、dump を諦める (= session は止めない)。
 fn open_debug_dump(path: &str, role: &str) -> Option<std::fs::File> {
@@ -425,10 +480,11 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let stdin_is_tty = is_tty(stdin.as_fd());
-    let _raw_guard = if stdin_is_tty {
+    let raw_guard: Option<std::sync::Arc<std::sync::Mutex<hyoui::sys::TtyGuard>>> = if stdin_is_tty
+    {
         match nix::unistd::dup(stdin.as_fd()) {
             Ok(dup_for_guard) => match enter_raw(dup_for_guard) {
-                Ok(g) => Some(g),
+                Ok(g) => Some(std::sync::Arc::new(std::sync::Mutex::new(g))),
                 Err(e) => {
                     eprintln!("hyoui: raw mode 失敗: {e} (続行)");
                     None
@@ -436,6 +492,26 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
             },
             Err(e) => {
                 eprintln!("hyoui: stdin dup 失敗: {e} (raw mode skip)");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // DR-0015 §2.3: attach client が外部 SIGTSTP を受けたら、自プロセスの termios を
+    // 復元 → STOPPED に入り、SIGCONT 復帰時に raw mode 再設定。daemon には何も
+    // 送らない (= 軸 2 廃止、子プロセスとは無関係)。
+    let signal_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal_thread = if let Some(guard) = raw_guard.as_ref() {
+        let guard_for_thread = std::sync::Arc::clone(guard);
+        let shutdown_for_thread = std::sync::Arc::clone(&signal_shutdown);
+        match install_attach_signal_thread(guard_for_thread, shutdown_for_thread) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                eprintln!(
+                    "hyoui: SIGTSTP handler 設定失敗: {e} (続行、suspend 時 termios 復元なし)"
+                );
                 None
             }
         }
@@ -466,7 +542,7 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         }
         None => conn.run(&mut stdin_file, &mut stdout),
     };
-    match run_result {
+    let exit_code = match run_result {
         // DR-0015 §2.1: session.exit.notify 受信時は exit-status をそのまま伝搬。
         Ok(Some(status)) => {
             let masked = u8::try_from(status & 0xFF).unwrap_or(255);
@@ -477,7 +553,18 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
             eprintln!("hyoui: attach 実行エラー: {e}");
             ExitCode::from(1)
         }
+    };
+
+    // signal_thread を畳む (= Arc 解放 → main の `raw_guard` Arc が drop されたら
+    // TtyGuard::Drop が走り termios 復元される)。
+    signal_shutdown.store(true, std::sync::atomic::Ordering::Release);
+    if let Some(handle) = signal_thread {
+        // join は signal_thread の drain ループ次の iteration で shutdown 検知し終了
+        // (= 最大 50ms の sleep + drain 1 周)。
+        let _ = handle.join();
     }
+    drop(raw_guard); // 明示的に Arc<Mutex<TtyGuard>> を drop して termios 復元
+    exit_code
 }
 
 /// R5-H3: socket liveness probe (= daemon が応答するか確認)。
