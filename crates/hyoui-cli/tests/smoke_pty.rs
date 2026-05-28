@@ -27,13 +27,8 @@ use common::pty::HyouiTestRunner;
 ///
 /// 既存 558+ test の regression なし + 新規 harness の生 round-trip 検証。
 ///
-/// DR-0015 Task 22 (linger pattern) で socket race は解消したが、CI macOS で
-/// `handshake.response decode failed` の race が残存 (= linger 経路の
-/// process_pending_handshakes ベース handshake が CI 環境で timing 不安定)。
-/// ローカル macOS では pass、CI macOS で偶発失敗。別 task で linger 経路の
-/// 同期 handshake 化 (= worker thread 経由ではなく本 thread で同期実行) を
-/// 検討するまで `#[ignore]`。
-#[ignore = "DR-0015 Task 25 待ち: linger 経路の handshake CI race"]
+/// DR-0015 Task 22 (linger pattern) で socket race を、Task 25 で handshake →
+/// SessionExitNotify の writer flush race を順次解消。
 #[test]
 fn smoke_hyoui_run_echo() {
     let runner = HyouiTestRunner::new();

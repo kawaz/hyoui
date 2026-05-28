@@ -551,6 +551,21 @@ fn linger_for_late_attach(
 
         // 1 client でも attach 完了したら SessionExitNotify を送って break。
         if !clients.is_empty() {
+            // Task 25 race 対策: process_pending_handshakes が handshake.response を
+            // enqueue した直後で、writer thread が flush する前に SessionExitNotify
+            // を続けて enqueue すると、CI macOS で client 側 decode タイミングが
+            // 不安定になる (= `handshake.response decode failed`)。
+            // handshake.response の queued_bytes が 0 になるまで wait してから
+            // SessionExitNotify を送る (= 順序を sequential に強制)。
+            let handshake_drain_deadline = Instant::now() + std::time::Duration::from_millis(500);
+            for ch in clients.iter() {
+                while ch.queued_bytes.load(std::sync::atomic::Ordering::Acquire) > 0
+                    && Instant::now() < handshake_drain_deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+
             let notify = ControlMessage::SessionExitNotify(SessionExitNotify {
                 exit_status,
                 signal: None,
@@ -560,8 +575,9 @@ fn linger_for_late_attach(
                 &notify,
                 "session-exit-v1",
             );
-            // drain (= 全 client の queued_bytes が 0 になるまで短時間待つ)
-            let drain_deadline = Instant::now() + std::time::Duration::from_millis(200);
+            // 終端 drain: SessionExitNotify を send 完了するまで wait (= CI race 緩和、
+            // 旧 200ms → 1000ms)
+            let drain_deadline = Instant::now() + std::time::Duration::from_millis(1000);
             for ch in clients.iter() {
                 while ch.queued_bytes.load(std::sync::atomic::Ordering::Acquire) > 0
                     && Instant::now() < drain_deadline
