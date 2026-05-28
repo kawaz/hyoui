@@ -15,6 +15,7 @@
 use std::io::Write;
 use std::os::fd::AsFd;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 use hyoui::cli::{
     AttachConfig, Command, HelpTopic, InputCommand, InputSpec, KillConfig, ListConfig,
@@ -29,7 +30,7 @@ use hyoui::protocol::messages::{
     StateSnapshotRequest, StatusQuery, TailRequest,
 };
 use hyoui::protocol::{ControlMessage, Mode};
-use hyoui::sys::{enter_raw, is_tty};
+use hyoui::sys::{TtyGuard, enter_raw, is_tty};
 
 mod completion;
 mod daemonize;
@@ -304,6 +305,28 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
         dcfg.screen_vt100_scrollback_rows = n;
     }
 
+    // Issue #1: daemon thread が `raise(SIGSTOP)` する前後で外側 TTY の termios を
+    // pre-raw に戻す / raw 再設定する callback を inject する。raw_mode 化は
+    // Session::start の **後** に行うため、ここでは空 slot (= `Arc<Mutex<Option<_>>>`)
+    // だけ先に作り、後段で TtyGuard を `*slot.lock() = Some(guard)` の形で埋める。
+    let raw_guard_slot: Arc<Mutex<Option<TtyGuard>>> = Arc::new(Mutex::new(None));
+    let suspend_slot = raw_guard_slot.clone();
+    dcfg.on_suspend = Some(Arc::new(move || {
+        if let Ok(slot) = suspend_slot.lock() {
+            if let Some(g) = slot.as_ref() {
+                g.suspend();
+            }
+        }
+    }));
+    let resume_slot = raw_guard_slot.clone();
+    dcfg.on_resume = Some(Arc::new(move || {
+        if let Ok(slot) = resume_slot.lock() {
+            if let Some(g) = slot.as_ref() {
+                g.resume();
+            }
+        }
+    }));
+
     let session = match Session::start(dcfg) {
         Ok(s) => s,
         Err(e) => {
@@ -341,23 +364,27 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
         hyoui::client::StdinEofAction::SendEof
     };
     let conn = conn.with_stdin_eof_action(eof_action);
-    let _raw_guard = if stdin_is_tty {
+    if stdin_is_tty {
         match nix::unistd::dup(stdin.as_fd()) {
             Ok(dup_for_guard) => match enter_raw(dup_for_guard) {
-                Ok(g) => Some(g),
+                Ok(g) => {
+                    // Issue #1: daemon thread の SIGTSTP/SIGCONT handler から
+                    // suspend()/resume() を呼べるように slot に格納する。slot 自体は
+                    // Session::start 前に on_suspend/on_resume callback に渡り済。
+                    *raw_guard_slot.lock().expect("raw_guard_slot poisoned") = Some(g);
+                }
                 Err(e) => {
                     eprintln!("hyoui: raw mode 失敗: {e} (続行)");
-                    None
                 }
             },
             Err(e) => {
                 eprintln!("hyoui: stdin dup 失敗: {e} (raw mode skip)");
-                None
             }
         }
-    } else {
-        None
-    };
+    }
+    // raw_guard_slot は main thread のスコープ末尾まで生存 (= 関数末尾の `drop`
+    // で TtyGuard::Drop が saved termios を復元する)。daemon callback が後追いで
+    // 触れないように、ここでは move せず参照のままにする。
 
     // ClientConnection::run に渡す stdin は dup したものを File として使う
     // (= raw mode 用 guard と read 用が別 fd なので close 順序を気にしなくて良い)

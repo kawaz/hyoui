@@ -57,6 +57,41 @@ impl TtyGuard {
         // Take the fd out so Drop's tcsetattr below becomes a no-op.
         self.fd.take().expect("TtyGuard fd already taken")
     }
+
+    /// Restore the saved (pre-raw) termios on the held fd. Idempotent
+    /// (re-applying saved termios is a no-op).
+    ///
+    /// Used by DR-0001 jobcontrol 2 軸 handlers around `raise(SIGSTOP)`:
+    /// the outer terminal must be returned to its pre-raw state before
+    /// the process becomes STOPPED, otherwise the surrounding shell /
+    /// terminal multiplexer (cmux / tmux / libghostty) is left talking
+    /// to a TTY in raw mode and may freeze on resume.
+    ///
+    /// Best-effort: errors are silently ignored (matches `Drop`).
+    pub fn suspend(&self) {
+        if let Some(fd) = self.fd.as_ref() {
+            let _ = termios::tcsetattr(fd.as_fd(), SetArg::TCSAFLUSH, &self.saved);
+        }
+    }
+
+    /// Re-apply raw mode (`cfmakeraw` + `IUTF8` on supported platforms) on
+    /// the held fd. Used to restore raw mode after returning from
+    /// `SIGSTOP` (i.e. the SIGCONT side of [`Self::suspend`]).
+    ///
+    /// Best-effort: errors are silently ignored.
+    pub fn resume(&self) {
+        let Some(fd) = self.fd.as_ref() else {
+            return;
+        };
+        let mut raw_t = self.saved.clone();
+        termios::cfmakeraw(&mut raw_t);
+        // Mirror `enter_raw`: re-set IUTF8 on platforms that support it.
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        {
+            raw_t.input_flags |= termios::InputFlags::IUTF8;
+        }
+        let _ = termios::tcsetattr(fd.as_fd(), SetArg::TCSAFLUSH, &raw_t);
+    }
 }
 
 impl Drop for TtyGuard {
@@ -170,6 +205,40 @@ mod tests {
             cur.input_flags.contains(termios::InputFlags::IUTF8),
             "IUTF8 must be set after enter_raw on UTF-8-aware platforms",
         );
+    }
+
+    #[test]
+    fn suspend_restores_saved_termios_resume_reapplies_raw() {
+        // DR-0001 jobcontrol: suspend()/resume() must round-trip between
+        // saved (cooked) and raw (cfmakeraw) termios so that the outer
+        // terminal can be parked in a sane state across SIGSTOP/SIGCONT.
+        let pty = crate::sys::pty::Pty::open(80, 24).expect("open pty");
+        let master = pty.into_master();
+        // Capture the "cooked" termios that enter_raw will save.
+        let saved_before = termios::tcgetattr(master.as_fd()).expect("tcgetattr");
+        let guard = enter_raw(master).expect("enter raw");
+        // After enter_raw, termios is raw.
+        let raw_view = termios::tcgetattr(guard.fd()).expect("tcgetattr raw");
+        assert_ne!(
+            raw_view.local_flags, saved_before.local_flags,
+            "enter_raw must change local_flags from saved",
+        );
+        // suspend() → saved restored.
+        guard.suspend();
+        let after_suspend = termios::tcgetattr(guard.fd()).expect("tcgetattr suspend");
+        assert_eq!(
+            after_suspend.local_flags, saved_before.local_flags,
+            "suspend() must restore saved local_flags",
+        );
+        // resume() → raw re-applied.
+        guard.resume();
+        let after_resume = termios::tcgetattr(guard.fd()).expect("tcgetattr resume");
+        assert_eq!(
+            after_resume.local_flags, raw_view.local_flags,
+            "resume() must re-apply raw local_flags",
+        );
+        // Drop must still restore saved (idempotent w.r.t. suspend()).
+        drop(guard);
     }
 
     #[test]

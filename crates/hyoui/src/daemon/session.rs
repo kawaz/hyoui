@@ -621,13 +621,24 @@ fn handle_suspend_signals(
                     // 子は何もしない (= 走り続ける)。
                 }
             }
+            // Issue #1: 親が STOPPED に入る **直前** に外側 TTY の termios を
+            // pre-raw に戻す。CLI process が保持する TtyGuard.suspend() への
+            // 橋渡し (= DaemonConfig::on_suspend、`daemon/config.rs`)。これを
+            // 忘れると外側 cmux / tmux / libghostty が raw mode の TTY に
+            // talk して freeze する。
+            if let Some(hook) = config.on_suspend.as_ref() {
+                hook();
+            }
             // 親自身を停止。SIGSTOP は catch 不可なので、SIGTSTP ハンドラが
             // self-pipe に流した後で安全に raise できる (= self-pipe handler 内
             // ではない同期 path)。
             let _ = raise(Signal::SIGSTOP);
             // SIGSTOP/SIGCONT で復帰した時点で本 path から抜け serve_loop に戻る。
-            // 復帰後は self-pipe に SIGCONT byte が積まれているはずで、次 iteration
-            // で `handle_suspend_signals` が invariant 回復を担う。
+            // 復帰後は外側 TTY を raw mode に戻す (= on_resume)。SIGCONT byte は
+            // 次 iteration で `handle_suspend_signals` が invariant 回復を担う。
+            if let Some(hook) = config.on_resume.as_ref() {
+                hook();
+            }
         } else if sig_i32 == Signal::SIGCONT as i32 {
             // invariant 回復 (DR-0001 §invariant): 親が再開した時、子が STOPPED
             // なら必ず SIGCONT を送って復帰させる。`waitpid(WNOHANG | WUNTRACED |
@@ -682,10 +693,20 @@ fn handle_child_transition(
                     let _ = kill_pgrp(child, Signal::SIGCONT);
                 }
                 OnChildSuspend::Follow => {
+                    // Issue #1: 親が STOPPED に入る直前に外側 TTY の termios を
+                    // pre-raw に戻す (= handle_suspend_signals 内 SIGTSTP 経路と
+                    // 同じ理由)。
+                    if let Some(hook) = config.on_suspend.as_ref() {
+                        hook();
+                    }
                     // 親自身に SIGSTOP raise。kernel が catch 不可な SIGSTOP を
                     // 処理して親を STOPPED にする。外側 shell に制御が戻り、
                     // ユーザの `fg` で親 + 子 (invariant 回復経由) が揃って復帰。
                     let _ = raise(Signal::SIGSTOP);
+                    // 復帰後 = raw mode を再設定。
+                    if let Some(hook) = config.on_resume.as_ref() {
+                        hook();
+                    }
                 }
             }
             None

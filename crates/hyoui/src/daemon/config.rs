@@ -1,14 +1,23 @@
 //! daemon の起動 config (DR-0008 §Consequences)。
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::cli::{OnChildSuspend, OnParentSuspend};
+
+/// suspend / resume の前後 hook (DR-0001 jobcontrol 2 軸 + Issue #1: termios 復元)。
+///
+/// daemon thread が `raise(SIGSTOP)` する直前 (= [`DaemonConfig::on_suspend`]) /
+/// 復帰直後 (= [`DaemonConfig::on_resume`]) に呼ぶ callback。CLI process が
+/// 保持する [`crate::sys::TtyGuard`] の `suspend()` / `resume()` を thread 越しに
+/// 触らせるための薄い橋渡し。
+pub type SuspendHook = Arc<dyn Fn() + Send + Sync>;
 
 /// daemon 1 つ分の起動設定。
 ///
 /// `cmd` で指定した process を子 PTY として spawn し、`socket_path` で
 /// Unix socket を bind して client 接続を受け付ける。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DaemonConfig {
     /// session 名 (= status.response や `hyoui list` で識別される)。
     pub session_id: String,
@@ -103,6 +112,51 @@ pub struct DaemonConfig {
     /// - [`OnParentSuspend::Decouple`]: 親だけ `SIGSTOP` を `raise`、子はそのまま
     ///   走らせる (= headless バッチで親を止めても子のジョブを進めたいとき)。
     pub on_parent_suspend: OnParentSuspend,
+
+    /// daemon が `raise(SIGSTOP)` する **直前** に呼ぶ hook。
+    ///
+    /// 典型用途: CLI process が保持する [`crate::sys::TtyGuard::suspend`] を呼んで
+    /// 外側 TTY を pre-raw 状態に戻す (= 外側 cmux / tmux / libghostty が STOPPED 中の
+    /// raw mode TTY に talk して freeze する事故を防ぐ、Issue #1 修正)。
+    ///
+    /// `None` なら no-op。
+    pub on_suspend: Option<SuspendHook>,
+
+    /// daemon が `raise(SIGSTOP)` から **復帰した直後** に呼ぶ hook。
+    ///
+    /// 典型用途: CLI process が保持する [`crate::sys::TtyGuard::resume`] を呼んで
+    /// 外側 TTY を再 raw 化する。`on_suspend` と対になる。
+    ///
+    /// `None` なら no-op。
+    pub on_resume: Option<SuspendHook>,
+}
+
+impl std::fmt::Debug for DaemonConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonConfig")
+            .field("session_id", &self.session_id)
+            .field("socket_path", &self.socket_path)
+            .field("cmd", &self.cmd)
+            .field("cols", &self.cols)
+            .field("rows", &self.rows)
+            .field("scrollback_bytes", &self.scrollback_bytes)
+            .field("screen_input_log_bytes", &self.screen_input_log_bytes)
+            .field(
+                "screen_vt100_scrollback_rows",
+                &self.screen_vt100_scrollback_rows,
+            )
+            .field("client_buffer_bytes", &self.client_buffer_bytes)
+            .field(
+                "expected_token",
+                &self.expected_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("until", &self.until)
+            .field("on_child_suspend", &self.on_child_suspend)
+            .field("on_parent_suspend", &self.on_parent_suspend)
+            .field("on_suspend", &self.on_suspend.as_ref().map(|_| "<hook>"))
+            .field("on_resume", &self.on_resume.as_ref().map(|_| "<hook>"))
+            .finish()
+    }
 }
 
 impl DaemonConfig {
@@ -130,6 +184,8 @@ impl DaemonConfig {
             // 与えるため、ここで明示する。
             on_child_suspend: OnChildSuspend::Follow,
             on_parent_suspend: OnParentSuspend::Transparent,
+            on_suspend: None,
+            on_resume: None,
         }
     }
 }
