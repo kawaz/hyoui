@@ -18,6 +18,22 @@ journal へ誘導する形にしている。
 
 ## バージョン履歴（概略）
 
+### v0.2.0 (2026-05-28)
+
+DR-0001 軸 1/2 (suspend policy) 実装、state-based wait/snapshot、input family、
+lock state machine、screen state dump (scrollback / both layer)、homebrew tap
+自動公開フローなど、大量の機能追加と整備。詳細:
+
+- DR-0001 軸 1/2 wiring (ChildTransition + suspend policy fields)
+- screen dump (--format=text/plain, scrollback rows config)
+- state-based wait + input family
+- lock state machine + token handling
+- release.yml に update-homebrew job 追加 (brew tap 自動反映)
+- Taskfile.pkl bump-version task で workspace 内 path 依存 version も同期
+
+詳細: [GitHub Release v0.2.0](https://github.com/kawaz/hyoui/releases/tag/v0.2.0)、
+`docs/decisions/INDEX.md`、`docs/journal/`。
+
 ### v0.1.0 (2026-05-27)
 
 MVP: daemon ライフサイクル + multi-attach + protocol cap negotiation の土台が完成。
