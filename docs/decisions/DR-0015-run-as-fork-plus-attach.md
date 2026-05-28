@@ -36,15 +36,32 @@
 
 ```
 hyoui run -- cmd
-  ├─ 親 process: fork
-  │   └─ 親が attach client として動く (= conn.run で stdin/stdout 中継 + 自プロセスで raw mode + SIGTSTP handler)
-  └─ 子 process (= daemon): exec __daemonize-run + 子 PTY 起動 + socket bind + broadcast
+  ├─ 親 process: detached daemon を spawn (= fork+exec "hyoui run --detached --session=... -- cmd")
+  │                ↓ ready 通知待ち
+  │              親自身を attach に exec で置換 (= exec "hyoui attach <session>")
+  │                ↓
+  │            (親 process = hyoui attach として動く)
+  └─ 子 process (= daemon): "hyoui run --detached" exec 経路、子 PTY 起動 + socket bind + broadcast
 ```
 
-- `--detached` flag = 「親が attach せず即 exit」 (= 現状と意味同じ、再定義不要)
-- `--detached` 無し = 「親が attach して serve」、現状の `hyoui run --detached <session> && hyoui attach <session>` の合成と等価
+挙動:
+- `hyoui run -- cmd` (= non-detached) = **`hyoui run --detached -- cmd` と `hyoui attach <session>` の完全合成**。親 process が前者を spawn、後者に exec で置換
+- `hyoui run --detached -- cmd` = daemon 子 spawn + 親即 exit (= 既存挙動)
+- `hyoui attach <session>` = 既存 daemon に接続 (= 既存挙動)
+
+`ps` で見える形:
+- `hyoui run --detached --session=... -- cmd` (= daemon process、常駐)
+- `hyoui attach <session>` (= 親 process、exec 後の姿)
+- 「run」コマンド名は **どこにも見えない** (= parent が attach に exec で変身済)
+
+利点:
 - daemon process は外側 TTY / 親 termios を **一切知らない**
-- client process (= 親) が外側 TTY raw mode + 自分の SIGTSTP/SIGCONT を独立管理
+- attach client process が外側 TTY raw mode + 自分の SIGTSTP/SIGCONT を独立管理
+- **memory 共有事故ゼロ** (= fork+exec で memory image 完全置換、global static の thread 罠回避)
+- **コード重複ゼロ** (= 既存 `--detached` + `attach` 実装をそのまま流用)
+- `run_command` 実装が wrapper 数十行に圧縮 (= spawn → ready 待ち → exec)
+- debug 観測単純 (= parent を strace/lsof しても attach の挙動だけ見える)
+- ps で role が一目瞭然
 
 ### 2. Protocol 拡張
 
@@ -199,10 +216,11 @@ DR-0001 への影響:
 - §invariant の「親が死ねば子も」を **「子が死ねば daemon と client は exit」のみ**に修正
   (= 親 client 死 → 子は無影響、子 exit → daemon exit + 全 client exit、の片方向)
 
-#### 2.3.5 採用する実装パターン (= 類似 OSS 調査 2026-05-28 由来)
+#### 2.3.5 採用する実装パターン (= 類似 OSS 調査 2026-05-28 由来 + exec attach pattern)
 
 DR-0015 起票直後に agent で tmux / abduco / dtach / zellij / shpool / mosh の
-client/server 分離パターンを調査。以下を hyoui に採用:
+client/server 分離パターンを調査。本 DR の **exec attach pattern** (= §1) と
+組み合わせて以下を採用:
 
 **起動 race 対策 = tmux 流 lock + retry**:
 - 親プロセスは最初に socket connect 試行 → ENOENT/ECONNREFUSED なら
@@ -210,13 +228,23 @@ client/server 分離パターンを調査。以下を hyoui に採用:
 - 二段構えで「別 client が同時に同 session を起こす」 race を回避
 - 既存 hyoui の `--session` 名空間と整合
 
-**daemon 起動失敗の文字列伝達 = abduco/dtach 流 pipe + CLOEXEC**:
-- fork 直前に親が `pipe2(O_CLOEXEC)` を作って親側 read 端を保持、子側 write 端を渡す
-- 子の exec 成功時 = CLOEXEC で write 端自動 close → 親 read が EOF → 「成功」判定
-- 子の exec 失敗時 = errno + 関連 path を write 端に書く → 親 read で error 文字列を取得
-- §2.4 socketpair handshake の代替として **より単純な経路**として採用検討
-  (= startup result の metadata = session_id / socket_path も同じ pipe で送れる)
-- 最終的に socketpair か pipe どちらにするかは Phase A 実装時に決定
+**daemon 起動 handshake = 既存 ready pipe + stderr inherit** (= exec attach pattern で
+socketpair 不要に):
+
+exec attach pattern (= §1) では parent が `hyoui run --detached` を **`Command::spawn`**
+で起こすため、起動 handshake は標準的な child process 起動と同じ仕組みで足りる:
+
+- **既存 ready pipe (= 1 byte 通知)** で「socket bind 完了」を待つ (= 現行
+  `daemonize::run_detached_parent` 実装そのまま)
+- daemon child の **stderr を parent が inherit** (= `Command::stderr(Stdio::inherit())`
+  もしくは pipe で capture)。daemon が起動失敗時に stderr に error 文字列を吐けば
+  parent / ユーザに自然に伝わる
+- ready pipe が EOF (= daemon が ready 通知前に死亡) → parent は spawn の
+  exit status を `wait()` で取り、stderr から拾った error と合わせてユーザに表示
+- **新 protocol message (= `DaemonStartupResult` 等) は不要** (= 既存 OS 機能で完結)
+
+これは abduco / dtach 流の pipe + CLOEXEC pattern を **stderr で自然に実現** したもの
+(= stderr 自体が pipe、CLOEXEC は標準動作)。
 
 **子 exit code 伝搬 = tmux/abduco 流 `MSG_EXIT` + buffer drain 待機**:
 - daemon は子 exit を観測しても **すぐに socket close しない**
@@ -224,34 +252,6 @@ client/server 分離パターンを調査。以下を hyoui に採用:
 - buffer drain 完了 (= 全 client の queued_bytes が 0 になる、もしくは drain budget timeout)
 - それから `session.exit.notify` を broadcast → daemon exit
 - 既存 serve_loop の `DRAIN_BUDGET_PER_CLIENT` (= 200ms) と整合する
-
-#### 2.4 `daemon.startup` channel (= 親 ↔ fork daemon 子 の起動 handshake)
-
-現状 `daemonize::run_detached_parent` は ready pipe 1 byte で「成功 / 失敗」のみ通知。新方針では **詳細 error 文字列を含む startup notify** が必要:
-
-選択肢:
-- **案 A**: ready pipe を「1 byte status + 残り length-prefix string」に拡張
-- **案 B**: socketpair で親子間 control channel を確立、daemon が起動完了 / 失敗を message として送る
-
-→ **案 B 採用**。理由:
-- 起動後も親 client が daemon に socket connect する経路 (= 通常の attach 経路) と分離しておく方が清潔
-- ただし socketpair は daemon が socket bind 成功 → 親に「ready」通知 → 親が通常 attach、までの **起動 handshake 専用**。それ以降は親が close する
-- error 文字列 / startup metadata (= session_id / socket_path / pid) も同じ channel で渡せる
-
-handshake protocol:
-```cbor
-// daemon → 親 (= startup の結果通知)
-{
-  "kind": "daemon.startup.result",
-  "ok": <bool>,
-  "session-id": <text> | null,    // ok=true 時
-  "socket-path": <text> | null,   // ok=true 時
-  "pid": <uint> | null,           // ok=true 時 (= daemon process pid)
-  "error": <text> | null          // ok=false 時、人間可読 error 文字列
-}
-```
-
-実装上は **既存の Frame layout (= DR-0008 §1) を流用**して socketpair に流せばよい (= wire format は変えない、transport だけ socketpair に置き換え)。
 
 ### 3. 廃止される実装
 
@@ -292,10 +292,12 @@ hyoui run -- cmd
             └─ broadcast loop
        ↑ signal 共有が問題
 
-[AFTER = 本 DR、軸 2 廃止後]
+[AFTER = 本 DR、exec attach pattern + 軸 2 廃止]
 hyoui run -- cmd
-  ├─ process A (= 親 client、pid=Y、leader)
-  │    ├─ socketpair で daemon と startup handshake
+  ├─ parent process: Command::spawn で daemon child 起動 → ready pipe 待ち
+  │                  → exec("hyoui attach <session>") で自プロセス置換
+  │
+  ├─ process A (= exec 後の姿、`ps` で "hyoui attach <session>")
   │    ├─ TtyGuard (= 外側 TTY raw mode)
   │    ├─ SIGTSTP/SIGCONT handler (= 自プロセスの termios 管理のみ)
   │    │    └─ 外部 TSTP 受信 → TtyGuard.suspend() + raise(SIGSTOP) で自分だけ止まる
@@ -305,9 +307,11 @@ hyoui run -- cmd
   │    ├─ session.child.stopped.notify 受信 → 軸 1 follow/auto-resume 発動
   │    │    └─ follow なら TtyGuard.suspend() + raise(SIGSTOP)、復帰後
   │    │       session.child.resume.request を送って子も復帰
-  │    └─ session.exit.notify 受信 → exit-status として親が exit
-  └─ process B (= daemon、pid=Z、A の子)
-       ├─ socketpair handshake で DaemonStartupResult を A に送信
+  │    └─ session.exit.notify 受信 → exit-status で親 (= ex parent) が exit
+  │
+  └─ process B (= daemon、`ps` で "hyoui run --detached --session=...")
+       ├─ Command::spawn で起動、stderr inherit で起動 error は parent / ユーザ stderr へ
+       ├─ ready pipe (= 1 byte) で socket bind 完了通知 → parent が exec attach に進む
        ├─ child PTY (= cmd 孫 process、line discipline で Ctrl-Z → 子 SIGTSTP)
        ├─ socket bind + listener
        ├─ SIGCHLD + waitpid(WUNTRACED|WCONTINUED) handler
@@ -317,6 +321,13 @@ hyoui run -- cmd
        ├─ session.child.resume.request 受信 → killpg(child_pgid, SIGCONT)
        └─ broadcast loop (= daemon が能動的に子 pgrp を SIGSTOP する経路は本 DR では一切不存在)
 ```
+
+`ps` で見える形:
+- `hyoui run --detached --session=<id> -- cmd args...` (= daemon、process B)
+- `hyoui attach <session>` (= ex-parent、process A = exec 後の姿)
+- → 「run」コマンド名は parent が短命 (= spawn → ready 待ち → exec) のため
+  通常 `ps` snapshot では見えない。daemon は常に "run --detached"、parent は
+  常に "attach" として観測される
 
 **Ctrl-Z 配信経路の整理**:
 - 子 PTY 内で Ctrl-Z byte 入力 → PTY line discipline が SIGTSTP を子 pgrp に送る
@@ -396,7 +407,7 @@ hyoui run -- cmd
    - `SessionExitNotify` (= cap `session-exit-v1`)
    - `SessionChildStoppedNotify` (= cap `child-state-v1`)
    - `SessionChildResumeRequest` (= cap `child-state-v1`)
-   - `DaemonStartupResult` (= socketpair handshake 用、cap 不要 = 起動 handshake は cap negotiate 前)
+   - (= **新 protocol message は上記 3 個のみ**、起動 handshake は OS 標準機能で済む、§2.3.5)
 2. MVP_CAPS に `session-exit-v1` / `child-state-v1` を追加
 3. **cap-aware broadcast helper** 新設 (= `broadcast_control_with_cap`、negotiated_caps に
    含まない client は skip)
@@ -408,26 +419,38 @@ hyoui run -- cmd
        `killpg(child_pgid, SIGCONT)` で **auto-resume fallback**
      - それ以外は `SessionChildStoppedNotify` を leader へ送信
    - `SessionChildResumeRequest` 受信時に `killpg(child_pgid, SIGCONT)`
-5. daemonize.rs を ready pipe → socketpair handshake に書き換え、`DaemonStartupResult`
-   message を送る
+5. daemonize.rs は **現行 ready pipe (= 1 byte 通知) を維持**。stderr は inherit して
+   起動 error 文字列を parent / ユーザに伝える (= §2.3.5、新 message 不要)
 
-### Phase B: client process 側
+### Phase B: client process 側 (= exec attach pattern、§1)
 
-1. `hyoui-cli/src/main.rs::run_command` を fork (= daemonize spawn) + 親 attach の合成に書き換え
-2. fork 後の親が socketpair で startup result を受け取り、ok なら attach 経路へ進む
-3. attach client (= run の親 / 単独 attach 共通) に sigaction install + self-pipe で
-   **SIGTSTP / SIGCONT を自プロセスのために**監視
-4. **client 自身の SIGTSTP 受信時** (= 旧軸 2 廃止後の挙動):
-   - `TtyGuard.suspend()` → `raise(SIGSTOP)` → 復帰時 `TtyGuard.resume()`
-   - daemon に対しては **何もリクエストしない** (= §2.3、子は無関係)
-5. **子 self-stop 経路 = `session.child.stopped.notify` 受信時**:
-   - `follow` policy: `TtyGuard.suspend()` → `raise(SIGSTOP)` → 復帰時 (= 外側 fg)
-     `TtyGuard.resume()` → daemon に `session.child.resume.request` (= invariant 回復)
-   - `auto-resume` policy: 即 daemon に `session.child.resume.request` を返す
-     (= 子の self-stop を許さない)
-6. `session.exit.notify` 受信時に exit code を伝搬して親 exit
-7. cap negotiate payload に `on-child-suspend` policy を含めて daemon が leader 不在時の
-   fallback (= auto-resume) を判定できるようにする
+1. `hyoui-cli/src/main.rs::run_command` を以下に書き換え (= wrapper 数十行):
+   - `cfg.detached` 時: 既存 `daemonize::run_detached_parent` をそのまま呼ぶ (= 既存挙動)
+   - 非 detached 時:
+     1. session_id 採番 + socket path 解決
+     2. `Command::new(current_exe()).args(["run", "--detached", "--session=...", ...])` で
+        daemon child を spawn、stderr は inherit、ready pipe で wait
+     3. ready 受信後、`exec("hyoui", ["attach", "<session>", "--debug-dump-client=..."])`
+        で **自プロセスを attach バイナリに置換**
+     4. exec 後は戻らない (= attach バイナリの `attach_command` が走る)
+   - 既存の `Session::start` + `thread::spawn(...)` + `daemon_handle.join()` の同プロセス
+     経路は **削除**
+2. `attach_command` 側に追加実装:
+   - sigaction install + self-pipe で **SIGTSTP / SIGCONT を自プロセスのために**監視
+   - **client 自身の SIGTSTP 受信時** (= 旧軸 2 廃止後の挙動):
+     - `TtyGuard.suspend()` → `raise(SIGSTOP)` → 復帰時 `TtyGuard.resume()`
+     - daemon に対しては **何もリクエストしない** (= §2.3、子は無関係)
+   - **子 self-stop 経路 = `session.child.stopped.notify` 受信時**:
+     - `follow` policy: `TtyGuard.suspend()` → `raise(SIGSTOP)` → 復帰時 (= 外側 fg)
+       `TtyGuard.resume()` → daemon に `session.child.resume.request` (= invariant 回復)
+     - `auto-resume` policy: 即 daemon に `session.child.resume.request` を返す
+       (= 子の self-stop を許さない)
+   - `session.exit.notify` 受信時に `exit-status` をそのまま `process::exit(status)` で
+     伝搬
+   - cap negotiate payload に `on-child-suspend` policy を含めて daemon が leader 不在時の
+     fallback (= auto-resume) を判定できるようにする
+3. `--on-child-suspend` flag は attach にも追加 (= run の wrapper が引き渡す)。
+   `--on-parent-suspend` は削除 (= §2.3 で軸 2 廃止)
 
 ### Phase C: 廃棄物清掃
 
