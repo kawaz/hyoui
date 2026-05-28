@@ -5656,10 +5656,8 @@ mod tests {
     #[test]
     fn parse_input_max_file_bytes_default() {
         let _g = MAX_FILE_BYTES_ENV_GUARD.lock().unwrap();
-        // SAFETY: env 操作は test 内のみ、guard で並列 test と直列化
-        unsafe {
-            std::env::remove_var("HYOUI_MAX_FILE_BYTES");
-        }
+        // env 操作は test 内のみ、guard で並列 test と直列化
+        crate::sys::env::remove_var("HYOUI_MAX_FILE_BYTES");
         match parse_args(&args(&["input", "demo", "text:x"])) {
             Command::Input(cmd) => {
                 assert_eq!(cmd.max_file_bytes, DEFAULT_INPUT_MAX_FILE_BYTES);
@@ -5714,16 +5712,11 @@ mod tests {
     #[test]
     fn parse_input_max_file_bytes_env_fallback() {
         let _g = MAX_FILE_BYTES_ENV_GUARD.lock().unwrap();
-        // SAFETY: env 操作は test 内のみ、guard で並列 test と直列化
-        unsafe {
-            std::env::set_var("HYOUI_MAX_FILE_BYTES", "65536");
-        }
+        // env 操作は test 内のみ、guard で並列 test と直列化
+        crate::sys::env::set_var("HYOUI_MAX_FILE_BYTES", "65536");
         let res = parse_args(&args(&["input", "demo", "text:x"]));
         // 後始末を確実に
-        // SAFETY: 同上
-        unsafe {
-            std::env::remove_var("HYOUI_MAX_FILE_BYTES");
-        }
+        crate::sys::env::remove_var("HYOUI_MAX_FILE_BYTES");
         match res {
             Command::Input(cmd) => {
                 assert_eq!(cmd.max_file_bytes, 65536);
@@ -5736,15 +5729,9 @@ mod tests {
     #[test]
     fn parse_input_max_file_bytes_flag_overrides_env() {
         let _g = MAX_FILE_BYTES_ENV_GUARD.lock().unwrap();
-        // SAFETY: 同上
-        unsafe {
-            std::env::set_var("HYOUI_MAX_FILE_BYTES", "99999");
-        }
+        crate::sys::env::set_var("HYOUI_MAX_FILE_BYTES", "99999");
         let res = parse_args(&args(&["input", "demo", "--max-file-bytes=4096", "text:x"]));
-        // SAFETY: 同上
-        unsafe {
-            std::env::remove_var("HYOUI_MAX_FILE_BYTES");
-        }
+        crate::sys::env::remove_var("HYOUI_MAX_FILE_BYTES");
         match res {
             Command::Input(cmd) => {
                 assert_eq!(cmd.max_file_bytes, 4096);
@@ -5757,15 +5744,9 @@ mod tests {
     #[test]
     fn parse_input_max_file_bytes_env_invalid_falls_back_to_default() {
         let _g = MAX_FILE_BYTES_ENV_GUARD.lock().unwrap();
-        // SAFETY: 同上
-        unsafe {
-            std::env::set_var("HYOUI_MAX_FILE_BYTES", "not-a-number");
-        }
+        crate::sys::env::set_var("HYOUI_MAX_FILE_BYTES", "not-a-number");
         let res = parse_args(&args(&["input", "demo", "text:x"]));
-        // SAFETY: 同上
-        unsafe {
-            std::env::remove_var("HYOUI_MAX_FILE_BYTES");
-        }
+        crate::sys::env::remove_var("HYOUI_MAX_FILE_BYTES");
         match res {
             Command::Input(cmd) => {
                 assert_eq!(cmd.max_file_bytes, DEFAULT_INPUT_MAX_FILE_BYTES);

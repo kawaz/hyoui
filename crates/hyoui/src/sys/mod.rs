@@ -5,6 +5,8 @@
 //! invoked from the safe wrappers, but their `unsafe` bodies stay encapsulated.
 
 pub mod clock;
+#[cfg(test)]
+pub mod env;
 pub mod error;
 pub mod fd;
 pub mod poll;
