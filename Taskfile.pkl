@@ -92,7 +92,7 @@ local build: Task = new {
   description = "cargo build --release --workspace"
   inputs {
     ...rustSources
-    "VERSION"
+    "Cargo.toml"
   }
   outputs { "target/release/hyoui" }
   deps { lint }
@@ -113,7 +113,7 @@ local checkVersionBumped: Task =
   (kawaz.semver.checkBumped) {
     compareRef = "main@origin"
     triggerPaths = List("crates/hyoui/src/", "crates/hyoui-cli/src/")
-    versionFiles = List("VERSION")
+    versionFiles = List("Cargo.toml")
     taskName = "semver:check-version-bumped"
   }.check
 
@@ -122,16 +122,15 @@ local checkAgainstLatestRelease: Task =
   (kawaz.semver.checkBumped) {
     compareRef = "vcs:latest-tag()"
     triggerPaths = List("crates/hyoui/src/", "crates/hyoui-cli/src/")
-    versionFiles = List("VERSION")
+    versionFiles = List("Cargo.toml")
     taskName = "semver:check-against-latest-release"
     needsFetchTags = true
   }.check
 
-// VERSION と Cargo.toml の workspace.package.version (cmd 経由で抽出) と
-// build 済 binary の --version を横断比較する gate。
+// Cargo.toml の workspace.package.version と build 済 binary の --version を
+// 横断比較する gate (= Task 24 で旧 VERSION ファイル廃止、Cargo.toml を正本に統一)。
 local versions = (kawaz.semver.versions) {
-  versionFiles = List("VERSION")
-  cmdSources = List(#"cmd:grep -E '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/'"#)
+  versionFiles = List("Cargo.toml")
 }
 local versionDisplay: Task = versions.version
 local checkVersionsAligned: Task = versions.checkAligned
@@ -140,7 +139,7 @@ local checkVersionsAligned: Task = versions.checkAligned
 
 local bumpVersion: Task = new {
   name = "bump-version"
-  description = "bump VERSION + sync workspace.package.version in Cargo.toml"
+  description = "bump Cargo.toml workspace.package.version + sync path dep versions"
   cache = false
   deps { kawaz.vcs.ensureClean }
   params {
@@ -155,12 +154,9 @@ local bumpVersion: Task = new {
   cmd =
     #"""
     set -euo pipefail
-    new_version=$(bump-semver "$LEVEL" VERSION --write --no-hint)
-    # workspace.package.version は bump-semver が直接扱えないため perl で同期 (DR-0003)
-    # 注: `if !$done++` だと 1 行目のみで判定するため、match 未成立でも flag が立ち
-    # 後続行で s/// が走らない。`s/// and $done=1` 形式で「初回 match 時のみ」に修正。
-    perl -i -pe 'BEGIN{$v=shift @ARGV} s/^version\s*=\s*"[^"]*"/version = "$v"/ and $done=1 unless $done' \
-      "$new_version" Cargo.toml
+    # bump-semver は Cargo.toml の workspace.package.version を auto-detect で
+    # 直接書き換える (= Task 24 で旧 VERSION ファイル廃止、Cargo.toml 正本化)。
+    new_version=$(bump-semver "$LEVEL" Cargo.toml --write --no-hint)
     # workspace 内 path 依存の version 制約も同期 (例: hyoui-cli が hyoui を参照)。
     # `version = "X.Y"` 形式 (semver major.minor の short form) のみ更新する。
     # `version = "X.Y.Z"` 等の full pin や `>=X.Y` は変えない (= 意図ある制約は保持)。

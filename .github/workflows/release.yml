@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "VERSION"
+      - "Cargo.toml"
 
 jobs:
   check-version:
@@ -20,7 +20,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          CURRENT_VERSION=$(cat VERSION | tr -d '[:space:]')
+          # Task 24: 旧 VERSION ファイル廃止、Cargo.toml workspace.package.version
+          # から抽出 (= grep + perl で 1 行目だけ match)。
+          CURRENT_VERSION=$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
           if gh release view "v${CURRENT_VERSION}" --repo "$REPO" >/dev/null 2>&1; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "Version unchanged: v${CURRENT_VERSION} already released"
