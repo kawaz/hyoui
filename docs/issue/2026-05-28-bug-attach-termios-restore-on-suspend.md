@@ -2,8 +2,11 @@
 
 - Date: 2026-05-28 (Issue #1 修正後に切り出し)
 - Priority: 中 (= run --detached → 別端末 attach のシナリオで cmux freeze 再発の可能性)
-- Status: 未着手
-- 関連: [2026-05-28-bug-termios-restore-on-suspend.md](./2026-05-28-bug-termios-restore-on-suspend.md) (= 親 Issue)
+- Status: **完全解消 (DR-0015 Phase B-3、2026-05-28)**
+- 解消方法: DR-0015 で attach process が独自に sigaction install + self-pipe signal monitor thread + Arc<Mutex<TtyGuard>> 経由で termios suspend/resume を実装。本 issue が想定していた攻撃面 (= attach + 外部 SIGTSTP) を直接カバー
+- 現行設計の正本: [DR-0015](../decisions/DR-0015-run-as-fork-plus-attach.md) §2.3
+- 関連: [2026-05-28-bug-termios-restore-on-suspend.md](./2026-05-28-bug-termios-restore-on-suspend.md) (= 親 Issue、同時解消)
+- 以下 historical reference として保存
 
 ## 現象
 

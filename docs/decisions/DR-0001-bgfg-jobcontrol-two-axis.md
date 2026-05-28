@@ -133,15 +133,17 @@ hyoui 自身が外部（`kill -TSTP` / `bg`）から suspend されたときの�
 - 子は独立セッションリーダーなので **子の pgid == 子の pid**。
   グループ送信は `killpg(child_pid, sig)`。
 - INT / TERM / QUIT / HUP は子 pgrp にリレー。WINCH は PTY リサイズ。
-- **termios 復元** (= 2026-05-28 追加): hyoui が STOPPED に入る際、外側 TTY が raw mode のままだと
-  親 multiplexer (cmux / tmux / libghostty 等) が freeze する。対策として:
+- **termios 復元** (= 2026-05-28 追加、2026-05-28 DR-0015 で再設計): hyoui が STOPPED に入る際、
+  外側 TTY が raw mode のままだと親 multiplexer (cmux / tmux / libghostty 等) が freeze する。
+  対策として:
   - `TtyGuard::suspend()` (= saved termios 適用) / `resume()` (= raw 再適用) を `sys/tty.rs` に追加
-  - `DaemonConfig::on_suspend` / `on_resume` callback で CLI process が保持する `TtyGuard` を
-    daemon thread から触る形に橋渡し (= `hyoui run` 非 detached は 1 プロセス内 main + daemon の
-    2 thread なので Arc 共有可能)
-  - `handle_suspend_signals` (= 外部 SIGTSTP 経路 = 軸 2) と `handle_child_transition::Follow`
-    (= 子 self-stop 経路 = 軸 1) の両方で `raise(SIGSTOP)` 直前/直後に呼ぶ
-  - `hyoui attach` プロセスは別 process のため独自 SIGTSTP handler 配線が必要 (= 別 issue)
+  - **現行設計 (= DR-0015 Phase B-3 以降)**: attach client process が独自に sigaction install +
+    self-pipe signal monitor thread を起動。signal thread が SIGTSTP byte 受信時に
+    `TtyGuard.suspend()` → install_default(SIGTSTP) + raise(SIGTSTP) → 復帰時に
+    re-register + `TtyGuard.resume()` を実行。`Arc<Mutex<TtyGuard>>` で thread 共有
+  - 旧設計 (= DR-0015 以前、historical) は `DaemonConfig::on_suspend` callback inject だったが、
+    1 プロセス 2 thread モデル前提だったため DR-0015 で廃止
+  - 詳細は [[DR-0015]] §2.3 を参照
 
 ## 仕様の限界
 

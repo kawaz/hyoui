@@ -2,8 +2,15 @@
 
 - Date: 2026-05-28
 - Priority: **最重要** (= 実機で完全 freeze 誘発、kawaz がアクティビティモニタ強制終了)
-- Status: **修正済 (hyoui run 非 detached 経路、commit 2751ff28)** / hyoui attach 経路は別 issue
-- 派生 issue: [2026-05-28-bug-attach-termios-restore-on-suspend.md](./2026-05-28-bug-attach-termios-restore-on-suspend.md) (= attach プロセスは別 process なので別途修正必要)
+- Status: **完全解消 (DR-0015 Phase B-3、2026-05-28)**
+- 解消経緯:
+  1. 初期修正 (= commit 2751ff28、`DaemonConfig::on_suspend` callback inject) で hyoui run 非 detached のみ対応
+  2. DR-0015 起票で「run/attach 兼ねる構造」を fork+exec attach pattern に変更
+  3. DR-0015 Phase B-3 で attach process が独自の sigaction install + termios suspend/resume
+  4. callback inject 経路は不要に (= Phase A で削除済)、attach 派生 issue も同時解消
+- 派生 issue: [2026-05-28-bug-attach-termios-restore-on-suspend.md](./2026-05-28-bug-attach-termios-restore-on-suspend.md) も同時解消 (= attach process 独自 sigaction で対応)
+- 現行設計の正本: [DR-0015](../decisions/DR-0015-run-as-fork-plus-attach.md) §2.3
+- 以下 historical reference として保存
 
 ## 現象
 
