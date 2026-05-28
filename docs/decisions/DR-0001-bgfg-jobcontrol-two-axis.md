@@ -111,6 +111,15 @@ hyoui 自身が外部（`kill -TSTP` / `bg`）から suspend されたときの�
 - 子は独立セッションリーダーなので **子の pgid == 子の pid**。
   グループ送信は `killpg(child_pid, sig)`。
 - INT / TERM / QUIT / HUP は子 pgrp にリレー。WINCH は PTY リサイズ。
+- **termios 復元** (= 2026-05-28 追加): hyoui が STOPPED に入る際、外側 TTY が raw mode のままだと
+  親 multiplexer (cmux / tmux / libghostty 等) が freeze する。対策として:
+  - `TtyGuard::suspend()` (= saved termios 適用) / `resume()` (= raw 再適用) を `sys/tty.rs` に追加
+  - `DaemonConfig::on_suspend` / `on_resume` callback で CLI process が保持する `TtyGuard` を
+    daemon thread から触る形に橋渡し (= `hyoui run` 非 detached は 1 プロセス内 main + daemon の
+    2 thread なので Arc 共有可能)
+  - `handle_suspend_signals` (= 外部 SIGTSTP 経路 = 軸 2) と `handle_child_transition::Follow`
+    (= 子 self-stop 経路 = 軸 1) の両方で `raise(SIGSTOP)` 直前/直後に呼ぶ
+  - `hyoui attach` プロセスは別 process のため独自 SIGTSTP handler 配線が必要 (= 別 issue)
 
 ## 仕様の限界
 
