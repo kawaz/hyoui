@@ -67,13 +67,20 @@ daemon が子 PTY exit を観測した瞬間、daemon shutdown 前に全 attache
 ```cbor
 {
   "kind": "session.exit.notify",
-  "exit-code": <int>,         // 子 PTY の exit code (= POSIX 0..255 + 拡張 for signal death)
-  "signaled": <bool>,         // signal で死んだか? true なら exit-code は signal number
-  "signal": <text> | null     // DR-0012 形式 (= "SIGTERM" 等)、signaled=true 時のみ
+  "exit-status": <int>,       // 親 client がそのまま `process::exit(status)` する shell convention 値
+                              // = 通常 exit: 子の exit code (0..255)
+                              // = signal 死亡: 128 + signum (= shell convention、bash 等と整合)
+  "signal": <text> | null     // signal で死んだ場合の補足情報 (= "SIGTERM" 等、DR-0012 形式)
+                              // signaled=true 時のみ非 null、debug / 表示用
 }
 ```
 
-client は本 message 受信時に自プロセスの exit code として伝搬。daemon は本 message broadcast 後に socket close + process exit。
+client は本 message 受信時に **`exit-status` をそのまま自プロセスの exit code として
+伝搬** (= 既存 `finalize_child` の `Ok(WaitStatus::Signaled(_, sig, _)) => 128 + sig`
+慣習と整合)。`signal` field は補足情報で、client が「signal 死亡」を区別したい場合の
+optional info (= 多くの場合は `exit-status` だけで足りる)。
+
+daemon は本 message broadcast 後に socket close + process exit。
 
 #### 2.2 `session.child.stopped.notify` + `session.child.resume.request` (= DR-0001 軸 1 維持、cap flag `child-state-v1`)
 
@@ -285,37 +292,39 @@ hyoui run -- cmd
             └─ broadcast loop
        ↑ signal 共有が問題
 
-[AFTER = 本 DR]
+[AFTER = 本 DR、軸 2 廃止後]
 hyoui run -- cmd
   ├─ process A (= 親 client、pid=Y、leader)
   │    ├─ socketpair で daemon と startup handshake
   │    ├─ TtyGuard (= 外側 TTY raw mode)
-  │    ├─ SIGTSTP/SIGCONT handler (= 軸 2 transparent/decouple)
-  │    │    └─ 外部 TSTP 受信 → daemon に signal{SIGSTOP} + 自分も raise(SIGSTOP)
-  │    ├─ socket connect (= 通常 attach、negotiate cap で policy 渡す)
+  │    ├─ SIGTSTP/SIGCONT handler (= 自プロセスの termios 管理のみ)
+  │    │    └─ 外部 TSTP 受信 → TtyGuard.suspend() + raise(SIGSTOP) で自分だけ止まる
+  │    │       (= daemon には何も送らない、§2.3 軸 2 廃止)
+  │    ├─ socket connect (= 通常 attach、negotiate cap で on-child-suspend policy 渡す)
   │    ├─ conn.run (= stdin/stdout 中継)
   │    ├─ session.child.stopped.notify 受信 → 軸 1 follow/auto-resume 発動
-  │    └─ session.exit.notify 受信 → exit code として exit
+  │    │    └─ follow なら TtyGuard.suspend() + raise(SIGSTOP)、復帰後
+  │    │       session.child.resume.request を送って子も復帰
+  │    └─ session.exit.notify 受信 → exit-status として親が exit
   └─ process B (= daemon、pid=Z、A の子)
        ├─ socketpair handshake で DaemonStartupResult を A に送信
        ├─ child PTY (= cmd 孫 process、line discipline で Ctrl-Z → 子 SIGTSTP)
        ├─ socket bind + listener
        ├─ SIGCHLD + waitpid(WUNTRACED|WCONTINUED) handler
-       │    ├─ 子 stopped → session.child.stopped.notify を leader に
+       │    ├─ 子 stopped (= 100% self-stop 起因、§2.3 で軸 2 廃止)
+       │    │    → leader cap check → notify or auto-resume fallback
        │    └─ 子 exit → session.exit.notify を全 client に (cap-aware broadcast)
-       ├─ session.child.resume.request 受信 → killpg(child, SIGCONT)
-       ├─ signal{SIGSTOP/SIGCONT} 受信 → killpg(child, signal) (= 軸 2)
-       └─ broadcast loop
+       ├─ session.child.resume.request 受信 → killpg(child_pgid, SIGCONT)
+       └─ broadcast loop (= daemon が能動的に子 pgrp を SIGSTOP する経路は本 DR では一切不存在)
 ```
 
-**Ctrl-Z 配信経路の整理** (= codex 指摘 1 への対応根拠):
+**Ctrl-Z 配信経路の整理**:
 - 子 PTY 内で Ctrl-Z byte 入力 → PTY line discipline が SIGTSTP を子 pgrp に送る
   → 子 stopped → daemon の `waitpid(WUNTRACED)` が observe
   → leader (= process A) に `session.child.stopped.notify` 送信
-  → leader が follow/auto-resume policy 発動
-- 外部 `kill -TSTP <process A>` → process A の SIGTSTP handler が signal{SIGSTOP}
-  message を daemon に送る → daemon が `killpg(child, SIGSTOP)` (= 軸 2 transparent)
-  → process A 自身も `raise(SIGSTOP)`
+  → leader が `on-child-suspend` policy 発動 (= follow / auto-resume)
+- **外部 `kill -TSTP <process A>` の場合は process A だけが止まる** (= 軸 2 廃止、§2.3)。
+  daemon には何も伝わらず、子も他 client も無影響
 
 ## Rejected alternatives
 
