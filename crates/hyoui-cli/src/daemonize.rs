@@ -32,12 +32,48 @@ pub fn run_detached_parent(
     debug_dump: Option<String>,
     cmd: Vec<String>,
 ) -> ExitCode {
+    match spawn_detached_daemon_and_wait_ready(
+        session_id_override,
+        socket_override,
+        cols,
+        rows,
+        until,
+        scrollback_rows,
+        debug_dump,
+        cmd,
+    ) {
+        Ok((_session_id, sock)) => {
+            // 子は live + bind 完了。親は exit。socket path を出力。
+            println!("{}", sock.display());
+            ExitCode::SUCCESS
+        }
+        Err(code) => code,
+    }
+}
+
+/// DR-0015 §1 (exec attach pattern): detached daemon を spawn して ready 通知を待ち、
+/// 成功時に `(session_id, sock_path)` を返す。失敗時は stderr を吐いて `ExitCode` を返す。
+///
+/// `hyoui run --detached` の path (= ready 通知後に親が exit) と、
+/// `hyoui run` 非 detached の path (= ready 通知後に親が `hyoui attach` に exec で
+/// 自プロセスを置換) で共通利用される spawn + wait helper。
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_detached_daemon_and_wait_ready(
+    session_id_override: Option<String>,
+    socket_override: Option<String>,
+    cols: u16,
+    rows: u16,
+    until: Option<String>,
+    scrollback_rows: Option<usize>,
+    debug_dump: Option<String>,
+    cmd: Vec<String>,
+) -> Result<(String, PathBuf), ExitCode> {
     let session_id = session_id_override.unwrap_or_else(socket_path::auto_session_id);
     let sock = match socket_path::resolve(socket_override.as_deref(), &session_id) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("hyoui: socket path 解決失敗: {e}");
-            return ExitCode::from(1);
+            return Err(ExitCode::from(1));
         }
     };
 
@@ -46,7 +82,7 @@ pub fn run_detached_parent(
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("hyoui: pipe 失敗: {e}");
-            return ExitCode::from(1);
+            return Err(ExitCode::from(1));
         }
     };
 
@@ -54,7 +90,7 @@ pub fn run_detached_parent(
         Ok(p) => p,
         Err(e) => {
             eprintln!("hyoui: current_exe 失敗: {e}");
-            return ExitCode::from(1);
+            return Err(ExitCode::from(1));
         }
     };
 
@@ -69,20 +105,14 @@ pub fn run_detached_parent(
     child.arg(format!("--cols={cols}"));
     child.arg(format!("--rows={rows}"));
     child.arg(format!("--ready-fd={wr_raw}"));
-    // R5-FB1: --until PATTERN を daemon 子に伝搬。空 string は無効。
     if let Some(needle) = until.as_deref() {
         if !needle.is_empty() {
             child.arg(format!("--until={needle}"));
         }
     }
-    // DR-0015: 軸 2 廃止 + 軸 1 policy は client 側で発動するため、daemon 子に
-    // jobcontrol policy を渡さない (= 旧 --on-child-suspend / --on-parent-suspend 廃止)。
-    // DR-0013 §8 + §8 Update: scrollback rows を daemon 子に伝搬。
-    // 未指定 (= None) なら flag は渡さず子側の既定 (= DaemonConfig 既定値 1000) が使われる。
     if let Some(n) = scrollback_rows {
         child.arg(format!("--scrollback-rows={n}"));
     }
-    // `--debug-dump=<path>` を daemon 子に伝搬。
     if let Some(path) = debug_dump.as_deref() {
         if !path.is_empty() {
             child.arg(format!("--debug-dump={path}"));
@@ -92,10 +122,11 @@ pub fn run_detached_parent(
     for c in cmd {
         child.arg(c);
     }
-    // 子の stdio は /dev/null (= daemon らしく独立)。
+    // 子の stdio: daemon らしく独立。ただし stderr は inherit (= §2.3.5 採用パターン、
+    // daemon 起動失敗時の error 文字列を parent / ユーザに伝えるため)。
     child.stdin(Stdio::null());
     child.stdout(Stdio::null());
-    child.stderr(Stdio::null());
+    child.stderr(Stdio::inherit());
 
     let spawn_result = child.spawn();
     // 親側の write 端 fd は spawn 後 close (= 子が close したときに親側 read が
@@ -104,7 +135,7 @@ pub fn run_detached_parent(
 
     if let Err(e) = spawn_result {
         eprintln!("hyoui: spawn 失敗: {e}");
-        return ExitCode::from(1);
+        return Err(ExitCode::from(1));
     }
 
     // ready pipe から 1 byte 読む (= 子が ready 通知)
@@ -113,14 +144,10 @@ pub fn run_detached_parent(
     drop(rd);
 
     match n {
-        Ok(1) => {
-            // 子は live + bind 完了。親は exit。socket path を出力。
-            println!("{}", sock.display());
-            ExitCode::SUCCESS
-        }
+        Ok(1) => Ok((session_id, sock)),
         _ => {
             eprintln!("hyoui: daemon child failed to start");
-            ExitCode::from(1)
+            Err(ExitCode::from(1))
         }
     }
 }
