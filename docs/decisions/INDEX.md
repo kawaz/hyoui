@@ -29,7 +29,7 @@ hyoui の設計判断記録一覧。ファイル名は `DR-NNNN-title.md`（4 �
 | [DR-0012](./DR-0012-signal-wire-name-not-number.md) | 🟡 部分実装 | signal wire を u8 number から signal name string に変更 (v0.2.0 breaking change) |
 | [DR-0013](./DR-0013-screen-emulator-and-attach-stability.md) | 🟡 部分実装 (Phase A/B + scrollback layer 完了、Phase C 残: observe mode / multi-client resize モード / reflow / zstd 等) | screen emulator + attach/detach 安定化 + データモデル統一 (vt100 採用、daemon = screen state 正本化) |
 | [DR-0014](./DR-0014-transparency-and-empirical-verification.md) | N/A (= プロセス) | 透過原則の徹底と検証主義 (= self-check リスト、マトリクス検証主義、ドッグフーディング、CLAUDE.md 経由で常時参照) |
-| [DR-0015](./DR-0015-run-as-fork-plus-attach.md) | ⬜ 未実装 (Phase A-D) | `hyoui run` を fork daemon + attach client の合成に再定義、client/server 同居廃止 (= signal handling 単純化、Issue #1 / attach 派生 issue を統合吸収) |
+| [DR-0015](./DR-0015-run-as-fork-plus-attach.md) | ✅ 実装済 (2026-05-28) | `hyoui run` を fork daemon + attach client の合成に再定義、client/server 同居廃止 (= Phase A-D 全完了、新 protocol message 3 個 + linger pattern + attach SIGTSTP handler + Issue #1 / 派生 issue 解消) |
 
 ## Archived
 
