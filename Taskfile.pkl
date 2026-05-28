@@ -29,13 +29,15 @@ local lintRust: Task = new {
     """
 }
 
-// unsafe 封じ込め gate: unsafe は sys/raw.rs / sys/signal.rs のみに限定。
+// unsafe 封じ込め gate: unsafe は sys/raw.rs / sys/signal.rs / sys/env.rs のみに限定。
 // daemon/session.rs の例外 (= R4-H4 の Session::into_parts) は Option<Inner>
-// 化で撤去済。他に漏れたら fail。grep が何もマッチしなければ exit 1 を返すので、
+// 化で撤去済。sys/env.rs は Rust 2024 edition で unsafe 化された
+// std::env::set_var / remove_var の test 用 thin wrapper を集約。
+// 他に漏れたら fail。grep が何もマッチしなければ exit 1 を返すので、
 // マッチ無しを成功とする。
 local lintUnsafe: Task = new {
   name = "lint:unsafe"
-  description = "verify unsafe is confined to sys/raw.rs, sys/signal.rs"
+  description = "verify unsafe is confined to sys/raw.rs, sys/signal.rs, sys/env.rs"
   visibility = "internal"
   inputs {
     "crates/hyoui/src/**/*.rs"
@@ -44,9 +46,9 @@ local lintUnsafe: Task = new {
     #"""
     set -uo pipefail
     leaked=$(grep -rnE '\bunsafe[[:space:]]+(fn|impl|trait|extern|\{)' crates/hyoui/src --include='*.rs' \
-      | grep -v 'src/sys/raw.rs\|src/sys/signal.rs' || true)
+      | grep -v 'src/sys/raw.rs\|src/sys/signal.rs\|src/sys/env.rs' || true)
     if [ -n "$leaked" ]; then
-      echo "ERROR: unsafe leaked outside whitelisted files (sys/raw.rs, sys/signal.rs):" >&2
+      echo "ERROR: unsafe leaked outside whitelisted files (sys/raw.rs, sys/signal.rs, sys/env.rs):" >&2
       echo "$leaked" >&2
       exit 1
     fi
