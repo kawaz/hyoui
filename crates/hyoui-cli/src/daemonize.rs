@@ -25,8 +25,7 @@ use crate::socket_path;
 pub fn run_detached_parent(
     session_id_override: Option<String>,
     socket_override: Option<String>,
-    cols: u16,
-    rows: u16,
+    initial_size: Option<(u16, u16)>,
     until: Option<String>,
     scrollback_rows: Option<usize>,
     debug_dump: Option<String>,
@@ -35,8 +34,7 @@ pub fn run_detached_parent(
     match spawn_detached_daemon_and_wait_ready(
         session_id_override,
         socket_override,
-        cols,
-        rows,
+        initial_size,
         until,
         scrollback_rows,
         debug_dump,
@@ -61,8 +59,7 @@ pub fn run_detached_parent(
 pub fn spawn_detached_daemon_and_wait_ready(
     session_id_override: Option<String>,
     socket_override: Option<String>,
-    cols: u16,
-    rows: u16,
+    initial_size: Option<(u16, u16)>,
     until: Option<String>,
     scrollback_rows: Option<usize>,
     debug_dump: Option<String>,
@@ -102,8 +99,9 @@ pub fn spawn_detached_daemon_and_wait_ready(
     child.arg("__daemonize-run");
     child.arg(format!("--socket={}", sock.display()));
     child.arg(format!("--session={session_id}"));
-    child.arg(format!("--cols={cols}"));
-    child.arg(format!("--rows={rows}"));
+    // DR-0015 Task #N (2026-05-29 kawaz 指示): 初期 PTY size は **stdin pipe 経由**で
+    // daemon に渡す (= 明示 `--cols/--rows` も同経路、ps から数値完全クリーン化)。
+    // 旧 `--cols=N --rows=M` arg は廃止 (= ps cleanup の主目的)。
     child.arg(format!("--ready-fd={wr_raw}"));
     if let Some(needle) = until.as_deref() {
         if !needle.is_empty() {
@@ -122,9 +120,10 @@ pub fn spawn_detached_daemon_and_wait_ready(
     for c in cmd {
         child.arg(c);
     }
-    // 子の stdio: daemon らしく独立。ただし stderr は inherit (= §2.3.5 採用パターン、
-    // daemon 起動失敗時の error 文字列を parent / ユーザに伝えるため)。
-    child.stdin(Stdio::null());
+    // 子の stdio: stdin は **piped** で initial size 通信用 (= 1 行読み終わったら
+    // daemon 側で /dev/null に redirect)。stdout は /dev/null、stderr は inherit
+    // (= §2.3.5 採用パターン、daemon 起動失敗時の error 文字列を parent / ユーザに伝える)。
+    child.stdin(Stdio::piped());
     child.stdout(Stdio::null());
     child.stderr(Stdio::inherit());
 
@@ -133,10 +132,24 @@ pub fn spawn_detached_daemon_and_wait_ready(
     // EOF を返せるように)。
     let _ = nix::unistd::close(wr_raw);
 
-    if let Err(e) = spawn_result {
-        eprintln!("hyoui: spawn 失敗: {e}");
-        return Err(ExitCode::from(1));
+    let mut spawned = match spawn_result {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("hyoui: spawn 失敗: {e}");
+            return Err(ExitCode::from(1));
+        }
+    };
+
+    // initial size を stdin pipe に書く (= optional、None なら何も書かない、
+    // daemon 側 default 80x24 で起動)。書き終わったら stdin handle を drop して
+    // EOF 通知 (= daemon 側 read_line が return)。
+    if let Some((cols, rows)) = initial_size {
+        if let Some(stdin) = spawned.stdin.as_mut() {
+            use std::io::Write as _;
+            let _ = writeln!(stdin, "size {cols} {rows}");
+        }
     }
+    drop(spawned.stdin.take());
 
     // ready pipe から 1 byte 読む (= 子が ready 通知)
     let mut buf = [0u8; 1];
@@ -212,6 +225,33 @@ pub fn run_daemon_child(args: &[String]) -> ExitCode {
         }
     };
     let session_id = session.unwrap_or_else(|| format!("run-{}", std::process::id()));
+
+    // DR-0015 Task #N (2026-05-29 kawaz 指示): stdin pipe 経由で initial size を
+    // 受け取る (= ps から `--cols/--rows` 数値を消す目的)。parent が `"size COLS ROWS"`
+    // を 1 行書いて drop、daemon は read_line で受け取る。read 後は stdin を /dev/null
+    // に redirect (= daemonize 慣例)。pipe が無い (= 旧経路 / 単体起動) なら read EOF
+    // で何もせず continue。
+    {
+        use std::io::BufRead as _;
+        let stdin = std::io::stdin();
+        let mut line = String::new();
+        // pipe からの 1 行 read (parent が drop で EOF 通知)。pipe 不在なら即 EOF。
+        let _ = stdin.lock().read_line(&mut line);
+        // split_whitespace は trailing whitespace を skip するため trim 不要 (clippy)
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 3 && parts[0] == "size" {
+            if let Ok(c) = parts[1].parse::<u16>() {
+                cols = c;
+            }
+            if let Ok(r) = parts[2].parse::<u16>() {
+                rows = r;
+            }
+        }
+    }
+    // stdin を /dev/null に redirect (= daemon 化慣例、後続処理が誤って stdin から
+    // read しないように)。pipe handle は既に EOF 状態、drop で close。
+    // hyoui-cli は forbid(unsafe_code) のため hyoui::sys::raw 経由で safe wrap を使う。
+    let _ = hyoui::sys::raw::redirect_stdin_to_devnull();
 
     // setsid で新セッションリーダーになる (= controlling tty 切り離し)。
     // 既に session leader の場合は EPERM、無視。

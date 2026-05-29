@@ -189,3 +189,28 @@ pub(crate) fn borrow_raw_fd<'a>(raw: RawFd) -> BorrowedFd<'a> {
     // SAFETY: delegated to the caller's contract.
     unsafe { BorrowedFd::borrow_raw(raw) }
 }
+
+/// Redirect `stdin` (= fd 0) to `/dev/null` (= daemon 化慣例の subset)。
+///
+/// `dup2(devnull, 0)` で fd 0 を /dev/null に置換する。`hyoui-cli` 等の
+/// `forbid(unsafe_code)` crate から safe に呼べるよう本 module 経由で wrap する。
+///
+/// nix 0.31 の `dup2(src: BorrowedFd, dst: &mut OwnedFd)` は fd 0 を OwnedFd 化
+/// できない (= close 時に std stdin が無効化される) ため、libc::dup2 を直接 unsafe で
+/// 呼ぶ。本 module は `unsafe` boundary なので OK。
+///
+/// # Errors
+///
+/// `/dev/null` を open できない / `dup2` syscall が失敗した場合に [`Error`] を返す。
+pub fn redirect_stdin_to_devnull() -> Result<()> {
+    let devnull = std::fs::File::open("/dev/null").map_err(Error::from)?;
+    let devnull_fd = devnull.as_raw_fd();
+    // SAFETY: libc::dup2 は raw fd を取る同期 syscall。devnull_fd は本関数内で生存
+    // (= devnull が drop されるのは関数終了時、dup2 は scope 内同期完結)。fd 0 は
+    // POSIX で stdin として available、dup2 で置換しても OS が close する責務。
+    let rc = unsafe { libc::dup2(devnull_fd, 0) };
+    if rc < 0 {
+        return Err(Error::from(Errno::last()));
+    }
+    Ok(())
+}

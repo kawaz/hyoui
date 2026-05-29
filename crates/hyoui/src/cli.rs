@@ -127,10 +127,12 @@ pub enum HelpTopic {
 pub struct RunConfig {
     /// Operating mode.
     pub mode: Mode,
-    /// Virtual screen columns (used in headless mode; default 80).
-    pub cols: i32,
-    /// Virtual screen rows (used in headless mode; default 24).
-    pub rows: i32,
+    /// Virtual screen columns (explicit `--cols/--size` 指定時のみ Some)。
+    /// `None` なら caller (= `run_command`) が外側 TTY size or 80 fallback で解決。
+    pub cols: Option<i32>,
+    /// Virtual screen rows (explicit `--rows/--size` 指定時のみ Some)。
+    /// `None` なら caller (= `run_command`) が外側 TTY size or 24 fallback で解決。
+    pub rows: Option<i32>,
     /// Overall timeout in milliseconds, or `None` if unset.
     /// 負値は意味を持たないので `u64` (WaitConfig.timeout_ms と整合)。
     pub timeout_ms: Option<u64>,
@@ -1621,14 +1623,12 @@ fn parse_run(args: &[String]) -> Command {
         Mode::Interactive => OnChildSuspend::Follow,
     });
 
-    // Virtual size: default to 80x24 when unspecified.
-    let cols = explicit_cols.unwrap_or(80);
-    let rows = explicit_rows.unwrap_or(24);
-
+    // Virtual size: explicit 指定のみ Some、未指定なら None で caller (= run_command)
+    // が外側 TTY size を継承する経路に流す (= ユーザ指示 2026-05-29)。
     Command::Run(RunConfig {
         mode,
-        cols,
-        rows,
+        cols: explicit_cols,
+        rows: explicit_rows,
         timeout_ms,
         idle_timeout_ms,
         until,
@@ -3516,8 +3516,10 @@ mod tests {
             Command::Run(cfg) => {
                 assert_eq!(cfg.mode, Mode::Headless);
                 assert_eq!(cfg.on_child_suspend, OnChildSuspend::AutoResume);
-                assert_eq!(cfg.cols, 80);
-                assert_eq!(cfg.rows, 24);
+                // size 未指定なら None = caller (= run_command) が外側 TTY size or
+                // 80x24 fallback で解決する経路 (= ユーザ指示 2026-05-29)。
+                assert_eq!(cfg.cols, None);
+                assert_eq!(cfg.rows, None);
             }
             other => panic!("expected Run, got {other:?}"),
         }
@@ -3544,8 +3546,8 @@ mod tests {
     fn run_size_parses_cols_and_rows() {
         match parse_args(&args(&["run", "--size", "120x40", "--", "vim"])) {
             Command::Run(cfg) => {
-                assert_eq!(cfg.cols, 120);
-                assert_eq!(cfg.rows, 40);
+                assert_eq!(cfg.cols, Some(120));
+                assert_eq!(cfg.rows, Some(40));
             }
             other => panic!("expected Run, got {other:?}"),
         }
@@ -3557,8 +3559,8 @@ mod tests {
             "run", "--cols", "100", "--rows", "30", "--", "top",
         ])) {
             Command::Run(cfg) => {
-                assert_eq!(cfg.cols, 100);
-                assert_eq!(cfg.rows, 30);
+                assert_eq!(cfg.cols, Some(100));
+                assert_eq!(cfg.rows, Some(30));
             }
             other => panic!("expected Run, got {other:?}"),
         }

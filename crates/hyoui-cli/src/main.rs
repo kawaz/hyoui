@@ -342,8 +342,39 @@ fn resolve_scrollback_rows(cfg_value: Option<usize>) -> Option<usize> {
 /// 4. daemon thread を join、その exit code を返す
 fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     let scrollback_rows = resolve_scrollback_rows(cfg.scrollback_rows);
-    let cols = u16::try_from(cfg.cols).unwrap_or(80);
-    let rows = u16::try_from(cfg.rows).unwrap_or(24);
+    // size 解決 (= ユーザ指示 2026-05-29、stdin pipe 経由):
+    // - 明示指定 (= --cols/--rows/--size) があればそれを使う
+    // - 非 detached + 明示なし → 外側 TTY size (= stdin) を継承
+    // - detached + 明示なし → None (= daemon 側 default 80x24 で起動、後で attach resize)
+    // - 非 TTY (= pipe) + 明示なし → None (= daemon 側 default)
+    //
+    // Some なら parent が daemon spawn 時に stdin pipe で送る (= ps から数値消す目的)、
+    // None なら何も送らない (= daemon 側 default 80x24)。
+    let initial_size: Option<(u16, u16)> = {
+        let explicit_c = cfg.cols.and_then(|c| u16::try_from(c).ok());
+        let explicit_r = cfg.rows.and_then(|r| u16::try_from(r).ok());
+        match (explicit_c, explicit_r) {
+            (Some(c), Some(r)) => Some((c, r)),
+            _ if !cfg.detached => {
+                let stdin = std::io::stdin();
+                if let Ok(Some(ws)) = hyoui::sys::tty_size(stdin.as_fd()) {
+                    Some((explicit_c.unwrap_or(ws.cols), explicit_r.unwrap_or(ws.rows)))
+                } else {
+                    // 部分指定は補完して送る、両方なしは None で daemon default
+                    match (explicit_c, explicit_r) {
+                        (Some(c), None) => Some((c, 24)),
+                        (None, Some(r)) => Some((80, r)),
+                        _ => None,
+                    }
+                }
+            }
+            _ => match (explicit_c, explicit_r) {
+                (Some(c), None) => Some((c, 24)),
+                (None, Some(r)) => Some((80, r)),
+                _ => None, // detached + 全部未指定 → daemon default
+            },
+        }
+    };
     if cfg.detached {
         if cfg.debug_dump_client.is_some() {
             // detached parent は client role を担わない (= 即 exit) ので
@@ -357,8 +388,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
         return daemonize::run_detached_parent(
             cfg.session.clone(),
             cfg.socket.clone(),
-            cols,
-            rows,
+            initial_size,
             cfg.until.clone(),
             scrollback_rows,
             cfg.debug_dump_server.clone(),
@@ -377,8 +407,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     let (session_id, _sock) = match daemonize::spawn_detached_daemon_and_wait_ready(
         cfg.session.clone(),
         cfg.socket.clone(),
-        cols,
-        rows,
+        initial_size,
         cfg.until.clone(),
         scrollback_rows,
         cfg.debug_dump_server.clone(),
