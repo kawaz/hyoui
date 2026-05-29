@@ -95,35 +95,44 @@ pub fn spawn_detached_daemon_and_wait_ready(
     // この fd が継承されている前提で読み書きする (POSIX 標準挙動)。
     let wr_raw = wr.into_raw_fd();
 
+    // DR-0015 Task #N (2026-05-29 kawaz 指示、完全形): 旧 `__daemonize-run` hidden
+    // subcommand + `--cols/--rows/--socket/--session/--ready-fd/--scrollback-rows/
+    // --debug-dump/--until` 全 internal arg を **env 1 つにシリアライズ**して渡す。
+    // ps からは `hyoui run --detached -- cmd args...` の最終形 (= user-facing と同じ)。
+    //
+    // daemon は env `HYOUI_DAEMONIZE_INIT` を main entry 直後に parse → unset で
+    // 孫 process には漏れない。pipe は ready 通知 (= daemon → parent の bind 完了
+    // 通知、env では実装不可) のみ残置。
+    let init = DaemonizeInit {
+        socket: sock.to_string_lossy().into_owned(),
+        session: session_id.clone(),
+        ready_fd: wr_raw,
+        cols: initial_size.map(|(c, _)| c),
+        rows: initial_size.map(|(_, r)| r),
+        until: until.filter(|s| !s.is_empty()),
+        scrollback_rows,
+        debug_dump: debug_dump.filter(|s| !s.is_empty()),
+    };
+    let init_json = match serde_json::to_string(&init) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("hyoui: daemon init serialize 失敗: {e}");
+            return Err(ExitCode::from(1));
+        }
+    };
+
     let mut child = Command::new(exe);
-    child.arg("__daemonize-run");
-    child.arg(format!("--socket={}", sock.display()));
-    child.arg(format!("--session={session_id}"));
-    // DR-0015 Task #N (2026-05-29 kawaz 指示): 初期 PTY size は **stdin pipe 経由**で
-    // daemon に渡す (= 明示 `--cols/--rows` も同経路、ps から数値完全クリーン化)。
-    // 旧 `--cols=N --rows=M` arg は廃止 (= ps cleanup の主目的)。
-    child.arg(format!("--ready-fd={wr_raw}"));
-    if let Some(needle) = until.as_deref() {
-        if !needle.is_empty() {
-            child.arg(format!("--until={needle}"));
-        }
-    }
-    if let Some(n) = scrollback_rows {
-        child.arg(format!("--scrollback-rows={n}"));
-    }
-    if let Some(path) = debug_dump.as_deref() {
-        if !path.is_empty() {
-            child.arg(format!("--debug-dump={path}"));
-        }
-    }
+    child.env("HYOUI_DAEMONIZE_INIT", &init_json);
+    child.arg("run");
+    child.arg("--detached");
     child.arg("--");
     for c in cmd {
         child.arg(c);
     }
-    // 子の stdio: stdin は **piped** で initial size 通信用 (= 1 行読み終わったら
-    // daemon 側で /dev/null に redirect)。stdout は /dev/null、stderr は inherit
-    // (= §2.3.5 採用パターン、daemon 起動失敗時の error 文字列を parent / ユーザに伝える)。
-    child.stdin(Stdio::piped());
+    // 子の stdio: stdin は /dev/null (= 旧 stdin pipe size 経路は env 化で廃止)、
+    // stdout は /dev/null、stderr は inherit (= §2.3.5 採用パターン、daemon 起動
+    // 失敗時の error 文字列を parent / ユーザに伝える)。
+    child.stdin(Stdio::null());
     child.stdout(Stdio::null());
     child.stderr(Stdio::inherit());
 
@@ -132,24 +141,10 @@ pub fn spawn_detached_daemon_and_wait_ready(
     // EOF を返せるように)。
     let _ = nix::unistd::close(wr_raw);
 
-    let mut spawned = match spawn_result {
-        Ok(child) => child,
-        Err(e) => {
-            eprintln!("hyoui: spawn 失敗: {e}");
-            return Err(ExitCode::from(1));
-        }
-    };
-
-    // initial size を stdin pipe に書く (= optional、None なら何も書かない、
-    // daemon 側 default 80x24 で起動)。書き終わったら stdin handle を drop して
-    // EOF 通知 (= daemon 側 read_line が return)。
-    if let Some((cols, rows)) = initial_size {
-        if let Some(stdin) = spawned.stdin.as_mut() {
-            use std::io::Write as _;
-            let _ = writeln!(stdin, "size {cols} {rows}");
-        }
+    if let Err(e) = spawn_result {
+        eprintln!("hyoui: spawn 失敗: {e}");
+        return Err(ExitCode::from(1));
     }
-    drop(spawned.stdin.take());
 
     // ready pipe から 1 byte 読む (= 子が ready 通知)
     let mut buf = [0u8; 1];
@@ -165,93 +160,92 @@ pub fn spawn_detached_daemon_and_wait_ready(
     }
 }
 
-/// `__daemonize-run` 隠し subcommand: daemon 子 process の本体。
+/// DR-0015 Task #N (= kawaz 指示 2026-05-29): daemon 子 process に init 情報を
+/// env で渡すための JSON schema。
 ///
-/// 引数:
-/// - `--socket=PATH`: bind 対象
-/// - `--session=ID`: session id
-/// - `--cols=N --rows=N`: 子 PTY サイズ
-/// - `--ready-fd=N`: 親に ready 通知する pipe write 端 fd
-/// - `--` 以降: 子 PTY が exec する command + args
-pub fn run_daemon_child(args: &[String]) -> ExitCode {
-    let mut socket: Option<String> = None;
-    let mut session: Option<String> = None;
-    let mut cols: u16 = 80;
-    let mut rows: u16 = 24;
-    let mut ready_fd: Option<i32> = None;
-    let mut until: Option<String> = None;
-    // DR-0013 §8: parent から伝搬される scrollback rows。None なら DaemonConfig 既定値を維持。
-    let mut scrollback_rows: Option<usize> = None;
-    let mut debug_dump: Option<String> = None;
+/// 独自 format (= `key=val|key=val`) は escape rule 不在 + path に `|` 含む edge
+/// case で壊れる脆さがあるため JSON を採用 (= serde_json で safe encode/decode)。
+/// env value は text-safe (= UTF-8 で完結、null byte 不可) なので JSON が自然。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct DaemonizeInit {
+    socket: String,
+    session: String,
+    #[serde(rename = "ready_fd")]
+    ready_fd: std::os::fd::RawFd,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    cols: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    rows: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    until: Option<String>,
+    #[serde(
+        rename = "scrollback_rows",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    scrollback_rows: Option<usize>,
+    #[serde(
+        rename = "debug_dump",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    debug_dump: Option<String>,
+}
+
+/// daemon 子 process の本体 (= env `HYOUI_DAEMONIZE_INIT` で JSON init を受け取る)。
+///
+/// DR-0015 Task #N (2026-05-29 kawaz 指示、env JSON):
+/// - 旧 `__daemonize-run` hidden subcommand 廃止
+/// - 旧 `--socket=PATH --session=ID --cols=N --rows=N --ready-fd=N --until=... --
+///   scrollback-rows=N --debug-dump=...` の internal arg 全廃
+/// - **env `HYOUI_DAEMONIZE_INIT` (= JSON) で全 init 情報を受け取る**経路に統一
+/// - 残る argv: parent が put した `["run", "--detached", "--", cmd, args...]`
+///   (= ps からは通常の `hyoui run --detached -- cmd` に見える、internal flag ゼロ)
+///
+/// caller (= `hyoui-cli` main entry) が env 存在で本関数に dispatch、子 process
+/// の argv は本関数では使わず env から init 情報 + その argv は `run --detached
+/// -- cmd args...` から cmd 部分を取得する。
+pub fn run_daemon_child() -> ExitCode {
+    // env から JSON init を取得 + unset (= 孫 process 漏れ防止)。
+    let init_json = match std::env::var("HYOUI_DAEMONIZE_INIT") {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("hyoui: daemon child requires HYOUI_DAEMONIZE_INIT env (= internal)");
+            return ExitCode::from(2);
+        }
+    };
+    hyoui::sys::env::remove_var_at_startup("HYOUI_DAEMONIZE_INIT");
+
+    let init: DaemonizeInit = match serde_json::from_str(&init_json) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("hyoui: HYOUI_DAEMONIZE_INIT parse 失敗: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let socket = PathBuf::from(&init.socket);
+    let session_id = init.session.clone();
+    let cols = init.cols.unwrap_or(80);
+    let rows = init.rows.unwrap_or(24);
+    let ready_fd: Option<i32> = Some(init.ready_fd);
+    let until = init.until.clone();
+    let scrollback_rows = init.scrollback_rows;
+    let debug_dump = init.debug_dump.clone();
+
+    // 子 cmd は argv `["run", "--detached", "--", cmd, args...]` の "--" 以降を取得。
+    let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut cmd: Vec<String> = Vec::new();
     let mut in_cmd = false;
-    for arg in args {
+    for arg in &argv {
         if in_cmd {
             cmd.push(arg.clone());
             continue;
         }
         if arg == "--" {
             in_cmd = true;
-            continue;
-        }
-        if let Some(v) = arg.strip_prefix("--socket=") {
-            socket = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--session=") {
-            session = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--cols=") {
-            cols = v.parse().unwrap_or(80);
-        } else if let Some(v) = arg.strip_prefix("--rows=") {
-            rows = v.parse().unwrap_or(24);
-        } else if let Some(v) = arg.strip_prefix("--ready-fd=") {
-            ready_fd = v.parse().ok();
-        } else if let Some(v) = arg.strip_prefix("--until=") {
-            // R5-FB1: 親から渡された needle pattern
-            until = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--scrollback-rows=") {
-            // DR-0013 §8: 親 RunConfig から伝搬。parse 失敗時は既定値維持。
-            scrollback_rows = v.parse::<usize>().ok();
-        } else if let Some(v) = arg.strip_prefix("--debug-dump=") {
-            if !v.is_empty() {
-                debug_dump = Some(v.to_string());
-            }
         }
     }
-
-    let socket = match socket {
-        Some(s) => PathBuf::from(s),
-        None => {
-            eprintln!("hyoui: __daemonize-run requires --socket");
-            return ExitCode::from(2);
-        }
-    };
-    let session_id = session.unwrap_or_else(|| format!("run-{}", std::process::id()));
-
-    // DR-0015 Task #N (2026-05-29 kawaz 指示): stdin pipe 経由で initial size を
-    // 受け取る (= ps から `--cols/--rows` 数値を消す目的)。parent が `"size COLS ROWS"`
-    // を 1 行書いて drop、daemon は read_line で受け取る。read 後は stdin を /dev/null
-    // に redirect (= daemonize 慣例)。pipe が無い (= 旧経路 / 単体起動) なら read EOF
-    // で何もせず continue。
-    {
-        use std::io::BufRead as _;
-        let stdin = std::io::stdin();
-        let mut line = String::new();
-        // pipe からの 1 行 read (parent が drop で EOF 通知)。pipe 不在なら即 EOF。
-        let _ = stdin.lock().read_line(&mut line);
-        // split_whitespace は trailing whitespace を skip するため trim 不要 (clippy)
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 3 && parts[0] == "size" {
-            if let Ok(c) = parts[1].parse::<u16>() {
-                cols = c;
-            }
-            if let Ok(r) = parts[2].parse::<u16>() {
-                rows = r;
-            }
-        }
-    }
-    // stdin を /dev/null に redirect (= daemon 化慣例、後続処理が誤って stdin から
-    // read しないように)。pipe handle は既に EOF 状態、drop で close。
-    // hyoui-cli は forbid(unsafe_code) のため hyoui::sys::raw 経由で safe wrap を使う。
-    let _ = hyoui::sys::raw::redirect_stdin_to_devnull();
 
     // setsid で新セッションリーダーになる (= controlling tty 切り離し)。
     // 既に session leader の場合は EPERM、無視。

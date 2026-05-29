@@ -24,6 +24,10 @@ regex = { workspace = true }
 # `wait_core` の内部 CBOR デコード型 (= daemon の `ScreenSnapshot` 鏡像) を
 # serde::Deserialize で取り回すために必要。
 serde = { workspace = true }
+# DR-0015 Task #N: `__daemonize-run` 子に init 情報 (= socket / session / size 等)
+# を env シリアライズで渡す。JSON は env value の text-safe な serialize 形式として
+# 採用 (= 独自 parse の脆さ回避、kawaz 指示 2026-05-29)。
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

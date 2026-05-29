@@ -220,11 +220,17 @@ fn main() -> ExitCode {
     // Skip argv[0]: parse_args expects the trailing arguments only.
     let argv: Vec<String> = std::env::args().skip(1).collect();
 
-    // Hidden subcommand: 親 `hyoui run --detached ...` から self-exec 経由で
-    // 起動される daemon 子 process の entry point。cli parser を汚さないため
-    // ここで直接 dispatch する。
-    if argv.first().map(String::as_str) == Some("__daemonize-run") {
-        return daemonize::run_daemon_child(&argv[1..]);
+    // DR-0015 Task #N (2026-05-29 kawaz 指示): daemon 子 process は **env で識別**する
+    // (= 旧 `__daemonize-run` hidden subcommand 廃止)。`ps` から見ると通常の
+    // `hyoui run --detached --socket=... --session=... -- cmd` に見える形に。
+    //
+    // 起動直後に env を unset することで daemon が spawn する孫 process (= 子 PTY 経由
+    // の cmd) には漏れない。
+    // env `HYOUI_DAEMONIZE_INIT` 存在で daemon child 経路に分岐 (= JSON serialize で
+    // 初期化情報を全部受け取る)。run_daemon_child 内で env parse + unset する。
+    // 旧 `__daemonize-run` hidden subcommand + 旧 `--socket=` 等 flag は **全廃**。
+    if std::env::var("HYOUI_DAEMONIZE_INIT").is_ok() {
+        return daemonize::run_daemon_child();
     }
 
     let cmd = parse_args(&argv);
