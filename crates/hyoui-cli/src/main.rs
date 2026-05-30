@@ -939,14 +939,21 @@ fn kill_command(cfg: KillConfig) -> ExitCode {
     };
 
     let opts = AttachOptions {
-        mode: Mode::Ro, // kill だけ送るので入力なし、ro で OK
+        // kill は daemon 側 `handle_kill` で `ensure_rw_mode` 必須 (= Round2 #6 で
+        // 厳格化、`!Ro` → `Rw` のみに)。Ro で attach すると daemon が黙って
+        // ErrorMessage 返して session terminate しない (= 旧実装の regression、
+        // 「送信完了」表示で exit 0 してた致命 bug)。`hyoui kill` は session
+        // terminate 操作なので Rw + detach_others で leader 確保が筋。
+        mode: Mode::Rw,
         caps: hyoui::protocol::MVP_CAPS
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
         token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
         exclusive: false,
-        detach_others: false,
+        // kill は破壊操作なので既存 leader を蹴ってでも実行する (= UX 上「kill が
+        // leader busy で失敗」より「kill は確実に効く」が期待される)。
+        detach_others: true,
     };
 
     // R5-FB4: socket 不存在系 errno は短時間 retry。
@@ -969,9 +976,37 @@ fn kill_command(cfg: KillConfig) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    // daemon が close するのを待ってから exit。read で EOF を待つ。
-    // ClientConnection::run は stdin が必要なので使えない。明示的に socket を
-    // drop して exit。
+    // daemon の応答を待つ。
+    // 成功 path: `handle_kill` が `TerminateSession` を返して session 終了 →
+    //            daemon が socket を close → `recv_control` が Err (= EOF) で抜ける。
+    // 失敗 path: ensure_rw_mode 失敗 / invalid signal name 等で daemon が
+    //            `ControlMessage::Error` を 1 frame 送って `Continue` (= client
+    //            は切らない) → recv_control が `Ok(Error)` を返す。
+    //
+    // handshake 中 / 過渡的に LeaderNotify / ModeChange 等の broadcast control
+    // message が来る可能性があるため、Error / EOF 以外は skip して次の frame を待つ。
+    //
+    // 旧実装は send 直後 drop(conn) + 「送信完了」printだったため、失敗 path で
+    // daemon の ErrorMessage を読まず誤って成功扱いにする regression があった。
+    loop {
+        match conn.recv_control(None) {
+            Ok(hyoui::protocol::ControlMessage::Error(err)) => {
+                eprintln!(
+                    "hyoui: kill: daemon rejected ({:?}): {}",
+                    err.code, err.message
+                );
+                return ExitCode::from(1);
+            }
+            Ok(_) => {
+                // LeaderNotify / ModeChange 等の broadcast、skip して次の frame を待つ。
+                continue;
+            }
+            Err(_) => {
+                // EOF (= daemon が session terminate して socket close)。成功 path。
+                break;
+            }
+        }
+    }
     drop(conn);
 
     println!("hyoui: kill 送信完了: {}", sock.display());
