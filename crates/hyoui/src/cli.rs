@@ -276,6 +276,8 @@ pub struct StatusConfig {
     pub socket: Option<String>,
     /// Target session id。
     pub session_id: Option<String>,
+    /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
+    pub index: Option<i32>,
     /// `--format=plain|json` (= default `Plain`、H5: scripting で grep/cut の罠回避)。
     pub format: StatusFormat,
 }
@@ -295,6 +297,8 @@ pub struct TailConfig {
     pub socket: Option<String>,
     /// Target session id。
     pub session_id: Option<String>,
+    /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
+    pub index: Option<i32>,
     /// `--follow` で daemon が live stream を継続送信。
     pub follow: bool,
     /// `--strip-ansi` (alias: `--strip`) で daemon 側で escape を strip 済の TailData を流す。
@@ -324,6 +328,8 @@ pub struct WaitConfig {
     pub socket: Option<String>,
     /// Target session id。
     pub session_id: Option<String>,
+    /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
+    pub index: Option<i32>,
     /// regex pattern (= visible state に対する正規表現)。空文字列は parser 段で
     /// reject。multiline mode は実行側 (= `wait_core::wait_for_pattern`) で default
     /// ON にする。
@@ -403,6 +409,8 @@ pub struct ScreenDumpConfig {
     pub socket: Option<String>,
     /// Target session id。
     pub session_id: Option<String>,
+    /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
+    pub index: Option<i32>,
     /// `--format=ansi|binary|cbor` (= default ansi)。
     pub format: ScreenDumpCliFormat,
     /// `--layer=visible|scrollback|both` (= default visible、MVP は visible のみ送信)。
@@ -452,6 +460,8 @@ pub struct ScreenSnapshotConfig {
     pub socket: Option<String>,
     /// Target session id。
     pub session_id: Option<String>,
+    /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
+    pub index: Option<i32>,
     /// `--include=Cells,Cursor,...` (= comma-separated)、default は全 component。
     /// Vec はそのまま wire の `include: Vec<SnapshotComponent>` に流す。
     pub include: Vec<SnapshotCliComponent>,
@@ -515,6 +525,8 @@ pub struct LockAcquireConfig {
     pub socket: Option<String>,
     /// Target session id。
     pub session_id: Option<String>,
+    /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
+    pub index: Option<i32>,
     /// `--mode=wait|fail` (= default Wait)。fail = 即時 fail、wait = polling retry。
     pub mode: LockMode,
     /// `--timeout=<dur>` (= acquire 全体 timeout、`None` なら無限 wait)。
@@ -530,6 +542,8 @@ pub struct LockReleaseConfig {
     pub socket: Option<String>,
     /// Target session id。
     pub session_id: Option<String>,
+    /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
+    pub index: Option<i32>,
     /// `--token=<T>` の値 (`HYOUI_LOCK_TOKEN` env fallback あり、parser 段では None 可、
     /// CLI dispatcher 側で env を読む)。CLI flag で空文字列は parser 段で reject。
     pub token: Option<String>,
@@ -900,19 +914,25 @@ fn parse_kill(args: &[String]) -> Command {
     Command::Kill(cfg)
 }
 
-/// shared helper: --socket / --help / positional session_id を抜き出す。
+/// shared helper: `--socket` / `--index` / `--help` / positional session_id を抜き出す。
 /// 残ったオプションは caller がコールバックで処理する。
+///
+/// 戻り値: `(socket, session_id, index)`。同時指定の排他チェックも本 helper で行う。
+/// `--index=N` は session selector の共通形式 (= mtime 昇順 1-based、`1` 最古 / `-1` 最新)、
+/// `0` は不正。session_id が無く index も socket も無い場合はエラー (= 全 selector 不在)。
 #[allow(clippy::result_large_err)] // Command 内 String/Vec の Err サイズは parse path のみで許容
+#[allow(clippy::type_complexity)] // 3-tuple は session selector の自然な戻り型 (= 別 alias は冗長)
 fn parse_session_targeted<F>(
     name: &str,
     args: &[String],
     help_topic: HelpTopic,
     mut on_option: F,
-) -> Result<(Option<String>, Option<String>), Command>
+) -> Result<(Option<String>, Option<String>, Option<i32>), Command>
 where
     F: FnMut(&str, Option<String>) -> Result<bool, Command>,
 {
     let mut socket: Option<String> = None;
+    let mut index: Option<i32> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut i = 0usize;
     while i < args.len() {
@@ -938,6 +958,24 @@ where
                 Some(v) => socket = Some(v),
                 None => return Err(Command::Error(format!("{name}: --socket requires a value"))),
             },
+            "--index" => match value {
+                Some(v) => match v.parse::<i32>() {
+                    Ok(0) => {
+                        return Err(Command::Error(format!(
+                            "{name}: --index=0 は不正です (= 1-based、1 が最古、-1 が最新)"
+                        )));
+                    }
+                    Ok(n) => index = Some(n),
+                    Err(_) => {
+                        return Err(Command::Error(format!(
+                            "{name}: --index には整数を指定してください (got: {v:?})"
+                        )));
+                    }
+                },
+                None => {
+                    return Err(Command::Error(format!("{name}: --index requires a value")));
+                }
+            },
             other if other.starts_with("--") => {
                 let cb_consumed = on_option(other, value)?;
                 if !cb_consumed {
@@ -959,10 +997,10 @@ where
     }
     let session_id = match positionals.len() {
         0 => {
-            if socket.is_none() {
+            if socket.is_none() && index.is_none() {
                 return Err(Command::Error(format!(
-                    "{name}: session id (positional) または --socket=<path> が必要です。\
-                     例: `hyoui {name} <session-id>` / `hyoui list` で session 一覧を確認できます"
+                    "{name}: session id (positional) / --index=N / --socket=<path> のいずれかが必要です。\
+                     例: `hyoui {name} <session-id>` / `hyoui {name} --index=1` / `hyoui list` で session 一覧を確認できます"
                 )));
             }
             None
@@ -981,7 +1019,15 @@ where
             )));
         }
     };
-    Ok((socket, session_id))
+
+    // selector 排他チェック: session_id (位置引数) と --index は同時指定不可。
+    if session_id.is_some() && index.is_some() {
+        return Err(Command::Error(format!(
+            "{name}: session id (位置引数) と --index を同時に指定できません"
+        )));
+    }
+
+    Ok((socket, session_id, index))
 }
 
 #[allow(clippy::result_large_err)]
@@ -1008,9 +1054,10 @@ fn parse_status(args: &[String]) -> Command {
         other => Err(Command::Error(format!("status: unknown option: {other}"))),
     });
     match res {
-        Ok((socket, session_id)) => Command::Status(StatusConfig {
+        Ok((socket, session_id, index)) => Command::Status(StatusConfig {
             socket,
             session_id,
+            index,
             format,
         }),
         Err(c) => c,
@@ -1057,13 +1104,14 @@ fn parse_tail(args: &[String]) -> Command {
         other => Err(Command::Error(format!("tail: unknown option: {other}"))),
     });
     match res {
-        Ok((socket, session_id)) => {
+        Ok((socket, session_id, index)) => {
             if since_strict && since_ms.is_none() {
                 return Command::Error("tail: --since-strict requires --since=<DUR>".into());
             }
             Command::Tail(TailConfig {
                 socket,
                 session_id,
+                index,
                 follow,
                 strip_ansi,
                 since_ms,
@@ -1079,6 +1127,7 @@ fn parse_wait(args: &[String]) -> Command {
     let mut timeout_ms: Option<u64> = None;
     let mut poll_interval_ms: Option<u64> = None;
     let mut socket: Option<String> = None;
+    let mut index: Option<i32> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut i = 0usize;
     while i < args.len() {
@@ -1124,6 +1173,22 @@ fn parse_wait(args: &[String]) -> Command {
                 },
                 None => return Command::Error("wait: --poll-interval requires a value".into()),
             },
+            "--index" => match value {
+                Some(v) => match v.parse::<i32>() {
+                    Ok(0) => {
+                        return Command::Error(
+                            "wait: --index=0 は不正です (= 1-based、1 が最古、-1 が最新)".into(),
+                        );
+                    }
+                    Ok(n) => index = Some(n),
+                    Err(_) => {
+                        return Command::Error(format!(
+                            "wait: --index には整数を指定してください (got: {v:?})"
+                        ));
+                    }
+                },
+                None => return Command::Error("wait: --index requires a value".into()),
+            },
             other if other.starts_with("--") => {
                 return Command::Error(format!("wait: unknown option: {other}"));
             }
@@ -1137,13 +1202,15 @@ fn parse_wait(args: &[String]) -> Command {
             i += 1;
         }
     }
-    // positionals: --socket あり → 1 つだけ (= pattern)、--socket なし → 2 つ
-    // (= session_id, pattern)。前者で 0 個は pattern 不在で error、後者で
-    // 1 個だけ場合は session_id を validate して pattern 不在 error。
-    let (session_id, pattern) = match (socket.is_some(), positionals.len()) {
+    // positionals: socket / index あり (= selector 確定) → pattern 1 個だけ、
+    // それ以外 (= session_id 位置引数) → 2 個 (= session_id, pattern)。
+    let selector_present = socket.is_some() || index.is_some();
+    let (session_id, pattern) = match (selector_present, positionals.len()) {
         (true, 0) => {
             return Command::Error(
-                "wait: pattern が必要です。例: `hyoui wait --socket=<path> 'Continue\\?'`".into(),
+                "wait: pattern が必要です。例: `hyoui wait --socket=<path> 'Continue\\?'` / \
+                 `hyoui wait --index=1 'Continue\\?'`"
+                    .into(),
             );
         }
         (true, 1) => (None, positionals.pop().expect("non-empty")),
@@ -1155,7 +1222,7 @@ fn parse_wait(args: &[String]) -> Command {
         }
         (false, 0) => {
             return Command::Error(
-                "wait: session id と pattern が必要です。\
+                "wait: session id (位置引数) / --index=N / --socket=<path> のいずれかと pattern が必要です。\
                  例: `hyoui wait <session-id> 'Continue\\?' --timeout=5s` / \
                  `hyoui list` で session 一覧を確認できます"
                     .into(),
@@ -1186,9 +1253,15 @@ fn parse_wait(args: &[String]) -> Command {
     if pattern.is_empty() {
         return Command::Error("wait: pattern が空文字列です (= 正規表現が必要)".into());
     }
+    if session_id.is_some() && index.is_some() {
+        return Command::Error(
+            "wait: session id (位置引数) と --index を同時に指定できません".into(),
+        );
+    }
     Command::Wait(WaitConfig {
         socket,
         session_id,
+        index,
         pattern,
         timeout_ms,
         poll_interval_ms,
@@ -1974,9 +2047,10 @@ fn parse_screen_dump(args: &[String]) -> Command {
         }
     });
     match res {
-        Ok((socket, session_id)) => Command::Screen(ScreenCommand::Dump(ScreenDumpConfig {
+        Ok((socket, session_id, index)) => Command::Screen(ScreenCommand::Dump(ScreenDumpConfig {
             socket,
             session_id,
+            index,
             format,
             layer,
             rect,
@@ -2084,11 +2158,12 @@ fn parse_screen_snapshot(args: &[String]) -> Command {
         },
     );
     match res {
-        Ok((socket, session_id)) => {
+        Ok((socket, session_id, index)) => {
             let include = include.unwrap_or_else(default_snapshot_include);
             Command::Screen(ScreenCommand::Snapshot(ScreenSnapshotConfig {
                 socket,
                 session_id,
+                index,
                 include,
                 format,
                 output,
@@ -2239,9 +2314,10 @@ fn parse_lock_acquire(args: &[String]) -> Command {
         },
     );
     match res {
-        Ok((socket, session_id)) => Command::Lock(LockCommand::Acquire(LockAcquireConfig {
+        Ok((socket, session_id, index)) => Command::Lock(LockCommand::Acquire(LockAcquireConfig {
             socket,
             session_id,
+            index,
             mode,
             timeout_ms,
         })),
@@ -2281,9 +2357,10 @@ fn parse_lock_release(args: &[String]) -> Command {
         },
     );
     match res {
-        Ok((socket, session_id)) => Command::Lock(LockCommand::Release(LockReleaseConfig {
+        Ok((socket, session_id, index)) => Command::Lock(LockCommand::Release(LockReleaseConfig {
             socket,
             session_id,
+            index,
             token,
         })),
         Err(c) => c,
@@ -2309,9 +2386,10 @@ fn parse_unlock(args: &[String]) -> Command {
         other => Err(Command::Error(format!("unlock: unknown option: {other}"))),
     });
     match res {
-        Ok((socket, session_id)) => Command::Unlock(LockReleaseConfig {
+        Ok((socket, session_id, index)) => Command::Unlock(LockReleaseConfig {
             socket,
             session_id,
+            index,
             token,
         }),
         Err(c) => c,

@@ -1098,20 +1098,44 @@ fn kill_command_single(cfg: KillConfig) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// session_id / socket オプションから target socket path を resolve するヘルパ。
+/// session_id / socket / index オプションから target socket path を resolve するヘルパ。
+///
+/// 優先順:
+/// 1. `socket` が `Some` → そのまま PathBuf
+/// 2. `index` が `Some` → `resolve_session_by_index` で session-id を確定 → socket_path::resolve
+/// 3. `session_id` が `Some` → socket_path::resolve
+/// 4. 全て None → `print_session_required` で error
+///
+/// session selector の共通化 (= kawaz 方針 2026-05-30) のため `index` 引数を取る。
+/// status / tail / wait / screen / lock 系の全 caller で同一の選択ロジックを共有する。
 fn resolve_target_socket(
     cmd: &str,
     socket: Option<&str>,
     session_id: Option<&str>,
+    index: Option<i32>,
 ) -> Result<std::path::PathBuf, ExitCode> {
     if let Some(p) = socket {
         return Ok(std::path::PathBuf::from(p));
     }
-    let sid = match session_id {
-        Some(s) => s,
-        None => {
-            print_session_required(cmd);
-            return Err(ExitCode::from(2));
+    let sid_owned: String;
+    let sid: &str = if let Some(idx) = index {
+        match resolve_session_by_index(idx) {
+            Ok(s) => {
+                sid_owned = s;
+                sid_owned.as_str()
+            }
+            Err(e) => {
+                eprintln!("hyoui: {cmd}: {e}");
+                return Err(ExitCode::from(1));
+            }
+        }
+    } else {
+        match session_id {
+            Some(s) => s,
+            None => {
+                print_session_required(cmd);
+                return Err(ExitCode::from(2));
+            }
         }
     };
     socket_path::resolve(None, sid).map_err(|e| {
@@ -1123,11 +1147,15 @@ fn resolve_target_socket(
 
 /// `status` subcommand: connect → handshake → status.query → print response。
 fn status_command(cfg: StatusConfig) -> ExitCode {
-    let sock =
-        match resolve_target_socket("status", cfg.socket.as_deref(), cfg.session_id.as_deref()) {
-            Ok(p) => p,
-            Err(code) => return code,
-        };
+    let sock = match resolve_target_socket(
+        "status",
+        cfg.socket.as_deref(),
+        cfg.session_id.as_deref(),
+        cfg.index,
+    ) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
     let opts = AttachOptions {
         mode: Mode::Ro,
         ..AttachOptions::default()
@@ -1256,8 +1284,12 @@ fn json_string(s: &str) -> String {
 
 /// `tail` subcommand: connect → handshake (ro) → tail.request → stdout に書き出す。
 fn tail_command(cfg: TailConfig) -> ExitCode {
-    let sock = match resolve_target_socket("tail", cfg.socket.as_deref(), cfg.session_id.as_deref())
-    {
+    let sock = match resolve_target_socket(
+        "tail",
+        cfg.socket.as_deref(),
+        cfg.session_id.as_deref(),
+        cfg.index,
+    ) {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -1353,8 +1385,12 @@ fn tail_command(cfg: TailConfig) -> ExitCode {
 /// - 2: Cancelled / invalid usage (= regex compile 失敗等)
 /// - 3: daemon error (= `state-snapshot-v1` cap 未対応 / unexpected response 等)
 fn wait_command(cfg: WaitConfig) -> ExitCode {
-    let sock = match resolve_target_socket("wait", cfg.socket.as_deref(), cfg.session_id.as_deref())
-    {
+    let sock = match resolve_target_socket(
+        "wait",
+        cfg.socket.as_deref(),
+        cfg.session_id.as_deref(),
+        cfg.index,
+    ) {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -1422,6 +1458,7 @@ fn screen_dump_command(cfg: ScreenDumpConfig) -> ExitCode {
         "screen dump",
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
+        cfg.index,
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -1582,6 +1619,7 @@ fn screen_snapshot_command(cfg: ScreenSnapshotConfig) -> ExitCode {
         "screen snapshot",
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
+        cfg.index,
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -1767,11 +1805,15 @@ fn input_command(cmd: InputCommand) -> ExitCode {
     }
 
     // 1. socket path resolve。
-    let sock =
-        match resolve_target_socket("input", cmd.socket.as_deref(), cmd.session_id.as_deref()) {
-            Ok(p) => p,
-            Err(code) => return code,
-        };
+    let sock = match resolve_target_socket(
+        "input",
+        cmd.socket.as_deref(),
+        cmd.session_id.as_deref(),
+        None, // input family は --index 未対応 (= 別 commit で展開予定)
+    ) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
 
     // 2. attach (= Rw mode で連結)。raw_data frame の書き込みは Rw client のみ
     //    daemon が master fd に流す (= Ro は silently drop される)。
@@ -1856,6 +1898,7 @@ fn lock_acquire_command(cfg: LockAcquireConfig) -> ExitCode {
         "lock acquire",
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
+        cfg.index,
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -2143,11 +2186,15 @@ fn lock_release_command(cmd_label: &str, cfg: LockReleaseConfig) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let sock =
-        match resolve_target_socket(cmd_label, cfg.socket.as_deref(), cfg.session_id.as_deref()) {
-            Ok(p) => p,
-            Err(code) => return code,
-        };
+    let sock = match resolve_target_socket(
+        cmd_label,
+        cfg.socket.as_deref(),
+        cfg.session_id.as_deref(),
+        cfg.index,
+    ) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
     // release は新規 connection で送るため、daemon 側 holder 照合で必ず通らない。
     // それでも protocol 的に正しく `LockRelease` を送って `lock.not-held` error を観測し、
     // ユーザに明確な hint を返すのが現状の MVP 実装での誠実な挙動。
@@ -2538,6 +2585,7 @@ mod tests {
         let cfg = ScreenDumpConfig {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
+            index: None,
             format: ScreenDumpCliFormat::Ansi,
             layer: ScreenDumpCliLayer::Visible,
             rect: None,
@@ -2602,6 +2650,7 @@ mod tests {
         let cfg = ScreenDumpConfig {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
+            index: None,
             format: ScreenDumpCliFormat::TextPlain,
             layer: ScreenDumpCliLayer::Visible,
             rect: None,
@@ -2678,6 +2727,7 @@ mod tests {
         let cfg = ScreenDumpConfig {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
+            index: None,
             format: ScreenDumpCliFormat::TextPlain,
             layer: ScreenDumpCliLayer::Scrollback,
             rect: None,
@@ -2762,6 +2812,7 @@ mod tests {
         let cfg = ScreenSnapshotConfig {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
+            index: None,
             include: vec![
                 SnapshotCliComponent::Cursor,
                 SnapshotCliComponent::Mode,
@@ -2952,6 +3003,7 @@ mod tests {
         let cfg = WaitConfig {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
+            index: None,
             pattern: "READY".into(),
             timeout_ms: Some(5_000),
             poll_interval_ms: Some(50),
@@ -3013,6 +3065,7 @@ mod tests {
         let cfg = WaitConfig {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
+            index: None,
             pattern: "NEVER_SHOWS_UP".into(),
             timeout_ms: Some(300),
             poll_interval_ms: Some(50),
