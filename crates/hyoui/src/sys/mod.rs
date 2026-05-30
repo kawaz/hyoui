@@ -22,8 +22,8 @@ pub use fd::FdExt;
 pub use poll::{PollOutcome, poll};
 pub use pty::Pty;
 pub use signal::{
-    SelfPipe, SigMaskGuard, install_default, install_ignore, install_self_pipe, install_winch,
-    raise, register_self_pipe,
+    SelfPipe, install_default, install_ignore, install_self_pipe, install_winch, raise,
+    register_self_pipe,
 };
 pub use socket::{UmaskGuard, UnixSock};
 pub use tty::{TtyGuard, enter_raw, is_tty, tty_size};

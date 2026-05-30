@@ -17,7 +17,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use nix::errno::Errno;
-use nix::sys::signal::{SigAction, SigHandler, SigSet, SigmaskHow, Signal};
+use nix::sys::signal::{SigAction, SigHandler, SigSet, Signal};
 use nix::unistd;
 
 use super::error::{Error, Result};
@@ -223,38 +223,6 @@ pub fn register_self_pipe(signum: Signal) -> Result<()> {
     // SAFETY: `selfpipe_handler` is async-signal-safe (atomic load + write).
     unsafe { nix::sys::signal::sigaction(signum, &action) }.map_err(Error::from)?;
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// sigprocmask RAII
-// ---------------------------------------------------------------------------
-
-/// RAII wrapper around `sigprocmask`. On drop the previous mask is restored.
-#[derive(Debug)]
-pub struct SigMaskGuard {
-    prev: SigSet,
-}
-
-impl SigMaskGuard {
-    /// Block `signums` in addition to whatever is currently blocked.
-    pub fn block(signums: &[Signal]) -> Result<Self> {
-        let mut set = SigSet::empty();
-        for s in signums {
-            set.add(*s);
-        }
-        let mut prev = SigSet::empty();
-        nix::sys::signal::sigprocmask(SigmaskHow::SIG_BLOCK, Some(&set), Some(&mut prev))
-            .map_err(Error::from)?;
-        Ok(Self { prev })
-    }
-}
-
-impl Drop for SigMaskGuard {
-    fn drop(&mut self) {
-        // Best-effort: a failure here means something has corrupted the
-        // signal mask. We cannot do anything useful at drop time.
-        let _ = nix::sys::signal::sigprocmask(SigmaskHow::SIG_SETMASK, Some(&self.prev), None);
-    }
 }
 
 #[allow(unused_imports)]
