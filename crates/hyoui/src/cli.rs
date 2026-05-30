@@ -189,6 +189,17 @@ pub struct AttachConfig {
     /// `--debug-dump-client=<path>`: client 側受信 bytes を file に append (debug)。
     /// `hyoui run` の同名 flag と同じ意味 (= attach 単体で使うときの名前統一)。
     pub debug_dump_client: Option<String>,
+    /// `--index=N` or 位置引数の数字 (= `hyoui attach 1` / `attach -1`)。
+    ///
+    /// `hyoui list` の mtime 昇順 sort 結果に対する index 指定:
+    /// - `1` → 1 番古い session、`2` → 2 番古い、...
+    /// - `-1` → 1 番新しい session、`-2` → 2 番新しい、...
+    /// - `0` は不正 (= 1-based index、`Command::Error` で reject)
+    ///
+    /// `session_id` と同時指定はエラー。位置引数が数字のみで該当 session-id が
+    /// 存在しない場合は index 解釈、数字以外の session-id を強制したい場合は
+    /// `--` セパレータか `--index=N` を使う。
+    pub index: Option<i32>,
 }
 
 /// `list` subcommand の出力形式 (= `--format=plain|jsonl`)。
@@ -1366,12 +1377,29 @@ fn parse_attach(args: &[String]) -> Command {
         exclusive: false,
         detach_others: false,
         debug_dump_client: None,
+        index: None,
     };
 
     let mut positionals: Vec<String> = Vec::new();
+    // `--` 以降の引数は強制 session-id 扱い (= 数字 session-id を escape したい
+    // case の救済路、cli-design-preferences.md の「`--` セパレータ」)。
+    let mut after_separator = false;
     let mut i = 0usize;
     while i < args.len() {
         let arg = args[i].as_str();
+
+        if after_separator {
+            positionals.push(args[i].clone());
+            i += 1;
+            continue;
+        }
+
+        if arg == "--" {
+            after_separator = true;
+            i += 1;
+            continue;
+        }
+
         let (name, inline_value) = split_eq(arg);
         let mut consumed_extra = false;
         let value: Option<String> = match inline_value {
@@ -1414,11 +1442,34 @@ fn parse_attach(args: &[String]) -> Command {
                     return Command::Error("--debug-dump-client requires a value".into());
                 }
             },
+            "--index" => match value {
+                Some(v) => match v.parse::<i32>() {
+                    Ok(0) => {
+                        return Command::Error(
+                            "attach: --index=0 は不正です (= 1-based index、1 が最古、-1 が最新)"
+                                .into(),
+                        );
+                    }
+                    Ok(n) => cfg.index = Some(n),
+                    Err(_) => {
+                        return Command::Error(format!(
+                            "attach: --index には整数を指定してください (got: {v:?})"
+                        ));
+                    }
+                },
+                None => return Command::Error("--index requires a value".into()),
+            },
+            // `-1` / `-2` ... のような負数だけ allow (= attach index 用)。
+            // `-foo` のような未知 flag は弾く。
+            other if other.starts_with('-') && other.parse::<i32>().is_ok() => {
+                consumed_extra = false;
+                positionals.push(args[i].clone());
+            }
             other if other.starts_with('-') => {
                 return Command::Error(format!("unknown attach option: {other}"));
             }
             _ => {
-                // positional (= session id)
+                // positional (= session id or index 数字)
                 consumed_extra = false;
                 positionals.push(args[i].clone());
             }
@@ -1431,16 +1482,45 @@ fn parse_attach(args: &[String]) -> Command {
 
     match positionals.len() {
         0 => {
-            if cfg.socket.is_none() {
+            if cfg.socket.is_none() && cfg.index.is_none() {
                 return Command::Error(
-                    "attach: session id (positional) または --socket=<path> が必要です。\
-                     例: `hyoui attach <session-id>` / `hyoui list` で session 一覧を確認できます"
+                    "attach: session id (positional) または --socket=<path> / --index=N が必要です。\
+                     例: `hyoui attach <session-id>` / `hyoui attach 1` (最古) / `hyoui attach -1` (最新) / \
+                     `hyoui list` で session 一覧を確認できます"
                         .into(),
                 );
             }
         }
-        1 => cfg.session_id = Some(positionals.into_iter().next().unwrap()),
+        1 => {
+            let pos = positionals.into_iter().next().unwrap();
+            // `--` 以降は強制 session-id 扱い、それ以前は整数なら index 解釈、
+            // 数字以外なら session-id 扱い。`--index` と位置引数の同時指定はエラー。
+            let as_int = if after_separator {
+                None
+            } else {
+                pos.parse::<i32>().ok()
+            };
+            match (as_int, cfg.index) {
+                (Some(0), _) => {
+                    return Command::Error(
+                        "attach: index 0 は不正です (= 1-based、1 が最古、-1 が最新)".into(),
+                    );
+                }
+                (Some(n), None) => cfg.index = Some(n),
+                (Some(_), Some(_)) => {
+                    return Command::Error(
+                        "attach: --index と位置引数 (数字) を同時に指定できません".into(),
+                    );
+                }
+                (None, _) => cfg.session_id = Some(pos),
+            }
+        }
         _ => return Command::Error("attach: too many positional arguments".into()),
+    }
+
+    // 最終整合性: session_id / socket / index のいずれかは必須 (= 0 個 case は上で reject 済)
+    if cfg.session_id.is_some() && cfg.index.is_some() {
+        return Command::Error("attach: session id と --index を同時に指定できません".into());
     }
 
     Command::Attach(cfg)
@@ -2285,15 +2365,25 @@ fn usage_attach() -> String {
         \n\
         USAGE:\n    \
             hyoui attach <session-id> [options]\n    \
-            hyoui attach --socket=<path> [options]\n\
+            hyoui attach <index> [options]            # 数字は index 解釈 (= 1 最古, -1 最新)\n    \
+            hyoui attach --index=<N> [options]\n    \
+            hyoui attach --socket=<path> [options]\n    \
+            hyoui attach -- <session-id> [options]    # 数字 session-id を escape\n\
         \n\
         OPTIONS:\n    \
             --socket PATH         Explicit socket path (alternative to session-id)\n    \
+            --index N             session を mtime 昇順の index で指定 (= 1=最古, -1=最新)\n    \
             --mode rw|ro|rw-no-leader\n                          \
                 Operating mode (default: rw)\n    \
             --exclusive           Demand exclusive session ownership at start\n    \
             --detach-others       Drop other attached clients on connect\n    \
             -h, --help            Show this help and exit\n\
+        \n\
+        INDEX 指定:\n    \
+            位置引数が整数 (= `^-?\\d+$`) なら必ず index 解釈になる。`1` は最古、\n    \
+            `-1` は最新、`2` は 2 番目に古い、... と `hyoui list` の mtime 昇順 sort\n    \
+            結果に対する 1-based 指定。stale socket は index 対象外。範囲外は error。\n    \
+            数字を session-id として使う場合は `--` セパレータか `--socket=<path>` を使う。\n\
         \n\
         DETACH KEY (= session を生かしたまま client だけ抜ける):\n    \
             Ctrl-A d              detach (session 維持 + 自分だけ Detach 送って終了)\n    \
@@ -2311,6 +2401,10 @@ fn usage_attach() -> String {
         \n\
         EXAMPLES:\n    \
             hyoui attach demo                       # session_id=demo に attach\n    \
+            hyoui attach 1                          # 1 番古い live session に attach\n    \
+            hyoui attach -1                         # 1 番新しい live session に attach\n    \
+            hyoui attach --index=2                  # 2 番古い live session に attach\n    \
+            hyoui attach -- 1                       # session_id=\"1\" (数字 escape) に attach\n    \
             hyoui attach --socket=/tmp/x.sock       # 直接 socket 指定\n    \
             hyoui attach demo --mode=ro             # 読み取り専用 attach\n    \
             hyoui attach demo --detach-others       # 他 client を蹴って奪う\n    \
@@ -4349,6 +4443,94 @@ mod tests {
         match parse_args(&args(&["attach", "demo", "--bogus"])) {
             Command::Error(msg) => assert!(msg.contains("bogus") || msg.contains("attach")),
             other => panic!("got {other:?}"),
+        }
+    }
+
+    /// 位置引数の正の整数は index 解釈 (= `attach 1` → cfg.index=Some(1))。
+    #[test]
+    fn attach_positional_positive_int_is_index() {
+        match parse_args(&args(&["attach", "1"])) {
+            Command::Attach(cfg) => {
+                assert_eq!(cfg.index, Some(1));
+                assert_eq!(cfg.session_id, None);
+            }
+            other => panic!("expected Attach with index=1, got {other:?}"),
+        }
+    }
+
+    /// 位置引数の負の整数は newest-first index (= `attach -1` → cfg.index=Some(-1))。
+    #[test]
+    fn attach_positional_negative_int_is_index() {
+        match parse_args(&args(&["attach", "-1"])) {
+            Command::Attach(cfg) => {
+                assert_eq!(cfg.index, Some(-1));
+                assert_eq!(cfg.session_id, None);
+            }
+            other => panic!("expected Attach with index=-1, got {other:?}"),
+        }
+    }
+
+    /// `--index=N` option も index 設定 (= 案 B、ロングオプション流儀)。
+    #[test]
+    fn attach_index_option_sets_index() {
+        match parse_args(&args(&["attach", "--index=2"])) {
+            Command::Attach(cfg) => {
+                assert_eq!(cfg.index, Some(2));
+                assert_eq!(cfg.session_id, None);
+            }
+            other => panic!("expected Attach with index=2, got {other:?}"),
+        }
+    }
+
+    /// `--index 0` / `attach 0` は不正 (= 1-based、0 は意味なし)。
+    #[test]
+    fn attach_index_zero_is_error() {
+        match parse_args(&args(&["attach", "0"])) {
+            Command::Error(msg) => assert!(msg.contains("0"), "got msg={msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        match parse_args(&args(&["attach", "--index=0"])) {
+            Command::Error(msg) => assert!(msg.contains("0"), "got msg={msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// `--` セパレータ後の数字は session-id 扱い (= 数字 session-id を escape)。
+    #[test]
+    fn attach_dashdash_separator_forces_session_id() {
+        match parse_args(&args(&["attach", "--", "1"])) {
+            Command::Attach(cfg) => {
+                assert_eq!(cfg.session_id.as_deref(), Some("1"));
+                assert_eq!(cfg.index, None);
+            }
+            other => panic!("expected Attach with session_id='1', got {other:?}"),
+        }
+    }
+
+    /// `--index` と位置引数の session-id 同時指定はエラー。
+    #[test]
+    fn attach_index_and_session_id_conflict() {
+        match parse_args(&args(&["attach", "demo", "--index=1"])) {
+            Command::Error(msg) => assert!(msg.contains("--index") || msg.contains("session")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// 位置引数の数字と `--index` の同時指定もエラー。
+    #[test]
+    fn attach_index_and_positional_int_conflict() {
+        match parse_args(&args(&["attach", "2", "--index=1"])) {
+            Command::Error(msg) => assert!(msg.contains("--index") || msg.contains("位置")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// `--index=foo` のような非整数値はエラー。
+    #[test]
+    fn attach_index_non_integer_is_error() {
+        match parse_args(&args(&["attach", "--index=foo"])) {
+            Command::Error(msg) => assert!(msg.contains("整数") || msg.contains("--index")),
+            other => panic!("expected Error, got {other:?}"),
         }
     }
 

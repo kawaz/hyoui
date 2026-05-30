@@ -450,6 +450,71 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
 ///
 /// 既存 daemon に socket connect し、stdin/stdout を中継する。
 /// daemon は別 process / 別 hyoui run --detached 等で起動済みの想定。
+/// `--index=N` (or 位置引数の数字) から session id を解決する。
+///
+/// `hyoui list` と同様に socket dir を scan、`*.sock` の live 一覧を mtime 昇順 sort、
+/// 以下の index 規約で 1 件選ぶ:
+/// - `1` → 最古、`2` → 2 番目に古い、...
+/// - `-1` → 最新、`-2` → 2 番目に新しい、...
+///
+/// stale socket は除外 (= attach 失敗確実のため index に含めない)。
+/// 範囲外 / 0 件 → `Err`。
+fn resolve_session_by_index(index: i32) -> Result<String, String> {
+    if index == 0 {
+        return Err("index 0 は不正です (= 1-based、1 が最古、-1 が最新)".to_string());
+    }
+    let dirs = list_candidate_dirs();
+    let mut entries: Vec<(String, std::time::SystemTime)> = Vec::new();
+    for dir in dirs {
+        let read = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("sock") {
+                continue;
+            }
+            if !probe_socket_liveness(&path) {
+                continue;
+            }
+            let session = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string();
+            let mtime = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            entries.push((session, mtime));
+        }
+    }
+    if entries.is_empty() {
+        return Err("no live sessions found".to_string());
+    }
+    entries.sort_by_key(|e| e.1);
+    let len = entries.len();
+    let resolved = if index > 0 {
+        // 1-based 古い順: 1 → 最古
+        let idx = (index - 1) as usize;
+        entries.get(idx).map(|e| e.0.clone())
+    } else {
+        // -1 → 最新、-2 → 2 番目に新しい
+        let abs = (-index) as usize;
+        if abs > len {
+            None
+        } else {
+            Some(entries[len - abs].0.clone())
+        }
+    };
+    resolved.ok_or_else(|| {
+        format!(
+            "attach: index {index} は範囲外 (= {len} live session(s) 検出、\
+             `hyoui list` で一覧確認可)"
+        )
+    })
+}
+
 fn attach_command(cfg: AttachConfig) -> ExitCode {
     // H3: HYOUI_DETACH_PREFIX を raw mode 入る **前** に validate。invalid なら
     // 通常 terminal で stderr に出してから exit (= 旧 silent fallback で warning が
@@ -462,11 +527,27 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
     let sock = if let Some(p) = cfg.socket.clone() {
         std::path::PathBuf::from(p)
     } else {
-        let sid = match cfg.session_id.as_deref() {
-            Some(s) => s,
-            None => {
-                print_session_required("attach");
-                return ExitCode::from(2);
+        // index 指定なら resolve_session_by_index で session-id を確定、
+        // それ以外は cfg.session_id を使う (= parse_attach で同時指定は弾かれている)。
+        let sid_owned: String;
+        let sid = if let Some(index) = cfg.index {
+            match resolve_session_by_index(index) {
+                Ok(s) => {
+                    sid_owned = s;
+                    sid_owned.as_str()
+                }
+                Err(e) => {
+                    eprintln!("hyoui: attach: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+        } else {
+            match cfg.session_id.as_deref() {
+                Some(s) => s,
+                None => {
+                    print_session_required("attach");
+                    return ExitCode::from(2);
+                }
             }
         };
         match socket_path::resolve(None, sid) {
