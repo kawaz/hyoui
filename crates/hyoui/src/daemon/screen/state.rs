@@ -199,6 +199,41 @@ impl ScreenState {
         self.parser.screen().state_formatted()
     }
 
+    /// 子が 1 byte も出力していない pristine 状態か判定する。
+    ///
+    /// 判定条件 (= 全て満たす時のみ true):
+    /// - alt screen OFF
+    /// - cursor が (0, 0)
+    /// - 全 visible cell の `contents()` が空文字列
+    ///
+    /// cursor visibility / mode 系 (= app keypad / DECCKM / bracketed paste) は判定
+    /// 対象外。これらは子が起動直後に切り替える可能性があり、外側 shell の画面
+    /// history を保護したい目的 (= attach 直後の `?1049l` + clear screen 抑止) とは
+    /// 独立な state なので、空判定の sufficient condition に含めない。
+    ///
+    /// `super::redraw::build_attach_redraw` で空 Vec 早期 return 判定に使う
+    /// (= issue 2026-05-29-bug-attach-initial-clear-on-empty-session.md)。
+    pub(crate) fn visible_state_is_pristine(&self) -> bool {
+        if self.alternate_screen() {
+            return false;
+        }
+        if self.cursor_position() != (0, 0) {
+            return false;
+        }
+        let scr = self.parser.screen();
+        let (rows, cols) = self.size();
+        for r in 0..rows {
+            for c in 0..cols {
+                if let Some(cell) = scr.cell(r, c) {
+                    if !cell.contents().is_empty() {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// `last_feed_at` から `STALLED_RESET_TIMEOUT` 経過していれば true。
     pub(crate) fn is_stalled(&self, now: Instant) -> bool {
         now.duration_since(self.last_feed_at) >= STALLED_RESET_TIMEOUT

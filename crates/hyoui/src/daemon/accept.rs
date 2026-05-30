@@ -450,10 +450,12 @@ pub(super) fn send_attach_redraw(
     screen_state: &ScreenState,
     overflow_ids: &mut Vec<u64>,
 ) {
+    // pristine state なら `bytes` は空 Vec (= issue 2026-05-29-bug-attach-initial-
+    // clear-on-empty-session.md の対策、`build_attach_redraw` 参照)。frame 自体は
+    // 既存 client / test の「handshake 直後に必ず raw_data frame が 1 つ来る」契約を
+    // 維持するため empty payload で送る。client 側は empty payload を stdout に書いても
+    // 何も起きない (= 自然な no-op)、外側 shell の画面 history が clear されない。
     let bytes = build_attach_redraw(screen_state);
-    if bytes.is_empty() {
-        return;
-    }
     let mut frame_bytes = Vec::new();
     if Frame::raw_data(bytes).encode_to(&mut frame_bytes).is_err() {
         return;

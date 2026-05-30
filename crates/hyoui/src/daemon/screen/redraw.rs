@@ -21,7 +21,15 @@ use super::state::ScreenState;
 ///
 /// client は本 bytes を stdout に書くだけで detach 時の画面が復元される
 /// (DR-0013 §4 Phase A: push 型 redraw bytes)。
+///
+/// 子が 1 byte も出力していない初期状態 (= alt screen OFF + cursor (0,0) + 全 cell
+/// empty) なら空の `Vec` を返す。これは attach 直後に外側 shell の画面 history が
+/// `?1049l` + `\x1b[H\x1b[J` で clear されてしまう UX bug を防ぐため
+/// (= `docs/issue/2026-05-29-bug-attach-initial-clear-on-empty-session.md`)。
 pub(crate) fn build_attach_redraw(state: &ScreenState) -> Vec<u8> {
+    if state.visible_state_is_pristine() {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     // alt screen フラグの prepend (PoC §2 で発覚した state_formatted の欠落補完)。
     // primary 側でも `?1049l` を明示し、client が detach 前と別 buffer に居ても
@@ -75,6 +83,62 @@ mod tests {
         let scr2 = s2.screen();
         let c0 = scr2.cell(0, 0).unwrap();
         assert_eq!(c0.contents(), "a");
+    }
+
+    /// 子が 1 byte も出力していない pristine state では redraw が空 Vec を返す。
+    /// これで attach 直後に外側 shell の画面 history が clear されるのを防ぐ
+    /// (= issue 2026-05-29-bug-attach-initial-clear-on-empty-session.md)。
+    #[test]
+    fn redraw_is_empty_for_pristine_state() {
+        let s = ScreenState::new(24, 80, 100);
+        let out = build_attach_redraw(&s);
+        assert!(
+            out.is_empty(),
+            "pristine state should yield empty redraw, got {} bytes: {:?}",
+            out.len(),
+            out
+        );
+    }
+
+    /// 子が 1 byte でも出力した state では redraw は従来通り `?1049l` から始まる。
+    #[test]
+    fn redraw_non_empty_after_child_output() {
+        let mut s = ScreenState::new(24, 80, 100);
+        s.process(b"x");
+        let out = build_attach_redraw(&s);
+        assert!(
+            !out.is_empty(),
+            "post-output state should yield non-empty redraw"
+        );
+        assert!(out.starts_with(b"\x1b[?1049l"), "primary prepend retained");
+    }
+
+    /// alt screen ON だけで cell が空でも pristine 扱いせず、従来通り `?1049h` 起点
+    /// の redraw を返す (= claude TUI のような alt mode 常駐 app の復元を壊さない)。
+    #[test]
+    fn redraw_non_empty_for_alt_screen_even_if_cells_empty() {
+        let mut s = ScreenState::new(24, 80, 100);
+        s.process(b"\x1b[?1049h");
+        assert!(s.alternate_screen());
+        let out = build_attach_redraw(&s);
+        assert!(
+            !out.is_empty(),
+            "alt screen should not be treated as pristine"
+        );
+        assert!(out.starts_with(b"\x1b[?1049h"), "alt prepend retained");
+    }
+
+    /// cursor だけ移動して cell は空の場合も pristine 扱いせず redraw する (= 子が
+    /// `\x1b[5;10H` のような cursor 制御だけ送ったケース、cell は空でも子は active)。
+    #[test]
+    fn redraw_non_empty_when_cursor_moved_even_if_cells_empty() {
+        let mut s = ScreenState::new(24, 80, 100);
+        s.process(b"\x1b[5;10H");
+        let out = build_attach_redraw(&s);
+        assert!(
+            !out.is_empty(),
+            "cursor-moved state should not be treated as pristine"
+        );
     }
 
     /// redraw を別 state に流し戻して cursor 位置と可視状態が一致する。
