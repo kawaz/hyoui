@@ -916,16 +916,101 @@ fn list_candidate_dirs() -> Vec<std::path::PathBuf> {
     out
 }
 
+/// 全 live session の id を mtime 昇順で列挙する (= `--all` 用)。
+///
+/// `resolve_session_by_index` と同じ scan logic だが index 解決ではなく全件返す。
+fn list_all_live_sessions() -> Vec<String> {
+    let dirs = list_candidate_dirs();
+    let mut entries: Vec<(String, std::time::SystemTime)> = Vec::new();
+    for dir in dirs {
+        let read = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("sock") {
+                continue;
+            }
+            if !probe_socket_liveness(&path) {
+                continue;
+            }
+            let session = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string();
+            let mtime = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            entries.push((session, mtime));
+        }
+    }
+    entries.sort_by_key(|e| e.1);
+    entries.into_iter().map(|(s, _)| s).collect()
+}
+
 /// `hyoui kill <session>` の主要ロジック。
 fn kill_command(cfg: KillConfig) -> ExitCode {
+    // --all は全 live session を順次 kill (= killall 相当)。
+    if cfg.all {
+        let sessions = list_all_live_sessions();
+        if sessions.is_empty() {
+            eprintln!("hyoui: kill --all: no live sessions found");
+            return ExitCode::SUCCESS;
+        }
+        let mut failures = 0usize;
+        let total = sessions.len();
+        for sid in sessions {
+            let sub_cfg = KillConfig {
+                socket: None,
+                session_id: Some(sid.clone()),
+                signal: cfg.signal.clone(),
+                index: None,
+                all: false,
+            };
+            let exit = kill_command_single(sub_cfg);
+            if exit != ExitCode::SUCCESS {
+                failures += 1;
+            }
+        }
+        if failures > 0 {
+            eprintln!("hyoui: kill --all: {failures}/{total} session(s) failed");
+            return ExitCode::from(1);
+        }
+        eprintln!("hyoui: kill --all: {total}/{total} session(s) terminated");
+        return ExitCode::SUCCESS;
+    }
+
+    kill_command_single(cfg)
+}
+
+/// 単一 session の kill 実行 (= `--all` で 1 件ずつ呼び出すための内部 helper)。
+fn kill_command_single(cfg: KillConfig) -> ExitCode {
     let sock = if let Some(p) = cfg.socket.clone() {
         std::path::PathBuf::from(p)
     } else {
-        let sid = match cfg.session_id.as_deref() {
-            Some(s) => s,
-            None => {
-                print_session_required("kill");
-                return ExitCode::from(2);
+        // index 指定なら resolve_session_by_index で session-id を確定、
+        // それ以外は cfg.session_id を使う (= parse_kill で同時指定は弾かれている)。
+        let sid_owned: String;
+        let sid = if let Some(index) = cfg.index {
+            match resolve_session_by_index(index) {
+                Ok(s) => {
+                    sid_owned = s;
+                    sid_owned.as_str()
+                }
+                Err(e) => {
+                    eprintln!("hyoui: kill: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+        } else {
+            match cfg.session_id.as_deref() {
+                Some(s) => s,
+                None => {
+                    print_session_required("kill");
+                    return ExitCode::from(2);
+                }
             }
         };
         match socket_path::resolve(None, sid) {

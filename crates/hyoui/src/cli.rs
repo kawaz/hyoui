@@ -231,7 +231,7 @@ pub struct ListConfig {
 }
 
 /// `kill` subcommand configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct KillConfig {
     /// Target socket path (explicit) または session_id から resolve。
     pub socket: Option<String>,
@@ -239,10 +239,23 @@ pub struct KillConfig {
     pub session_id: Option<String>,
     /// 子 PTY に送る signal 名 (= default SIGTERM、DR-0012)。
     ///
-    /// 正規表記は SIG-prefix 大文字 ("SIGTERM" / "SIGKILL" 等)。受信した name は
-    /// daemon 側で OS native value に解決される。略名 ("TERM") / 小文字
-    /// ("sigterm") / 数値 ("15") は CLI 段で reject される。
+    /// 入力は POSIX kill 慣習 (= 数字 `9` / 略名 `KILL` / `-N` flag) も受理し、
+    /// CLI 段で正規 SIG-prefix 大文字 (= `SIGKILL`) に normalize してから wire
+    /// に流す (= daemon 側 `signal_name_to_nix_signal` は SIG-prefix 大文字のみ
+    /// 解釈、defense in depth)。OS 上で defined でない signal は CLI 段で reject。
     pub signal: Option<String>,
+    /// `--index=N` または 位置引数 (正数) 由来の session selector index。
+    ///
+    /// `hyoui list` の mtime 昇順 sort に対する 1-based 指定 (= attach と同じ流儀)。
+    /// `session_id` / `socket` / `all` と排他。
+    ///
+    /// kill 文脈では 位置引数の負数は **signal 番号 (POSIX `-N`)** として扱うため、
+    /// 最新 session を選ぶには `--index=-1` を使う (= 位置引数 `-1` は SIGHUP)。
+    pub index: Option<i32>,
+    /// `--all`: 全 live session を kill する (= killall 相当)。
+    ///
+    /// `session_id` / `socket` / `index` と排他。`--signal` だけは併用可。
+    pub all: bool,
 }
 
 /// `status` subcommand の出力形式 (= `--format=plain|json`)。
@@ -679,16 +692,72 @@ fn parse_list(args: &[String]) -> Command {
     Command::List(cfg)
 }
 
-fn parse_kill(args: &[String]) -> Command {
-    let mut cfg = KillConfig {
-        socket: None,
-        session_id: None,
-        signal: None,
+/// signal 表記 (= 数字 / 略名 / SIG-prefix 大文字) を正規 SIG-prefix 大文字に
+/// normalize する。
+///
+/// 受理する表記:
+/// - `"SIGTERM"` / `"SIGKILL"` — 正規表記、そのまま通る
+/// - `"sigterm"` / `"sigkill"` — 大文字化して通す
+/// - `"TERM"` / `"KILL"` — SIG-prefix を付加
+/// - `"term"` / `"kill"` — 大文字化 + SIG-prefix
+/// - `"9"` / `"15"` — 数字から OS の Signal variant 経由で名前解決 (= `"SIGKILL"` 等)
+///
+/// reject する表記:
+/// - OS 上で defined されていない signal name / 番号 (= `nix::Signal::parse` / `try_from` で None)
+/// - 空文字列
+///
+/// wire (= protocol message) には正規 SIG-prefix 大文字を流す (DR-0012、defense in
+/// depth で daemon 側でも再 validate)。
+pub fn normalize_signal_spec(spec: &str) -> Result<String, String> {
+    use nix::sys::signal::Signal;
+    if spec.is_empty() {
+        return Err("signal spec is empty".into());
+    }
+    // (1) 数字 (= POSIX kill 慣習 `9` / `15`)。OS の Signal variant に解決できるか確認。
+    if let Ok(num) = spec.parse::<i32>() {
+        return match Signal::try_from(num) {
+            Ok(sig) => Ok(sig.as_str().to_string()),
+            Err(_) => Err(format!(
+                "signal number {num} is not defined on this OS (use --help for valid names)"
+            )),
+        };
+    }
+    // (2) 大文字化して SIG-prefix を付加してから parse 試行。
+    let upper = spec.to_ascii_uppercase();
+    let candidate = if upper.starts_with("SIG") {
+        upper
+    } else {
+        format!("SIG{upper}")
     };
+    match candidate.parse::<Signal>() {
+        Ok(sig) => Ok(sig.as_str().to_string()),
+        Err(_) => Err(format!(
+            "unknown signal: {spec:?} (use SIG-prefix uppercase, alias, or POSIX number)"
+        )),
+    }
+}
+
+fn parse_kill(args: &[String]) -> Command {
+    let mut cfg = KillConfig::default();
     let mut positionals: Vec<String> = Vec::new();
+    // `--` 以降は強制 session-id 扱い (= 数字 session-id を escape、attach と同流儀)
+    let mut after_separator = false;
     let mut i = 0usize;
     while i < args.len() {
         let arg = args[i].as_str();
+
+        if after_separator {
+            positionals.push(args[i].clone());
+            i += 1;
+            continue;
+        }
+
+        if arg == "--" {
+            after_separator = true;
+            i += 1;
+            continue;
+        }
+
         let (name, inline_value) = split_eq(arg);
         let mut consumed_extra = false;
         let value: Option<String> = match inline_value {
@@ -712,35 +781,69 @@ fn parse_kill(args: &[String]) -> Command {
                 Some(v) => cfg.socket = Some(v),
                 None => return Command::Error("--socket requires a value".into()),
             },
-            // DR-0012: 旧 `--signum N` は完全廃止。v0.2.0 breaking。
+            // DR-0012: 旧 `--signum N` は完全廃止 (= --signal で数字も受ける)。
+            // 数字 / 略名 / SIG-prefix 大文字 全部 normalize 経由で wire 形式に揃える。
             "--signal" => match value.as_deref() {
-                Some(v) => {
-                    // CLI 段で正規表記 (SIG-prefix 大文字) を強制する。
-                    // - 略名 ("TERM") は SIG-prefix 不在で reject
-                    // - 小文字 ("sigterm") は ASCII 大文字以外を含むので reject
-                    // - 数値 ("15") は SIG prefix 不在で reject
-                    // - 完全未知 ("SIGBOGUS") は CLI を通過し、daemon 側で
-                    //   signal.invalid として reject される
-                    if !v.starts_with("SIG")
-                        || v.len() <= 3
-                        || !v
-                            .bytes()
-                            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
-                    {
-                        return Command::Error(format!(
-                            "invalid --signal value: {v} (expected SIG-prefix uppercase, e.g. SIGTERM)"
-                        ));
-                    }
-                    cfg.signal = Some(v.to_string());
-                }
+                Some(v) => match normalize_signal_spec(v) {
+                    Ok(name) => cfg.signal = Some(name),
+                    Err(e) => return Command::Error(format!("invalid --signal value: {e}")),
+                },
                 None => return Command::Error("--signal requires a value".into()),
             },
             "--signum" => {
-                // 旧形式は v0.2.0 で廃止。明確な error メッセージで誘導する
-                // (DR-0012, R5-C4)。
+                // 旧形式は v0.2.0 で廃止 (= --signal で数字を受けるため不要)。
                 return Command::Error(
-                    "--signum is removed in v0.2.0 (DR-0012); use --signal NAME (e.g. --signal SIGTERM)".into(),
+                    "--signum is removed in v0.2.0 (DR-0012); use --signal NUM_OR_NAME (e.g. --signal 9 / --signal KILL / --signal SIGKILL)".into(),
                 );
+            }
+            "--index" => match value {
+                Some(v) => match v.parse::<i32>() {
+                    Ok(0) => {
+                        return Command::Error(
+                            "kill: --index=0 は不正です (= 1-based、1 が最古、-1 が最新)".into(),
+                        );
+                    }
+                    Ok(n) => cfg.index = Some(n),
+                    Err(_) => {
+                        return Command::Error(format!(
+                            "kill: --index には整数を指定してください (got: {v:?})"
+                        ));
+                    }
+                },
+                None => return Command::Error("--index requires a value".into()),
+            },
+            "--all" => {
+                cfg.all = true;
+                consumed_extra = false;
+            }
+            // POSIX kill 慣習 + 略名拡張: `-X` short flag (= `--` で始まらない short
+            // option) は signal spec として解釈する (kawaz 方針 2026-05-30):
+            // - `-9`       = SIGKILL (= 番号)
+            // - `-KILL`    = SIGKILL (= 略名)
+            // - `-SIGKILL` = SIGKILL (= 正規表記)
+            // - `-TERM`    = SIGTERM
+            //
+            // 既存 long option (`--socket` / `--index` / `--all` / `--signal` 等) は
+            // 前 arm で match されるためここに来ない。short option は `-h` (`--help`
+            // short) のみで、それも前 arm で先に処理。残りの `-X` は全て signal 扱い。
+            //
+            // 注: attach の `-1` は最新 index 解釈だが、kill 文脈では signal 慣習を
+            // 優先する (POSIX kill の慣行)。最新 session を kill したい場合は
+            // `--index=-1` を使う (= 位置引数の -1 は SIGHUP として解釈される)。
+            other if other.starts_with('-') && !other.starts_with("--") && other.len() > 1 => {
+                let sig_spec = &other[1..];
+                match normalize_signal_spec(sig_spec) {
+                    Ok(name) => {
+                        if cfg.signal.is_some() {
+                            return Command::Error("kill: signal を複数指定できません".into());
+                        }
+                        cfg.signal = Some(name);
+                    }
+                    Err(e) => {
+                        return Command::Error(format!("kill: invalid signal {other}: {e}"));
+                    }
+                }
+                consumed_extra = false;
             }
             other if other.starts_with('-') => {
                 return Command::Error(format!("unknown kill option: {other}"));
@@ -755,23 +858,55 @@ fn parse_kill(args: &[String]) -> Command {
             i += 1;
         }
     }
+
+    // --all との排他チェック
+    if cfg.all
+        && (cfg.session_id.is_some()
+            || cfg.socket.is_some()
+            || cfg.index.is_some()
+            || !positionals.is_empty())
+    {
+        return Command::Error("kill: --all は session-id / --index / --socket と排他です".into());
+    }
+
     match positionals.len() {
         0 => {
-            if cfg.socket.is_none() {
+            if cfg.socket.is_none() && cfg.index.is_none() && !cfg.all {
                 return Command::Error(
-                    "kill: session id (positional) または --socket=<path> が必要です。\
-                     例: `hyoui kill <session-id>` / `hyoui list` で session 一覧を確認できます"
+                    "kill: session id (positional) / --index=N / --socket=<path> / --all のいずれかが必要です。\
+                     例: `hyoui kill <session-id>` / `hyoui kill 1` / `hyoui kill --all` / `hyoui list` で session 一覧を確認できます"
                         .into(),
                 );
             }
         }
         1 => {
-            let sid = positionals.into_iter().next().unwrap();
-            // R5-AUD-C2: positional session_id を validate (= path traversal 早期 reject)
-            if let Err(e) = validate_session_id(&sid) {
-                return Command::Error(format!("kill: {e}"));
+            let pos = positionals.into_iter().next().unwrap();
+            // `--` 以降は強制 session-id、そうでなければ正の整数なら index 解釈。
+            let as_int = if after_separator {
+                None
+            } else {
+                pos.parse::<i32>().ok()
+            };
+            match (as_int, cfg.index) {
+                (Some(0), _) => {
+                    return Command::Error(
+                        "kill: index 0 は不正です (= 1-based、1 が最古、-1 が最新)".into(),
+                    );
+                }
+                (Some(n), None) if n > 0 => cfg.index = Some(n),
+                (Some(_), Some(_)) => {
+                    return Command::Error(
+                        "kill: --index と位置引数 (数字) を同時に指定できません".into(),
+                    );
+                }
+                _ => {
+                    // R5-AUD-C2: session_id を validate (= path traversal 早期 reject)
+                    if let Err(e) = validate_session_id(&pos) {
+                        return Command::Error(format!("kill: {e}"));
+                    }
+                    cfg.session_id = Some(pos);
+                }
             }
-            cfg.session_id = Some(sid);
         }
         _ => return Command::Error("kill: too many positional arguments".into()),
     }
@@ -2600,27 +2735,53 @@ fn usage_kill() -> String {
         \n\
         USAGE:\n    \
             hyoui kill <session-id> [options]\n    \
-            hyoui kill --socket=<path> [options]\n\
+            hyoui kill <index> [options]              # 正数は index 解釈 (= 1 最古)\n    \
+            hyoui kill --index=<N> [options]          # 負数も含む (= -1 最新)\n    \
+            hyoui kill --all [options]                # 全 live session を kill\n    \
+            hyoui kill --socket=<path> [options]\n    \
+            hyoui kill -- <session-id> [options]      # 数字 session-id を escape\n\
         \n\
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
-            --signal NAME   Signal name to send to the child PTY (default: SIGTERM)\n    \
+            --index N       session selector index (= mtime 昇順、1 最古 / -1 最新)\n    \
+            --all           全 live session を順次 kill (= killall 相当)\n    \
+            --signal SPEC   送信 signal (= default SIGTERM)。数字 / 略名 / SIG-prefix 大文字 OK\n    \
+            -N              POSIX kill 慣習: 短縮 signal 番号 (e.g. -9 = SIGKILL)\n    \
+            -NAME           短縮 signal 名 (e.g. -KILL / -TERM / -SIGKILL も OK)\n    \
             -h, --help      Show this help and exit\n\
         \n\
-        SIGNAL NAME (DR-0012):\n    \
-            正規表記は SIG-prefix 大文字 (e.g. SIGTERM / SIGKILL / SIGINT / SIGHUP /\n    \
-            SIGQUIT / SIGUSR1 / SIGUSR2 / SIGCONT / SIGTSTP / SIGCHLD)\n    \
-            略名 (TERM) / 小文字 (sigterm) / 数値 (15) は受理されない\n    \
-            POSIX が signal 数値を規定していないため wire 上は name で送る\n\
+        SIGNAL SPEC (= --signal の引数 or -N short flag):\n    \
+            数字:        9 / 15 / 1            (= POSIX signal 番号、OS で defined のみ)\n    \
+            略名:        KILL / TERM / INT     (= SIG-prefix 自動付加)\n    \
+            正規表記:    SIGKILL / SIGTERM     (= そのまま)\n    \
+            大文字緩和:  kill / sigterm        (= 内部大文字化)\n    \
+            短縮 flag:   -9 / -KILL / -SIGKILL (= --signal=9 と等価、POSIX kill 慣習 + 略名拡張)\n    \
+            wire には正規 SIG-prefix 大文字を流す (DR-0012、daemon 側は SIG-prefix のみ解釈)\n\
+        \n\
+        SESSION SELECTOR:\n    \
+            位置引数の正数 (e.g. `kill 2`)        => index 解釈 (= 2 番目に古い session)\n    \
+            位置引数の負数 (e.g. `kill -9`)       => signal 番号 解釈 (POSIX kill 慣習)\n    \
+            最新 session を kill したい場合は `--index=-1` を使う (= 位置引数の -1 は SIGHUP)\n    \
+            数字を session-id として使う場合は `--` セパレータ or `--socket=`\n\
         \n\
         EXIT CODE:\n    \
             0   送信完了 (= daemon が close するのを待ってから exit)\n    \
-            1   connect / send 失敗\n    \
-            2   引数不足 (session-id も --socket も無し)\n\
+            1   connect / send 失敗 / daemon が reject\n    \
+            2   引数不足 / 排他違反\n\
         \n\
         EXAMPLES:\n    \
             hyoui kill demo                          # session_id=demo に SIGTERM\n    \
-            hyoui kill demo --signal=SIGKILL         # SIGKILL を送る\n    \
+            hyoui kill demo --signal=SIGKILL         # SIGKILL を送る (= 正規表記)\n    \
+            hyoui kill demo --signal=KILL            # SIGKILL を送る (= 略名)\n    \
+            hyoui kill demo --signal=9               # SIGKILL を送る (= 数字)\n    \
+            hyoui kill -9 demo                       # SIGKILL を送る (= 番号 短縮)\n    \
+            hyoui kill -KILL demo                    # SIGKILL を送る (= 略名 短縮)\n    \
+            hyoui kill -SIGTERM demo                 # SIGTERM を送る (= 正規 短縮)\n    \
+            hyoui kill 1                             # 1 番古い session を SIGTERM\n    \
+            hyoui kill --index=-1                    # 最新 session を SIGTERM\n    \
+            hyoui kill --all                         # 全 live session を SIGTERM\n    \
+            hyoui kill --all --signal=KILL           # 全 live session を SIGKILL\n    \
+            hyoui kill -- 1                          # session_id=\"1\" (数字 escape) を kill\n    \
             hyoui kill --socket=/tmp/x.sock          # socket 直指定で kill\n\
         \n\
         RELATED:\n    \
@@ -4900,11 +5061,40 @@ mod tests {
         }
     }
 
-    /// DR-0012: 略名 / 小文字 / 数値は CLI 段で reject される (= wire の正規化を
-    /// CLI 入口で強制)。
+    /// kawaz 方針 2026-05-30: POSIX kill 慣習に揃えて略名 / 数字 / 小文字を accept、
+    /// CLI 段で正規 SIG-prefix 大文字に normalize して wire に流す。daemon 側は
+    /// 引き続き SIG-prefix 大文字のみ解釈 (defense in depth)。
     #[test]
-    fn parse_kill_rejects_non_canonical_signal_names() {
-        for bogus in &["TERM", "sigterm", "15", "SIG", "sig_term"] {
+    fn parse_kill_accepts_aliases_and_numbers_and_lowercase() {
+        let cases = [
+            ("TERM", "SIGTERM"),
+            ("KILL", "SIGKILL"),
+            ("sigterm", "SIGTERM"),
+            ("sigkill", "SIGKILL"),
+            ("term", "SIGTERM"),
+            ("15", "SIGTERM"),
+            ("9", "SIGKILL"),
+            ("1", "SIGHUP"),
+            ("SIGINT", "SIGINT"),
+        ];
+        for (input, expected_wire) in cases {
+            match parse_args(&args(&["kill", "demo", "--signal", input])) {
+                Command::Kill(cfg) => {
+                    assert_eq!(
+                        cfg.signal.as_deref(),
+                        Some(expected_wire),
+                        "input {input:?} should normalize to {expected_wire}"
+                    );
+                }
+                other => panic!("expected Kill cfg for `--signal {input}`, got {other:?}"),
+            }
+        }
+    }
+
+    /// 不正な signal spec (= 完全未知の文字列 / 範囲外数字) はエラー。
+    #[test]
+    fn parse_kill_rejects_truly_invalid_signal() {
+        for bogus in &["SIG", "sig_term", "FOOBAR", "999"] {
             match parse_args(&args(&["kill", "demo", "--signal", bogus])) {
                 Command::Error(msg) => {
                     assert!(
@@ -4914,6 +5104,91 @@ mod tests {
                 }
                 other => panic!("expected Error for `--signal {bogus}`, got {other:?}"),
             }
+        }
+    }
+
+    /// POSIX kill 慣習: `-9` / `-KILL` / `-SIGKILL` 等の short flag を signal とみなす。
+    #[test]
+    fn parse_kill_short_flag_signal() {
+        let cases = [
+            ("-9", "SIGKILL"),
+            ("-15", "SIGTERM"),
+            ("-1", "SIGHUP"),
+            ("-KILL", "SIGKILL"),
+            ("-TERM", "SIGTERM"),
+            ("-SIGINT", "SIGINT"),
+            ("-sigterm", "SIGTERM"),
+        ];
+        for (input, expected_wire) in cases {
+            match parse_args(&args(&["kill", input, "demo"])) {
+                Command::Kill(cfg) => {
+                    assert_eq!(
+                        cfg.signal.as_deref(),
+                        Some(expected_wire),
+                        "short flag {input:?} should normalize to {expected_wire}"
+                    );
+                    assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                }
+                other => panic!("expected Kill cfg for `{input} demo`, got {other:?}"),
+            }
+        }
+    }
+
+    /// `--all` flag は cfg.all を true に。session-id / --index と排他。
+    #[test]
+    fn parse_kill_all_flag() {
+        match parse_args(&args(&["kill", "--all"])) {
+            Command::Kill(cfg) => {
+                assert!(cfg.all);
+                assert_eq!(cfg.session_id, None);
+                assert_eq!(cfg.index, None);
+            }
+            other => panic!("expected Kill(all=true), got {other:?}"),
+        }
+        // session-id と排他
+        match parse_args(&args(&["kill", "--all", "demo"])) {
+            Command::Error(msg) => assert!(msg.contains("--all") || msg.contains("排他")),
+            other => panic!("expected Error for --all+positional, got {other:?}"),
+        }
+        // --index と排他
+        match parse_args(&args(&["kill", "--all", "--index=1"])) {
+            Command::Error(msg) => assert!(msg.contains("--all") || msg.contains("排他")),
+            other => panic!("expected Error for --all+index, got {other:?}"),
+        }
+    }
+
+    /// 位置引数の正数は index 解釈 (= 1 番古い session を指す)、負数は signal。
+    #[test]
+    fn parse_kill_positional_int_semantics() {
+        // 正数 → index
+        match parse_args(&args(&["kill", "2"])) {
+            Command::Kill(cfg) => {
+                assert_eq!(cfg.index, Some(2));
+                assert_eq!(cfg.session_id, None);
+                assert_eq!(cfg.signal, None);
+            }
+            other => panic!("expected Kill(index=2), got {other:?}"),
+        }
+        // 負数 → signal (POSIX kill 慣習)
+        match parse_args(&args(&["kill", "-9", "demo"])) {
+            Command::Kill(cfg) => {
+                assert_eq!(cfg.signal.as_deref(), Some("SIGKILL"));
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.index, None);
+            }
+            other => panic!("expected Kill(signal=SIGKILL, session=demo), got {other:?}"),
+        }
+    }
+
+    /// `--` セパレータで数字 session-id を escape できる。
+    #[test]
+    fn parse_kill_dashdash_escape() {
+        match parse_args(&args(&["kill", "--", "1"])) {
+            Command::Kill(cfg) => {
+                assert_eq!(cfg.session_id.as_deref(), Some("1"));
+                assert_eq!(cfg.index, None);
+            }
+            other => panic!("expected Kill(session=\"1\"), got {other:?}"),
         }
     }
 
