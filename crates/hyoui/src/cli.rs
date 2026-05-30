@@ -191,6 +191,19 @@ pub struct AttachConfig {
     pub debug_dump_client: Option<String>,
 }
 
+/// `list` subcommand の出力形式 (= `--format=plain|jsonl`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ListFormat {
+    /// Plain text (= human readable、default)。固定長 columns で
+    /// `SESSION / STATUS / DUR / SOCKET` を 1 行ごとに出力。
+    #[default]
+    Plain,
+    /// JSON Lines (= scripting 用、1 session 1 行 JSON object)。
+    /// field: `session` / `status` / `started_unix_ms` / `dur_ms` / `socket`。
+    Jsonl,
+}
+
 /// `list` subcommand configuration (R5-H3)。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ListConfig {
@@ -201,6 +214,9 @@ pub struct ListConfig {
     /// `--prune-stale` は connect 試行で死活確認し、`ECONNREFUSED` 等で
     /// 失敗した socket を unlink で除去する。
     pub prune_stale: bool,
+
+    /// 出力 format (= default Plain、`--format=jsonl` で JSON Lines)。
+    pub format: ListFormat,
 }
 
 /// `kill` subcommand configuration.
@@ -624,8 +640,28 @@ fn parse_list(args: &[String]) -> Command {
     }
     let mut cfg = ListConfig::default();
     for a in args {
-        match a.as_str() {
-            "--prune-stale" => cfg.prune_stale = true,
+        let (name, inline_value) = split_eq(a.as_str());
+        match name.as_str() {
+            "--prune-stale" => {
+                if inline_value.is_some() {
+                    return Command::Error("list: --prune-stale does not take a value".to_string());
+                }
+                cfg.prune_stale = true;
+            }
+            "--format" => match inline_value.as_deref() {
+                Some("plain") => cfg.format = ListFormat::Plain,
+                Some("jsonl") => cfg.format = ListFormat::Jsonl,
+                Some(other) => {
+                    return Command::Error(format!(
+                        "list: --format expects plain|jsonl, got: {other}"
+                    ));
+                }
+                None => {
+                    return Command::Error(
+                        "list: --format requires a value (= plain | jsonl)".to_string(),
+                    );
+                }
+            },
             other => return Command::Error(format!("list: unexpected argument: {other}")),
         }
     }
@@ -2419,14 +2455,24 @@ fn usage_list() -> String {
         "hyoui list — list daemon sessions (= socket dir scan + liveness probe)\n\
         \n\
         USAGE:\n    \
-            hyoui list [--prune-stale]\n\
+            hyoui list [--prune-stale] [--format=plain|jsonl]\n\
         \n\
         OPTIONS:\n    \
-            --prune-stale   stale socket (= connect 不能) を unlink で削除\n    \
-            -h, --help      Show this help and exit\n\
+            --prune-stale       stale socket (= connect 不能) を unlink で削除\n    \
+            --format=plain|jsonl  出力 format (= default plain)。jsonl は 1 session 1 行の JSON object\n    \
+            -h, --help          Show this help and exit\n\
         \n\
-        OUTPUT (TAB separated, 1 line per session):\n    \
-            <session-id>\\t<live|stale>\\t<socket-path>\n\
+        OUTPUT (plain, fixed-width columns, sorted by socket mtime ascending):\n    \
+            SESSION              STATUS  DUR        SOCKET\n    \
+            test-claude          live    1h2m       /tmp/.../test-claude.sock\n    \
+            stale-test           stale   -          /tmp/.../stale-test.sock\n\
+        \n\
+        OUTPUT (jsonl, 1 session = 1 line):\n    \
+            {\"session\":\"<id>\",\"status\":\"live|stale\",\"started_unix_ms\":<ms>,\"dur_ms\":<ms>,\"socket\":\"<path>\"}\n\
+        \n\
+        SORT ORDER:\n    \
+            socket mtime ascending (= 古い session が上、新しい session が下)。\n    \
+            `hyoui attach --index=1` で 1 番古い、`--index=-1` で 1 番新しい session を指す前提。\n\
         \n\
         LIVENESS PROBE (R5-H3):\n    \
             各 socket に対し best-effort connect 試行 (= 100ms timeout)。\n    \
@@ -2442,9 +2488,10 @@ fn usage_list() -> String {
             0   正常終了 (= 0 件でも成功扱い、stderr に `no sessions found` を 1 行)\n\
         \n\
         EXAMPLES:\n    \
-            hyoui list                              # 全 session を一覧 (live/stale 表示)\n    \
+            hyoui list                              # plain format (固定長)\n    \
+            hyoui list --format=jsonl               # 機械可読 (1 session 1 行 JSON)\n    \
             hyoui list --prune-stale                # stale socket を削除して live のみ残す\n    \
-            hyoui list | awk '$2 == \"live\" {print $1}'  # live session id を抽出\n\
+            hyoui list --format=jsonl | jq -r '.session'  # session id を抽出\n\
         \n\
         RELATED:\n    \
             hyoui status <id>   session 1 件の詳細\n    \
@@ -4389,6 +4436,61 @@ mod tests {
         match parse_args(&args(&["list", "--bogus"])) {
             Command::Error(msg) => {
                 assert!(msg.contains("--bogus"), "error should mention the flag");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// `--format=plain` は `ListFormat::Plain` を設定する (= default と同等だが明示)。
+    #[test]
+    fn list_format_plain_sets_plain() {
+        match parse_args(&args(&["list", "--format=plain"])) {
+            Command::List(cfg) => assert_eq!(cfg.format, ListFormat::Plain),
+            other => panic!("expected List(format=Plain), got {other:?}"),
+        }
+    }
+
+    /// `--format=jsonl` は `ListFormat::Jsonl` を設定する。
+    #[test]
+    fn list_format_jsonl_sets_jsonl() {
+        match parse_args(&args(&["list", "--format=jsonl"])) {
+            Command::List(cfg) => assert_eq!(cfg.format, ListFormat::Jsonl),
+            other => panic!("expected List(format=Jsonl), got {other:?}"),
+        }
+    }
+
+    /// `--format=<unknown>` は `Command::Error` を返す。
+    #[test]
+    fn list_format_unknown_value_is_error() {
+        match parse_args(&args(&["list", "--format=yaml"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("yaml"), "error should mention rejected value");
+                assert!(msg.contains("--format"), "error should mention --format");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// `--format` の値なし (= `--format` 単独) は `Command::Error` を返す。
+    #[test]
+    fn list_format_requires_value() {
+        match parse_args(&args(&["list", "--format"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("--format"), "error should mention --format");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// `--prune-stale=true` のような値付きは `Command::Error` (= bool flag に値は取らない)。
+    #[test]
+    fn list_prune_stale_does_not_accept_value() {
+        match parse_args(&args(&["list", "--prune-stale=true"])) {
+            Command::Error(msg) => {
+                assert!(
+                    msg.contains("--prune-stale"),
+                    "error should mention --prune-stale"
+                );
             }
             other => panic!("expected Error, got {other:?}"),
         }

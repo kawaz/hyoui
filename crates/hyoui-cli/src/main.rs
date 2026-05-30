@@ -17,7 +17,7 @@ use std::os::fd::AsFd;
 use std::process::ExitCode;
 
 use hyoui::cli::{
-    AttachConfig, Command, HelpTopic, InputCommand, InputSpec, KillConfig, ListConfig,
+    AttachConfig, Command, HelpTopic, InputCommand, InputSpec, KillConfig, ListConfig, ListFormat,
     LockAcquireConfig, LockCommand, LockMode, LockReleaseConfig, ScreenCommand,
     ScreenDumpCliFormat, ScreenDumpCliLayer, ScreenDumpConfig, ScreenSnapshotConfig,
     SnapshotCliComponent, StatusConfig, TailConfig, WaitConfig, parse_args, usage,
@@ -638,18 +638,33 @@ fn list_command(cfg: ListConfig) -> ExitCode {
     list_command_with_dirs(cfg, list_candidate_dirs())
 }
 
+/// `hyoui list` で 1 session を表す internal 構造体。
+///
+/// mtime 順 sort のために `started_unix_ms` を保持する。`hyoui attach --index=N`
+/// (= [`docs/issue/2026-05-30-feature-attach-index-shortcut.md`]) も本順序を前提に
+/// 「1=最古 / -1=最新」と解釈する。
+struct ListEntry {
+    session: String,
+    socket_path: std::path::PathBuf,
+    live: bool,
+    /// socket file mtime を epoch ms に換算した値 (= sort key + jsonl 出力用)。
+    started_unix_ms: u64,
+    /// 起動からの経過時間 (= `now - mtime`)。stale の場合は 0 とする (= 表示時は `-`)。
+    dur: std::time::Duration,
+}
+
 /// `list_command` の testable な内部実装。dir 一覧を引数で受けることで
 /// env (`XDG_RUNTIME_DIR` / `TMPDIR`) 依存を切り離し、unit test 可能にする。
 fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<std::path::PathBuf>) -> ExitCode {
-    let mut found = 0usize;
-    let mut stale_count = 0usize;
+    let now = std::time::SystemTime::now();
+    let mut entries: Vec<ListEntry> = Vec::new();
     let mut pruned_count = 0usize;
     for dir in dirs {
-        let entries = match std::fs::read_dir(&dir) {
+        let read_entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
             Err(_) => continue, // dir 不存在は無視 (= 何も daemon 起動してない可能性)
         };
-        for entry in entries.flatten() {
+        for entry in read_entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("sock") {
                 continue;
@@ -660,12 +675,24 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<std::path::PathBuf>) -> Exi
                 .unwrap_or("?")
                 .to_string();
             let live = probe_socket_liveness(&path);
-            let status = if live { "live" } else { "stale" };
-            if !live {
-                stale_count += 1;
-            }
-            println!("{session}\t{status}\t{}", path.display());
-            found += 1;
+            let (started_unix_ms, dur) = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+                Ok(mtime) => {
+                    let started_ms = mtime
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let dur = now.duration_since(mtime).unwrap_or_default();
+                    (started_ms, dur)
+                }
+                Err(_) => (0, std::time::Duration::ZERO),
+            };
+            entries.push(ListEntry {
+                session,
+                socket_path: path.clone(),
+                live,
+                started_unix_ms,
+                dur,
+            });
 
             // R5-H3: --prune-stale で stale socket を unlink。
             if !live && cfg.prune_stale {
@@ -681,6 +708,21 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<std::path::PathBuf>) -> Exi
             }
         }
     }
+
+    // mtime ascending (= 古い session が先頭、新しい session が末尾)。
+    // attach --index=1 が最古、--index=-1 が最新を指す前提。
+    entries.sort_by_key(|e| e.started_unix_ms);
+
+    match cfg.format {
+        ListFormat::Plain => print_list_plain(&entries),
+        ListFormat::Jsonl => print_list_jsonl(&entries),
+        // `ListFormat` is `#[non_exhaustive]`; fall back to plain
+        // for unknown future variants.
+        _ => print_list_plain(&entries),
+    }
+
+    let found = entries.len();
+    let stale_count = entries.iter().filter(|e| !e.live).count();
     if found == 0 {
         // 0 件は stderr で明示 (script 用に stdout を汚さない)。
         // 詳細な誘導 (= 起動例 / socket dir) は冗長で「エラー?」と誤認させるため
@@ -695,6 +737,79 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<std::path::PathBuf>) -> Exi
         eprintln!("hyoui: pruned {pruned_count} stale socket(s)");
     }
     ExitCode::SUCCESS
+}
+
+/// `std::time::Duration` を human readable な短い表記に整形 (= `1h2m` / `15m` / `3d4h`)。
+///
+/// `hyoui list` の DUR 列で固定長を維持しやすくするため、cap は 10 chars 程度に
+/// 収まる範囲で表示する。
+fn fmt_dur(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d{}h", secs / 86400, (secs % 86400) / 3600)
+    }
+}
+
+/// session id を最大 `max` chars に切り詰める。超過分は末尾を `…` で示す。
+fn truncate_to(s: &str, max: usize) -> String {
+    let len = s.chars().count();
+    if len <= max {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{truncated}…")
+    }
+}
+
+/// Plain format (= 固定長 column) で `entries` を stdout に出力する。
+///
+/// header: `SESSION (20ch) STATUS (7ch) DUR (10ch) SOCKET (残り)`。entries 0 件なら
+/// header も出さない (= 旧挙動互換、`no sessions found` は stderr で別途出る)。
+fn print_list_plain(entries: &[ListEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    println!("{:<20} {:<7} {:<10} SOCKET", "SESSION", "STATUS", "DUR");
+    for e in entries {
+        let status = if e.live { "live" } else { "stale" };
+        let dur = if e.live {
+            fmt_dur(e.dur)
+        } else {
+            "-".to_string()
+        };
+        let session = truncate_to(&e.session, 20);
+        println!(
+            "{:<20} {:<7} {:<10} {}",
+            session,
+            status,
+            dur,
+            e.socket_path.display()
+        );
+    }
+}
+
+/// JSON Lines format で `entries` を stdout に出力する。
+///
+/// 1 session = 1 行の JSON object。field: `session` / `status` / `started_unix_ms` /
+/// `dur_ms` / `socket`。stale session の `started_unix_ms` は file 削除済等で 0 に
+/// なり得る、その場合 `dur_ms` も 0。
+fn print_list_jsonl(entries: &[ListEntry]) {
+    for e in entries {
+        let obj = serde_json::json!({
+            "session": e.session,
+            "status": if e.live { "live" } else { "stale" },
+            "started_unix_ms": e.started_unix_ms,
+            "dur_ms": e.dur.as_millis() as u64,
+            "socket": e.socket_path.display().to_string(),
+        });
+        println!("{obj}");
+    }
 }
 
 /// `hyoui list` で scan する候補 dir を返す。
@@ -2060,7 +2175,10 @@ mod tests {
         let _live_listener = UnixListener::bind(&live_path).expect("bind live");
 
         // dir 一覧を直接渡して env mutation を回避
-        let cfg = ListConfig { prune_stale: true };
+        let cfg = ListConfig {
+            prune_stale: true,
+            ..Default::default()
+        };
         let _exit = list_command_with_dirs(cfg, vec![sock_dir.path().to_path_buf()]);
 
         // 確認: stale は unlink された、live はまだ残っている
@@ -2084,7 +2202,10 @@ mod tests {
         }
         assert!(stale_path.exists());
 
-        let cfg = ListConfig { prune_stale: false };
+        let cfg = ListConfig {
+            prune_stale: false,
+            ..Default::default()
+        };
         let _exit = list_command_with_dirs(cfg, vec![sock_dir.path().to_path_buf()]);
 
         assert!(
