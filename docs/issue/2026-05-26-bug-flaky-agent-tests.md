@@ -1,6 +1,6 @@
 # BUG: agent.rs tests がフレーキー (`agent_run_echo_output_visible_via_observer`, `agent_socket_input_reaches_child`)
 
-- Status: Open
+- Status: **廃止 (2026-05-30 整理)** — 該当 test 2 件は agent.rs ごと削除済 (commit `numkmlolnkkl`、2026-05-26)、症状消滅。根本 race condition は v0.1.0 daemon 再実装計画 (= 当時の根本対処方針) とともに撤回されたため、本 issue としては closed。historical reference として保存。
 - Date: 2026-05-26
 - Priority: Middle (CI を fail させるが、v0.1.0 daemon 再実装で根本対処予定)
 - 発見元: PoC 完了後の push (`pkf run push`) で test 失敗、CI でも別の test (agent_socket_input_reaches_child) で fail

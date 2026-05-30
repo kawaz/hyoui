@@ -2,7 +2,7 @@
 
 - Date: 2026-05-28
 - Priority: 中 (= process 改善、本格 fix で再発防止)
-- Status: 未着手 (= DR 改訂判断は kawaz と要相談)
+- Status: **部分完了 (2026-05-30 整理)** — 盲点 1〜3 は DR-0014 改訂 (commit `mqkrkxqnplqw`) で反映済 (= self-check 拡張、Anti-pattern 追加、§状態観測 / §検証主義 補強、CLAUDE.md 連動更新)。**残り作業**: harness 自動 test (`matrix_test.rs`) への `stty -a` 観測組み込み + real-world TUI 3 category 検証の CI 化 + 盲点 4 (DR Implementation Auditor persona) 実装。
 
 ## 背景
 
