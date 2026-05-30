@@ -2582,10 +2582,12 @@ fn usage_status() -> String {
         \n\
         USAGE:\n    \
             hyoui status <session-id>\n    \
+            hyoui status --index=<N>\n    \
             hyoui status --socket=<path>\n\
         \n\
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
+            --index N       Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
             -h, --help      Show this help and exit\n\
         \n\
         OUTPUT (plaintext key:value 1 行ごと):\n    \
@@ -2614,10 +2616,12 @@ fn usage_tail() -> String {
         \n\
         USAGE:\n    \
             hyoui tail <session-id> [options]\n    \
+            hyoui tail --index=<N> [options]\n    \
             hyoui tail --socket=<path> [options]\n\
         \n\
         OPTIONS:\n    \
             --socket PATH        Explicit socket path (alternative to session-id)\n    \
+            --index N            Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
             --follow             子 PTY exit / TailEnd まで stream を継続する\n    \
             --strip              ANSI escape を strip 済の bytes を受け取る (= `--strip-ansi` alias)\n    \
             --since DUR          過去 DUR 以内の chunk のみ流す。単位必須 (例: 500ms / 2s / 1m)\n    \
@@ -2660,6 +2664,7 @@ fn usage_wait() -> String {
         \n\
         USAGE:\n    \
             hyoui wait <session-id> <pattern> [options]\n    \
+            hyoui wait --index=<N> <pattern> [options]\n    \
             hyoui wait --socket=<path> <pattern> [options]\n\
         \n\
         PATTERN:\n    \
@@ -2676,6 +2681,7 @@ fn usage_wait() -> String {
         \n\
         OPTIONS:\n    \
             --socket PATH         Explicit socket path (alternative to session-id)\n    \
+            --index N             Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
             --timeout DUR         絶対 timeout。**指定なしは無限 wait**\n    \
             --poll-interval DUR   snapshot polling 周期 (default 100ms)。\n                      \
                                   環境変数 `HYOUI_WAIT_POLL_MS` でも override 可。\n    \
@@ -2835,10 +2841,12 @@ fn usage_screen_dump() -> String {
         \n\
         USAGE:\n    \
             hyoui screen dump <session-id> [options]\n    \
+            hyoui screen dump --index=<N> [options]\n    \
             hyoui screen dump --socket=<path> [options]\n\
         \n\
         OPTIONS:\n    \
             --socket PATH       Explicit socket path (alternative to session-id)\n    \
+            --index N           Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
             --format FMT        Output format (default: ansi)\n                        \
                 ansi       — raw ANSI bytes (= terminal で cat 再生可)\n                        \
                 binary     — 空白除去 + 改行 plaintext (= grep 用)\n                        \
@@ -2888,10 +2896,12 @@ fn usage_screen_snapshot() -> String {
         \n\
         USAGE:\n    \
             hyoui screen snapshot <session-id> [options]\n    \
+            hyoui screen snapshot --index=<N> [options]\n    \
             hyoui screen snapshot --socket=<path> [options]\n\
         \n\
         OPTIONS:\n    \
             --socket PATH       Explicit socket path (alternative to session-id)\n    \
+            --index N           Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
             --include SET       Components (comma-separated, case-insensitive; default: all)\n                        \
                 Cells, Cursor, Mode, Style, Scrollback, WindowSize, Buffer, SequenceNo\n                        \
                 (Scrollback は daemon 側で未実装 → 明示指定すると error)\n    \
@@ -2953,10 +2963,12 @@ fn usage_lock_acquire() -> String {
         \n\
         USAGE:\n    \
             hyoui lock acquire <session-id> [options]\n    \
+            hyoui lock acquire --index=<N> [options]\n    \
             hyoui lock acquire --socket=<path> [options]\n\
         \n\
         OPTIONS:\n    \
             --socket PATH       Explicit socket path (alternative to session-id)\n    \
+            --index N           Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
             --mode wait|fail    Behavior when another holder exists (default: wait)\n                        \
                 wait — keep polling until acquired or --timeout expires\n                        \
                 fail — exit 1 immediately when denied\n    \
@@ -3008,10 +3020,12 @@ fn usage_lock_release() -> String {
         \n\
         USAGE:\n    \
             hyoui lock release <session-id> --token=<T>\n    \
+            hyoui lock release --index=<N> --token=<T>\n    \
             hyoui lock release --socket=<path> --token=<T>\n\
         \n\
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
+            --index N       Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
             --token TOKEN   Lock token to release (required; env HYOUI_LOCK_TOKEN fallback)\n    \
             -h, --help      Show this help and exit\n\
         \n\
@@ -3049,10 +3063,12 @@ fn usage_unlock() -> String {
         \n\
         USAGE:\n    \
             hyoui unlock <session-id> --token=<T>\n    \
+            hyoui unlock --index=<N> --token=<T>\n    \
             hyoui unlock --socket=<path> --token=<T>\n\
         \n\
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
+            --index N       Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
             --token TOKEN   Lock token to release (required; env HYOUI_LOCK_TOKEN fallback)\n    \
             -h, --help      Show this help and exit\n\
         \n\
@@ -3174,6 +3190,8 @@ pub struct InputCommand {
     pub socket: Option<String>,
     /// Target session id (= positional 第 1 引数)。`socket` 指定時は None でも OK。
     pub session_id: Option<String>,
+    /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
+    pub index: Option<i32>,
     /// Spec list (= 出現順で送信、空 Vec は parser 段で reject)。
     pub specs: Vec<InputSpec>,
     /// Per-spec timeout (= default 5s、特に `wait:` / `wait-idle:` で意味を持つ)。
@@ -3316,6 +3334,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
 /// **本タスクでは parser のみ**。各 spec の handler は別 task (= #16/#17) で配線。
 fn parse_input(args: &[String]) -> Command {
     let mut socket: Option<String> = None;
+    let mut index: Option<i32> = None;
     let mut timeout_ms: u64 = 5_000;
     let mut lock_token: Option<String> = None;
     // task #21: `file:` spec の 1 file あたり最大 bytes。
@@ -3354,6 +3373,22 @@ fn parse_input(args: &[String]) -> Command {
                     socket = Some(v);
                 }
                 None => return Command::Error("input: --socket requires a value".into()),
+            },
+            "--index" => match value {
+                Some(v) => match v.parse::<i32>() {
+                    Ok(0) => {
+                        return Command::Error(
+                            "input: --index=0 は不正です (= 1-based、1 が最古、-1 が最新)".into(),
+                        );
+                    }
+                    Ok(n) => index = Some(n),
+                    Err(_) => {
+                        return Command::Error(format!(
+                            "input: --index には整数を指定してください (got: {v:?})"
+                        ));
+                    }
+                },
+                None => return Command::Error("input: --index requires a value".into()),
             },
             "--timeout" => match value {
                 Some(v) => match parse_duration_ms(&v) {
@@ -3414,25 +3449,25 @@ fn parse_input(args: &[String]) -> Command {
     }
 
     // positional の最初は session_id。それ以降が spec list。
-    // ただし `--socket` 指定時は session_id を省略でき、全 positional が spec。
+    // ただし `--socket` / `--index` 指定時は session_id を省略でき、全 positional が spec。
     // 判別は positional 第 1 引数が「spec prefix を含むか」ではなく
     // session_id とみなしてから validate (= `text:` 等が session_id 形式の
     // validation に引っかかる)。
     //
     // 戦略:
-    // 1. `--socket` 指定 → 全 positional を spec として parse
+    // 1. `--socket` or `--index` 指定 → 全 positional を spec として parse
     // 2. それ以外 → 第 1 positional を session_id 候補とみなし、`validate_session_id`
-    //    が通れば session_id、通らない場合は error (= 「最初の引数が session_id か
-    //    spec か」を曖昧にしない、ユーザに spec を最初に書くなら `--socket` を
-    //    使わせる)
-    let (session_id, spec_strs): (Option<String>, &[String]) = if socket.is_some() {
+    //    が通れば session_id、通らない場合は error
+    let (session_id, spec_strs): (Option<String>, &[String]) = if socket.is_some()
+        || index.is_some()
+    {
         (None, positionals.as_slice())
     } else {
         match positionals.first() {
             None => {
                 return Command::Error(
-                    "input: session id (positional) または --socket=<path> が必要です。\
-                     例: `hyoui input <session-id> text:hello key:Enter`"
+                    "input: session id (positional) / --index=N / --socket=<path> のいずれかが必要です。\
+                     例: `hyoui input <session-id> text:hello key:Enter` / `hyoui input --index=1 text:hello`"
                         .into(),
                 );
             }
@@ -3486,6 +3521,7 @@ fn parse_input(args: &[String]) -> Command {
     Command::Input(InputCommand {
         socket,
         session_id,
+        index,
         specs,
         timeout: Duration::from_millis(timeout_ms),
         lock_token,
@@ -3499,6 +3535,7 @@ fn usage_input() -> String {
         \n\
         USAGE:\n    \
             hyoui input <session-id> <spec>... [options]\n    \
+            hyoui input --index=<N> <spec>... [options]\n    \
             hyoui input --socket=<path> <spec>... [options]\n\
         \n\
         SPECS (= 出現順で送信、order-preserved):\n    \
@@ -3512,6 +3549,7 @@ fn usage_input() -> String {
         \n\
         OPTIONS:\n    \
             --socket PATH      Explicit socket path (alternative to session-id)\n    \
+            --index N          Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
             --timeout DUR      Per-spec timeout (default: 5s; DUR 形式は下記参照)\n    \
             --lock-token T     明示 lock token (= env HYOUI_LOCK_TOKEN より優先、DR-0006 §8.5)\n    \
             --max-file-bytes N file: spec の 1 file あたり最大 bytes (default 16777216 = 16 MiB、\n                       \

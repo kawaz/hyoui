@@ -1793,9 +1793,9 @@ fn write_screen_snapshot_payload(payload: &[u8], output: Option<&str>) -> ExitCo
 ///
 /// **wait / wait-idle は task #17 の scope**。本 task では到達したら明示 error。
 fn input_command(cmd: InputCommand) -> ExitCode {
-    // socket path 解決。session_id / --socket どちらかが必須 (= 通常 parser 段で
-    // 確定済だが defense-in-depth)。
-    if cmd.socket.is_none() && cmd.session_id.is_none() {
+    // socket path 解決。session_id / --socket / --index のいずれかが必須 (= 通常 parser
+    // 段で確定済だが defense-in-depth)。
+    if cmd.socket.is_none() && cmd.session_id.is_none() && cmd.index.is_none() {
         print_session_required("input");
         return ExitCode::from(2);
     }
@@ -1809,7 +1809,7 @@ fn input_command(cmd: InputCommand) -> ExitCode {
         "input",
         cmd.socket.as_deref(),
         cmd.session_id.as_deref(),
-        None, // input family は --index 未対応 (= 別 commit で展開予定)
+        cmd.index,
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -3131,6 +3131,7 @@ mod tests {
         let cmd = InputCommand {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
+            index: None,
             specs: vec![InputSpec::Wait("GO".into())],
             timeout: std::time::Duration::from_secs(3),
             lock_token: None,
@@ -3188,6 +3189,7 @@ mod tests {
         let cmd = InputCommand {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
+            index: None,
             specs: vec![InputSpec::WaitIdle(std::time::Duration::from_millis(200))],
             timeout: std::time::Duration::from_secs(3),
             lock_token: None,
