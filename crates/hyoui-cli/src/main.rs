@@ -682,12 +682,10 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<std::path::PathBuf>) -> Exi
         }
     }
     if found == 0 {
-        // 0 件は stderr で明示 (script 用に stdout を汚さない)
+        // 0 件は stderr で明示 (script 用に stdout を汚さない)。
+        // 詳細な誘導 (= 起動例 / socket dir) は冗長で「エラー?」と誤認させるため
+        // 1 行のみとし、context が必要なら `hyoui list --help` を参照させる。
         eprintln!("hyoui: no sessions found");
-        eprintln!("       新しい session を始めるには: `hyoui run --detached -- <cmd>`");
-        eprintln!(
-            "       socket 候補 dir: $XDG_RUNTIME_DIR/hyoui または ${{TMPDIR:-/tmp}}/hyoui-<uid>"
-        );
     } else if stale_count > 0 && !cfg.prune_stale {
         eprintln!(
             "hyoui: {stale_count} stale socket(s) found. \
