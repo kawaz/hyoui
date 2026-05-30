@@ -880,36 +880,23 @@ fn parse_kill(args: &[String]) -> Command {
             }
         }
         1 => {
+            // kawaz 方針: 位置引数は数字でも session-id 扱い (= index は --index=N 専用)。
             let pos = positionals.into_iter().next().unwrap();
-            // `--` 以降は強制 session-id、そうでなければ正の整数なら index 解釈。
-            let as_int = if after_separator {
-                None
-            } else {
-                pos.parse::<i32>().ok()
-            };
-            match (as_int, cfg.index) {
-                (Some(0), _) => {
-                    return Command::Error(
-                        "kill: index 0 は不正です (= 1-based、1 が最古、-1 が最新)".into(),
-                    );
-                }
-                (Some(n), None) if n > 0 => cfg.index = Some(n),
-                (Some(_), Some(_)) => {
-                    return Command::Error(
-                        "kill: --index と位置引数 (数字) を同時に指定できません".into(),
-                    );
-                }
-                _ => {
-                    // R5-AUD-C2: session_id を validate (= path traversal 早期 reject)
-                    if let Err(e) = validate_session_id(&pos) {
-                        return Command::Error(format!("kill: {e}"));
-                    }
-                    cfg.session_id = Some(pos);
-                }
+            // R5-AUD-C2: session_id を validate (= path traversal 早期 reject)
+            if let Err(e) = validate_session_id(&pos) {
+                return Command::Error(format!("kill: {e}"));
             }
+            cfg.session_id = Some(pos);
         }
         _ => return Command::Error("kill: too many positional arguments".into()),
     }
+
+    if cfg.session_id.is_some() && cfg.index.is_some() {
+        return Command::Error(
+            "kill: session id (位置引数) と --index を同時に指定できません".into(),
+        );
+    }
+
     Command::Kill(cfg)
 }
 
@@ -1516,25 +1503,9 @@ fn parse_attach(args: &[String]) -> Command {
     };
 
     let mut positionals: Vec<String> = Vec::new();
-    // `--` 以降の引数は強制 session-id 扱い (= 数字 session-id を escape したい
-    // case の救済路、cli-design-preferences.md の「`--` セパレータ」)。
-    let mut after_separator = false;
     let mut i = 0usize;
     while i < args.len() {
         let arg = args[i].as_str();
-
-        if after_separator {
-            positionals.push(args[i].clone());
-            i += 1;
-            continue;
-        }
-
-        if arg == "--" {
-            after_separator = true;
-            i += 1;
-            continue;
-        }
-
         let (name, inline_value) = split_eq(arg);
         let mut consumed_extra = false;
         let value: Option<String> = match inline_value {
@@ -1594,17 +1565,12 @@ fn parse_attach(args: &[String]) -> Command {
                 },
                 None => return Command::Error("--index requires a value".into()),
             },
-            // `-1` / `-2` ... のような負数だけ allow (= attach index 用)。
-            // `-foo` のような未知 flag は弾く。
-            other if other.starts_with('-') && other.parse::<i32>().is_ok() => {
-                consumed_extra = false;
-                positionals.push(args[i].clone());
-            }
             other if other.starts_with('-') => {
                 return Command::Error(format!("unknown attach option: {other}"));
             }
             _ => {
-                // positional (= session id or index 数字)
+                // positional (= session id)。数字も session-id 扱い (kawaz 方針:
+                // index 指定は --index=N option 専用、位置引数は名前として保持)。
                 consumed_extra = false;
                 positionals.push(args[i].clone());
             }
@@ -1620,42 +1586,20 @@ fn parse_attach(args: &[String]) -> Command {
             if cfg.socket.is_none() && cfg.index.is_none() {
                 return Command::Error(
                     "attach: session id (positional) または --socket=<path> / --index=N が必要です。\
-                     例: `hyoui attach <session-id>` / `hyoui attach 1` (最古) / `hyoui attach -1` (最新) / \
-                     `hyoui list` で session 一覧を確認できます"
+                     例: `hyoui attach <session-id>` / `hyoui attach --index=1` (最古) / \
+                     `hyoui attach --index=-1` (最新) / `hyoui list` で session 一覧を確認できます"
                         .into(),
                 );
             }
         }
-        1 => {
-            let pos = positionals.into_iter().next().unwrap();
-            // `--` 以降は強制 session-id 扱い、それ以前は整数なら index 解釈、
-            // 数字以外なら session-id 扱い。`--index` と位置引数の同時指定はエラー。
-            let as_int = if after_separator {
-                None
-            } else {
-                pos.parse::<i32>().ok()
-            };
-            match (as_int, cfg.index) {
-                (Some(0), _) => {
-                    return Command::Error(
-                        "attach: index 0 は不正です (= 1-based、1 が最古、-1 が最新)".into(),
-                    );
-                }
-                (Some(n), None) => cfg.index = Some(n),
-                (Some(_), Some(_)) => {
-                    return Command::Error(
-                        "attach: --index と位置引数 (数字) を同時に指定できません".into(),
-                    );
-                }
-                (None, _) => cfg.session_id = Some(pos),
-            }
-        }
+        1 => cfg.session_id = Some(positionals.into_iter().next().unwrap()),
         _ => return Command::Error("attach: too many positional arguments".into()),
     }
 
-    // 最終整合性: session_id / socket / index のいずれかは必須 (= 0 個 case は上で reject 済)
     if cfg.session_id.is_some() && cfg.index.is_some() {
-        return Command::Error("attach: session id と --index を同時に指定できません".into());
+        return Command::Error(
+            "attach: session id (位置引数) と --index を同時に指定できません".into(),
+        );
     }
 
     Command::Attach(cfg)
@@ -2500,10 +2444,8 @@ fn usage_attach() -> String {
         \n\
         USAGE:\n    \
             hyoui attach <session-id> [options]\n    \
-            hyoui attach <index> [options]            # 数字は index 解釈 (= 1 最古, -1 最新)\n    \
             hyoui attach --index=<N> [options]\n    \
-            hyoui attach --socket=<path> [options]\n    \
-            hyoui attach -- <session-id> [options]    # 数字 session-id を escape\n\
+            hyoui attach --socket=<path> [options]\n\
         \n\
         OPTIONS:\n    \
             --socket PATH         Explicit socket path (alternative to session-id)\n    \
@@ -2514,11 +2456,12 @@ fn usage_attach() -> String {
             --detach-others       Drop other attached clients on connect\n    \
             -h, --help            Show this help and exit\n\
         \n\
-        INDEX 指定:\n    \
-            位置引数が整数 (= `^-?\\d+$`) なら必ず index 解釈になる。`1` は最古、\n    \
-            `-1` は最新、`2` は 2 番目に古い、... と `hyoui list` の mtime 昇順 sort\n    \
-            結果に対する 1-based 指定。stale socket は index 対象外。範囲外は error。\n    \
-            数字を session-id として使う場合は `--` セパレータか `--socket=<path>` を使う。\n\
+        SESSION SELECTOR:\n    \
+            位置引数 (= session-id 名) または `--index=N` で指定する。位置引数の\n    \
+            数字 (= `attach 1`) は session-id 名として扱う (= 数字も valid な\n    \
+            session-id)。`--index=N` は `hyoui list` の mtime 昇順 sort 結果に対する\n    \
+            1-based 指定で、`1` = 最古、`-1` = 最新、`2` = 2 番目に古い、...。\n    \
+            stale socket は index 対象外。範囲外は error。session-id と --index は排他。\n\
         \n\
         DETACH KEY (= session を生かしたまま client だけ抜ける):\n    \
             Ctrl-A d              detach (session 維持 + 自分だけ Detach 送って終了)\n    \
@@ -2536,10 +2479,10 @@ fn usage_attach() -> String {
         \n\
         EXAMPLES:\n    \
             hyoui attach demo                       # session_id=demo に attach\n    \
-            hyoui attach 1                          # 1 番古い live session に attach\n    \
-            hyoui attach -1                         # 1 番新しい live session に attach\n    \
+            hyoui attach 1                          # session_id=\"1\" に attach (= 数字も名前扱い)\n    \
+            hyoui attach --index=1                  # 1 番古い live session に attach\n    \
+            hyoui attach --index=-1                 # 1 番新しい live session に attach\n    \
             hyoui attach --index=2                  # 2 番古い live session に attach\n    \
-            hyoui attach -- 1                       # session_id=\"1\" (数字 escape) に attach\n    \
             hyoui attach --socket=/tmp/x.sock       # 直接 socket 指定\n    \
             hyoui attach demo --mode=ro             # 読み取り専用 attach\n    \
             hyoui attach demo --detach-others       # 他 client を蹴って奪う\n    \
@@ -2735,11 +2678,10 @@ fn usage_kill() -> String {
         \n\
         USAGE:\n    \
             hyoui kill <session-id> [options]\n    \
-            hyoui kill <index> [options]              # 正数は index 解釈 (= 1 最古)\n    \
-            hyoui kill --index=<N> [options]          # 負数も含む (= -1 最新)\n    \
+            hyoui kill --index=<N> [options]          # 1=最古, -1=最新\n    \
             hyoui kill --all [options]                # 全 live session を kill\n    \
             hyoui kill --socket=<path> [options]\n    \
-            hyoui kill -- <session-id> [options]      # 数字 session-id を escape\n\
+            hyoui kill -- <session-id> [options]      # `-` で始まる session-id を escape\n\
         \n\
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
@@ -2759,10 +2701,10 @@ fn usage_kill() -> String {
             wire には正規 SIG-prefix 大文字を流す (DR-0012、daemon 側は SIG-prefix のみ解釈)\n\
         \n\
         SESSION SELECTOR:\n    \
-            位置引数の正数 (e.g. `kill 2`)        => index 解釈 (= 2 番目に古い session)\n    \
-            位置引数の負数 (e.g. `kill -9`)       => signal 番号 解釈 (POSIX kill 慣習)\n    \
-            最新 session を kill したい場合は `--index=-1` を使う (= 位置引数の -1 は SIGHUP)\n    \
-            数字を session-id として使う場合は `--` セパレータ or `--socket=`\n\
+            位置引数 (e.g. `kill demo` / `kill 1`)  => session-id 名 (= 数字も名前扱い)\n    \
+            `-N` short flag (e.g. `kill -9 demo`)   => signal 解釈 (POSIX kill 慣習)\n    \
+            `--index=N`                              => mtime 昇順 1-based index (= 1 最古, -1 最新)\n    \
+            `-` で始まる session-id は `--` セパレータで escape (e.g. `kill -- -foo`)\n\
         \n\
         EXIT CODE:\n    \
             0   送信完了 (= daemon が close するのを待ってから exit)\n    \
@@ -2777,11 +2719,12 @@ fn usage_kill() -> String {
             hyoui kill -9 demo                       # SIGKILL を送る (= 番号 短縮)\n    \
             hyoui kill -KILL demo                    # SIGKILL を送る (= 略名 短縮)\n    \
             hyoui kill -SIGTERM demo                 # SIGTERM を送る (= 正規 短縮)\n    \
-            hyoui kill 1                             # 1 番古い session を SIGTERM\n    \
+            hyoui kill 1                             # session_id=\"1\" を SIGTERM (= 数字も名前)\n    \
+            hyoui kill --index=1                     # 1 番古い session を SIGTERM\n    \
             hyoui kill --index=-1                    # 最新 session を SIGTERM\n    \
             hyoui kill --all                         # 全 live session を SIGTERM\n    \
             hyoui kill --all --signal=KILL           # 全 live session を SIGKILL\n    \
-            hyoui kill -- 1                          # session_id=\"1\" (数字 escape) を kill\n    \
+            hyoui kill -- -dash-id                   # session_id=\"-dash-id\" を kill (escape)\n    \
             hyoui kill --socket=/tmp/x.sock          # socket 直指定で kill\n\
         \n\
         RELATED:\n    \
@@ -4607,59 +4550,10 @@ mod tests {
         }
     }
 
-    /// 位置引数の正の整数は index 解釈 (= `attach 1` → cfg.index=Some(1))。
+    /// 位置引数の数字は session-id 扱い (= kawaz 方針: index は --index 専用)。
     #[test]
-    fn attach_positional_positive_int_is_index() {
+    fn attach_positional_number_is_session_id() {
         match parse_args(&args(&["attach", "1"])) {
-            Command::Attach(cfg) => {
-                assert_eq!(cfg.index, Some(1));
-                assert_eq!(cfg.session_id, None);
-            }
-            other => panic!("expected Attach with index=1, got {other:?}"),
-        }
-    }
-
-    /// 位置引数の負の整数は newest-first index (= `attach -1` → cfg.index=Some(-1))。
-    #[test]
-    fn attach_positional_negative_int_is_index() {
-        match parse_args(&args(&["attach", "-1"])) {
-            Command::Attach(cfg) => {
-                assert_eq!(cfg.index, Some(-1));
-                assert_eq!(cfg.session_id, None);
-            }
-            other => panic!("expected Attach with index=-1, got {other:?}"),
-        }
-    }
-
-    /// `--index=N` option も index 設定 (= 案 B、ロングオプション流儀)。
-    #[test]
-    fn attach_index_option_sets_index() {
-        match parse_args(&args(&["attach", "--index=2"])) {
-            Command::Attach(cfg) => {
-                assert_eq!(cfg.index, Some(2));
-                assert_eq!(cfg.session_id, None);
-            }
-            other => panic!("expected Attach with index=2, got {other:?}"),
-        }
-    }
-
-    /// `--index 0` / `attach 0` は不正 (= 1-based、0 は意味なし)。
-    #[test]
-    fn attach_index_zero_is_error() {
-        match parse_args(&args(&["attach", "0"])) {
-            Command::Error(msg) => assert!(msg.contains("0"), "got msg={msg}"),
-            other => panic!("expected Error, got {other:?}"),
-        }
-        match parse_args(&args(&["attach", "--index=0"])) {
-            Command::Error(msg) => assert!(msg.contains("0"), "got msg={msg}"),
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    /// `--` セパレータ後の数字は session-id 扱い (= 数字 session-id を escape)。
-    #[test]
-    fn attach_dashdash_separator_forces_session_id() {
-        match parse_args(&args(&["attach", "--", "1"])) {
             Command::Attach(cfg) => {
                 assert_eq!(cfg.session_id.as_deref(), Some("1"));
                 assert_eq!(cfg.index, None);
@@ -4668,20 +4562,43 @@ mod tests {
         }
     }
 
-    /// `--index` と位置引数の session-id 同時指定はエラー。
+    /// `-1` のような short flag は attach に signal 概念がないので unknown option。
     #[test]
-    fn attach_index_and_session_id_conflict() {
-        match parse_args(&args(&["attach", "demo", "--index=1"])) {
-            Command::Error(msg) => assert!(msg.contains("--index") || msg.contains("session")),
+    fn attach_negative_short_flag_is_unknown_option() {
+        match parse_args(&args(&["attach", "-1"])) {
+            Command::Error(msg) => assert!(msg.contains("unknown") || msg.contains("-1")),
+            other => panic!("expected Error for `-1`, got {other:?}"),
+        }
+    }
+
+    /// `--index=N` option で index 設定 (= 1=最古、-1=最新、2=2番目に古い)。
+    #[test]
+    fn attach_index_option_sets_index() {
+        for (input, expected) in [("--index=1", 1i32), ("--index=-1", -1), ("--index=2", 2)] {
+            match parse_args(&args(&["attach", input])) {
+                Command::Attach(cfg) => {
+                    assert_eq!(cfg.index, Some(expected));
+                    assert_eq!(cfg.session_id, None);
+                }
+                other => panic!("expected Attach({input}), got {other:?}"),
+            }
+        }
+    }
+
+    /// `--index=0` は不正 (= 1-based、0 は意味なし)。
+    #[test]
+    fn attach_index_zero_is_error() {
+        match parse_args(&args(&["attach", "--index=0"])) {
+            Command::Error(msg) => assert!(msg.contains("0"), "got msg={msg}"),
             other => panic!("expected Error, got {other:?}"),
         }
     }
 
-    /// 位置引数の数字と `--index` の同時指定もエラー。
+    /// `--index` と位置引数の session-id 同時指定はエラー (= 排他)。
     #[test]
-    fn attach_index_and_positional_int_conflict() {
-        match parse_args(&args(&["attach", "2", "--index=1"])) {
-            Command::Error(msg) => assert!(msg.contains("--index") || msg.contains("位置")),
+    fn attach_index_and_session_id_conflict() {
+        match parse_args(&args(&["attach", "demo", "--index=1"])) {
+            Command::Error(msg) => assert!(msg.contains("--index") || msg.contains("session")),
             other => panic!("expected Error, got {other:?}"),
         }
     }
@@ -5159,17 +5076,17 @@ mod tests {
 
     /// 位置引数の正数は index 解釈 (= 1 番古い session を指す)、負数は signal。
     #[test]
-    fn parse_kill_positional_int_semantics() {
-        // 正数 → index
+    fn parse_kill_positional_semantics() {
+        // 位置引数の数字も session-id 扱い (kawaz 方針: index は --index 専用)
         match parse_args(&args(&["kill", "2"])) {
             Command::Kill(cfg) => {
-                assert_eq!(cfg.index, Some(2));
-                assert_eq!(cfg.session_id, None);
+                assert_eq!(cfg.session_id.as_deref(), Some("2"));
+                assert_eq!(cfg.index, None);
                 assert_eq!(cfg.signal, None);
             }
-            other => panic!("expected Kill(index=2), got {other:?}"),
+            other => panic!("expected Kill(session=\"2\"), got {other:?}"),
         }
-        // 負数 → signal (POSIX kill 慣習)
+        // `-9` 等の short flag は signal 解釈 (POSIX kill 慣習)
         match parse_args(&args(&["kill", "-9", "demo"])) {
             Command::Kill(cfg) => {
                 assert_eq!(cfg.signal.as_deref(), Some("SIGKILL"));
@@ -5180,15 +5097,38 @@ mod tests {
         }
     }
 
-    /// `--` セパレータで数字 session-id を escape できる。
+    /// `--` セパレータで `-` 始まる session-id を escape できる。
     #[test]
     fn parse_kill_dashdash_escape() {
-        match parse_args(&args(&["kill", "--", "1"])) {
+        match parse_args(&args(&["kill", "--", "-dash-id"])) {
             Command::Kill(cfg) => {
-                assert_eq!(cfg.session_id.as_deref(), Some("1"));
+                assert_eq!(cfg.session_id.as_deref(), Some("-dash-id"));
                 assert_eq!(cfg.index, None);
+                assert_eq!(cfg.signal, None);
             }
-            other => panic!("expected Kill(session=\"1\"), got {other:?}"),
+            other => panic!("expected Kill(session=\"-dash-id\"), got {other:?}"),
+        }
+    }
+
+    /// `--index=N` で index 指定 (= 正/負/0 範囲外)。
+    #[test]
+    fn parse_kill_index_option() {
+        match parse_args(&args(&["kill", "--index=1"])) {
+            Command::Kill(cfg) => {
+                assert_eq!(cfg.index, Some(1));
+                assert_eq!(cfg.session_id, None);
+            }
+            other => panic!("expected Kill(index=1), got {other:?}"),
+        }
+        match parse_args(&args(&["kill", "--index=-1"])) {
+            Command::Kill(cfg) => {
+                assert_eq!(cfg.index, Some(-1));
+            }
+            other => panic!("expected Kill(index=-1), got {other:?}"),
+        }
+        match parse_args(&args(&["kill", "--index=0"])) {
+            Command::Error(msg) => assert!(msg.contains("0"), "got msg={msg}"),
+            other => panic!("expected Error for --index=0, got {other:?}"),
         }
     }
 
