@@ -421,6 +421,22 @@ mod tests {
             ],
             scrollback_bytes: 65536,
             lock_holder: None,
+            cwd: None,
+            argv: None,
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn status_response_with_cwd_argv_roundtrip() {
+        let msg = ControlMessage::StatusResponse(StatusResponse {
+            session_id: "demo".into(),
+            child_pid: Some(99),
+            clients: vec![],
+            scrollback_bytes: 0,
+            lock_holder: None,
+            cwd: Some("/Users/kawaz/work".into()),
+            argv: Some(vec!["bash".into(), "-l".into()]),
         });
         assert_eq!(roundtrip(&msg), msg);
     }

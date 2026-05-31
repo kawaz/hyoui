@@ -247,6 +247,10 @@ pub fn run_daemon_child() -> ExitCode {
         }
     }
 
+    // cwd 取得は chdir("/") の **直前**に行う (= `hyoui run` を叩いた起点 dir を
+    // capture して `hyoui list` 表示に使う)。chdir 後だと "/" になってしまう。
+    let invoked_cwd = std::env::current_dir().ok();
+
     // setsid で新セッションリーダーになる (= controlling tty 切り離し)。
     // 既に session leader の場合は EPERM、無視。
     let _ = nix::unistd::setsid();
@@ -256,6 +260,7 @@ pub fn run_daemon_child() -> ExitCode {
     let _ = nix::unistd::chdir("/");
 
     let mut dcfg = DaemonConfig::new(session_id, socket, cmd);
+    dcfg.cwd = invoked_cwd;
     dcfg.cols = cols;
     dcfg.rows = rows;
     // Round2 #2: HYOUI_LOCK_TOKEN env を daemon 側の expected_token に伝搬。

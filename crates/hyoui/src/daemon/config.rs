@@ -95,6 +95,17 @@ pub struct DaemonConfig {
     ///   出して dump を諦める (= session 自体は止めない)。
     /// - `None` なら dump 無効 (= 既定)。
     pub debug_dump_path: Option<PathBuf>,
+
+    /// daemon 起動時の cwd (= `hyoui run` を叩いた起点 dir)。
+    ///
+    /// `hyoui list` の表示で「この session は何処で起動された session か」を一目で
+    /// 把握できるようにするための情報源。`status.response` の `cwd` field に乗せて
+    /// client に渡す。
+    ///
+    /// daemonize の経路では `run_daemon_child` の **`chdir("/")` 直前**に
+    /// `std::env::current_dir()` を読み取ってここに格納する (= 親 process の
+    /// cwd を inherit している瞬間の値)。test 経路や cwd 取得失敗時は `None`。
+    pub cwd: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for DaemonConfig {
@@ -118,6 +129,7 @@ impl std::fmt::Debug for DaemonConfig {
             )
             .field("until", &self.until)
             .field("debug_dump_path", &self.debug_dump_path)
+            .field("cwd", &self.cwd)
             .finish()
     }
 }
@@ -144,6 +156,7 @@ impl DaemonConfig {
             // DR-0015: daemon は jobcontrol policy を持たない (= client 側で発動)。
             // 子 stopped 観測時は notify_child_stopped が cap-aware に leader へ通知する。
             debug_dump_path: None,
+            cwd: None,
         }
     }
 }
@@ -174,5 +187,14 @@ mod tests {
         let cloned = cfg.clone();
         assert_eq!(cfg.session_id, cloned.session_id);
         assert_eq!(cfg.socket_path, cloned.socket_path);
+    }
+
+    #[test]
+    fn cwd_default_is_none_and_settable() {
+        let mut cfg =
+            DaemonConfig::new("demo", PathBuf::from("/tmp/x.sock"), vec!["/bin/sh".into()]);
+        assert!(cfg.cwd.is_none(), "default cwd must be None");
+        cfg.cwd = Some(PathBuf::from("/work"));
+        assert_eq!(cfg.cwd.as_deref(), Some(std::path::Path::new("/work")));
     }
 }

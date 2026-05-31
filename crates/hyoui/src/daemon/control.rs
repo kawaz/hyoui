@@ -717,6 +717,15 @@ fn handle_status_query(
         clients: clients_info,
         scrollback_bytes: scrollback.total_bytes() as u64,
         lock_holder: state.lock_holder,
+        cwd: config
+            .cwd
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+        argv: if config.cmd.is_empty() {
+            None
+        } else {
+            Some(config.cmd.clone())
+        },
     };
     let _ = send_control(&clients[idx], ControlMessage::StatusResponse(resp));
     ClientFrameOutcome::Continue

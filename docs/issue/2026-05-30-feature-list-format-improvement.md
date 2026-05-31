@@ -2,7 +2,12 @@
 
 - Date: 2026-05-30
 - Priority: 中 (= UX 改善、多 session 運用時に効果大)
-- Status: **Partially Done (2026-05-31)** — mtime sort (古い→新しい) / 固定長 plain format (SESSION/STATUS/DUR/SOCKET) / `--format=jsonl` (session/status/started_unix_ms/dur_ms/socket) は実装完了 (commit `1d76dbce`)。**残り**: cwd / argv 表示 = daemon protocol 拡張要 (= session start 時の cwd と argv を daemon が保持して list 応答に乗せる、または `getcwd`/`/proc/<pid>/cmdline` 相当の取得経路)。kawaz 相談要
+- Status: **Closed (2026-05-31)** — cwd / argv / clients 表示が完成。実装サマリ:
+  - `DaemonConfig.cwd` を追加、`run_daemon_child` の `chdir("/")` 直前で `std::env::current_dir()` を capture
+  - `StatusResponse` に `cwd` / `argv` を optional field で追加 (= cap flag 不要、backward compatible)
+  - `hyoui list` が live socket に対し並列で status.query を投げて cwd / argv / clients を取得 (per-query 300ms / overall 500ms timeout、自前低レベル handshake + `UnixStream::set_read_timeout` で実装)
+  - plain format は `SESSION STATUS DUR CLIENTS CWD ARGV` の 6 列、SOCKET 列は jsonl 側のみに残す (= kawaz の「socket 名だけ出されても分からん」要件、機械可読は jsonl 側を使う前提)
+  - cwd shorten: `<...>/repos/<host>/<owner>/<repo>/<sub>` → `<owner>/<repo>/<sub>`、それ以外は `$HOME` 前カット (`~/...`) のみ適用
 - 報告者: kawaz 発言 (2026-05-30)
 
 ## 背景

@@ -40,4 +40,16 @@ pub struct StatusResponse {
     /// lock 保持者の client-id (= null なら未保持)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock_holder: Option<u64>,
+    /// daemon 起動時の cwd (= `hyoui run` の起動 dir、`hyoui list` 表示用)。
+    ///
+    /// optional field。古い daemon は載せて来ないので client 側は `None` を許容する
+    /// (= cap flag 不要、backward compatible)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// daemon の子 PTY として起動した argv (= `DaemonConfig::cmd`)。
+    ///
+    /// `hyoui list` で「何の process が動いているか」を識別する用途。古い daemon は
+    /// 載せて来ないので client 側は `None` を許容する (= cap flag 不要、backward compatible)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argv: Option<Vec<String>>,
 }

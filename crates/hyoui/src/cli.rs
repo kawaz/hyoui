@@ -2719,12 +2719,20 @@ fn usage_list() -> String {
             -h, --help          Show this help and exit\n\
         \n\
         OUTPUT (plain, fixed-width columns, sorted by socket mtime ascending):\n    \
-            SESSION              STATUS  DUR        SOCKET\n    \
-            test-claude          live    1h2m       /tmp/.../test-claude.sock\n    \
-            stale-test           stale   -          /tmp/.../stale-test.sock\n\
+            SESSION              STATUS  DUR        CLIENTS  CWD                              ARGV\n    \
+            test-claude          live    1h2m       2        kawaz/hyoui/main                 claude\n    \
+            stale-test           stale   -          -        -                                -\n\
+        \n\
+        COLUMNS (plain):\n    \
+            SESSION   session id (= socket file 名から拡張子を除いた値、20ch で truncate)\n    \
+            STATUS    live | stale\n    \
+            DUR       socket mtime からの経過時間 (= 1h2m / 15m / 3d4h 形式)\n    \
+            CLIENTS   現在 attach 中の client 数 (= status.query の結果)\n    \
+            CWD       daemon 起動時の cwd (= `repos/<host>/` 前カット、~ 前カット、32ch truncate)\n    \
+            ARGV      daemon が起動した子 PTY の argv (= space-join、空白含む arg は \"...\" quote)\n\
         \n\
         OUTPUT (jsonl, 1 session = 1 line):\n    \
-            {\"session\":\"<id>\",\"status\":\"live|stale\",\"started_unix_ms\":<ms>,\"dur_ms\":<ms>,\"socket\":\"<path>\"}\n\
+            {\"session\":\"<id>\",\"status\":\"live|stale\",\"started_unix_ms\":<ms>,\"dur_ms\":<ms>,\"socket\":\"<path>\",\"cwd\":\"<path>|null\",\"argv\":[...]|null,\"clients\":<n>|null}\n\
         \n\
         SORT ORDER:\n    \
             socket mtime ascending (= 古い session が上、新しい session が下)。\n    \

@@ -732,6 +732,12 @@ struct ListEntry {
     started_unix_ms: u64,
     /// 起動からの経過時間 (= `now - mtime`)。stale の場合は 0 とする (= 表示時は `-`)。
     dur: std::time::Duration,
+    /// daemon 起動時の cwd (= `status.query` で取得)。stale / timeout / 取得失敗時は `None`。
+    cwd: Option<String>,
+    /// daemon の argv (= `status.query` で取得)。stale / timeout / 取得失敗時は `None`。
+    argv: Option<Vec<String>>,
+    /// 接続中 client 数 (= `status.query` で取得)。stale / timeout 時は `None`。
+    clients: Option<usize>,
 }
 
 /// `list_command` の testable な内部実装。dir 一覧を引数で受けることで
@@ -773,6 +779,9 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<std::path::PathBuf>) -> Exi
                 live,
                 started_unix_ms,
                 dur,
+                cwd: None,
+                argv: None,
+                clients: None,
             });
 
             // R5-H3: --prune-stale で stale socket を unlink。
@@ -793,6 +802,13 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<std::path::PathBuf>) -> Exi
     // mtime ascending (= 古い session が先頭、新しい session が末尾)。
     // attach --index=1 が最古、--index=-1 が最新を指す前提。
     entries.sort_by_key(|e| e.started_unix_ms);
+
+    // live entry に status.query を投げて cwd / argv / clients を埋める。
+    // - timeout: socket 接続 + handshake + 1 response の合計 300ms (= 1 daemon stuck で
+    //   list 全体が止まらない予算)
+    // - 各 daemon を 1 thread で同時打ち (= O(N) を実時間 O(1) 化)
+    // - 失敗 / timeout は graceful: cwd/argv/clients が None のまま、entry は残す
+    enrich_entries_with_status(&mut entries);
 
     match cfg.format {
         ListFormat::Plain => print_list_plain(&entries),
@@ -848,15 +864,198 @@ fn truncate_to(s: &str, max: usize) -> String {
     }
 }
 
+/// live `ListEntry` に対し status.query を並列に投げて cwd / argv / clients を埋める。
+///
+/// 1 daemon あたり実時間 timeout 300ms (= connect + handshake + 1 response 合算)。
+/// timeout / error は graceful に skip (= 該当 entry の cwd/argv/clients は `None`
+/// のまま、表示は `-` になる)。
+///
+/// 実装: 各 daemon を独立 thread で query。本体は `recv_timeout` で 1 daemon ずつ
+/// 結果を回収するが、全 thread が同時に走るため実時間は max(per-thread time) で
+/// 抑えられる (= O(1) wall-clock)。実装上の timeout 上限は `OVERALL_TIMEOUT` で
+/// 統合 (= 1 thread が刺さっても list 全体を止めない)。
+fn enrich_entries_with_status(entries: &mut [ListEntry]) {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    const PER_QUERY_TIMEOUT: Duration = Duration::from_millis(300);
+    // overall timeout は per-query よりやや長め (= 並列 spawn / mpsc overhead の余裕)。
+    const OVERALL_TIMEOUT: Duration = Duration::from_millis(500);
+
+    let (tx, rx) = mpsc::channel::<(usize, Option<(Option<String>, Option<Vec<String>>, usize)>)>();
+    let mut spawned = 0usize;
+    for (idx, e) in entries.iter().enumerate() {
+        if !e.live {
+            continue;
+        }
+        spawned += 1;
+        let tx = tx.clone();
+        let sock = e.socket_path.clone();
+        std::thread::spawn(move || {
+            let result = query_status_for_list(&sock, PER_QUERY_TIMEOUT);
+            let _ = tx.send((idx, result));
+        });
+    }
+    drop(tx);
+    let deadline = Instant::now() + OVERALL_TIMEOUT;
+    for _ in 0..spawned {
+        let now = Instant::now();
+        if now >= deadline {
+            // 残 thread は abandon (= 結果が来ても無視、entry は cwd/argv None のまま)。
+            break;
+        }
+        let remaining = deadline - now;
+        let (idx, result) = match rx.recv_timeout(remaining) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        if let Some((cwd, argv, clients)) = result {
+            entries[idx].cwd = cwd;
+            entries[idx].argv = argv;
+            entries[idx].clients = Some(clients);
+        }
+    }
+}
+
+/// 1 socket に status.query を投げて cwd / argv / clients を取得する。
+///
+/// 全体 timeout は `total_timeout`。connect + handshake + recv 合算で超過したら `None`。
+/// 内部の `recv_control` は block するため、UnixStream の read_timeout で割込む。
+fn query_status_for_list(
+    sock: &std::path::Path,
+    total_timeout: std::time::Duration,
+) -> Option<(Option<String>, Option<Vec<String>>, usize)> {
+    use std::os::unix::net::UnixStream;
+    use std::time::Instant;
+
+    let deadline = Instant::now() + total_timeout;
+
+    // 直接 UnixStream を connect + read_timeout を設定する経路を取る (= `ClientConnection`
+    // の handshake が無応答 daemon で無限 block するのを避ける)。read_timeout は
+    // SO_RCVTIMEO 経由で kernel に効く (= recv が EAGAIN/EWOULDBLOCK で帰る)。
+    let stream = UnixStream::connect(sock).ok()?;
+    // 連続する read が同じ timeout を見れば良いので、設定は connect 直後 1 回でよい。
+    stream.set_read_timeout(Some(total_timeout)).ok()?;
+
+    // ClientConnection::connect は内部で handshake を blocking で行うため、
+    // 無応答 daemon (= test 用の bind-only listener 等) で固まる。代わりに自前で
+    // read_timeout 付き stream に handshake + status.query を流す。
+    use hyoui::protocol::messages::HandshakeRequest;
+    use hyoui::protocol::{Frame, MVP_CAPS, Mode as PMode, TYPE_CBOR_CONTROL};
+    use std::io::Write;
+
+    let req = ControlMessage::HandshakeRequest(HandshakeRequest {
+        caps: MVP_CAPS.iter().map(|s| (*s).to_string()).collect(),
+        mode: PMode::Ro,
+        exclusive: false,
+        detach_others: false,
+        token: None,
+    });
+    let body = req.encode_to_vec().ok()?;
+    let mut writer = stream.try_clone().ok()?;
+    Frame::cbor_control(body).encode_to(&mut writer).ok()?;
+    writer.flush().ok()?;
+
+    // handshake response 等を読む。loop で TYPE_CBOR_CONTROL のみを control message
+    // として decode、TYPE_RAW_DATA (= DR-0013 §4 Phase A attach redraw) は skip。
+    // status.response を見たら終わり。deadline で打ち切る。
+    let mut reader = stream;
+    let mut handshake_done = false;
+    let mut query_sent = false;
+    loop {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        reader.set_read_timeout(Some(remaining)).ok()?;
+        let frame = Frame::decode_from(&mut reader).ok()?;
+        if frame.ty != TYPE_CBOR_CONTROL {
+            // raw_data frame (= attach redraw 等) は捨てる。
+            continue;
+        }
+        let msg = ControlMessage::decode_from(frame.body.as_slice()).ok()?;
+        match msg {
+            ControlMessage::HandshakeResponse(_) => {
+                handshake_done = true;
+                // handshake 完了 → status.query を送る。
+                let q = ControlMessage::StatusQuery(StatusQuery {});
+                let qbody = q.encode_to_vec().ok()?;
+                Frame::cbor_control(qbody).encode_to(&mut writer).ok()?;
+                writer.flush().ok()?;
+                query_sent = true;
+            }
+            ControlMessage::StatusResponse(sr) => {
+                if handshake_done && query_sent {
+                    return Some((sr.cwd, sr.argv, sr.clients.len()));
+                }
+                return None;
+            }
+            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+            // daemon error (= cap mismatch / auth 等) は fail、entry は - で表示。
+            ControlMessage::Error(_) => return None,
+            _ => continue,
+        }
+    }
+}
+
+/// cwd を `hyoui list` 表示用に短縮する。
+///
+/// rule:
+/// - `<...>/repos/<host>/<owner>/<repo>/<sub...>` を含む path は `<owner>/<repo>/<sub...>`
+///   に短縮 (= `git-repo-management.md` の規約に沿った形)
+/// - host は `github.com` 限定ではなく汎用に効かせる (= `bitbucket.org` 等の他 host も
+///   同じ階層構造で運用する想定、`identifiers-*.md` 規約のサニタイズと衝突しない)
+/// - rule 不一致なら `$HOME` 前カット (= `~/foo` 形式) のみ適用、それ以外は無変更
+fn shorten_cwd(cwd: &str) -> String {
+    if let Some((_, rest)) = cwd.split_once("/repos/") {
+        // rest = "<host>/<owner>/<repo>/<sub...>" 形式を仮定。
+        // host 部分だけ落として `<owner>/<repo>/<sub...>` を返す。
+        if let Some((_, after_host)) = rest.split_once('/') {
+            return after_host.to_string();
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy();
+        if let Some(rest) = cwd.strip_prefix(home.as_ref()) {
+            return format!("~{rest}");
+        }
+    }
+    cwd.to_string()
+}
+
+/// argv を 1 行表示用に整形する (= shell-escape は最小、`'` を含む arg のみ quote)。
+///
+/// 完全な shell-escape は `--format=jsonl` 側を使ってもらう想定。plain 側は人間が読める
+/// 一覧として十分な近似で OK。
+fn fmt_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| {
+            if a.is_empty() || a.contains(' ') || a.contains('\t') || a.contains('"') {
+                format!("\"{}\"", a.replace('"', "\\\""))
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Plain format (= 固定長 column) で `entries` を stdout に出力する。
 ///
-/// header: `SESSION (20ch) STATUS (7ch) DUR (10ch) SOCKET (残り)`。entries 0 件なら
-/// header も出さない (= 旧挙動互換、`no sessions found` は stderr で別途出る)。
+/// header: `SESSION (20ch) STATUS (7ch) DUR (10ch) CLIENTS (8ch) CWD (32ch) ARGV (残り)`。
+/// SOCKET 列は plain には出さない (= kawaz の「socket 名だけ出されても分からん」要件、
+/// 機械可読が要るなら `--format=jsonl` を使う)。entries 0 件なら header も出さない。
 fn print_list_plain(entries: &[ListEntry]) {
     if entries.is_empty() {
         return;
     }
-    println!("{:<20} {:<7} {:<10} SOCKET", "SESSION", "STATUS", "DUR");
+    println!(
+        "{:<20} {:<7} {:<10} {:<8} {:<32} ARGV",
+        "SESSION", "STATUS", "DUR", "CLIENTS", "CWD"
+    );
     for e in entries {
         let status = if e.live { "live" } else { "stale" };
         let dur = if e.live {
@@ -865,21 +1064,27 @@ fn print_list_plain(entries: &[ListEntry]) {
             "-".to_string()
         };
         let session = truncate_to(&e.session, 20);
-        println!(
-            "{:<20} {:<7} {:<10} {}",
-            session,
-            status,
-            dur,
-            e.socket_path.display()
-        );
+        let clients = match e.clients {
+            Some(n) => n.to_string(),
+            None => "-".to_string(),
+        };
+        let cwd = match &e.cwd {
+            Some(c) => truncate_to(&shorten_cwd(c), 32),
+            None => "-".to_string(),
+        };
+        let argv = match &e.argv {
+            Some(a) if !a.is_empty() => fmt_argv(a),
+            _ => "-".to_string(),
+        };
+        println!("{session:<20} {status:<7} {dur:<10} {clients:<8} {cwd:<32} {argv}");
     }
 }
 
 /// JSON Lines format で `entries` を stdout に出力する。
 ///
 /// 1 session = 1 行の JSON object。field: `session` / `status` / `started_unix_ms` /
-/// `dur_ms` / `socket`。stale session の `started_unix_ms` は file 削除済等で 0 に
-/// なり得る、その場合 `dur_ms` も 0。
+/// `dur_ms` / `socket` / `cwd` / `argv` / `clients`。stale や status.query 失敗の
+/// entry では `cwd` / `argv` / `clients` が `null`。
 fn print_list_jsonl(entries: &[ListEntry]) {
     for e in entries {
         let obj = serde_json::json!({
@@ -888,6 +1093,9 @@ fn print_list_jsonl(entries: &[ListEntry]) {
             "started_unix_ms": e.started_unix_ms,
             "dur_ms": e.dur.as_millis() as u64,
             "socket": e.socket_path.display().to_string(),
+            "cwd": e.cwd,
+            "argv": e.argv,
+            "clients": e.clients,
         });
         println!("{obj}");
     }
@@ -2346,6 +2554,59 @@ mod tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
             .expect("chmod 0700");
         dir
+    }
+
+    /// `shorten_cwd`: `repos/github.com/...` 配下は `<owner>/<repo>/<sub>` に短縮。
+    #[test]
+    fn shorten_cwd_strips_repos_host_prefix() {
+        let cwd = "/Users/kawaz/.local/share/repos/github.com/kawaz/hyoui/main";
+        assert_eq!(shorten_cwd(cwd), "kawaz/hyoui/main");
+    }
+
+    /// `shorten_cwd`: `repos/<other-host>/...` も同じ規則で前カット。
+    #[test]
+    fn shorten_cwd_handles_other_host() {
+        let cwd = "/home/u/.local/share/repos/bitbucket.org/team/proj";
+        assert_eq!(shorten_cwd(cwd), "team/proj");
+    }
+
+    /// `shorten_cwd`: `repos/` 配下でない path は `$HOME` 前カットのみ。
+    #[test]
+    fn shorten_cwd_falls_back_to_home_prefix() {
+        // HOME が test 環境で seed されている前提 (= cargo test 由来の env)。
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = home.to_string_lossy().into_owned();
+            let cwd = format!("{home}/projects/foo");
+            assert_eq!(shorten_cwd(&cwd), "~/projects/foo");
+        }
+    }
+
+    /// `shorten_cwd`: 該当しない path は無変更。
+    #[test]
+    fn shorten_cwd_passthrough_unmatched() {
+        let cwd = "/tmp/some/where";
+        // HOME と異なる前提 (= test runner 環境では HOME = /Users/... 等)。
+        // HOME prefix とぶつかる場合は passthrough にならないので、明確に外す path を選ぶ。
+        let result = shorten_cwd(cwd);
+        // /tmp が HOME 配下になることは通常ない (= 安全な assert)
+        assert!(
+            result == cwd || result.starts_with("~/"),
+            "expected unchanged or HOME-prefixed, got: {result}"
+        );
+    }
+
+    /// `fmt_argv`: space を含む arg は quote される。
+    #[test]
+    fn fmt_argv_quotes_args_with_spaces() {
+        let argv = vec!["echo".to_string(), "hello world".to_string()];
+        assert_eq!(fmt_argv(&argv), "echo \"hello world\"");
+    }
+
+    /// `fmt_argv`: 空白なし arg はそのまま。
+    #[test]
+    fn fmt_argv_plain_args_no_quote() {
+        let argv = vec!["bash".to_string(), "-l".to_string()];
+        assert_eq!(fmt_argv(&argv), "bash -l");
     }
 
     /// R5-H3: live socket (= listener が bind されている) は `probe_socket_liveness`
