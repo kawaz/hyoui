@@ -2,7 +2,7 @@
 
 - Date: 2026-05-30
 - Priority: 中 (= UX 改善、複数 session 運用時に効果大)
-- Status: Open (= 案 A vs 案 B の設計選択を kawaz と要相談)
+- Status: **Closed (2026-05-31)** — 案 B (`--index=N` 専用) 採用で実装完了。全 session-targeted subcommand (attach / kill / status / tail / wait / screen / lock / input) に共通展開済。実装 commit: `997b0a2b` (attach --index 初版) / `f569ddd7` (kill --index + --all) / `a21bf67a` (位置引数の整数→index 解釈を撤回、案 A 不採用) / `0deeac56` (status/tail/wait/screen/lock に共通化) / `f2778c65` (usage 8 個 + input family)。`--all` は kill 専用維持 (kawaz「ケースバイケース」)
 - 報告者: kawaz 発言 (2026-05-30)
 
 ## 背景

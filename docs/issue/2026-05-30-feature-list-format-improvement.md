@@ -2,7 +2,7 @@
 
 - Date: 2026-05-30
 - Priority: 中 (= UX 改善、多 session 運用時に効果大)
-- Status: Open (= 設計判断 + protocol 拡張要、kawaz 相談)
+- Status: **Partially Done (2026-05-31)** — mtime sort (古い→新しい) / 固定長 plain format (SESSION/STATUS/DUR/SOCKET) / `--format=jsonl` (session/status/started_unix_ms/dur_ms/socket) は実装完了 (commit `1d76dbce`)。**残り**: cwd / argv 表示 = daemon protocol 拡張要 (= session start 時の cwd と argv を daemon が保持して list 応答に乗せる、または `getcwd`/`/proc/<pid>/cmdline` 相当の取得経路)。kawaz 相談要
 - 報告者: kawaz 発言 (2026-05-30)
 
 ## 背景
