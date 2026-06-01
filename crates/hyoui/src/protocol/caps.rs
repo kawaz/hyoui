@@ -23,6 +23,9 @@ use std::collections::BTreeSet;
 /// - `"session-exit-v1"`: `session.exit.notify` (DR-0015 §2.1、子 PTY exit code 伝搬)
 /// - `"child-state-v1"`: `session.child.stopped.notify` /
 ///   `session.child.resume.request` (DR-0015 §2.2、軸 1 follow / auto-resume)
+/// - `"record-v1"`: `record.*` messages (DR-0016 §7、tty I/O timeline 録画。
+///   **optional cap** — daemon は default で advertise、client は negotiate で
+///   得たら使う。未 cap の client が他機能を使うのは無影響)
 pub const MVP_CAPS: &[&str] = &[
     "data",
     "lock",
@@ -31,6 +34,7 @@ pub const MVP_CAPS: &[&str] = &[
     "state-snapshot-v1",
     "session-exit-v1",
     "child-state-v1",
+    "record-v1",
 ];
 
 /// 2 つの cap 集合の intersect を取って `Vec<String>` で返す。
@@ -82,6 +86,7 @@ mod tests {
         assert!(MVP_CAPS.contains(&"state-snapshot-v1"));
         assert!(MVP_CAPS.contains(&"session-exit-v1"));
         assert!(MVP_CAPS.contains(&"child-state-v1"));
+        assert!(MVP_CAPS.contains(&"record-v1"));
     }
 
     /// wait-l0 cap は DR-0006 §9 改訂 (state-based wait 移行) に伴い削除済。

@@ -78,6 +78,27 @@ pub enum ErrorCode {
     /// 不足等)。client が retry すれば成功する余地がある回復可能 error として
     /// 通知し、daemon 自身は panic せず session を継続する。R5-H11 で導入。
     InternalError,
+    /// `record.path-not-absolute` — `record.start.request.output_path` が相対 path
+    /// (DR-0016 §9、daemon の cwd と client cwd 不一致を避けるため絶対 path 必須)。
+    RecordPathNotAbsolute,
+    /// `record.output-already-exists` — output path に既存 file がある
+    /// (DR-0016 §9、`O_CREAT|O_EXCL` 相当の `create_new(true)` で reject)。
+    RecordOutputAlreadyExists,
+    /// `record.output-permission-denied` — output path への write 不可、または
+    /// 親 dir が存在しない / sensitive path prefix 拒否 (DR-0016 §9)。
+    RecordOutputPermissionDenied,
+    /// `record.unsupported-direction-for-format` — `RecordFormat::Raw` + `Both`
+    /// 等、format と direction の組合せが invalid (DR-0016 §5、raw は単一 direction 限定)。
+    RecordUnsupportedDirectionForFormat,
+    /// `record.invalid-prompt-pattern` — `prompt_pattern` regex の compile 失敗
+    /// (DR-0016 §6、custom regex の syntax error 等)。
+    RecordInvalidPromptPattern,
+    /// `record.limit-exceeded` — `max_bytes` / `max_duration_ms` 超過、または
+    /// bounded queue full で record sink が overflow (DR-0016 §8a)。
+    RecordLimitExceeded,
+    /// `record.not-found` — `record.stop.request.record_id` に該当する active
+    /// record が存在しない (DR-0016 §7)。
+    RecordNotFound,
     /// 未知の error code。wire 上の dotted text を保持する。
     ///
     /// 前方互換のため、新しい daemon / client が将来追加した code を
@@ -104,6 +125,15 @@ impl ErrorCode {
             ErrorCode::DetachTargetPartial => "detach.target-partial",
             ErrorCode::MasterWriteTimeout => "master.write-timeout",
             ErrorCode::InternalError => "internal.error",
+            ErrorCode::RecordPathNotAbsolute => "record.path-not-absolute",
+            ErrorCode::RecordOutputAlreadyExists => "record.output-already-exists",
+            ErrorCode::RecordOutputPermissionDenied => "record.output-permission-denied",
+            ErrorCode::RecordUnsupportedDirectionForFormat => {
+                "record.unsupported-direction-for-format"
+            }
+            ErrorCode::RecordInvalidPromptPattern => "record.invalid-prompt-pattern",
+            ErrorCode::RecordLimitExceeded => "record.limit-exceeded",
+            ErrorCode::RecordNotFound => "record.not-found",
             ErrorCode::Unknown(s) => s.as_str(),
         }
     }
@@ -126,6 +156,15 @@ impl ErrorCode {
             "detach.target-partial" => ErrorCode::DetachTargetPartial,
             "master.write-timeout" => ErrorCode::MasterWriteTimeout,
             "internal.error" => ErrorCode::InternalError,
+            "record.path-not-absolute" => ErrorCode::RecordPathNotAbsolute,
+            "record.output-already-exists" => ErrorCode::RecordOutputAlreadyExists,
+            "record.output-permission-denied" => ErrorCode::RecordOutputPermissionDenied,
+            "record.unsupported-direction-for-format" => {
+                ErrorCode::RecordUnsupportedDirectionForFormat
+            }
+            "record.invalid-prompt-pattern" => ErrorCode::RecordInvalidPromptPattern,
+            "record.limit-exceeded" => ErrorCode::RecordLimitExceeded,
+            "record.not-found" => ErrorCode::RecordNotFound,
             other => ErrorCode::Unknown(other.to_string()),
         }
     }
@@ -193,6 +232,25 @@ mod tests {
             (ErrorCode::DetachTargetPartial, "detach.target-partial"),
             (ErrorCode::MasterWriteTimeout, "master.write-timeout"),
             (ErrorCode::InternalError, "internal.error"),
+            (ErrorCode::RecordPathNotAbsolute, "record.path-not-absolute"),
+            (
+                ErrorCode::RecordOutputAlreadyExists,
+                "record.output-already-exists",
+            ),
+            (
+                ErrorCode::RecordOutputPermissionDenied,
+                "record.output-permission-denied",
+            ),
+            (
+                ErrorCode::RecordUnsupportedDirectionForFormat,
+                "record.unsupported-direction-for-format",
+            ),
+            (
+                ErrorCode::RecordInvalidPromptPattern,
+                "record.invalid-prompt-pattern",
+            ),
+            (ErrorCode::RecordLimitExceeded, "record.limit-exceeded"),
+            (ErrorCode::RecordNotFound, "record.not-found"),
         ];
 
         for (variant, wire) in known {

@@ -234,7 +234,15 @@ pub(super) fn handle_control_message(
         | ControlMessage::ScreenDumpResponse(_)
         | ControlMessage::StateSnapshotResponse(_)
         | ControlMessage::SessionExitNotify(_)
-        | ControlMessage::SessionChildStoppedNotify(_) => reject_unexpected_kind(idx, clients),
+        | ControlMessage::SessionChildStoppedNotify(_)
+        // DR-0016 Phase 1: protocol foundation のみ。実 handler は Phase 2 で配線、
+        // それまでは未対応 kind として reject (= response 系は元々 daemon 側で受けない)。
+        | ControlMessage::RecordStartRequest(_)
+        | ControlMessage::RecordStartResponse(_)
+        | ControlMessage::RecordStopRequest(_)
+        | ControlMessage::RecordStopAllRequest(_)
+        | ControlMessage::RecordListRequest(_)
+        | ControlMessage::RecordListResponse(_) => reject_unexpected_kind(idx, clients),
     }
 }
 

@@ -37,6 +37,7 @@ mod error;
 mod handshake;
 mod lifecycle;
 mod lock;
+mod record;
 mod screen;
 mod session_lifecycle;
 mod status;
@@ -50,6 +51,10 @@ pub use handshake::{
 pub use lifecycle::{Detach, DetachTarget, Kill};
 pub use lock::{
     LeaderNotify, LockAcquire, LockRelease, LockResponse, LockResult, ModeChange, SessionMode,
+};
+pub use record::{
+    InputSecrecy, RecordDirection, RecordFormat, RecordInfo, RecordListRequest, RecordListResponse,
+    RecordStartRequest, RecordStartResponse, RecordStopAllRequest, RecordStopRequest,
 };
 pub use screen::{
     BufferKind as ScreenBufferKind, CursorSnap as ScreenCursorSnap, DumpRect,
@@ -172,6 +177,36 @@ pub enum ControlMessage {
     /// (DR-0015 §2.2、cap `child-state-v1` 要)。
     #[serde(rename = "session.child.resume.request")]
     SessionChildResumeRequest(SessionChildResumeRequest),
+
+    /// `kind = "record.start.request"` — client → daemon、tty I/O 録画開始
+    /// (DR-0016 §7、cap `record-v1` 要)。
+    #[serde(rename = "record.start.request")]
+    RecordStartRequest(RecordStartRequest),
+
+    /// `kind = "record.start.response"` — daemon → client、`record_id` 採番返却
+    /// (DR-0016 §7、cap `record-v1` 要)。
+    #[serde(rename = "record.start.response")]
+    RecordStartResponse(RecordStartResponse),
+
+    /// `kind = "record.stop.request"` — client → daemon、特定 `record_id` 停止
+    /// (DR-0016 §7、cap `record-v1` 要)。
+    #[serde(rename = "record.stop.request")]
+    RecordStopRequest(RecordStopRequest),
+
+    /// `kind = "record.stop.all.request"` — client → daemon、同 session の全 record
+    /// 一括停止 (DR-0016 §7、cap `record-v1` 要)。
+    #[serde(rename = "record.stop.all.request")]
+    RecordStopAllRequest(RecordStopAllRequest),
+
+    /// `kind = "record.list.request"` — client → daemon、active record 一覧要求
+    /// (DR-0016 §7、cap `record-v1` 要)。
+    #[serde(rename = "record.list.request")]
+    RecordListRequest(RecordListRequest),
+
+    /// `kind = "record.list.response"` — daemon → client、active record 一覧
+    /// (DR-0016 §7、cap `record-v1` 要)。
+    #[serde(rename = "record.list.response")]
+    RecordListResponse(RecordListResponse),
 }
 
 /// CBOR control message の encode/decode error。
@@ -531,6 +566,173 @@ mod tests {
         // DR-0015 §2.2: payload 空
         let msg = ControlMessage::SessionChildResumeRequest(SessionChildResumeRequest::default());
         assert_eq!(roundtrip(&msg), msg);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // DR-0016 §7: record.* protocol foundation (= 6 message + cap `record-v1`)
+    // 未 cap で送ると daemon は `error` kind=`unsupported-capability` を返す前提。
+    // ここでは wire 互換 (CBOR roundtrip + kind dispatch) のみ検証する。
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn record_start_request_roundtrip_minimal() {
+        // 最小: option field 全部 None、direction=Both / format=Jsonl / 既定 redaction。
+        let msg = ControlMessage::RecordStartRequest(RecordStartRequest {
+            direction: RecordDirection::Both,
+            format: RecordFormat::Jsonl,
+            output_path: "/tmp/rec.jsonl".into(),
+            max_bytes: None,
+            max_duration_ms: None,
+            input_secrecy: InputSecrecy::RedactAfterPrompt,
+            prompt_pattern: None,
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn record_start_request_roundtrip_full() {
+        // 全 option 指定 + raw format + 単一 direction。
+        let msg = ControlMessage::RecordStartRequest(RecordStartRequest {
+            direction: RecordDirection::Stdout,
+            format: RecordFormat::Raw,
+            output_path: "/var/tmp/dump.bin".into(),
+            max_bytes: Some(104_857_600),
+            max_duration_ms: Some(3_600_000),
+            input_secrecy: InputSecrecy::NeverRecordStdin,
+            prompt_pattern: Some("(?i)mfa code".into()),
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn record_start_response_roundtrip() {
+        let msg = ControlMessage::RecordStartResponse(RecordStartResponse { record_id: 7 });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn record_stop_request_roundtrip() {
+        let msg = ControlMessage::RecordStopRequest(RecordStopRequest { record_id: 42 });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn record_stop_all_request_roundtrip() {
+        // empty payload (= `--all` 用、`RecordStopAllRequest {}`)
+        let msg = ControlMessage::RecordStopAllRequest(RecordStopAllRequest::default());
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn record_list_request_roundtrip() {
+        let msg = ControlMessage::RecordListRequest(RecordListRequest::default());
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn record_list_response_roundtrip_empty() {
+        // active record なし
+        let msg = ControlMessage::RecordListResponse(RecordListResponse { records: vec![] });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn record_list_response_roundtrip_with_records() {
+        // RecordInfo の全 field roundtrip (= 各種 direction / format 含む)。
+        let msg = ControlMessage::RecordListResponse(RecordListResponse {
+            records: vec![
+                RecordInfo {
+                    record_id: 1,
+                    direction: RecordDirection::Both,
+                    format: RecordFormat::Jsonl,
+                    output_path: "/tmp/a.jsonl".into(),
+                    started_unix_ms: 1_700_000_000_000,
+                    started_by_client_id: 3,
+                    raw_bytes_recorded: 12_345,
+                    file_bytes_written: 24_690,
+                    last_flushed_unix_ms: 1_700_000_001_000,
+                },
+                RecordInfo {
+                    record_id: 2,
+                    direction: RecordDirection::Stdin,
+                    format: RecordFormat::Raw,
+                    output_path: "/tmp/b.raw".into(),
+                    started_unix_ms: 1_700_000_002_000,
+                    started_by_client_id: 4,
+                    raw_bytes_recorded: 0,
+                    file_bytes_written: 0,
+                    last_flushed_unix_ms: 0,
+                },
+            ],
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn input_secrecy_all_variants_roundtrip() {
+        // wire 値 (kebab-case) を経由した 3 variant の roundtrip 確認。
+        for secrecy in [
+            InputSecrecy::RedactAfterPrompt,
+            InputSecrecy::RecordAll,
+            InputSecrecy::NeverRecordStdin,
+        ] {
+            let msg = ControlMessage::RecordStartRequest(RecordStartRequest {
+                direction: RecordDirection::Stdin,
+                format: RecordFormat::Jsonl,
+                output_path: "/tmp/x.jsonl".into(),
+                max_bytes: None,
+                max_duration_ms: None,
+                input_secrecy: secrecy,
+                prompt_pattern: None,
+            });
+            assert_eq!(roundtrip(&msg), msg);
+        }
+    }
+
+    #[test]
+    fn record_direction_all_variants_roundtrip() {
+        for dir in [
+            RecordDirection::Stdin,
+            RecordDirection::Stdout,
+            RecordDirection::Both,
+        ] {
+            let info = RecordInfo {
+                record_id: 9,
+                direction: dir,
+                format: RecordFormat::Jsonl,
+                output_path: "/tmp/d.jsonl".into(),
+                started_unix_ms: 1,
+                started_by_client_id: 1,
+                raw_bytes_recorded: 0,
+                file_bytes_written: 0,
+                last_flushed_unix_ms: 0,
+            };
+            let msg = ControlMessage::RecordListResponse(RecordListResponse {
+                records: vec![info],
+            });
+            assert_eq!(roundtrip(&msg), msg);
+        }
+    }
+
+    #[test]
+    fn record_start_request_kind_wire_format() {
+        // wire 上の `kind` discriminator が dotted naming `record.start.request` で
+        // encode されていることを確認 (= 既存 `screen.dump.*` と同パターン)。
+        let msg = ControlMessage::RecordStartRequest(RecordStartRequest {
+            direction: RecordDirection::Both,
+            format: RecordFormat::Jsonl,
+            output_path: "/tmp/x.jsonl".into(),
+            max_bytes: None,
+            max_duration_ms: None,
+            input_secrecy: InputSecrecy::RedactAfterPrompt,
+            prompt_pattern: None,
+        });
+        let bytes = msg.encode_to_vec().expect("encode");
+        let needle = b"record.start.request";
+        assert!(
+            bytes.windows(needle.len()).any(|w| w == needle),
+            "wire payload must contain `record.start.request` kind: {bytes:?}"
+        );
     }
 
     #[test]

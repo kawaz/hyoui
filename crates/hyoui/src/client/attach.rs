@@ -738,6 +738,7 @@ mod tests {
                 "state-snapshot-v1".into(),
                 "session-exit-v1".into(),
                 "child-state-v1".into(),
+                "record-v1".into(),
             ]
         );
         assert!(conn.response.leader);
