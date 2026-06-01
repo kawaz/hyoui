@@ -1,6 +1,6 @@
 # Feature idea: tty I/O の dump / record / play subcommand
 
-- Status: Open (Idea, 採用未確定)
+- Status: **Partially adopted (2026-06-01)** — 継続録画部分のみ [DR-0016](../decisions/DR-0016-tty-io-record.md) で MVP scope 切り出し、ctrl-z 系 bug 解析の観測道具として優先実装 (= `hyoui record` 命名、`hyoui screen dump` 静止画と分離)。`hyoui play` (= I/O 注入再生) / `hyoui sink` 抽象化 / `--rotate` / asciinema cast format は **本 issue に残置**、v0.3.0 以降検討
 - Date: 2026-05-26
 - Priority: Low (v0.3.0 以降検討)
 - 発見元: hyoui paste API 設計議論で `--spool-append` (継続的に file に追記) のユースケースを検討した際、
