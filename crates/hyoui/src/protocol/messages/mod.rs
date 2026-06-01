@@ -404,6 +404,7 @@ mod tests {
 
     #[test]
     fn status_response_roundtrip() {
+        // cwd / argv は required field (= v1.0 breaking OK 方針)。concrete value で roundtrip 確認。
         let msg = ControlMessage::StatusResponse(StatusResponse {
             session_id: "demo".into(),
             child_pid: Some(12345),
@@ -421,22 +422,8 @@ mod tests {
             ],
             scrollback_bytes: 65536,
             lock_holder: None,
-            cwd: None,
-            argv: None,
-        });
-        assert_eq!(roundtrip(&msg), msg);
-    }
-
-    #[test]
-    fn status_response_with_cwd_argv_roundtrip() {
-        let msg = ControlMessage::StatusResponse(StatusResponse {
-            session_id: "demo".into(),
-            child_pid: Some(99),
-            clients: vec![],
-            scrollback_bytes: 0,
-            lock_holder: None,
-            cwd: Some("/Users/kawaz/work".into()),
-            argv: Some(vec!["bash".into(), "-l".into()]),
+            cwd: "/Users/kawaz/work".into(),
+            argv: vec!["bash".into(), "-l".into()],
         });
         assert_eq!(roundtrip(&msg), msg);
     }

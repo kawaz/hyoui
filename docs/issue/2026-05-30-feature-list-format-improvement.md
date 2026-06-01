@@ -3,11 +3,12 @@
 - Date: 2026-05-30
 - Priority: 中 (= UX 改善、多 session 運用時に効果大)
 - Status: **Closed (2026-05-31)** — cwd / argv / clients 表示が完成。実装サマリ:
-  - `DaemonConfig.cwd` を追加、`run_daemon_child` の `chdir("/")` 直前で `std::env::current_dir()` を capture
-  - `StatusResponse` に `cwd` / `argv` を optional field で追加 (= cap flag 不要、backward compatible)
-  - `hyoui list` が live socket に対し並列で status.query を投げて cwd / argv / clients を取得 (per-query 300ms / overall 500ms timeout、自前低レベル handshake + `UnixStream::set_read_timeout` で実装)
+  - `DaemonConfig.cwd` を追加、`run_daemon_child` の `chdir("/")` 直前で `std::env::current_dir()` を capture (失敗時は `/` で fallback)
+  - `StatusResponse.cwd: String` / `argv: Vec<String>` は **必須 field** (= v1.0 breaking OK 方針、`memory: project_v1_0_breaking_change_ok`)。**最初の commit で optional field + 自前 timeout の graceful `-` 表示にしていたが「live なのに `cwd: -` 表示」の誤情報経路だったので修正済** (= 後続 commit `fix(list): required field 化 + 自前 timeout 廃止`)
+  - `hyoui list` が live socket に対し並列で status.query を投げて cwd / argv / clients を取得 (= `ClientConnection::connect` 経由 blocking、timeout なし。本物 daemon は local Unix socket で必ず即応答する前提)
   - plain format は `SESSION STATUS DUR CLIENTS CWD ARGV` の 6 列、SOCKET 列は jsonl 側のみに残す (= kawaz の「socket 名だけ出されても分からん」要件、機械可読は jsonl 側を使う前提)
   - cwd shorten: `<...>/repos/<host>/<owner>/<repo>/<sub>` → `<owner>/<repo>/<sub>`、それ以外は `$HOME` 前カット (`~/...`) のみ適用
+  - probe で live と判定 → status.query で failure (= connect/handshake/decode 失敗) なら **stale 格下げ + stderr warning** (= silent 誤情報を防ぐ)
 - 報告者: kawaz 発言 (2026-05-30)
 
 ## 背景

@@ -249,7 +249,13 @@ pub fn run_daemon_child() -> ExitCode {
 
     // cwd 取得は chdir("/") の **直前**に行う (= `hyoui run` を叩いた起点 dir を
     // capture して `hyoui list` 表示に使う)。chdir 後だと "/" になってしまう。
-    let invoked_cwd = std::env::current_dir().ok();
+    // `current_dir()` は ENOENT (= cwd dir が削除済) 等で失敗する場合がある。
+    // status.response の `cwd` は required field なので、daemon は必ず value を
+    // 載せる必要がある。失敗時は `/` で fallback (= chdir 先と一致、嘘ではない)。
+    let invoked_cwd = std::env::current_dir().unwrap_or_else(|e| {
+        eprintln!("hyoui: warning: current_dir 取得失敗 ({e}); cwd を `/` として記録");
+        std::path::PathBuf::from("/")
+    });
 
     // setsid で新セッションリーダーになる (= controlling tty 切り離し)。
     // 既に session leader の場合は EPERM、無視。
@@ -260,7 +266,7 @@ pub fn run_daemon_child() -> ExitCode {
     let _ = nix::unistd::chdir("/");
 
     let mut dcfg = DaemonConfig::new(session_id, socket, cmd);
-    dcfg.cwd = invoked_cwd;
+    dcfg.cwd = Some(invoked_cwd);
     dcfg.cols = cols;
     dcfg.rows = rows;
     // Round2 #2: HYOUI_LOCK_TOKEN env を daemon 側の expected_token に伝搬。

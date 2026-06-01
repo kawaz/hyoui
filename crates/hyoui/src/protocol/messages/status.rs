@@ -42,14 +42,13 @@ pub struct StatusResponse {
     pub lock_holder: Option<u64>,
     /// daemon 起動時の cwd (= `hyoui run` の起動 dir、`hyoui list` 表示用)。
     ///
-    /// optional field。古い daemon は載せて来ないので client 側は `None` を許容する
-    /// (= cap flag 不要、backward compatible)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
+    /// 必須 field。daemon は `current_dir()` 失敗時にも `/` を入れて必ず value を載せる
+    /// (= v1.0 未満なので breaking change OK 方針、`memory: project_v1_0_breaking_change_ok`)。
+    /// 「取得失敗」と「未指定」を区別したいケースは現状なく、空文字は invalid value。
+    pub cwd: String,
     /// daemon の子 PTY として起動した argv (= `DaemonConfig::cmd`)。
     ///
-    /// `hyoui list` で「何の process が動いているか」を識別する用途。古い daemon は
-    /// 載せて来ないので client 側は `None` を許容する (= cap flag 不要、backward compatible)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub argv: Option<Vec<String>>,
+    /// 必須 field。daemon は argv なしで起動しない (= 空 `Vec` は invalid value)。
+    /// `hyoui list` で「何の process が動いているか」を識別する用途。
+    pub argv: Vec<String>,
 }

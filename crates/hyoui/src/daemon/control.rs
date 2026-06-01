@@ -711,6 +711,10 @@ fn handle_status_query(
             leader: c.leader,
         })
         .collect();
+    // cwd / argv は required field (= v1.0 breaking OK 方針)。daemonize 経路で
+    // `DaemonConfig::cwd` を `current_dir()` で必ず埋めている (= 失敗時も `/` で
+    // fallback)。test 経路で `cwd` が `None` の場合は防衛的に `/` を入れる
+    // (= `/` は POSIX で必ず存在、空文字は invalid value)。
     let resp = StatusResponse {
         session_id: config.session_id.clone(),
         child_pid,
@@ -720,12 +724,9 @@ fn handle_status_query(
         cwd: config
             .cwd
             .as_ref()
-            .map(|p| p.to_string_lossy().into_owned()),
-        argv: if config.cmd.is_empty() {
-            None
-        } else {
-            Some(config.cmd.clone())
-        },
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/".to_string()),
+        argv: config.cmd.clone(),
     };
     let _ = send_control(&clients[idx], ControlMessage::StatusResponse(resp));
     ClientFrameOutcome::Continue
