@@ -29,6 +29,7 @@ mod config;
 mod control;
 mod lock;
 mod pty;
+mod record;
 mod screen;
 mod session;
 mod tail;

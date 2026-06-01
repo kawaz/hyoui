@@ -106,6 +106,16 @@ pub struct DaemonConfig {
     /// `std::env::current_dir()` を読み取ってここに格納する (= 親 process の
     /// cwd を inherit している瞬間の値)。test 経路や cwd 取得失敗時は `None`。
     pub cwd: Option<PathBuf>,
+
+    /// daemon プロセス起動を識別する一意 ID (DR-0016 §3 jsonl header)。
+    ///
+    /// pid は OS が再利用するため、**daemon restart を跨いだ真の識別子**として
+    /// UUID v4 を保持する。`hyoui record` の jsonl header に乗せて、複数 record
+    /// file を時系列でつなぐときの「同一 daemon プロセス由来か」判定に使う。
+    ///
+    /// `DaemonConfig::new` で起動毎に新規生成。clone 時は同 ID を保持
+    /// (= 同一 daemon の中で config を clone する経路は restart ではない)。
+    pub daemon_boot_id: String,
 }
 
 impl std::fmt::Debug for DaemonConfig {
@@ -130,6 +140,7 @@ impl std::fmt::Debug for DaemonConfig {
             .field("until", &self.until)
             .field("debug_dump_path", &self.debug_dump_path)
             .field("cwd", &self.cwd)
+            .field("daemon_boot_id", &self.daemon_boot_id)
             .finish()
     }
 }
@@ -157,6 +168,9 @@ impl DaemonConfig {
             // 子 stopped 観測時は notify_child_stopped が cap-aware に leader へ通知する。
             debug_dump_path: None,
             cwd: None,
+            // DR-0016 §3: daemon プロセス起動毎に UUID v4 を生成し、jsonl header の
+            // `daemon_boot_id` に乗せる。pid 再利用に強い識別子。
+            daemon_boot_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 }
@@ -196,5 +210,26 @@ mod tests {
         assert!(cfg.cwd.is_none(), "default cwd must be None");
         cfg.cwd = Some(PathBuf::from("/work"));
         assert_eq!(cfg.cwd.as_deref(), Some(std::path::Path::new("/work")));
+    }
+
+    #[test]
+    fn daemon_boot_id_is_generated_and_unique_per_new() {
+        // DR-0016 §3: 起動毎に新規 UUID。`new()` を 2 回呼べば異なる ID。
+        let a = DaemonConfig::new("a", PathBuf::from("/tmp/a.sock"), vec!["/bin/sh".into()]);
+        let b = DaemonConfig::new("b", PathBuf::from("/tmp/b.sock"), vec!["/bin/sh".into()]);
+        assert_ne!(a.daemon_boot_id, b.daemon_boot_id);
+        assert_eq!(
+            a.daemon_boot_id.len(),
+            36,
+            "uuid v4 hyphenated form expected"
+        );
+    }
+
+    #[test]
+    fn daemon_boot_id_is_stable_under_clone() {
+        // clone は同一 daemon プロセス内の handoff (= restart ではない)。
+        let cfg = DaemonConfig::new("demo", PathBuf::from("/tmp/x.sock"), vec!["/bin/sh".into()]);
+        let cloned = cfg.clone();
+        assert_eq!(cfg.daemon_boot_id, cloned.daemon_boot_id);
     }
 }
