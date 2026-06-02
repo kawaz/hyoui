@@ -220,6 +220,10 @@ pub struct RecordStopRequest {
 }
 // kind: "record.stop.all.request" (= --all 用、別 message)
 pub struct RecordStopAllRequest {}
+// kind: "record.stop.response" (= stop / stop.all 双方の成功 ACK)
+pub struct RecordStopResponse {
+    pub stopped: u32,  // 停止した record 数 (= single なら 1、--all なら N)
+}
 // kind: "record.list.request"
 pub struct RecordListRequest {}
 // kind: "record.list.response"
@@ -242,7 +246,8 @@ pub struct RecordInfo {
 CBOR encoding:
 - 全 struct は **empty braces** で定義 (= `RecordStopAllRequest {}` / `RecordListRequest {}`、既存 `StatusQuery {}` 互換、unit struct `;` は CBOR null になり kind dispatch 破綻)
 - field naming は serde の `#[serde(rename_all = "kebab-case")]` で kebab-case (= `record_id` → `record-id`)
-- kind は dotted: `record.start.request` / `record.start.response` / `record.stop.request` / `record.stop.all.request` / `record.list.request` / `record.list.response`
+- kind は dotted: `record.start.request` / `record.start.response` / `record.stop.request` / `record.stop.all.request` / `record.stop.response` / `record.list.request` / `record.list.response`
+- **stop / stop.all は成功時も `record.stop.response` を返す** (= 成功を無音にすると client が recv で永久 hang する。失敗 `record-not-found` error と同じ recv 経路で受ける)
 - enum は `#[non_exhaustive]` 付与 (= 新 variant 追加で caller match が壊れない)
 - error code: `RecordError::PathNotAbsolute` / `OutputAlreadyExists` / `OutputPermissionDenied` / `UnsupportedDirectionForFormat` / `InvalidPromptPattern` / `RecordLimitExceeded`
 

@@ -9,6 +9,7 @@
 //! - `record.start.response` — daemon → client、`record_id` 採番
 //! - `record.stop.request` — client → daemon、`record_id` 指定停止
 //! - `record.stop.all.request` — client → daemon、同 session の全 record 停止
+//! - `record.stop.response` — daemon → client、停止数 ACK (= 成功も応答する)
 //! - `record.list.request` — client → daemon、active record 一覧要求
 //! - `record.list.response` — daemon → client、active record 一覧
 //!
@@ -108,6 +109,19 @@ pub struct RecordStartResponse {
 pub struct RecordStopRequest {
     /// 停止対象の `record_id`。
     pub record_id: u32,
+}
+
+/// `record.stop.response` payload (DR-0016 §7、daemon → client)。
+///
+/// `record.stop.request` / `record.stop.all.request` 双方の成功 ACK。client は
+/// 成功でも response を待つ (= request/response の同期完結 + 失敗時の `record-not-found`
+/// error と同じ recv 経路で受ける)。成功を無音にすると client が永久 hang する
+/// (= 旧設計の bug)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct RecordStopResponse {
+    /// 実際に停止した record 数 (= single stop なら 1、`--all` なら N)。
+    pub stopped: u32,
 }
 
 /// `record.stop.all.request` payload (DR-0016 §7、client → daemon、`--all` 用)。

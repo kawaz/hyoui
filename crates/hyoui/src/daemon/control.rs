@@ -42,9 +42,9 @@ use nix::unistd::Pid;
 use crate::protocol::messages::{
     ClientInfo, ErrorCode, ErrorMessage, LockResponse, LockResult, ModeChange, RecordInfo,
     RecordListResponse, RecordStartRequest, RecordStartResponse, RecordStopRequest,
-    ScreenBufferKind, ScreenCursorSnap, ScreenDumpRequest, ScreenDumpResponse, ScreenModeSnap,
-    ScreenWindowSize, SessionMode, SnapshotComponent, StateSnapshotRequest, StateSnapshotResponse,
-    StatusResponse, TailRequest,
+    RecordStopResponse, ScreenBufferKind, ScreenCursorSnap, ScreenDumpRequest, ScreenDumpResponse,
+    ScreenModeSnap, ScreenWindowSize, SessionMode, SnapshotComponent, StateSnapshotRequest,
+    StateSnapshotResponse, StatusResponse, TailRequest,
 };
 use crate::protocol::{ControlMessage, Frame, Mode, TYPE_CBOR_CONTROL, TYPE_RAW_DATA};
 use crate::scrollback::Scrollback;
@@ -304,6 +304,7 @@ pub(super) fn handle_control_message(
         | ControlMessage::SessionExitNotify(_)
         | ControlMessage::SessionChildStoppedNotify(_)
         | ControlMessage::RecordStartResponse(_)
+        | ControlMessage::RecordStopResponse(_)
         | ControlMessage::RecordListResponse(_) => reject_unexpected_kind(idx, clients),
     }
 }
@@ -856,8 +857,12 @@ fn handle_record_stop_request(
     }
     match state.record_registry.stop(req.record_id) {
         Ok(()) => {
-            // 仕様上 `record.stop.response` は無い (DR-0016 §7)。成功通知は無音、
-            // client 側は `RecordListRequest` で active record の消失を確認する想定。
+            // 成功も ACK を返す (= client は成功 / 失敗とも recv で待つ。無音にすると
+            // client が永久 hang する、DR-0016 §7)。single stop の成功は stopped=1。
+            let _ = send_control(
+                &clients[idx],
+                ControlMessage::RecordStopResponse(RecordStopResponse { stopped: 1 }),
+            );
         }
         Err(RecordStopError(id)) => {
             let _ = send_control(
@@ -887,9 +892,15 @@ fn handle_record_stop_all_request(
     {
         return ClientFrameOutcome::Continue;
     }
-    // 停止数は最小限の observability で済む (= response message を別途定義しない、
-    // 確認は record.list で行う)。
-    let _stopped = state.record_registry.stop_all();
+    // 成功 ACK を返す (= client は recv で待つ、無音だと hang、DR-0016 §7)。
+    // stopped に実際の停止数を載せて `record stop --all` で件数表示できるようにする。
+    let stopped = state.record_registry.stop_all();
+    let _ = send_control(
+        &clients[idx],
+        ControlMessage::RecordStopResponse(RecordStopResponse {
+            stopped: stopped as u32,
+        }),
+    );
     ClientFrameOutcome::Continue
 }
 

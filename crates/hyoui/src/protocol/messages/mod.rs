@@ -55,6 +55,7 @@ pub use lock::{
 pub use record::{
     InputSecrecy, RecordDirection, RecordFormat, RecordInfo, RecordListRequest, RecordListResponse,
     RecordStartRequest, RecordStartResponse, RecordStopAllRequest, RecordStopRequest,
+    RecordStopResponse,
 };
 pub use screen::{
     BufferKind as ScreenBufferKind, CursorSnap as ScreenCursorSnap, DumpRect,
@@ -197,6 +198,12 @@ pub enum ControlMessage {
     /// 一括停止 (DR-0016 §7、cap `record-v1` 要)。
     #[serde(rename = "record.stop.all.request")]
     RecordStopAllRequest(RecordStopAllRequest),
+
+    /// `kind = "record.stop.response"` — daemon → client、停止数 ACK
+    /// (= `record.stop.request` / `record.stop.all.request` 双方の成功応答、
+    /// DR-0016 §7、cap `record-v1` 要)。成功も応答することで client の hang を防ぐ。
+    #[serde(rename = "record.stop.response")]
+    RecordStopResponse(RecordStopResponse),
 
     /// `kind = "record.list.request"` — client → daemon、active record 一覧要求
     /// (DR-0016 §7、cap `record-v1` 要)。
@@ -620,6 +627,13 @@ mod tests {
     fn record_stop_all_request_roundtrip() {
         // empty payload (= `--all` 用、`RecordStopAllRequest {}`)
         let msg = ControlMessage::RecordStopAllRequest(RecordStopAllRequest::default());
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn record_stop_response_roundtrip() {
+        // stop / stop.all 双方の成功 ACK (= 成功を無音にすると client hang)
+        let msg = ControlMessage::RecordStopResponse(RecordStopResponse { stopped: 3 });
         assert_eq!(roundtrip(&msg), msg);
     }
 

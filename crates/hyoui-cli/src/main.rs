@@ -2804,9 +2804,8 @@ fn record_stop_command(cfg: RecordStopConfig) -> ExitCode {
 /// `record stop` の response (= success / error) を待って exit code を決める helper。
 ///
 /// transient な broadcast (= `ModeChange` / `LeaderNotify`) は skip + 次 message を
-/// 待つ。Phase 4 後の daemon が `record.stop` 成功時に何を ACK として返すかは
-/// 未確定なので、当面は `RecordListResponse` を success の代理として受ける
-/// (= 確定実装は Phase 4 完了後に再調整、現状は error / unexpected 以外で SUCCESS)。
+/// 待つ。daemon は成功時 `RecordStopResponse { stopped }` を返す (= 無音だと client
+/// が永久 hang する、DR-0016 §7)。失敗は `record-not-found` error。
 fn record_stop_wait_response(conn: &mut ClientConnection, label: &str) -> ExitCode {
     loop {
         let msg = match conn.recv_control(None) {
@@ -2818,7 +2817,10 @@ fn record_stop_wait_response(conn: &mut ClientConnection, label: &str) -> ExitCo
         };
         match msg {
             ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
-            ControlMessage::RecordListResponse(_) => return ExitCode::SUCCESS,
+            ControlMessage::RecordStopResponse(resp) => {
+                println!("hyoui: {label}: stopped {} record(s)", resp.stopped);
+                return ExitCode::SUCCESS;
+            }
             ControlMessage::Error(e) => {
                 eprintln!(
                     "hyoui: {label}: daemon error: code={:?} message={}",
