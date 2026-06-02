@@ -14,15 +14,62 @@ jobs:
       changed: ${{ steps.version.outputs.changed }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # bump-semver の `vcs tag latest` で全 tag が必要
+
+      # bump-semver を install (release flow が bump-semver に依存)。
+      # 最新 release のバイナリを curl で取得 (linux-amd64)。
+      - name: Install bump-semver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          LATEST=$(gh release list --repo kawaz/bump-semver --limit 1 --json tagName -q '.[0].tagName' | sed 's/^v//')
+          curl -fsSL --retry 5 --retry-delay 2 --max-time 60 \
+            "https://github.com/kawaz/bump-semver/releases/download/v${LATEST}/bump-semver-linux-amd64" \
+            -o /usr/local/bin/bump-semver
+          chmod +x /usr/local/bin/bump-semver
+          bump-semver --version
+
       - name: Check version change
         id: version
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          # Task 24: 旧 VERSION ファイル廃止、Cargo.toml workspace.package.version
-          # から抽出 (= grep + perl で 1 行目だけ match)。
-          CURRENT_VERSION=$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          set -euo pipefail
+          # Cargo.toml workspace.package.version を正本として読む。
+          CURRENT_VERSION=$(bump-semver get Cargo.toml --no-hint)
+          echo "current=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
+
+          # 既存 tag より大きいか検証 (二重リリース防止)。
+          # `vcs tag latest` は SemVer-parseable な tag のみ filter して最大を返す。
+          set +e
+          LATEST=$(bump-semver vcs tag latest --include-prerelease --vcs git 2>/dev/null)
+          LATEST_EXIT=$?
+          set -e
+          if [ "$LATEST_EXIT" -ne 0 ]; then
+            echo "vcs tag latest exited ${LATEST_EXIT} (SemVer tag がまだ無い等); first release とみなす"
+          else
+            set +e
+            bump-semver compare gt Cargo.toml "$LATEST"
+            CMP_EXIT=$?
+            set -e
+            case "$CMP_EXIT" in
+              0) ;; # CURRENT > latest tag: release 続行
+              1)
+                echo "changed=false" >> "$GITHUB_OUTPUT"
+                echo "Version v${CURRENT_VERSION} は latest tag ${LATEST} 以下; release skip"
+                exit 0
+                ;;
+              *)
+                echo "::error::Unexpected exit code from bump-semver compare: ${CMP_EXIT}"
+                exit 1
+                ;;
+            esac
+          fi
+
+          # gh release で既存確認 (compare で通っても念のため二重防止)
           if gh release view "v${CURRENT_VERSION}" --repo "$REPO" >/dev/null 2>&1; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "Version unchanged: v${CURRENT_VERSION} already released"
@@ -30,7 +77,6 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "New version detected: v${CURRENT_VERSION}"
           fi
-          echo "current=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
 
   build-release:
     needs: check-version

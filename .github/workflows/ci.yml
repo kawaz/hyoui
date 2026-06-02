@@ -7,22 +7,6 @@ on:
     branches: [main]
 
 jobs:
-  unsafe-gate:
-    name: unsafe confinement
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - name: Verify unsafe is confined to sys/raw.rs, sys/signal.rs, sys/env.rs
-        run: |
-          set -uo pipefail
-          leaked=$(grep -rnE '\bunsafe[[:space:]]+(fn|impl|trait|extern|\{)' crates/hyoui/src --include='*.rs' \
-            | grep -v 'src/sys/raw.rs\|src/sys/signal.rs\|src/sys/env.rs' || true)
-          if [ -n "$leaked" ]; then
-            echo "ERROR: unsafe leaked outside whitelisted files (sys/raw.rs, sys/signal.rs, sys/env.rs):" >&2
-            echo "$leaked" >&2
-            exit 1
-          fi
-
   test:
     name: Test (${{ matrix.os }} / ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
@@ -40,10 +24,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ${{ matrix.os }}-${{ matrix.rust }}
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo build --workspace
-      - run: cargo test --workspace
+      - uses: extractions/setup-just@v3
+      # just ci = lint (fmt + clippy + unsafe 封じ込め gate) + test + build。
+      # ローカルと同一エントリで検査範囲を一致させる。
+      - run: just ci
 
   audit:
     name: cargo-audit (RUSTSEC advisories)
