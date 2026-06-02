@@ -118,6 +118,14 @@ pub enum HelpTopic {
     LockRelease,
     /// Help for the `unlock` subcommand (= release の alias、DR-0006 §7)。
     Unlock,
+    /// Help for the `record` parent subcommand (= 子: `start` / `stop` / `list`、DR-0016)。
+    Record,
+    /// Help for the `record start` subcommand (= DR-0016 §2)。
+    RecordStart,
+    /// Help for the `record stop` subcommand (= DR-0016 §2)。
+    RecordStop,
+    /// Help for the `record list` subcommand (= DR-0016 §2)。
+    RecordList,
     /// User invoked an unknown subcommand; render top-level help with note.
     UnknownSubcommand(String),
 }
@@ -560,6 +568,153 @@ pub enum LockCommand {
     Release(LockReleaseConfig),
 }
 
+// =============================================================================
+// `record` subcommand (DR-0016)
+// =============================================================================
+//
+// `protocol::messages::record` の wire enum と 1:1 対応する CLI 表現 enum を持つ
+// (= 既存 `ScreenDumpCliFormat` / `SnapshotCliComponent` と同流儀。cli.rs は
+// `protocol` を import しない pure module 方針)。main.rs 側で wire 型へ写像する。
+
+/// `record start --stdin / --stdout / --both` の CLI 表現 (DR-0016 §2)。
+///
+/// protocol 層の [`crate::protocol::messages::RecordDirection`] と 1:1 対応。
+/// CLI default は `Both` (= jsonl format との組合せで stdin/stdout 両方を記録)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum RecordDirectionArg {
+    /// `--stdin` (= 子 PTY 向け input のみ、認可済 write 成功 bytes)。
+    Stdin,
+    /// `--stdout` (= 子 PTY からの出力のみ、screen 加工前の生 bytes)。
+    Stdout,
+    /// `--both` (= stdin + stdout 双方、default、jsonl format 限定)。
+    #[default]
+    Both,
+}
+
+/// `record start --format=jsonl|raw` の CLI 表現 (DR-0016 §3, §5)。
+///
+/// protocol 層の [`crate::protocol::messages::RecordFormat`] と 1:1 対応。
+/// `Raw` は単一 direction 限定 (= `Both` との組合せは parse 段で reject)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum RecordFormatArg {
+    /// `--format=jsonl` (= default、header + body 構造化、診断 timeline 用)。
+    #[default]
+    Jsonl,
+    /// `--format=raw` (= 単一 direction の raw bytes、`cat` 互換、stream export 専用)。
+    Raw,
+}
+
+/// `record start --input-secrecy` policy の CLI 表現 (DR-0016 §6)。
+///
+/// protocol 層の [`crate::protocol::messages::InputSecrecy`] と 1:1 対応。
+/// default は `RedactAfterPrompt` (= password/OTP prompt 後の stdin を自動 redact)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum RecordInputSecrecyArg {
+    /// `redact-after-prompt` (= default、prompt pattern 後の stdin を redact)。
+    #[default]
+    RedactAfterPrompt,
+    /// `record-all` (= opt-in、redaction なし、全 stdin を hex 記録、loud warning 必須)。
+    RecordAll,
+    /// `never-record-stdin` (= opt-in、全 stdin を `in-redacted` 化、内容捨て)。
+    NeverRecordStdin,
+}
+
+/// `record list --format=table|jsonl` の CLI 表現 (DR-0016 §2)。
+///
+/// `Table` は人間可読の固定長 column 1 行 1 record、`Jsonl` は `RecordInfo` を
+/// そのまま 1 行 jsonl で出す (= scripting 用)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum RecordListFormatArg {
+    /// 固定長 column の人間可読出力 (= default)。
+    #[default]
+    Table,
+    /// `RecordInfo` を 1 record 1 行の JSON Lines で出す (= scripting 用)。
+    Jsonl,
+}
+
+/// `record start <session>` subcommand configuration (= DR-0016 §2)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordStartConfig {
+    /// Target socket path (explicit) または session_id から resolve。
+    pub socket: Option<String>,
+    /// Target session id。
+    pub session_id: Option<String>,
+    /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
+    pub index: Option<i32>,
+    /// 録画 direction (= default `Both`、`Raw` format との組合せでは parse 段で reject)。
+    pub direction: RecordDirectionArg,
+    /// 出力 format (= default `Jsonl`)。
+    pub format: RecordFormatArg,
+    /// 出力 file path (= **絶対 path 必須**、parse 段で `Path::is_absolute` reject)。
+    pub output_path: PathBuf,
+    /// `--max-bytes <N>` 解釈後の wire 値 (= `None` で disable / `Some(N)` で
+    /// 自動 stop)。CLI default 100 MiB は parse 段で適用済、明示 `0` で `None`。
+    /// 明示 `0` (= disable) は main.rs 側で loud warning を出す責務。
+    pub max_bytes: Option<u64>,
+    /// `--max-duration <DUR>` 解釈後の wire 値 (= `None` で disable / `Some(ms)`
+    /// で自動 stop)。CLI default 1h は parse 段で適用済、明示 `0` で `None`。
+    /// 明示 `0` は main.rs 側で loud warning を出す責務。
+    pub max_duration_ms: Option<u64>,
+    /// stdin redaction policy (= default `RedactAfterPrompt`、§6)。
+    pub input_secrecy: RecordInputSecrecyArg,
+    /// custom prompt detection regex (= `None` で daemon default 適用、§6)。
+    pub prompt_pattern: Option<String>,
+    /// `--max-bytes 0` で明示 disable された場合 `true` (= main.rs 側で loud warning)。
+    pub max_bytes_disabled: bool,
+    /// `--max-duration 0` で明示 disable された場合 `true` (= main.rs 側で loud warning)。
+    pub max_duration_disabled: bool,
+}
+
+/// `record stop <session>` subcommand configuration (= DR-0016 §2)。
+///
+/// `--id <N>` と `--all` は排他。両省略時は CLI 側で `record list` を query して
+/// single active 判定する経路 (= main.rs 側、Phase 1 message に手を入れず単一
+/// active の autoselect を CLI 側で完結させるための設計選択)。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RecordStopConfig {
+    /// Target socket path (explicit) または session_id から resolve。
+    pub socket: Option<String>,
+    /// Target session id。
+    pub session_id: Option<String>,
+    /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
+    pub index: Option<i32>,
+    /// `--id <N>` で停止対象 record_id を明示。`None` の場合 main.rs 側で
+    /// `record list` を先に query して single active のみ自動採用する
+    /// (= multiple active なら error、none なら error)。
+    pub record_id: Option<u32>,
+    /// `--all` (= 同 session の全 active record を一括停止、`record_id` と排他)。
+    pub all: bool,
+}
+
+/// `record list <session>` subcommand configuration (= DR-0016 §2)。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RecordListConfig {
+    /// Target socket path (explicit) または session_id から resolve。
+    pub socket: Option<String>,
+    /// Target session id。
+    pub session_id: Option<String>,
+    /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
+    pub index: Option<i32>,
+    /// `--format=table|jsonl` (= default `Table`)。
+    pub format: RecordListFormatArg,
+}
+
+/// `record` 親 subcommand の子 dispatch (= DR-0016 §2)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RecordCommand {
+    /// `record start <session>` — 録画開始、`record_id` を stdout に出す。
+    Start(RecordStartConfig),
+    /// `record stop <session>` — 特定 record / 全 record を停止。
+    Stop(RecordStopConfig),
+    /// `record list <session>` — active record 一覧を出す。
+    List(RecordListConfig),
+}
+
 /// Result of parsing argv (excluding argv[0]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -604,6 +759,12 @@ pub enum Command {
     /// 完全に同じ意味の subcommand を別名でも露出する: 「取得は `lock acquire`、
     /// 解放は `unlock`」という命名が直感的なため。
     Unlock(LockReleaseConfig),
+    /// `record` 親 subcommand (= DR-0016 §2、tty I/O timeline 録画)。
+    ///
+    /// 子: `start` / `stop` / `list`。protocol 層では `record-v1` cap 必須。
+    /// 各 subcommand の executor は本 commit (Phase 7) では protocol message を
+    /// 構築・送信できる構造のみ、daemon 側 hook 配線は Phase 4 で行う。
+    Record(RecordCommand),
     /// Print a completion script for the given shell.
     Completion {
         /// Target shell.
@@ -652,6 +813,7 @@ pub fn parse_args(args: &[String]) -> Command {
         "input" => parse_input(rest),
         "lock" => parse_lock(rest),
         "unlock" => parse_unlock(rest),
+        "record" => parse_record(rest),
         "completion" => parse_completion(rest),
         // Reserved for future stages.
         //
@@ -1698,6 +1860,10 @@ pub fn usage(topic: &HelpTopic) -> String {
         HelpTopic::LockAcquire => usage_lock_acquire(),
         HelpTopic::LockRelease => usage_lock_release(),
         HelpTopic::Unlock => usage_unlock(),
+        HelpTopic::Record => usage_record(),
+        HelpTopic::RecordStart => usage_record_start(),
+        HelpTopic::RecordStop => usage_record_stop(),
+        HelpTopic::RecordList => usage_record_list(),
         HelpTopic::Completion => usage_completion(),
     }
 }
@@ -2396,6 +2562,388 @@ fn parse_unlock(args: &[String]) -> Command {
     }
 }
 
+/// `record` 親 subcommand の dispatcher (= DR-0016 §2)。
+///
+/// 引数なし / `--help` は親 help を出す (= `parse_screen` / `parse_lock` と同流儀)。
+/// 最初の positional を子 subcommand 名として扱い、`start` / `stop` / `list` 以外は
+/// suggest closest 付き error にする。
+fn parse_record(args: &[String]) -> Command {
+    if args.is_empty() {
+        return Command::Help {
+            topic: HelpTopic::Record,
+        };
+    }
+    let head = args[0].as_str();
+    match head {
+        "--help" | "-h" => Command::Help {
+            topic: HelpTopic::Record,
+        },
+        "start" => parse_record_start(&args[1..]),
+        "stop" => parse_record_stop(&args[1..]),
+        "list" => parse_record_list(&args[1..]),
+        other if other.starts_with('-') => {
+            Command::Error(format!("record: unknown option: {other}"))
+        }
+        other => {
+            let base =
+                format!("record: unknown subcommand `{other}` (supported: start, stop, list)");
+            match suggest_closest(other, ["start", "stop", "list"]) {
+                Some(s) => Command::Error(format!("{base} (did you mean `record {s}`?)")),
+                None => Command::Error(base),
+            }
+        }
+    }
+}
+
+/// `--max-bytes <N>` の suffix 付き bytes 値を parse する。
+///
+/// 受理: `1024` (= bytes)、`1k` / `1K` / `1kb` / `1KiB` (= 1024 bytes)、
+/// `1m` / `1MB` / `1MiB` (= 1024² bytes)、`1g` / `1GB` / `1GiB` (= 1024³ bytes)。
+///
+/// `1MB` と `1MiB` を **同じ意味** (= 1024²) で扱う既存 input 系の慣行
+/// (`DEFAULT_INPUT_MAX_FILE_BYTES` 周辺) に合わせる。decimal (= 1.5M) は受理しない
+/// (= byte 単位は整数で十分、混乱回避)。
+///
+/// 戻り値 `Ok(0)` は呼び出し側で「明示 disable」として扱う (= main.rs 側で
+/// loud warning + protocol 上は `None` を送る)。
+fn parse_max_bytes(s: &str) -> Result<u64, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("empty value".into());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    // 末尾の単位を切り出す (= 数字部分との分離)。
+    let (num_str, mult): (&str, u64) = if let Some(stripped) = lower.strip_suffix("gib") {
+        (stripped, 1024 * 1024 * 1024)
+    } else if let Some(stripped) = lower.strip_suffix("mib") {
+        (stripped, 1024 * 1024)
+    } else if let Some(stripped) = lower.strip_suffix("kib") {
+        (stripped, 1024)
+    } else if let Some(stripped) = lower.strip_suffix("gb") {
+        (stripped, 1024 * 1024 * 1024)
+    } else if let Some(stripped) = lower.strip_suffix("mb") {
+        (stripped, 1024 * 1024)
+    } else if let Some(stripped) = lower.strip_suffix("kb") {
+        (stripped, 1024)
+    } else if let Some(stripped) = lower.strip_suffix('g') {
+        (stripped, 1024 * 1024 * 1024)
+    } else if let Some(stripped) = lower.strip_suffix('m') {
+        (stripped, 1024 * 1024)
+    } else if let Some(stripped) = lower.strip_suffix('k') {
+        (stripped, 1024)
+    } else if let Some(stripped) = lower.strip_suffix('b') {
+        (stripped, 1)
+    } else {
+        (lower.as_str(), 1)
+    };
+    let num: u64 = num_str
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid byte count: {s:?} (use 100 / 1k / 100m / 1g 等)"))?;
+    num.checked_mul(mult)
+        .ok_or_else(|| format!("byte count overflows u64: {s:?}"))
+}
+
+/// `record start <session>` parser (= DR-0016 §2)。
+///
+/// 受理する options:
+/// - `--socket=<path>` / `--index=<N>` / 位置 session id — 共通 selector
+/// - `--output <path>` — 出力 file path、**絶対 path 必須**
+/// - `--stdin` / `--stdout` / `--both` — 録画 direction、互いに排他、default `--both`
+/// - `--format=jsonl|raw` — file format、default `jsonl`。`raw` + (`--both` or default)
+///   は parse 段 error (= raw は単一 direction 限定)
+/// - `--max-bytes <N>` — 録画 bytes 上限 (default 100 MiB、`0` で disable + loud warning)
+/// - `--max-duration <DUR>` — 録画 duration 上限 (default 1h、`0` で disable + loud warning)
+/// - `--input-secrecy <POLICY>` — stdin redaction policy (default `redact-after-prompt`)
+/// - `--prompt-pattern <regex>` — custom prompt 検出 regex (default は daemon が適用)
+#[allow(clippy::result_large_err)]
+fn parse_record_start(args: &[String]) -> Command {
+    /// `--max-bytes` default = 100 MiB (= DR-0016 §2)。
+    const DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
+    /// `--max-duration` default = 1 hour (= DR-0016 §2)。
+    const DEFAULT_MAX_DURATION_MS: u64 = 60 * 60 * 1000;
+
+    let mut output: Option<PathBuf> = None;
+    // direction は 3 flag のうち最後に来たもの優先 + 「複数同時指定は error」検出のため
+    // Option で受け、複数立ったら error にする。
+    let mut direction_flag: Option<RecordDirectionArg> = None;
+    let mut direction_seen_count = 0usize;
+    let mut format = RecordFormatArg::default();
+    let mut max_bytes_raw: Option<u64> = None; // None = 未指定 / Some(N) = 指定値
+    let mut max_duration_raw: Option<u64> = None;
+    let mut input_secrecy = RecordInputSecrecyArg::default();
+    let mut prompt_pattern: Option<String> = None;
+
+    let res = parse_session_targeted(
+        "record start",
+        args,
+        HelpTopic::RecordStart,
+        |opt, value| match opt {
+            "--output" => {
+                let v = value.ok_or_else(|| {
+                    Command::Error("record start: --output requires a value".into())
+                })?;
+                if v.is_empty() {
+                    return Err(Command::Error(
+                        "record start: --output requires a non-empty path".into(),
+                    ));
+                }
+                let p = PathBuf::from(&v);
+                if !p.is_absolute() {
+                    return Err(Command::Error(format!(
+                        "record start: --output must be an absolute path (got {v:?}; \
+                         daemon と client の cwd が一致しない可能性があるため絶対 path 必須)"
+                    )));
+                }
+                output = Some(p);
+                Ok(true)
+            }
+            "--stdin" => {
+                direction_seen_count += 1;
+                direction_flag = Some(RecordDirectionArg::Stdin);
+                Ok(false)
+            }
+            "--stdout" => {
+                direction_seen_count += 1;
+                direction_flag = Some(RecordDirectionArg::Stdout);
+                Ok(false)
+            }
+            "--both" => {
+                direction_seen_count += 1;
+                direction_flag = Some(RecordDirectionArg::Both);
+                Ok(false)
+            }
+            "--format" => {
+                let v = value.ok_or_else(|| {
+                    Command::Error("record start: --format requires a value".into())
+                })?;
+                match v.as_str() {
+                    "jsonl" => format = RecordFormatArg::Jsonl,
+                    "raw" => format = RecordFormatArg::Raw,
+                    other => {
+                        return Err(Command::Error(format!(
+                            "record start: --format must be `jsonl` or `raw`, got {other:?}"
+                        )));
+                    }
+                }
+                Ok(true)
+            }
+            "--max-bytes" => {
+                let v = value.ok_or_else(|| {
+                    Command::Error("record start: --max-bytes requires a value".into())
+                })?;
+                let n = parse_max_bytes(&v)
+                    .map_err(|e| Command::Error(format!("record start: --max-bytes: {e}")))?;
+                max_bytes_raw = Some(n);
+                Ok(true)
+            }
+            "--max-duration" => {
+                let v = value.ok_or_else(|| {
+                    Command::Error("record start: --max-duration requires a value".into())
+                })?;
+                // `0` 単体は parse_duration_ms が `Ok(0)` を返す前提 (bare 数字は
+                // error だが `0ms` / `0s` 等は通る)。CLI として「disable 用の `0`」
+                // は単位省略でも受理したいので、純粋な `0` を pre-check で許容する。
+                let n = if v.trim() == "0" {
+                    0
+                } else {
+                    parse_duration_ms(&v)
+                        .map_err(|e| Command::Error(format!("record start: --max-duration: {e}")))?
+                };
+                max_duration_raw = Some(n);
+                Ok(true)
+            }
+            "--input-secrecy" => {
+                let v = value.ok_or_else(|| {
+                    Command::Error("record start: --input-secrecy requires a value".into())
+                })?;
+                match v.as_str() {
+                    "redact-after-prompt" => {
+                        input_secrecy = RecordInputSecrecyArg::RedactAfterPrompt
+                    }
+                    "record-all" => input_secrecy = RecordInputSecrecyArg::RecordAll,
+                    "never-record-stdin" => input_secrecy = RecordInputSecrecyArg::NeverRecordStdin,
+                    other => {
+                        return Err(Command::Error(format!(
+                            "record start: --input-secrecy must be one of \
+                             `redact-after-prompt` / `record-all` / `never-record-stdin`, got {other:?}"
+                        )));
+                    }
+                }
+                Ok(true)
+            }
+            "--prompt-pattern" => {
+                let v = value.ok_or_else(|| {
+                    Command::Error("record start: --prompt-pattern requires a value".into())
+                })?;
+                if v.is_empty() {
+                    return Err(Command::Error(
+                        "record start: --prompt-pattern requires a non-empty regex".into(),
+                    ));
+                }
+                prompt_pattern = Some(v);
+                Ok(true)
+            }
+            other => Err(Command::Error(format!(
+                "record start: unknown option: {other}"
+            ))),
+        },
+    );
+    let (socket, session_id, index) = match res {
+        Ok(t) => t,
+        Err(c) => return c,
+    };
+
+    // --output 必須
+    let output_path = match output {
+        Some(p) => p,
+        None => {
+            return Command::Error("record start: --output <path> が必要です (= 絶対 path)".into());
+        }
+    };
+
+    // direction の排他チェック (= 複数 flag 同時指定は error)
+    if direction_seen_count > 1 {
+        return Command::Error(
+            "record start: --stdin / --stdout / --both は同時に指定できません".into(),
+        );
+    }
+    let direction = direction_flag.unwrap_or_default();
+
+    // raw format は単一 direction 限定 (= --both は invalid)
+    if matches!(format, RecordFormatArg::Raw) && matches!(direction, RecordDirectionArg::Both) {
+        return Command::Error(
+            "record start: --format=raw requires --stdin or --stdout (--both は jsonl 限定)".into(),
+        );
+    }
+
+    // max_bytes / max_duration: 指定なし → default、明示 `0` → None (disable + warn)、
+    // 指定値 → Some(N)。disable した事実は config の flag に残し、main.rs 側で
+    // loud warning を出す責務を負う。
+    let (max_bytes, max_bytes_disabled) = match max_bytes_raw {
+        None => (Some(DEFAULT_MAX_BYTES), false),
+        Some(0) => (None, true),
+        Some(n) => (Some(n), false),
+    };
+    let (max_duration_ms, max_duration_disabled) = match max_duration_raw {
+        None => (Some(DEFAULT_MAX_DURATION_MS), false),
+        Some(0) => (None, true),
+        Some(n) => (Some(n), false),
+    };
+
+    Command::Record(RecordCommand::Start(RecordStartConfig {
+        socket,
+        session_id,
+        index,
+        direction,
+        format,
+        output_path,
+        max_bytes,
+        max_duration_ms,
+        input_secrecy,
+        prompt_pattern,
+        max_bytes_disabled,
+        max_duration_disabled,
+    }))
+}
+
+/// `record stop <session>` parser (= DR-0016 §2)。
+///
+/// `--id <N>` と `--all` は排他。両省略は CLI 側で `record list` を query する
+/// auto-select 経路 (= main.rs 側で single active のみ自動採用、複数 active なら error)。
+#[allow(clippy::result_large_err)]
+fn parse_record_stop(args: &[String]) -> Command {
+    let mut record_id: Option<u32> = None;
+    let mut all = false;
+
+    let res =
+        parse_session_targeted(
+            "record stop",
+            args,
+            HelpTopic::RecordStop,
+            |opt, value| match opt {
+                "--id" => {
+                    let v = value.ok_or_else(|| {
+                        Command::Error("record stop: --id requires a value".into())
+                    })?;
+                    let n: u32 = v.parse().map_err(|_| {
+                        Command::Error(format!(
+                            "record stop: --id must be a non-negative integer (got {v:?})"
+                        ))
+                    })?;
+                    record_id = Some(n);
+                    Ok(true)
+                }
+                "--all" => {
+                    all = true;
+                    Ok(false)
+                }
+                other => Err(Command::Error(format!(
+                    "record stop: unknown option: {other}"
+                ))),
+            },
+        );
+    let (socket, session_id, index) = match res {
+        Ok(t) => t,
+        Err(c) => return c,
+    };
+
+    if record_id.is_some() && all {
+        return Command::Error("record stop: --id と --all は同時に指定できません".into());
+    }
+
+    Command::Record(RecordCommand::Stop(RecordStopConfig {
+        socket,
+        session_id,
+        index,
+        record_id,
+        all,
+    }))
+}
+
+/// `record list <session>` parser (= DR-0016 §2)。
+#[allow(clippy::result_large_err)]
+fn parse_record_list(args: &[String]) -> Command {
+    let mut format = RecordListFormatArg::default();
+    let res =
+        parse_session_targeted(
+            "record list",
+            args,
+            HelpTopic::RecordList,
+            |opt, value| match opt {
+                "--format" => {
+                    let v = value.ok_or_else(|| {
+                        Command::Error("record list: --format requires a value".into())
+                    })?;
+                    match v.as_str() {
+                        "table" => format = RecordListFormatArg::Table,
+                        "jsonl" => format = RecordListFormatArg::Jsonl,
+                        other => {
+                            return Err(Command::Error(format!(
+                                "record list: --format must be `table` or `jsonl`, got {other:?}"
+                            )));
+                        }
+                    }
+                    Ok(true)
+                }
+                other => Err(Command::Error(format!(
+                    "record list: unknown option: {other}"
+                ))),
+            },
+        );
+    let (socket, session_id, index) = match res {
+        Ok(t) => t,
+        Err(c) => return c,
+    };
+
+    Command::Record(RecordCommand::List(RecordListConfig {
+        socket,
+        session_id,
+        index,
+        format,
+    }))
+}
+
 fn parse_completion(args: &[String]) -> Command {
     if args.is_empty() {
         return Command::Error("completion requires a shell name (bash|zsh|fish)".into());
@@ -2455,6 +3003,7 @@ fn usage_top(unknown: Option<&str>) -> String {
             input       Send input via spec list (DR-0006 §8; text:/key:/wait: ...)\n    \
             lock        Acquire / release a session lock (DR-0006 §7)\n    \
             unlock      Release a session lock (= `lock release` alias)\n    \
+            record      Record tty I/O timeline (DR-0016; start/stop/list)\n    \
             completion  Print a shell completion script (bash|zsh|fish)\n\
         \n\
         RESERVED (not yet implemented):\n    \
@@ -3098,6 +3647,150 @@ fn usage_unlock() -> String {
         RELATED:\n    \
             hyoui lock acquire <id>                Acquire a lock\n    \
             hyoui lock release <id> --token=<T>    Same operation\n",
+    )
+}
+
+fn usage_record() -> String {
+    String::from(
+        "hyoui record — record tty I/O timeline (DR-0016)\n\
+        \n\
+        USAGE:\n    \
+            hyoui record <subcommand> [options]\n\
+        \n\
+        SUBCOMMANDS:\n    \
+            start       Start a new record (writes to a file, returns record_id)\n    \
+            stop        Stop a running record (--id <N> or --all)\n    \
+            list        List active records for the session\n\
+        \n\
+        OPTIONS:\n    \
+            -h, --help      Show this help and exit\n\
+        \n\
+        Run `hyoui record <subcommand> --help` for per-subcommand help.\n\
+        \n\
+        SECURITY NOTE:\n    \
+            record file は子 PTY の全 I/O bytes を含むため、機密情報 (password / OTP /\n    \
+            API token 等) が永続化される可能性があります。default の `--input-secrecy=\n    \
+            redact-after-prompt` で password 系 prompt 後の stdin は自動 redact されますが、\n    \
+            完全防護ではありません。出力 file (mode 0600) は認証境界外に共有しないでください。\n",
+    )
+}
+
+fn usage_record_start() -> String {
+    String::from(
+        "hyoui record start — start recording tty I/O timeline (DR-0016 §2)\n\
+        \n\
+        USAGE:\n    \
+            hyoui record start <session-id> --output <path> [options]\n    \
+            hyoui record start --index=<N> --output <path> [options]\n    \
+            hyoui record start --socket=<path> --output <path> [options]\n\
+        \n\
+        OPTIONS:\n    \
+            --socket PATH               Explicit socket path (alternative to session-id)\n    \
+            --index N                   Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
+            --output PATH               出力 file path (= **絶対 path 必須**)\n    \
+            --stdin                     録画 direction: 子 PTY 入力のみ\n    \
+            --stdout                    録画 direction: 子 PTY 出力のみ\n    \
+            --both                      録画 direction: 両方 (= default、jsonl 限定)\n    \
+            --format=jsonl|raw          出力 format (default jsonl)\n                                \
+                jsonl は header + body 構造化 (= 診断 timeline 用)\n                                \
+                raw は単一 direction の raw bytes (= `--both` 不可、stream export 専用)\n    \
+            --max-bytes N               録画 bytes 上限 (default 100 MiB、`0` で disable + 警告)\n                                \
+                suffix 受理: k/K/kb/KiB (1024), m/MB/MiB (1024²), g/GB/GiB (1024³)\n    \
+            --max-duration DUR          録画 duration 上限 (default 1h、`0` で disable + 警告)\n                                \
+                DUR 形式: `30m` / `1h` / `1d12h` 等 (`hyoui run` の --timeout と同形式)\n    \
+            --input-secrecy POLICY      stdin redaction policy (default redact-after-prompt)\n                                \
+                redact-after-prompt — password/OTP prompt 後の stdin を redact\n                                \
+                record-all          — redaction なし、全 stdin を hex 記録 (opt-in、loud warning)\n                                \
+                never-record-stdin  — 全 stdin を redaction (内容捨て、byte_count のみ)\n    \
+            --prompt-pattern REGEX      custom prompt 検出 regex (default は daemon 適用)\n    \
+            -h, --help                  Show this help and exit\n\
+        \n\
+        ENVIRONMENT:\n    \
+            HYOUI_LOCK_TOKEN            lock token (= handshake.token)\n\
+        \n\
+        EXIT CODE:\n    \
+            0   record 開始成功 (= record_id を stdout に出力)\n    \
+            1   connect / I/O / daemon error (= cap `record-v1` 未対応含む)\n    \
+            2   引数不足 / 未知 option / --output が相対 path\n\
+        \n\
+        EXAMPLES:\n    \
+            # 最小: 絶対 path で出力先を指定 (= default --both --format=jsonl)\n    \
+            hyoui record start my-session --output /tmp/rec.jsonl\n\
+        \n    \
+            # stdout だけを raw bytes として export (= cat 再生用)\n    \
+            hyoui record start my-session --output /tmp/out.bin --format=raw --stdout\n\
+        \n    \
+            # 最厳 redaction: stdin を完全に捨てる\n    \
+            hyoui record start my-session --output /tmp/rec.jsonl --input-secrecy=never-record-stdin\n\
+        \n    \
+            # 上限を緩める (5 GiB / 24h)\n    \
+            hyoui record start my-session --output /tmp/long.jsonl --max-bytes=5g --max-duration=24h\n\
+        \n\
+        SECURITY:\n    \
+            起動時に stderr へ 3 行 loud warning を出します。file は mode 0600 で daemon が\n    \
+            open、symlink は ELOOP で reject、`.sh` / `~/.ssh/` 等 sensitive path は reject\n    \
+            されます (= daemon 側 validation、DR-0016 §9)。\n",
+    )
+}
+
+fn usage_record_stop() -> String {
+    String::from(
+        "hyoui record stop — stop a running record (DR-0016 §2)\n\
+        \n\
+        USAGE:\n    \
+            hyoui record stop <session-id> [--id <N> | --all]\n    \
+            hyoui record stop --index=<N> [--id <N> | --all]\n    \
+            hyoui record stop --socket=<path> [--id <N> | --all]\n\
+        \n\
+        OPTIONS:\n    \
+            --socket PATH    Explicit socket path (alternative to session-id)\n    \
+            --index N        Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
+            --id N           停止対象の record_id (= record start の戻り値、または\n                             \
+                record list で確認)\n    \
+            --all            同 session の全 active record を一括停止 (= `--id` と排他)\n    \
+            -h, --help       Show this help and exit\n\
+        \n\
+        --id / --all のどちらも省略した場合: client 側で `record list` を先に問い合わせ、\n    \
+        single active record があればそれを自動採用、複数 active なら error、none なら\n    \
+        error にする (= ambiguity を CLI 側で吸収、protocol message は単一 record 停止のみ)。\n\
+        \n\
+        EXIT CODE:\n    \
+            0   停止成功\n    \
+            1   connect / I/O / daemon error / multiple active 時の --id 不足\n    \
+            2   引数不足 (--id と --all 同時指定 等)\n\
+        \n\
+        EXAMPLES:\n    \
+            hyoui record stop my-session --id 1            # 特定 record_id を停止\n    \
+            hyoui record stop my-session --all             # 全 active record を停止\n    \
+            hyoui record stop my-session                   # single active なら自動採用\n",
+    )
+}
+
+fn usage_record_list() -> String {
+    String::from(
+        "hyoui record list — list active records for the session (DR-0016 §2)\n\
+        \n\
+        USAGE:\n    \
+            hyoui record list <session-id> [--format=table|jsonl]\n    \
+            hyoui record list --index=<N> [--format=table|jsonl]\n    \
+            hyoui record list --socket=<path> [--format=table|jsonl]\n\
+        \n\
+        OPTIONS:\n    \
+            --socket PATH       Explicit socket path (alternative to session-id)\n    \
+            --index N           Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
+            --format table|jsonl\n                                \
+                                Output format (default table)\n                                \
+                                table — 人間可読の固定長 column 1 行 1 record\n                                \
+                                jsonl — RecordInfo を 1 record 1 行の JSON Lines\n    \
+            -h, --help          Show this help and exit\n\
+        \n\
+        EXIT CODE:\n    \
+            0   一覧取得成功 (active 0 件でも 0)\n    \
+            1   connect / I/O / daemon error\n\
+        \n\
+        EXAMPLES:\n    \
+            hyoui record list my-session                   # default の table 表示\n    \
+            hyoui record list my-session --format=jsonl    # scripting / jq 用\n",
     )
 }
 
@@ -3814,6 +4507,7 @@ pub(crate) const TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
     "tx",
     "lock",
     "unlock",
+    "record",
 ];
 
 // =============================================================================
@@ -6708,5 +7402,562 @@ mod tests {
         let text = usage(&HelpTopic::Top);
         assert!(text.contains("lock"));
         assert!(text.contains("unlock"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // DR-0016 Phase 7: `record` subcommand (start/stop/list) parser tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// `record start --output /abs.jsonl <session>` の最小受理形を確認 (= default を全部適用)。
+    #[test]
+    fn record_start_minimal_args() {
+        let cmd = parse_args(&args(&[
+            "record",
+            "start",
+            "demo",
+            "--output",
+            "/tmp/rec.jsonl",
+        ]));
+        match cmd {
+            Command::Record(RecordCommand::Start(cfg)) => {
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.direction, RecordDirectionArg::Both);
+                assert_eq!(cfg.format, RecordFormatArg::Jsonl);
+                assert_eq!(cfg.input_secrecy, RecordInputSecrecyArg::RedactAfterPrompt);
+                assert_eq!(cfg.output_path, PathBuf::from("/tmp/rec.jsonl"));
+                // default 100 MiB / 1h が wire 値に適用される
+                assert_eq!(cfg.max_bytes, Some(100 * 1024 * 1024));
+                assert_eq!(cfg.max_duration_ms, Some(60 * 60 * 1000));
+                assert!(!cfg.max_bytes_disabled);
+                assert!(!cfg.max_duration_disabled);
+                assert!(cfg.prompt_pattern.is_none());
+            }
+            other => panic!("expected Command::Record(Start), got {other:?}"),
+        }
+    }
+
+    /// `--format=raw` + default `--both` (= 未指定) は parse 段で reject されることを確認。
+    #[test]
+    fn record_start_raw_both_rejected() {
+        let cmd = parse_args(&args(&[
+            "record",
+            "start",
+            "demo",
+            "--output",
+            "/tmp/rec.bin",
+            "--format=raw",
+        ]));
+        match cmd {
+            Command::Error(msg) => {
+                assert!(
+                    msg.contains("raw") && msg.contains("--both"),
+                    "expected raw+both rejection, got {msg}"
+                );
+            }
+            other => panic!("expected Command::Error, got {other:?}"),
+        }
+    }
+
+    /// `--format=raw --stdout` は受理されることを確認。
+    #[test]
+    fn record_start_raw_with_stdout_ok() {
+        let cmd = parse_args(&args(&[
+            "record",
+            "start",
+            "demo",
+            "--output",
+            "/tmp/out.bin",
+            "--format=raw",
+            "--stdout",
+        ]));
+        match cmd {
+            Command::Record(RecordCommand::Start(cfg)) => {
+                assert_eq!(cfg.format, RecordFormatArg::Raw);
+                assert_eq!(cfg.direction, RecordDirectionArg::Stdout);
+            }
+            other => panic!("expected Start with raw+stdout, got {other:?}"),
+        }
+    }
+
+    /// `--format=raw --stdin` も受理 (= 対称性確認)。
+    #[test]
+    fn record_start_raw_with_stdin_ok() {
+        let cmd = parse_args(&args(&[
+            "record",
+            "start",
+            "demo",
+            "--output",
+            "/tmp/in.bin",
+            "--format=raw",
+            "--stdin",
+        ]));
+        match cmd {
+            Command::Record(RecordCommand::Start(cfg)) => {
+                assert_eq!(cfg.format, RecordFormatArg::Raw);
+                assert_eq!(cfg.direction, RecordDirectionArg::Stdin);
+            }
+            other => panic!("expected Start with raw+stdin, got {other:?}"),
+        }
+    }
+
+    /// `--format=raw --both` (= 明示) も reject されることを確認。
+    #[test]
+    fn record_start_raw_explicit_both_rejected() {
+        let cmd = parse_args(&args(&[
+            "record",
+            "start",
+            "demo",
+            "--output",
+            "/tmp/x.bin",
+            "--format=raw",
+            "--both",
+        ]));
+        assert!(matches!(cmd, Command::Error(ref m) if m.contains("raw")));
+    }
+
+    /// `--output` に相対 path を与えると CLI 段で reject されることを確認 (= daemon
+    /// 接続前の早期 fail で integration test を成立させる前提)。
+    #[test]
+    fn record_start_output_must_be_absolute() {
+        let cmd = parse_args(&args(&[
+            "record",
+            "start",
+            "demo",
+            "--output",
+            "./relative.jsonl",
+        ]));
+        match cmd {
+            Command::Error(msg) => {
+                assert!(
+                    msg.contains("absolute"),
+                    "expected absolute-path rejection, got {msg}"
+                );
+            }
+            other => panic!("expected Command::Error, got {other:?}"),
+        }
+    }
+
+    /// `--output` を省略すると error (= 必須 flag)。
+    #[test]
+    fn record_start_output_required() {
+        let cmd = parse_args(&args(&["record", "start", "demo"]));
+        assert!(matches!(cmd, Command::Error(ref m) if m.contains("--output")));
+    }
+
+    /// `--input-secrecy` の 3 variant がそれぞれ parse 可能。
+    #[test]
+    fn record_start_input_secrecy_variants() {
+        for (val, expected) in [
+            (
+                "redact-after-prompt",
+                RecordInputSecrecyArg::RedactAfterPrompt,
+            ),
+            ("record-all", RecordInputSecrecyArg::RecordAll),
+            (
+                "never-record-stdin",
+                RecordInputSecrecyArg::NeverRecordStdin,
+            ),
+        ] {
+            let cmd = parse_args(&args(&[
+                "record",
+                "start",
+                "demo",
+                "--output",
+                "/tmp/x.jsonl",
+                "--input-secrecy",
+                val,
+            ]));
+            match cmd {
+                Command::Record(RecordCommand::Start(cfg)) => {
+                    assert_eq!(cfg.input_secrecy, expected, "{val} 不一致");
+                }
+                other => panic!("{val}: expected Start, got {other:?}"),
+            }
+        }
+    }
+
+    /// 未知 `--input-secrecy` 値は error。
+    #[test]
+    fn record_start_input_secrecy_unknown_errors() {
+        let cmd = parse_args(&args(&[
+            "record",
+            "start",
+            "demo",
+            "--output",
+            "/tmp/x.jsonl",
+            "--input-secrecy=bogus",
+        ]));
+        assert!(matches!(cmd, Command::Error(ref m) if m.contains("input-secrecy")));
+    }
+
+    /// `--max-bytes 0` で wire 値が `None` (= disable) になり、`max_bytes_disabled = true`
+    /// が立つ (= main.rs が loud warning を出す根拠)。stderr 出力は CLI 層では行わない
+    /// (= cli.rs は pure module)。
+    #[test]
+    fn record_start_max_bytes_zero_disables_with_flag() {
+        let cmd = parse_args(&args(&[
+            "record",
+            "start",
+            "demo",
+            "--output",
+            "/tmp/x.jsonl",
+            "--max-bytes",
+            "0",
+        ]));
+        match cmd {
+            Command::Record(RecordCommand::Start(cfg)) => {
+                assert_eq!(cfg.max_bytes, None);
+                assert!(cfg.max_bytes_disabled);
+            }
+            other => panic!("expected Start, got {other:?}"),
+        }
+    }
+
+    /// `--max-bytes 5m` は 5 MiB (= 5 * 1024²) として解釈される。
+    #[test]
+    fn record_start_max_bytes_suffix_mib() {
+        let cmd = parse_args(&args(&[
+            "record",
+            "start",
+            "demo",
+            "--output",
+            "/tmp/x.jsonl",
+            "--max-bytes",
+            "5m",
+        ]));
+        match cmd {
+            Command::Record(RecordCommand::Start(cfg)) => {
+                assert_eq!(cfg.max_bytes, Some(5 * 1024 * 1024));
+                assert!(!cfg.max_bytes_disabled);
+            }
+            other => panic!("expected Start, got {other:?}"),
+        }
+    }
+
+    /// `--max-bytes 1g` で 1 GiB として解釈 (= 各 suffix の動作確認)。
+    #[test]
+    fn record_start_max_bytes_suffix_gib() {
+        let cmd = parse_args(&args(&[
+            "record",
+            "start",
+            "demo",
+            "--output",
+            "/tmp/x.jsonl",
+            "--max-bytes=1g",
+        ]));
+        match cmd {
+            Command::Record(RecordCommand::Start(cfg)) => {
+                assert_eq!(cfg.max_bytes, Some(1024 * 1024 * 1024));
+            }
+            other => panic!("expected Start, got {other:?}"),
+        }
+    }
+
+    /// `--max-duration 0` で wire 値が `None`、disable flag が立つ。
+    #[test]
+    fn record_start_max_duration_zero_disables_with_flag() {
+        let cmd = parse_args(&args(&[
+            "record",
+            "start",
+            "demo",
+            "--output",
+            "/tmp/x.jsonl",
+            "--max-duration",
+            "0",
+        ]));
+        match cmd {
+            Command::Record(RecordCommand::Start(cfg)) => {
+                assert_eq!(cfg.max_duration_ms, None);
+                assert!(cfg.max_duration_disabled);
+            }
+            other => panic!("expected Start, got {other:?}"),
+        }
+    }
+
+    /// `--max-duration 30m` は 30 分 = 1_800_000 ms。
+    #[test]
+    fn record_start_max_duration_human_readable() {
+        let cmd = parse_args(&args(&[
+            "record",
+            "start",
+            "demo",
+            "--output",
+            "/tmp/x.jsonl",
+            "--max-duration",
+            "30m",
+        ]));
+        match cmd {
+            Command::Record(RecordCommand::Start(cfg)) => {
+                assert_eq!(cfg.max_duration_ms, Some(30 * 60 * 1000));
+            }
+            other => panic!("expected Start, got {other:?}"),
+        }
+    }
+
+    /// 複数 direction flag (= `--stdin --stdout` 同時指定) は error。
+    #[test]
+    fn record_start_multiple_direction_flags_rejected() {
+        let cmd = parse_args(&args(&[
+            "record",
+            "start",
+            "demo",
+            "--output",
+            "/tmp/x.jsonl",
+            "--stdin",
+            "--stdout",
+        ]));
+        assert!(matches!(cmd, Command::Error(ref m) if m.contains("同時")));
+    }
+
+    /// `--prompt-pattern <regex>` が config に乗ること。
+    #[test]
+    fn record_start_prompt_pattern() {
+        let cmd = parse_args(&args(&[
+            "record",
+            "start",
+            "demo",
+            "--output",
+            "/tmp/x.jsonl",
+            "--prompt-pattern",
+            "(?i)passcode",
+        ]));
+        match cmd {
+            Command::Record(RecordCommand::Start(cfg)) => {
+                assert_eq!(cfg.prompt_pattern.as_deref(), Some("(?i)passcode"));
+            }
+            other => panic!("expected Start, got {other:?}"),
+        }
+    }
+
+    /// 空 `--prompt-pattern` は reject。
+    #[test]
+    fn record_start_empty_prompt_pattern_rejected() {
+        let cmd = parse_args(&args(&[
+            "record",
+            "start",
+            "demo",
+            "--output",
+            "/tmp/x.jsonl",
+            "--prompt-pattern",
+            "",
+        ]));
+        assert!(matches!(cmd, Command::Error(ref m) if m.contains("prompt-pattern")));
+    }
+
+    /// `--socket` 指定で session selector が満たせること (= 位置引数なしでも OK)。
+    #[test]
+    fn record_start_socket_alternative() {
+        let cmd = parse_args(&args(&[
+            "record",
+            "start",
+            "--socket=/tmp/foo.sock",
+            "--output",
+            "/tmp/x.jsonl",
+        ]));
+        match cmd {
+            Command::Record(RecordCommand::Start(cfg)) => {
+                assert_eq!(cfg.socket.as_deref(), Some("/tmp/foo.sock"));
+                assert!(cfg.session_id.is_none());
+            }
+            other => panic!("expected Start with socket, got {other:?}"),
+        }
+    }
+
+    /// `record stop --id 1 --all` 両指定は error。
+    #[test]
+    fn record_stop_id_and_all_conflict() {
+        let cmd = parse_args(&args(&["record", "stop", "demo", "--id", "1", "--all"]));
+        assert!(matches!(cmd, Command::Error(ref m) if m.contains("--id") && m.contains("--all")));
+    }
+
+    /// `record stop` で `--id` も `--all` も省略は OK (= main.rs 側 auto-select 経路)。
+    #[test]
+    fn record_stop_neither_id_nor_all_ok() {
+        let cmd = parse_args(&args(&["record", "stop", "demo"]));
+        match cmd {
+            Command::Record(RecordCommand::Stop(cfg)) => {
+                assert!(cfg.record_id.is_none());
+                assert!(!cfg.all);
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+            }
+            other => panic!("expected Stop, got {other:?}"),
+        }
+    }
+
+    /// `record stop --id 42` で record_id が乗ること。
+    #[test]
+    fn record_stop_id_only() {
+        let cmd = parse_args(&args(&["record", "stop", "demo", "--id", "42"]));
+        match cmd {
+            Command::Record(RecordCommand::Stop(cfg)) => {
+                assert_eq!(cfg.record_id, Some(42));
+                assert!(!cfg.all);
+            }
+            other => panic!("expected Stop with id, got {other:?}"),
+        }
+    }
+
+    /// `record stop --all` で all=true。
+    #[test]
+    fn record_stop_all_only() {
+        let cmd = parse_args(&args(&["record", "stop", "demo", "--all"]));
+        match cmd {
+            Command::Record(RecordCommand::Stop(cfg)) => {
+                assert!(cfg.all);
+                assert!(cfg.record_id.is_none());
+            }
+            other => panic!("expected Stop with all, got {other:?}"),
+        }
+    }
+
+    /// `record stop --id <負数>` は u32 parse 失敗 → error。
+    #[test]
+    fn record_stop_negative_id_rejected() {
+        let cmd = parse_args(&args(&["record", "stop", "demo", "--id", "-1"]));
+        assert!(matches!(cmd, Command::Error(ref m) if m.contains("--id")));
+    }
+
+    /// `record list` default format は table。
+    #[test]
+    fn record_list_format_default_table() {
+        let cmd = parse_args(&args(&["record", "list", "demo"]));
+        match cmd {
+            Command::Record(RecordCommand::List(cfg)) => {
+                assert_eq!(cfg.format, RecordListFormatArg::Table);
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    /// `record list --format=jsonl`。
+    #[test]
+    fn record_list_format_jsonl() {
+        let cmd = parse_args(&args(&["record", "list", "demo", "--format=jsonl"]));
+        match cmd {
+            Command::Record(RecordCommand::List(cfg)) => {
+                assert_eq!(cfg.format, RecordListFormatArg::Jsonl);
+            }
+            other => panic!("expected List with jsonl, got {other:?}"),
+        }
+    }
+
+    /// `record list --format=bad` は error。
+    #[test]
+    fn record_list_unknown_format_rejected() {
+        let cmd = parse_args(&args(&["record", "list", "demo", "--format=bad"]));
+        assert!(matches!(cmd, Command::Error(ref m) if m.contains("--format")));
+    }
+
+    /// `hyoui record` 引数なし → 親 help を出す (= `parse_screen` / `parse_lock` と同流儀)。
+    #[test]
+    fn record_no_args_shows_parent_help() {
+        let cmd = parse_args(&args(&["record"]));
+        assert!(matches!(
+            cmd,
+            Command::Help {
+                topic: HelpTopic::Record
+            }
+        ));
+    }
+
+    /// `record --help` も親 help。
+    #[test]
+    fn record_help_flag_shows_parent_help() {
+        let cmd = parse_args(&args(&["record", "--help"]));
+        assert!(matches!(
+            cmd,
+            Command::Help {
+                topic: HelpTopic::Record
+            }
+        ));
+    }
+
+    /// 未知 record subcommand は edit distance suggest 付き error。
+    #[test]
+    fn record_unknown_subcommand_errors() {
+        let cmd = parse_args(&args(&["record", "startt", "demo"]));
+        match cmd {
+            Command::Error(msg) => {
+                assert!(msg.contains("unknown subcommand"), "got {msg}");
+                // edit distance 1 で `start` が suggest されるはず
+                assert!(msg.contains("start"), "got {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// session selector が無いと error (= status / tail / wait と同一規則)。
+    #[test]
+    fn record_start_requires_session_or_socket() {
+        let cmd = parse_args(&args(&["record", "start", "--output", "/tmp/x.jsonl"]));
+        assert!(matches!(cmd, Command::Error(ref m) if m.contains("session")));
+    }
+
+    /// usage が record subcommands を列挙する。
+    #[test]
+    fn usage_record_lists_subcommands() {
+        let text = usage(&HelpTopic::Record);
+        assert!(text.contains("start"));
+        assert!(text.contains("stop"));
+        assert!(text.contains("list"));
+    }
+
+    /// `record start` usage が `--input-secrecy` / `--max-bytes` / `--output` を含む。
+    #[test]
+    fn usage_record_start_lists_key_options() {
+        let text = usage(&HelpTopic::RecordStart);
+        assert!(text.contains("--output"));
+        assert!(text.contains("--max-bytes"));
+        assert!(text.contains("--input-secrecy"));
+        assert!(text.contains("--format=jsonl|raw"));
+    }
+
+    /// `record stop` usage が `--id` / `--all` を含む。
+    #[test]
+    fn usage_record_stop_lists_key_options() {
+        let text = usage(&HelpTopic::RecordStop);
+        assert!(text.contains("--id"));
+        assert!(text.contains("--all"));
+    }
+
+    /// `record list` usage が `--format=table|jsonl` を含む。
+    #[test]
+    fn usage_record_list_lists_key_options() {
+        let text = usage(&HelpTopic::RecordList);
+        assert!(text.contains("--format"));
+        assert!(text.contains("table"));
+        assert!(text.contains("jsonl"));
+    }
+
+    /// top-level usage に record が列挙される。
+    #[test]
+    fn usage_top_lists_record() {
+        let text = usage(&HelpTopic::Top);
+        assert!(text.contains("record"));
+    }
+
+    /// `parse_max_bytes` の suffix 解釈 unit test。
+    #[test]
+    fn parse_max_bytes_suffix_variants() {
+        assert_eq!(parse_max_bytes("0").unwrap(), 0);
+        assert_eq!(parse_max_bytes("1024").unwrap(), 1024);
+        assert_eq!(parse_max_bytes("1k").unwrap(), 1024);
+        assert_eq!(parse_max_bytes("1K").unwrap(), 1024);
+        assert_eq!(parse_max_bytes("1kb").unwrap(), 1024);
+        assert_eq!(parse_max_bytes("1KiB").unwrap(), 1024);
+        assert_eq!(parse_max_bytes("1m").unwrap(), 1024 * 1024);
+        assert_eq!(parse_max_bytes("1MB").unwrap(), 1024 * 1024);
+        assert_eq!(parse_max_bytes("1MiB").unwrap(), 1024 * 1024);
+        assert_eq!(parse_max_bytes("1g").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_max_bytes("100b").unwrap(), 100);
+    }
+
+    /// `parse_max_bytes` の invalid 形式は error。
+    #[test]
+    fn parse_max_bytes_invalid() {
+        assert!(parse_max_bytes("").is_err());
+        assert!(parse_max_bytes("abc").is_err());
+        assert!(parse_max_bytes("1.5m").is_err()); // decimal 非対応
     }
 }

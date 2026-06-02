@@ -18,14 +18,17 @@ use std::process::ExitCode;
 
 use hyoui::cli::{
     AttachConfig, Command, HelpTopic, InputCommand, InputSpec, KillConfig, ListConfig, ListFormat,
-    LockAcquireConfig, LockCommand, LockMode, LockReleaseConfig, ScreenCommand,
-    ScreenDumpCliFormat, ScreenDumpCliLayer, ScreenDumpConfig, ScreenSnapshotConfig,
-    SnapshotCliComponent, StatusConfig, TailConfig, WaitConfig, parse_args, usage,
+    LockAcquireConfig, LockCommand, LockMode, LockReleaseConfig, RecordCommand, RecordDirectionArg,
+    RecordFormatArg, RecordInputSecrecyArg, RecordListConfig, RecordListFormatArg,
+    RecordStartConfig, RecordStopConfig, ScreenCommand, ScreenDumpCliFormat, ScreenDumpCliLayer,
+    ScreenDumpConfig, ScreenSnapshotConfig, SnapshotCliComponent, StatusConfig, TailConfig,
+    WaitConfig, parse_args, usage,
 };
 use hyoui::client::{AttachOptions, ClientConnection};
 use hyoui::protocol::messages::{
-    DumpRect, ScreenDumpFormat, ScreenDumpLayer, ScreenDumpRequest, SnapshotComponent,
-    StateSnapshotRequest, StatusQuery, TailRequest,
+    DumpRect, InputSecrecy, RecordDirection, RecordFormat, RecordInfo, RecordListRequest,
+    RecordStartRequest, RecordStopAllRequest, RecordStopRequest, ScreenDumpFormat, ScreenDumpLayer,
+    ScreenDumpRequest, SnapshotComponent, StateSnapshotRequest, StatusQuery, TailRequest,
 };
 use hyoui::protocol::{ControlMessage, Mode};
 use hyoui::sys::{enter_raw, is_tty};
@@ -299,6 +302,20 @@ fn main() -> ExitCode {
         },
 
         Command::Unlock(cfg) => lock_release_command("unlock", cfg),
+
+        Command::Record(sub) => match sub {
+            RecordCommand::Start(cfg) => record_start_command(cfg),
+            RecordCommand::Stop(cfg) => record_stop_command(cfg),
+            RecordCommand::List(cfg) => record_list_command(cfg),
+            // `RecordCommand` is `#[non_exhaustive]`; future variants surface as
+            // a generic skew error so older binaries report clearly.
+            _ => {
+                eprintln!(
+                    "hyoui: record: unsupported record subcommand variant (binary/library version skew)"
+                );
+                ExitCode::from(2)
+            }
+        },
 
         Command::Completion { shell } => {
             print!("{}", completion::script(shell));
@@ -2515,6 +2532,456 @@ fn lock_release_command(cmd_label: &str, cfg: LockReleaseConfig) -> ExitCode {
             }
             ExitCode::from(1)
         }
+    }
+}
+
+// =============================================================================
+// DR-0016 Phase 7: `record` subcommand executors
+// =============================================================================
+//
+// CLI 表現 enum (= `RecordDirectionArg` 等) → protocol 表現 enum (= `RecordDirection`
+// 等) の写像、connect + handshake + send/recv 処理、出力整形を本セクションで行う。
+//
+// daemon 側 hook 配線 (Phase 4) 完了前は record 系 message を送ると daemon が
+// `unsupported-capability` 系 error を返す前提。CLI は `ControlMessage::Error`
+// を受けて hint を出して exit 1 する。
+
+/// CLI 表現の direction を protocol 表現に写像。
+fn map_record_direction(d: RecordDirectionArg) -> RecordDirection {
+    match d {
+        RecordDirectionArg::Stdin => RecordDirection::Stdin,
+        RecordDirectionArg::Stdout => RecordDirection::Stdout,
+        RecordDirectionArg::Both => RecordDirection::Both,
+        // `RecordDirectionArg` は `#[non_exhaustive]`; future variants は Both で
+        // 落とす (= 録画範囲を絞らず誤動作回避)。
+        _ => RecordDirection::Both,
+    }
+}
+
+/// CLI 表現の format を protocol 表現に写像。
+fn map_record_format(f: RecordFormatArg) -> RecordFormat {
+    match f {
+        RecordFormatArg::Jsonl => RecordFormat::Jsonl,
+        RecordFormatArg::Raw => RecordFormat::Raw,
+        _ => RecordFormat::Jsonl,
+    }
+}
+
+/// CLI 表現の input secrecy を protocol 表現に写像。
+fn map_record_input_secrecy(s: RecordInputSecrecyArg) -> InputSecrecy {
+    match s {
+        RecordInputSecrecyArg::RedactAfterPrompt => InputSecrecy::RedactAfterPrompt,
+        RecordInputSecrecyArg::RecordAll => InputSecrecy::RecordAll,
+        RecordInputSecrecyArg::NeverRecordStdin => InputSecrecy::NeverRecordStdin,
+        _ => InputSecrecy::RedactAfterPrompt,
+    }
+}
+
+/// daemon error が `record-v1` cap 未対応を示すかを heuristics で判定し、stderr
+/// に hint を出す共通 helper。
+fn print_record_cap_hint(err_msg: &str) {
+    if err_msg.contains("record-v1") || err_msg.contains("unsupported-capability") {
+        eprintln!(
+            "       daemon が `record-v1` cap をサポートしていません (= Phase 4 未配線 or 旧 daemon)。"
+        );
+        eprintln!("       daemon を新しいバージョンに更新してください。");
+    }
+}
+
+/// `record start` 実行時に stderr へ出す 3 行 loud warning (DR-0016 §2)。
+///
+/// `--input-secrecy` の値と出力 path を埋め込み、record file が機密情報を含む
+/// 可能性を毎回明示する (= ユーザが「うっかり共有」を防ぐ最終防壁)。
+fn print_record_start_warning(output_path: &std::path::Path, secrecy: RecordInputSecrecyArg) {
+    let secrecy_str = match secrecy {
+        RecordInputSecrecyArg::RedactAfterPrompt => "redact-after-prompt",
+        RecordInputSecrecyArg::RecordAll => "record-all",
+        RecordInputSecrecyArg::NeverRecordStdin => "never-record-stdin",
+        _ => "redact-after-prompt",
+    };
+    eprintln!("WARNING: record file contains ALL bytes including potential secrets");
+    eprintln!("  (passwords typed at prompts, OTP, API tokens).");
+    eprintln!(
+        "  Output: {} (mode 0600, only readable by your user).",
+        output_path.display()
+    );
+    eprintln!("  Default input redaction: --input-secrecy={secrecy_str} is active.");
+    eprintln!("  Do NOT share record files outside your authentication boundary.");
+}
+
+/// `record start` 実行ロジック。
+///
+/// 1. session selector を socket path に解決
+/// 2. stderr に 3 行 loud warning (DR-0016 §2)
+/// 3. `--max-bytes 0` / `--max-duration 0` で disable された場合の追加 warning
+/// 4. connect + handshake (cap negotiate で `record-v1` を要求)
+/// 5. `RecordStartRequest` を送信
+/// 6. `RecordStartResponse` を受信して `record_id` を stdout に出す
+fn record_start_command(cfg: RecordStartConfig) -> ExitCode {
+    let sock = match resolve_target_socket(
+        "record start",
+        cfg.socket.as_deref(),
+        cfg.session_id.as_deref(),
+        cfg.index,
+    ) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+
+    // Loud warning は **必ず** record 開始の意思表示直前に出す (= 接続前に出して
+    // ユーザが Ctrl-C で中断する余地を残す)。
+    print_record_start_warning(&cfg.output_path, cfg.input_secrecy);
+    if cfg.max_bytes_disabled {
+        eprintln!(
+            "WARNING: --max-bytes=0 で size 上限が無効化されています。disk full で他 record /\n         \
+             session に影響する前に手動 stop を確実に実行してください。"
+        );
+    }
+    if cfg.max_duration_disabled {
+        eprintln!(
+            "WARNING: --max-duration=0 で duration 上限が無効化されています。session 終了まで\n         \
+             record が継続するため、record file size を別途監視してください。"
+        );
+    }
+
+    // handshake では MVP_CAPS を要求 (= `record-v1` 含む、既存 status/screen/tail と同流儀)。
+    // token は env (HYOUI_LOCK_TOKEN) から取る (= 認証付き daemon にも対応)。
+    let opts = AttachOptions {
+        mode: Mode::Ro,
+        token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
+        ..AttachOptions::default()
+    };
+    let mut conn = match connect_with_retry(&sock, opts) {
+        Ok(c) => c,
+        Err(e) => {
+            print_connect_failure("record start", &sock, &e);
+            return ExitCode::from(1);
+        }
+    };
+
+    let req = RecordStartRequest {
+        direction: map_record_direction(cfg.direction),
+        format: map_record_format(cfg.format),
+        // protocol 上は String、CLI 側は PathBuf。display 経由でなく to_string_lossy
+        // で wire 文字列化 (= 絶対 path 保証済なので lossy 化の loss なし、UTF-8 path 想定)。
+        output_path: cfg.output_path.to_string_lossy().into_owned(),
+        max_bytes: cfg.max_bytes,
+        max_duration_ms: cfg.max_duration_ms,
+        input_secrecy: map_record_input_secrecy(cfg.input_secrecy),
+        prompt_pattern: cfg.prompt_pattern.clone(),
+    };
+    if let Err(e) = conn.send_control(&ControlMessage::RecordStartRequest(req)) {
+        eprintln!("hyoui: record start: send 失敗: {e}");
+        return ExitCode::from(1);
+    }
+
+    loop {
+        let msg = match conn.recv_control(None) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("hyoui: record start: recv 失敗: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        match msg {
+            ControlMessage::RecordStartResponse(resp) => {
+                println!(
+                    "Started record #{} -> {}",
+                    resp.record_id,
+                    cfg.output_path.display()
+                );
+                return ExitCode::SUCCESS;
+            }
+            ControlMessage::Error(e) => {
+                eprintln!(
+                    "hyoui: record start: daemon error: code={:?} message={}",
+                    e.code, e.message
+                );
+                print_record_cap_hint(&e.message);
+                return ExitCode::from(1);
+            }
+            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+            other => {
+                eprintln!("hyoui: record start: unexpected response: {other:?}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+}
+
+/// `record stop` 実行ロジック。
+///
+/// - `--all` → `RecordStopAllRequest` を送信
+/// - `--id N` → `RecordStopRequest { record_id: N }` を送信
+/// - 両省略 → 先に `RecordListRequest` を query して single active なら自動採用、
+///   複数 active なら error、none なら error (= ambiguity を CLI 側で吸収)
+fn record_stop_command(cfg: RecordStopConfig) -> ExitCode {
+    let sock = match resolve_target_socket(
+        "record stop",
+        cfg.socket.as_deref(),
+        cfg.session_id.as_deref(),
+        cfg.index,
+    ) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+
+    let opts = AttachOptions {
+        mode: Mode::Ro,
+        token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
+        ..AttachOptions::default()
+    };
+    let mut conn = match connect_with_retry(&sock, opts) {
+        Ok(c) => c,
+        Err(e) => {
+            print_connect_failure("record stop", &sock, &e);
+            return ExitCode::from(1);
+        }
+    };
+
+    // --all → 全停止 message
+    if cfg.all {
+        if let Err(e) = conn.send_control(&ControlMessage::RecordStopAllRequest(
+            RecordStopAllRequest {},
+        )) {
+            eprintln!("hyoui: record stop: send 失敗 (--all): {e}");
+            return ExitCode::from(1);
+        }
+        return record_stop_wait_response(&mut conn, "record stop (--all)");
+    }
+
+    // --id 明示 → 単一停止
+    if let Some(id) = cfg.record_id {
+        if let Err(e) = conn.send_control(&ControlMessage::RecordStopRequest(RecordStopRequest {
+            record_id: id,
+        })) {
+            eprintln!("hyoui: record stop: send 失敗 (--id={id}): {e}");
+            return ExitCode::from(1);
+        }
+        return record_stop_wait_response(&mut conn, "record stop");
+    }
+
+    // --id も --all も無し → 先に list query で single active を確認。
+    if let Err(e) = conn.send_control(&ControlMessage::RecordListRequest(RecordListRequest {})) {
+        eprintln!("hyoui: record stop: list query send 失敗: {e}");
+        return ExitCode::from(1);
+    }
+    let records = match wait_record_list_response(&mut conn, "record stop") {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    match records.len() {
+        0 => {
+            eprintln!("hyoui: record stop: 停止対象の record がありません (active 0 件)");
+            ExitCode::from(1)
+        }
+        1 => {
+            let id = records[0].record_id;
+            if let Err(e) =
+                conn.send_control(&ControlMessage::RecordStopRequest(RecordStopRequest {
+                    record_id: id,
+                }))
+            {
+                eprintln!("hyoui: record stop: auto-select send 失敗 (--id={id}): {e}");
+                return ExitCode::from(1);
+            }
+            eprintln!("hyoui: record stop: auto-selected record_id={id}");
+            record_stop_wait_response(&mut conn, "record stop")
+        }
+        n => {
+            eprintln!(
+                "hyoui: record stop: 複数の active record が存在します ({n} 件)。\
+                 `--id <N>` で対象を指定するか `--all` で一括停止してください。"
+            );
+            for r in &records {
+                eprintln!("       record_id={} -> {}", r.record_id, r.output_path);
+            }
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `record stop` の response (= success / error) を待って exit code を決める helper。
+///
+/// transient な broadcast (= `ModeChange` / `LeaderNotify`) は skip + 次 message を
+/// 待つ。Phase 4 後の daemon が `record.stop` 成功時に何を ACK として返すかは
+/// 未確定なので、当面は `RecordListResponse` を success の代理として受ける
+/// (= 確定実装は Phase 4 完了後に再調整、現状は error / unexpected 以外で SUCCESS)。
+fn record_stop_wait_response(conn: &mut ClientConnection, label: &str) -> ExitCode {
+    loop {
+        let msg = match conn.recv_control(None) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("hyoui: {label}: recv 失敗: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        match msg {
+            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+            ControlMessage::RecordListResponse(_) => return ExitCode::SUCCESS,
+            ControlMessage::Error(e) => {
+                eprintln!(
+                    "hyoui: {label}: daemon error: code={:?} message={}",
+                    e.code, e.message
+                );
+                print_record_cap_hint(&e.message);
+                return ExitCode::from(1);
+            }
+            other => {
+                eprintln!("hyoui: {label}: unexpected response: {other:?}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+}
+
+/// `record.list.response` を待って records を返す helper。error は exit code に変換。
+fn wait_record_list_response(
+    conn: &mut ClientConnection,
+    label: &str,
+) -> Result<Vec<RecordInfo>, ExitCode> {
+    loop {
+        let msg = match conn.recv_control(None) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("hyoui: {label}: recv 失敗: {e}");
+                return Err(ExitCode::from(1));
+            }
+        };
+        match msg {
+            ControlMessage::RecordListResponse(resp) => return Ok(resp.records),
+            ControlMessage::Error(e) => {
+                eprintln!(
+                    "hyoui: {label}: daemon error: code={:?} message={}",
+                    e.code, e.message
+                );
+                print_record_cap_hint(&e.message);
+                return Err(ExitCode::from(1));
+            }
+            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+            other => {
+                eprintln!("hyoui: {label}: unexpected response: {other:?}");
+                return Err(ExitCode::from(1));
+            }
+        }
+    }
+}
+
+/// `record list` 実行ロジック。
+fn record_list_command(cfg: RecordListConfig) -> ExitCode {
+    let sock = match resolve_target_socket(
+        "record list",
+        cfg.socket.as_deref(),
+        cfg.session_id.as_deref(),
+        cfg.index,
+    ) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+
+    let opts = AttachOptions {
+        mode: Mode::Ro,
+        token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
+        ..AttachOptions::default()
+    };
+    let mut conn = match connect_with_retry(&sock, opts) {
+        Ok(c) => c,
+        Err(e) => {
+            print_connect_failure("record list", &sock, &e);
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(e) = conn.send_control(&ControlMessage::RecordListRequest(RecordListRequest {})) {
+        eprintln!("hyoui: record list: send 失敗: {e}");
+        return ExitCode::from(1);
+    }
+    let records = match wait_record_list_response(&mut conn, "record list") {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    match cfg.format {
+        RecordListFormatArg::Table => print_record_list_table(&records),
+        RecordListFormatArg::Jsonl => print_record_list_jsonl(&records),
+        _ => print_record_list_table(&records),
+    }
+    ExitCode::SUCCESS
+}
+
+/// `record list` の table format 出力 (= 人間可読、固定長 column)。
+///
+/// 0 件なら header 行のみ出す (= scripting でも空集合と判別可能)。
+fn print_record_list_table(records: &[RecordInfo]) {
+    println!(
+        "{:>4}  {:<6}  {:<6}  {:>20}  {:>10}  {:>10}  OUTPUT",
+        "ID", "DIR", "FORMAT", "STARTED_MS", "RAW_BYTES", "FILE_BYTES",
+    );
+    for r in records {
+        let dir = match r.direction {
+            RecordDirection::Stdin => "stdin",
+            RecordDirection::Stdout => "stdout",
+            RecordDirection::Both => "both",
+            _ => "?",
+        };
+        let fmt = match r.format {
+            RecordFormat::Jsonl => "jsonl",
+            RecordFormat::Raw => "raw",
+            _ => "?",
+        };
+        println!(
+            "{:>4}  {:<6}  {:<6}  {:>20}  {:>10}  {:>10}  {}",
+            r.record_id,
+            dir,
+            fmt,
+            r.started_unix_ms,
+            r.raw_bytes_recorded,
+            r.file_bytes_written,
+            r.output_path,
+        );
+    }
+}
+
+/// `record list` の jsonl format 出力 (= scripting / jq 用)。
+///
+/// `RecordInfo` を 1 record 1 行に整形。serde_json への依存を避け、手書きで
+/// JSON encode する (= `print_status_json` と同流儀、kebab-case wire 名は使わず
+/// snake_case で出す = field 名 一貫性)。
+fn print_record_list_jsonl(records: &[RecordInfo]) {
+    use std::fmt::Write as _;
+    for r in records {
+        let dir = match r.direction {
+            RecordDirection::Stdin => "stdin",
+            RecordDirection::Stdout => "stdout",
+            RecordDirection::Both => "both",
+            _ => "unknown",
+        };
+        let fmt = match r.format {
+            RecordFormat::Jsonl => "jsonl",
+            RecordFormat::Raw => "raw",
+            _ => "unknown",
+        };
+        let mut out = String::new();
+        out.push('{');
+        write!(&mut out, "\"record_id\":{}", r.record_id).ok();
+        write!(&mut out, ",\"direction\":\"{dir}\"").ok();
+        write!(&mut out, ",\"format\":\"{fmt}\"").ok();
+        write!(&mut out, ",\"output_path\":{}", json_string(&r.output_path)).ok();
+        write!(&mut out, ",\"started_unix_ms\":{}", r.started_unix_ms).ok();
+        write!(
+            &mut out,
+            ",\"started_by_client_id\":{}",
+            r.started_by_client_id
+        )
+        .ok();
+        write!(&mut out, ",\"raw_bytes_recorded\":{}", r.raw_bytes_recorded).ok();
+        write!(&mut out, ",\"file_bytes_written\":{}", r.file_bytes_written).ok();
+        write!(
+            &mut out,
+            ",\"last_flushed_unix_ms\":{}",
+            r.last_flushed_unix_ms
+        )
+        .ok();
+        out.push('}');
+        println!("{out}");
     }
 }
 
