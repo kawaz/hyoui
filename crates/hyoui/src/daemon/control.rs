@@ -1415,4 +1415,119 @@ mod tests {
         assert_eq!(v["sig_num"], expected_signum);
         assert_eq!(v["pid"], 1234);
     }
+
+    // ===== record stop / stop --all の ACK 回帰 (= hang bug の核心) =====
+
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc::Receiver;
+
+    use super::super::broadcast::{SharedBytes, Subscription};
+
+    /// `record-v1` cap を持つ test 用 `ClientHandle` を、writer thread 無しの素の
+    /// mpsc channel 付きで組み立てる。`send_control` の enqueue 先 (= rx) を test が
+    /// 直接 drain して daemon の応答 frame を覗ける。
+    fn record_test_client() -> (ClientHandle, Receiver<SharedBytes>) {
+        let (tx, rx) = std::sync::mpsc::channel::<SharedBytes>();
+        // ClientHandle は UnixStream (reader) を要求するがダミーで足りる。writer_tx は
+        // 素の mpsc で writer thread も spawn しないため、reader は Drop 以外で触られない
+        // (= 両端そのまま drop して問題ない)。
+        let (_a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let ch = ClientHandle {
+            id: 1,
+            mode: Mode::Ro,
+            leader: false,
+            subscription: Subscription::Raw,
+            negotiated_caps: vec!["record-v1".into()],
+            writer_tx: tx,
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            buffer_limit: 1 << 20,
+            writer_thread: None,
+            reader: b,
+        };
+        (ch, rx)
+    }
+
+    /// queue に積まれた次の frame を decode して `ControlMessage` を返す。
+    /// 何も積まれていなければ panic (= 「無音 return = hang」を test failure に変える)。
+    fn recv_control_from_queue(rx: &Receiver<SharedBytes>) -> ControlMessage {
+        let payload = rx
+            .try_recv()
+            .expect("daemon must enqueue a response (silent return = client hang)");
+        let frame = Frame::decode_from(&mut payload.as_slice()).expect("decode frame");
+        assert_eq!(frame.ty, TYPE_CBOR_CONTROL);
+        ControlMessage::decode_from(frame.body.as_slice()).expect("decode control message")
+    }
+
+    fn start_record(state: &SessionState, path: &std::path::Path) -> u32 {
+        let req = crate::protocol::messages::RecordStartRequest {
+            direction: RecordDirection::Both,
+            format: RecordFormat::Jsonl,
+            output_path: path.to_string_lossy().into_owned(),
+            max_bytes: None,
+            max_duration_ms: None,
+            input_secrecy: InputSecrecy::RedactAfterPrompt,
+            prompt_pattern: None,
+        };
+        let session = super::super::record::SessionInfo {
+            session_id: "t".into(),
+            daemon_pid: 1,
+            daemon_boot_id: "boot".into(),
+            argv: vec!["sh".into()],
+            cwd: "/".into(),
+        };
+        state.record_registry.start(&req, 1, session).unwrap()
+    }
+
+    /// 成功時に `RecordStopResponse { stopped: 1 }` を enqueue する (= 無音 return
+    /// しない)。これが今回の hang bug の核心の固定。
+    #[test]
+    fn record_stop_request_sends_stop_response_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = SessionState::default();
+        let id = start_record(&state, &dir.path().join("a.jsonl"));
+        let (mut ch, rx) = record_test_client();
+        let clients = std::slice::from_mut(&mut ch);
+
+        handle_record_stop_request(0, RecordStopRequest { record_id: id }, clients, &state);
+
+        match recv_control_from_queue(&rx) {
+            ControlMessage::RecordStopResponse(resp) => assert_eq!(resp.stopped, 1),
+            other => panic!("expected RecordStopResponse {{ stopped: 1 }}, got {other:?}"),
+        }
+    }
+
+    /// stop --all は停止件数を `stopped` に載せて返す (= 2 件停止 → stopped=2)。
+    #[test]
+    fn record_stop_all_sends_stop_response_with_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = SessionState::default();
+        start_record(&state, &dir.path().join("a.jsonl"));
+        start_record(&state, &dir.path().join("b.jsonl"));
+        let (mut ch, rx) = record_test_client();
+        let clients = std::slice::from_mut(&mut ch);
+
+        handle_record_stop_all_request(0, clients, &state);
+
+        match recv_control_from_queue(&rx) {
+            ControlMessage::RecordStopResponse(resp) => assert_eq!(resp.stopped, 2),
+            other => panic!("expected RecordStopResponse {{ stopped: 2 }}, got {other:?}"),
+        }
+    }
+
+    /// 存在しない record_id への stop も無音 return せず、`RecordNotFound` error を
+    /// 返す (= 失敗経路も client が hang しないことの固定)。
+    #[test]
+    fn record_stop_nonexistent_id_sends_error_not_silent() {
+        let state = SessionState::default();
+        let (mut ch, rx) = record_test_client();
+        let clients = std::slice::from_mut(&mut ch);
+
+        handle_record_stop_request(0, RecordStopRequest { record_id: 999 }, clients, &state);
+
+        match recv_control_from_queue(&rx) {
+            ControlMessage::Error(e) => assert_eq!(e.code, ErrorCode::RecordNotFound),
+            other => panic!("expected Error {{ RecordNotFound }}, got {other:?}"),
+        }
+    }
 }
