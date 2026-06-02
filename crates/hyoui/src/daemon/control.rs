@@ -128,26 +128,45 @@ pub(super) fn handle_client_frame(
             // disconnect 扱いし、slow-reader 経由の client DoS が成立する。
             // `write_all_with_idle_timeout` は EAGAIN を poll(POLLOUT) で
             // 待ち、forward progress が `MASTER_WRITE_IDLE_TIMEOUT_MS` 続け
-            // ないときだけ ETIMEDOUT を返す。タイムアウト時は明示 error
-            // (= `master.write-timeout`) を通知してから DropClient する。
+            // ないときだけ idle-timeout を返す (DR-0016 §4)。
+            //
+            // DR-0016 §4: 戻り値が `Result<WriteOutcome, _>` に変更された。
+            // partial write 時の written byte 数 + error kind を両方保持し、
+            // record sink には `bytes[0..written_len]` を `in` event、残りを
+            // `in-write-error` event として push する想定 (Phase 4 で配線)。
+            // 本 dispatcher の従来挙動 (= idle-timeout で master.write-timeout
+            // notify + DropClient、その他 error は無言 DropClient) は維持する。
             match pty
                 .master_fd()
                 .write_all_with_idle_timeout(&frame.body, MASTER_WRITE_IDLE_TIMEOUT_MS)
             {
-                Ok(()) => ClientFrameOutcome::Continue,
-                Err(crate::sys::Error::Errno(nix::errno::Errno::ETIMEDOUT)) => {
-                    let _ = send_control(
-                        &clients[idx],
-                        ControlMessage::Error(ErrorMessage {
-                            code: ErrorCode::MasterWriteTimeout,
-                            message: format!(
-                                "master PTY write made no forward progress for {MASTER_WRITE_IDLE_TIMEOUT_MS} ms \
-                                (child is a slow reader); disconnecting client"
-                            ),
-                            details: None,
-                        }),
-                    );
-                    ClientFrameOutcome::DropClient
+                Ok(outcome) if outcome.is_complete() => ClientFrameOutcome::Continue,
+                Ok(outcome) => {
+                    // partial / failure (= written_len < requested_len、または error)。
+                    // TODO(Phase 4): record sink に `in` (written prefix) +
+                    // `in-write-error` (requested/written/error/unwritten) を push。
+                    // 本 commit は WriteOutcome の解釈に揃えるだけで、record 配線は
+                    // しない (= Phase 2/3 と Phase 4 を境界で分ける方針)。
+                    match outcome.error {
+                        Some(crate::sys::WriteError::IdleTimeout) => {
+                            let _ = send_control(
+                                &clients[idx],
+                                ControlMessage::Error(ErrorMessage {
+                                    code: ErrorCode::MasterWriteTimeout,
+                                    message: format!(
+                                        "master PTY write made no forward progress for {MASTER_WRITE_IDLE_TIMEOUT_MS} ms \
+                                        (child is a slow reader); disconnecting client (written={}/{})",
+                                        outcome.written_len, outcome.requested_len
+                                    ),
+                                    details: None,
+                                }),
+                            );
+                            ClientFrameOutcome::DropClient
+                        }
+                        Some(crate::sys::WriteError::Io(_)) | None => {
+                            ClientFrameOutcome::DropClient
+                        }
+                    }
                 }
                 Err(_) => ClientFrameOutcome::DropClient,
             }

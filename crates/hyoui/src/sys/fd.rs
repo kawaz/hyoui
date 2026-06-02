@@ -14,6 +14,62 @@ use nix::poll::{PollFd, PollFlags, PollTimeout};
 
 use super::error::{Error, Result};
 
+/// `write_all_with_idle_timeout` の write 失敗種別 (DR-0016 §4)。
+///
+/// partial write 後の error kind を caller / record sink で区別するために用意する:
+/// - `IdleTimeout` は client → 子 PTY 経路の slow-reader 検知 (= 旧 `Errno::ETIMEDOUT`)、
+///   client にも `master.write-timeout` で notify されて DropClient される。
+/// - `Io` はそれ以外の transport failure (= EIO / POLLHUP / POLLERR 等)。
+///
+/// `WriteOutcome` の `error` field に格納される。`written_len > 0` で error あり、
+/// `written_len == 0` で error あり、`written_len == requested_len` で error なし、の
+/// 3 パターンを 1 値で表現する (DR-0016 §4)。
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum WriteError {
+    /// idle timeout が経過し、forward progress が立たなかった (= 旧 ETIMEDOUT)。
+    IdleTimeout,
+    /// IO 失敗 (= POLLHUP / POLLERR / write の errno 等)。`Errno` を保持。
+    Io(Errno),
+}
+
+impl WriteError {
+    /// errno があれば返す (= record sink で wire 文字列化するときに使う)。
+    pub fn errno(&self) -> Option<Errno> {
+        match self {
+            Self::IdleTimeout => Some(Errno::ETIMEDOUT),
+            Self::Io(e) => Some(*e),
+        }
+    }
+}
+
+/// `write_all_with_idle_timeout` の戻り値 (DR-0016 §4)。
+///
+/// partial write 時の **written byte 数 + error kind** を両方保持する:
+/// - `written_len == requested_len && error.is_none()`: 完全成功
+/// - `written_len > 0 && error.is_some()`: partial write (= 成功 prefix と error 両方)
+/// - `written_len == 0 && error.is_some()`: 何も書けず失敗
+///
+/// caller (= daemon control.rs) は `written_len` と `error.is_some()` で
+/// partial / failure を判定する。record sink には `bytes[0..written_len]` を `in`
+/// event、残りを `in-write-error` event として push する想定 (Phase 4)。
+#[derive(Debug)]
+pub struct WriteOutcome {
+    /// 呼び出し時に渡した bytes 長 (= data.len())。
+    pub requested_len: usize,
+    /// 子に write 成功した byte 数 (= 0 ≤ written_len ≤ requested_len)。
+    pub written_len: usize,
+    /// error 種別 (= None なら完全成功)。
+    pub error: Option<WriteError>,
+}
+
+impl WriteOutcome {
+    /// 全 bytes を書き終え、error も無い完全成功状態か。
+    pub fn is_complete(&self) -> bool {
+        self.error.is_none() && self.written_len == self.requested_len
+    }
+}
+
 /// Methods we want available on any owned descriptor.
 pub trait FdExt: AsFd {
     /// `read(2)` with EINTR retry. Returns `Ok(0)` on EOF.
@@ -62,16 +118,35 @@ pub trait FdExt: AsFd {
     /// the child's PTY line discipline buffer (typically 4–8 KiB) is
     /// transiently full. See `docs/decisions/DR-0008-protocol-design.md`
     /// (raw_data hot path) and R5-Kernel C1.
-    fn write_all_with_idle_timeout(&self, data: &[u8], idle_timeout_ms: u32) -> Result<()> {
+    fn write_all_with_idle_timeout(
+        &self,
+        data: &[u8],
+        idle_timeout_ms: u32,
+    ) -> Result<WriteOutcome> {
+        // DR-0016 §4: 戻り値を `Result<WriteOutcome, _>` に変更。`written_len` と
+        // `error` を両方保持し、partial write 時の written byte prefix を caller /
+        // record sink で再現できるようにする。本 fn 開始前の error (= invalid arg)
+        // のみ outer `Err(_)`、write 中に発生した error はすべて `WriteOutcome.error`
+        // に集約する (= 「何 byte 書けたか」を捨てないため)。
         if data.is_empty() {
-            return Ok(());
+            return Ok(WriteOutcome {
+                requested_len: 0,
+                written_len: 0,
+                error: None,
+            });
         }
         let timeout = PollTimeout::try_from(idle_timeout_ms)
             .map_err(|_| Error::Invalid("idle_timeout_ms out of range for PollTimeout"))?;
         let mut off = 0;
+        // helper: WriteOutcome を組み立てる。
+        let make = |off: usize, err: Option<WriteError>| WriteOutcome {
+            requested_len: data.len(),
+            written_len: off,
+            error: err,
+        };
         while off < data.len() {
             match nix::unistd::write(self.as_fd(), &data[off..]) {
-                Ok(0) => return Err(Error::Errno(Errno::EIO)),
+                Ok(0) => return Ok(make(off, Some(WriteError::Io(Errno::EIO)))),
                 Ok(n) => {
                     off += n;
                 }
@@ -92,26 +167,26 @@ pub trait FdExt: AsFd {
                     let mut pfd = [PollFd::new(fd, PollFlags::POLLOUT)];
                     loop {
                         match nix::poll::poll(&mut pfd, timeout) {
-                            Ok(0) => return Err(Error::Errno(Errno::ETIMEDOUT)),
+                            Ok(0) => return Ok(make(off, Some(WriteError::IdleTimeout))),
                             Ok(_) => {
                                 let revents = pfd[0].revents().unwrap_or(PollFlags::empty());
                                 if revents.intersects(
                                     PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL,
                                 ) {
-                                    return Err(Error::Errno(Errno::EIO));
+                                    return Ok(make(off, Some(WriteError::Io(Errno::EIO))));
                                 }
                                 // POLLOUT or some other ready bit — go retry write.
                                 break;
                             }
                             Err(Errno::EINTR) => continue,
-                            Err(e) => return Err(Error::from(e)),
+                            Err(e) => return Ok(make(off, Some(WriteError::Io(e)))),
                         }
                     }
                 }
-                Err(e) => return Err(Error::from(e)),
+                Err(e) => return Ok(make(off, Some(WriteError::Io(e)))),
             }
         }
-        Ok(())
+        Ok(make(off, None))
     }
 
     /// Toggle `O_NONBLOCK` on this fd.
@@ -216,9 +291,15 @@ mod tests {
         // discipline buffer several times over.
         let payload = vec![b'A'; 64 * 1024];
         // 500 ms idle timeout matches the daemon's constant.
-        pty.master_fd()
+        let outcome = pty
+            .master_fd()
             .write_all_with_idle_timeout(&payload, 500)
-            .expect("write should complete despite EAGAIN");
+            .expect("write should not surface invalid-arg error");
+        assert!(
+            outcome.is_complete(),
+            "expected complete write, got {outcome:?}"
+        );
+        assert_eq!(outcome.written_len, payload.len());
 
         stop.store(true, Ordering::Relaxed);
         // Drop the master so the reader sees EOF eventually.
@@ -250,15 +331,21 @@ mod tests {
 
         let start = std::time::Instant::now();
         // 100 ms idle timeout — short enough for the test to be fast.
-        let err = wr
+        let outcome = wr
             .write_all_with_idle_timeout(&payload, 100)
-            .expect_err("write should ETIMEDOUT when peer never reads");
+            .expect("idle-timeout is a WriteOutcome.error, not an outer Err");
         let elapsed = start.elapsed();
 
-        match err {
-            Error::Errno(Errno::ETIMEDOUT) => {}
-            other => panic!("expected ETIMEDOUT, got {other:?}"),
+        assert!(
+            !outcome.is_complete(),
+            "expected partial / failed write, got {outcome:?}"
+        );
+        match outcome.error {
+            Some(WriteError::IdleTimeout) => {}
+            other => panic!("expected IdleTimeout, got {other:?}"),
         }
+        // 一部 byte は line discipline buffer に書けている可能性がある (= partial)。
+        assert!(outcome.written_len < outcome.requested_len);
         // Should give up within a small multiple of the idle timeout. We
         // allow generous slack because the first write(2) call may write
         // a partial chunk before EAGAIN, but the idle window starts only
@@ -276,8 +363,58 @@ mod tests {
         use crate::sys::pty::Pty;
         let pty = Pty::open(80, 24).expect("openpty");
         pty.master_fd().set_nonblocking(true).expect("nonblock");
-        pty.master_fd()
+        let outcome = pty
+            .master_fd()
             .write_all_with_idle_timeout(&[], 100)
             .expect("empty write should succeed");
+        assert_eq!(outcome.requested_len, 0);
+        assert_eq!(outcome.written_len, 0);
+        assert!(outcome.error.is_none());
+        assert!(outcome.is_complete());
+    }
+
+    /// DR-0016 §4 regression: writing to a closed peer (= read end dropped) must
+    /// surface `WriteError::Io(EPIPE)` in `WriteOutcome.error`、`written_len` は
+    /// `requested_len` 未満 (= 多くの場合 0、kernel が EPIPE を即返すケース)。
+    /// outer `Err(_)` ではない。
+    #[test]
+    fn master_write_io_error_carries_written_len_and_kind() {
+        let (rd, wr) = nix::unistd::pipe().expect("pipe");
+        wr.set_nonblocking(true).expect("nonblock");
+        // read end を即 drop すると、wr への write は EPIPE を返す (= SIGPIPE は
+        // process-wide ignore でなくても EPIPE は errno で返ってくる)。
+        drop(rd);
+        // SIGPIPE で process が死ぬのを防ぐため、ここではテストプロセスの SIGPIPE
+        // 既定 disposition (= terminate) を一時 ignore に揃える。test 内のみ、unsafe を
+        // 持ち込まずに `crate::sys::signal::install_ignore` を使う。
+        let _ = crate::sys::signal::install_ignore(nix::sys::signal::Signal::SIGPIPE);
+        let payload = b"hello-pipe-closed";
+        let outcome = wr
+            .write_all_with_idle_timeout(payload, 50)
+            .expect("io-error is captured in WriteOutcome, not outer Err");
+        assert_eq!(outcome.requested_len, payload.len());
+        match &outcome.error {
+            Some(WriteError::Io(Errno::EPIPE)) => {}
+            other => panic!("expected Io(EPIPE), got {other:?}"),
+        }
+        // partial write は kernel 実装次第 (= macOS の pipe は write の途中で EPIPE
+        // を返すことがある)、ここでは「complete でない」ことだけ確認する。
+        assert!(!outcome.is_complete());
+    }
+
+    /// DR-0016 §4 corollary: 完全成功時の WriteOutcome の field 値。
+    #[test]
+    fn master_write_complete_outcome_shape() {
+        // self-pipe で完全成功させる (= kernel pipe buffer に十分余裕がある小サイズ)。
+        let (rd, wr) = nix::unistd::pipe().expect("pipe");
+        wr.set_nonblocking(true).expect("nonblock");
+        let payload = b"abc";
+        let outcome = wr.write_all_with_idle_timeout(payload, 100).expect("ok");
+        assert_eq!(outcome.requested_len, payload.len());
+        assert_eq!(outcome.written_len, payload.len());
+        assert!(outcome.error.is_none());
+        assert!(outcome.is_complete());
+        drop(wr);
+        drop(rd);
     }
 }
