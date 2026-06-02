@@ -40,18 +40,23 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
 use crate::protocol::messages::{
-    ClientInfo, ErrorCode, ErrorMessage, LockResponse, LockResult, ModeChange, ScreenBufferKind,
-    ScreenCursorSnap, ScreenDumpRequest, ScreenDumpResponse, ScreenModeSnap, ScreenWindowSize,
-    SessionMode, SnapshotComponent, StateSnapshotRequest, StateSnapshotResponse, StatusResponse,
-    TailRequest,
+    ClientInfo, ErrorCode, ErrorMessage, LockResponse, LockResult, ModeChange, RecordInfo,
+    RecordListResponse, RecordStartRequest, RecordStartResponse, RecordStopRequest,
+    ScreenBufferKind, ScreenCursorSnap, ScreenDumpRequest, ScreenDumpResponse, ScreenModeSnap,
+    ScreenWindowSize, SessionMode, SnapshotComponent, StateSnapshotRequest, StateSnapshotResponse,
+    StatusResponse, TailRequest,
 };
 use crate::protocol::{ControlMessage, Frame, Mode, TYPE_CBOR_CONTROL, TYPE_RAW_DATA};
 use crate::scrollback::Scrollback;
-use crate::sys::{FdExt, Pty};
+use crate::sys::{FdExt, Pty, WriteError};
 
 use super::DaemonConfig;
 use super::broadcast::{ClientHandle, broadcast_control, send_control};
 use super::lock::{SessionState, generate_lock_token};
+use super::record::{
+    InRejectedReason, LifecycleEvent, RecordStartError, RecordStopError, SessionInfo,
+    WriteErrorKind,
+};
 use super::screen::{
     ScreenDumpFormat as InternalDumpFormat, ScreenDumpLayer as InternalDumpLayer, ScreenState,
     build_screen_dump, build_screen_snapshot,
@@ -115,11 +120,26 @@ pub(super) fn handle_client_frame(
             // 書き込み authorization:
             // - Ro mode は書けない (silently drop)
             // - lock 中は lock holder のみ書ける (= 他 rw も silently drop)
+            // DR-0016 §3: reject 経路は `in-rejected` lifecycle event として記録する。
             if matches!(ch_mode, Mode::Ro) {
+                state.record_registry.push_in_rejected(
+                    ch_id,
+                    ch_mode,
+                    state.lock_holder,
+                    InRejectedReason::RoClient,
+                    &frame.body,
+                );
                 return ClientFrameOutcome::Continue;
             }
             if let Some(holder) = state.lock_holder {
                 if holder != ch_id {
+                    state.record_registry.push_in_rejected(
+                        ch_id,
+                        ch_mode,
+                        Some(holder),
+                        InRejectedReason::LockNotHeld,
+                        &frame.body,
+                    );
                     return ClientFrameOutcome::Continue;
                 }
             }
@@ -133,38 +153,55 @@ pub(super) fn handle_client_frame(
             // DR-0016 §4: 戻り値が `Result<WriteOutcome, _>` に変更された。
             // partial write 時の written byte 数 + error kind を両方保持し、
             // record sink には `bytes[0..written_len]` を `in` event、残りを
-            // `in-write-error` event として push する想定 (Phase 4 で配線)。
-            // 本 dispatcher の従来挙動 (= idle-timeout で master.write-timeout
-            // notify + DropClient、その他 error は無言 DropClient) は維持する。
+            // `in-write-error` event として push する。
             match pty
                 .master_fd()
                 .write_all_with_idle_timeout(&frame.body, MASTER_WRITE_IDLE_TIMEOUT_MS)
             {
-                Ok(outcome) if outcome.is_complete() => ClientFrameOutcome::Continue,
                 Ok(outcome) => {
-                    // partial / failure (= written_len < requested_len、または error)。
-                    // TODO(Phase 4): record sink に `in` (written prefix) +
-                    // `in-write-error` (requested/written/error/unwritten) を push。
-                    // 本 commit は WriteOutcome の解釈に揃えるだけで、record 配線は
-                    // しない (= Phase 2/3 と Phase 4 を境界で分ける方針)。
-                    match outcome.error {
-                        Some(crate::sys::WriteError::IdleTimeout) => {
-                            let _ = send_control(
-                                &clients[idx],
-                                ControlMessage::Error(ErrorMessage {
-                                    code: ErrorCode::MasterWriteTimeout,
-                                    message: format!(
-                                        "master PTY write made no forward progress for {MASTER_WRITE_IDLE_TIMEOUT_MS} ms \
-                                        (child is a slow reader); disconnecting client (written={}/{})",
-                                        outcome.written_len, outcome.requested_len
-                                    ),
-                                    details: None,
-                                }),
-                            );
-                            ClientFrameOutcome::DropClient
-                        }
-                        Some(crate::sys::WriteError::Io(_)) | None => {
-                            ClientFrameOutcome::DropClient
+                    // DR-0016 §4 hook: written prefix を `in` event、partial / error は
+                    // `in-write-error` event に分けて push する。complete / partial を
+                    // 区別する前に push することで「成功した bytes」と「失敗の root cause」
+                    // を別 record event として正本化する。
+                    if outcome.written_len > 0 {
+                        state
+                            .record_registry
+                            .push_bytes_in(ch_id, &frame.body[..outcome.written_len]);
+                    }
+                    if let Some(err) = outcome.error.as_ref() {
+                        let kind = match err {
+                            WriteError::IdleTimeout => WriteErrorKind::IdleTimeout,
+                            WriteError::Io(errno) => WriteErrorKind::IoError(format!("{errno}")),
+                        };
+                        state.record_registry.push_in_write_error(
+                            ch_id,
+                            outcome.requested_len,
+                            outcome.written_len,
+                            kind,
+                            &frame.body[outcome.written_len..],
+                        );
+                    }
+                    if outcome.is_complete() {
+                        ClientFrameOutcome::Continue
+                    } else {
+                        // partial / failure (= written_len < requested_len、または error)。
+                        match outcome.error {
+                            Some(WriteError::IdleTimeout) => {
+                                let _ = send_control(
+                                    &clients[idx],
+                                    ControlMessage::Error(ErrorMessage {
+                                        code: ErrorCode::MasterWriteTimeout,
+                                        message: format!(
+                                            "master PTY write made no forward progress for {MASTER_WRITE_IDLE_TIMEOUT_MS} ms \
+                                            (child is a slow reader); disconnecting client (written={}/{})",
+                                            outcome.written_len, outcome.requested_len
+                                        ),
+                                        details: None,
+                                    }),
+                                );
+                                ClientFrameOutcome::DropClient
+                            }
+                            Some(WriteError::Io(_)) | None => ClientFrameOutcome::DropClient,
                         }
                     }
                 }
@@ -235,8 +272,20 @@ pub(super) fn handle_control_message(
             handle_state_snapshot_request(idx, req, clients, screen_state)
         }
         ControlMessage::SessionChildResumeRequest(_) => {
-            handle_session_child_resume_request(child, idx, clients)
+            handle_session_child_resume_request(child, idx, clients, state)
         }
+        // DR-0016 Phase 4: record handler 配線 (= Phase 1 で reject されていた variant を
+        // 取り出して個別 handler に振る)。
+        ControlMessage::RecordStartRequest(req) => {
+            handle_record_start_request(idx, req, clients, state, config)
+        }
+        ControlMessage::RecordStopRequest(req) => {
+            handle_record_stop_request(idx, req, clients, state)
+        }
+        ControlMessage::RecordStopAllRequest(_req) => {
+            handle_record_stop_all_request(idx, clients, state)
+        }
+        ControlMessage::RecordListRequest(_req) => handle_record_list_request(idx, clients, state),
         // daemon → client 方向のはずの message が client → daemon に来た or 未実装 kind。
         // DR-0008 §3.2 「未知 kind は decode error」だが、ここに来るのは serde で既知
         // variant なので decode 段階では catch されない。protocol violation として
@@ -254,13 +303,7 @@ pub(super) fn handle_control_message(
         | ControlMessage::StateSnapshotResponse(_)
         | ControlMessage::SessionExitNotify(_)
         | ControlMessage::SessionChildStoppedNotify(_)
-        // DR-0016 Phase 1: protocol foundation のみ。実 handler は Phase 2 で配線、
-        // それまでは未対応 kind として reject (= response 系は元々 daemon 側で受けない)。
-        | ControlMessage::RecordStartRequest(_)
         | ControlMessage::RecordStartResponse(_)
-        | ControlMessage::RecordStopRequest(_)
-        | ControlMessage::RecordStopAllRequest(_)
-        | ControlMessage::RecordListRequest(_)
         | ControlMessage::RecordListResponse(_) => reject_unexpected_kind(idx, clients),
     }
 }
@@ -276,6 +319,7 @@ fn handle_session_child_resume_request(
     child: Pid,
     idx: usize,
     clients: &mut [ClientHandle],
+    state: &SessionState,
 ) -> ClientFrameOutcome {
     let ch = &clients[idx];
     if ensure_cap(
@@ -287,10 +331,35 @@ fn handle_session_child_resume_request(
     {
         return ClientFrameOutcome::Continue;
     }
+    let client_id = ch.id;
+    // DR-0016 §3 — 4 段階 lifecycle event の 2 段階目 (= resume-request-received)。
+    state
+        .record_registry
+        .push_lifecycle(LifecycleEvent::ResumeRequestReceived {
+            client_id,
+            ts_unix_ms: now_unix_ms(),
+        });
     // 子 pgrp に SIGCONT。DR-0001 §実装ノート「子は独立セッションリーダーなので
     // 子の pgid == 子の pid」を踏襲。
     let _ = nix::sys::signal::killpg(child, nix::sys::signal::Signal::SIGCONT);
+    // DR-0016 §3 — 4 段階 lifecycle event の 3 段階目 (= sigcont-sent)。
+    state
+        .record_registry
+        .push_lifecycle(LifecycleEvent::SigcontSent {
+            pid: child.as_raw() as u32,
+            ts_unix_ms: now_unix_ms(),
+        });
     ClientFrameOutcome::Continue
+}
+
+/// DR-0016 §3 lifecycle event の `ts_unix_ms` 用 (= epoch ms)。同 helper を
+/// session.rs にも置いているが、cross-module で参照すると pub 化が必要になり
+/// 副作用が大きいので、本 module でも独立に持つ (= 同じ epoch を返す)。
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 // === cap / mode 共通 helper ===
@@ -638,6 +707,14 @@ fn handle_lock_acquire(
     };
     state.lock_holder = Some(ch_id);
     state.lock_token = Some(token.clone());
+    // DR-0016 §3: lock-acquired lifecycle event。state mutation の直後で push する
+    // (= 観測順序を state 変化と一致させるため)。
+    state
+        .record_registry
+        .push_lifecycle(LifecycleEvent::LockAcquired {
+            client_id: ch_id,
+            ts_unix_ms: now_unix_ms(),
+        });
     let _ = send_control(
         &clients[idx],
         ControlMessage::LockResponse(LockResponse {
@@ -683,6 +760,13 @@ fn handle_lock_release(
     }
     state.lock_holder = None;
     state.lock_token = None;
+    // DR-0016 §3: lock-released lifecycle event。
+    state
+        .record_registry
+        .push_lifecycle(LifecycleEvent::LockReleased {
+            client_id: ch_id,
+            ts_unix_ms: now_unix_ms(),
+        });
     broadcast_control(
         clients,
         &ControlMessage::ModeChange(ModeChange {
@@ -692,6 +776,170 @@ fn handle_lock_release(
         }),
     );
     ClientFrameOutcome::Continue
+}
+
+// === DR-0016 record handler (Phase 4 配線) ===
+
+/// `RecordStartRequest` の daemon 側 entry (DR-0016 §7)。
+///
+/// `record-v1` cap を強制 + `SessionInfo` を組み立てて registry に start を委譲する。
+/// 成功時は `RecordStartResponse` を、失敗時は `ErrorMessage` を当該 client に返す。
+fn handle_record_start_request(
+    idx: usize,
+    req: RecordStartRequest,
+    clients: &mut [ClientHandle],
+    state: &SessionState,
+    config: &DaemonConfig,
+) -> ClientFrameOutcome {
+    if ensure_cap(
+        &clients[idx],
+        "record-v1",
+        "record.start.request requires `record-v1` cap",
+    )
+    .is_err()
+    {
+        return ClientFrameOutcome::Continue;
+    }
+    let started_by_client_id = clients[idx].id;
+    // TODO(Phase 6): argv / cwd を sensitive pattern で sanitize する。本 Phase は
+    // unsanitized で渡す (= jsonl header に raw 値が乗る、kawaz の認可境界内前提)。
+    let session_info = SessionInfo {
+        session_id: config.session_id.clone(),
+        daemon_pid: std::process::id(),
+        daemon_boot_id: config.daemon_boot_id.clone(),
+        argv: config.cmd.clone(),
+        cwd: config
+            .cwd
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/".to_string()),
+    };
+    match state
+        .record_registry
+        .start(&req, started_by_client_id, session_info)
+    {
+        Ok(record_id) => {
+            let _ = send_control(
+                &clients[idx],
+                ControlMessage::RecordStartResponse(RecordStartResponse { record_id }),
+            );
+        }
+        Err(e) => {
+            let (code, message) = record_start_error_to_protocol(&e);
+            let _ = send_control(
+                &clients[idx],
+                ControlMessage::Error(ErrorMessage {
+                    code,
+                    message,
+                    details: None,
+                }),
+            );
+        }
+    }
+    ClientFrameOutcome::Continue
+}
+
+fn handle_record_stop_request(
+    idx: usize,
+    req: RecordStopRequest,
+    clients: &mut [ClientHandle],
+    state: &SessionState,
+) -> ClientFrameOutcome {
+    if ensure_cap(
+        &clients[idx],
+        "record-v1",
+        "record.stop.request requires `record-v1` cap",
+    )
+    .is_err()
+    {
+        return ClientFrameOutcome::Continue;
+    }
+    match state.record_registry.stop(req.record_id) {
+        Ok(()) => {
+            // 仕様上 `record.stop.response` は無い (DR-0016 §7)。成功通知は無音、
+            // client 側は `RecordListRequest` で active record の消失を確認する想定。
+        }
+        Err(RecordStopError(id)) => {
+            let _ = send_control(
+                &clients[idx],
+                ControlMessage::Error(ErrorMessage {
+                    code: ErrorCode::RecordNotFound,
+                    message: format!("record not found: id={id}"),
+                    details: None,
+                }),
+            );
+        }
+    }
+    ClientFrameOutcome::Continue
+}
+
+fn handle_record_stop_all_request(
+    idx: usize,
+    clients: &mut [ClientHandle],
+    state: &SessionState,
+) -> ClientFrameOutcome {
+    if ensure_cap(
+        &clients[idx],
+        "record-v1",
+        "record.stop.all.request requires `record-v1` cap",
+    )
+    .is_err()
+    {
+        return ClientFrameOutcome::Continue;
+    }
+    // 停止数は最小限の observability で済む (= response message を別途定義しない、
+    // 確認は record.list で行う)。
+    let _stopped = state.record_registry.stop_all();
+    ClientFrameOutcome::Continue
+}
+
+fn handle_record_list_request(
+    idx: usize,
+    clients: &mut [ClientHandle],
+    state: &SessionState,
+) -> ClientFrameOutcome {
+    if ensure_cap(
+        &clients[idx],
+        "record-v1",
+        "record.list.request requires `record-v1` cap",
+    )
+    .is_err()
+    {
+        return ClientFrameOutcome::Continue;
+    }
+    let records: Vec<RecordInfo> = state.record_registry.list();
+    let _ = send_control(
+        &clients[idx],
+        ControlMessage::RecordListResponse(RecordListResponse { records }),
+    );
+    ClientFrameOutcome::Continue
+}
+
+/// `RecordStartError` を protocol error code + 説明文に写像する (DR-0016 §7)。
+fn record_start_error_to_protocol(e: &RecordStartError) -> (ErrorCode, String) {
+    match e {
+        RecordStartError::PathNotAbsolute => (
+            ErrorCode::RecordPathNotAbsolute,
+            "record output path must be absolute".to_string(),
+        ),
+        RecordStartError::OutputAlreadyExists => (
+            ErrorCode::RecordOutputAlreadyExists,
+            "record output file already exists".to_string(),
+        ),
+        RecordStartError::OutputPermissionDenied(msg) => (
+            ErrorCode::RecordOutputPermissionDenied,
+            format!("record output denied: {msg}"),
+        ),
+        RecordStartError::UnsupportedDirectionForFormat => (
+            ErrorCode::RecordUnsupportedDirectionForFormat,
+            "record raw format requires single direction (stdin or stdout, not both)".to_string(),
+        ),
+        RecordStartError::InvalidPromptPattern(msg) => (
+            ErrorCode::RecordInvalidPromptPattern,
+            format!("invalid prompt pattern regex: {msg}"),
+        ),
+        RecordStartError::Io(e) => (ErrorCode::InternalError, format!("record io error: {e}")),
+    }
 }
 
 /// `ControlMessage::TailRequest` の cap check + handler 呼び出し。
@@ -976,4 +1224,184 @@ fn handle_state_snapshot_request(
     };
     let _ = send_control(&clients[idx], ControlMessage::StateSnapshotResponse(resp));
     ClientFrameOutcome::Continue
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::messages::{InputSecrecy, RecordDirection, RecordFormat};
+
+    /// DR-0016 §7: `RecordStartError` を protocol `ErrorCode` に写像する table。
+    #[test]
+    fn record_start_error_mapping_uses_dr0016_codes() {
+        let cases = [
+            (
+                RecordStartError::PathNotAbsolute,
+                ErrorCode::RecordPathNotAbsolute,
+            ),
+            (
+                RecordStartError::OutputAlreadyExists,
+                ErrorCode::RecordOutputAlreadyExists,
+            ),
+            (
+                RecordStartError::OutputPermissionDenied("p".into()),
+                ErrorCode::RecordOutputPermissionDenied,
+            ),
+            (
+                RecordStartError::UnsupportedDirectionForFormat,
+                ErrorCode::RecordUnsupportedDirectionForFormat,
+            ),
+            (
+                RecordStartError::InvalidPromptPattern("x".into()),
+                ErrorCode::RecordInvalidPromptPattern,
+            ),
+        ];
+        for (input, expected_code) in cases {
+            let (code, _msg) = record_start_error_to_protocol(&input);
+            assert_eq!(code, expected_code, "input = {input:?}");
+        }
+        // io error → InternalError fallback (= path validation 経由でなく writer thread 等の I/O)
+        let io = RecordStartError::Io(std::io::Error::other("boom"));
+        let (code, _) = record_start_error_to_protocol(&io);
+        assert_eq!(code, ErrorCode::InternalError);
+    }
+
+    /// DR-0016 §3: `in-rejected` event の bytes は reject 時に hex で記録される。
+    /// SessionState 経由で registry を共有し、Ro client の reject path 相当を
+    /// 直接 `push_in_rejected` で再現する (= TYPE_RAW_DATA arm の hook と等価)。
+    #[test]
+    fn in_rejected_event_records_bytes_and_reason_via_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rej.jsonl");
+        let state = SessionState::default();
+        let req = crate::protocol::messages::RecordStartRequest {
+            direction: RecordDirection::Both,
+            format: RecordFormat::Jsonl,
+            output_path: path.to_string_lossy().into_owned(),
+            max_bytes: None,
+            max_duration_ms: None,
+            input_secrecy: InputSecrecy::RedactAfterPrompt,
+            prompt_pattern: None,
+        };
+        let session = super::super::record::SessionInfo {
+            session_id: "t".into(),
+            daemon_pid: 1,
+            daemon_boot_id: "boot".into(),
+            argv: vec!["sh".into()],
+            cwd: "/".into(),
+        };
+        let id = state.record_registry.start(&req, 1, session).unwrap();
+        state.record_registry.push_in_rejected(
+            7,
+            Mode::Ro,
+            None,
+            InRejectedReason::RoClient,
+            b"\x1b[A",
+        );
+        state.record_registry.stop(id).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let v: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(v["ev"], "in-rejected");
+        assert_eq!(v["client_id"], 7);
+        assert_eq!(v["client_mode"], "ro");
+        assert_eq!(v["reason"], "ro-client");
+        assert_eq!(v["bytes"], hex::encode(b"\x1b[A"));
+    }
+
+    /// DR-0016 §4: partial write は `in` event (= written prefix) + `in-write-error`
+    /// event (= requested/written/error/unwritten) の **両方** を別 line で記録する。
+    /// `WriteOutcome::written_len > 0` の場合に push_bytes_in、`error.is_some()`
+    /// で push_in_write_error が両方発火する hot path の意味論を再現する。
+    #[test]
+    fn partial_write_records_both_in_and_in_write_error_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pw.jsonl");
+        let state = SessionState::default();
+        let req = crate::protocol::messages::RecordStartRequest {
+            direction: RecordDirection::Both,
+            format: RecordFormat::Jsonl,
+            output_path: path.to_string_lossy().into_owned(),
+            max_bytes: None,
+            max_duration_ms: None,
+            input_secrecy: InputSecrecy::RedactAfterPrompt,
+            prompt_pattern: None,
+        };
+        let session = super::super::record::SessionInfo {
+            session_id: "t".into(),
+            daemon_pid: 1,
+            daemon_boot_id: "boot".into(),
+            argv: vec!["sh".into()],
+            cwd: "/".into(),
+        };
+        let id = state.record_registry.start(&req, 1, session).unwrap();
+        // hot path の partial write 経路と同じ shape で 2 event 発火する。
+        state.record_registry.push_bytes_in(5, b"prefix-written");
+        state.record_registry.push_in_write_error(
+            5,
+            20,
+            14,
+            WriteErrorKind::IdleTimeout,
+            b"unwritten",
+        );
+        state.record_registry.stop(id).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3, "header + 2 body events");
+        let in_evt: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(in_evt["dir"], "in");
+        assert_eq!(in_evt["client_id"], 5);
+        assert_eq!(in_evt["bytes"], hex::encode("prefix-written"));
+        let err_evt: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(err_evt["ev"], "in-write-error");
+        assert_eq!(err_evt["error"], "timeout");
+        assert_eq!(err_evt["requested_len"], 20);
+        assert_eq!(err_evt["written_len"], 14);
+        assert_eq!(err_evt["unwritten_bytes"], hex::encode("unwritten"));
+    }
+
+    /// DR-0016 §3 4 段階目の `child-stopped-observed` は registry が記録する。
+    #[test]
+    fn child_stopped_observed_lifecycle_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stop.jsonl");
+        let state = SessionState::default();
+        let req = crate::protocol::messages::RecordStartRequest {
+            direction: RecordDirection::Both,
+            format: RecordFormat::Jsonl,
+            output_path: path.to_string_lossy().into_owned(),
+            max_bytes: None,
+            max_duration_ms: None,
+            input_secrecy: InputSecrecy::RedactAfterPrompt,
+            prompt_pattern: None,
+        };
+        let session = super::super::record::SessionInfo {
+            session_id: "t".into(),
+            daemon_pid: 1,
+            daemon_boot_id: "boot".into(),
+            argv: vec!["sh".into()],
+            cwd: "/".into(),
+        };
+        let id = state.record_registry.start(&req, 1, session).unwrap();
+        // SIGTSTP は OS 依存 (Linux=20, Darwin=18) なので nix の Signal 列挙値で照合する。
+        let expected_signum = nix::sys::signal::Signal::SIGTSTP as i32;
+        state
+            .record_registry
+            .push_lifecycle(LifecycleEvent::ChildStoppedObserved {
+                sig_name: "SIGTSTP".into(),
+                sig_num: expected_signum,
+                pid: 1234,
+                ts_unix_ms: 0,
+            });
+        state.record_registry.stop(id).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let v: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(v["ev"], "child-stopped-observed");
+        assert_eq!(v["sig_name"], "SIGTSTP");
+        assert_eq!(v["sig_num"], expected_signum);
+        assert_eq!(v["pid"], 1234);
+    }
 }

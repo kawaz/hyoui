@@ -10,16 +10,20 @@
 //! token 比較) は本 module には含めない (= `session.rs` の `handle_control_message`
 //! に残る、Phase B で `control.rs` へ移動予定)。
 
+use std::sync::Arc;
+
 use crate::protocol::Mode;
 use crate::protocol::messages::SessionMode;
 
 use super::broadcast::ClientHandle;
+use super::record::RecordRegistry;
 
 /// session 全体の状態 (Phase 10)。lock 周りの state machine を保持する。
 ///
 /// 現状の field:
 /// - `lock_holder`: lock 保持中の client id (= `None` なら未 lock)
 /// - `lock_token`: 発行済 token (= `LockRelease` 検証用)
+/// - `record_registry`: DR-0016 record sink 集合 (= Phase 4 で hot path 配線)
 ///
 /// Wait queue は MVP では未実装 (`LockAcquire { wait: true, .. }` でも `Denied`
 /// を返す)。queue 実装は v0.2.0+ の Phase 12 で検討。
@@ -27,6 +31,9 @@ use super::broadcast::ClientHandle;
 pub(super) struct SessionState {
     pub(super) lock_holder: Option<u64>,
     pub(super) lock_token: Option<String>,
+    /// DR-0016 §8 — session-scope の record sink 集合。`Arc` で複数 hook 点から
+    /// clone して持つ (= push 時に lock 不要、registry 内部で同期)。
+    pub(super) record_registry: Arc<RecordRegistry>,
 }
 
 impl SessionState {

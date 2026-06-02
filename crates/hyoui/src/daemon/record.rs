@@ -38,11 +38,9 @@
 //! - DR-0016 §3 (jsonl format) / §5 (raw format) / §8 (sink) / §8a (queue) / §8b (seq)
 //! - `crates/hyoui/src/protocol/messages/record.rs` — protocol message + cap
 
-// Phase 2 では daemon hot path に未配線。Phase 4 で hook 点 (broadcast.rs / control.rs /
-// session.rs) から `RecordRegistry::push_*` を呼ぶまで、本 module の item は lib 内
-// から参照されない (= test 経路でのみ exercise される)。dead_code warning は配線まで
-// 抑制する。
-#![allow(dead_code)]
+// Phase 4 で daemon hot path への配線完了。本 module の API のうち、Phase 5
+// (= secret redaction state machine) で配線予定の item は narrow な
+// `#[allow(dead_code)]` で抑制している。Phase 5 で外す。
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -199,6 +197,8 @@ pub enum RecordEvent {
         ts_unix_ms: u64,
     },
     /// redaction mode 中の stdin (= bytes は捨てる、DR-0016 §6)。
+    /// Phase 5 (= secret redaction state machine) で発火、Phase 4 では未配線。
+    #[allow(dead_code)]
     InSecretRedacted {
         client_id: u64,
         byte_count: usize,
@@ -582,6 +582,8 @@ impl RecordRegistry {
         );
     }
 
+    /// Phase 5 (= secret redaction state machine) で配線、Phase 4 では未使用。
+    #[allow(dead_code)]
     pub fn push_in_secret_redacted(&self, client_id: u64, byte_count: usize, reason: String) {
         let ts = now_unix_ms();
         self.broadcast_for(

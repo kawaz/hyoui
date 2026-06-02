@@ -396,7 +396,17 @@ pub(super) fn process_pending_handshakes(
                         } else {
                             send_attach_redraw(&accepted.handle, screen_state, overflow_ids);
                         }
+                        let new_mode = accepted.handle.mode;
                         clients.push(accepted.handle);
+                        // DR-0016 §3: client-attached lifecycle event。handshake 完了 +
+                        // ClientHandle 登録完了の直後で push する (= 全 record sink に届く)。
+                        state.record_registry.push_lifecycle(
+                            super::record::LifecycleEvent::ClientAttached {
+                                client_id: new_id,
+                                mode: new_mode,
+                                ts_unix_ms: now_unix_ms(),
+                            },
+                        );
                         if became_leader {
                             // 他 client に新 leader を通知 (= 新 client 自身は handshake.response
                             // で leader=true を受け取り済みだが、broadcast でも届く)
@@ -473,6 +483,14 @@ pub(super) fn send_attach_redraw(
 /// hyoui 内 helper を経由することで「ここで所有権が移る」点を可視化する。
 pub(super) fn unix_stream_from_owned_fd(fd: OwnedFd) -> UnixStream {
     UnixStream::from(fd)
+}
+
+/// DR-0016 §3 lifecycle event の `ts_unix_ms` 用 (= epoch ms)。
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

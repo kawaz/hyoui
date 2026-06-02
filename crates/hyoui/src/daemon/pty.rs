@@ -44,9 +44,12 @@ pub(super) enum ChildState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ChildTransition {
     /// 子が新しく STOPPED 状態に遷移した (= 軸 1 policy を発火させる)。
-    Stopped,
+    /// `sig` は waitpid が報告した stop signal (= SIGTSTP=20 / SIGSTOP=19 等)、
+    /// DR-0016 §3 の `child-stopped-observed` event の `sig_name`/`sig_num` に転送する。
+    Stopped { sig: i32 },
     /// 子が STOPPED 状態から復帰した (= invariant 回復の確認用、外部介入で
     /// SIGCONT が送られた場合の log/trace 用途)。
+    /// `WaitStatus::Continued` は signal を carry しないので caller 側で SIGCONT 固定扱い。
     Continued,
     /// 子が exit した。`Some(code)` が判明している場合のみ含む。
     Exited(Option<i32>),
@@ -115,9 +118,12 @@ impl ChildLifecycle {
                     Some(ChildTransition::Exited(Some(code))),
                 )
             }
-            Ok(WaitStatus::Stopped(_, _)) => {
+            Ok(WaitStatus::Stopped(_, sig)) => {
                 self.stopped = true;
-                (ChildState::Stopped, Some(ChildTransition::Stopped))
+                (
+                    ChildState::Stopped,
+                    Some(ChildTransition::Stopped { sig: sig as i32 }),
+                )
             }
             Ok(WaitStatus::Continued(_)) => {
                 self.stopped = false;

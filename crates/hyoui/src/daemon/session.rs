@@ -826,14 +826,35 @@ fn handle_suspend_signals(
 fn notify_child_stopped(
     child: Pid,
     clients: &mut [ClientHandle],
-    signal_name: Option<&str>,
+    state: &SessionState,
+    sig_observed: i32,
 ) -> Vec<u64> {
     use crate::protocol::messages::SessionChildStoppedNotify;
+
+    // DR-0016 §3: child-stopped-observed lifecycle event (= 4 段階の 1 段階目)。
+    // WUNTRACED で stop transition を初めて観測した瞬間に push する。
+    let sig_name = sig_num_to_name(sig_observed);
+    state
+        .record_registry
+        .push_lifecycle(super::record::LifecycleEvent::ChildStoppedObserved {
+            sig_name: sig_name.clone(),
+            sig_num: sig_observed,
+            pid: child.as_raw() as u32,
+            ts_unix_ms: now_unix_ms(),
+        });
+
     // leader を探す。複数 leader はあり得ない設計 (= broadcast.rs::elevate_next_leader)。
     let leader_idx = clients.iter().position(|ch| ch.leader);
     let Some(idx) = leader_idx else {
         // leader 不在 = auto-resume fallback
+        // DR-0016 §3: sigcont-sent lifecycle event (resume-request 経由でない経路でも記録)
         let _ = kill_pgrp(child, Signal::SIGCONT);
+        state
+            .record_registry
+            .push_lifecycle(super::record::LifecycleEvent::SigcontSent {
+                pid: child.as_raw() as u32,
+                ts_unix_ms: now_unix_ms(),
+            });
         return Vec::new();
     };
     // cap check: leader が `child-state-v1` 持たないなら fallback
@@ -843,18 +864,57 @@ fn notify_child_stopped(
         .any(|c| c == "child-state-v1")
     {
         let _ = kill_pgrp(child, Signal::SIGCONT);
+        state
+            .record_registry
+            .push_lifecycle(super::record::LifecycleEvent::SigcontSent {
+                pid: child.as_raw() as u32,
+                ts_unix_ms: now_unix_ms(),
+            });
         return Vec::new();
     }
     // notify 送信 (= 単一 receiver、cap-aware broadcast helper を使うほどでもない)
     let msg = ControlMessage::SessionChildStoppedNotify(SessionChildStoppedNotify {
         pid: child.as_raw() as u32,
-        signal: signal_name.map(String::from),
+        signal: Some(sig_name),
     });
     if send_control(&clients[idx], msg) {
         Vec::new()
     } else {
         vec![clients[idx].id]
     }
+}
+
+/// DR-0016 §3: signal 番号から canonical な signal 名 (= "SIGTSTP" 等) を返す。
+/// nix の `Signal::try_from` で reverse lookup、未知 signal は "SIG<N>" fallback。
+fn sig_num_to_name(sig: i32) -> String {
+    match nix::sys::signal::Signal::try_from(sig) {
+        Ok(s) => s.as_str().to_string(),
+        Err(_) => format!("SIG{sig}"),
+    }
+}
+
+/// DR-0016 §3 4 段階の 4 段階目 (= `child-continued-observed`)。
+///
+/// `WaitStatus::Continued` は signal を carry しないが、kernel が continued を
+/// 報告するのは SIGCONT で起きた時だけなので、固定で SIGCONT 名 + 番号で push する。
+fn record_child_continued(state: &SessionState, child: Pid) {
+    let sig = nix::sys::signal::Signal::SIGCONT as i32;
+    state
+        .record_registry
+        .push_lifecycle(super::record::LifecycleEvent::ChildContinuedObserved {
+            sig_name: "SIGCONT".to_string(),
+            sig_num: sig,
+            pid: child.as_raw() as u32,
+            ts_unix_ms: now_unix_ms(),
+        });
+}
+
+/// DR-0016 §3 — record event の `ts_unix_ms` 用 (= epoch ms)。
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 // `handle_child_transition` は DR-0015 §2.2 で廃止 (= callback inject 経路の入り口
@@ -976,15 +1036,17 @@ fn serve_loop(
                         return outcome;
                     }
                 }
-                let (state, transition) = lifecycle.poll_with_transition(child);
-                if let ChildState::Exited(code) = state {
+                let (child_state, transition) = lifecycle.poll_with_transition(child);
+                if let ChildState::Exited(code) = child_state {
                     return RelayOutcome::ChildExited(code);
                 }
-                if let Some(t) = transition {
-                    if matches!(t, ChildTransition::Stopped) {
-                        let overflow = notify_child_stopped(child, clients, None);
+                match transition {
+                    Some(ChildTransition::Stopped { sig }) => {
+                        let overflow = notify_child_stopped(child, clients, state, sig);
                         overflow_ids.extend(overflow);
                     }
+                    Some(ChildTransition::Continued) => record_child_continued(state, child),
+                    _ => {}
                 }
                 continue;
             }
@@ -1021,6 +1083,13 @@ fn serve_loop(
                 indices_to_drop.dedup();
                 for idx in indices_to_drop.into_iter().rev() {
                     let ch = clients.remove(idx);
+                    // DR-0016 §3: client-detached lifecycle event。
+                    state.record_registry.push_lifecycle(
+                        super::record::LifecycleEvent::ClientDetached {
+                            client_id: ch.id,
+                            ts_unix_ms: now_unix_ms(),
+                        },
+                    );
                     // ClientHandle::Drop が writer_tx close + reader shutdown +
                     // writer_thread join を一括実行 (R5-H18)。
                     drop(ch);
@@ -1070,15 +1139,17 @@ fn serve_loop(
                     return outcome;
                 }
             }
-            let (state, transition) = lifecycle.poll_with_transition(child);
-            if let ChildState::Exited(code) = state {
+            let (child_state, transition) = lifecycle.poll_with_transition(child);
+            if let ChildState::Exited(code) = child_state {
                 return RelayOutcome::ChildExited(code);
             }
-            if let Some(t) = transition {
-                if matches!(t, ChildTransition::Stopped) {
-                    let overflow = notify_child_stopped(child, clients, None);
+            match transition {
+                Some(ChildTransition::Stopped { sig }) => {
+                    let overflow = notify_child_stopped(child, clients, state, sig);
                     overflow_ids.extend(overflow);
                 }
+                Some(ChildTransition::Continued) => record_child_continued(state, child),
+                _ => {}
             }
         }
 
@@ -1120,14 +1191,16 @@ fn serve_loop(
             let mut buf = [0u8; 8192];
             match pty.master_fd().read_some(&mut buf) {
                 Ok(0) => {
-                    let (state, transition) = lifecycle.poll_with_transition(child);
-                    if let Some(t) = transition {
-                        if matches!(t, ChildTransition::Stopped) {
-                            let overflow = notify_child_stopped(child, clients, None);
+                    let (child_state, transition) = lifecycle.poll_with_transition(child);
+                    match transition {
+                        Some(ChildTransition::Stopped { sig }) => {
+                            let overflow = notify_child_stopped(child, clients, state, sig);
                             overflow_ids.extend(overflow);
                         }
+                        Some(ChildTransition::Continued) => record_child_continued(state, child),
+                        _ => {}
                     }
-                    match state {
+                    match child_state {
                         ChildState::Exited(code) => return RelayOutcome::ChildExited(code),
                         ChildState::Stopped => {
                             // R4-H14: SIGTSTP'd 子で master EOF/POLLHUP が連続する間の
@@ -1151,6 +1224,10 @@ fn serve_loop(
                             debug_dump = None;
                         }
                     }
+                    // DR-0016 §8: out event hook — 子 PTY 生 bytes を screen 加工 /
+                    // broadcast の **直前** で record sink に push する (= 加工前の
+                    // 「daemon が観測した最初の形」を録画する、debug_dump と同じ意図)。
+                    state.record_registry.push_bytes_out(&buf[..n]);
                     // scrollback に push してから broadcast (subscription 種類で encoding 分岐)
                     let now = Instant::now();
                     scrollback.push(now, buf[..n].to_vec());
@@ -1178,14 +1255,16 @@ fn serve_loop(
                     }
                 }
                 Err(Error::Errno(nix::errno::Errno::EIO)) => {
-                    let (state, transition) = lifecycle.poll_with_transition(child);
-                    if let Some(t) = transition {
-                        if matches!(t, ChildTransition::Stopped) {
-                            let overflow = notify_child_stopped(child, clients, None);
+                    let (child_state, transition) = lifecycle.poll_with_transition(child);
+                    match transition {
+                        Some(ChildTransition::Stopped { sig }) => {
+                            let overflow = notify_child_stopped(child, clients, state, sig);
                             overflow_ids.extend(overflow);
                         }
+                        Some(ChildTransition::Continued) => record_child_continued(state, child),
+                        _ => {}
                     }
-                    match state {
+                    match child_state {
                         ChildState::Exited(code) => return RelayOutcome::ChildExited(code),
                         ChildState::Stopped => {
                             std::thread::sleep(STOPPED_POLL_INTERVAL);
@@ -1263,6 +1342,7 @@ fn serve_loop(
         let mut dropped_any_leader = false;
         for idx in indices_to_drop.into_iter().rev() {
             let ch = clients.remove(idx);
+            let detached_id = ch.id;
             if ch.leader {
                 dropped_any_leader = true;
             }
@@ -1275,6 +1355,17 @@ fn serve_loop(
             // writer_thread join を一括実行 (R5-H18)。backpressure 超過時の
             // writer_pump が write_all で block 中でも shutdown で即 error 化される。
             drop(ch);
+            // DR-0016 §3: client-detached lifecycle event。lock auto-release が
+            // 起きた場合は lock-released は別途 push しない (= explicit な
+            // LockRelease 経路でないため、observer は client-detached + lock_holder
+            // 変化で推定する想定。dropped_held_lock を見て lock-released を発火する
+            // のは将来 task)。
+            state
+                .record_registry
+                .push_lifecycle(super::record::LifecycleEvent::ClientDetached {
+                    client_id: detached_id,
+                    ts_unix_ms: now_unix_ms(),
+                });
         }
 
         // leader cascade: leader が消えた場合、次の Rw client を昇格させる
@@ -3939,5 +4030,62 @@ mod tests {
         .expect("send");
         s.flush().expect("flush");
         let _ = handle.join().expect("daemon thread");
+    }
+
+    // === DR-0016 Phase 4 配線 unit tests ===
+
+    /// DR-0016 §3 §M1: `sig_num_to_name` は nix 既知 signal を canonical 名で返す。
+    #[test]
+    fn sig_num_to_name_returns_canonical_name_for_known_signal() {
+        let tstp = nix::sys::signal::Signal::SIGTSTP as i32;
+        assert_eq!(sig_num_to_name(tstp), "SIGTSTP");
+        let cont = nix::sys::signal::Signal::SIGCONT as i32;
+        assert_eq!(sig_num_to_name(cont), "SIGCONT");
+    }
+
+    /// 未知 signal 番号は `SIG<N>` の fallback 名を返す (= panic しない)。
+    #[test]
+    fn sig_num_to_name_falls_back_to_sig_n_for_unknown() {
+        // 0 / 巨大値などは Signal::try_from で Err、fallback に乗る。
+        assert_eq!(sig_num_to_name(99999), "SIG99999");
+    }
+
+    /// DR-0016 §3 4 段階 — `record_child_continued` は registry に
+    /// `ChildContinuedObserved` を 1 件 push する。pid は呼び出し側で渡したものを乗せる。
+    #[test]
+    fn record_child_continued_pushes_lifecycle_event() {
+        use crate::protocol::messages::{InputSecrecy, RecordDirection, RecordFormat};
+        use std::path::Path;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cont.jsonl");
+        let state = SessionState::default();
+        let req = crate::protocol::messages::RecordStartRequest {
+            direction: RecordDirection::Both,
+            format: RecordFormat::Jsonl,
+            output_path: path.to_string_lossy().into_owned(),
+            max_bytes: None,
+            max_duration_ms: None,
+            input_secrecy: InputSecrecy::RedactAfterPrompt,
+            prompt_pattern: None,
+        };
+        let session = crate::daemon::record::SessionInfo {
+            session_id: "t".into(),
+            daemon_pid: 1,
+            daemon_boot_id: "boot".into(),
+            argv: vec!["sh".into()],
+            cwd: "/".into(),
+        };
+        let id = state.record_registry.start(&req, 1, session).unwrap();
+        record_child_continued(&state, nix::unistd::Pid::from_raw(4242));
+        state.record_registry.stop(id).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        // header + 1 lifecycle event
+        assert_eq!(lines.len(), 2, "lines = {lines:?}");
+        let v: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(v["ev"], "child-continued-observed");
+        assert_eq!(v["sig_name"], "SIGCONT");
+        assert_eq!(v["pid"], 4242);
+        let _ = Path::new(&path); // keep path borrow alive
     }
 }
