@@ -52,7 +52,7 @@ jobs:
             echo "vcs tag latest exited ${LATEST_EXIT} (SemVer tag がまだ無い等); first release とみなす"
           else
             set +e
-            bump-semver compare gt Cargo.toml "$LATEST"
+            bump-semver compare gt "$CURRENT_VERSION" "$LATEST"
             CMP_EXIT=$?
             set -e
             case "$CMP_EXIT" in
