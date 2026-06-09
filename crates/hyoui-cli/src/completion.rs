@@ -3,8 +3,19 @@
 //! Each function returns a self-contained completion script for the
 //! corresponding shell. The scripts are intentionally hand-written rather
 //! than generated, so the supported subcommand/option surface evolves in
-//! lock-step with [`hyoui::cli`]. Future stages (`send`, `detach`) are
-//! listed pre-emptively so users get tab-completion on day one.
+//! lock-step with [`hyoui::cli`].
+//!
+//! The subcommand / option / enum-value surface is kept in sync with the
+//! parser via the single-source-of-truth constants in [`hyoui::cli`]
+//! (`IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS`, `RESERVED_TOP_LEVEL_SUBCOMMANDS`,
+//! `SCREEN_SUBCOMMANDS`, `LOCK_SUBCOMMANDS`, `RECORD_SUBCOMMANDS`,
+//! `SNAPSHOT_INCLUDE_VALUES`, ...). The completion tests assert that every
+//! element of those constants appears in all three shell scripts and that no
+//! reserved subcommand (`send` / `detach` / `tx`) leaks into the candidates.
+//!
+//! Reserved-but-unimplemented subcommands are intentionally **not** offered:
+//! `parse_args` returns a "reserved but not yet implemented" error for them, so
+//! completing them would mislead users.
 
 use hyoui::cli::Shell;
 
@@ -45,28 +56,34 @@ _hyoui() {
     done
 
     if [[ -z "$sub" ]]; then
-        # Top-level: subcommands + global flags.
-        COMPREPLY=( $(compgen -W "run attach list kill status tail wait screen input completion send detach --help -h --version -V" -- "$cur") )
+        # Top-level: implemented subcommands + global flags.
+        # (reserved subcommands send/detach/tx are intentionally omitted.)
+        COMPREPLY=( $(compgen -W "run attach list kill status tail wait screen input lock unlock record completion --help -h --version -V" -- "$cur") )
         return 0
     fi
 
-    # Detect `screen` sub-subcommand (= `screen dump` / `screen snapshot`).
-    if [[ "$sub" == "screen" ]]; then
-        local screen_sub=""
-        for (( i=1; i < cword; i++ )); do
-            local w="${words[i]}"
-            if [[ "$w" == "screen" ]]; then
-                # find first non-flag after `screen`
-                local j
-                for (( j=i+1; j < cword; j++ )); do
-                    case "${words[j]}" in
+    # Helper: find first non-flag word after a given subcommand name.
+    _hyoui_child_of() {
+        local parent="$1"
+        local k m child=""
+        for (( k=1; k < cword; k++ )); do
+            if [[ "${words[k]}" == "$parent" ]]; then
+                for (( m=k+1; m < cword; m++ )); do
+                    case "${words[m]}" in
                         -*) ;;
-                        *) screen_sub="${words[j]}"; break ;;
+                        *) child="${words[m]}"; break ;;
                     esac
                 done
                 break
             fi
         done
+        printf '%s' "$child"
+    }
+
+    # Detect `screen` sub-subcommand (= `screen dump` / `screen snapshot`).
+    if [[ "$sub" == "screen" ]]; then
+        local screen_sub
+        screen_sub="$(_hyoui_child_of screen)"
         if [[ -z "$screen_sub" ]]; then
             COMPREPLY=( $(compgen -W "dump snapshot --help -h" -- "$cur") )
             return 0
@@ -75,30 +92,97 @@ _hyoui() {
             dump)
                 case "$prev" in
                     --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                    --format) COMPREPLY=( $(compgen -W "ansi binary cbor" -- "$cur") ); return 0 ;;
+                    --format) COMPREPLY=( $(compgen -W "ansi binary cbor text/plain" -- "$cur") ); return 0 ;;
                     --layer) COMPREPLY=( $(compgen -W "visible scrollback both" -- "$cur") ); return 0 ;;
                     --output) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                    --rect|--timeout) return 0 ;;
+                    --index|--rect|--timeout) return 0 ;;
                 esac
-                COMPREPLY=( $(compgen -W "--socket --format --layer --rect --output --timeout --help -h" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--socket --index --format --layer --rect --output --timeout --help -h" -- "$cur") )
                 return 0 ;;
             snapshot)
                 case "$prev" in
                     --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                    --include) COMPREPLY=( $(compgen -W "screen cursor size mode title" -- "$cur") ); return 0 ;;
+                    --include) COMPREPLY=( $(compgen -W "cells cursor mode style scrollback windowsize buffer sequenceno" -- "$cur") ); return 0 ;;
+                    --format) COMPREPLY=( $(compgen -W "cbor json" -- "$cur") ); return 0 ;;
                     --output) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                    --timeout) return 0 ;;
+                    --index|--timeout) return 0 ;;
                 esac
-                COMPREPLY=( $(compgen -W "--socket --include --output --timeout --help -h" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--socket --index --include --format --output --timeout --help -h" -- "$cur") )
                 return 0 ;;
         esac
+        return 0
+    fi
+
+    # Detect `lock` sub-subcommand (= `lock acquire` / `lock release`).
+    if [[ "$sub" == "lock" ]]; then
+        local lock_sub
+        lock_sub="$(_hyoui_child_of lock)"
+        if [[ -z "$lock_sub" ]]; then
+            COMPREPLY=( $(compgen -W "acquire release --help -h" -- "$cur") )
+            return 0
+        fi
+        case "$lock_sub" in
+            acquire)
+                case "$prev" in
+                    --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                    --mode) COMPREPLY=( $(compgen -W "wait fail" -- "$cur") ); return 0 ;;
+                    --index|--timeout) return 0 ;;
+                esac
+                COMPREPLY=( $(compgen -W "--socket --index --mode --timeout --help -h" -- "$cur") )
+                return 0 ;;
+            release)
+                case "$prev" in
+                    --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                    --index|--token) return 0 ;;
+                esac
+                COMPREPLY=( $(compgen -W "--socket --index --token --help -h" -- "$cur") )
+                return 0 ;;
+        esac
+        return 0
+    fi
+
+    # Detect `record` sub-subcommand (= `record start` / `record stop` / `record list`).
+    if [[ "$sub" == "record" ]]; then
+        local record_sub
+        record_sub="$(_hyoui_child_of record)"
+        if [[ -z "$record_sub" ]]; then
+            COMPREPLY=( $(compgen -W "start stop list --help -h" -- "$cur") )
+            return 0
+        fi
+        case "$record_sub" in
+            start)
+                case "$prev" in
+                    --socket|--output) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                    --format) COMPREPLY=( $(compgen -W "jsonl raw" -- "$cur") ); return 0 ;;
+                    --input-secrecy) COMPREPLY=( $(compgen -W "redact-after-prompt record-all never-record-stdin" -- "$cur") ); return 0 ;;
+                    --index|--max-bytes|--max-duration|--prompt-pattern) return 0 ;;
+                esac
+                COMPREPLY=( $(compgen -W "--socket --index --output --stdin --stdout --both --format --max-bytes --max-duration --input-secrecy --prompt-pattern --help -h" -- "$cur") )
+                return 0 ;;
+            stop)
+                case "$prev" in
+                    --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                    --index|--id) return 0 ;;
+                esac
+                COMPREPLY=( $(compgen -W "--socket --index --id --all --help -h" -- "$cur") )
+                return 0 ;;
+            list)
+                case "$prev" in
+                    --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                    --format) COMPREPLY=( $(compgen -W "table jsonl" -- "$cur") ); return 0 ;;
+                    --index) return 0 ;;
+                esac
+                COMPREPLY=( $(compgen -W "--socket --index --format --help -h" -- "$cur") )
+                return 0 ;;
+        esac
+        return 0
     fi
 
     # `input` の spec prefix を current word の状態に応じて補完。
     if [[ "$sub" == "input" ]]; then
         case "$prev" in
             --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-            --timeout|--lock-token|--max-file-bytes) return 0 ;;
+            --index|--timeout|--lock-token|--max-file-bytes) return 0 ;;
         esac
         # spec prefix の途中 (= "text:" / "key:" 等) に来たら value 部分は補完しない
         # (= 任意文字列 / regex / path)。ただし "file:" の場合は path 補完を提供。
@@ -121,7 +205,7 @@ _hyoui() {
                 done
                 return 0 ;;
         esac
-        COMPREPLY=( $(compgen -W "--socket --timeout --lock-token --max-file-bytes --help -h text: hex: file: paste: key: wait: wait-idle:" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--socket --index --timeout --lock-token --max-file-bytes --help -h text: hex: file: paste: key: wait: wait-idle:" -- "$cur") )
         return 0
     fi
 
@@ -132,8 +216,6 @@ _hyoui() {
                     COMPREPLY=( $(compgen -W "interactive headless" -- "$cur") ); return 0 ;;
                 --on-child-suspend)
                     COMPREPLY=( $(compgen -W "follow auto-resume" -- "$cur") ); return 0 ;;
-                --on-parent-suspend)
-                    COMPREPLY=( $(compgen -W "transparent decouple" -- "$cur") ); return 0 ;;
                 --socket)
                     _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
                 --timeout|--idle-timeout|--until|--size|--cols|--rows|--scrollback-rows)
@@ -144,10 +226,8 @@ _hyoui() {
                     COMPREPLY=( $(compgen -W "interactive headless" -- "${cur#*=}") ); return 0 ;;
                 --on-child-suspend=*)
                     COMPREPLY=( $(compgen -W "follow auto-resume" -- "${cur#*=}") ); return 0 ;;
-                --on-parent-suspend=*)
-                    COMPREPLY=( $(compgen -W "transparent decouple" -- "${cur#*=}") ); return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--mode --socket --timeout --idle-timeout --until --on-child-suspend --on-parent-suspend --scrollback-rows --size --cols --rows --help -h --" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--mode --socket --timeout --idle-timeout --until --on-child-suspend --scrollback-rows --size --cols --rows --help -h --" -- "$cur") )
             return 0 ;;
         completion)
             COMPREPLY=( $(compgen -W "bash zsh fish --help -h" -- "$cur") )
@@ -156,38 +236,53 @@ _hyoui() {
             case "$prev" in
                 --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
                 --mode) COMPREPLY=( $(compgen -W "rw ro rw-no-leader" -- "$cur") ); return 0 ;;
+                --index) return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --mode --exclusive --detach-others --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --index --mode --exclusive --detach-others --help -h" -- "$cur") )
             return 0 ;;
         list)
-            COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
+            case "$cur" in
+                --format=*)
+                    COMPREPLY=( $(compgen -W "plain jsonl" -- "${cur#*=}") ); return 0 ;;
+            esac
+            COMPREPLY=( $(compgen -W "--prune-stale --format --help -h" -- "$cur") )
             return 0 ;;
         kill)
             case "$prev" in
                 --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
                 --signal) COMPREPLY=( $(compgen -W "SIGHUP SIGINT SIGQUIT SIGABRT SIGKILL SIGUSR1 SIGUSR2 SIGTERM SIGCONT SIGTSTP SIGCHLD" -- "$cur") ); return 0 ;;
+                --index) return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --signal --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --index --all --signal --help -h" -- "$cur") )
             return 0 ;;
         status)
             case "$prev" in
                 --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                --format) COMPREPLY=( $(compgen -W "plain json" -- "$cur") ); return 0 ;;
+                --index) return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --index --format --help -h" -- "$cur") )
             return 0 ;;
         tail)
             case "$prev" in
                 --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                --since|--last-bytes) return 0 ;;
+                --index|--since|--last-bytes) return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --follow --strip-ansi --since --last-bytes --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --index --follow --strip-ansi --since --since-strict --last-bytes --help -h" -- "$cur") )
             return 0 ;;
         wait)
             case "$prev" in
                 --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                --timeout) return 0 ;;
+                --index|--timeout|--poll-interval) return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --timeout --no-strip-escapes --newline-convert-lf --help -h text: pattern: wait: wait-idle:" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --index --timeout --poll-interval --help -h" -- "$cur") )
+            return 0 ;;
+        unlock)
+            case "$prev" in
+                --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                --index|--token) return 0 ;;
+            esac
+            COMPREPLY=( $(compgen -W "--socket --index --token --help -h" -- "$cur") )
             return 0 ;;
         *)
             return 0 ;;
@@ -225,6 +320,7 @@ _hyoui() {
                 attach)
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
+                        '--index=[Session selector (1=oldest, -1=newest)]:index:' \
                         '--mode=[Operating mode]:mode:(rw ro rw-no-leader)' \
                         '--exclusive[Demand exclusive ownership]' \
                         '--detach-others[Drop other clients on connect]' \
@@ -232,11 +328,16 @@ _hyoui() {
                         '*:session id:'
                     ;;
                 list)
-                    _arguments '(-h --help)'{-h,--help}'[Show help]'
+                    _arguments \
+                        '--prune-stale[Unlink stale sockets]' \
+                        '--format=[Output format]:format:(plain jsonl)' \
+                        '(-h --help)'{-h,--help}'[Show help]'
                     ;;
                 kill)
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
+                        '--index=[Session selector (1=oldest, -1=newest)]:index:' \
+                        '--all[Kill all live sessions]' \
                         '--signal=[Signal name (SIG-prefix uppercase, DR-0012)]:signal:(SIGHUP SIGINT SIGQUIT SIGABRT SIGKILL SIGUSR1 SIGUSR2 SIGTERM SIGCONT SIGTSTP SIGCHLD)' \
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:session id:'
@@ -244,15 +345,19 @@ _hyoui() {
                 status)
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
+                        '--index=[Session selector (1=oldest, -1=newest)]:index:' \
+                        '--format=[Output format]:format:(plain json)' \
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:session id:'
                     ;;
                 tail)
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
+                        '--index=[Session selector (1=oldest, -1=newest)]:index:' \
                         '--follow[Continue streaming live output]' \
                         '--strip-ansi[Strip ANSI escapes in output]' \
                         '--since=[Drop chunks older than DUR (e.g. 500ms / 2s / 1m)]:duration:' \
+                        '--since-strict[Exit non-zero if --since range was evicted]' \
                         '--last-bytes=[Trim to last N bytes]:bytes:' \
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:session id:'
@@ -260,17 +365,31 @@ _hyoui() {
                 wait)
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
+                        '--index=[Session selector (1=oldest, -1=newest)]:index:' \
                         '--timeout=[Absolute timeout (e.g. 5s / 30s)]:duration:' \
-                        '--no-strip-escapes[Do not strip ANSI escapes before matching]' \
-                        '--newline-convert-lf[Convert CRLF to LF before matching]' \
+                        '--poll-interval=[Snapshot polling interval (default 100ms)]:duration:' \
                         '(-h --help)'{-h,--help}'[Show help]' \
-                        '*:positional (predicate or session-id):'
+                        '*:positional (session-id then regex pattern):'
                     ;;
                 screen)
                     _hyoui_screen
                     ;;
                 input)
                     _hyoui_input
+                    ;;
+                lock)
+                    _hyoui_lock
+                    ;;
+                unlock)
+                    _arguments \
+                        '--socket=[Explicit socket path]:socket:_files' \
+                        '--index=[Session selector (1=oldest, -1=newest)]:index:' \
+                        '--token=[Lock token to release]:token:' \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '*:session id:'
+                    ;;
+                record)
+                    _hyoui_record
                     ;;
             esac
             ;;
@@ -289,9 +408,10 @@ _hyoui_subcommands() {
         'wait:Wait until predicate matches'
         'screen:Dump / inspect virtual screen state (dump, snapshot)'
         'input:Send input via spec list (DR-0006 §8)'
+        'lock:Acquire / release a session lock (acquire, release)'
+        'unlock:Release a session lock (= lock release alias)'
+        'record:Record tty I/O timeline (start, stop, list)'
         'completion:Print a shell completion script'
-        'send:(reserved) Send input to a running session'
-        'detach:(reserved) Detach helper'
     )
     _describe -t commands 'hyoui subcommand' subs
 }
@@ -308,7 +428,8 @@ _hyoui_screen() {
                 dump)
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
-                        '--format=[Output format]:format:(ansi binary cbor)' \
+                        '--index=[Session selector (1=oldest, -1=newest)]:index:' \
+                        '--format=[Output format]:format:(ansi binary cbor text/plain)' \
                         '--layer=[Layer to dump]:layer:(visible scrollback both)' \
                         '--rect=[Sub-rectangle x,y,w,h]:rect:' \
                         '--output=[Output file path]:file:_files' \
@@ -319,7 +440,9 @@ _hyoui_screen() {
                 snapshot)
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
-                        '*--include=[Snapshot components to include]:component:(screen cursor size mode title)' \
+                        '--index=[Session selector (1=oldest, -1=newest)]:index:' \
+                        '--include=[Snapshot components to include]:component:(cells cursor mode style scrollback windowsize buffer sequenceno)' \
+                        '--format=[Output format]:format:(cbor json)' \
                         '--output=[Output file path]:file:_files' \
                         '--timeout=[Response timeout]:duration:' \
                         '(-h --help)'{-h,--help}'[Show help]' \
@@ -334,9 +457,106 @@ _hyoui_screen_subcommands() {
     local -a subs
     subs=(
         'dump:Dump current screen / scrollback as ANSI / binary / CBOR'
-        'snapshot:Take a structured snapshot (screen + cursor + size + mode)'
+        'snapshot:Take a structured snapshot (cells + cursor + mode + ...)'
     )
     _describe -t commands 'hyoui screen subcommand' subs
+}
+
+_hyoui_lock() {
+    local context state state_descr line
+    typeset -A opt_args
+    _arguments -C \
+        '1: :_hyoui_lock_subcommands' \
+        '*::arg:->lock_args'
+    case $state in
+        lock_args)
+            case $line[1] in
+                acquire)
+                    _arguments \
+                        '--socket=[Explicit socket path]:socket:_files' \
+                        '--index=[Session selector (1=oldest, -1=newest)]:index:' \
+                        '--mode=[Behavior when held]:mode:(wait fail)' \
+                        '--timeout=[Acquire timeout]:duration:' \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '*:session id:'
+                    ;;
+                release)
+                    _arguments \
+                        '--socket=[Explicit socket path]:socket:_files' \
+                        '--index=[Session selector (1=oldest, -1=newest)]:index:' \
+                        '--token=[Lock token to release]:token:' \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '*:session id:'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_hyoui_lock_subcommands() {
+    local -a subs
+    subs=(
+        'acquire:Acquire a lock, print token to stdout, hold connection'
+        'release:Release a lock by token'
+    )
+    _describe -t commands 'hyoui lock subcommand' subs
+}
+
+_hyoui_record() {
+    local context state state_descr line
+    typeset -A opt_args
+    _arguments -C \
+        '1: :_hyoui_record_subcommands' \
+        '*::arg:->record_args'
+    case $state in
+        record_args)
+            case $line[1] in
+                start)
+                    _arguments \
+                        '--socket=[Explicit socket path]:socket:_files' \
+                        '--index=[Session selector (1=oldest, -1=newest)]:index:' \
+                        '--output=[Output file path (absolute)]:file:_files' \
+                        '--stdin[Record child PTY input only]' \
+                        '--stdout[Record child PTY output only]' \
+                        '--both[Record both directions (default, jsonl only)]' \
+                        '--format=[Output format]:format:(jsonl raw)' \
+                        '--max-bytes=[Recording byte cap (0 disables)]:bytes:' \
+                        '--max-duration=[Recording duration cap (0 disables)]:duration:' \
+                        '--input-secrecy=[stdin redaction policy (NOTE: unimplemented, Phase 5)]:policy:(redact-after-prompt record-all never-record-stdin)' \
+                        '--prompt-pattern=[Custom prompt detection regex]:regex:' \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '*:session id:'
+                    ;;
+                stop)
+                    _arguments \
+                        '--socket=[Explicit socket path]:socket:_files' \
+                        '--index=[Session selector (1=oldest, -1=newest)]:index:' \
+                        '--id=[record_id to stop]:id:' \
+                        '--all[Stop all active records]' \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '*:session id:'
+                    ;;
+                list)
+                    _arguments \
+                        '--socket=[Explicit socket path]:socket:_files' \
+                        '--index=[Session selector (1=oldest, -1=newest)]:index:' \
+                        '--format=[Output format]:format:(table jsonl)' \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '*:session id:'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_hyoui_record_subcommands() {
+    local -a subs
+    subs=(
+        'start:Start a new record (writes to a file, returns record_id)'
+        'stop:Stop a running record (--id <N> or --all)'
+        'list:List active records for the session'
+    )
+    _describe -t commands 'hyoui record subcommand' subs
 }
 
 _hyoui_input() {
@@ -344,6 +564,7 @@ _hyoui_input() {
     # spec prefix を候補に出し、`file:` だけ path 補完を効かせる。
     _arguments \
         '--socket=[Explicit socket path]:socket:_files' \
+        '--index=[Session selector (1=oldest, -1=newest)]:index:' \
         '--timeout=[Per-spec timeout (e.g. 5s)]:duration:' \
         '--lock-token=[Explicit lock token (overrides HYOUI_LOCK_TOKEN)]:token:' \
         '--max-file-bytes=[Max bytes for file: spec (0 = unlimited)]:bytes:' \
@@ -391,7 +612,6 @@ _hyoui_run() {
         '--cols=[Virtual screen columns]:cols:' \
         '--rows=[Virtual screen rows]:rows:' \
         '--on-child-suspend=[Action when child is stopped]:action:(follow auto-resume)' \
-        '--on-parent-suspend=[Action when parent is stopped]:action:(transparent decouple)' \
         '--scrollback-rows=[vt100 scrollback ring max rows (default 1000)]:rows:' \
         '(-h --help)'{-h,--help}'[Show help]' \
         '*::child command:_normal'
@@ -404,13 +624,14 @@ _hyoui "$@"
 fn fish() -> &'static str {
     r#"# fish completion for hyoui
 
-# Detect whether a known subcommand has already been provided.
+# Detect whether a known (implemented) subcommand has already been provided.
+# reserved subcommands send/detach/tx are intentionally not listed.
 function __hyoui_using_subcommand
     set -l cmd (commandline -opc)
     set -e cmd[1]
     for arg in $cmd
         switch $arg
-            case run attach list kill status tail wait screen input completion send detach
+            case run attach list kill status tail wait screen input lock unlock record completion
                 if test "$arg" = "$argv[1]"
                     return 0
                 end
@@ -425,57 +646,71 @@ function __hyoui_no_subcommand
     set -e cmd[1]
     for arg in $cmd
         switch $arg
-            case run attach list kill status tail wait screen input completion send detach
+            case run attach list kill status tail wait screen input lock unlock record completion
                 return 1
         end
     end
     return 0
 end
 
-# screen の子 subcommand 検出 (= `screen dump` / `screen snapshot`)。
-function __hyoui_screen_using_sub
+# Generic helper: is the parent's child subcommand equal to $argv[2]?
+# $argv[1] = parent name, $argv[2] = candidate child name.
+function __hyoui_child_using
     set -l cmd (commandline -opc)
     set -e cmd[1]
-    set -l seen_screen 0
+    set -l seen 0
     for arg in $cmd
-        if test $seen_screen -eq 1
+        if test $seen -eq 1
             switch $arg
-                case dump snapshot
-                    if test "$arg" = "$argv[1]"
+                case '-*'
+                    # skip flags between parent and child
+                case '*'
+                    if test "$arg" = "$argv[2]"
                         return 0
                     end
                     return 1
             end
         end
-        if test "$arg" = "screen"
-            set seen_screen 1
+        if test "$arg" = "$argv[1]"
+            set seen 1
         end
     end
     return 1
 end
 
-function __hyoui_screen_no_sub
+# Has the parent ($argv[1]) been given but no child yet?
+function __hyoui_child_none
     set -l cmd (commandline -opc)
     set -e cmd[1]
-    set -l seen_screen 0
+    set -l seen 0
     for arg in $cmd
-        if test $seen_screen -eq 1
+        if test $seen -eq 1
             switch $arg
-                case dump snapshot
+                case '-*'
+                case '*'
                     return 1
             end
         end
-        if test "$arg" = "screen"
-            set seen_screen 1
+        if test "$arg" = "$argv[1]"
+            set seen 1
         end
     end
-    if test $seen_screen -eq 1
+    if test $seen -eq 1
         return 0
     end
     return 1
 end
 
-# Top-level: subcommands.
+# screen 子 subcommand 検出 (= `screen dump` / `screen snapshot`)。
+function __hyoui_screen_using_sub
+    __hyoui_child_using screen $argv[1]
+end
+
+function __hyoui_screen_no_sub
+    __hyoui_child_none screen
+end
+
+# Top-level: implemented subcommands (reserved send/detach/tx omitted).
 complete -c hyoui -n __hyoui_no_subcommand -f -a run        -d 'Run a command inside a PTY as a transparent proxy'
 complete -c hyoui -n __hyoui_no_subcommand -f -a attach     -d 'Attach to a running session'
 complete -c hyoui -n __hyoui_no_subcommand -f -a list       -d 'List daemon sessions'
@@ -485,9 +720,10 @@ complete -c hyoui -n __hyoui_no_subcommand -f -a tail       -d 'Stream scrollbac
 complete -c hyoui -n __hyoui_no_subcommand -f -a wait       -d 'Wait until predicate matches'
 complete -c hyoui -n __hyoui_no_subcommand -f -a screen     -d 'Dump / inspect virtual screen state'
 complete -c hyoui -n __hyoui_no_subcommand -f -a input      -d 'Send input via spec list (DR-0006 §8)'
+complete -c hyoui -n __hyoui_no_subcommand -f -a lock       -d 'Acquire / release a session lock'
+complete -c hyoui -n __hyoui_no_subcommand -f -a unlock     -d 'Release a session lock (= lock release alias)'
+complete -c hyoui -n __hyoui_no_subcommand -f -a record     -d 'Record tty I/O timeline'
 complete -c hyoui -n __hyoui_no_subcommand -f -a completion -d 'Print a shell completion script'
-complete -c hyoui -n __hyoui_no_subcommand -f -a send       -d '(reserved) Send input to a running session'
-complete -c hyoui -n __hyoui_no_subcommand -f -a detach     -d '(reserved) Detach helper'
 
 # Top-level global flags.
 complete -c hyoui -n __hyoui_no_subcommand -s h -l help    -d 'Show help and exit'
@@ -503,7 +739,6 @@ complete -c hyoui -n '__hyoui_using_subcommand run' -l size              -x     
 complete -c hyoui -n '__hyoui_using_subcommand run' -l cols              -x                              -d 'Virtual screen columns'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l rows              -x                              -d 'Virtual screen rows'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l on-child-suspend  -x -a 'follow auto-resume'      -d 'Action when child is stopped'
-complete -c hyoui -n '__hyoui_using_subcommand run' -l on-parent-suspend -x -a 'transparent decouple'    -d 'Action when parent is stopped'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l scrollback-rows   -x                              -d 'vt100 scrollback ring max rows (default 1000)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -s h -l help                                          -d 'Show help and exit'
 
@@ -513,45 +748,55 @@ complete -c hyoui -n '__hyoui_using_subcommand completion' -s h -l help         
 
 # `hyoui attach` options.
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l socket         -r -F                        -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_using_subcommand attach' -l index          -x                           -d 'Session selector (1=oldest, -1=newest)'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l mode           -x -a 'rw ro rw-no-leader'   -d 'Operating mode'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l exclusive                                    -d 'Demand exclusive ownership'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l detach-others                                -d 'Drop other clients on connect'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -s h -l help                                    -d 'Show help and exit'
 
 # `hyoui list` options.
-complete -c hyoui -n '__hyoui_using_subcommand list' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_using_subcommand list' -l prune-stale          -d 'Unlink stale sockets'
+complete -c hyoui -n '__hyoui_using_subcommand list' -l format -x -a 'plain jsonl' -d 'Output format'
+complete -c hyoui -n '__hyoui_using_subcommand list' -s h -l help            -d 'Show help and exit'
 
 # `hyoui kill` options.
 complete -c hyoui -n '__hyoui_using_subcommand kill' -l socket -r -F -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_using_subcommand kill' -l index  -x    -d 'Session selector (1=oldest, -1=newest)'
+complete -c hyoui -n '__hyoui_using_subcommand kill' -l all          -d 'Kill all live sessions'
 complete -c hyoui -n '__hyoui_using_subcommand kill' -l signal -x -a 'SIGHUP SIGINT SIGQUIT SIGABRT SIGKILL SIGUSR1 SIGUSR2 SIGTERM SIGCONT SIGTSTP SIGCHLD' -d 'Signal name (SIG-prefix uppercase, DR-0012)'
 complete -c hyoui -n '__hyoui_using_subcommand kill' -s h -l help    -d 'Show help and exit'
 
 # `hyoui status` options.
 complete -c hyoui -n '__hyoui_using_subcommand status' -l socket -r -F -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_using_subcommand status' -l index  -x    -d 'Session selector (1=oldest, -1=newest)'
+complete -c hyoui -n '__hyoui_using_subcommand status' -l format -x -a 'plain json' -d 'Output format'
 complete -c hyoui -n '__hyoui_using_subcommand status' -s h -l help    -d 'Show help and exit'
 
 # `hyoui tail` options.
 complete -c hyoui -n '__hyoui_using_subcommand tail' -l socket          -r -F  -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_using_subcommand tail' -l index           -x      -d 'Session selector (1=oldest, -1=newest)'
 complete -c hyoui -n '__hyoui_using_subcommand tail' -l follow                  -d 'Continue streaming live output'
 complete -c hyoui -n '__hyoui_using_subcommand tail' -l strip-ansi              -d 'Strip ANSI escapes in output'
 complete -c hyoui -n '__hyoui_using_subcommand tail' -l since           -x      -d 'Drop chunks older than DUR (500ms / 2s / 1m)'
+complete -c hyoui -n '__hyoui_using_subcommand tail' -l since-strict            -d 'Exit non-zero if --since range was evicted'
 complete -c hyoui -n '__hyoui_using_subcommand tail' -l last-bytes      -x      -d 'Trim to last N bytes'
 complete -c hyoui -n '__hyoui_using_subcommand tail' -s h -l help               -d 'Show help and exit'
 
 # `hyoui wait` options.
 complete -c hyoui -n '__hyoui_using_subcommand wait' -l socket            -r -F  -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_using_subcommand wait' -l index             -x      -d 'Session selector (1=oldest, -1=newest)'
 complete -c hyoui -n '__hyoui_using_subcommand wait' -l timeout           -x      -d 'Absolute timeout (5s / 30s)'
-complete -c hyoui -n '__hyoui_using_subcommand wait' -l no-strip-escapes          -d 'Do not strip ANSI escapes before matching'
-complete -c hyoui -n '__hyoui_using_subcommand wait' -l newline-convert-lf        -d 'Convert CRLF to LF before matching'
+complete -c hyoui -n '__hyoui_using_subcommand wait' -l poll-interval      -x      -d 'Snapshot polling interval (default 100ms)'
 complete -c hyoui -n '__hyoui_using_subcommand wait' -s h -l help                 -d 'Show help and exit'
 
 # `hyoui screen` 子 subcommand
 complete -c hyoui -n __hyoui_screen_no_sub -f -a dump     -d 'Dump screen / scrollback as ANSI / binary / CBOR'
-complete -c hyoui -n __hyoui_screen_no_sub -f -a snapshot -d 'Take a structured snapshot (screen + cursor + size + mode)'
+complete -c hyoui -n __hyoui_screen_no_sub -f -a snapshot -d 'Take a structured snapshot (cells + cursor + mode + ...)'
 
 # `hyoui screen dump` options
 complete -c hyoui -n '__hyoui_screen_using_sub dump' -l socket  -r -F                          -d 'Explicit socket path'
-complete -c hyoui -n '__hyoui_screen_using_sub dump' -l format  -x -a 'ansi binary cbor'       -d 'Output format'
+complete -c hyoui -n '__hyoui_screen_using_sub dump' -l index   -x                              -d 'Session selector (1=oldest, -1=newest)'
+complete -c hyoui -n '__hyoui_screen_using_sub dump' -l format  -x -a 'ansi binary cbor text/plain' -d 'Output format'
 complete -c hyoui -n '__hyoui_screen_using_sub dump' -l layer   -x -a 'visible scrollback both' -d 'Layer to dump'
 complete -c hyoui -n '__hyoui_screen_using_sub dump' -l rect    -x                              -d 'Sub-rectangle x,y,w,h'
 complete -c hyoui -n '__hyoui_screen_using_sub dump' -l output  -r -F                          -d 'Output file path'
@@ -560,24 +805,127 @@ complete -c hyoui -n '__hyoui_screen_using_sub dump' -s h -l help               
 
 # `hyoui screen snapshot` options
 complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l socket  -r -F                                -d 'Explicit socket path'
-complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l include -x -a 'screen cursor size mode title' -d 'Snapshot components to include'
+complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l index   -x                                    -d 'Session selector (1=oldest, -1=newest)'
+complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l include -x -a 'cells cursor mode style scrollback windowsize buffer sequenceno' -d 'Snapshot components to include'
+complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l format  -x -a 'cbor json'                     -d 'Output format'
 complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l output  -r -F                                -d 'Output file path'
 complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l timeout -x                                    -d 'Response timeout'
 complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -s h -l help                                     -d 'Show help and exit'
 
 # `hyoui input` options + spec prefix
 complete -c hyoui -n '__hyoui_using_subcommand input' -l socket          -r -F  -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_using_subcommand input' -l index           -x      -d 'Session selector (1=oldest, -1=newest)'
 complete -c hyoui -n '__hyoui_using_subcommand input' -l timeout         -x      -d 'Per-spec timeout (e.g. 5s)'
 complete -c hyoui -n '__hyoui_using_subcommand input' -l lock-token      -x      -d 'Explicit lock token (overrides HYOUI_LOCK_TOKEN)'
 complete -c hyoui -n '__hyoui_using_subcommand input' -l max-file-bytes  -x      -d 'Max bytes for file: spec (0 = unlimited)'
 complete -c hyoui -n '__hyoui_using_subcommand input' -s h -l help              -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_using_subcommand input' -f -a 'text\: hex\: file\: paste\: key\: wait\: wait-idle\:' -d 'Input spec prefix'
+
+# `hyoui lock` 子 subcommand
+function __hyoui_lock_using_sub
+    __hyoui_child_using lock $argv[1]
+end
+function __hyoui_lock_no_sub
+    __hyoui_child_none lock
+end
+complete -c hyoui -n __hyoui_lock_no_sub -f -a acquire -d 'Acquire a lock, print token, hold connection'
+complete -c hyoui -n __hyoui_lock_no_sub -f -a release -d 'Release a lock by token'
+
+# `hyoui lock acquire` options
+complete -c hyoui -n '__hyoui_lock_using_sub acquire' -l socket  -r -F           -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_lock_using_sub acquire' -l index   -x              -d 'Session selector (1=oldest, -1=newest)'
+complete -c hyoui -n '__hyoui_lock_using_sub acquire' -l mode    -x -a 'wait fail' -d 'Behavior when held'
+complete -c hyoui -n '__hyoui_lock_using_sub acquire' -l timeout -x              -d 'Acquire timeout'
+complete -c hyoui -n '__hyoui_lock_using_sub acquire' -s h -l help               -d 'Show help and exit'
+
+# `hyoui lock release` options
+complete -c hyoui -n '__hyoui_lock_using_sub release' -l socket -r -F -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_lock_using_sub release' -l index  -x    -d 'Session selector (1=oldest, -1=newest)'
+complete -c hyoui -n '__hyoui_lock_using_sub release' -l token  -x    -d 'Lock token to release'
+complete -c hyoui -n '__hyoui_lock_using_sub release' -s h -l help    -d 'Show help and exit'
+
+# `hyoui unlock` options
+complete -c hyoui -n '__hyoui_using_subcommand unlock' -l socket -r -F -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_using_subcommand unlock' -l index  -x    -d 'Session selector (1=oldest, -1=newest)'
+complete -c hyoui -n '__hyoui_using_subcommand unlock' -l token  -x    -d 'Lock token to release'
+complete -c hyoui -n '__hyoui_using_subcommand unlock' -s h -l help    -d 'Show help and exit'
+
+# `hyoui record` 子 subcommand
+function __hyoui_record_using_sub
+    __hyoui_child_using record $argv[1]
+end
+function __hyoui_record_no_sub
+    __hyoui_child_none record
+end
+complete -c hyoui -n __hyoui_record_no_sub -f -a start -d 'Start a new record (returns record_id)'
+complete -c hyoui -n __hyoui_record_no_sub -f -a stop  -d 'Stop a running record (--id <N> or --all)'
+complete -c hyoui -n __hyoui_record_no_sub -f -a list  -d 'List active records for the session'
+
+# `hyoui record start` options
+complete -c hyoui -n '__hyoui_record_using_sub start' -l socket        -r -F  -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_record_using_sub start' -l index         -x      -d 'Session selector (1=oldest, -1=newest)'
+complete -c hyoui -n '__hyoui_record_using_sub start' -l output        -r -F  -d 'Output file path (absolute)'
+complete -c hyoui -n '__hyoui_record_using_sub start' -l stdin                 -d 'Record child PTY input only'
+complete -c hyoui -n '__hyoui_record_using_sub start' -l stdout                -d 'Record child PTY output only'
+complete -c hyoui -n '__hyoui_record_using_sub start' -l both                  -d 'Record both directions (default, jsonl only)'
+complete -c hyoui -n '__hyoui_record_using_sub start' -l format -x -a 'jsonl raw' -d 'Output format'
+complete -c hyoui -n '__hyoui_record_using_sub start' -l max-bytes    -x       -d 'Recording byte cap (0 disables)'
+complete -c hyoui -n '__hyoui_record_using_sub start' -l max-duration -x       -d 'Recording duration cap (0 disables)'
+complete -c hyoui -n '__hyoui_record_using_sub start' -l input-secrecy -x -a 'redact-after-prompt record-all never-record-stdin' -d 'stdin redaction policy (NOTE: unimplemented, Phase 5)'
+complete -c hyoui -n '__hyoui_record_using_sub start' -l prompt-pattern -x     -d 'Custom prompt detection regex'
+complete -c hyoui -n '__hyoui_record_using_sub start' -s h -l help             -d 'Show help and exit'
+
+# `hyoui record stop` options
+complete -c hyoui -n '__hyoui_record_using_sub stop' -l socket -r -F -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_record_using_sub stop' -l index  -x    -d 'Session selector (1=oldest, -1=newest)'
+complete -c hyoui -n '__hyoui_record_using_sub stop' -l id     -x    -d 'record_id to stop'
+complete -c hyoui -n '__hyoui_record_using_sub stop' -l all          -d 'Stop all active records'
+complete -c hyoui -n '__hyoui_record_using_sub stop' -s h -l help    -d 'Show help and exit'
+
+# `hyoui record list` options
+complete -c hyoui -n '__hyoui_record_using_sub list' -l socket -r -F -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_record_using_sub list' -l index  -x    -d 'Session selector (1=oldest, -1=newest)'
+complete -c hyoui -n '__hyoui_record_using_sub list' -l format -x -a 'table jsonl' -d 'Output format'
+complete -c hyoui -n '__hyoui_record_using_sub list' -s h -l help    -d 'Show help and exit'
 "#
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyoui::cli::{
+        IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS, LIST_FORMAT_VALUES, LOCK_SUBCOMMANDS,
+        RECORD_INPUT_SECRECY_VALUES, RECORD_LIST_FORMAT_VALUES, RECORD_START_FORMAT_VALUES,
+        RECORD_SUBCOMMANDS, RESERVED_TOP_LEVEL_SUBCOMMANDS, SCREEN_DUMP_FORMAT_VALUES,
+        SCREEN_DUMP_LAYER_VALUES, SCREEN_SNAPSHOT_FORMAT_VALUES, SCREEN_SUBCOMMANDS,
+        SNAPSHOT_INCLUDE_VALUES, STATUS_FORMAT_VALUES,
+    };
+
+    const ALL_SHELLS: [Shell; 3] = [Shell::Bash, Shell::Zsh, Shell::Fish];
+
+    /// Word-boundary aware containment check.
+    ///
+    /// `s.contains("list")` matches inside `prune-stale` etc.; for short tokens
+    /// like `list` / `stop` we want a real boundary so the SSOT verification does
+    /// not pass on incidental substrings. Boundaries are the usual shell-script
+    /// delimiters plus `\:` (zsh escaped spec prefixes).
+    fn contains_token(s: &str, token: &str) -> bool {
+        let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let bytes = s.as_bytes();
+        let mut start = 0;
+        while let Some(off) = s[start..].find(token) {
+            let i = start + off;
+            let before_ok = i == 0 || !is_word(s[..i].chars().next_back().unwrap());
+            let after_idx = i + token.len();
+            let after_ok =
+                after_idx >= bytes.len() || !is_word(s[after_idx..].chars().next().unwrap_or(' '));
+            if before_ok && after_ok {
+                return true;
+            }
+            start = i + 1;
+        }
+        false
+    }
 
     #[test]
     fn completion_bash_contains_run_subcommand() {
@@ -604,30 +952,167 @@ mod tests {
         assert!(s.contains("--mode") || s.contains(" mode "));
     }
 
+    /// SSOT: every implemented top-level subcommand must appear in all shells.
     #[test]
-    fn completion_all_shells_mention_implemented_subcommands() {
-        for sh in [Shell::Bash, Shell::Zsh, Shell::Fish] {
+    fn completion_all_shells_mention_every_implemented_subcommand() {
+        for sh in ALL_SHELLS {
             let s = script(sh);
-            for sub in [
-                "run", "attach", "list", "kill", "status", "tail", "wait", "screen", "input",
-            ] {
-                assert!(s.contains(sub), "shell {sh:?} missing `{sub}`");
+            for sub in IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS {
+                assert!(
+                    contains_token(&s, sub),
+                    "shell {sh:?} missing implemented subcommand `{sub}`"
+                );
             }
+        }
+    }
+
+    /// SSOT (= 廃止物検証): reserved subcommands must NOT appear in any shell.
+    ///
+    /// `parse_args` returns "reserved but not yet implemented" for these, so
+    /// offering them as completion candidates would mislead users.
+    ///
+    /// Boundaries here are stricter than `contains_token` (= whitespace / quote /
+    /// line edge only), so legitimate substrings like `detach-others` (an attach
+    /// flag) do not trip the check — only a bare `detach` candidate would.
+    #[test]
+    fn completion_all_shells_omit_reserved_subcommands() {
+        let is_boundary = |c: Option<char>| match c {
+            None => true,
+            Some(c) => c.is_whitespace() || c == '\'' || c == '"' || c == '`',
+        };
+        for sh in ALL_SHELLS {
+            let s = script(sh);
+            for sub in RESERVED_TOP_LEVEL_SUBCOMMANDS {
+                let mut start = 0;
+                while let Some(off) = s[start..].find(*sub) {
+                    let i = start + off;
+                    let before = s[..i].chars().next_back();
+                    let after = s[i + sub.len()..].chars().next();
+                    assert!(
+                        !(is_boundary(before) && is_boundary(after)),
+                        "shell {sh:?} leaks reserved subcommand `{sub}` as a bare candidate"
+                    );
+                    start = i + 1;
+                }
+            }
+        }
+    }
+
+    /// SSOT: legacy / removed wait flags and the removed run flag must be gone.
+    #[test]
+    fn completion_all_shells_omit_removed_flags() {
+        for sh in ALL_SHELLS {
+            let s = script(sh);
+            for flag in [
+                "--no-strip-escapes",   // 旧 wait flag (廃止)
+                "--newline-convert-lf", // 旧 wait flag (廃止)
+                "--on-parent-suspend",  // DR-0015 で run から廃止
+            ] {
+                assert!(
+                    !s.contains(flag),
+                    "shell {sh:?} still offers removed flag `{flag}`"
+                );
+            }
+        }
+    }
+
+    /// Does the script offer a long option `name` (without `--`)?
+    ///
+    /// bash/zsh spell it `--name`; fish declares it as `-l name`. Accept both.
+    fn offers_long_opt(s: &str, name: &str) -> bool {
+        s.contains(&format!("--{name}")) || s.contains(&format!("-l {name}"))
+    }
+
+    /// SSOT: wait must offer the current `--poll-interval` flag.
+    #[test]
+    fn completion_all_shells_offer_wait_poll_interval() {
+        for sh in ALL_SHELLS {
+            let s = script(sh);
+            assert!(
+                offers_long_opt(&s, "poll-interval"),
+                "shell {sh:?} missing wait `--poll-interval`"
+            );
         }
     }
 
     #[test]
     fn completion_all_shells_mention_screen_subsubcommands() {
-        for sh in [Shell::Bash, Shell::Zsh, Shell::Fish] {
+        for sh in ALL_SHELLS {
             let s = script(sh);
-            assert!(s.contains("dump"), "shell {sh:?} missing `dump`");
-            assert!(s.contains("snapshot"), "shell {sh:?} missing `snapshot`");
+            for sub in SCREEN_SUBCOMMANDS {
+                assert!(
+                    contains_token(&s, sub),
+                    "shell {sh:?} missing screen `{sub}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn completion_all_shells_mention_lock_and_record_subsubcommands() {
+        for sh in ALL_SHELLS {
+            let s = script(sh);
+            for sub in LOCK_SUBCOMMANDS {
+                assert!(contains_token(&s, sub), "shell {sh:?} missing lock `{sub}`");
+            }
+            for sub in RECORD_SUBCOMMANDS {
+                assert!(
+                    contains_token(&s, sub),
+                    "shell {sh:?} missing record `{sub}`"
+                );
+            }
+        }
+    }
+
+    /// SSOT: every accepted `screen snapshot --include` value must appear and the
+    /// old bogus values (`size` / `title`) must be gone.
+    #[test]
+    fn completion_all_shells_sync_snapshot_include_values() {
+        for sh in ALL_SHELLS {
+            let s = script(sh);
+            for v in SNAPSHOT_INCLUDE_VALUES {
+                assert!(
+                    contains_token(&s, v),
+                    "shell {sh:?} missing snapshot include value `{v}`"
+                );
+            }
+        }
+        // 旧 completion の誤値 (parse 実装は受理しない) は include 文脈で出ない。
+        for sh in ALL_SHELLS {
+            let s = script(sh);
+            assert!(
+                !s.contains("size mode title"),
+                "shell {sh:?} still lists bogus snapshot include set (size/title)"
+            );
+        }
+    }
+
+    /// SSOT: enum-valued flags expose exactly the parser-accepted values.
+    #[test]
+    fn completion_all_shells_sync_enum_value_sets() {
+        for sh in ALL_SHELLS {
+            let s = script(sh);
+            let groups: &[(&str, &[&str])] = &[
+                ("screen dump --format", SCREEN_DUMP_FORMAT_VALUES),
+                ("screen dump --layer", SCREEN_DUMP_LAYER_VALUES),
+                ("screen snapshot --format", SCREEN_SNAPSHOT_FORMAT_VALUES),
+                ("list --format", LIST_FORMAT_VALUES),
+                ("status --format", STATUS_FORMAT_VALUES),
+                ("record list --format", RECORD_LIST_FORMAT_VALUES),
+                ("record start --format", RECORD_START_FORMAT_VALUES),
+                ("record start --input-secrecy", RECORD_INPUT_SECRECY_VALUES),
+            ];
+            for (label, values) in groups {
+                for v in *values {
+                    assert!(s.contains(v), "shell {sh:?} missing `{v}` for {label}");
+                }
+            }
         }
     }
 
     #[test]
     fn completion_all_shells_mention_input_spec_prefixes() {
-        for sh in [Shell::Bash, Shell::Zsh, Shell::Fish] {
+        for sh in ALL_SHELLS {
             let s = script(sh);
             // bash/fish は `text:` 形式、zsh は `text\:` (= escape) 形式で出る。
             // どちらの形式でも prefix 文字列が含まれていればよい。
@@ -640,14 +1125,14 @@ mod tests {
         }
     }
 
+    /// `--index` selector must be offered by every session-targeted subcommand.
     #[test]
-    fn completion_all_shells_mention_reserved_subcommands() {
-        for sh in [Shell::Bash, Shell::Zsh, Shell::Fish] {
+    fn completion_all_shells_offer_index_selector() {
+        for sh in ALL_SHELLS {
             let s = script(sh);
-            assert!(s.contains("send"), "shell {sh:?} missing reserved `send`");
             assert!(
-                s.contains("detach"),
-                "shell {sh:?} missing reserved `detach`"
+                offers_long_opt(&s, "index"),
+                "shell {sh:?} missing `--index` selector"
             );
         }
     }

@@ -2363,18 +2363,13 @@ fn parse_snapshot_include(s: &str) -> Result<Vec<SnapshotCliComponent>, String> 
         }
         let lower = trimmed.to_ascii_lowercase();
         let normalized: String = lower.chars().filter(|c| *c != '-' && *c != '_').collect();
-        let comp = match normalized.as_str() {
-            "cells" => SnapshotCliComponent::Cells,
-            "cursor" => SnapshotCliComponent::Cursor,
-            "mode" => SnapshotCliComponent::Mode,
-            "style" => SnapshotCliComponent::Style,
-            "scrollback" => SnapshotCliComponent::Scrollback,
-            "windowsize" => SnapshotCliComponent::WindowSize,
-            "buffer" => SnapshotCliComponent::Buffer,
-            "sequenceno" => SnapshotCliComponent::SequenceNo,
-            other => {
+        // 正規化済名 → enum は `snapshot_component_from_normalized` が正本
+        // (= SSOT 定数 SNAPSHOT_INCLUDE_VALUES と同じ対応表を共有)。
+        let comp = match snapshot_component_from_normalized(normalized.as_str()) {
+            Some(c) => c,
+            None => {
                 return Err(format!(
-                    "unknown component {other:?} (valid: Cells / Cursor / Mode / Style / Scrollback / WindowSize / Buffer / SequenceNo)"
+                    "unknown component {normalized:?} (valid: Cells / Cursor / Mode / Style / Scrollback / WindowSize / Buffer / SequenceNo)"
                 ));
             }
         };
@@ -3669,9 +3664,11 @@ fn usage_record() -> String {
         \n\
         SECURITY NOTE:\n    \
             record file は子 PTY の全 I/O bytes を含むため、機密情報 (password / OTP /\n    \
-            API token 等) が永続化される可能性があります。default の `--input-secrecy=\n    \
-            redact-after-prompt` で password 系 prompt 後の stdin は自動 redact されますが、\n    \
-            完全防護ではありません。出力 file (mode 0600) は認証境界外に共有しないでください。\n",
+            API token 等) が永続化される可能性があります。出力 file (mode 0600) は\n    \
+            認証境界外に共有しないでください。\n    \
+            ⚠ WARNING: `--input-secrecy` の redaction は **未実装** (= Phase 5 予定)。\n    \
+            現状どの policy を指定しても stdin は素通しで記録されます\n    \
+            (= password / OTP も平文で残る)。\n",
     )
 }
 
@@ -3699,9 +3696,11 @@ fn usage_record_start() -> String {
             --max-duration DUR          録画 duration 上限 (default 1h、`0` で disable + 警告)\n                                \
                 DUR 形式: `30m` / `1h` / `1d12h` 等 (`hyoui run` の --timeout と同形式)\n    \
             --input-secrecy POLICY      stdin redaction policy (default redact-after-prompt)\n                                \
-                redact-after-prompt — password/OTP prompt 後の stdin を redact\n                                \
-                record-all          — redaction なし、全 stdin を hex 記録 (opt-in、loud warning)\n                                \
-                never-record-stdin  — 全 stdin を redaction (内容捨て、byte_count のみ)\n    \
+                ⚠ redaction は **未実装** (Phase 5 予定)。現状どの policy でも\n                                \
+                stdin は素通しで記録される (= password / OTP も平文で残る)。\n                                \
+                redact-after-prompt — (予定) password/OTP prompt 後の stdin を redact\n                                \
+                record-all          — (予定) redaction なし、全 stdin を hex 記録\n                                \
+                never-record-stdin  — (予定) 全 stdin を redaction (内容捨て、byte_count のみ)\n    \
             --prompt-pattern REGEX      custom prompt 検出 regex (default は daemon 適用)\n    \
             -h, --help                  Show this help and exit\n\
         \n\
@@ -4489,8 +4488,12 @@ const INPUT_SPEC_PREFIXES: &[&str] = &["text", "hex", "file", "paste", "key", "w
 
 /// 既知の top-level subcommand 一覧 (= unknown subcommand 時の suggest 用)。
 ///
-/// reserved (`send` / `detach` / `tx` / `lock` / `unlock`) も含める
+/// reserved (`send` / `detach` / `tx`) も含める
 /// (= 「予約済」と気づかせるほうが UX 改善になる)。
+///
+/// 実装済 subcommand のみが欲しい場合は [`IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS`] を使う
+/// (= completion script の single source of truth)。reserved だけが欲しい場合は
+/// [`RESERVED_TOP_LEVEL_SUBCOMMANDS`]。
 pub(crate) const TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
     "run",
     "attach",
@@ -4511,6 +4514,114 @@ pub(crate) const TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
 ];
 
 // =============================================================================
+// Completion single source of truth (= DR-0014 §検証主義)
+//
+// completion script (crates/hyoui-cli/src/completion.rs) と parse 実装の乖離を
+// 機械検証で防ぐための SSOT 定数群。parse 実装からも本定数を参照し、completion 側
+// テストが「定数の全要素が 3 shell 出力に含まれる」「reserved 語が含まれない」を
+// 検証する。新規 subcommand / option / 列挙値を足すときは **まず本定数を更新** する。
+// =============================================================================
+
+/// 実装済 (= dispatch 経路が存在する) top-level subcommand 一覧。
+///
+/// completion script はこの全要素を補完候補として出力しなければならない
+/// (= completion.rs のテストで機械検証)。reserved 語 (`send` / `detach` / `tx`) は
+/// **含めない** (= 実装では `parse_args` が「予約だが未実装」error を返すため、
+/// 補完候補に出すと user を誤誘導する)。
+pub const IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
+    "run",
+    "attach",
+    "list",
+    "kill",
+    "status",
+    "tail",
+    "wait",
+    "screen",
+    "input",
+    "lock",
+    "unlock",
+    "record",
+    "completion",
+];
+
+/// 予約済だが未実装の top-level subcommand 一覧 (= `parse_args` が error を返す)。
+///
+/// completion script はこれらを補完候補に **出してはならない**
+/// (= completion.rs のテストで機械検証、出ると user を誤誘導する)。
+pub const RESERVED_TOP_LEVEL_SUBCOMMANDS: &[&str] = &["send", "detach", "tx"];
+
+/// `hyoui screen` の子 subcommand 一覧 (= `parse_screen` が dispatch する値)。
+pub const SCREEN_SUBCOMMANDS: &[&str] = &["dump", "snapshot"];
+
+/// `hyoui lock` の子 subcommand 一覧 (= `parse_lock` が dispatch する値)。
+pub const LOCK_SUBCOMMANDS: &[&str] = &["acquire", "release"];
+
+/// `hyoui record` の子 subcommand 一覧 (= `parse_record` が dispatch する値)。
+pub const RECORD_SUBCOMMANDS: &[&str] = &["start", "stop", "list"];
+
+/// `hyoui screen snapshot --include` が受理する正規化済 component 名一覧。
+///
+/// `parse_snapshot_include` が本定数を正本として参照する (= 乖離防止)。
+/// completion script は本定数の全要素を `--include` の補完候補に出す。
+/// 値は parse 段の正規化 (= lowercase + `-`/`_` 除去) 後の形 (= `windowsize` /
+/// `sequenceno`) で持つ。`SnapshotCliComponent` との対応は
+/// [`snapshot_component_from_normalized`] で 1:1。
+pub const SNAPSHOT_INCLUDE_VALUES: &[&str] = &[
+    "cells",
+    "cursor",
+    "mode",
+    "style",
+    "scrollback",
+    "windowsize",
+    "buffer",
+    "sequenceno",
+];
+
+/// `hyoui screen dump --format` が受理する値一覧 (= primary name のみ、alias 除く)。
+pub const SCREEN_DUMP_FORMAT_VALUES: &[&str] = &["ansi", "binary", "cbor", "text/plain"];
+
+/// `hyoui screen dump --layer` が受理する値一覧。
+pub const SCREEN_DUMP_LAYER_VALUES: &[&str] = &["visible", "scrollback", "both"];
+
+/// `hyoui screen snapshot --format` が受理する値一覧。
+pub const SCREEN_SNAPSHOT_FORMAT_VALUES: &[&str] = &["cbor", "json"];
+
+/// `hyoui list --format` が受理する値一覧。
+pub const LIST_FORMAT_VALUES: &[&str] = &["plain", "jsonl"];
+
+/// `hyoui status --format` が受理する値一覧。
+pub const STATUS_FORMAT_VALUES: &[&str] = &["plain", "json"];
+
+/// `hyoui record list --format` が受理する値一覧。
+pub const RECORD_LIST_FORMAT_VALUES: &[&str] = &["table", "jsonl"];
+
+/// `hyoui record start --format` が受理する値一覧。
+pub const RECORD_START_FORMAT_VALUES: &[&str] = &["jsonl", "raw"];
+
+/// `hyoui record start --input-secrecy` が受理する policy 値一覧。
+pub const RECORD_INPUT_SECRECY_VALUES: &[&str] =
+    &["redact-after-prompt", "record-all", "never-record-stdin"];
+
+/// `正規化済 component 名 → SnapshotCliComponent` を 1:1 で解決する。
+///
+/// `parse_snapshot_include` と SSOT 定数 [`SNAPSHOT_INCLUDE_VALUES`] の両方から
+/// 参照する単一の対応表 (= 列挙値の追加漏れを 1 箇所に集約)。`normalized` は
+/// lowercase + `-`/`_` 除去済の文字列を渡す。
+fn snapshot_component_from_normalized(normalized: &str) -> Option<SnapshotCliComponent> {
+    Some(match normalized {
+        "cells" => SnapshotCliComponent::Cells,
+        "cursor" => SnapshotCliComponent::Cursor,
+        "mode" => SnapshotCliComponent::Mode,
+        "style" => SnapshotCliComponent::Style,
+        "scrollback" => SnapshotCliComponent::Scrollback,
+        "windowsize" => SnapshotCliComponent::WindowSize,
+        "buffer" => SnapshotCliComponent::Buffer,
+        "sequenceno" => SnapshotCliComponent::SequenceNo,
+        _ => return None,
+    })
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -4521,6 +4632,203 @@ mod tests {
     /// Build a `Vec<String>` from string literals — keeps tests terse.
     fn args(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    // -------- Completion SSOT 定数 ↔ parse 実装の整合性検証 --------
+    //
+    // completion.rs はこれら定数を single source of truth として参照する。
+    // 定数が parse 実装からズレると completion も連鎖してズレるため、定数自体が
+    // 実装と一致することを本 module で機械検証する (= 二段構えの整合性ガード)。
+
+    #[test]
+    fn ssot_implemented_subcommands_are_dispatchable() {
+        // 実装済 subcommand は「予約だが未実装」error を返さない。
+        for sub in IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS {
+            let cmd = parse_args(&args(&[sub]));
+            if let Command::Error(msg) = &cmd {
+                assert!(
+                    !msg.contains("reserved but not yet implemented"),
+                    "implemented subcommand `{sub}` returned reserved error: {msg}"
+                );
+            }
+            // UnknownSubcommand にもならない (= dispatch 経路が存在する)。
+            assert!(
+                !matches!(
+                    &cmd,
+                    Command::Help {
+                        topic: HelpTopic::UnknownSubcommand(_)
+                    }
+                ),
+                "implemented subcommand `{sub}` is treated as unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn ssot_reserved_subcommands_return_reserved_error() {
+        for sub in RESERVED_TOP_LEVEL_SUBCOMMANDS {
+            match parse_args(&args(&[sub])) {
+                Command::Error(msg) => assert!(
+                    msg.contains("reserved but not yet implemented"),
+                    "reserved subcommand `{sub}` returned unexpected error: {msg}"
+                ),
+                other => panic!("reserved subcommand `{sub}` expected Error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn ssot_implemented_and_reserved_are_disjoint() {
+        for r in RESERVED_TOP_LEVEL_SUBCOMMANDS {
+            assert!(
+                !IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS.contains(r),
+                "`{r}` is in both implemented and reserved lists"
+            );
+        }
+    }
+
+    #[test]
+    fn ssot_snapshot_include_values_all_parse() {
+        for v in SNAPSHOT_INCLUDE_VALUES {
+            assert!(
+                parse_snapshot_include(v).is_ok(),
+                "SNAPSHOT_INCLUDE_VALUES entry `{v}` rejected by parse_snapshot_include"
+            );
+            assert!(
+                snapshot_component_from_normalized(v).is_some(),
+                "SNAPSHOT_INCLUDE_VALUES entry `{v}` has no enum mapping"
+            );
+        }
+        // 旧 completion の誤値は実装に存在しない (= reject される)。
+        for bogus in ["screen", "size", "title"] {
+            assert!(
+                parse_snapshot_include(bogus).is_err(),
+                "stale include value `{bogus}` unexpectedly accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn ssot_screen_subcommands_dispatch() {
+        for sub in SCREEN_SUBCOMMANDS {
+            // session 無しなので Error にはなるが、UnknownSubcommand error ではない。
+            if let Command::Error(msg) = parse_args(&args(&["screen", sub])) {
+                assert!(
+                    !msg.contains("unknown subcommand"),
+                    "screen `{sub}` treated as unknown: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ssot_lock_subcommands_dispatch() {
+        for sub in LOCK_SUBCOMMANDS {
+            if let Command::Error(msg) = parse_args(&args(&["lock", sub])) {
+                assert!(
+                    !msg.contains("unknown subcommand"),
+                    "lock `{sub}` treated as unknown: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ssot_record_subcommands_dispatch() {
+        for sub in RECORD_SUBCOMMANDS {
+            if let Command::Error(msg) = parse_args(&args(&["record", sub])) {
+                assert!(
+                    !msg.contains("unknown subcommand"),
+                    "record `{sub}` treated as unknown: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ssot_status_format_values_all_parse() {
+        for v in STATUS_FORMAT_VALUES {
+            match parse_args(&args(&["status", "demo", "--format", v])) {
+                Command::Status(_) => {}
+                other => panic!("status --format={v} rejected: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn ssot_list_format_values_all_parse() {
+        for v in LIST_FORMAT_VALUES {
+            match parse_args(&args(&["list", &format!("--format={v}")])) {
+                Command::List(_) => {}
+                other => panic!("list --format={v} rejected: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn ssot_screen_dump_enum_values_all_parse() {
+        for v in SCREEN_DUMP_FORMAT_VALUES {
+            match parse_args(&args(&["screen", "dump", "demo", "--format", v])) {
+                Command::Screen(_) => {}
+                other => panic!("screen dump --format={v} rejected: {other:?}"),
+            }
+        }
+        for v in SCREEN_DUMP_LAYER_VALUES {
+            match parse_args(&args(&["screen", "dump", "demo", "--layer", v])) {
+                Command::Screen(_) => {}
+                other => panic!("screen dump --layer={v} rejected: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn ssot_screen_snapshot_format_values_all_parse() {
+        for v in SCREEN_SNAPSHOT_FORMAT_VALUES {
+            match parse_args(&args(&["screen", "snapshot", "demo", "--format", v])) {
+                Command::Screen(_) => {}
+                other => panic!("screen snapshot --format={v} rejected: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn ssot_record_format_and_secrecy_values_all_parse() {
+        for v in RECORD_LIST_FORMAT_VALUES {
+            match parse_args(&args(&["record", "list", "demo", "--format", v])) {
+                Command::Record(_) => {}
+                other => panic!("record list --format={v} rejected: {other:?}"),
+            }
+        }
+        for v in RECORD_START_FORMAT_VALUES {
+            // raw は単一 direction 限定なので --stdout を併せて与える。
+            match parse_args(&args(&[
+                "record",
+                "start",
+                "demo",
+                "--output",
+                "/tmp/r.out",
+                "--stdout",
+                "--format",
+                v,
+            ])) {
+                Command::Record(_) => {}
+                other => panic!("record start --format={v} rejected: {other:?}"),
+            }
+        }
+        for v in RECORD_INPUT_SECRECY_VALUES {
+            match parse_args(&args(&[
+                "record",
+                "start",
+                "demo",
+                "--output",
+                "/tmp/r.out",
+                "--input-secrecy",
+                v,
+            ])) {
+                Command::Record(_) => {}
+                other => panic!("record start --input-secrecy={v} rejected: {other:?}"),
+            }
+        }
     }
 
     // -------- Ported from cli_wbtest.mbt (21 tests, all under `run`) --------
