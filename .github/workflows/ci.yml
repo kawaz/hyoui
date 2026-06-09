@@ -29,6 +29,40 @@ jobs:
       # ローカルと同一エントリで検査範囲を一致させる。
       - run: just ci
 
+  ignored-tests:
+    name: Ignored tests (${{ matrix.os }} / PTY+daemon)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.os }}-stable
+      - name: Run ignored integration tests (PTY/daemon)
+        run: cargo test --workspace -- --ignored
+
+  msrv:
+    name: MSRV check (rust-version = 1.86)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.86"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ubuntu-latest-1.86
+      - name: cargo check on MSRV
+        run: cargo check --workspace
+
   audit:
     name: cargo-audit (RUSTSEC advisories)
     runs-on: ubuntu-latest
