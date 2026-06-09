@@ -20,6 +20,15 @@
 //! - `RecordRegistry`: session-scope の sink 集合 (= start/stop/list/broadcast)
 //! - `RecordEvent`: in/out bytes / reject / write error / redaction / lifecycle
 //!
+//! ## ⚠ redaction は未実装 (= stdin は素通し記録)
+//!
+//! `InputSecrecy::RedactAfterPrompt` / `prompt_pattern` を request で渡せるが、
+//! **secret redaction の state machine は Phase 5 で配線予定で、現状は未実装**。
+//! `record-all` と同様に **stdin bytes をそのまま file に記録する** (= header の
+//! `input_secrecy` 値に関わらず redaction は効かない)。`InSecretRedacted` event /
+//! `push_in_secret_redacted` も Phase 5 まで dead code。passphrase / token 等を
+//! stdin で打つ session を `direction: stdin|both` で録ると平文で残る点に注意。
+//!
 //! ## 設計判断メモ
 //!
 //! - `seq` は **sink 側 (push 側) で `AtomicU32::fetch_add` 採番** する (DR-0016 §8b)。
@@ -49,7 +58,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crossbeam_channel::{Sender, TrySendError, bounded};
 use serde::Serialize;
@@ -58,6 +67,7 @@ use crate::protocol::Mode;
 use crate::protocol::messages::{
     InputSecrecy, RecordDirection, RecordFormat, RecordInfo, RecordStartRequest,
 };
+use crate::sys::clock::now_unix_ms;
 
 // === Tunables ===
 
@@ -1067,11 +1077,37 @@ fn encode_lifecycle(seq: u32, ev: &LifecycleEvent) -> serde_json::Value {
 
 // === path validation + file open ===
 
+/// output path を検証する (DR-0016 §9 + REVIEW-BACKLOG R5-C2 系の防御強化)。
+///
+/// 検証順:
+/// 1. absolute であること
+/// 2. `..` (parent dir) 成分を含まないこと (= `/tmp/../home/u/.ssh/x.log` で
+///    後段の sensitive prefix deny を迂回されるのを防ぐ)
+/// 3. 拡張子 allowlist (file_name 由来なので canonicalize に依らず安定)
+/// 4. **親ディレクトリを canonicalize** し (= 中間ディレクトリの symlink
+///    `/tmp/evil -> ~` を実体に解決)、解決後の path で sensitive prefix を判定
+///
+/// file 自体は未存在 (= `O_EXCL` で後段 open) なので path 全体は canonicalize
+/// できない。`parent().canonicalize()? + file_name` で解決後 path を組む。
+/// O_NOFOLLOW が最終要素 symlink のみを防ぐのに対し、parent canonicalize は
+/// **中間ディレクトリ symlink** を塞ぐ (= 防御層の補完)。
 fn validate_output_path(path: &Path) -> Result<(), RecordStartError> {
+    use std::path::Component;
+
     if !path.is_absolute() {
         return Err(RecordStartError::PathNotAbsolute);
     }
-    // 拡張子 allowlist
+
+    // `..` 成分を含むパスは即 reject (= 正規化前に潜り込ませた traversal を弾く)。
+    // `.` (CurDir) は無害なので許容、絶対パス前提なので Prefix は無い。
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(RecordStartError::OutputPermissionDenied(format!(
+            "path must not contain '..': {}",
+            path.display()
+        )));
+    }
+
+    // 拡張子 allowlist (file_name 由来なので canonicalize に依らず安定)。
     let ext_ok = path
         .extension()
         .and_then(|s| s.to_str())
@@ -1084,30 +1120,50 @@ fn validate_output_path(path: &Path) -> Result<(), RecordStartError> {
             path.display()
         )));
     }
-    // HOME 配下の sensitive prefix
+
+    // 親 dir を実体に解決する。file 自体は未存在なので親だけ canonicalize し、
+    // file_name を結合して「解決後の output path」を組む。親 dir が存在しない /
+    // 解決できない場合はここで弾く (= 旧来の `parent.exists()` check を内包)。
+    let Some(parent) = path.parent() else {
+        return Err(RecordStartError::OutputPermissionDenied(format!(
+            "output path has no parent directory: {}",
+            path.display()
+        )));
+    };
+    let Some(file_name) = path.file_name() else {
+        return Err(RecordStartError::OutputPermissionDenied(format!(
+            "output path has no file name: {}",
+            path.display()
+        )));
+    };
+    let real_parent = parent.canonicalize().map_err(|e| {
+        RecordStartError::OutputPermissionDenied(format!(
+            "parent directory does not resolve ({e}): {}",
+            parent.display()
+        ))
+    })?;
+    let resolved = real_parent.join(file_name);
+
+    // HOME 配下の sensitive prefix を **解決後 path** で判定 (= 中間 symlink
+    // 経由で `~/.ssh/` 等に着地するケースも実体パスで検出する)。
     if let Some(home) = std::env::var_os("HOME") {
+        // HOME 自体も symlink を含む可能性があるので canonicalize して揃える
+        // (= 解決失敗時は raw HOME に fallback して strip を試みる)。
         let home = PathBuf::from(home);
-        if let Ok(rel) = path.strip_prefix(&home) {
+        let home = home.canonicalize().unwrap_or(home);
+        if let Ok(rel) = resolved.strip_prefix(&home) {
             let rel_str = rel.to_string_lossy();
             for bad in SENSITIVE_HOME_PREFIXES {
                 if rel_str.starts_with(bad) {
                     return Err(RecordStartError::OutputPermissionDenied(format!(
-                        "sensitive HOME prefix denied: {}",
-                        path.display()
+                        "sensitive HOME prefix denied (resolved): {}",
+                        resolved.display()
                     )));
                 }
             }
         }
     }
-    // 親 dir 存在 check
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            return Err(RecordStartError::OutputPermissionDenied(format!(
-                "parent directory does not exist: {}",
-                parent.display()
-            )));
-        }
-    }
+
     Ok(())
 }
 
@@ -1124,15 +1180,6 @@ fn open_record_file(path: &Path) -> Result<File, RecordStartError> {
         }
         Err(e) => Err(RecordStartError::Io(e)),
     }
-}
-
-// === time helper ===
-
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 // === unused warning suppression for `MetadataExt`/`Path` re-exports ===
@@ -1432,6 +1479,105 @@ mod tests {
         }
         let err = res.expect_err("~/.ssh/* must be rejected");
         assert!(matches!(err, RecordStartError::OutputPermissionDenied(_)));
+    }
+
+    #[test]
+    fn parent_dir_traversal_component_rejected() {
+        // `/tmp/../etc/x.log` のような `..` 入り path は、後段の sensitive prefix
+        // deny を迂回し得るので、正規化前に即 reject される。
+        let registry = RecordRegistry::new();
+        let mut req = jsonl_request(Path::new("/tmp/../tmp/x.jsonl"), RecordDirection::Both);
+        req.output_path = "/tmp/../tmp/x.jsonl".into();
+        let err = registry
+            .start(&req, 1, sample_session())
+            .expect_err("path containing '..' must be rejected");
+        match err {
+            RecordStartError::OutputPermissionDenied(msg) => {
+                assert!(msg.contains("'..'"), "unexpected message: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn traversal_into_sensitive_home_prefix_rejected() {
+        // HOME=<tmp> に差し替え、`<tmp>/safe/../.ssh/key.jsonl` という `..` 経由で
+        // sensitive prefix (.ssh/) に着地させようとする迂回を `..` reject で塞ぐ。
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("safe")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".ssh")).unwrap();
+        let traversal = dir.path().join("safe/../.ssh/key.jsonl");
+        let registry = RecordRegistry::new();
+        let prev_home = std::env::var_os("HOME");
+        crate::sys::env::set_var("HOME", &dir.path().to_string_lossy());
+        let mut req = jsonl_request(&traversal, RecordDirection::Both);
+        req.output_path = traversal.to_string_lossy().into_owned();
+        let res = registry.start(&req, 1, sample_session());
+        match prev_home {
+            Some(v) => crate::sys::env::set_var("HOME", &v.to_string_lossy()),
+            None => crate::sys::env::remove_var("HOME"),
+        }
+        let err = res.expect_err("'..' traversal into ~/.ssh must be rejected");
+        assert!(matches!(err, RecordStartError::OutputPermissionDenied(_)));
+    }
+
+    #[test]
+    fn intermediate_symlink_into_sensitive_home_resolved_and_rejected() {
+        // 中間ディレクトリ symlink (`<tmp>/evil -> $HOME`) 経由で `~/.ssh/` に
+        // 着地させる迂回を、親 dir canonicalize で実体解決して reject する。
+        // O_NOFOLLOW は最終要素のみなので、この層が無いと素通りしてしまう。
+        let home = tempfile::tempdir().unwrap();
+        let ssh = home.path().join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+
+        // 攻撃者の作業 dir 内に HOME を指す symlink を張る。
+        let work = tempfile::tempdir().unwrap();
+        let evil = work.path().join("evil");
+        std::os::unix::fs::symlink(home.path(), &evil).unwrap();
+
+        // `<work>/evil/.ssh/key.jsonl` を解決すると実体は `<home>/.ssh/key.jsonl`。
+        let attack = evil.join(".ssh").join("key.jsonl");
+        let registry = RecordRegistry::new();
+        let prev_home = std::env::var_os("HOME");
+        crate::sys::env::set_var("HOME", &home.path().to_string_lossy());
+        let mut req = jsonl_request(&attack, RecordDirection::Both);
+        req.output_path = attack.to_string_lossy().into_owned();
+        let res = registry.start(&req, 1, sample_session());
+        match prev_home {
+            Some(v) => crate::sys::env::set_var("HOME", &v.to_string_lossy()),
+            None => crate::sys::env::remove_var("HOME"),
+        }
+        let err = res.expect_err("intermediate symlink into ~/.ssh must be rejected");
+        match err {
+            RecordStartError::OutputPermissionDenied(msg) => {
+                assert!(msg.contains("resolved"), "unexpected message: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        // file が作られていないことも確認 (= deny は open 前)。
+        assert!(!ssh.join("key.jsonl").exists());
+    }
+
+    #[test]
+    fn intermediate_symlink_to_safe_dir_allowed() {
+        // 中間 symlink が sensitive でない場所を指す場合は、canonicalize しても
+        // deny されず正常に record できる (= 過剰 block の回帰防止)。
+        let real = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(real.path().join("logs")).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let link = work.path().join("link");
+        std::os::unix::fs::symlink(real.path().join("logs"), &link).unwrap();
+        let path = link.join("ok.jsonl");
+        let registry = RecordRegistry::new();
+        let id = registry
+            .start(
+                &jsonl_request(&path, RecordDirection::Both),
+                1,
+                sample_session(),
+            )
+            .expect("symlink to safe dir must be allowed");
+        registry.stop(id).unwrap();
+        assert!(path.exists());
     }
 
     #[test]

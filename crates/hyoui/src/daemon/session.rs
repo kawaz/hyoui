@@ -28,6 +28,7 @@ use crate::protocol::Mode;
 use crate::protocol::messages::{LeaderNotify, ModeChange};
 use crate::protocol::{ControlMessage, Frame};
 use crate::scrollback::Scrollback;
+use crate::sys::clock::now_unix_ms;
 use crate::sys::{
     FdExt, Pty, SelfPipe, UnixSock, install_default, install_self_pipe, poll::PollFlags,
     poll::PollOutcome, poll::poll, pty::Spawned, register_self_pipe,
@@ -128,8 +129,12 @@ impl UntilWatcher {
 /// the SIGCHLD self-pipe and uses it to wake `poll(2)` on child state
 /// transitions (= STOP / CONT / exit). If `try_lock` fails (= another serve
 /// is already using it in the same process, e.g. concurrent test runs), the
-/// serve falls back to the legacy 500ms polling path with no correctness
-/// regression.
+/// serve falls back to the legacy 500ms polling path. In that fallback the
+/// serve_loop caps its `poll(2)` timeout at 500ms (see `cap_poll_timeout`
+/// usage) and re-polls `ChildLifecycle` on every Timeout wake, so an idle
+/// child's STOP / exit is still detected within ~500ms instead of blocking
+/// forever — the only difference from the self-pipe path is detection latency
+/// (ms vs ~500ms), not correctness.
 ///
 /// The guard is held inside `serve()` for the entire lifetime of the loop,
 /// and is dropped before `SelfPipe::drop` so that `SELFPIPE_WRITE_FD` is
@@ -909,17 +914,26 @@ fn record_child_continued(state: &SessionState, child: Pid) {
         });
 }
 
-/// DR-0016 §3 — record event の `ts_unix_ms` 用 (= epoch ms)。
-fn now_unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 // `handle_child_transition` は DR-0015 §2.2 で廃止 (= callback inject 経路の入り口
 // だった)。新方針では `notify_child_stopped` を caller (= serve_loop) が直接呼ぶ。
 // transition::Stopped 以外 (Continued / Exited) は caller 側で処理する形に統一。
+
+/// `current` を上限 `cap_ms` で頭打ちする。`current` が `NONE` (= 無限 block)
+/// または `cap_ms` より大きいときだけ `cap_ms` に縮める。それ以外 (= 既により
+/// 短い timeout) はそのまま返す。
+///
+/// ※ nix の `PollTimeout::as_millis` は `NONE` 時に内部 unwrap で panic するため、
+///   先に `is_none()` で分岐してから ms を取り出す。
+fn cap_poll_timeout(current: PollTimeout, cap_ms: u16) -> PollTimeout {
+    let cap = PollTimeout::from(cap_ms);
+    if current.is_none() {
+        cap
+    } else if let Some(ms) = current.as_millis() {
+        if ms > cap_ms as u32 { cap } else { current }
+    } else {
+        current
+    }
+}
 
 /// serve loop の本体。`Session::serve` から切り出して所有権整理を平坦化。
 #[allow(clippy::too_many_arguments)]
@@ -980,23 +994,27 @@ fn serve_loop(
         // backpressure overflow / writer dead で disconnect が必要な client_id を集める
         let mut overflow_ids: Vec<u64> = Vec::new();
 
-        // R4-C3: pending handshake がある間は poll timeout を 50ms 以下に抑える。
-        // 完了通知 (mpsc) は fd-poll では検出できないため、短い周期で try_recv する
-        // 必要がある。pending が無い場合は無限 block (= 別 fd の POLLIN で起きる)。
+        // poll timeout の決定。デフォルトは無限 block (= 別 fd の POLLIN /
+        // self-pipe wake で起きる) で、以下の cap を順に適用して頭打ちする:
+        //
+        // - R4-C3: pending handshake がある間は 50ms。完了通知 (mpsc) は fd-poll
+        //   できないため、短い周期で try_recv する必要がある。
+        // - R5-H6 fallback: SIGCHLD self-pipe の ownership を取れず
+        //   `sigchld_pipe == None` で動く serve は、poll_fds に self-pipe fd を
+        //   積めない。pending_handshakes が空のとき poll が無限 block すると、
+        //   idle 中 (= master 出力も client 入力も無い) の子 STOP / exit を
+        //   一切検出できず、子が死んでも daemon が永久に起きない correctness
+        //   regression になる。legacy polling 経路 (ChildLifecycle, ~500ms 粒度)
+        //   に合わせて poll timeout を 500ms で頭打ちし、Timeout 経路の
+        //   `lifecycle.poll_with_transition` で子の state 変化を拾えるようにする。
         let mut poll_timeout = PollTimeout::NONE;
         if !pending_handshakes.is_empty() {
             const HANDSHAKE_POLL_CAP_MS: u16 = 50;
-            let cap = PollTimeout::from(HANDSHAKE_POLL_CAP_MS);
-            // 既存 timeout が NONE か cap より大きいなら cap で頭打ちする。
-            // ※ nix 0.31 の `PollTimeout::as_millis` は NONE 時に内部 unwrap で
-            //   panic するため、先に `is_none()` で分岐してから ms を取り出す。
-            if poll_timeout.is_none() {
-                poll_timeout = cap;
-            } else if let Some(ms) = poll_timeout.as_millis() {
-                if ms > HANDSHAKE_POLL_CAP_MS as u32 {
-                    poll_timeout = cap;
-                }
-            }
+            poll_timeout = cap_poll_timeout(poll_timeout, HANDSHAKE_POLL_CAP_MS);
+        }
+        if sigchld_pipe.is_none() {
+            const NO_SELFPIPE_POLL_CAP_MS: u16 = 500;
+            poll_timeout = cap_poll_timeout(poll_timeout, NO_SELFPIPE_POLL_CAP_MS);
         }
         // R4-C3: Timeout 経路では poll_fds の revents は使わないので、まず borrows を
         // 解いてから check_wait_timeouts / process_pending_handshakes を呼ぶ。
@@ -1052,6 +1070,25 @@ fn serve_loop(
             }
             Ok(PollOutcome::Timeout) => {
                 drop(poll_fds);
+                // R5-H6 fallback: self-pipe を持たない serve では poll が
+                // child state transition で起きないため、timeout 起床のたびに
+                // legacy polling 経路で子の STOP / CONT / exit を拾う。
+                // self-pipe を持つ通常 path はここで lifecycle を触らない
+                // (= Interrupted / sigchld_ready 経路で処理済、二重 poll を避ける)。
+                if sigchld_pipe.is_none() {
+                    let (child_state, transition) = lifecycle.poll_with_transition(child);
+                    if let ChildState::Exited(code) = child_state {
+                        return RelayOutcome::ChildExited(code);
+                    }
+                    match transition {
+                        Some(ChildTransition::Stopped { sig }) => {
+                            let overflow = notify_child_stopped(child, clients, state, sig);
+                            overflow_ids.extend(overflow);
+                        }
+                        Some(ChildTransition::Continued) => record_child_continued(state, child),
+                        _ => {}
+                    }
+                }
                 process_pending_handshakes(
                     &mut pending_handshakes,
                     config,
@@ -1503,6 +1540,38 @@ mod tests {
         // 子 process が orphan で残らないように SIGKILL → wait。
         let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
         let _ = nix::sys::wait::waitpid(pid, None);
+    }
+
+    // ---- cap_poll_timeout unit tests ----
+
+    /// NONE (= 無限 block) は常に cap で頭打ちされる。
+    /// R5-H6 fallback (self-pipe 不在 + pending_handshakes 空) で poll が
+    /// 無限 block して idle 子の stop/exit を見逃す regression を塞ぐ要。
+    #[test]
+    fn cap_poll_timeout_caps_none_to_cap() {
+        let capped = cap_poll_timeout(PollTimeout::NONE, 500);
+        assert_eq!(capped.as_millis(), Some(500));
+    }
+
+    /// cap より大きい既存 timeout は cap に縮む。
+    #[test]
+    fn cap_poll_timeout_shrinks_larger_value() {
+        let capped = cap_poll_timeout(PollTimeout::from(2000u16), 500);
+        assert_eq!(capped.as_millis(), Some(500));
+    }
+
+    /// cap より小さい既存 timeout はそのまま (= より短い cap が既に効いている)。
+    #[test]
+    fn cap_poll_timeout_keeps_smaller_value() {
+        let capped = cap_poll_timeout(PollTimeout::from(50u16), 500);
+        assert_eq!(capped.as_millis(), Some(50));
+    }
+
+    /// cap と同値はそのまま (= 余計に再生成しない)。
+    #[test]
+    fn cap_poll_timeout_keeps_equal_value() {
+        let capped = cap_poll_timeout(PollTimeout::from(500u16), 500);
+        assert_eq!(capped.as_millis(), Some(500));
     }
 
     // ---- R5-FB1: UntilWatcher unit tests ----

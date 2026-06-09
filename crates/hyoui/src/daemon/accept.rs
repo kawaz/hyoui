@@ -38,6 +38,7 @@ use crate::protocol::{
     Transport, UnixStreamTransport, intersect_caps,
 };
 use crate::sys::UnixSock;
+use crate::sys::clock::now_unix_ms;
 
 use super::DaemonConfig;
 use super::broadcast::{
@@ -483,14 +484,6 @@ pub(super) fn send_attach_redraw(
 /// hyoui 内 helper を経由することで「ここで所有権が移る」点を可視化する。
 pub(super) fn unix_stream_from_owned_fd(fd: OwnedFd) -> UnixStream {
     UnixStream::from(fd)
-}
-
-/// DR-0016 §3 lifecycle event の `ts_unix_ms` 用 (= epoch ms)。
-fn now_unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

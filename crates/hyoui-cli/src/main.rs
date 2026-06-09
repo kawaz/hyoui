@@ -219,6 +219,57 @@ fn print_session_required(cmd: &str) {
     eprintln!("       起動中の session 一覧は `hyoui list` で確認できます。");
 }
 
+/// daemon の応答 1 frame を待つ受信タイムアウト (= half-open 接続での永久 hang 防止)。
+///
+/// daemon は同期 request/response 設計なので健全時はこの上限に届かない。daemon
+/// process が消えたが socket FIN が流れていない half-open ケースで、blocking
+/// `recv_control` が永久に固まるのを防ぐ。
+const LOCK_RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `conn` の reader fd を poll して recv 可能になるまで最大 `timeout` 待つ。
+///
+/// 戻り値:
+/// - `Ok(true)`: POLLIN、caller は `recv_control` で frame を読める。
+/// - `Ok(false)`: timeout 超過 / POLLHUP / POLLERR (= daemon 無応答 or 消失)。
+///   caller は「daemon 消失」として error 終了すべき。
+/// - `Err`: poll(2) 自体の失敗。
+///
+/// EINTR は signal 割り込みなので通算 deadline で re-poll する。
+fn poll_recv_ready(
+    conn: &ClientConnection,
+    timeout: std::time::Duration,
+) -> Result<bool, hyoui::sys::Error> {
+    use hyoui::sys::poll::{PollFlags, PollOutcome, poll};
+    use nix::poll::{PollFd, PollTimeout};
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let fd = conn.reader_fd();
+        let mut fds = [PollFd::new(fd, PollFlags::POLLIN)];
+        let to = PollTimeout::try_from(remaining.as_millis().min(i32::MAX as u128) as i32)
+            .unwrap_or(PollTimeout::NONE);
+        match poll(&mut fds, to) {
+            Ok(PollOutcome::Ready(_)) => {
+                let re = fds[0].revents().unwrap_or(PollFlags::empty());
+                if re.contains(PollFlags::POLLIN) {
+                    return Ok(true);
+                }
+                if re.contains(PollFlags::POLLHUP) || re.contains(PollFlags::POLLERR) {
+                    return Ok(false);
+                }
+                // 想定外 revents は re-poll。
+            }
+            Ok(PollOutcome::Timeout) => return Ok(false),
+            Ok(PollOutcome::Interrupted) => continue,
+            Ok(_) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn main() -> ExitCode {
     // Skip argv[0]: parse_args expects the trailing arguments only.
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -2224,7 +2275,23 @@ fn lock_acquire_command(cfg: LockAcquireConfig) -> ExitCode {
             return ExitCode::from(1);
         }
         // response 待ち (frame 1 つ)。期待外の broadcast (mode.change 等) は捨てる。
+        // recv_control は blocking で read timeout を持たないため、daemon が half-open
+        // (= process 消失だが FIN 未着) で固まると永久 hang する。reader fd を poll で
+        // 監視して LOCK_RECV_TIMEOUT / POLLHUP を検知し、daemon 消失なら error 終了する。
         let response = loop {
+            match poll_recv_ready(&conn, LOCK_RECV_TIMEOUT) {
+                Ok(true) => {}
+                Ok(false) => {
+                    eprintln!(
+                        "hyoui: lock acquire: daemon が応答しません (= recv timeout、daemon が消失/停止した可能性)"
+                    );
+                    return ExitCode::from(1);
+                }
+                Err(e) => {
+                    eprintln!("hyoui: lock acquire: poll 失敗: {e}");
+                    return ExitCode::from(1);
+                }
+            }
             match conn.recv_control(None) {
                 Ok(hyoui::protocol::ControlMessage::LockResponse(lr)) => break lr,
                 Ok(hyoui::protocol::ControlMessage::Error(em)) => {
@@ -2605,7 +2672,16 @@ fn print_record_start_warning(output_path: &std::path::Path, secrecy: RecordInpu
         "  Output: {} (mode 0600, only readable by your user).",
         output_path.display()
     );
-    eprintln!("  Default input redaction: --input-secrecy={secrecy_str} is active.");
+    eprintln!("  Selected input secrecy: --input-secrecy={secrecy_str}.");
+    // redact-after-prompt は未実装 (= redaction 機構が無く stdin は素通しで記録
+    // される)。値を選んでも実際の redaction は行われないことを明示し、ユーザが
+    // 「redact されている」と誤認するのを防ぐ。
+    if matches!(secrecy, RecordInputSecrecyArg::RedactAfterPrompt) {
+        eprintln!(
+            "  NOTE: redact-after-prompt is NOT yet implemented; stdin is recorded\n        \
+             verbatim (no redaction). Secrets typed during recording WILL be stored."
+        );
+    }
     eprintln!("  Do NOT share record files outside your authentication boundary.");
 }
 

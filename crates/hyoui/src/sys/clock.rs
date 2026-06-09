@@ -1,11 +1,22 @@
-//! Monotonic clock — used by the agent loop for timeouts/heartbeats.
+//! Clock utilities — monotonic clock for timeouts/heartbeats, and wall-clock
+//! epoch helper for record event timestamps.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nix::sys::time::TimeSpec;
 use nix::time::{ClockId, clock_gettime};
 
 use super::error::{Error, Result};
+
+/// DR-0016 §3 — record event の `ts_unix_ms` 用 (= epoch ms)。
+///
+/// `SystemTime::UNIX_EPOCH` より前の時刻 (= 時計がリセットされた等) は `0` を返す。
+pub fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// `clock_gettime(CLOCK_MONOTONIC)` as a `Duration` since some unspecified
 /// epoch.

@@ -173,6 +173,27 @@ pub(super) fn enqueue_for_client(ch: &ClientHandle, payload: SharedBytes) -> Enq
     EnqueueOutcome::Sent
 }
 
+/// 1 client への enqueue 結果を評価し、overflow / writer dead なら disconnect
+/// 対象として `overflow_ids` に push する。overflow の場合は client に
+/// `backpressure.disconnect` error を best-effort 送信して切断理由を通知する。
+///
+/// 3 つの broadcast helper (`broadcast_master_bytes` / `broadcast_bytes` /
+/// `broadcast_control_with_cap`) の overflow 時挙動を統一するための共通ヘルパ
+/// (= 旧 `broadcast_control_with_cap` は backpressure error 通知を欠いて無通知で
+/// 切断していた)。
+fn handle_enqueue_outcome(ch: &ClientHandle, outcome: EnqueueOutcome, overflow_ids: &mut Vec<u64>) {
+    match outcome {
+        EnqueueOutcome::Sent => {}
+        EnqueueOutcome::Overflow => {
+            send_backpressure_error(ch, ch.queued_bytes.load(Ordering::Acquire));
+            overflow_ids.push(ch.id);
+        }
+        EnqueueOutcome::WriterDead => {
+            overflow_ids.push(ch.id);
+        }
+    }
+}
+
 /// `backpressure.disconnect` error message を best-effort で投げる。
 ///
 /// L5: 旧実装は `writer_tx.send` を直接呼んで `queued_bytes` をバイパスしていた。
@@ -308,16 +329,7 @@ pub(super) fn broadcast_master_bytes(
             Subscription::TailFollow { strip_ansi } => encode_tail(strip_ansi, &mut tail_cache),
         };
         if let Some(fb) = fb {
-            match enqueue_for_client(ch, fb) {
-                EnqueueOutcome::Sent => {}
-                EnqueueOutcome::Overflow => {
-                    send_backpressure_error(ch, ch.queued_bytes.load(Ordering::Acquire));
-                    overflow_ids.push(ch.id);
-                }
-                EnqueueOutcome::WriterDead => {
-                    overflow_ids.push(ch.id);
-                }
-            }
+            handle_enqueue_outcome(ch, enqueue_for_client(ch, fb), &mut overflow_ids);
         }
     }
     overflow_ids
@@ -351,6 +363,10 @@ pub(super) fn broadcast_control(clients: &mut [ClientHandle], msg: &ControlMessa
 ///
 /// 戻り値: 送信先 client のうち overflow / writer dead で disconnect すべき
 /// `client_id` 一覧。cap 不足で skip した client は含まない。
+///
+/// overflow 時は他 2 helper (`broadcast_master_bytes` / `broadcast_bytes`) と
+/// 同様に [`send_backpressure_error`] で切断理由を通知してから disconnect 対象に
+/// 加える (= [`handle_enqueue_outcome`] で挙動を統一)。
 pub(super) fn broadcast_control_with_cap(
     clients: &mut [ClientHandle],
     msg: &ControlMessage,
@@ -375,15 +391,11 @@ pub(super) fn broadcast_control_with_cap(
         if !ch.negotiated_caps.iter().any(|c| c == required_cap) {
             continue;
         }
-        match enqueue_for_client(ch, Arc::clone(&payload)) {
-            EnqueueOutcome::Sent => {}
-            EnqueueOutcome::Overflow => {
-                overflow_ids.push(ch.id);
-            }
-            EnqueueOutcome::WriterDead => {
-                overflow_ids.push(ch.id);
-            }
-        }
+        handle_enqueue_outcome(
+            ch,
+            enqueue_for_client(ch, Arc::clone(&payload)),
+            &mut overflow_ids,
+        );
     }
     overflow_ids
 }
@@ -419,16 +431,11 @@ pub(super) fn broadcast_bytes(clients: &mut [ClientHandle], payload: SharedBytes
     // (= memcpy O(payload.len())) を N clients 分繰り返していた。
     let mut overflow_ids: Vec<u64> = Vec::new();
     for ch in clients.iter() {
-        match enqueue_for_client(ch, Arc::clone(&payload)) {
-            EnqueueOutcome::Sent => {}
-            EnqueueOutcome::Overflow => {
-                send_backpressure_error(ch, ch.queued_bytes.load(Ordering::Acquire));
-                overflow_ids.push(ch.id);
-            }
-            EnqueueOutcome::WriterDead => {
-                overflow_ids.push(ch.id);
-            }
-        }
+        handle_enqueue_outcome(
+            ch,
+            enqueue_for_client(ch, Arc::clone(&payload)),
+            &mut overflow_ids,
+        );
     }
     overflow_ids
 }
@@ -476,6 +483,109 @@ mod tests {
         );
         // queued_bytes は変化なし (= Overflow 時は加算前に reject)
         assert_eq!(ch.queued_bytes.load(Ordering::Acquire), 100);
+    }
+
+    /// テスト用に `ClientHandle` を組み立てるヘルパ。`writer_tx` の rx 側を
+    /// 一緒に返すので、enqueue された payload を test 側で取り出せる。
+    fn make_test_client(
+        id: u64,
+        buffer_limit: usize,
+        caps: Vec<String>,
+    ) -> (
+        ClientHandle,
+        std::sync::mpsc::Receiver<SharedBytes>,
+        UnixStream,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel::<SharedBytes>();
+        let (peer, reader) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let ch = ClientHandle {
+            id,
+            mode: Mode::Rw,
+            leader: true,
+            subscription: Subscription::Raw,
+            negotiated_caps: caps,
+            writer_tx: tx,
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            buffer_limit,
+            writer_thread: None,
+            reader,
+        };
+        (ch, rx, peer)
+    }
+
+    /// overflow 時に backpressure error が client に通知されることを確認する
+    /// 共通テスト本体。3 つの broadcast helper で挙動が統一されたことの回帰。
+    ///
+    /// `broadcast` クロージャに対象 helper を渡し、queue を limit まで埋めた
+    /// client に 1 メッセージ broadcast する。overflow_id が返り、かつ
+    /// queue 末尾に `backpressure.disconnect` error frame が積まれていることを
+    /// 検証する (= `send_backpressure_error` が呼ばれた証跡)。
+    fn assert_overflow_notifies_backpressure<F>(caps: Vec<String>, broadcast: F)
+    where
+        F: FnOnce(&mut [ClientHandle]) -> Vec<u64>,
+    {
+        // buffer_limit を小さくし、予め limit ちょうどまで queue を埋めておく。
+        let (ch, rx, _peer) = make_test_client(7, 64, caps);
+        ch.queued_bytes.store(64, Ordering::Release);
+
+        let mut clients = vec![ch];
+        let overflow_ids = broadcast(&mut clients);
+
+        // overflow として disconnect 対象に挙がる
+        assert_eq!(overflow_ids, vec![7]);
+
+        // queue を浚って backpressure.disconnect error frame が積まれているか確認。
+        // (= broadcast 本体の payload は overflow で reject されるが、
+        //  send_backpressure_error が limit を超えて 1 frame 積む)
+        let mut found_backpressure = false;
+        while let Ok(payload) = rx.try_recv() {
+            let mut cur = std::io::Cursor::new(&payload[..]);
+            if let Ok(frame) = Frame::decode_from(&mut cur) {
+                if let Ok(ControlMessage::Error(err)) =
+                    ControlMessage::decode_from(frame.body.as_slice())
+                {
+                    if err.code == ErrorCode::BackpressureDisconnect {
+                        found_backpressure = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            found_backpressure,
+            "overflow 時に backpressure.disconnect error が通知されるべき"
+        );
+    }
+
+    /// `broadcast_bytes` の overflow 時 backpressure 通知 (既存挙動の回帰)。
+    #[test]
+    fn broadcast_bytes_notifies_backpressure_on_overflow() {
+        assert_overflow_notifies_backpressure(vec![], |clients| {
+            broadcast_bytes(clients, Arc::new(vec![0u8; 32]))
+        });
+    }
+
+    /// `broadcast_master_bytes` の overflow 時 backpressure 通知 (既存挙動の回帰)。
+    #[test]
+    fn broadcast_master_bytes_notifies_backpressure_on_overflow() {
+        assert_overflow_notifies_backpressure(vec![], |clients| {
+            broadcast_master_bytes(clients, b"some master output bytes", Instant::now())
+        });
+    }
+
+    /// `broadcast_control_with_cap` の overflow 時 backpressure 通知。
+    ///
+    /// 旧実装では overflow 時に `overflow_ids.push` のみで
+    /// `send_backpressure_error` を呼ばず、client は理由不明のまま切断されていた。
+    /// 共通ヘルパ化で他 2 helper と挙動が統一されたことを保証する。
+    #[test]
+    fn broadcast_control_with_cap_notifies_backpressure_on_overflow() {
+        let cap = "session-exit-v1";
+        let msg = ControlMessage::LeaderNotify(crate::protocol::messages::LeaderNotify {
+            client_id: Some(1),
+        });
+        assert_overflow_notifies_backpressure(vec![cap.to_string()], move |clients| {
+            broadcast_control_with_cap(clients, &msg, cap)
+        });
     }
 
     /// R5-H18: `ClientHandle::Drop` が writer_pump thread を確実に終了させること。

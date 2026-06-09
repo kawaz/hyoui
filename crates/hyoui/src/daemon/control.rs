@@ -48,6 +48,7 @@ use crate::protocol::messages::{
 };
 use crate::protocol::{ControlMessage, Frame, Mode, TYPE_CBOR_CONTROL, TYPE_RAW_DATA};
 use crate::scrollback::Scrollback;
+use crate::sys::clock::now_unix_ms;
 use crate::sys::{FdExt, Pty, WriteError};
 
 use super::DaemonConfig;
@@ -351,16 +352,6 @@ fn handle_session_child_resume_request(
             ts_unix_ms: now_unix_ms(),
         });
     ClientFrameOutcome::Continue
-}
-
-/// DR-0016 §3 lifecycle event の `ts_unix_ms` 用 (= epoch ms)。同 helper を
-/// session.rs にも置いているが、cross-module で参照すると pub 化が必要になり
-/// 副作用が大きいので、本 module でも独立に持つ (= 同じ epoch を返す)。
-fn now_unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 // === cap / mode 共通 helper ===

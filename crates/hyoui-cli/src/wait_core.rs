@@ -26,8 +26,19 @@ use hyoui::protocol::ControlMessage;
 use hyoui::protocol::messages::{
     ErrorMessage, SnapshotComponent, StateSnapshotRequest, StateSnapshotResponse,
 };
+use hyoui::sys::poll::{PollFlags, PollOutcome, poll};
+use nix::poll::{PollFd, PollTimeout};
 use regex::Regex;
 use serde::Deserialize;
+
+/// snapshot request 送信後、daemon の response 1 frame を待つ受信タイムアウト。
+///
+/// daemon は `screen.snapshot.request` を受けたら同期で即応答する設計のため、
+/// 健全な daemon ではこの上限に届くことはない。daemon が half-open (= process は
+/// 消えたが kernel が socket FIN を流していない) で固まったケースで永久 hang を
+/// 防ぐための上限値。`--timeout` (= pattern が出ない / idle にならない) とは別物で、
+/// 本値超過は「daemon 無応答」= I/O error として扱い、wait の意味論を変えない。
+const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// state-based wait の outcome (= subcommand / input family 共通)。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +176,57 @@ pub struct SnapshotProbe {
     pub sequence_no: Option<u64>,
 }
 
+/// `conn` の reader fd を poll して、recv 可能 (= POLLIN) になるまで最大 `timeout`
+/// 待つ。daemon 消失 (POLLHUP / POLLERR) と無応答 timeout を `WaitOutcome` に変換する。
+///
+/// - POLLIN: 即 `Ok(())`、caller が `recv_control` で frame を読める。
+/// - POLLHUP / POLLERR: daemon が socket を閉じた / 異常 → `IoError` (= daemon 消失)。
+/// - timeout 超過: daemon 無応答 → `IoError`。`--timeout` (= pattern が出ない) とは
+///   別物として扱い、ユーザ指定 timeout の意味論を変えない。
+/// - EINTR: signal で中断されただけなので re-poll する (= timeout は通算で計る)。
+fn wait_recv_ready(conn: &ClientConnection, timeout: Duration) -> Result<(), WaitOutcome> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(WaitOutcome::IoError(
+                "daemon が応答しません (= snapshot response 受信 timeout、daemon が消失/停止した可能性)"
+                    .to_string(),
+            ));
+        }
+        let fd = conn.reader_fd();
+        let mut fds = [PollFd::new(fd, PollFlags::POLLIN)];
+        let to = PollTimeout::try_from(remaining.as_millis().min(i32::MAX as u128) as i32)
+            .unwrap_or(PollTimeout::NONE);
+        match poll(&mut fds, to) {
+            Ok(PollOutcome::Ready(_)) => {
+                let re = fds[0].revents().unwrap_or(PollFlags::empty());
+                if re.contains(PollFlags::POLLIN) {
+                    return Ok(());
+                }
+                if re.contains(PollFlags::POLLHUP) || re.contains(PollFlags::POLLERR) {
+                    return Err(WaitOutcome::IoError(
+                        "daemon が socket を閉じました (= daemon 消失/停止)".to_string(),
+                    ));
+                }
+                // 想定外 revents は re-poll で確実な outcome を取り直す。
+            }
+            Ok(PollOutcome::Timeout) => {
+                return Err(WaitOutcome::IoError(
+                    "daemon が応答しません (= snapshot response 受信 timeout、daemon が消失/停止した可能性)"
+                        .to_string(),
+                ));
+            }
+            // EINTR: self-pipe 等の signal 割り込み、通算 deadline で再 poll。
+            Ok(PollOutcome::Interrupted) => continue,
+            Ok(_) => continue,
+            Err(e) => {
+                return Err(WaitOutcome::IoError(format!("poll 失敗: {e}")));
+            }
+        }
+    }
+}
+
 /// daemon から snapshot を 1 回取得する low-level helper。
 ///
 /// caller は include を必要最小限にすること (= cells を要らない場合は SequenceNo
@@ -180,6 +242,10 @@ pub fn fetch_snapshot(
     conn.send_control(&ControlMessage::StateSnapshotRequest(req))
         .map_err(|e| WaitOutcome::IoError(format!("snapshot request send 失敗: {e}")))?;
     loop {
+        // recv_control は blocking で socket-level read timeout を持たない。daemon が
+        // half-open (= process 消失だが FIN 未着) で固まると永久 hang するため、
+        // reader fd を poll で監視して RECV_TIMEOUT / POLLHUP を検知する。
+        wait_recv_ready(conn, RECV_TIMEOUT)?;
         let msg = conn
             .recv_control(None)
             .map_err(|e| WaitOutcome::IoError(format!("snapshot response recv 失敗: {e}")))?;

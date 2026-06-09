@@ -1,8 +1,8 @@
 //! `hyoui run --detached` の daemonize 実装。
 //!
 //! 親 process は `current_exe` を `__daemonize-run --socket=PATH --session=ID --
-//! CMD ARGS...` で spawn し、子の socket bind 完了を待ってから socket path を
-//! stdout に 1 行出して exit する。
+//! CMD ARGS...` で spawn し、子の socket bind 完了を待ってから **session 名**を
+//! stdout に 1 行出して exit する (= `hyoui attach <session>` にそのまま渡せる)。
 //!
 //! 子 ([`run_daemon_child`]) は setsid で controlling tty を切り、stdio を
 //! /dev/null に redirect、その後 `Session::start` → `Session::serve` を実行する。
@@ -20,7 +20,8 @@ use crate::socket_path;
 /// `hyoui run --detached` の parent path。
 ///
 /// 子 daemon process を spawn し、socket bind 完了 (= ready pipe からの 1 byte)
-/// を待ってから親は exit。stdout に socket path を 1 行出力する。
+/// を待ってから親は exit。stdout に **session 名** を 1 行出力する
+/// (= `hyoui attach <session>` にそのまま渡せる)。
 #[allow(clippy::too_many_arguments)]
 pub fn run_detached_parent(
     session_id_override: Option<String>,
@@ -40,9 +41,13 @@ pub fn run_detached_parent(
         debug_dump,
         cmd,
     ) {
-        Ok((_session_id, sock)) => {
-            // 子は live + bind 完了。親は exit。socket path を出力。
-            println!("{}", sock.display());
+        Ok((session_id, _sock)) => {
+            // 子は live + bind 完了。親は exit。stdout には **session 名** を出力する。
+            // (旧版は socket path を出していたが、socket path を session 引数として
+            // 渡すと `session_id too long` で弾かれ、README の Quickstart
+            // `S=$(hyoui run --detached ...)` → `hyoui attach $S` が動かなかった。
+            // breaking change だが v0.x なので OK。)
+            println!("{session_id}");
             ExitCode::SUCCESS
         }
         Err(code) => code,
@@ -141,21 +146,115 @@ pub fn spawn_detached_daemon_and_wait_ready(
     // EOF を返せるように)。
     let _ = nix::unistd::close(wr_raw);
 
-    if let Err(e) = spawn_result {
-        eprintln!("hyoui: spawn 失敗: {e}");
-        return Err(ExitCode::from(1));
-    }
+    let child_proc = match spawn_result {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hyoui: spawn 失敗: {e}");
+            return Err(ExitCode::from(1));
+        }
+    };
+    let child_pid = child_proc.id();
 
-    // ready pipe から 1 byte 読む (= 子が ready 通知)
-    let mut buf = [0u8; 1];
-    let n = nix::unistd::read(&rd, &mut buf);
+    // ready pipe から 1 byte 読む (= 子が ready 通知)。fd 継承異常などで子が
+    // ready byte を書かず、かつ close もしない (= EOF が来ない) 場合に親が無言
+    // hang するのを防ぐため、poll で READY_TIMEOUT を被せる。
+    let n = read_ready_with_timeout(&rd, READY_TIMEOUT);
     drop(rd);
 
     match n {
-        Ok(1) => Ok((session_id, sock)),
-        _ => {
-            eprintln!("hyoui: daemon child failed to start");
+        ReadyOutcome::Ready => Ok((session_id, sock)),
+        ReadyOutcome::Eof => {
+            // 子が ready を書かずに pipe を閉じた (= Session::start 失敗で early exit 等)。
+            eprintln!(
+                "hyoui: daemon child failed to start (pid: {child_pid}, socket: {})",
+                sock.display()
+            );
             Err(ExitCode::from(1))
+        }
+        ReadyOutcome::Timeout => {
+            eprintln!(
+                "hyoui: daemon child が {timeout_s}s 以内に ready 通知を返しませんでした \
+                 (= fd 継承異常 / 起動遅延の可能性、pid: {child_pid}, socket: {sock})\n\
+                 \x20      `hyoui list` で起動有無を確認し、不要なら `kill {child_pid}` で停止してください。",
+                timeout_s = READY_TIMEOUT.as_secs(),
+                sock = sock.display(),
+            );
+            Err(ExitCode::from(1))
+        }
+        ReadyOutcome::Error(e) => {
+            eprintln!(
+                "hyoui: daemon child の ready 通知 read 失敗: {e} (pid: {child_pid}, socket: {})",
+                sock.display()
+            );
+            Err(ExitCode::from(1))
+        }
+    }
+}
+
+/// daemon child の ready 通知を待つ poll タイムアウト。
+///
+/// 子は `Session::start` 直後 (= socket bind 完了直後) に ready byte を書くため、
+/// 健全時は数十〜数百 ms で届く。fd 継承異常で子が ready を書かず close もしない
+/// 異常時に親が無言 hang するのを防ぐための上限値。
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// [`read_ready_with_timeout`] の結果。
+enum ReadyOutcome {
+    /// ready byte (1 byte) を受信した。
+    Ready,
+    /// 子が ready を書かず pipe を閉じた (= EOF / read 0)。
+    Eof,
+    /// timeout 超過で ready byte が届かなかった。
+    Timeout,
+    /// poll / read の I/O error。
+    Error(String),
+}
+
+/// ready pipe の read 端を poll で監視し、最大 `timeout` 待って 1 byte 読む。
+///
+/// EINTR は signal 割り込みなので通算 deadline で re-poll する。
+fn read_ready_with_timeout(
+    rd: &impl std::os::fd::AsFd,
+    timeout: std::time::Duration,
+) -> ReadyOutcome {
+    use hyoui::sys::poll::{PollFlags, PollOutcome, poll};
+    use nix::poll::{PollFd, PollTimeout};
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return ReadyOutcome::Timeout;
+        }
+        let mut fds = [PollFd::new(rd.as_fd(), PollFlags::POLLIN)];
+        let to = PollTimeout::try_from(remaining.as_millis().min(i32::MAX as u128) as i32)
+            .unwrap_or(PollTimeout::NONE);
+        match poll(&mut fds, to) {
+            Ok(PollOutcome::Ready(_)) => {
+                let re = fds[0].revents().unwrap_or(PollFlags::empty());
+                if re.contains(PollFlags::POLLIN) {
+                    let mut buf = [0u8; 1];
+                    return match nix::unistd::read(rd, &mut buf) {
+                        Ok(1) => ReadyOutcome::Ready,
+                        Ok(_) => ReadyOutcome::Eof, // read 0 = EOF (= 子が close)
+                        Err(e) => ReadyOutcome::Error(e.to_string()),
+                    };
+                }
+                if re.contains(PollFlags::POLLHUP) {
+                    // 子が ready を書かず pipe を閉じた。残データがあるかもしれないので
+                    // 1 回 read を試みる (= POLLHUP でも buffered byte は読める)。
+                    let mut buf = [0u8; 1];
+                    return match nix::unistd::read(rd, &mut buf) {
+                        Ok(1) => ReadyOutcome::Ready,
+                        Ok(_) => ReadyOutcome::Eof,
+                        Err(e) => ReadyOutcome::Error(e.to_string()),
+                    };
+                }
+                // 想定外 revents は re-poll。
+            }
+            Ok(PollOutcome::Timeout) => return ReadyOutcome::Timeout,
+            Ok(PollOutcome::Interrupted) => continue,
+            Ok(_) => continue,
+            Err(e) => return ReadyOutcome::Error(e.to_string()),
         }
     }
 }
@@ -276,6 +375,11 @@ pub fn run_daemon_child() -> ExitCode {
             dcfg.expected_token = Some(token);
         }
     }
+    // 取り込み後は env を unset する (= HYOUI_DAEMONIZE_INIT と同じ流儀)。daemon が
+    // spawn する子 PTY (= 実コマンド) に HYOUI_LOCK_TOKEN が継承されると、子が env
+    // 経由で lock token を読めて認証境界を越えてしまう (= lock holder になりすませる)。
+    // daemon の expected_token として取り込んだ後は子に漏らさない。
+    hyoui::sys::env::remove_var_at_startup("HYOUI_LOCK_TOKEN");
     // R5-FB1: --until pattern を daemon に配線。
     if let Some(needle) = until {
         if !needle.is_empty() {
