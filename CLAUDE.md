@@ -96,7 +96,7 @@ DR-0013 完了で screen dump / snapshot / tail / wait 等の観測道具が揃�
 
 ## push
 
-`pkf run push` を使う。直接 `git push` / `jj git push` 禁止 (= deps で check + test + 翻訳ペア
+`just push` を使う。直接 `git push` / `jj git push` 禁止 (= deps で check + test + 翻訳ペア
 検証 + version bump 漏れ検出が走る)。
 
 ## 言語

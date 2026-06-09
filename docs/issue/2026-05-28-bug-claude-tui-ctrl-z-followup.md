@@ -64,3 +64,45 @@ kawaz の **正規 path** (= 手元 Ctrl-Z) でのみ再現する。私の役割
 - `docs/issue/2026-05-27-claude-tui-poc-followup.md` (= claude TUI PoC follow-up、Phase C scrollback で部分解決済)
 - DR-0001 軸 1 follow (= 親 STOPPED 検知 → follow / decouple 判断)
 - Issue 1 (= termios) / Issue 2 (= SIGCONT) と独立だが、同じ handler 周辺を触る
+
+---
+
+## 調査結果 2026-06-10 (= 「未確認事項」を実機で確定、想定パターン表の答え)
+
+> 検証者: Claude subagent (= 実機マトリクス検証)。バイナリ v0.2.6、Rust 未変更。
+> claude TUI 実機は使わず、SIG_DFL の代役 (cat/less/vim/python/bash) で
+> 「子が STOPPED するか」を直接観測 (= CLAUDE.md 検証主義、最低 3 カテゴリ)。
+
+### 結論: 想定パターン表の `T` でも `S` でもなく **「SIGTSTP が orphan group で
+discard され子が止まらない」が真因** (= 本質は claude 非依存の hyoui 構造問題)
+
+本 issue の「未確認事項 2 (= claude が SIGTSTP catch & continue?)」は **誤った前提**
+だった。claude が catch しているのではなく、**hyoui 構造上、子 (= claude を含む全 app)
+の process group が orphan になり、line discipline が生成した SIGTSTP を kernel が
+discard する**。claude が「suspended」message を出すのは claude 自身の handler だが、
+実際の STOP は orphan discard で起きない。
+
+→ 詳細・観測マトリクス・修正方針は姉妹 issue **`2026-05-29-bug-claude-tui-ctrl-z-not-stopping.md`
+の「調査結果 2026-06-10」に集約**。本 issue (= claude 限定の疑い) はその一般形 (=
+全 TUI app で同症状) に吸収される。
+
+### 想定パターン表への回答 (= 実測)
+
+| stat | 当初解釈 | 実測 |
+|---|---|---|
+| `T` | hyoui follow trigger 不在 | ✗ 子は T にならない |
+| `S` | claude が SIGTSTP catch & continue | △ 見かけは S だが理由が違う。catch でなく **orphan discard** |
+| `Ts+` | STOPPED + leader | ✗ 内側 Ctrl-Z / 外部 SIGTSTP では到達不能。外部 SIGSTOP でのみ `Ts+` 到達 |
+
+実測の核: 子は常に `Ss+` (= 止まらず session leader)。外部 `kill -STOP` を送った時だけ
+`Ts+` に止まる (= SIGSTOP は orphan でも discard 不可)。これが claude を含む全 app 共通。
+
+### claude 特有事項 (= 残る未確認、ただし優先度低)
+
+- claude の「Claude Code has been suspended」message は claude 自身の SIGTSTP handler
+  由来。orphan discard で実際の STOP は起きないので **message と実態が乖離** する
+  (= ユーザ期待「suspend したはず」vs 実態「走り続けている」)。これは hyoui 修正
+  (= 姉妹 issue 案 A4 で子に SIGSTOP を確実に届ける) で解消する見込み
+- claude 実機での `ps stat` 確認は未実施 (= 代役 5 種で一般法則を確定したため不要と
+  判断)。必要なら kawaz 正規 path で `ps -o stat -p <claude pid>` が `Ss+` を返すか
+  1 点確認すれば足りる

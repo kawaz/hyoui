@@ -231,6 +231,30 @@ unsafe を `sys/raw.rs` (forkpty / login_tty / TIOCSWINSZ) と `sys/signal.rs` (
 / self-pipe) の 2 ファイルに封じ込め。`sys/socket.rs` で perm 0600 / dir 0700 enforce、
 `sys/poll.rs` で poll(2) を type-safe に wrap、`sys/clock.rs` で Instant ↔ epoch ms。
 
+### 2.9 Record (`crates/hyoui/src/daemon/record.rs`)
+
+tty I/O timeline の永続録画
+([DR-0016](./decisions/DR-0016-tty-io-record.md))。daemon は byte stream の正本
+（broadcast 点で全 in/out byte を既に見ている）なので、録画は client broadcast
+経路とは独立した **daemon 内の I/O sink** として配線される。
+
+- `RecordRegistry` が session ごとの active record を保持。`record start/stop/list`
+  control message が生成 / drain / 列挙する
+- hot path は **bounded queue** に event を push し、専用の **writer task** が
+  ファイルへ drain する。queue を bounded にすることで、遅いディスクが PTY
+  read/write loop を止めたり観測している timing を歪めたりしないようにする
+  (DR-0016 の「観測対象を歪めない」invariant)
+- `RecordEvent` は in/out bytes、reject / write-error、lifecycle (start/stop、
+  SIGTSTP/SIGCONT)、monotonic な `seq` を運ぶ
+- format: `jsonl` (1 event 1 行、timestamp + lifecycle event つき。診断 timeline
+  format) と `raw` (単一方向の生 byte stream、timestamp なし。export 専用、
+  `--both` 不可)
+- cap: `record-v1` optional capability で gate し、旧 client も動作継続する
+- **⚠ secret redaction は未実装。** `--input-secrecy`（default `redact-after-prompt`）は
+  受理・保存されるが、redaction の state machine は Phase 5 に積み残しで、policy に
+  関わらず stdin は素通し記録される。`InSecretRedacted` / `push_in_secret_redacted` は
+  それまで dead code。
+
 ## 3. データフロー
 
 ### 3.1 attach 中の I/O

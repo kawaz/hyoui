@@ -161,3 +161,146 @@ protocol: 既存 `signal` message を「pgrp 送信」に変える (= codex 過�
 - DR-0015 §2.3 軸 2 廃止判断 (= 本 issue で部分 revisit する可能性)
 - DR-0001 §1 「内側 (= 子) は既に正しい」(= claude のような raw mode TUI では成立しない)
 - DR-0002 命名議論の核 (= 「Ctrl-Z x2 で claude を bg」)
+
+---
+
+## 調査結果 2026-06-10 (= 実機検証で orphan group discard 仮説を確定)
+
+> 検証者: Claude subagent (= 実機マトリクス検証)。バイナリ `target/release/hyoui`
+> v0.2.6。Rust コードは未変更 (= 調査のみ)。検証 harness は Python `pty.fork()` で
+> 実 PTY を作り、`hyoui run --session=ID -- CMD` を attach client 化、master fd に
+> Ctrl-Z byte (0x1a) を注入して子 stat / termios / foreground pgrp / session を観測。
+
+### 結論: orphan process group discard が **真の根本原因** (= 確定)
+
+issue の「推定原因 (= orphan group discard 仮説)」は **実機で確定した**。
+案 A1〜A3 が不可で、**案 A4 (= attach client が Ctrl-Z byte を intercept → daemon
+経由で子 pgrp に SIGSTOP) が唯一の実用解** という issue の推奨も裏取りできた。
+
+### 観測事実マトリクス (= 5 カテゴリ、winsize 80x24 設定済)
+
+| app | カテゴリ | 子 session | 内側 Ctrl-Z byte x2 | 外部 `kill -TSTP` → 子pgrp | 外部 `kill -STOP` → 子pgrp |
+|---|---|---|---|---|---|
+| cat | line-oriented | 子=leader (≠親) | Ss+ (止まらず) | **Ss+ (discard)** | **Ts+ (止まる)** |
+| less /etc/hosts | pager | 子=leader | Ss+ | **Ss+ (discard)** | **Ts+** |
+| vim | TUI alt-screen | 子=leader | Ss+ | **Ss+ (discard)** | **Ts+** |
+| python3 -u | REPL | 子=leader | Ss+ | **Ss+ (discard)** | **Ts+** |
+| bash --norc -i | shell | 子=leader | Ss+ | **Ss+ (discard)** | **Ts+** |
+
+全カテゴリで完全に一致 (= app 固有の独自 Ctrl-Z 処理は無関係、hyoui の構造問題で確定)。
+
+### 確定した因果 (= 推測ではなく観測 + コード裏取り)
+
+1. **子 PTY の line discipline は正常**: `ps -o tty` で子 tty を特定 → 別プロセスから
+   `O_NOCTTY` で open して `tcgetattr` で観測。`ISIG=True ICANON=True ECHO=True`、
+   `VSUSP=0x1a (26)`。**Ctrl-Z → SIGTSTP の変換設定自体は正しい**。
+   (= `forkpty(&ws, None)` で termios 未指定 = kernel default cooked、`raw.rs:102`)
+2. **子は独立 session leader**: 全 app で `pgid==pid==sid`、親 (= daemon) は別 session。
+   daemon は `daemonize.rs:358` で `setsid()` 済 (= controlling tty 切り離し)、子は
+   `forkpty + login_tty` で別 session leader。
+   → POSIX orphaned process group 定義 (= 「グループの全メンバーの親が、グループ
+   メンバーでもグループの session メンバーでもない」) を **両条件とも満たす**。
+3. **orphan group の SIGTSTP は kernel が discard**: 外部から `kill -TSTP` を子 pgrp に
+   直接送っても子は `Ss+` のまま (= 止まらない)。`kill -STOP` (= discard 不可) なら
+   `Ts+` に止まる。両者の差が orphan discard を直接証明。
+   POSIX 規範 (= 流し読み回避、正確に):
+   > If the process group is orphaned and the action of SIGTSTP, SIGTTIN, or
+   > SIGTTOU is SIG_DFL, the signal shall be discarded.
+
+   line discipline が VSUSP で生成する SIGTSTP の action は子側 default (SIG_DFL)、
+   かつ子グループは orphan → **生成された SIGTSTP は kernel が握り潰す**。
+
+### 棄却した仮説と根拠
+
+- **「子 PTY が raw mode 化されてて 0x1a を byte 消費」(= issue 推定 step 1)**:
+  ✗ 棄却。実測で子 PTY は cooked (ICANON=True, ISIG=True, VSUSP=0x1a)。
+  raw 化されていない。0x1a は SIGTSTP に変換される (= が orphan で discard)。
+- **「app (claude) 固有の独自 Ctrl-Z 処理が原因」(= issue 1 の当初疑い)**:
+  ✗ 棄却。cat/less/python/bash の SIG_DFL app でも同症状。app 非依存。
+- **「signal 配送経路 (daemon→子) 自体が壊れている」**:
+  ✗ 棄却。`kill -STOP` は確実に届いて子が `Ts+`。配送は健全、discard は SIGTSTP
+  限定の orphan 仕様。
+
+### 修正方針案 (= issue 推奨 A4 を実機で裏付け)
+
+**案 A4 (= attach client が Ctrl-Z byte 0x1a を intercept → daemon に suspend 要求 →
+daemon が `killpg(child_pgid, SIGSTOP)`)** が実機裏付けで唯一実用的:
+
+- SIGSTOP は orphan group でも discard されず確実に止まる (= 実機で `Ts+` 確認済)
+- 既存に `SessionChildResumeRequest` → `killpg(child, SIGCONT)` の **resume 経路は
+  存在する** (`control.rs:274 handle_session_child_resume_request`、`session.rs` の
+  `kill_pgrp(child, SIGCONT)`)。対称な suspend 経路 (= `SessionChildSuspendRequest`
+  → `killpg(child, SIGSTOP)`) を追加するだけで済む
+- DR-0015 §2.3 が「daemon が能動的に子を SIGSTOP する経路は本 DR では一切存在しない」と
+  明記して廃止した経路を、**子 self-stop ではなく client intercept 起点で復活**させる形
+
+### 該当コード箇所 (= file:line)
+
+- `crates/hyoui/src/sys/raw.rs:102` — `forkpty(&ws, None)` で子 PTY 起動 (= 子が
+  独立 session leader になる根本)。termios は default cooked
+- `crates/hyoui-cli/src/daemonize.rs:358` — daemon `setsid()` (= 子グループを orphan に
+  する要因。daemon と子が別 session)
+- `crates/hyoui/src/client/attach.rs:run` (= 約 387 行目以降の stdin→socket raw_data
+  経路) — ここで Ctrl-Z byte (0x1a) を detect して suspend 要求に変える intercept を
+  入れる (= detach prefix `process_detach_prefix` と同じレイヤ)
+- `crates/hyoui/src/daemon/control.rs:274` — 既存 `SessionChildResumeRequest` handler。
+  対称に `SessionChildSuspendRequest` handler を追加する箇所
+- `crates/hyoui/src/protocol/messages/session_lifecycle.rs` — `SessionChildResumeRequest`
+  の隣に `SessionChildSuspendRequest` 構造体 + cap flag を追加
+
+### 修正規模見積り (= 中規模)
+
+- 新 protocol message `SessionChildSuspendRequest` 1 個 + cap flag (= 既存
+  `child-state-v1` に相乗りも可) + round-trip test
+- `ControlMessage` enum variant 1 個追加
+- attach.rs の stdin 経路に Ctrl-Z intercept state machine (= detach prefix と同様、
+  env で disable 可能に。byte 0x1a 単発を見て suspend frame 送信)
+- daemon control.rs に suspend handler (= `killpg(child_pgid, SIGSTOP)`、resume の
+  対称形なので数十行)
+- attach client 自身も `raise(SIGSTOP)` して外側 shell に "suspended" を見せる
+  (= ユーザ体験維持。これは既存 follow policy の `raise(SIGSTOP)` 経路を流用)
+- → **新規実装は概ね resume 経路のミラー**。protocol + attach intercept + daemon
+  handler の 3 箇所、テスト込みで中規模
+
+### 注意 (= 検証中に観測した別バグ、本 issue とは独立)
+
+winsize 未設定 (= grid 0) の PTY で `hyoui run` を起動して子に出力させると
+**vt100-0.16.2 `screen.rs:827` で `drawing_cell(pos).unwrap()` が None で panic** し
+daemon が crash する (= 子も巻き込んで死ぬ)。winsize を 80x24 に設定すると再現しない。
+kawaz の実機 (= 正常な端末サイズ) では本 panic は通常踏まないが、別 issue として
+起票推奨 (= grid 0 / 極小サイズ耐性、vt100 への upstream 報告 or 自前ガード)。
+Ctrl-Z の orphan discard とは無関係 (= 切り分け済)。
+
+## 追加調査 2026-06-10 (= main session + kawaz 実機): 層 2 の発見と修正方針の更新
+
+> 詳細マトリクス・PoC コードは
+> [findings/2026-06-10-ctrl-z-two-layer-cause-and-session-anchor-poc.md](../findings/2026-06-10-ctrl-z-two-layer-cause-and-session-anchor-poc.md)
+> を正本とする。本節は issue としての結論差分のみ。
+
+### 原因は二層構造 (= 上記 orphan discard だけでは説明が閉じない)
+
+- **層 1**: orphan pgrp の SIGTSTP discard (= 上記調査の通り)
+- **層 2**: **daemon の auto-resume が、止まった子を即 SIGCONT で起こす**。
+  `kill -STOP` (= discard 不可) ですら子が止まったままにならないことを実機で確認
+  (daemon を先に SIGSTOP で止めた場合のみ子が Ts+ を維持 → daemon 再開で子も CONT
+  される)。該当: `session.rs` の DR-0001 軸 1 実装、leader 不在時 fallback の無条件
+  `killpg(child, SIGCONT)`。**案 A4 を実装しても層 2 と衝突する** (= detached 時の
+  suspend が即解除される) ため、auto-resume policy の見直しが必須。
+
+### 修正方針の更新 (= A4 は fallback に降格、session anchor 案を本命に)
+
+上記「案 A4 が唯一の実用解」は **層 2 未発見時点の結論**であり、以下で更新する:
+
+1. **本命: session anchor 案** (= forkpty 廃止、daemon が `openpty` + `TIOCSCTTY` で
+   controlling tty を持ち、child を同 session・別 pgrp・foreground で fork)。
+   macOS / Linux glibc / Linux musl の 3 platform PoC で `kill -TSTP` /
+   line discipline ^Z の両経路とも **SIGTSTP 本来のセマンティクス** (catch 可能 =
+   TUI の suspend cleanup が走る) で動作確認済み。
+   A4 の弱点 (= SIGSTOP は catch 不可なので vim/claude の alt-screen 解除・termios
+   復元が走らず raw のまま凍結) を持たない。プロセス構造も zsh 直接起動と同型に
+   なり透過性が向上する。残課題: DR-0003/0005/0001 改訂
+2. **fallback: 案 A4** (= session anchor 案に未知の障害が出た場合)
+3. supervisor 分離案は不採用方向 (= supervisor kill -9 で foreground pgrp に SIGHUP
+   → child 巻き添え死の新故障モード)
+4. tmux も同一制限を持つ (= 実証済)。本修正が入れば **「直接起動した子の ^Z が効く
+   PTY ラッパー」は hyoui の差別化点になる**

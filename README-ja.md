@@ -21,7 +21,7 @@
 daemon は子 PTY を [`vt100`](https://docs.rs/vt100) ベースの screen emulator で
 解釈し、**screen state の正本を持つ**。これによって attach 復元 (= alt screen
 常駐 TUI の観戦も含む)、wait の現在 visible state に対する match、structured
-snapshot などが安定して動作する ([[DR-0013]])。
+snapshot などが安定して動作する ([DR-0013](./docs/decisions/DR-0013-screen-emulator-and-attach-stability.md))。
 
 ## Who is hyoui for?
 
@@ -52,7 +52,7 @@ gateway 経由で外側から制御** する。
   画面を再描画するので、alt screen 常駐の TUI も画面崩壊なしで再現される
 - CI / スクリプトから入力注入と出力待ちで自動操作する（`hyoui input` の
   `text:` / `key:` / `paste:` / `wait:` / `wait-idle:` spec、`hyoui wait`、
-  `hyoui screen dump` / `screen snapshot`、`hyoui lock` / `tx`）
+  `hyoui screen dump` / `screen snapshot`、`hyoui record`、`hyoui lock`）
 - 複数 client で同じセッションを共有する（pair-programming、観戦、人手介入）
 
 ## Installation
@@ -81,14 +81,14 @@ cargo build --release
 # binary は target/release/hyoui
 ```
 
-### Homebrew (planned)
+### Homebrew
 
 ```bash
 brew install kawaz/tap/hyoui
 ```
 
-> tap への formula 公開は準備中（[`docs/issue/2026-05-27-homebrew-tap-deploy-key.md`](./docs/issue/2026-05-27-homebrew-tap-deploy-key.md)）。
-> それまでは上記 3 経路を使う。
+> formula は release のたびに `release.yml` が
+> [`kawaz/homebrew-tap`](https://github.com/kawaz/homebrew-tap) へ自動公開する。
 
 対応 platform: Linux / macOS（Rust 1.86+、PTY と Unix socket を使うため Windows は未対応）。
 
@@ -122,7 +122,7 @@ hyoui kill "$SESS"
 ```
 
 attach は daemon の screen state から 1 frame で画面を再描画する
-([[DR-0013]] §4 Phase A) ので、claude TUI のような alt screen 常駐アプリも
+([DR-0013](./docs/decisions/DR-0013-screen-emulator-and-attach-stability.md) §4 Phase A) ので、claude TUI のような alt screen 常駐アプリも
 detach 直前の状態が綺麗に復元される。
 
 ### 自動操作: input / wait / screen / lock
@@ -140,26 +140,34 @@ hyoui input "$SESS" "hex:1b5b41"
 # multi-line script を bracketed paste で
 hyoui input "$SESS" "paste:$(cat script.py)"
 
-# 単独 wait (= timeout / print 制御つき)
-hyoui wait "$SESS" "^\\$" --timeout=10s --print=line
+# 単独 wait (= 現在の visible state に対する regex マッチ、timeout つき)
+hyoui wait "$SESS" "^\\$" --timeout=10s
 
 # 画面 dump (= ANSI bytes、terminal で cat 再生可)
 hyoui screen dump "$SESS"
 hyoui screen dump "$SESS" --layer=both --rect=0,0,80,5
 
-# 構造化 snapshot (= JSON、jq で処理しやすい)
+# 構造化 snapshot (= wire 上は CBOR encoded StateSnapshotResponse)
+# 注: --format=json は forward-compat で未配線 (= 現状の出力は CBOR)。
+#     jq に流す前に CBOR デコーダを通すこと。
 hyoui screen snapshot "$SESS" --include=Cursor
-hyoui screen snapshot "$SESS" --include=Cells,Cursor,Mode | jq '.cursor'
+hyoui screen snapshot "$SESS" --include=Cells,Cursor,Mode
 
 # 排他取得 (= 他 client が強制 ro、自分は leader 強制昇格)
-hyoui lock acquire "$SESS" --timeout-idle=30s
+hyoui lock acquire "$SESS" --timeout=30s
 hyoui lock release "$SESS"
 
-# transactional な排他 (= 子プロセスに HYOUI_LOCK_TOKEN を注入、子 exit で自動解放)
-hyoui lock tx "$SESS" -- hyoui input "$SESS" "wait:^Prompt>" "text:..." "key:Enter"
+# tty I/O timeline をファイルに録画 (= jsonl)
+# ⚠ stdin の redaction はまだ未配線 — --input-secrecy の値に関わらず stdin は
+#   素通しで記録される。secret を打つ可能性があるなら --stdout のみに限定する。
+hyoui record start "$SESS" --output session.jsonl --both
+hyoui record list "$SESS"
+hyoui record stop "$SESS" --all
 
 # raw bytes を grep / 保存したい時は tail
-hyoui tail "$SESS" --since-strict --last-bytes=4096
+hyoui tail "$SESS" --last-bytes=4096
+# strict variant: 要求した window が scrollback から evict 済なら fail
+hyoui tail "$SESS" --since=10s --since-strict
 ```
 
 ### 主な subcommand
@@ -169,12 +177,14 @@ hyoui tail "$SESS" --since-strict --last-bytes=4096
 | `hyoui run [--detached] [--session=ID] [--size=COLSxROWS] -- cmd args...` | PTY 起動・daemon 化 |
 | `hyoui attach <session> [--mode=rw\|ro\|rw-no-leader]` | 入出力中継 (= screen state から画面復元) |
 | `hyoui list` | アクティブ session を列挙 |
-| `hyoui kill <session> [--signum=N]` | 子に signal 送出（default SIGTERM） |
+| `hyoui kill <session> [--signal=NUM_OR_NAME]` | 子に signal 送出（default SIGTERM、name / number 両対応。例 `--signal KILL` / `--signal 9`） |
+| `hyoui status <session>` | session 状態表示 (= clients / leader / lock / scrollback) |
 | `hyoui input <session> <spec>...` | 入力注入 (= `text:` / `hex:` / `file:` / `paste:` / `key:` / `wait:` / `wait-idle:` spec) |
 | `hyoui wait <session> <pattern>` | 現在 visible state に対する regex match 待ち |
 | `hyoui screen dump <session>` | 画面 ANSI dump (= terminal で cat 再生可) |
 | `hyoui screen snapshot <session>` | 構造化 state snapshot (= JSON / CBOR) |
-| `hyoui lock acquire\|release\|tx <session>` | 排他制御 (= 自動操作の atomic 性) |
+| `hyoui lock acquire\|release <session>` | 排他制御 (= 自動操作の atomic 性。`unlock` は `lock release` の alias、`tx` は未実装) |
+| `hyoui record start\|stop\|list <session>` | tty I/O timeline を永続録画 (= jsonl / raw)。**⚠ stdin redaction は未配線** |
 | `hyoui tail <session>` | raw bytes stream (= log / grep / asciinema 前段) |
 
 詳細仕様は [`docs/DESIGN.md`](./docs/DESIGN.md) と
@@ -209,7 +219,7 @@ hyoui は **terminal multiplexer ではない**。「人が中で生活する系
 | 外側 CLI からの入力注入 | **first-class** (`input` family) | × | × | library から call | ブラウザ経由 | 録画のみ |
 | 現在 visible state に対する待ち合わせ | **first-class** (`wait` state-based) | × | × | `expect()` (= 子 PTY stream regex) | × | × |
 | 構造化 snapshot / dump | **first-class** (`screen dump` / `screen snapshot`) | × | × | × | × | × |
-| 録画 / replay | 追加予定 | × | × | × | × | 中心機能 |
+| 録画 / replay | **record 出荷済**（`record start/stop/list`、jsonl/raw timeline）/ replay 追加予定 | × | × | × | × | 中心機能 |
 | HTTP / ブラウザ gateway | 追加予定 (= `kawaz/hyoui-serve`) | × | × | × | 中心機能 | replay のみ |
 | daemon ライフサイクル | 起動と同時、子 exit で終了 | session manager 型 | 永続 server | 子と心中 | server 型 | N/A |
 
@@ -237,10 +247,12 @@ v0.1.x = **外側 API 確立期**。
 - `run` / `attach` / `list` / `kill` + multi-attach + protocol cap negotiation:
   v0.1.0 で安定動作
 - screen emulator 採用 + attach handshake redraw + state-based wait /
-  snapshot / dump: [[DR-0013]] Phase A/B で完了 (= **claude TUI 観戦 / 自動操作
+  snapshot / dump: [DR-0013](./docs/decisions/DR-0013-screen-emulator-and-attach-stability.md) Phase A/B で完了 (= **claude TUI 観戦 / 自動操作
   の核となる機能が動作する状態**)
 - input family (= `text:` / `hex:` / `file:` / `paste:` / `key:` / `wait:` /
-  `wait-idle:` spec) と lock / tx の本実装も完了済
+  `wait-idle:` spec) と `lock` / `unlock` の本実装も完了済（`tx` は未実装）
+- `hyoui record start/stop/list` (= tty I/O timeline、jsonl/raw) は v0.2.2 で出荷。
+  ただし **stdin redaction (`--input-secrecy`) はまだ未配線**
 
 **production readiness**:
 
@@ -250,7 +262,7 @@ v0.1.x = **外側 API 確立期**。
 - production 利用: kawaz 自身が `claude` 駆動の daily-driver として使用
   (= eat your own dogfood)。業務運用にはまだ self-test 推奨
 - **production stable の目安**: `serve` gateway (= 別 repo `kawaz/hyoui-serve`)
-  公開と remaining 機能 (= record / replay、observability、L2 wait 等) の確立後
+  公開と remaining 機能 (= record redaction 配線、replay、observability、L2 wait 等) の確立後
 
 ロードマップ詳細: [`docs/ROADMAP.md`](./docs/ROADMAP.md)。
 

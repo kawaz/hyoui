@@ -24,7 +24,7 @@ The daemon parses the child PTY through a [`vt100`](https://docs.rs/vt100)-based
 screen emulator and **owns the canonical screen state**. That foundation is
 what makes attach restore (including observing alt-screen-resident TUIs),
 match-against-current-visible-state `wait`, and structured snapshots work
-reliably ([[DR-0013]]).
+reliably ([DR-0013](./docs/decisions/DR-0013-screen-emulator-and-attach-stability.md)).
 
 ## Who is hyoui for?
 
@@ -58,8 +58,8 @@ Primary use cases:
   come back without redraw glitches
 - Inject input and wait for output from CI / scripts via `hyoui input` with the
   `text:` / `key:` / `paste:` / `wait:` / `wait-idle:` spec family, plus
-  `hyoui wait`, `hyoui screen dump` / `screen snapshot`, and `hyoui lock` /
-  `tx`
+  `hyoui wait`, `hyoui screen dump` / `screen snapshot`, `hyoui record`, and
+  `hyoui lock`
 - Share one session across multiple clients (pair programming, observation,
   human-in-the-loop)
 
@@ -89,15 +89,14 @@ cargo build --release
 # binary at target/release/hyoui
 ```
 
-### Homebrew (planned)
+### Homebrew
 
 ```bash
 brew install kawaz/tap/hyoui
 ```
 
-> Formula publication to the tap is in progress (see
-> [`docs/issue/2026-05-27-homebrew-tap-deploy-key.md`](./docs/issue/2026-05-27-homebrew-tap-deploy-key.md)).
-> Until then, use one of the three install paths above.
+> The formula is auto-published to [`kawaz/homebrew-tap`](https://github.com/kawaz/homebrew-tap)
+> on each release by `release.yml`.
 
 Supported platforms: Linux / macOS (Rust 1.86+, PTY and Unix sockets — Windows
 is not supported).
@@ -132,7 +131,7 @@ hyoui kill "$SESS"
 ```
 
 Attach repaints the screen from the daemon's canonical state in a single
-frame ([[DR-0013]] §4 Phase A), so alt-screen-resident apps like the `claude`
+frame ([DR-0013](./docs/decisions/DR-0013-screen-emulator-and-attach-stability.md) §4 Phase A), so alt-screen-resident apps like the `claude`
 TUI come back exactly as they were before detach.
 
 ### Automation: input / wait / screen / lock
@@ -150,27 +149,34 @@ hyoui input "$SESS" "hex:1b5b41"
 # multi-line script via bracketed paste
 hyoui input "$SESS" "paste:$(cat script.py)"
 
-# standalone wait (with timeout / printing controls)
-hyoui wait "$SESS" "^\\$" --timeout=10s --print=line
+# standalone wait (regex against the current visible state, with timeout)
+hyoui wait "$SESS" "^\\$" --timeout=10s
 
 # screen dump (ANSI bytes; reproduces in a terminal via cat)
 hyoui screen dump "$SESS"
 hyoui screen dump "$SESS" --layer=both --rect=0,0,80,5
 
-# structured snapshot (JSON; easy to pipe into jq)
+# structured snapshot (CBOR-encoded StateSnapshotResponse on the wire)
+# NOTE: --format=json is forward-compat and NOT wired yet; output is CBOR today,
+#       so decode with a CBOR tool before piping to jq.
 hyoui screen snapshot "$SESS" --include=Cursor
-hyoui screen snapshot "$SESS" --include=Cells,Cursor,Mode | jq '.cursor'
+hyoui screen snapshot "$SESS" --include=Cells,Cursor,Mode
 
 # exclusive acquire (other clients become forced-ro; you become leader)
-hyoui lock acquire "$SESS" --timeout-idle=30s
+hyoui lock acquire "$SESS" --timeout=30s
 hyoui lock release "$SESS"
 
-# transactional locking (child process inherits HYOUI_LOCK_TOKEN;
-# auto-released on child exit)
-hyoui lock tx "$SESS" -- hyoui input "$SESS" "wait:^Prompt>" "text:..." "key:Enter"
+# record the tty I/O timeline to a file (jsonl)
+# ⚠ stdin redaction is NOT wired yet — stdin is recorded verbatim regardless of
+#   --input-secrecy. Limit to --stdout if you may type secrets.
+hyoui record start "$SESS" --output session.jsonl --both
+hyoui record list "$SESS"
+hyoui record stop "$SESS" --all
 
 # raw byte stream for grep / save (log / asciinema preprocessing)
-hyoui tail "$SESS" --since-strict --last-bytes=4096
+hyoui tail "$SESS" --last-bytes=4096
+# strict variant: fail if the requested window was already evicted from scrollback
+hyoui tail "$SESS" --since=10s --since-strict
 ```
 
 ### Main subcommands
@@ -180,12 +186,14 @@ hyoui tail "$SESS" --since-strict --last-bytes=4096
 | `hyoui run [--detached] [--session=ID] [--size=COLSxROWS] -- cmd args...` | Start a PTY and daemonize |
 | `hyoui attach <session> [--mode=rw\|ro\|rw-no-leader]` | I/O bridge (repaints from screen state on attach) |
 | `hyoui list` | Enumerate active sessions |
-| `hyoui kill <session> [--signum=N]` | Send a signal to the child (default SIGTERM) |
+| `hyoui kill <session> [--signal=NUM_OR_NAME]` | Send a signal to the child (default SIGTERM; name or number, e.g. `--signal KILL` / `--signal 9`) |
+| `hyoui status <session>` | Print session status (clients / leader / lock / scrollback) |
 | `hyoui input <session> <spec>...` | Inject input via `text:` / `hex:` / `file:` / `paste:` / `key:` / `wait:` / `wait-idle:` specs |
 | `hyoui wait <session> <pattern>` | Wait until a regex matches the current visible state |
 | `hyoui screen dump <session>` | Dump the screen as ANSI bytes (terminal-replayable) |
 | `hyoui screen snapshot <session>` | Structured screen-state snapshot (JSON / CBOR) |
-| `hyoui lock acquire\|release\|tx <session>` | Exclusion for atomic automation |
+| `hyoui lock acquire\|release <session>` | Exclusion for atomic automation (`unlock` is an alias for `lock release`; `tx` is not yet implemented) |
+| `hyoui record start\|stop\|list <session>` | Persist the tty I/O timeline (jsonl / raw). **⚠ stdin redaction is not yet wired** |
 | `hyoui tail <session>` | Raw byte stream (logging / grep / asciinema preprocessing) |
 
 See [`docs/DESIGN.md`](./docs/DESIGN.md) and
@@ -221,7 +229,7 @@ intended composition.
 | Input injection from external CLI | **first-class** (`input` family) | no | no | library call | via browser | record-only |
 | Wait against the current visible state | **first-class** (state-based `wait`) | no | no | `expect()` (child PTY stream regex) | no | no |
 | Structured snapshot / dump | **first-class** (`screen dump` / `screen snapshot`) | no | no | no | no | no |
-| Record / replay | planned | no | no | no | no | core feature |
+| Record / replay | **record shipped** (`record start/stop/list`, jsonl/raw timeline); replay planned | no | no | no | no | core feature |
 | HTTP / browser gateway | planned (= `kawaz/hyoui-serve`) | no | no | no | core feature | replay only |
 | Daemon lifecycle | starts with `run`, exits with the child | session manager | long-lived server | dies with the child | server | N/A |
 
@@ -254,11 +262,13 @@ v0.1.x = **external API stabilization phase**.
 - `run` / `attach` / `list` / `kill` + multi-attach + protocol cap
   negotiation: stable since v0.1.0
 - Screen emulator adoption + attach handshake redraw + state-based wait /
-  snapshot / dump: completed in [[DR-0013]] Phase A/B (= the **core machinery
+  snapshot / dump: completed in [DR-0013](./docs/decisions/DR-0013-screen-emulator-and-attach-stability.md) Phase A/B (= the **core machinery
   for observing claude TUI sessions and driving them from the outside is in
   place**)
 - The input family (`text:` / `hex:` / `file:` / `paste:` / `key:` / `wait:`
-  / `wait-idle:` specs) and lock / tx are implemented
+  / `wait-idle:` specs) and `lock` / `unlock` are implemented (`tx` is not yet)
+- `hyoui record start/stop/list` (tty I/O timeline, jsonl/raw) ships since
+  v0.2.2; **stdin redaction (`--input-secrecy`) is not yet wired**
 
 **Production readiness:**
 
@@ -269,8 +279,8 @@ v0.1.x = **external API stabilization phase**.
   (eat-your-own-dogfood), but treat business-critical use as self-test
   territory for now
 - **Production-stable target**: after the `serve` gateway (in a separate repo
-  `kawaz/hyoui-serve`) ships and the remaining work (record / replay,
-  observability, L2 wait, ...) lands
+  `kawaz/hyoui-serve`) ships and the remaining work (record redaction wiring,
+  replay, observability, L2 wait, ...) lands
 
 Roadmap details: [`docs/ROADMAP.md`](./docs/ROADMAP.md).
 

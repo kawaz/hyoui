@@ -178,22 +178,26 @@ Wild debugger / Competitive 分析 / Rust API 設計
 
 ### CRITICAL
 
-- [ ] **R5-C1** CBOR decode に recursion limit 無し → 認証前 remote daemon crash
+- [x] **R5-C1** CBOR decode に recursion limit 無し → 認証前 remote daemon crash
   - 出典: Audit (R5-AUD-C1) / 該当: `crates/hyoui/src/protocol/messages/mod.rs:156`, `daemon/accept.rs:179`
   - 攻撃面: handshake は token 検証**前**に decode、socket 到達可能な同 UID プロセスが認証無しで daemon abort 可能 (panic=abort と相乗)
   - 提案: `ciborium::de::Deserializer::with_recursion_limit(32)` で wrap、または handshake frame size を 64 KiB 別 cap に絞る
-- [ ] **R5-C2** `session_id` path traversal で任意 0700 dir の socket file unlink/上書き
+  - 解消: `protocol/messages/mod.rs` の `from_reader_with_recursion_limit(r, MAX_CBOR_RECURSION_DEPTH)` で wrap 済み。`RecursionLimitExceeded` は `ControlMessageError::Decode` としてハンドルされ daemon abort しない
+- [x] **R5-C2** `session_id` path traversal で任意 0700 dir の socket file unlink/上書き
   - 出典: Audit (R5-AUD-C2) / 該当: `crates/hyoui-cli/src/socket_path.rs:66`
   - 攻撃面: 同 UID 攻撃者が `session_id="../../.ssh/control"` を渡すと `UnixSock::listen` の `unlink(&path)` が `~/.ssh/control` を吹き飛ばす
   - 提案: `[A-Za-z0-9._-]{1,64}` whitelist で CLI 入口 + library API 双方で validate。R5-AUD-M4 (handshake response 経由の ANSI injection) も同時解決
-- [ ] **R5-C3** master PTY への client write が EAGAIN で即 DropClient → 子の slow-reader 経由 client DoS
+  - 解消: `socket_path.rs::validate_session_id` (= `hyoui::cli::validate_session_id` の wrapper) を実装。`PathBuf::join` 前に必ず呼ぶよう `socket_path_for` に配線済み。回帰テスト多数 (`path_traversal`, `ansi_escape`, `too_long` 等)
+- [x] **R5-C3** master PTY への client write が EAGAIN で即 DropClient → 子の slow-reader 経由 client DoS
   - 出典: Kernel (R5-KER-C1) / 該当: `daemon/control.rs:105`, `sys/fd.rs:30`
   - 状況: master は nonblock、`FdExt::write_all` は EAGAIN を retry せず即 Error 返し、`handle_client_frame` は DropClient。Linux PTY buffer 4-8 KiB に対し client が 16 KiB paste で silent disconnect
   - 提案: write loop で `poll(master, POLLOUT)` 待ちか、master 向け bounded per-target write queue を 1 本足す
-- [ ] **R5-C4** wire protocol が生 signal number (u8) を送る → cross-OS 不整合
+  - 解消: `control.rs` に `write_all_with_idle_timeout` を導入。EAGAIN 時は `poll(master, POLLOUT)` で待ち、`MASTER_WRITE_IDLE_TIMEOUT_MS` 超過で「forward progress なし」エラーとして DropClient に格上げ (DoS で silent 切断する代わりに、無進捗状態を明示ログ)
+- [x] **R5-C4** wire protocol が生 signal number (u8) を送る → cross-OS 不整合
   - 出典: POSIX (R5-POSIX-C1) / 該当: `protocol/messages/control.rs:25-26`, `lifecycle.rs:31-33`, DR-0008 §protocol
   - 状況: POSIX.1-2008 は signal 値を規定しない。SIGUSR1/USR2/CHLD/STOP/TSTP は Linux と macOS で値が異なる。v0.2.0 serve gateway (HTTP/WebSocket remote) で cross-OS client が叩いた瞬間に破綻
   - 提案: wire を **signal 名 string** に変更 (`"signal": "SIGTERM"`)、daemon 側で OS native 値に解決。**v0.2.0 serve gateway 着手前の breaking change で実施**
+  - 解消: DR-0012 (`DR-0012-signal-wire-name-not-number.md`) 起票済み + 実装済み (INDEX: ✅)。`protocol/messages/control.rs` の wire は signal name string、`normalize_signal_spec` で NUM/NAME 両受け → SIG-prefix 大文字 name に正規化。`--signum` は廃止エラーで `--signal` へ誘導
 
 ### HIGH
 
@@ -220,10 +224,11 @@ Wild debugger / Competitive 分析 / Rust API 設計
   - 出典: Classic (R5-CLS-H2)
   - 状況: HTTP/TLS/WebSocket dep (hyper/tokio/rustls) が `hyoui-cli` の supply chain に視認される。`websocketd hyoui attach $SESS` で 90% 代替可能
   - 提案: `kawaz/hyoui-serve` を別 repo として開始、core repo の Cargo.toml を `nix + serde + ciborium + regex` の lean な状態で v0.x 全期間維持
-- [ ] **R5-H6** SIGCHLD self-pipe 不在 = 子 state transition 検出が polling 経路にのみ依存
+- [x] **R5-H6** SIGCHLD self-pipe 不在 = 子 state transition 検出が polling 経路にのみ依存
   - 出典: Kernel+Perf (R5-KER-H3, R5-PERF-H3) / 該当: `daemon/pty.rs::ChildLifecycle::poll`, ALIVE_RETRY_INTERVAL=5ms
   - 状況: SIGCONT 検出 latency が最大 500ms (Ctrl-Z → fg の半秒 freeze)、master EOF 後 5ms busy spin
   - 提案: `sys/signal.rs` の self-pipe infra で `SIGCHLD` を register、serve_loop の poll_fds に追加。一行で latency ms オーダー、busy spin 撤廃。forkpty 子側で `SIGCHLD: SIG_DFL` リセット必要 (= R5-KER-M4)
+  - 解消: `session.rs` に `SigchldOwner` + `acquire_sigchld_selfpipe()` を実装。`Session::serve` 開始時に process-wide SIGCHLD self-pipe ownership を取得し、serve_loop の `poll_fds` に self-pipe fd を追加。SIGCHLD wake-up で `waitpid(WNOHANG|WCONTINUED)` を drain。取得失敗時は fallback (500ms timeout 継続) で graceful degradation
 - [ ] **R5-H7** `Session::Drop` / `finalize_child` の signal が child PID 単独 → 孫プロセス orphan 化
   - 出典: Kernel+POSIX (R5-KER-H2, R5-POSIX-M2) / 該当: `daemon/session.rs:263, 282, :627`
   - 状況: `kill(child, SIGTERM)` は session leader 1 つだけ。`hyoui run /bin/sh -c 'sleep 9999 &'` で sleep orphan 化、init/launchd に re-parent。tmux/screen/abduco は全て pgid 単位
@@ -370,9 +375,10 @@ Wild debugger / Competitive 分析 / Rust API 設計
   - 出典: Audit+POSIX (R5-AUD-M2, R5-POSIX-I3) / 該当: `socket_path.rs:21-23`
   - 提案: `format!("run-{}-{}", pid, rand_suffix)` (8 hex chars)
   - 解消: `socket_path.rs::auto_session_id` を `run-<pid>-<rand4hex>` (4 byte = 8 hex char) に変更。`/dev/urandom` 直読み (rand crate 依存を増やさない)、failure 時は `run-<pid>` に silent fallback。連続生成で接尾辞がバラけることと `validate_session_id` を通過することを test で確認。`cli.rs` の関連 doc 文言も更新。
-- [ ] **R5-M25** `DaemonConfig.expected_token` の `Debug` derive で全文表示しうる (R4-H8 延長)
+- [x] **R5-M25** `DaemonConfig.expected_token` の `Debug` derive で全文表示しうる (R4-H8 延長)
   - 出典: Audit (R5-AUD-M6) / 該当: `daemon/config.rs:43`
   - 提案: `expected_token` を `secrecy::SecretString` 風 newtype に包むか、`DaemonConfig` Debug を手書きで redact
+  - 解消: `DaemonConfig` の `#[derive(Debug)]` を撤去し、`impl std::fmt::Debug for DaemonConfig` を手書き。`expected_token` は `&self.expected_token.as_ref().map(|_| "<redacted>")` で token 値を表示しない
 - [ ] **R5-M26** `HYOUI_DETACH_PREFIX` env が printable byte (例: 'a') を受理 → ロックアウト DoS
   - 出典: Audit (R5-AUD-M7) / 該当: `client/attach.rs:94-127`
   - 提案: env validate で control character (0x20 未満 + 0x7f) のみ受理、printable byte は reject
@@ -476,9 +482,10 @@ Wild debugger / Competitive 分析 / Rust API 設計
   - 出典: Audit (R5-AUD-I4)
 - [ ] **R5-I28** `IUTF8` 以外 raw mode で `ONLCR` 落ち → CR-only 出力で line break 見えなくなる
   - 出典: Kernel (R5-KER-I3) / 提案: README に "raw mode は ONLCR を落とす" 1 行
-- [ ] **R5-I29** Ctrl-A D 一個だけの in-band escape が DR-0005「透明性最優先」と文言整合性 (子に対しては透過、ユーザ視点では 1 個)
+- [x] **R5-I29** Ctrl-A D 一個だけの in-band escape が DR-0005「透明性最優先」と文言整合性 (子に対しては透過、ユーザ視点では 1 個)
   - 出典: Classic (R5-CLS-I5) / R4-M4 / R4-M16 と統合
   - 提案: DR-0005 文言を「子に対して in-band escape 無し」と狭める、または `Ctrl-A D` を廃止して `hyoui detach <session>` (out-of-band only)
+  - 解消: DR-0005 冒頭に注記 (2026-06-10) を追加。「attach client の `Ctrl-A D` は唯一の例外だが、子の stdin には届かない (= attach client のローカル解釈)。子への入力経路 (`hyoui input`) には prefix キーを一切持たない」と整理し文言矛盾を解消
 - [ ] **R5-I30** `--` の必要性が subcommand 不揃い (Rule of Least Surprise)
   - 出典: Classic (R5-CLS-M5) / 提案: 「複数 positional 取る subcommand は `--` 必須」をルール明文化
 - [ ] **R5-I31** launch announcement (HN/Reddit/lobste.rs) 準備不在 (v0.2.0 タイミングで)
@@ -575,7 +582,8 @@ commit `e39179f6` で D1-D8 + H1-H7 + L1-L6 全件解消済。詳細は jj log �
 
 ## Field findings (= 実機検証由来、cmux-msg 検証セッション 2026-05-27)
 
-出典: `docs/issue/2026-05-27-cmux-msg-experiment-feedback-v020-refresh.md` + `docs/findings/2026-05-27-headless-claude-remote-control-leak.md`
+出典: `docs/findings/2026-05-27-cmux-msg-hyoui-integration-feedback.md` + `docs/findings/2026-05-27-headless-claude-remote-control-leak.md`
+<!-- 注: 旧 `docs/issue/2026-05-27-cmux-msg-experiment-feedback-v020-refresh.md` は不存在。正しくは findings 配下の cmux-msg-hyoui-integration-feedback.md -->
 
 ### B1-B8
 
@@ -583,7 +591,8 @@ commit `e39179f6` で D1-D8 + H1-H7 + L1-L6 全件解消済。詳細は jj log �
   - 出典: 実機検証 / 解消 (2026-05-27): `DaemonConfig.until` + `UntilWatcher` (= sliding window matcher with carry buffer) を serve_loop に配線。master byte stream の chunk 境界を跨ぐ needle も検出。match 時に `kill_pgrp(child, SIGTERM)` → `ClientDetachedOrKilled` 経路で finalize
 - [done] **R5-FB2** headless mode で stdin EOF が子に伝わらない (= `echo "1+2" | hyoui run -- bc` で hang)
   - 出典: 実機検証 / 解消 (2026-05-27): `StdinEofAction` enum (Detach / SendEof) を `hyoui::client` に新設、`ClientConnection::with_stdin_eof_action(SendEof)` で stdin EOF 時に EOT (0x04) を子 PTY に raw_data 送信。`hyoui-cli/main.rs::run_command` で stdin が TTY 以外の場合 (= pipe / file / heredoc) に SendEof を自動選択
-- [ ] **R5-FB3** `hyoui run --detached` 未実装 (= attach --help の RELATED 節に記載あるが本体未実装、v0.2.0 scope に組み込み要)
+- [x] **R5-FB3** `hyoui run --detached` 未実装 (= attach --help の RELATED 節に記載あるが本体未実装、v0.2.0 scope に組み込み要)
+  - 解消: `hyoui-cli/src/daemonize.rs` に `run_detached_parent` / `spawn_detached_daemon_and_wait_ready` 実装済み。`RunConfig.detached: bool` フラグで `main.rs::run_command` が分岐し、detached path では daemon spawn → ready pipe 通知待ち → 親 exit の流れを実装
 - [done] **R5-FB4** `run` 直後の wait/status が ENOENT (= socket 作成 race)
   - 出典: 実機検証 / 解消 (2026-05-27): `connect_with_retry()` helper を `hyoui-cli/main.rs` に新設、socket 不存在系 errno (ENOENT / ECONNREFUSED) のみ 100ms × 20 attempts = 2s budget で retry。attach / kill / status / tail / wait の 5 subcommand に適用。認証エラー / protocol error は retry せず即 fail で hint 経路へ
 - [done] **R5-FB5** `--socket` 親 dir mode エラー文言が不親切 (= hint 追記で改善)

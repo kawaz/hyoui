@@ -1,7 +1,7 @@
 # hyoui justfile
 #
 # Canonical task runner. VCS 操作 (clean check / diff / commit / push) と翻訳ペア
-# 鮮度チェックは `bump-semver vcs` サブコマンド (DR-0020 系) に委譲して jj/git 透過化。
+# 鮮度チェックは `bump-semver vcs` サブコマンドに委譲して jj/git 透過化。
 # kawaz/bump-semver・kawaz/claude-gh-monitor の justfile と同じ流儀。
 #
 # Taskfile.pkl は残置 (pkf 運用は廃止だが file としては残す)。

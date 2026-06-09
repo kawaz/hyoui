@@ -128,3 +128,62 @@ stty -a < /dev/ttys<N>
 - `crates/hyoui/src/daemon/pty.rs::ChildLifecycle` (= state 追跡)
 - `crates/hyoui/src/client/attach.rs::run` (= SessionChildStoppedNotify 受信 + raise(SIGSTOP))
 - DR-0015 §2.2 / DR-0001 軸 1 follow
+
+---
+
+## 調査結果 2026-06-10 (= 「2 度目以降」以前に「子が一度も止まらない」が確定)
+
+> 検証者: Claude subagent (= 実機マトリクス検証)。バイナリ v0.2.6、Rust 未変更。
+
+### 結論: 本 issue の前提「1 度目の Ctrl-Z で子が suspend した」が **実は成立して
+いない**。真因は姉妹 issue の orphan group discard
+
+実機検証で、`hyoui run -- sleep` の **子 (sleep) は 1 度目の内側 Ctrl-Z でも止まらない**
+ことが確定した (= 子は常に `Ss+`、外部 `kill -STOP` でのみ `Ts+`)。よって仮説 A/B/C
+(= ChildLifecycle の transition 取りこぼし / attach loop の state / 子 PTY termios 変化)
+は **いずれも本 issue の主因ではない**。
+
+→ 観測マトリクス・確定した因果・修正方針は
+**`2026-05-29-bug-claude-tui-ctrl-z-not-stopping.md` の「調査結果 2026-06-10」に集約**。
+本 issue (= sleep の 2 度目) はその orphan discard 問題の一症状。
+
+### 仮説の棄却根拠 (= 実機 + コード)
+
+- **仮説 A (= daemon notify が 1 回限り / WCONTINUED 取りこぼし)**: ✗ 棄却。
+  `pty.rs::ChildLifecycle::poll_with_transition` は `WUNTRACED|WCONTINUED` で
+  Stopped/Continued を正しく state 追跡しており (= `stopped` flag を Continued で
+  false に戻す)、`session.rs` serve_loop の複数箇所が transition 毎に
+  `notify_child_stopped` を呼ぶ。コード上 2 度目 Stopped は再 notify される設計。
+  そもそも 1 度目で子が STOPPED しない (= notify 自体が発火しない) ので、この経路は
+  本症状に到達しない。
+- **仮説 C (= 子 PTY termios が 1 度目で変化)**: ✗ 棄却。子 PTY termios は
+  `ISIG=True ICANON=True VSUSP=0x1a` で安定 (= Ctrl-Z 前後で不変)。子は常に
+  cooked。SIGTSTP は生成されるが orphan group で discard される。
+- **仮説 B (= attach loop の socket 受信 state)**: △ 主因ではない。1 度目で notify が
+  来ないので attach の受信 state を疑う前段で詰む。
+
+### 「kawaz の sleep 報告では 1 度目 suspended に見えた」件 = 残る仮説 (= 未確定)
+
+kawaz の実機 (= zsh から `hyoui run -- sleep`、`zsh: suspended` 表示) と、本検証
+(= Python pty で attach を session leader 化、`zsh: suspended` 相当が出ない) で
+**1 度目の見かけが食い違う**。本検証では外側 shell (bash --norc -i, `set -m`) から
+`hyoui run -- sleep` を起動し外側 tty に 0x1a を送っても、attach は `S+` のまま
+止まらず `^Z` が echo されるだけだった (= 1 度目も suspended しない再現)。
+
+- 観測事実: 本検証環境では「1 度目から止まらない」(= attach は外側 tty を raw 化
+  済で ISIG off、0x1a は byte として子へ → orphan discard)
+- 残る仮説 (= 未検証): kawaz の zsh では (a) `hyoui run` 親が `exec attach` に変身する
+  **前**の一瞬 (= 外側 tty まだ raw 化前) に Ctrl-Z が当たると、外側 line discipline が
+  SIGTSTP に変換し run 親が STOPPED → `zsh: suspended` 表示、もしくは (b) zsh と bash の
+  job control / raw mode タイミング差。**この 1 度目の差は orphan discard の本筋とは
+  別レイヤ**で、修正 (= 姉妹 issue 案 A4) が入れば「1 度目から確実に子も止まる」ため
+  食い違い自体が解消する見込み
+
+### 次の検証手順 (= 1 度目の食い違いを詰めるなら)
+
+1. kawaz 正規 path (zsh) で `hyoui run -- sleep` → Ctrl-Z 直後に
+   `ps -o pid,ppid,stat -p <attach>,<sleep>` を即取得 (= attach が `T` か、sleep が
+   `Ss` のままか)。attach が `T` で sleep が `Ss` なら「attach だけ止まる」= 上記
+   仮説 (a)/(b) が裏付く
+2. `--debug-dump-client` / `--debug-dump-server` を付けて 1 度目の byte 経路を比較
+3. ただし優先度は低 (= 根本 fix で吸収される)。主対応は姉妹 issue 案 A4

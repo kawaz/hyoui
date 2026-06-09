@@ -1,7 +1,15 @@
 # DR-0016: `hyoui record` — tty I/O timeline の永続録画 subcommand
 
-- Status: Active
+- Status: Active — 🟡 record core 実装済 (v0.2.x 出荷、Phase 4 daemon hot path 配線完了)
 - Date: 2026-06-01
+
+> **⚠ 実装状況の注意 (2026-06-10 時点)**: 本 DR の record 本体 (start/stop/list、jsonl/raw sink、
+> bounded queue + writer task、lifecycle event) は実装・出荷済みだが、**§6 の secret redaction
+> (`redact-after-prompt`) は未実装**。state machine の配線が Phase 5 に積み残されており
+> (`crates/hyoui/src/daemon/record.rs` 冒頭 `⚠ redaction は未実装` 参照)、`--input-secrecy` の値に
+> 関わらず **stdin は素通しで記録される**。passphrase / token を録画したくない場合は録画対象を
+> `--stdout` のみに限定すること。本実装は
+> [docs/issue/2026-06-10-feature-record-redaction-phase5.md](../issue/2026-06-10-feature-record-redaction-phase5.md) で追跡。
 - Related: DR-0005 (= 外側自動操作主軸、本 DR の思想根拠), DR-0008 (= protocol cap flag), DR-0013 (= daemon = screen state 正本、本 DR は I/O stream 正本化), DR-0014 (= 透過原則 + 検証主義、本 DR は観測道具の整備), DR-0015 (= jobcontrol notify / resume protocol、本 DR の lifecycle event 経路)
 - Supersedes / Superseded by: なし
 - Issue: [docs/issue/2026-05-26-feature-recording-and-dump.md](../issue/2026-05-26-feature-recording-and-dump.md) (= 元 idea、本 DR は record 部分のみ MVP 切り出し)

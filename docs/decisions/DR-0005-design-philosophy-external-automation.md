@@ -4,6 +4,24 @@
 - Date: 2026-05-26
 - Related: DR-0001 (jobcontrol 2 軸), DR-0002 (naming), DR-0003 (Rust 一本化), DR-0006 (CLI ground rules), DR-0007 (MVP scope)
 
+> **📌 現行 CLI 体系への注記 (2026-06-10 追記、本文は判断記録として保存)**:
+> 本 DR が例示する `hyoui send / keys / paste / detach` は **草案段階の構想名**であり、
+> 現行 CLI では以下の体系に統合・改名されている。本文中の `send/keys/paste/detach` の表記は
+> 当時の思想説明として読むこと:
+>
+> | 当時の構想名 | 現行 CLI |
+> |---|---|
+> | `send` / `keys` / `paste` | `hyoui input` family に統合 (= `text:` / `hex:` / `file:` / `paste:` / `key:` spec を順序保証で送信、DR-0006 §8)。独立 subcommand 化せず |
+> | `detach` (out-of-band) | attach client 内の `Ctrl-A D` detach キー (下記) + daemon は linger 継続 (DR-0015)。`hyoui detach` は予約エラー |
+> | `tx` | 未実装 (docs/issue/2026-05-27-tx-lock-unlock-cli-subcommands.md) |
+>
+> **「in-band escape を一切導入しない」原則の唯一の例外**: attach client の `Ctrl-A D`
+> detach キー (= prefix `Ctrl-A` 0x01 + `d`、`HYOUI_DETACH_PREFIX` で変更可)。
+> これは **attach client (= ユーザが繋いでいる端末) のローカル解釈**であり、子プロセスには
+> 透過しない (= 子の stdin には届かない)。「ユーザ視点では in-band に見えるが、子プロセスには
+> out-of-band で透過」という整理で原則と両立する。子への入力経路 (`hyoui input`) には依然
+> prefix キーを一切持たない。
+
 ## Context
 
 poc → Rust 一本化 (DR-0003) → v0.0.0 リリース後、本実装の機能設計フェーズに入った。

@@ -275,6 +275,33 @@ and `sys/signal.rs` (sigaction / self-pipe). `sys/socket.rs` enforces perm
 0600 / dir 0700, `sys/poll.rs` wraps poll(2) type-safely, `sys/clock.rs`
 provides Instant ↔ epoch ms.
 
+### 2.9 Record (`crates/hyoui/src/daemon/record.rs`)
+
+Persistent tty I/O timeline recording
+([DR-0016](./decisions/DR-0016-tty-io-record.md)). The daemon is the canonical
+owner of the byte stream (it already sees every in/out byte at the broadcast
+point), so recording is wired as an **independent I/O sink in the daemon** —
+separate from the client broadcast path.
+
+- `RecordRegistry` holds active records per session; `record start/stop/list`
+  control messages create / drain / enumerate them
+- The hot path pushes events into a **bounded queue**; a dedicated **writer
+  task** drains it to the file. The queue is bounded so a slow disk can't stall
+  the PTY read/write loop or distort the timing it observes (DR-0016's
+  "must not distort the observed target" invariant)
+- `RecordEvent` carries in/out bytes, reject / write-error, lifecycle
+  (start/stop, SIGTSTP/SIGCONT) and a monotonic `seq`
+- Formats: `jsonl` (one event per line, with timestamps + lifecycle events;
+  the diagnostic timeline format) and `raw` (single-direction byte stream, no
+  timestamps — export only, `--both` not allowed)
+- Caps: gated behind the `record-v1` optional capability so older clients keep
+  working
+- **⚠ Secret redaction is not yet implemented.** `--input-secrecy`
+  (`redact-after-prompt` default) is accepted and stored, but the redaction
+  state machine is parked in Phase 5 — stdin is recorded verbatim regardless of
+  the policy. `InSecretRedacted` / `push_in_secret_redacted` are dead code until
+  then.
+
 ## 3. Data flow
 
 ### 3.1 I/O while attached
