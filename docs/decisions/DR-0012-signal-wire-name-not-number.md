@@ -112,7 +112,7 @@ DR-0008 の Signal / Kill message 記述 (`signum: <uint>` 形式) を本 DR で
 ### 6. protocol breaking とリリース時の扱い
 
 - 既存 v0.1.x peer (= 旧 `signum` u8 形式) との **wire 互換性なし**。新旧混在不可
-- v0.2.0 リリース時に CHANGELOG / README で breaking change として明示
+- v0.2.0 リリース時に GitHub Release notes / README で breaking change として明示
 - DR-0008 §3 (= "Schema evolution = cap flags 一本") の forward-compat policy
   は **field 追加** には適用されるが、本件は **field rename + 型変更 (u8 → string)**
   なので forward-compat 範疇外。新名 (`signal`) を使うことで旧 field

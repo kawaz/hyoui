@@ -47,6 +47,10 @@ jobs:
         with:
           shared-key: ${{ matrix.os }}-stable
       - name: Run ignored integration tests (PTY/daemon)
+        # step timeout にする理由: job timeout 超過は「cancelled」になり
+        # continue-on-error で吸収されず workflow 全体が cancelled 表示になる。
+        # step timeout なら step failure → job failure → continue-on-error で workflow は緑。
+        timeout-minutes: 13
         run: cargo test --workspace -- --ignored
 
   msrv:

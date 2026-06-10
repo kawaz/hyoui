@@ -19,9 +19,9 @@
    cat VERSION
    git/jj log -- VERSION | head -3   # 直近で bump commit があるか
    ```
-2. **CHANGELOG.md が最新か**:
-   - 新規 commit (= 前 tag からの差分) が CHANGELOG に反映されているか
-   - `## [Unreleased]` セクションが当該 version に rename されているか
+2. **リリースノートの素材が揃っているか**:
+   - 履歴の正本は [GitHub Releases](https://github.com/kawaz/hyoui/releases)（CI が tag 打ち時に自動生成）
+   - 前 tag からの差分が release notes に反映される想定か（必要なら DR / journal を確認）
 3. **CI が main で green か**:
    ```bash
    gh run list --branch main --limit 5

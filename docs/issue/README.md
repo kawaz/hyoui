@@ -30,7 +30,7 @@ YYYY-MM-DD-{slug}.md           (prefix なし)
 feature-  ─ 採用 ─→  task- にリネーム or 直接実装
           └ 却下 ─→  削除 (jj/git 履歴で内容追える)
 
-bug-      ─ 修正 ─→  削除 (commit/CHANGELOG で追える)
+bug-      ─ 修正 ─→  削除 (commit/GitHub Releases で追える)
           └ 不再現/仕様 ─→  削除 + journal/findings に記録
 
 task-     ─ 完了 ─→  削除
@@ -46,7 +46,7 @@ task-     ─ 完了 ─→  削除
 
 | 解決の性格 | 記録先 |
 |---|---|
-| 単純なコード修正のみ | 記録不要 (commit/CHANGELOG で足りる) |
+| 単純なコード修正のみ | 記録不要 (commit/GitHub Releases で足りる) |
 | 設計判断を伴う | `docs/decisions/DR-NNNN-...md` |
 | 運用上の再発可能性 | `docs/runbooks/<topic>.md` |
 | 経緯・試行錯誤・ハマり所 | `docs/journal/YYYY-MM-DD-<slug>.md` |

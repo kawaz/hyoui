@@ -1,6 +1,6 @@
 # hyoui ROADMAP
 
-> 注: ここに version 区切り (= v0.1.x / v0.2.0 等) は記載しない。scope の正本はこの ROADMAP、version は release 時の便宜 (= bump-semver で打つ)。リリースに何が含まれるかは git log / CHANGELOG を参照。
+> 注: ここに version 区切り (= v0.1.x / v0.2.0 等) は記載しない。scope の正本はこの ROADMAP、version は release 時の便宜 (= bump-semver で打つ)。リリースに何が含まれるかは git log / [GitHub Releases](https://github.com/kawaz/hyoui/releases) を参照。
 
 [[DR-0013]] 起票 (2026-05-27) を機に、従来の version 区切り型 (= v0.1.x / v0.2.0 / v0.3.0+) ROADMAP を**廃止**。
 固定 version への scope 紐付けは実態と乖離しやすく指標として弱いため、**4 層列挙型** (必須 / 優先 / 追加予定 / 過去 milestone) に再編した。
