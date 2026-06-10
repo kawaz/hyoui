@@ -1213,12 +1213,12 @@ fn print_list_jsonl(entries: &[ListEntry]) {
 /// `hyoui list` で scan する候補 dir を返す。
 fn list_candidate_dirs() -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
-    if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
-        if !xdg.is_empty() {
-            let p = std::path::PathBuf::from(xdg).join("hyoui");
-            if p.is_dir() {
-                out.push(p);
-            }
+    if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR")
+        && !xdg.is_empty()
+    {
+        let p = std::path::PathBuf::from(xdg).join("hyoui");
+        if p.is_dir() {
+            out.push(p);
         }
     }
     let tmp = std::env::var_os("TMPDIR")
@@ -2317,11 +2317,11 @@ fn lock_acquire_command(cfg: LockAcquireConfig) -> ExitCode {
                 // 将来 daemon が queue 実装した場合に来る path。CLI は単に response が
                 // 再送されてくるのを待つ (= 再 LockAcquire は送らない)。
                 // 簡略化のため本 MVP では Queued が来たら polling と同じ扱いで sleep + 再送する。
-                if let Some(dl) = deadline {
-                    if Instant::now() >= dl {
-                        eprintln!("hyoui: lock acquire: timeout (queued path)");
-                        return ExitCode::from(1);
-                    }
+                if let Some(dl) = deadline
+                    && Instant::now() >= dl
+                {
+                    eprintln!("hyoui: lock acquire: timeout (queued path)");
+                    return ExitCode::from(1);
                 }
                 std::thread::sleep(POLL_INTERVAL);
                 continue;
@@ -2334,11 +2334,11 @@ fn lock_acquire_command(cfg: LockAcquireConfig) -> ExitCode {
                     return ExitCode::from(1);
                 }
                 LockMode::Wait => {
-                    if let Some(dl) = deadline {
-                        if Instant::now() >= dl {
-                            eprintln!("hyoui: lock acquire: timeout");
-                            return ExitCode::from(1);
-                        }
+                    if let Some(dl) = deadline
+                        && Instant::now() >= dl
+                    {
+                        eprintln!("hyoui: lock acquire: timeout");
+                        return ExitCode::from(1);
                     }
                     std::thread::sleep(POLL_INTERVAL);
                     continue;

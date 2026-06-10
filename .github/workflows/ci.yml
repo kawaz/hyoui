@@ -50,16 +50,16 @@ jobs:
         run: cargo test --workspace -- --ignored
 
   msrv:
-    name: MSRV check (rust-version = 1.86)
+    name: MSRV check (rust-version = 1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.86"
+          toolchain: "1.88"
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ubuntu-latest-1.86
+          shared-key: ubuntu-latest-1.88
       - name: cargo check on MSRV
         run: cargo check --workspace
 

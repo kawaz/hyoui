@@ -98,7 +98,7 @@ brew install kawaz/tap/hyoui
 > The formula is auto-published to [`kawaz/homebrew-tap`](https://github.com/kawaz/homebrew-tap)
 > on each release by `release.yml`.
 
-Supported platforms: Linux / macOS (Rust 1.86+, PTY and Unix sockets — Windows
+Supported platforms: Linux / macOS (Rust 1.88+, PTY and Unix sockets — Windows
 is not supported).
 
 ## Quickstart

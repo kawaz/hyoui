@@ -35,10 +35,10 @@ fn settle() {
 fn wait_for_stat(pid: i32, expected: char, timeout: Duration) -> Option<String> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if let Ok(state) = process_state_of(pid) {
-            if state.stat.starts_with(expected) {
-                return Some(state.stat);
-            }
+        if let Ok(state) = process_state_of(pid)
+            && state.stat.starts_with(expected)
+        {
+            return Some(state.stat);
         }
         if std::time::Instant::now() >= deadline {
             return None;
@@ -73,11 +73,11 @@ fn follow_child_self_stop_makes_attach_stopped() {
     let mut child_pid: Option<i32> = None;
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
-        if let Ok(descendants) = find_descendants(attach_pid) {
-            if let Some(sleep_proc) = descendants.iter().find(|p| p.comm.contains("sleep")) {
-                child_pid = Some(sleep_proc.pid);
-                break;
-            }
+        if let Ok(descendants) = find_descendants(attach_pid)
+            && let Some(sleep_proc) = descendants.iter().find(|p| p.comm.contains("sleep"))
+        {
+            child_pid = Some(sleep_proc.pid);
+            break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }

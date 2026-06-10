@@ -540,14 +540,12 @@ mod tests {
         let mut found_backpressure = false;
         while let Ok(payload) = rx.try_recv() {
             let mut cur = std::io::Cursor::new(&payload[..]);
-            if let Ok(frame) = Frame::decode_from(&mut cur) {
-                if let Ok(ControlMessage::Error(err)) =
+            if let Ok(frame) = Frame::decode_from(&mut cur)
+                && let Ok(ControlMessage::Error(err)) =
                     ControlMessage::decode_from(frame.body.as_slice())
-                {
-                    if err.code == ErrorCode::BackpressureDisconnect {
-                        found_backpressure = true;
-                    }
-                }
+                && err.code == ErrorCode::BackpressureDisconnect
+            {
+                found_backpressure = true;
             }
         }
         assert!(

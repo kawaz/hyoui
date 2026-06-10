@@ -132,17 +132,17 @@ pub(super) fn handle_client_frame(
                 );
                 return ClientFrameOutcome::Continue;
             }
-            if let Some(holder) = state.lock_holder {
-                if holder != ch_id {
-                    state.record_registry.push_in_rejected(
-                        ch_id,
-                        ch_mode,
-                        Some(holder),
-                        InRejectedReason::LockNotHeld,
-                        &frame.body,
-                    );
-                    return ClientFrameOutcome::Continue;
-                }
+            if let Some(holder) = state.lock_holder
+                && holder != ch_id
+            {
+                state.record_registry.push_in_rejected(
+                    ch_id,
+                    ch_mode,
+                    Some(holder),
+                    InRejectedReason::LockNotHeld,
+                    &frame.body,
+                );
+                return ClientFrameOutcome::Continue;
             }
             // R5-C3: master fd は NONBLOCK なので `write_all` だと EAGAIN
             // (= 子の line discipline buffer 4–8 KiB が満杯の瞬間) を即

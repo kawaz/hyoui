@@ -163,7 +163,7 @@ fn daemon_role(sock_path: &str) {
         }
         clients = alive;
 
-        if loop_count % 10000 == 0 {
+        if loop_count.is_multiple_of(10000) {
             // 進捗 mark (デバッグ用、通常出ない)
         }
     }

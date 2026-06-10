@@ -101,10 +101,10 @@ fn parse_detach_prefix(raw: &str) -> Option<Option<u8>> {
         return Some(None);
     }
     // hex "0xNN"
-    if let Some(hex) = lower.strip_prefix("0x") {
-        if let Ok(v) = u8::from_str_radix(hex, 16) {
-            return Some(Some(v));
-        }
+    if let Some(hex) = lower.strip_prefix("0x")
+        && let Ok(v) = u8::from_str_radix(hex, 16)
+    {
+        return Some(Some(v));
     }
     // ctrl-x / ^x
     let ctrl_letter = lower
@@ -112,11 +112,11 @@ fn parse_detach_prefix(raw: &str) -> Option<Option<u8>> {
         .or_else(|| lower.strip_prefix('^'));
     if let Some(rest) = ctrl_letter {
         let mut chars = rest.chars();
-        if let (Some(c), None) = (chars.next(), chars.next()) {
-            if c.is_ascii_lowercase() {
-                let byte = (c as u8) - b'a' + 1;
-                return Some(Some(byte));
-            }
+        if let (Some(c), None) = (chars.next(), chars.next())
+            && c.is_ascii_lowercase()
+        {
+            let byte = (c as u8) - b'a' + 1;
+            return Some(Some(byte));
         }
     }
     // decimal 0..=255
@@ -426,12 +426,12 @@ impl ClientConnection {
                                 }
                                 return Ok(None);
                             }
-                            if let DetachAction::Forward(forward_bytes) = action {
-                                if !forward_bytes.is_empty() {
-                                    let frame = Frame::raw_data(forward_bytes);
-                                    if frame.encode_to(&mut self.writer).is_err() {
-                                        return Ok(None);
-                                    }
+                            if let DetachAction::Forward(forward_bytes) = action
+                                && !forward_bytes.is_empty()
+                            {
+                                let frame = Frame::raw_data(forward_bytes);
+                                if frame.encode_to(&mut self.writer).is_err() {
+                                    return Ok(None);
                                 }
                             }
                         } else {

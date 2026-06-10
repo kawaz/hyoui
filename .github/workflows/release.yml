@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - "Cargo.toml"
+  # workflow 自体の修正を Cargo.toml 変更なしで再走させる手動トリガ
+  workflow_dispatch:
 
 jobs:
   check-version:
@@ -39,7 +41,28 @@ jobs:
         run: |
           set -euo pipefail
           # Cargo.toml workspace.package.version を正本として読む。
-          CURRENT_VERSION=$(bump-semver get Cargo.toml --no-hint)
+          # CI 環境でのみ bump-semver get が fallback rule に落ちて失敗する未解明問題
+          # があるため (手元の同一 binary + 同一ファイルでは再現せず)、失敗時は
+          # (1) 切り分け用診断を残し (2) [workspace.package].version の直読みに
+          # フォールバックして release gate 自体は機能させる。
+          CURRENT_VERSION=$(bump-semver get Cargo.toml --no-hint) || {
+            echo "::group::bump-semver get failure diagnostics"
+            bump-semver --version || true
+            sha256sum /usr/local/bin/bump-semver || true
+            sha256sum Cargo.toml || true
+            head -8 Cargo.toml | od -c | head -20 || true
+            bump-semver get Cargo.toml || true
+            echo "::endgroup::"
+            CURRENT_VERSION=""
+          }
+          if [ -z "$CURRENT_VERSION" ]; then
+            CURRENT_VERSION=$(perl -00 -ne 'if (/^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"/ms) { print $1; exit }' Cargo.toml)
+            echo "::warning::bump-semver get failed; fell back to direct TOML read: ${CURRENT_VERSION}"
+          fi
+          if [ -z "$CURRENT_VERSION" ]; then
+            echo "::error::could not determine current version from Cargo.toml"
+            exit 2
+          fi
           echo "current=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
 
           # 既存 tag より大きいか検証 (二重リリース防止)。

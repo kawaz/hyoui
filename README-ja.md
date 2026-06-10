@@ -90,7 +90,7 @@ brew install kawaz/tap/hyoui
 > formula は release のたびに `release.yml` が
 > [`kawaz/homebrew-tap`](https://github.com/kawaz/homebrew-tap) へ自動公開する。
 
-対応 platform: Linux / macOS（Rust 1.86+、PTY と Unix socket を使うため Windows は未対応）。
+対応 platform: Linux / macOS（Rust 1.88+、PTY と Unix socket を使うため Windows は未対応）。
 
 ## Quickstart
 

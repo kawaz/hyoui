@@ -536,10 +536,9 @@ fn linger_for_late_attach(
         if listener_revents.contains(PollFlags::POLLIN)
             && clients.len() < MAX_CLIENTS_PER_DAEMON
             && pending_handshakes.len() < MAX_PENDING_HANDSHAKES
+            && let Ok(pending) = spawn_handshake_worker(listener, config)
         {
-            if let Ok(pending) = spawn_handshake_worker(listener, config) {
-                pending_handshakes.push(pending);
-            }
+            pending_handshakes.push(pending);
         }
 
         // 完了済 handshake を回収
@@ -1281,14 +1280,14 @@ fn serve_loop(
                     // 子 process group へ SIGTERM を投げて session 終了させる。
                     // (broadcast / scrollback の後で match 判定するのは、最後の
                     // chunk も client / scrollback には届けるため。)
-                    if let Some(ref mut w) = until_watcher {
-                        if w.feed(&buf[..n]) {
-                            let _ = kill_pgrp(child, Signal::SIGTERM);
-                            // finalize_child が SIGTERM → wait → SIGKILL を実施。
-                            // `ClientDetachedOrKilled` を返すことで finalize 経路に
-                            // 乗せる (= `kill` subcommand と同じ後始末)。
-                            return RelayOutcome::ClientDetachedOrKilled;
-                        }
+                    if let Some(ref mut w) = until_watcher
+                        && w.feed(&buf[..n])
+                    {
+                        let _ = kill_pgrp(child, Signal::SIGTERM);
+                        // finalize_child が SIGTERM → wait → SIGKILL を実施。
+                        // `ClientDetachedOrKilled` を返すことで finalize 経路に
+                        // 乗せる (= `kill` subcommand と同じ後始末)。
+                        return RelayOutcome::ClientDetachedOrKilled;
                     }
                 }
                 Err(Error::Errno(nix::errno::Errno::EIO)) => {
@@ -1823,12 +1822,11 @@ mod tests {
         // 孫 PID が書き出されるまで最大 2 秒待つ。
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let grandchild_pid: i32 = loop {
-            if let Ok(s) = std::fs::read_to_string(&pid_file) {
-                if let Some(line) = s.lines().next() {
-                    if let Ok(pid) = line.trim().parse::<i32>() {
-                        break pid;
-                    }
-                }
+            if let Ok(s) = std::fs::read_to_string(&pid_file)
+                && let Some(line) = s.lines().next()
+                && let Ok(pid) = line.trim().parse::<i32>()
+            {
+                break pid;
             }
             assert!(
                 std::time::Instant::now() < deadline,

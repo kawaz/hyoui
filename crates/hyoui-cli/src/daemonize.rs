@@ -370,10 +370,10 @@ pub fn run_daemon_child() -> ExitCode {
     dcfg.rows = rows;
     // Round2 #2: HYOUI_LOCK_TOKEN env を daemon 側の expected_token に伝搬。
     // detached daemon child は親 process から env を受け継ぐ。
-    if let Ok(token) = std::env::var("HYOUI_LOCK_TOKEN") {
-        if !token.is_empty() {
-            dcfg.expected_token = Some(token);
-        }
+    if let Ok(token) = std::env::var("HYOUI_LOCK_TOKEN")
+        && !token.is_empty()
+    {
+        dcfg.expected_token = Some(token);
     }
     // 取り込み後は env を unset する (= HYOUI_DAEMONIZE_INIT と同じ流儀)。daemon が
     // spawn する子 PTY (= 実コマンド) に HYOUI_LOCK_TOKEN が継承されると、子が env
@@ -381,10 +381,10 @@ pub fn run_daemon_child() -> ExitCode {
     // daemon の expected_token として取り込んだ後は子に漏らさない。
     hyoui::sys::env::remove_var_at_startup("HYOUI_LOCK_TOKEN");
     // R5-FB1: --until pattern を daemon に配線。
-    if let Some(needle) = until {
-        if !needle.is_empty() {
-            dcfg.until = Some(needle);
-        }
+    if let Some(needle) = until
+        && !needle.is_empty()
+    {
+        dcfg.until = Some(needle);
     }
     // DR-0015: daemon は jobcontrol policy を持たない (= client 側発動)。
     // DR-0013 §8 + §8 Update: scrollback rows 上限を daemon に配線。

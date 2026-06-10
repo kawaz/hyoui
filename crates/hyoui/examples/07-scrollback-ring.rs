@@ -68,13 +68,13 @@ impl Scrollback {
 
     fn since_strict(&self, now: Instant, dur: Duration) -> Result<Vec<u8>, BufferInsufficient> {
         let since_start = now - dur;
-        if let Some(last_evict) = self.last_evicted_ts {
-            if last_evict >= since_start {
-                return Err(BufferInsufficient {
-                    last_evicted_ts: last_evict,
-                    since_start,
-                });
-            }
+        if let Some(last_evict) = self.last_evicted_ts
+            && last_evict >= since_start
+        {
+            return Err(BufferInsufficient {
+                last_evicted_ts: last_evict,
+                since_start,
+            });
         }
         Ok(self.since(now, dur))
     }

@@ -53,11 +53,11 @@ fn forkpty_child_has_ctty_and_can_be_stopped() {
     // ctty (login_tty contract).
     let mut fg_pgid = None;
     for _ in 0..100 {
-        if let Ok(p) = nix::unistd::tcgetpgrp(spawned.pty.master_fd()) {
-            if p.as_raw() == child.as_raw() {
-                fg_pgid = Some(p);
-                break;
-            }
+        if let Ok(p) = nix::unistd::tcgetpgrp(spawned.pty.master_fd())
+            && p.as_raw() == child.as_raw()
+        {
+            fg_pgid = Some(p);
+            break;
         }
         thread::sleep(Duration::from_millis(10));
     }

@@ -3987,7 +3987,7 @@ fn parse_hex_value(s: &str) -> Result<Vec<u8>, String> {
     if s.is_empty() {
         return Err("hex: spec requires non-empty hex string".into());
     }
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(format!(
             "hex: payload must be even-length (got {} chars in {s:?})",
             s.len()

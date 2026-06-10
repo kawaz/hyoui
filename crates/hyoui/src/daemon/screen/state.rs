@@ -224,10 +224,10 @@ impl ScreenState {
         let (rows, cols) = self.size();
         for r in 0..rows {
             for c in 0..cols {
-                if let Some(cell) = scr.cell(r, c) {
-                    if !cell.contents().is_empty() {
-                        return false;
-                    }
+                if let Some(cell) = scr.cell(r, c)
+                    && !cell.contents().is_empty()
+                {
+                    return false;
                 }
             }
         }

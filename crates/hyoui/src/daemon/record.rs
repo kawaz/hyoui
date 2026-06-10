@@ -411,10 +411,10 @@ impl RecordRegistry {
         // (3 の前に) prompt pattern compile 検証は Phase 5 で。Phase 2 では Option を
         // 受け取るが触らない (= None なら default、Some なら storage のみ、redaction の
         // state machine 配線は Phase 5 で行う)。
-        if let Some(pat) = request.prompt_pattern.as_deref() {
-            if let Err(e) = regex::Regex::new(pat) {
-                return Err(RecordStartError::InvalidPromptPattern(e.to_string()));
-            }
+        if let Some(pat) = request.prompt_pattern.as_deref()
+            && let Err(e) = regex::Regex::new(pat)
+        {
+            return Err(RecordStartError::InvalidPromptPattern(e.to_string()));
         }
 
         // 3. file open
@@ -709,11 +709,11 @@ fn writer_thread_main(file: File, rx: crossbeam_channel::Receiver<SeqEvent>, cfg
     let mut w = BufWriter::new(file);
 
     // jsonl の場合は header を eager に書く。raw は header なし (§5)。
-    if matches!(cfg.format, RecordFormat::Jsonl) {
-        if let Err(e) = write_jsonl_header(&mut w, &cfg) {
-            eprintln!("hyoui-record-{}: header write failed: {e}", cfg.record_id);
-            return;
-        }
+    if matches!(cfg.format, RecordFormat::Jsonl)
+        && let Err(e) = write_jsonl_header(&mut w, &cfg)
+    {
+        eprintln!("hyoui-record-{}: header write failed: {e}", cfg.record_id);
+        return;
     }
 
     // メインループ: event を recv → encode → write + flush。
@@ -837,15 +837,17 @@ fn write_raw_event(
 }
 
 fn exceeds_limits(cfg: &WriterConfig) -> bool {
-    if let Some(max_b) = cfg.max_bytes {
-        if max_b > 0 && cfg.stats.raw_bytes_recorded.load(Ordering::Relaxed) >= max_b {
-            return true;
-        }
+    if let Some(max_b) = cfg.max_bytes
+        && max_b > 0
+        && cfg.stats.raw_bytes_recorded.load(Ordering::Relaxed) >= max_b
+    {
+        return true;
     }
-    if let Some(max_d) = cfg.max_duration_ms {
-        if max_d > 0 && now_unix_ms().saturating_sub(cfg.started_unix_ms) >= max_d {
-            return true;
-        }
+    if let Some(max_d) = cfg.max_duration_ms
+        && max_d > 0
+        && now_unix_ms().saturating_sub(cfg.started_unix_ms) >= max_d
+    {
+        return true;
     }
     false
 }
