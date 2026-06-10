@@ -33,6 +33,12 @@ pub struct StatusResponse {
     /// 子 PTY の PID (= null なら子が exit 済)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_pid: Option<u32>,
+    /// DR-0017 §柱2: 子が現在 stopped (= SIGTSTP/SIGSTOP で停止中) と daemon が
+    /// 観測しているか。auto-resume 廃止後は stopped のまま残り得るため、`list` /
+    /// `status` で放置 stopped child を可観測にする。子 exit 済 (= `child_pid`
+    /// が `None`) の場合は `false`。
+    #[serde(default)]
+    pub child_stopped: bool,
     /// 現在 attach 中の client 一覧。
     pub clients: Vec<ClientInfo>,
     /// scrollback ring buffer 内の総 byte 数。

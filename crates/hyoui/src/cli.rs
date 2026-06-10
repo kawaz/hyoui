@@ -264,6 +264,14 @@ pub struct KillConfig {
     ///
     /// `session_id` / `socket` / `index` と排他。`--signal` だけは併用可。
     pub all: bool,
+    /// `--no-terminate` (DR-0017 §柱2): signal を送るだけで **session を畳まない**。
+    ///
+    /// 既定の `kill` は signal 送信後に session を terminate する (= master close →
+    /// 子に SIGHUP)。stopped child を起こすだけ (= `--signal=CONT --no-terminate`)
+    /// 等、session を残したまま signal を送りたい場合に使う。`ControlMessage::Signal`
+    /// (= 非 terminate) 経路に切り替わる。`--all` とは併用不可 (= killall に
+    /// 非 terminate は意味を成さない)。
+    pub no_terminate: bool,
 }
 
 /// `status` subcommand の出力形式 (= `--format=plain|json`)。
@@ -992,6 +1000,10 @@ fn parse_kill(args: &[String]) -> Command {
                 cfg.all = true;
                 consumed_extra = false;
             }
+            "--no-terminate" => {
+                cfg.no_terminate = true;
+                consumed_extra = false;
+            }
             // POSIX kill 慣習 + 略名拡張: `-X` short flag (= `--` で始まらない short
             // option) は signal spec として解釈する (kawaz 方針 2026-05-30):
             // - `-9`       = SIGKILL (= 番号)
@@ -1043,6 +1055,14 @@ fn parse_kill(args: &[String]) -> Command {
             || !positionals.is_empty())
     {
         return Command::Error("kill: --all は session-id / --index / --socket と排他です".into());
+    }
+
+    // DR-0017: --no-terminate は単一 session 向け (= killall に「畳まない」は無意味)。
+    if cfg.all && cfg.no_terminate {
+        return Command::Error(
+            "kill: --no-terminate は --all と併用できません (= 非 terminate な signal 送信は単一 session 向け)"
+                .into(),
+        );
     }
 
     match positionals.len() {
@@ -2051,11 +2071,11 @@ fn parse_run(args: &[String]) -> Command {
         return Command::Error("no command given (use `-- cmd [args...]`)".into());
     }
 
-    // Mode-driven preset defaults for suspend behavior, unless overridden.
-    let final_child_suspend = on_child_suspend.unwrap_or(match mode {
-        Mode::Headless => OnChildSuspend::AutoResume,
-        Mode::Interactive => OnChildSuspend::Follow,
-    });
+    // DR-0017 §柱2: default は **notify のみ** (= 子の suspend を勝手に起こさない)。
+    // `OnChildSuspend::Follow` が notify-only に相当する。`AutoResume` は opt-in
+    // (`--on-child-suspend=auto-resume`) として残すが、どの mode でも default には
+    // しない (= headless でも勝手に resume しない)。
+    let final_child_suspend = on_child_suspend.unwrap_or(OnChildSuspend::Follow);
 
     // Virtual size: explicit 指定のみ Some、未指定なら None で caller (= run_command)
     // が外側 TTY size を継承する経路に流す (= ユーザ指示 2026-05-29)。
@@ -3324,6 +3344,8 @@ fn usage_kill() -> String {
             --index N       session selector index (= mtime 昇順、1 最古 / -1 最新)\n    \
             --all           全 live session を順次 kill (= killall 相当)\n    \
             --signal SPEC   送信 signal (= default SIGTERM)。数字 / 略名 / SIG-prefix 大文字 OK\n    \
+            --no-terminate  signal を送るだけで session を畳まない (= stopped child を\n    \
+            \x20               CONT で起こす用途等。`--all` とは併用不可)\n    \
             -N              POSIX kill 慣習: 短縮 signal 番号 (e.g. -9 = SIGKILL)\n    \
             -NAME           短縮 signal 名 (e.g. -KILL / -TERM / -SIGKILL も OK)\n    \
             -h, --help      Show this help and exit\n\
@@ -3360,6 +3382,7 @@ fn usage_kill() -> String {
             hyoui kill --index=-1                    # 最新 session を SIGTERM\n    \
             hyoui kill --all                         # 全 live session を SIGTERM\n    \
             hyoui kill --all --signal=KILL           # 全 live session を SIGKILL\n    \
+            hyoui kill demo --signal=CONT --no-terminate  # stopped child を起こす (= session 継続)\n    \
             hyoui kill -- -dash-id                   # session_id=\"-dash-id\" を kill (escape)\n    \
             hyoui kill --socket=/tmp/x.sock          # socket 直指定で kill\n\
         \n\
@@ -4882,15 +4905,34 @@ mod tests {
     }
 
     #[test]
-    fn run_headless_preset_flips_suspend_defaults() {
+    fn run_headless_default_is_notify_only() {
+        // DR-0017 §柱2: headless でも default は notify-only (= Follow)。auto-resume は
+        // opt-in に限定 (= 勝手に子を起こさない)。
         match parse_args(&args(&["run", "--mode=headless", "--", "cat"])) {
             Command::Run(cfg) => {
                 assert_eq!(cfg.mode, Mode::Headless);
-                assert_eq!(cfg.on_child_suspend, OnChildSuspend::AutoResume);
+                assert_eq!(cfg.on_child_suspend, OnChildSuspend::Follow);
                 // size 未指定なら None = caller (= run_command) が外側 TTY size or
                 // 80x24 fallback で解決する経路 (= ユーザ指示 2026-05-29)。
                 assert_eq!(cfg.cols, None);
                 assert_eq!(cfg.rows, None);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_auto_resume_is_opt_in() {
+        // DR-0017 §柱2: auto-resume は明示 opt-in でのみ選べる (= default にはならない)。
+        match parse_args(&args(&[
+            "run",
+            "--mode=headless",
+            "--on-child-suspend=auto-resume",
+            "--",
+            "cat",
+        ])) {
+            Command::Run(cfg) => {
+                assert_eq!(cfg.on_child_suspend, OnChildSuspend::AutoResume);
             }
             other => panic!("expected Run, got {other:?}"),
         }
@@ -6059,6 +6101,34 @@ mod tests {
                 );
             }
             other => panic!("expected Error for invalid session_id, got {other:?}"),
+        }
+    }
+
+    /// DR-0017 §柱2: `--no-terminate` が cfg.no_terminate=true で格納され、
+    /// `--signal` と併用できる (= stopped child を CONT で起こす経路)。
+    #[test]
+    fn parse_kill_no_terminate_with_signal() {
+        match parse_args(&args(&["kill", "demo", "--signal=CONT", "--no-terminate"])) {
+            Command::Kill(cfg) => {
+                assert!(cfg.no_terminate, "--no-terminate must set no_terminate");
+                assert_eq!(cfg.signal.as_deref(), Some("SIGCONT"));
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+            }
+            other => panic!("expected Kill(no_terminate, signal=SIGCONT), got {other:?}"),
+        }
+    }
+
+    /// DR-0017 §柱2: `--no-terminate` は `--all` と併用不可。
+    #[test]
+    fn parse_kill_no_terminate_rejects_all() {
+        match parse_args(&args(&["kill", "--all", "--no-terminate"])) {
+            Command::Error(msg) => {
+                assert!(
+                    msg.contains("no-terminate") && msg.contains("all"),
+                    "error should mention both flags: {msg}"
+                );
+            }
+            other => panic!("expected Error for --all --no-terminate, got {other:?}"),
         }
     }
 

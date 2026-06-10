@@ -5,19 +5,16 @@
 //! 1. [`Pty::open`] — `openpty(3)` for tests / scenarios that need a
 //!    master+slave pair without forking (e.g. winsize tests).
 //!
-//! 2. [`Pty::spawn`] — `forkpty(3)` + `execvp(3)`. `forkpty` internally calls
-//!    `login_tty(3)` in the child, so the new process gets a controlling
-//!    terminal *deterministically*. This is the central reason DR-0001's
-//!    two-axis job control works (without a separate `TIOCSCTTY` step that
-//!    races against `setsid`).
+//! 2. [`Pty::spawn`] — DR-0017 session anchor: `openpty(3)` + 手動 `fork(2)` +
+//!    `execvp(3)`。parent (= setsid 済 daemon) が slave を `TIOCSCTTY` で
+//!    controlling tty にし、child を **同 session・別 pgrp・foreground** で
+//!    起動する。child の pgrp が orphan でなくなり、SIGTSTP が本来の
+//!    セマンティクスで動く (= TUI の ^Z が効く)。詳細は DR-0017。
 //!
-//! Note: `forkpty` opens its own PTY pair. We deliberately do NOT chain
-//! `Pty::open` into `Pty::spawn` because that would leak a second master fd.
-//!
-//! Why `forkpty` rather than `posix_spawn + SETSID + TIOCSCTTY` (the bootstrap
-//! design): `posix_spawn` cannot do `login_tty`, so the child has to acquire
-//! its ctty manually, which is racy on macOS. See
-//! `docs/journal/2026-05-22-rust-rewrite.md`.
+//! `Pty::spawn` は anchor を満たせない呼び出し (= session leader でない /
+//! 既に ctty を持つ = テストが `Session::start` を直接呼ぶケース) を
+//! `Error::Precondition` で検知し、**明示 warning を出した上で** 旧 `forkpty`
+//! 構造 ([`raw::forkpty_then_exec_legacy`]) に fallback する (= テスト経由のみ)。
 
 use std::ffi::CString;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
@@ -76,11 +73,18 @@ impl Pty {
         })
     }
 
-    /// `forkpty(3) + execvp(3)`. Opens a new PTY, forks, and in the child
-    /// calls `login_tty` (via `forkpty`) and then `execvp(argv[0], argv)`.
+    /// DR-0017 session anchor: `openpty(3)` + 手動 `fork(2)` + `execvp(3)`。
+    /// parent が slave を `TIOCSCTTY` で controlling tty にし、child を同
+    /// session・別 pgrp・foreground で起動する。
     ///
     /// Returns the parent-side [`Spawned`]. The child path **does not
     /// return** — it always execs or `_exit(127)`s.
+    ///
+    /// anchor 前提 (= caller が session leader かつ ctty 無し) を満たさない
+    /// 呼び出し (= テストが直接呼ぶケース) では、`TIOCSCTTY` 失敗
+    /// (`Error::Precondition`) を検知して **明示 warning を stderr に出した上で**
+    /// 旧 `forkpty` 構造に fallback する (= child が独立 session leader、^Z は
+    /// 効かないがテストの大半は anchor と無関係なため実害なし)。詳細は DR-0017 §柱1。
     pub fn spawn(argv: &[&str], cols: u16, rows: u16) -> Result<Spawned> {
         if argv.is_empty() {
             return Err(Error::Invalid("argv must not be empty"));
@@ -89,7 +93,22 @@ impl Pty {
             .iter()
             .map(|s| CString::new(*s).map_err(|_| Error::Invalid("argv contained NUL")))
             .collect::<Result<_>>()?;
-        let forked = raw::forkpty_then_exec(&argv_c, cols, rows)?;
+        let forked = match raw::openpty_fork_anchor_exec(&argv_c, cols, rows) {
+            Ok(f) => f,
+            Err(Error::Precondition(_)) => {
+                // anchor 前提を満たさない (= TIOCSCTTY 失敗)。production の daemon は
+                // setsid 済なのでここに来ない (= 来たら呼び出し経路が test など非
+                // daemonize)。サイレントにせず明示 warning を出してから legacy 構造で
+                // 起動する (= DR-0017 §柱1 が許容する fallback)。
+                eprintln!(
+                    "hyoui: warning: session anchor 化不可 (= 呼び出しプロセスが session leader でない / 既に controlling tty を持つ)。\
+                     旧 forkpty 構造で child を起動します (= child が独立 session leader、^Z は効きません)。\
+                     production の daemon は setsid 済のためこの経路には入りません (= テスト等の直接呼び出しのみ)。"
+                );
+                raw::forkpty_then_exec_legacy(&argv_c, cols, rows)?
+            }
+            Err(e) => return Err(e),
+        };
         Ok(Spawned {
             pty: Self {
                 master: Some(forked.master),

@@ -11,6 +11,7 @@
 //! に残る、Phase B で `control.rs` へ移動予定)。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::protocol::Mode;
 use crate::protocol::messages::SessionMode;
@@ -34,6 +35,12 @@ pub(super) struct SessionState {
     /// DR-0016 §8 — session-scope の record sink 集合。`Arc` で複数 hook 点から
     /// clone して持つ (= push 時に lock 不要、registry 内部で同期)。
     pub(super) record_registry: Arc<RecordRegistry>,
+    /// DR-0017 §柱2: 子が現在 stopped (= SIGTSTP/SIGSTOP で停止中) と観測されて
+    /// いるか。`notify_child_stopped` で `true`、`record_child_continued` で
+    /// `false` にする。`status` query (= `&SessionState` 経由) から読むため
+    /// 内部可変 (`AtomicBool`)。auto-resume 廃止後は stopped のまま残り得るため、
+    /// `status` / `list` での可観測性に使う。
+    child_stopped: AtomicBool,
 }
 
 impl SessionState {
@@ -47,6 +54,16 @@ impl SessionState {
         } else {
             SessionMode::Rw
         }
+    }
+
+    /// DR-0017 §柱2: 子の stopped 観測状態を更新する。
+    pub(super) fn set_child_stopped(&self, stopped: bool) {
+        self.child_stopped.store(stopped, Ordering::Relaxed);
+    }
+
+    /// DR-0017 §柱2: 子が現在 stopped と観測されているか (= `status`/`list` 用)。
+    pub(super) fn child_stopped(&self) -> bool {
+        self.child_stopped.load(Ordering::Relaxed)
     }
 }
 

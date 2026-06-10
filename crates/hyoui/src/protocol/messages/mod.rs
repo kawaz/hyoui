@@ -450,6 +450,7 @@ mod tests {
         let msg = ControlMessage::StatusResponse(StatusResponse {
             session_id: "demo".into(),
             child_pid: Some(12345),
+            child_stopped: false,
             clients: vec![
                 ClientInfo {
                     client_id: 0,

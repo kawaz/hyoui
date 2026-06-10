@@ -992,9 +992,13 @@ fn handle_status_query(
     // `DaemonConfig::cwd` を `current_dir()` で必ず埋めている (= 失敗時も `/` で
     // fallback)。test 経路で `cwd` が `None` の場合は防衛的に `/` を入れる
     // (= `/` は POSIX で必ず存在、空文字は invalid value)。
+    // DR-0017 §柱2: 子が exit 済 (= child_pid None) なら stopped は意味を持たない
+    // ので false。生存中のみ `SessionState` の観測フラグを反映する。
+    let child_stopped = child_pid.is_some() && state.child_stopped();
     let resp = StatusResponse {
         session_id: config.session_id.clone(),
         child_pid,
+        child_stopped,
         clients: clients_info,
         scrollback_bytes: scrollback.total_bytes() as u64,
         lock_holder: state.lock_holder,

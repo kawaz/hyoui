@@ -467,6 +467,22 @@ impl ClientConnection {
         })
     }
 
+    /// reader 側 socket に read timeout を設定する。
+    ///
+    /// `None` で timeout 解除 (= blocking)。`Some(dur)` で `recv_control` /
+    /// `recv_frame` が `dur` 以内に 1 byte も読めなければ `WouldBlock` / `TimedOut`
+    /// の `Error::Io` を返すようになる。DR-0017: `hyoui kill --no-terminate` で
+    /// 「daemon が Error を返さなければ成功」と短時間で判定するために使う
+    /// (= 非 terminate な `ControlMessage::Signal` は成功時に ack を返さないため、
+    /// blocking recv だと hang する)。
+    ///
+    /// # Errors
+    ///
+    /// `set_read_timeout` syscall が失敗した場合に [`Error::Io`]。
+    pub fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> Result<(), Error> {
+        self.reader.set_read_timeout(dur).map_err(Error::from)
+    }
+
     /// daemon → client への次の **CBOR control** message を受信。raw_data frame
     /// は skip して次の CBOR frame を待つ (= attach 切替前の旧 raw_data を捨てる
     /// 用途で便利)。`buffer_raw_data` が Some なら skip した raw_data の body を

@@ -1,7 +1,9 @@
 //! daemon 1 つ分の session 状態 + 起動ロジック。
 //!
 //! `Session::start` で:
-//! 1. 子 PTY を `Pty::spawn` で起動 (= forkpty + login_tty + execvp)
+//! 1. 子 PTY を `Pty::spawn` で起動 (= DR-0017 session anchor: openpty + 手動
+//!    fork + execvp。daemon が controlling tty を握り、子は同 session・別 pgrp・
+//!    foreground で起動)
 //! 2. Unix socket を `UnixSock::listen` で bind (perm 0600 + 親 dir 0700)
 //!
 //! `Session::serve` (Phase 9 で導入) が本流の lifecycle entry point:
@@ -53,10 +55,10 @@ use super::screen::{ScreenState, StalledOutcome, check_stalled};
 /// (= grandchildren of the daemon, e.g. `sh -c 'sleep 100 &'`) are not
 /// orphaned to `init`/`launchd`.
 ///
-/// `forkpty(3)` internally calls `login_tty(3)` which calls `setsid(2)`,
-/// making the child both a session leader and a process group leader with
-/// `pgid == pid`. `kill(2)` with a negative pid is the POSIX `killpg(2)`
-/// equivalent and targets every process whose pgid matches `|pid|`.
+/// DR-0017 session anchor 構造では child は session leader **ではない** が、
+/// fork 直後の `setpgid(0, 0)` で **process group leader** (= `pgid == pid`) には
+/// なる。よって `kill(2)` with a negative pid (= POSIX `killpg(2)` 相当) は
+/// child の pgrp 全体を変わらず狙える。
 ///
 /// Errors are intentionally ignored at most call sites (Drop / finalize),
 /// matching `tmux` / `screen` / `abduco` which always treat this as a
@@ -805,28 +807,20 @@ fn handle_suspend_signals(
     None
 }
 
-/// DR-0001 軸 1: `lifecycle.poll_with_transition` が **新規** `Stopped` transition
-/// を観測した瞬間に呼ばれる。policy に応じて Follow / AutoResume を発火する。
+/// 子の **新規** `Stopped` transition を観測した瞬間に呼ばれる
+/// (= `lifecycle.poll_with_transition`)。
 ///
-/// - **`OnChildSuspend::AutoResume`**: 子 pgrp に即 `SIGCONT` を送って復帰
-///   (= 子の suspend を一切許さない、poc3 nosuspend 相当)。
-/// - **`OnChildSuspend::Follow`**: 親自身に `SIGSTOP` を `raise`。親が STOPPED に
-///   なると外側 shell の job control が親を bg/fg 制御に組み込み、`fg` で揃って
-///   復帰する。復帰時は SIGCONT byte が self-pipe に乗って `handle_suspend_signals`
-///   が invariant 回復で子も SIGCONT する。
+/// DR-0017 §柱2: ユーザ / 端末起因の stop (SIGTSTP / SIGSTOP) は **意図的な操作**
+/// なので daemon は **勝手に起こさない**。`SessionChildStoppedNotify` で leader に
+/// follow 判断を委ねるのみ。leader 不在 / cap 不足でも **SIGCONT は送らず**、
+/// stopped のまま残す (= 外側 API `hyoui kill --signal=CONT` で起こせるため
+/// 「誰も起こせない」状況は構造的に存在しない)。`state.child_stopped` を立てて
+/// status/list での可観測性を担保する。
 ///
-/// `Continued` / `Exited` transition は (現状) 単に通知するだけで policy 発火なし。
-/// `Exited` の場合は caller 側 (`lifecycle.poll_with_transition` の返り `ChildState`)
-/// が `RelayOutcome::ChildExited` で serve_loop を抜けるので、本 helper は `None`。
-/// DR-0015 §2.2: 子 stopped transition の新方針 handler。
-///
-/// daemon は **直接 raise(SIGSTOP) も親 termios も触らない**。代わりに leader
-/// (= rw + leader 取得 client) に `session.child.stopped.notify` を送って follow
-/// policy 決定を委ねる。leader が `child-state-v1` cap を持たない or leader 不在
-/// の場合は **auto-resume fallback** (= 即 `killpg(child, SIGCONT)`) で子を起こす。
+/// daemon は **直接 raise(SIGSTOP) も親 termios も触らない**。
 ///
 /// 子の self-stop だけが本 path に来る (= DR-0015 §2.3 で軸 2 廃止のため daemon
-/// 自身が `killpg(child, SIGSTOP)` する経路は存在しない、衝突 origin 記録不要)。
+/// 自身が `killpg(child, SIGSTOP)` する経路は存在しない)。
 fn notify_child_stopped(
     child: Pid,
     clients: &mut [ClientHandle],
@@ -834,6 +828,9 @@ fn notify_child_stopped(
     sig_observed: i32,
 ) -> Vec<u64> {
     use crate::protocol::messages::SessionChildStoppedNotify;
+
+    // 子が stopped であることを記録 (= status/list の可観測性、DR-0017 §柱2)。
+    state.set_child_stopped(true);
 
     // DR-0016 §3: child-stopped-observed lifecycle event (= 4 段階の 1 段階目)。
     // WUNTRACED で stop transition を初めて観測した瞬間に push する。
@@ -850,30 +847,18 @@ fn notify_child_stopped(
     // leader を探す。複数 leader はあり得ない設計 (= broadcast.rs::elevate_next_leader)。
     let leader_idx = clients.iter().position(|ch| ch.leader);
     let Some(idx) = leader_idx else {
-        // leader 不在 = auto-resume fallback
-        // DR-0016 §3: sigcont-sent lifecycle event (resume-request 経由でない経路でも記録)
-        let _ = kill_pgrp(child, Signal::SIGCONT);
-        state
-            .record_registry
-            .push_lifecycle(super::record::LifecycleEvent::SigcontSent {
-                pid: child.as_raw() as u32,
-                ts_unix_ms: now_unix_ms(),
-            });
+        // leader 不在: DR-0017 §柱2 で auto-resume fallback を廃止。SIGCONT を
+        // 送らず stopped のまま残す (= 外側 API で起こせる)。notify 先がいないので
+        // 何もしない。
         return Vec::new();
     };
-    // cap check: leader が `child-state-v1` 持たないなら fallback
+    // cap check: leader が `child-state-v1` を持たない場合も同様に SIGCONT を送らず
+    // notify もしない (= stopped のまま残す、外側 API で起こせる)。
     if !clients[idx]
         .negotiated_caps
         .iter()
         .any(|c| c == "child-state-v1")
     {
-        let _ = kill_pgrp(child, Signal::SIGCONT);
-        state
-            .record_registry
-            .push_lifecycle(super::record::LifecycleEvent::SigcontSent {
-                pid: child.as_raw() as u32,
-                ts_unix_ms: now_unix_ms(),
-            });
         return Vec::new();
     }
     // notify 送信 (= 単一 receiver、cap-aware broadcast helper を使うほどでもない)
@@ -902,6 +887,8 @@ fn sig_num_to_name(sig: i32) -> String {
 /// `WaitStatus::Continued` は signal を carry しないが、kernel が continued を
 /// 報告するのは SIGCONT で起きた時だけなので、固定で SIGCONT 名 + 番号で push する。
 fn record_child_continued(state: &SessionState, child: Pid) {
+    // DR-0017 §柱2: 子が再開したので stopped 観測フラグを下ろす (= status/list 整合)。
+    state.set_child_stopped(false);
     let sig = nix::sys::signal::Signal::SIGCONT as i32;
     state
         .record_registry
@@ -1612,6 +1599,81 @@ mod tests {
     fn until_watcher_empty_needle_never_matches() {
         let mut w = UntilWatcher::new(String::new());
         assert!(!w.feed(b"anything"));
+    }
+
+    /// DR-0017 §柱2 (層 2): `notify_child_stopped` は leader 不在時に **SIGCONT を
+    /// 送らない** (= auto-resume fallback 廃止)。子は stopped のまま残り、
+    /// `state.child_stopped()` が立つ (= status/list で可観測)。
+    ///
+    /// 旧実装は leader 不在で無条件 `killpg(child, SIGCONT)` していたため、
+    /// `kill -STOP` した子が即起こされて止まらなかった (= ^Z bug 層 2)。
+    ///
+    /// PTY child を使うため `#[ignore]` (= ローカルで `--ignored` 実行)。
+    #[ignore = "PTY child を使う、ローカルで --ignored 実行 (DR-0017 §柱2 層 2 検証)"]
+    #[test]
+    fn notify_child_stopped_does_not_auto_resume_without_leader() {
+        use crate::sys::Pty;
+        use nix::sys::signal::Signal;
+        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+
+        let spawned = Pty::spawn(&["cat"], 80, 24).expect("spawn cat");
+        let child = spawned.child;
+
+        // 子を SIGSTOP で停止させる (= ^Z 相当の停止状態を作る)。
+        nix::sys::signal::kill(child, Signal::SIGSTOP).expect("SIGSTOP");
+        // WUNTRACED で stop transition を回収 (= notify_child_stopped が呼ばれる前提)。
+        let mut stopped = false;
+        for _ in 0..100 {
+            if let Ok(WaitStatus::Stopped(_, _)) =
+                waitpid(child, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED))
+            {
+                stopped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(stopped, "child should be Stopped after SIGSTOP");
+
+        // leader 不在 (= clients 空) で notify_child_stopped を呼ぶ。
+        let state = SessionState::default();
+        let mut clients: Vec<ClientHandle> = Vec::new();
+        let overflow = notify_child_stopped(child, &mut clients, &state, Signal::SIGTSTP as i32);
+        assert!(overflow.is_empty(), "no leader = no notify overflow");
+
+        // DR-0017: stopped 観測フラグが立つ (= 可観測性)。
+        assert!(
+            state.child_stopped(),
+            "child_stopped flag must be set for status/list observability"
+        );
+
+        // 子が **依然 stopped のまま** であることを確認 (= auto-resume されていない)。
+        // SIGCONT を送られていれば WCONTINUED が観測できてしまうが、ここでは
+        // WNOHANG | WUNTRACED で「まだ stopped」を複数回確認する。
+        let mut still_stopped = true;
+        for _ in 0..10 {
+            match waitpid(
+                child,
+                Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED),
+            ) {
+                // StillAlive = 既に回収済 stop の latch、または何も新規 transition なし。
+                Ok(WaitStatus::StillAlive) | Ok(WaitStatus::Stopped(_, _)) => {}
+                Ok(WaitStatus::Continued(_)) => {
+                    still_stopped = false;
+                    break;
+                }
+                other => panic!("unexpected wait status: {other:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            still_stopped,
+            "DR-0017: daemon must NOT auto-resume a stopped child when no leader is present"
+        );
+
+        // cleanup
+        let _ = nix::sys::signal::kill(child, Signal::SIGCONT);
+        let _ = nix::sys::signal::kill(child, Signal::SIGKILL);
+        let _ = waitpid(child, Some(WaitPidFlag::empty()));
     }
 
     /// R4-H14: `ChildLifecycle` は SIGSTOP / SIGCONT の transition を取りこぼさず、
