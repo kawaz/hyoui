@@ -59,11 +59,7 @@ crates/
   hyoui/            # library crate (all core functionality)
     src/
       lib.rs        # re-exports
-      cli/          # CLI parser + per-subcommand handlers
-        mod.rs
-        input.rs    # hyoui input (= spec parser; text/hex/file/paste/key/wait*)
-        wait_core.rs # state-based wait polling (snapshot trigger + cells → text)
-        ...
+      cli.rs        # CLI parser + subcommand definitions
       daemon/       # daemon side (server holding one session)
         mod.rs
         config.rs   # session config (socket path, scrollback size, screen sizes)
@@ -73,6 +69,8 @@ crates/
           state.rs       # VirtualScreen (owns vt100::Parser as the canonical state)
           input_log.rs   # bounded ring for primary buffer (resize replay)
           snapshot.rs    # structured snapshot wrapper (CBOR compression)
+          redraw.rs      # initial redraw on attach
+          health.rs      # screen state health checks
         control.rs  # control message dispatcher
         broadcast.rs # writer pump + backpressure + ClientHandle
         accept.rs   # handshake worker pool
@@ -80,6 +78,7 @@ crates/
         tail.rs     # tail subscription
         lock.rs     # SessionState + leader cascade
         pty.rs      # child lifecycle
+        record.rs   # tty I/O timeline recording (DR-0016)
       client/       # client side (connects to the daemon)
         mod.rs
         attach.rs   # ClientConnection (handshake + raw I/O + detach prefix + raw bytes send)
@@ -101,13 +100,16 @@ crates/
         socket.rs   # Unix socket bind (perm 0600 / dir 0700)
         clock.rs    # Instant ↔ epoch ms
         poll.rs     # poll(2) wrapper
-        ...
+        wait.rs     # waitpid wrapper
+        fd.rs / env.rs / tty.rs / error.rs
   hyoui-cli/        # binary crate (the `hyoui` command)
     src/
       main.rs       # entry point, dispatches the Command enum from cli.rs
       daemonize.rs  # double fork + setsid (--detached)
       socket_path.rs # socket directory resolver (XDG / TMPDIR)
-      completion.rs # shell completion stub
+      input_handlers.rs # subcommand handlers for the input family
+      wait_core.rs  # state-based wait polling (snapshot trigger + cells → text)
+      completion.rs # shell completion generation
 ```
 
 The daemon module split is canonical in [[DR-0009]]; the `screen/` subtree is
@@ -141,8 +143,8 @@ Control message body (type=0x01) = CBOR map { "kind": "<dotted.name>", ...payloa
   cap flags negotiate "what the peer can speak"
 - v0.1.x cap set: `["data", "lock", "tail-v1", "screen-dump-v1", "state-snapshot-v1"]`
 - Wait is **state-based** (no dedicated cap or kind; the CLI side
-  `cli/wait_core.rs` polls `screen.snapshot.request`, rebuilds text from the
-  visible cells, and runs the regex). The legacy `wait.request` /
+  `hyoui-cli/src/wait_core.rs` polls `screen.snapshot.request`, rebuilds text
+  from the visible cells, and runs the regex). The legacy `wait.request` /
   `wait.result` kinds, the `wait-l0` cap, and the `wait.*` error codes were
   removed from both wire and implementation when DR-0006 §9 and DR-0013 §9
   landed.
@@ -185,7 +187,7 @@ across nine modules — `session.rs` is now the orchestrator, with `pty.rs` /
 - **State-based wait helpers** (`wait.rs`): incoming master bytes trigger
   snapshot polling and compute the poll interval. The legacy L0 wait protocol
   (`wait.request` / `wait.result` kinds) was removed; the actual matching
-  lives in the CLI (`cli/wait_core.rs`)
+  lives in the CLI (`hyoui-cli/src/wait_core.rs`)
 - **Structured snapshot / dump** ([[DR-0013]] §9): handlers for
   `screen.dump.request` / `screen.snapshot.request`, routed through the CBOR
   compression wrapper in `screen/snapshot.rs`

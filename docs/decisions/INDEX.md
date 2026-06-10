@@ -31,6 +31,7 @@ hyoui の設計判断記録一覧。ファイル名は `DR-NNNN-title.md`（4 �
 | [DR-0014](./DR-0014-transparency-and-empirical-verification.md) | N/A (= プロセス) | 透過原則の徹底と検証主義 (= self-check リスト、マトリクス検証主義、ドッグフーディング、CLAUDE.md 経由で常時参照) |
 | [DR-0015](./DR-0015-run-as-fork-plus-attach.md) | ✅ 実装済 (2026-05-28) | `hyoui run` を fork daemon + attach client の合成に再定義、client/server 同居廃止 (= Phase A-D 全完了、新 protocol message 3 個 + linger pattern + attach SIGTSTP handler + Issue #1 / 派生 issue 解消) |
 | [DR-0016](./DR-0016-tty-io-record.md) | 🟡 record core 実装済 (v0.2.x 出荷、Phase 4 hot path 配線完了。⚠ redaction の state machine = Phase 5 は未配線、`--input-secrecy` 値に関わらず stdin は素通し記録) | `hyoui record` — tty I/O timeline の永続録画 subcommand (= bug 解析の観測道具、jsonl format with header + bytes/lifecycle event + seq monotonic + 4 段階 SIGTSTP/SIGCONT lifecycle 分離、broadcast 経路と独立 I/O sink、bounded queue + writer task で観測対象を歪めない設計、redact-after-prompt default で secret 防護、record-v1 optional cap で旧 client 互換、`hyoui screen dump` 静止画とは命名分離) |
+| [DR-0017](./DR-0017-session-anchor-and-suspend-policy.md) | ⬜ 未実装 | session anchor 化 + suspend policy 改訂 — TUI の Ctrl-Z を本来のセマンティクスで動かす (= 2 本柱。柱 1: `forkpty` 廃止し `openpty` + 手動 fork、daemon が `TIOCSCTTY` で controlling tty を取り child を同 session・別 pgrp・foreground で起動 → orphan pgrp の SIGTSTP discard を解消 (層 1)。柱 2: leader 不在時の無条件 auto-resume fallback を廃止、ユーザ/端末起因 stop を尊重 (層 2、DR-0001 軸 1 改訂)。DR-0003 の「子を session leader にする」部分を部分 supersede、3 platform PoC 済) |
 
 ## Archived
 

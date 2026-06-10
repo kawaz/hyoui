@@ -2,7 +2,12 @@
 
 - Status: Active (= 軸 1 follow/auto-resume のみ。軸 2 transparent/decouple は [[DR-0015]] で廃止 2026-05-28)
 - Date: 2026-05-21 (= 初版) / 2026-05-28 (= 軸 2 廃止)
-- Related: docs/journal/2026-05-21-bootstrap.md, DR-0002 (ネーミング — 「一心同体」概念がこの設計と地続き), DR-0015 (= `hyoui run` の fork 化に伴い軸 2 廃止 + 軸 1 の実装方式変更)
+- Related: docs/journal/2026-05-21-bootstrap.md, DR-0002 (ネーミング — 「一心同体」概念がこの設計と地続き), DR-0015 (= `hyoui run` の fork 化に伴い軸 2 廃止 + 軸 1 の実装方式変更), DR-0017 (= 軸 1 の auto-resume fallback 改訂)
+
+> **📌 注記 (2026-06-10、[[DR-0017]] により軸 1 一部改訂)**: 軸 1 の「leader 不在時 fallback =
+> 無条件 `killpg(child, SIGCONT)`」を [[DR-0017]] で廃止する (= ユーザ/端末起因の stop を尊重、
+> 勝手に起こさない)。`SessionChildStoppedNotify` の follow 通知は維持。`OnChildSuspend::AutoResume`
+> は opt-in 設定として残すが default は notify のみ。
 
 ## Update (2026-05-28): 軸 2 廃止 + 軸 1 実装方式変更 (= [[DR-0015]])
 

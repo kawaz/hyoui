@@ -2,7 +2,12 @@
 
 - Status: Active
 - Date: 2026-05-26
-- Related: DR-0001 (jobcontrol 2 軸), DR-0002 (naming), DR-0003 (Rust 一本化), DR-0006 (CLI ground rules), DR-0007 (MVP scope)
+- Related: DR-0001 (jobcontrol 2 軸), DR-0002 (naming), DR-0003 (Rust 一本化), DR-0006 (CLI ground rules), DR-0007 (MVP scope), DR-0017 (session anchor 化 — daemon の役割を改訂)
+
+> **📌 思想改訂注記 (2026-06-10、[[DR-0017]] により改訂)**: 本 DR の「daemon は外側の観測者」に、
+> [[DR-0017]] で **「daemon は child の session の anchor を兼ねる」**を追記する。daemon が
+> `TIOCSCTTY` で controlling tty を保持し、slave に `tcsetpgrp` / `tcsetattr` を行うことは、
+> TUI の Ctrl-Z を本来のセマンティクスで動かすために [[DR-0017]] で justify された必要最小限の介入。
 
 > **📌 現行 CLI 体系への注記 (2026-06-10 追記、本文は判断記録として保存)**:
 > 本 DR が例示する `hyoui send / keys / paste / detach` は **草案段階の構想名**であり、

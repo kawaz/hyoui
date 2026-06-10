@@ -50,11 +50,7 @@ crates/
   hyoui/            # library crate (= 全コア機能)
     src/
       lib.rs        # re-export
-      cli/          # CLI parser + 各 subcommand handler
-        mod.rs
-        input.rs    # hyoui input (= spec parser、text/hex/file/paste/key/wait*)
-        wait_core.rs # state-based wait polling (= snapshot 発火 + cells → text 構築)
-        ...
+      cli.rs        # CLI parser + 各 subcommand 定義
       daemon/       # daemon (= session 1 つを抱える server)
         mod.rs
         config.rs   # session config (socket path, scrollback size, screen sizes)
@@ -64,6 +60,8 @@ crates/
           state.rs       # VirtualScreen (vt100::Parser を抱える正本)
           input_log.rs   # primary 用 bounded ring (resize replay)
           snapshot.rs    # 構造化 snapshot wrapper (CBOR 圧縮)
+          redraw.rs      # attach 時の初期 redraw
+          health.rs      # screen state health 判定
         control.rs  # control message dispatcher
         broadcast.rs # writer pump + backpressure + ClientHandle
         accept.rs   # handshake worker pool
@@ -71,6 +69,7 @@ crates/
         tail.rs     # tail subscription
         lock.rs     # SessionState + leader cascade
         pty.rs      # child lifecycle
+        record.rs   # tty I/O timeline 録画 (DR-0016)
       client/       # client (= daemon に attach する側)
         mod.rs
         attach.rs   # ClientConnection (handshake + raw I/O + detach prefix + raw bytes 送信)
@@ -91,13 +90,16 @@ crates/
         socket.rs   # Unix socket bind (perm 0600 / dir 0700)
         clock.rs    # Instant ↔ epoch ms 変換
         poll.rs     # poll(2) wrapper
-        ...
+        wait.rs     # waitpid wrapper
+        fd.rs / env.rs / tty.rs / error.rs
   hyoui-cli/        # binary crate (`hyoui` command)
     src/
       main.rs       # entry point、cli.rs の Command を dispatch
       daemonize.rs  # double fork + setsid (--detached)
       socket_path.rs # socket dir resolver (XDG / TMPDIR)
-      completion.rs # shell completion stub
+      input_handlers.rs # input family の subcommand handler
+      wait_core.rs  # state-based wait polling (= snapshot 発火 + cells → text 構築)
+      completion.rs # shell completion 生成
 ```
 
 daemon module の責務分割は [[DR-0009]]、screen 配下は [[DR-0013]] が正本。
@@ -126,7 +128,7 @@ Control message body (type=0x01) = CBOR map { "kind": "<dotted.name>", ...payloa
 - **wire 外枠 (size + type + body) は永久固定**。breaking change は別 socket path で fork
 - 制御メッセージは CBOR map で **未知 field は ignore**、cap flags で「相手が話せるか」交渉
 - v0.1.x cap 集合: `["data", "lock", "tail-v1", "screen-dump-v1", "state-snapshot-v1"]`
-- wait は **state-based** (= 専用 cap / kind なし、CLI 側 `cli/wait_core.rs` が
+- wait は **state-based** (= 専用 cap / kind なし、CLI 側 `hyoui-cli/src/wait_core.rs` が
   `screen.snapshot.request` を polling して visible cells から text を組み立て regex match)。
   旧 `wait.request` / `wait.result` kind と `wait-l0` cap、`wait.*` error code は
   [[DR-0006]] §9 + [[DR-0013]] §9 への移行で wire / 実装ともに削除済
@@ -159,7 +161,7 @@ Control message body (type=0x01) = CBOR map { "kind": "<dotted.name>", ...payloa
   所有、master read 直後に push。tail コマンド (= `--since` / `--last-bytes`) 専用層
 - **state-based wait 補助** (`wait.rs`): master bytes 着信を trigger にして snapshot 発火 /
   poll interval 算出。L0 wait protocol (= `wait.request`/`wait.result` kind) は廃止済、
-  実体は CLI 側 (`cli/wait_core.rs`) の polling
+  実体は CLI 側 (`hyoui-cli/src/wait_core.rs`) の polling
 - **structured snapshot / dump** ([[DR-0013]] §9): `screen.dump.request` / `screen.snapshot.request`
   の handler、`screen/snapshot.rs` の CBOR 圧縮 wrapper を経由
 - **backpressure** (`broadcast.rs`): `Arc<AtomicUsize> queued_bytes` で byte 単位 cap、

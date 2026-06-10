@@ -4,6 +4,12 @@
 - Date: 2026-05-25
 - Related: DR-0001 (bg/fg ジョブ制御の 2 軸設計), DR-0002 (プロジェクト名), docs/journal/2026-05-25-rust-rebuild.md
 
+> **📌 注記 (2026-06-10、[[DR-0017]] により一部 supersede)**: 本 DR の「`forkpty(3)` + `login_tty(3)` で
+> **子を `setsid` + session leader にする**」部分は [[DR-0017]] で supersede され、`openpty` + 手動 fork
+> (= daemon が `TIOCSCTTY` で session anchor を兼任、子は同 session・別 pgrp) へ移行する。orphan
+> process group での Ctrl-Z (SIGTSTP) discard を解消するための変更。Rust 一本化判断および raw fd /
+> 制御端末獲得の他の理由は影響を受けない。
+
 ## Context
 
 poc 段階の実装は **MoonBit + Rust FFI 二層構成** だった (`ffi/` 1146 行 + `lib/agent/` 988 行)。

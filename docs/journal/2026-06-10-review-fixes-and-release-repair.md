@@ -138,3 +138,19 @@ push 後に発覚した問題の連鎖と解決:
 - [issue/2026-05-29-bug-claude-tui-ctrl-z-not-stopping.md](../issue/2026-05-29-bug-claude-tui-ctrl-z-not-stopping.md) / [issue/2026-05-29-bug-ctrl-z-second-time-noop.md](../issue/2026-05-29-bug-ctrl-z-second-time-noop.md) / [issue/2026-05-28-bug-claude-tui-ctrl-z-followup.md](../issue/2026-05-28-bug-claude-tui-ctrl-z-followup.md) — Ctrl-Z 関連 issue
 - [decisions/DR-0014-transparency-and-empirical-verification.md](../decisions/DR-0014-transparency-and-empirical-verification.md) — 透過原則 + 検証主義 (本日の判断軸)
 - [REVIEW-BACKLOG.md](../REVIEW-BACKLOG.md) — レビュー指摘 backlog
+
+## 追記: DR-0017 session anchor 実装完了 (同日夜)
+
+DR-0017 起票 → 実装まで同日に完走。forkpty を廃止して `openpty` + 親側 `TIOCSCTTY` +
+手動 fork (子: `setpgid`/`tcsetpgrp`/`dup2`/`execvp`) に変更し、auto-resume fallback を削除。
+実機マトリクス (cat/sleep/python/bash/vim) で「^Z 1 回目から停止 → `list` に stopped 表示 →
+`kill --signal=CONT --no-terminate` で session 継続のまま復帰 → 2 回目の ^Z も停止」を確認。
+vim (raw mode TUI) も自前 handler の re-raise が anchor により機能して停止 = claude TUI と
+同構造の本丸ケースが解決。
+
+実装中の発見: `hyoui kill --signal=CONT` は signal 後に必ず session を terminate する仕様で、
+DR-0017 の前提「外側 API で起こせる」が不成立だった → `--no-terminate` フラグを追加して
+非 terminate の `ControlMessage::Signal` 経路を CLI に露出 (対極チェックの成果)。
+
+残: 起動直後の SIGTTIN 一過性 (issue 起票済・実害なし)、signal.ack (issue 起票済)、
+kawaz の実端末での attach ^Z 最終確認。
