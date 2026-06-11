@@ -154,3 +154,19 @@ DR-0017 の前提「外側 API で起こせる」が不成立だった → `--no
 
 残: 起動直後の SIGTTIN 一過性 (issue 起票済・実害なし)、signal.ack (issue 起票済)、
 kawaz の実端末での attach ^Z 最終確認。
+
+## 追記 2026-06-11: Ctrl-Z 完全解決の実機確認とその後
+
+- kawaz 実機確認 (claude TUI / ghostty): ^Z → 外側 shell 正常 → fg → 再描画 + 入力可能。
+  **Ctrl-Z 問題は完全解決** (DR-0017 anchor + suspend/resume の外側端末管理)
+- 初回の実機 NG は PATH の brew 版 v0.2.3 を踏んでいたのが原因 (フルパス指定で解決)。
+  教訓: 再テスト依頼には必ず `--version` 確認を含める
+- kill 即時応答化 (default) + --wait 化。発端は「claude は SIGTERM 1 発で死なない」
+  → daemon が exit 待ちで無応答 → ^C → 孤児 daemon、の連鎖
+- 孤児 daemon 11 個を発見・掃除 (socket unlink 後に子の exit を待ち続けた旧 kill の実害
+  + agent 実験の途中ビルド残骸)。現行バイナリでは子 exit 後に daemon が正しく終了する
+  ことを再確認済み
+- bump-semver v0.38.0 の stdin フォールバック修正に追加バグ: 開いたまま無データの
+  socket/pipe では read が永久ブロック (Claude Code Bash の background 実行で 2 時間
+  ハング、lsof で fd0=unix socket を確認)。回避: `< /dev/null` 明示。bump-semver へ報告済み
+- session namespace (DR-0018) 実装・検証完了 → v0.5.0
