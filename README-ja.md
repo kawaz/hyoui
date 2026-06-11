@@ -170,13 +170,45 @@ hyoui tail "$SESS" --last-bytes=4096
 hyoui tail "$SESS" --since=10s --since-strict
 ```
 
+### session namespace
+
+session を **namespace** でグループ分けして、無関係なグループが `hyoui list` で
+混ざらないようにできる ([DR-0018](./docs/decisions/DR-0018-session-namespace.md))。
+namespace は `--namespace` flag > env `HYOUI_NAMESPACE` > `default` の順で解決され、
+全 session 系コマンド (run / attach / list / kill / input / ...) が同じ解決を共有する。
+`default` namespace は従来の socket 配置そのままなので、既存 session には影響しない。
+
+```bash
+# 普段使いの session (= default namespace、従来と完全に同じ挙動)
+hyoui run --detached -- claude
+
+# worker 群を専用 namespace に隔離
+hyoui run --detached --namespace=workers --session=w1 -- worker-cmd
+hyoui run --detached --namespace=workers --session=w2 -- worker-cmd
+
+hyoui list                          # default のみ — worker のノイズが混ざらない
+hyoui list --namespace=workers      # worker 群のみ
+hyoui list --all-namespaces         # 全部 (= NS 列付き)
+hyoui attach w1 --namespace=workers # selector は全部 namespace スコープ
+hyoui kill --all --namespace=workers  # killall も worker 群だけに効く
+
+# direnv 連携: プロジェクトの .envrc に `export HYOUI_NAMESPACE=myproj` を書けば、
+# そのプロジェクト内の run/list/attach が全部自動で分離される。
+```
+
+`hyoui run` は解決済 namespace を子プロセスの env に `HYOUI_NAMESPACE` として
+**常時注入**する (= `default` でも入れる)。namespace 内でネスト起動した hyoui は
+指定なしで同じ namespace を引き継ぐ — tmux の `TMUX` / screen の `STY` と同じ慣行。
+namespace 内から別 namespace で起動したい場合は `--namespace=<別ns>` を明示する
+(例: `--namespace=default`)。
+
 ### 主な subcommand
 
 | コマンド | 用途 |
 |---|---|
 | `hyoui run [--detached] [--session=ID] [--size=COLSxROWS] -- cmd args...` | PTY 起動・daemon 化 |
 | `hyoui attach <session> [--mode=rw\|ro\|rw-no-leader]` | 入出力中継 (= screen state から画面復元) |
-| `hyoui list` | アクティブ session を列挙 |
+| `hyoui list [--namespace=NS\|--all-namespaces]` | アクティブ session を列挙 (= namespace スコープ) |
 | `hyoui kill <session> [--signal=NUM_OR_NAME]` | 子に signal 送出（default SIGTERM、name / number 両対応。例 `--signal KILL` / `--signal 9`） |
 | `hyoui status <session>` | session 状態表示 (= clients / leader / lock / scrollback) |
 | `hyoui input <session> <spec>...` | 入力注入 (= `text:` / `hex:` / `file:` / `paste:` / `key:` / `wait:` / `wait-idle:` spec) |

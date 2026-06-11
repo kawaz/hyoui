@@ -45,3 +45,18 @@ pub fn remove_var_at_startup(key: &str) {
     // SAFETY: caller が「main entry 冒頭、thread spawn 前」を保証する前提。
     unsafe { std::env::remove_var(key) }
 }
+
+/// `std::env::set_var` の production 用 wrapper (= 起動初期 single-threaded のみ)。
+///
+/// # Safety (caller 契約)
+/// **process 起動初期 + single-threaded** でのみ呼ぶこと。`remove_var_at_startup`
+/// と同じ理由 (= 並列 thread で env を触ると glibc env table に race) で、`fn main`
+/// 冒頭 / daemon child 起動初期 (= thread spawn 前) なら risk は無い。
+///
+/// 本 wrapper は daemon child (`run_daemon_child`) が `Session::start` (= 子 PTY を
+/// fork+execvp する) **前** に `HYOUI_NAMESPACE` を自 env に set し、execvp される
+/// 子 PTY がそれを継承する用途で使う (= DR-0018 namespace 継承)。
+pub fn set_var_at_startup(key: &str, value: &str) {
+    // SAFETY: caller が「daemon child 起動初期、thread spawn 前」を保証する前提。
+    unsafe { std::env::set_var(key, value) }
+}

@@ -12,6 +12,19 @@
 //!    - dir は **新規作成時** mode 0700。既存 dir は所有者と mode を verify
 //!
 //! HOME 直下 (`~/.hyoui` 等) は使わない (= ユーザ HOME を汚さない)。
+//!
+//! # namespace (DR-0018)
+//!
+//! session を用途グループごとに分離するため、socket dir を namespace で分ける:
+//!
+//! - `default` namespace (= 既定): 上記の base dir **直下** にそのまま socket を置く
+//!   (= 既存 session と完全互換、dir 移動なし)。
+//! - それ以外の namespace `<ns>`: base dir の下に `<ns>/` サブ dir を 1 段掘り、
+//!   その中に socket を置く (= `<base>/hyoui-<uid>/<ns>/<session>.sock`)。
+//!
+//! namespace の解決順は `--namespace=X` flag > env `HYOUI_NAMESPACE` > `default`
+//! ([`resolve_namespace`])。ns 名は [`hyoui::cli::validate_namespace`] で whitelist
+//! validate される (= path traversal / `/` 禁止)。
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -75,21 +88,67 @@ pub fn validate_session_id(session_id: &str) -> std::io::Result<()> {
         .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))
 }
 
-/// daemon socket path を決定する。
+/// `namespace` whitelist validator の io::Error 化 wrapper (= DR-0018)。
 ///
-/// `explicit = Some(p)` ならそのまま、`None` なら自動 path:
-/// `$XDG_RUNTIME_DIR/hyoui/<sid>.sock` (= dir 実在時)、
-/// それ以外は `${TMPDIR:-/tmp}/hyoui-<uid>/<sid>.sock`。
-/// parent dir は **新規作成時のみ** mode 0700 で create、既存 dir は所有者/mode 検証。
+/// canonical な validator は [`hyoui::cli::validate_namespace`] にある。本関数は
+/// 戻り値を `std::io::Error` (`ErrorKind::InvalidInput`) にラップして、socket dir
+/// 解決系の戻り型と整合させるための薄い shim。
 ///
 /// # Errors
 ///
-/// dir 作成・検証で失敗時に [`std::io::Error`]。
-pub fn resolve(explicit: Option<&str>, session_id: &str) -> std::io::Result<PathBuf> {
+/// `namespace` が whitelist に反する場合、`std::io::ErrorKind::InvalidInput` を返す。
+pub fn validate_namespace(namespace: &str) -> std::io::Result<()> {
+    hyoui::cli::validate_namespace(namespace)
+        .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))
+}
+
+/// session namespace を解決する (= DR-0018)。
+///
+/// 優先順位 (高 → 低):
+///
+/// 1. `flag` (= `--namespace=X`) が `Some(非空)` ならその値
+/// 2. env `HYOUI_NAMESPACE` が set + 非空ならその値
+/// 3. どちらも無ければ [`hyoui::cli::DEFAULT_NAMESPACE`] (= `"default"`)
+///
+/// 返り値は **validate 前** の生文字列。caller は socket dir 解決の前段で
+/// [`validate_namespace`] (or それを内包する [`resolve_in_namespace`]) を通すこと。
+pub fn resolve_namespace(flag: Option<&str>) -> String {
+    if let Some(v) = flag
+        && !v.is_empty()
+    {
+        return v.to_string();
+    }
+    match std::env::var("HYOUI_NAMESPACE") {
+        Ok(v) if !v.is_empty() => v,
+        _ => hyoui::cli::DEFAULT_NAMESPACE.to_string(),
+    }
+}
+
+/// daemon socket path を **namespace スコープ**で決定する (= DR-0018)。
+///
+/// `explicit = Some(p)` ならそのまま、`None` なら自動 path:
+/// - `default` namespace → base dir 直下 (= 既存互換):
+///   `$XDG_RUNTIME_DIR/hyoui/<sid>.sock` (= dir 実在時) /
+///   `${TMPDIR:-/tmp}/hyoui-<uid>/<sid>.sock`
+/// - それ以外 → `<base>/<namespace>/<sid>.sock`
+///
+/// parent dir は **新規作成時のみ** mode 0700 で create、既存 dir は所有者/mode 検証。
+/// `namespace` は事前に [`validate_namespace`] で検証される (= path traversal 防止)。
+///
+/// # Errors
+///
+/// `namespace` / `session_id` が whitelist 違反、または dir 作成・検証で失敗時に
+/// [`std::io::Error`]。
+pub fn resolve_in_namespace(
+    explicit: Option<&str>,
+    session_id: &str,
+    namespace: &str,
+) -> std::io::Result<PathBuf> {
     let env = EnvSnapshot {
         xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR"),
         tmpdir: std::env::var_os("TMPDIR"),
         uid: nix::unistd::geteuid().as_raw(),
+        namespace: namespace.to_string(),
     };
     resolve_with_env(explicit, session_id, &env)
 }
@@ -103,6 +162,9 @@ pub struct EnvSnapshot {
     pub tmpdir: Option<OsString>,
     /// 現在の effective UID。
     pub uid: u32,
+    /// 解決済 session namespace (= DR-0018)。`default` なら base dir 直下、
+    /// それ以外は base dir 配下に `<namespace>/` サブ dir を掘る。
+    pub namespace: String,
 }
 
 /// `resolve` の env を呼び出し側で注入できる test 用版。
@@ -117,22 +179,35 @@ pub fn resolve_with_env(
     // R5-AUD-C2: session_id を `PathBuf::join` に渡す前に whitelist validate。
     // 不正値が来た場合は dir 作成すら行わず即 reject (= traversal の副作用なし)。
     validate_session_id(session_id)?;
-    let dir = pick_socket_dir(env)?;
-    ensure_socket_dir(&dir, env.uid)?;
+    // DR-0018: namespace も `PathBuf::join` 前に validate (= path traversal 防止)。
+    validate_namespace(&env.namespace)?;
+    // namespace dir も base dir と同じ規律 (= mode 0700 / 所有者検証) で ensure する。
+    // `create_dir_all` は中間 dir の mode を umask に委ねてしまい 0700 を保証しない
+    // ため、base → ns の順で `ensure_socket_dir` を 2 段呼びして両階層とも 0700 を
+    // 強制する (= 非 default ns でも base dir の所有者/権限検証が効く)。
+    let base = pick_base_dir(env);
+    ensure_socket_dir(&base, env.uid)?;
+    let dir = if env.namespace == hyoui::cli::DEFAULT_NAMESPACE {
+        base
+    } else {
+        let ns_dir = base.join(&env.namespace);
+        ensure_socket_dir(&ns_dir, env.uid)?;
+        ns_dir
+    };
     Ok(dir.join(format!("{session_id}.sock")))
 }
 
-/// 候補 dir を選ぶ。
+/// namespace を含めない base socket dir を選ぶ (= `hyoui-<uid>` まで)。
 ///
 /// 1. `XDG_RUNTIME_DIR` が空でなく実在 dir → `$XDG_RUNTIME_DIR/hyoui`
 /// 2. それ以外 → `${TMPDIR:-/tmp}/hyoui-<uid>`
-fn pick_socket_dir(env: &EnvSnapshot) -> std::io::Result<PathBuf> {
+fn pick_base_dir(env: &EnvSnapshot) -> PathBuf {
     if let Some(xdg) = env.xdg_runtime_dir.as_ref()
         && !xdg.is_empty()
     {
         let p = PathBuf::from(xdg);
         if p.is_dir() {
-            return Ok(p.join("hyoui"));
+            return p.join("hyoui");
         }
     }
     let tmp = env
@@ -141,7 +216,7 @@ fn pick_socket_dir(env: &EnvSnapshot) -> std::io::Result<PathBuf> {
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    Ok(tmp.join(format!("hyoui-{}", env.uid)))
+    tmp.join(format!("hyoui-{}", env.uid))
 }
 
 /// `dir` を「mode 0700 + 所有者 = euid」で利用可能にする。
@@ -185,10 +260,15 @@ mod tests {
     use super::*;
 
     fn env_with(xdg: Option<&Path>, tmp: Option<&Path>) -> EnvSnapshot {
+        env_with_ns(xdg, tmp, hyoui::cli::DEFAULT_NAMESPACE)
+    }
+
+    fn env_with_ns(xdg: Option<&Path>, tmp: Option<&Path>, ns: &str) -> EnvSnapshot {
         EnvSnapshot {
             xdg_runtime_dir: xdg.map(|p| p.as_os_str().to_os_string()),
             tmpdir: tmp.map(|p| p.as_os_str().to_os_string()),
             uid: nix::unistd::geteuid().as_raw(),
+            namespace: ns.to_string(),
         }
     }
 
@@ -276,6 +356,7 @@ mod tests {
             xdg_runtime_dir: Some(OsString::new()), // 空 string は無視
             tmpdir: Some(tmp.path().as_os_str().to_os_string()),
             uid: nix::unistd::geteuid().as_raw(),
+            namespace: hyoui::cli::DEFAULT_NAMESPACE.to_string(),
         };
         let got = resolve_with_env(None, "x", &env).expect("resolve");
         assert!(
@@ -296,6 +377,7 @@ mod tests {
             xdg_runtime_dir: Some(bogus.as_os_str().to_os_string()),
             tmpdir: Some(tmp.path().as_os_str().to_os_string()),
             uid: nix::unistd::geteuid().as_raw(),
+            namespace: hyoui::cli::DEFAULT_NAMESPACE.to_string(),
         };
         let got = resolve_with_env(None, "x", &env).expect("resolve");
         assert!(got.starts_with(tmp.path()), "should fall back to tmpdir");
@@ -462,5 +544,113 @@ mod tests {
             .unwrap()
             .as_nanos()
             .to_string()
+    }
+
+    // ------------------------------------------------------------------
+    // DR-0018: namespace resolution / socket dir 分離
+    // ------------------------------------------------------------------
+
+    /// `default` namespace は base dir **直下** に socket を置く (= 既存互換、dir 移動なし)。
+    #[test]
+    fn default_namespace_places_socket_directly_under_base() {
+        let tmp = tempfile::Builder::new()
+            .prefix("hyoui-ns-default-")
+            .tempdir()
+            .expect("tempdir");
+        let uid = nix::unistd::geteuid().as_raw();
+        let env = env_with_ns(None, Some(tmp.path()), "default");
+        let got = resolve_with_env(None, "mysession", &env).expect("resolve");
+        assert_eq!(
+            got,
+            tmp.path()
+                .join(format!("hyoui-{uid}"))
+                .join("mysession.sock")
+        );
+    }
+
+    /// 非 default namespace は base dir 配下に `<ns>/` サブ dir を掘る。
+    #[test]
+    fn non_default_namespace_uses_subdir() {
+        let tmp = tempfile::Builder::new()
+            .prefix("hyoui-ns-sub-")
+            .tempdir()
+            .expect("tempdir");
+        let uid = nix::unistd::geteuid().as_raw();
+        let env = env_with_ns(None, Some(tmp.path()), "workers");
+        let got = resolve_with_env(None, "w1", &env).expect("resolve");
+        assert_eq!(
+            got,
+            tmp.path()
+                .join(format!("hyoui-{uid}"))
+                .join("workers")
+                .join("w1.sock")
+        );
+        // ns dir も base dir も mode 0700。
+        let ns_dir = got.parent().unwrap();
+        let base_dir = ns_dir.parent().unwrap();
+        assert_eq!(
+            std::fs::metadata(ns_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(base_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    /// namespace に `/` を含む値は reject される (= path traversal / 階層予約)。
+    #[test]
+    fn resolve_rejects_namespace_with_slash() {
+        let env = env_with_ns(None, None, "a/b");
+        let err = resolve_with_env(None, "x", &env).expect_err("slash ns must err");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// namespace に `..` を含む値は reject される (= traversal)。
+    #[test]
+    fn resolve_rejects_namespace_dotdot() {
+        for ns in ["..", "../escape"] {
+            let env = env_with_ns(None, None, ns);
+            let err = resolve_with_env(None, "x", &env).expect_err(&format!("ns {ns:?} must err"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "ns={ns:?}");
+        }
+    }
+
+    /// 空 namespace は reject される。
+    #[test]
+    fn resolve_rejects_empty_namespace() {
+        let env = env_with_ns(None, None, "");
+        let err = resolve_with_env(None, "x", &env).expect_err("empty ns must err");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// `resolve_namespace`: flag > env > default の優先順位。
+    #[test]
+    fn resolve_namespace_precedence() {
+        // flag は env より優先 (= env 値があっても flag が勝つ)。
+        // production env を汚さないよう、flag 優先パスのみ env 非依存で検証する。
+        assert_eq!(resolve_namespace(Some("flagns")), "flagns");
+        // 空 flag は無視 → env or default。
+        // 既存 env を読み取って期待値を組む (= test 並列実行で env を書き換えない)。
+        let expected = match std::env::var("HYOUI_NAMESPACE") {
+            Ok(v) if !v.is_empty() => v,
+            _ => "default".to_string(),
+        };
+        assert_eq!(resolve_namespace(Some("")), expected);
+        assert_eq!(resolve_namespace(None), expected);
+    }
+
+    /// `validate_namespace` の error は `namespace` 文脈の文言になる。
+    #[test]
+    fn validate_namespace_error_mentions_namespace() {
+        let err = validate_namespace("").expect_err("empty must err");
+        assert!(
+            err.to_string().contains("namespace"),
+            "error should mention namespace, got: {err}"
+        );
+        assert!(
+            !err.to_string().contains("session_id"),
+            "error should not leak session_id wording, got: {err}"
+        );
     }
 }

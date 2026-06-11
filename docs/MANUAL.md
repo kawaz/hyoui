@@ -25,6 +25,7 @@ CLI).
   - [6. Read the screen (`screen dump` / `snapshot`)](#6-read-the-screen-screen-dump--snapshot)
   - [7. Exclusive automation (`lock`)](#7-exclusive-automation-lock)
   - [8. Record the tty I/O timeline (`record`)](#8-record-the-tty-io-timeline-record)
+  - [9. Group sessions with namespaces](#9-group-sessions-with-namespaces)
 - [Troubleshooting](#troubleshooting)
 - [See also](#see-also)
 
@@ -136,6 +137,51 @@ hyoui record stop "$SESS" --all
 > redaction state machine is parked in Phase 5
 > ([DR-0016](./decisions/DR-0016-tty-io-record.md)). If you may type passphrases
 > or tokens, record only `--stdout`, or avoid recording stdin during secret entry.
+
+### 9. Group sessions with namespaces
+
+Use **namespaces** ([DR-0018](./decisions/DR-0018-session-namespace.md)) when
+unrelated session groups (e.g. your day-to-day `claude` and a temporary worker
+fleet) should not mix in `hyoui list`. Resolution is
+`--namespace` flag > env `HYOUI_NAMESPACE` > `default`, shared by every session
+command. The `default` namespace keeps the traditional socket layout, so
+existing sessions are unaffected.
+
+```sh
+# isolate a worker fleet
+hyoui run --detached --namespace=workers --session=w1 -- worker-cmd
+hyoui run --detached --namespace=workers --session=w2 -- worker-cmd
+
+hyoui list                            # default only — workers don't show up
+hyoui list --namespace=workers        # the fleet only
+hyoui list --all-namespaces           # everything, with a leading NS column
+hyoui list --all-namespaces --prune-stale  # sweep stale sockets in every namespace
+
+# every selector is namespace-scoped (session id, --index, kill --all, ...)
+hyoui attach w1 --namespace=workers
+hyoui input --namespace=workers w1 "text:ls" "key:Enter"
+hyoui kill --all --namespace=workers
+```
+
+**direnv recipe** — put this in a project `.envrc`:
+
+```sh
+export HYOUI_NAMESPACE=myproj
+```
+
+Every `hyoui run` / `list` / `attach` executed inside the project directory is
+then isolated automatically, with no flags.
+
+**Inheritance** — `hyoui run` always injects the resolved namespace into the
+child's environment as `HYOUI_NAMESPACE` (even `default`), the same convention
+as tmux's `TMUX` / screen's `STY`. A hyoui launched from inside a namespaced
+session therefore stays in the same namespace by default; pass
+`--namespace=<other>` (e.g. `--namespace=default`) to escape. The variable also
+lets a process detect "am I running under hyoui, and in which namespace?".
+
+Namespace names share the session-id character set (`[A-Za-z0-9._-]`, max 64
+bytes); `/` is rejected today and reserved for possible future hierarchical
+namespaces. `default` is a reserved name that maps to the base socket dir.
 
 ## Troubleshooting
 

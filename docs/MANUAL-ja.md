@@ -23,6 +23,7 @@
   - [6. 画面を読む (`screen dump` / `snapshot`)](#6-画面を読む-screen-dump--snapshot)
   - [7. 排他自動操作 (`lock`)](#7-排他自動操作-lock)
   - [8. tty I/O timeline を録画する (`record`)](#8-tty-io-timeline-を録画する-record)
+  - [9. session を namespace でグループ分けする](#9-session-を-namespace-でグループ分けする)
 - [トラブルシューティング](#トラブルシューティング)
 - [関連リンク](#関連リンク)
 
@@ -133,6 +134,51 @@ hyoui record stop "$SESS" --all
 > state machine は Phase 5 に積み残し
 > ([DR-0016](./decisions/DR-0016-tty-io-record.md))。passphrase / token を打つ
 > 可能性があるなら `--stdout` のみ録画するか、secret 入力中は録画を避けること。
+
+### 9. session を namespace でグループ分けする
+
+普段使いの `claude` と一時的な worker 群のように、無関係な session グループが
+`hyoui list` で混ざるのが邪魔なときは **namespace**
+([DR-0018](./decisions/DR-0018-session-namespace.md)) を使う。解決順は
+`--namespace` flag > env `HYOUI_NAMESPACE` > `default` で、全 session 系コマンドが
+同じ解決を共有する。`default` namespace は従来の socket 配置そのままなので、
+既存 session には影響しない。
+
+```sh
+# worker 群を隔離する
+hyoui run --detached --namespace=workers --session=w1 -- worker-cmd
+hyoui run --detached --namespace=workers --session=w2 -- worker-cmd
+
+hyoui list                            # default のみ — worker は混ざらない
+hyoui list --namespace=workers        # worker 群のみ
+hyoui list --all-namespaces           # 全部 (= 先頭に NS 列)
+hyoui list --all-namespaces --prune-stale  # 全 namespace の stale socket を掃除
+
+# selector は全部 namespace スコープ (session id / --index / kill --all / ...)
+hyoui attach w1 --namespace=workers
+hyoui input --namespace=workers w1 "text:ls" "key:Enter"
+hyoui kill --all --namespace=workers
+```
+
+**direnv レシピ** — プロジェクトの `.envrc` に書く:
+
+```sh
+export HYOUI_NAMESPACE=myproj
+```
+
+これでそのプロジェクト dir 内で実行する `hyoui run` / `list` / `attach` が
+flag なしで全部自動分離される。
+
+**継承** — `hyoui run` は解決済 namespace を子プロセスの env に
+`HYOUI_NAMESPACE` として **常時注入**する (= `default` でも入れる)。tmux の
+`TMUX` / screen の `STY` と同じ慣行で、namespace 内の session からネスト起動した
+hyoui は指定なしで同じ namespace に入る。別 namespace で起動したい場合は
+`--namespace=<別ns>` (例: `--namespace=default`) を明示する。この env 変数は
+「自分は hyoui 配下か、どの namespace か」の自己検出にも使える。
+
+namespace 名は session id と同じ文字集合 (`[A-Za-z0-9._-]`、最大 64 bytes)。
+`/` は現状 reject される (= 将来の階層 namespace 用に予約)。`default` は
+base socket dir 直下にマップされる予約名。
 
 ## トラブルシューティング
 

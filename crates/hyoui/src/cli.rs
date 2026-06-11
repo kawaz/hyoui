@@ -177,6 +177,9 @@ pub struct RunConfig {
     /// redraw / DR-0013 state-based 翻訳の結果を含む = 「ユーザの terminal が
     /// 見ている形」が残る。
     pub debug_dump_client: Option<String>,
+    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。socket 配置先 dir と、
+    /// 子プロセスへ常時注入する `HYOUI_NAMESPACE` env の値を決める。
+    pub namespace: Option<String>,
     /// argv of the child command.
     pub command: Vec<String>,
 }
@@ -208,6 +211,9 @@ pub struct AttachConfig {
     /// 存在しない場合は index 解釈、数字以外の session-id を強制したい場合は
     /// `--` セパレータか `--index=N` を使う。
     pub index: Option<i32>,
+    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。session / index 解決を
+    /// namespace スコープに絞る。
+    pub namespace: Option<String>,
 }
 
 /// `list` subcommand の出力形式 (= `--format=plain|jsonl`)。
@@ -236,6 +242,14 @@ pub struct ListConfig {
 
     /// 出力 format (= default Plain、`--format=jsonl` で JSON Lines)。
     pub format: ListFormat,
+
+    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。表示対象を当該
+    /// namespace のみに絞る。`all_namespaces` 指定時は無視される。
+    pub namespace: Option<String>,
+
+    /// `--all-namespaces` (= DR-0018)。全 namespace を横断 scan し、出力に NS 列を
+    /// 追加する。`--prune-stale` と併用すると全 namespace の stale socket を掃除する。
+    pub all_namespaces: bool,
 }
 
 /// `kill` subcommand configuration.
@@ -284,6 +298,9 @@ pub struct KillConfig {
     /// `--no-terminate` とは併用不可 (= terminate しない経路に「終了を待つ」は
     /// 意味を成さない)。terminate 経路 (= `ControlMessage::Kill`) 専用。
     pub wait: bool,
+    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。session / index / --all の
+    /// 解決を namespace スコープに絞る。
+    pub namespace: Option<String>,
 }
 
 /// `status` subcommand の出力形式 (= `--format=plain|json`)。
@@ -306,6 +323,9 @@ pub struct StatusConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
+    /// `--namespace=X` flag の生値 (= 未指定なら None、実行時に env / default へ fallback)。
+    /// DR-0018: session 解決を namespace スコープに絞る。
+    pub namespace: Option<String>,
     /// `--format=plain|json` (= default `Plain`、H5: scripting で grep/cut の罠回避)。
     pub format: StatusFormat,
 }
@@ -327,6 +347,8 @@ pub struct TailConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
+    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
+    pub namespace: Option<String>,
     /// `--follow` で daemon が live stream を継続送信。
     pub follow: bool,
     /// `--strip-ansi` (alias: `--strip`) で daemon 側で escape を strip 済の TailData を流す。
@@ -358,6 +380,8 @@ pub struct WaitConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
+    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
+    pub namespace: Option<String>,
     /// regex pattern (= visible state に対する正規表現)。空文字列は parser 段で
     /// reject。multiline mode は実行側 (= `wait_core::wait_for_pattern`) で default
     /// ON にする。
@@ -439,6 +463,8 @@ pub struct ScreenDumpConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
+    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
+    pub namespace: Option<String>,
     /// `--format=ansi|binary|cbor` (= default ansi)。
     pub format: ScreenDumpCliFormat,
     /// `--layer=visible|scrollback|both` (= default visible、MVP は visible のみ送信)。
@@ -490,6 +516,8 @@ pub struct ScreenSnapshotConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
+    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
+    pub namespace: Option<String>,
     /// `--include=Cells,Cursor,...` (= comma-separated)、default は全 component。
     /// Vec はそのまま wire の `include: Vec<SnapshotComponent>` に流す。
     pub include: Vec<SnapshotCliComponent>,
@@ -555,6 +583,8 @@ pub struct LockAcquireConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
+    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
+    pub namespace: Option<String>,
     /// `--mode=wait|fail` (= default Wait)。fail = 即時 fail、wait = polling retry。
     pub mode: LockMode,
     /// `--timeout=<dur>` (= acquire 全体 timeout、`None` なら無限 wait)。
@@ -572,6 +602,8 @@ pub struct LockReleaseConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
+    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
+    pub namespace: Option<String>,
     /// `--token=<T>` の値 (`HYOUI_LOCK_TOKEN` env fallback あり、parser 段では None 可、
     /// CLI dispatcher 側で env を読む)。CLI flag で空文字列は parser 段で reject。
     pub token: Option<String>,
@@ -665,6 +697,8 @@ pub struct RecordStartConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
+    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
+    pub namespace: Option<String>,
     /// 録画 direction (= default `Both`、`Raw` format との組合せでは parse 段で reject)。
     pub direction: RecordDirectionArg,
     /// 出力 format (= default `Jsonl`)。
@@ -702,6 +736,8 @@ pub struct RecordStopConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
+    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
+    pub namespace: Option<String>,
     /// `--id <N>` で停止対象 record_id を明示。`None` の場合 main.rs 側で
     /// `record list` を先に query して single active のみ自動採用する
     /// (= multiple active なら error、none なら error)。
@@ -719,6 +755,8 @@ pub struct RecordListConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
+    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
+    pub namespace: Option<String>,
     /// `--format=table|jsonl` (= default `Table`)。
     pub format: RecordListFormatArg,
 }
@@ -868,6 +906,27 @@ fn parse_list(args: &[String]) -> Command {
                 }
                 cfg.prune_stale = true;
             }
+            "--all-namespaces" => {
+                if inline_value.is_some() {
+                    return Command::Error(
+                        "list: --all-namespaces does not take a value".to_string(),
+                    );
+                }
+                cfg.all_namespaces = true;
+            }
+            "--namespace" => match inline_value.as_deref() {
+                Some(v) => {
+                    if let Err(e) = validate_namespace(v) {
+                        return Command::Error(format!("list: --namespace: {e}"));
+                    }
+                    cfg.namespace = Some(v.to_string());
+                }
+                None => {
+                    return Command::Error(
+                        "list: --namespace requires a value (= `--namespace=<ns>`)".to_string(),
+                    );
+                }
+            },
             "--format" => match inline_value.as_deref() {
                 Some("plain") => cfg.format = ListFormat::Plain,
                 Some("jsonl") => cfg.format = ListFormat::Jsonl,
@@ -884,6 +943,11 @@ fn parse_list(args: &[String]) -> Command {
             },
             other => return Command::Error(format!("list: unexpected argument: {other}")),
         }
+    }
+    if cfg.namespace.is_some() && cfg.all_namespaces {
+        return Command::Error(
+            "list: --namespace と --all-namespaces は同時に指定できません".to_string(),
+        );
     }
     Command::List(cfg)
 }
@@ -976,6 +1040,15 @@ fn parse_kill(args: &[String]) -> Command {
             "--socket" => match value {
                 Some(v) => cfg.socket = Some(v),
                 None => return Command::Error("--socket requires a value".into()),
+            },
+            "--namespace" => match value {
+                Some(v) => {
+                    if let Err(e) = validate_namespace(&v) {
+                        return Command::Error(format!("kill: --namespace: {e}"));
+                    }
+                    cfg.namespace = Some(v);
+                }
+                None => return Command::Error("--namespace requires a value".into()),
             },
             // DR-0012: 旧 `--signum N` は完全廃止 (= --signal で数字も受ける)。
             // 数字 / 略名 / SIG-prefix 大文字 全部 normalize 経由で wire 形式に揃える。
@@ -1135,12 +1208,13 @@ fn parse_session_targeted<F>(
     args: &[String],
     help_topic: HelpTopic,
     mut on_option: F,
-) -> Result<(Option<String>, Option<String>, Option<i32>), Command>
+) -> Result<SessionTarget, Command>
 where
     F: FnMut(&str, Option<String>) -> Result<bool, Command>,
 {
     let mut socket: Option<String> = None;
     let mut index: Option<i32> = None;
+    let mut namespace: Option<String> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut i = 0usize;
     while i < args.len() {
@@ -1165,6 +1239,19 @@ where
             "--socket" => match value {
                 Some(v) => socket = Some(v),
                 None => return Err(Command::Error(format!("{name}: --socket requires a value"))),
+            },
+            "--namespace" => match value {
+                Some(v) => {
+                    if let Err(e) = validate_namespace(&v) {
+                        return Err(Command::Error(format!("{name}: --namespace: {e}")));
+                    }
+                    namespace = Some(v);
+                }
+                None => {
+                    return Err(Command::Error(format!(
+                        "{name}: --namespace requires a value"
+                    )));
+                }
             },
             "--index" => match value {
                 Some(v) => match v.parse::<i32>() {
@@ -1235,7 +1322,24 @@ where
         )));
     }
 
-    Ok((socket, session_id, index))
+    Ok(SessionTarget {
+        socket,
+        session_id,
+        index,
+        namespace,
+    })
+}
+
+/// [`parse_session_targeted`] が返す session 選択情報 (= DR-0018 で namespace 追加)。
+///
+/// 旧来の `(socket, session_id, index)` tuple を struct 化し、`namespace` を足した。
+/// `namespace` は `--namespace=X` flag の生値 (= 未指定なら `None`、実行時に env /
+/// default へ fallback される)。
+struct SessionTarget {
+    socket: Option<String>,
+    session_id: Option<String>,
+    index: Option<i32>,
+    namespace: Option<String>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -1262,10 +1366,11 @@ fn parse_status(args: &[String]) -> Command {
         other => Err(Command::Error(format!("status: unknown option: {other}"))),
     });
     match res {
-        Ok((socket, session_id, index)) => Command::Status(StatusConfig {
-            socket,
-            session_id,
-            index,
+        Ok(t) => Command::Status(StatusConfig {
+            socket: t.socket,
+            session_id: t.session_id,
+            index: t.index,
+            namespace: t.namespace,
             format,
         }),
         Err(c) => c,
@@ -1312,14 +1417,15 @@ fn parse_tail(args: &[String]) -> Command {
         other => Err(Command::Error(format!("tail: unknown option: {other}"))),
     });
     match res {
-        Ok((socket, session_id, index)) => {
+        Ok(t) => {
             if since_strict && since_ms.is_none() {
                 return Command::Error("tail: --since-strict requires --since=<DUR>".into());
             }
             Command::Tail(TailConfig {
-                socket,
-                session_id,
-                index,
+                socket: t.socket,
+                session_id: t.session_id,
+                index: t.index,
+                namespace: t.namespace,
                 follow,
                 strip_ansi,
                 since_ms,
@@ -1336,6 +1442,7 @@ fn parse_wait(args: &[String]) -> Command {
     let mut poll_interval_ms: Option<u64> = None;
     let mut socket: Option<String> = None;
     let mut index: Option<i32> = None;
+    let mut namespace: Option<String> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut i = 0usize;
     while i < args.len() {
@@ -1366,6 +1473,15 @@ fn parse_wait(args: &[String]) -> Command {
             "--socket" => match value {
                 Some(v) => socket = Some(v),
                 None => return Command::Error("wait: --socket requires a value".into()),
+            },
+            "--namespace" => match value {
+                Some(v) => {
+                    if let Err(e) = validate_namespace(&v) {
+                        return Command::Error(format!("wait: --namespace: {e}"));
+                    }
+                    namespace = Some(v);
+                }
+                None => return Command::Error("wait: --namespace requires a value".into()),
             },
             "--timeout" => match value {
                 Some(v) => match parse_duration_ms(&v) {
@@ -1470,6 +1586,7 @@ fn parse_wait(args: &[String]) -> Command {
         socket,
         session_id,
         index,
+        namespace,
         pattern,
         timeout_ms,
         poll_interval_ms,
@@ -1781,6 +1898,7 @@ fn parse_attach(args: &[String]) -> Command {
         detach_others: false,
         debug_dump_client: None,
         index: None,
+        namespace: None,
     };
 
     let mut positionals: Vec<String> = Vec::new();
@@ -1809,6 +1927,15 @@ fn parse_attach(args: &[String]) -> Command {
             "--socket" => match value {
                 Some(v) => cfg.socket = Some(v),
                 None => return Command::Error("--socket requires a value".into()),
+            },
+            "--namespace" => match value {
+                Some(v) => {
+                    if let Err(e) = validate_namespace(&v) {
+                        return Command::Error(format!("attach: --namespace: {e}"));
+                    }
+                    cfg.namespace = Some(v);
+                }
+                None => return Command::Error("--namespace requires a value".into()),
             },
             "--mode" => match value {
                 Some(v) => cfg.mode_str = Some(v),
@@ -1946,6 +2073,7 @@ fn parse_run(args: &[String]) -> Command {
     let mut command: Vec<String> = Vec::new();
     let mut detached = false;
     let mut session: Option<String> = None;
+    let mut namespace: Option<String> = None;
     let mut scrollback_rows: Option<usize> = None;
     let mut debug_dump_server: Option<String> = None;
     let mut debug_dump_client: Option<String> = None;
@@ -2062,6 +2190,15 @@ fn parse_run(args: &[String]) -> Command {
                 }
                 None => return Command::Error("--session requires a value".into()),
             },
+            "--namespace" => match value {
+                Some(v) => {
+                    if let Err(e) = validate_namespace(&v) {
+                        return Command::Error(format!("--namespace: {e}"));
+                    }
+                    namespace = Some(v);
+                }
+                None => return Command::Error("--namespace requires a value".into()),
+            },
             "--scrollback-rows" => match value.as_deref() {
                 Some(v) => match v.parse::<usize>() {
                     Ok(n) => scrollback_rows = Some(n),
@@ -2119,6 +2256,7 @@ fn parse_run(args: &[String]) -> Command {
         scrollback_rows,
         debug_dump_server,
         debug_dump_client,
+        namespace,
         command,
     })
 }
@@ -2259,10 +2397,11 @@ fn parse_screen_dump(args: &[String]) -> Command {
         }
     });
     match res {
-        Ok((socket, session_id, index)) => Command::Screen(ScreenCommand::Dump(ScreenDumpConfig {
-            socket,
-            session_id,
-            index,
+        Ok(t) => Command::Screen(ScreenCommand::Dump(ScreenDumpConfig {
+            socket: t.socket,
+            session_id: t.session_id,
+            index: t.index,
+            namespace: t.namespace,
             format,
             layer,
             rect,
@@ -2370,12 +2509,13 @@ fn parse_screen_snapshot(args: &[String]) -> Command {
         },
     );
     match res {
-        Ok((socket, session_id, index)) => {
+        Ok(t) => {
             let include = include.unwrap_or_else(default_snapshot_include);
             Command::Screen(ScreenCommand::Snapshot(ScreenSnapshotConfig {
-                socket,
-                session_id,
-                index,
+                socket: t.socket,
+                session_id: t.session_id,
+                index: t.index,
+                namespace: t.namespace,
                 include,
                 format,
                 output,
@@ -2521,10 +2661,11 @@ fn parse_lock_acquire(args: &[String]) -> Command {
         },
     );
     match res {
-        Ok((socket, session_id, index)) => Command::Lock(LockCommand::Acquire(LockAcquireConfig {
-            socket,
-            session_id,
-            index,
+        Ok(t) => Command::Lock(LockCommand::Acquire(LockAcquireConfig {
+            socket: t.socket,
+            session_id: t.session_id,
+            index: t.index,
+            namespace: t.namespace,
             mode,
             timeout_ms,
         })),
@@ -2564,10 +2705,11 @@ fn parse_lock_release(args: &[String]) -> Command {
         },
     );
     match res {
-        Ok((socket, session_id, index)) => Command::Lock(LockCommand::Release(LockReleaseConfig {
-            socket,
-            session_id,
-            index,
+        Ok(t) => Command::Lock(LockCommand::Release(LockReleaseConfig {
+            socket: t.socket,
+            session_id: t.session_id,
+            index: t.index,
+            namespace: t.namespace,
             token,
         })),
         Err(c) => c,
@@ -2593,10 +2735,11 @@ fn parse_unlock(args: &[String]) -> Command {
         other => Err(Command::Error(format!("unlock: unknown option: {other}"))),
     });
     match res {
-        Ok((socket, session_id, index)) => Command::Unlock(LockReleaseConfig {
-            socket,
-            session_id,
-            index,
+        Ok(t) => Command::Unlock(LockReleaseConfig {
+            socket: t.socket,
+            session_id: t.session_id,
+            index: t.index,
+            namespace: t.namespace,
             token,
         }),
         Err(c) => c,
@@ -2830,7 +2973,7 @@ fn parse_record_start(args: &[String]) -> Command {
             ))),
         },
     );
-    let (socket, session_id, index) = match res {
+    let t = match res {
         Ok(t) => t,
         Err(c) => return c,
     };
@@ -2873,9 +3016,10 @@ fn parse_record_start(args: &[String]) -> Command {
     };
 
     Command::Record(RecordCommand::Start(RecordStartConfig {
-        socket,
-        session_id,
-        index,
+        socket: t.socket,
+        session_id: t.session_id,
+        index: t.index,
+        namespace: t.namespace,
         direction,
         format,
         output_path,
@@ -2924,7 +3068,7 @@ fn parse_record_stop(args: &[String]) -> Command {
                 ))),
             },
         );
-    let (socket, session_id, index) = match res {
+    let t = match res {
         Ok(t) => t,
         Err(c) => return c,
     };
@@ -2934,9 +3078,10 @@ fn parse_record_stop(args: &[String]) -> Command {
     }
 
     Command::Record(RecordCommand::Stop(RecordStopConfig {
-        socket,
-        session_id,
-        index,
+        socket: t.socket,
+        session_id: t.session_id,
+        index: t.index,
+        namespace: t.namespace,
         record_id,
         all,
     }))
@@ -2972,15 +3117,16 @@ fn parse_record_list(args: &[String]) -> Command {
                 ))),
             },
         );
-    let (socket, session_id, index) = match res {
+    let t = match res {
         Ok(t) => t,
         Err(c) => return c,
     };
 
     Command::Record(RecordCommand::List(RecordListConfig {
-        socket,
-        session_id,
-        index,
+        socket: t.socket,
+        session_id: t.session_id,
+        index: t.index,
+        namespace: t.namespace,
         format,
     }))
 }
@@ -3075,6 +3221,8 @@ fn usage_run() -> String {
             --idle-timeout DUR            Output idle timeout (= 子 PTY 出力が止まったら exit)\n    \
             --until PATTERN               Terminate when PATTERN appears in output\n    \
             --socket PATH                 Unix socket path for input injection\n    \
+            --namespace NS                Session namespace (default: \"default\";\n                                  \
+                env HYOUI_NAMESPACE で継承可、子に常時注入される)\n    \
             --on-child-suspend=follow|auto-resume\n                                  \
                 Action when the child is stopped\n                                  \
                 (default: follow; headless: auto-resume)\n    \
@@ -3094,6 +3242,7 @@ fn usage_run() -> String {
             SHELL                  Fallback command when none is given (legacy)\n    \
             XDG_RUNTIME_DIR        Base directory for the auto-generated socket path\n    \
             TMPDIR                 Socket path base when XDG_RUNTIME_DIR is unset\n    \
+            HYOUI_NAMESPACE        Session namespace (= --namespace の env 経路、flag 優先)\n    \
             HYOUI_SCROLLBACK_ROWS  --scrollback-rows と同じ値を env で渡す\n                                   \
                 (--scrollback-rows 指定時は flag 優先)\n\
         \n\
@@ -3118,6 +3267,7 @@ fn usage_attach() -> String {
         OPTIONS:\n    \
             --socket PATH         Explicit socket path (alternative to session-id)\n    \
             --index N             session を mtime 昇順の index で指定 (= 1=最古, -1=最新)\n    \
+            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --mode rw|ro|rw-no-leader\n                          \
                 Operating mode (default: rw)\n    \
             --exclusive           Demand exclusive session ownership at start\n    \
@@ -3178,6 +3328,7 @@ fn usage_status() -> String {
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
             --index N       Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
+            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             -h, --help      Show this help and exit\n\
         \n\
         OUTPUT (plaintext key:value 1 行ごと):\n    \
@@ -3212,6 +3363,7 @@ fn usage_tail() -> String {
         OPTIONS:\n    \
             --socket PATH        Explicit socket path (alternative to session-id)\n    \
             --index N            Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
+            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --follow             子 PTY exit / TailEnd まで stream を継続する\n    \
             --strip              ANSI escape を strip 済の bytes を受け取る (= `--strip-ansi` alias)\n    \
             --since DUR          過去 DUR 以内の chunk のみ流す。単位必須 (例: 500ms / 2s / 1m)\n    \
@@ -3272,6 +3424,7 @@ fn usage_wait() -> String {
         OPTIONS:\n    \
             --socket PATH         Explicit socket path (alternative to session-id)\n    \
             --index N             Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
+            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --timeout DUR         絶対 timeout。**指定なしは無限 wait**\n    \
             --poll-interval DUR   snapshot polling 周期 (default 100ms)。\n                      \
                                   環境変数 `HYOUI_WAIT_POLL_MS` でも override 可。\n    \
@@ -3301,9 +3454,13 @@ fn usage_list() -> String {
         "hyoui list — list daemon sessions (= socket dir scan + liveness probe)\n\
         \n\
         USAGE:\n    \
-            hyoui list [--prune-stale] [--format=plain|jsonl]\n\
+            hyoui list [--namespace=<ns>] [--all-namespaces] [--prune-stale] [--format=plain|jsonl]\n\
         \n\
         OPTIONS:\n    \
+            --namespace NS      表示対象を指定 namespace に絞る (= default: env HYOUI_NAMESPACE\n                                \
+                                or \"default\")。`--all-namespaces` とは排他\n    \
+            --all-namespaces    全 namespace を横断表示 (= NS 列を追加)。`--prune-stale` 併用で\n                                \
+                                全 namespace の stale socket を掃除\n    \
             --prune-stale       stale socket (= connect 不能) を unlink で削除\n    \
             --format=plain|jsonl  出力 format (= default plain)。jsonl は 1 session 1 行の JSON object\n    \
             -h, --help          Show this help and exit\n\
@@ -3334,15 +3491,19 @@ fn usage_list() -> String {
             stale は daemon の panic / SIGKILL で socket が unlink されずに\n    \
             残留した状態。`hyoui list --prune-stale` で掃除可能。\n\
         \n\
-        SCAN ORDER (= socket_path::resolve と同順、最初に見つかった dir のみ):\n    \
-            1. $XDG_RUNTIME_DIR/hyoui/\n    \
-            2. $TMPDIR/hyoui-<uid>/  (TMPDIR 未設定なら /tmp/hyoui-<uid>/)\n\
+        SCAN ORDER (= socket_path::resolve_in_namespace と同順、最初に見つかった dir のみ):\n    \
+            default namespace: base dir 直下 (= 既存互換):\n    \
+            \x20 1. $XDG_RUNTIME_DIR/hyoui/\n    \
+            \x20 2. $TMPDIR/hyoui-<uid>/  (TMPDIR 未設定なら /tmp/hyoui-<uid>/)\n    \
+            その他 namespace: <base>/<ns>/。--all-namespaces は base 配下のサブ dir も走査。\n\
         \n\
         EXIT CODE:\n    \
             0   正常終了 (= 0 件でも成功扱い、stderr に `no sessions found` を 1 行)\n\
         \n\
         EXAMPLES:\n    \
-            hyoui list                              # plain format (固定長)\n    \
+            hyoui list                              # 現在の namespace (default) の session 一覧\n    \
+            hyoui list --namespace=workers          # workers namespace のみ表示\n    \
+            hyoui list --all-namespaces             # 全 namespace 横断 (= NS 列付き)\n    \
             hyoui list --format=jsonl               # 機械可読 (1 session 1 行 JSON)\n    \
             hyoui list --prune-stale                # stale socket を削除して live のみ残す\n    \
             hyoui list --format=jsonl | jq -r '.session'  # session id を抽出\n\
@@ -3377,6 +3538,7 @@ fn usage_kill() -> String {
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
             --index N       session selector index (= mtime 昇順、1 最古 / -1 最新)\n    \
+            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --all           全 live session を順次 kill (= killall 相当)\n    \
             --signal SPEC   送信 signal (= default SIGTERM)。数字 / 略名 / SIG-prefix 大文字 OK\n    \
             --wait          子 exit + session 終了まで見届けて return (= 従来挙動)。\n    \
@@ -3461,6 +3623,7 @@ fn usage_screen_dump() -> String {
         OPTIONS:\n    \
             --socket PATH       Explicit socket path (alternative to session-id)\n    \
             --index N           Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
+            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --format FMT        Output format (default: ansi)\n                        \
                 ansi       — raw ANSI bytes (= terminal で cat 再生可)\n                        \
                 binary     — 空白除去 + 改行 plaintext (= grep 用)\n                        \
@@ -3516,6 +3679,7 @@ fn usage_screen_snapshot() -> String {
         OPTIONS:\n    \
             --socket PATH       Explicit socket path (alternative to session-id)\n    \
             --index N           Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
+            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --include SET       Components (comma-separated, case-insensitive; default: all)\n                        \
                 Cells, Cursor, Mode, Style, Scrollback, WindowSize, Buffer, SequenceNo\n                        \
                 (Scrollback は daemon 側で未実装 → 明示指定すると error)\n    \
@@ -3583,6 +3747,7 @@ fn usage_lock_acquire() -> String {
         OPTIONS:\n    \
             --socket PATH       Explicit socket path (alternative to session-id)\n    \
             --index N           Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
+            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --mode wait|fail    Behavior when another holder exists (default: wait)\n                        \
                 wait — keep polling until acquired or --timeout expires\n                        \
                 fail — exit 1 immediately when denied\n    \
@@ -3640,6 +3805,7 @@ fn usage_lock_release() -> String {
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
             --index N       Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
+            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --token TOKEN   Lock token to release (required; env HYOUI_LOCK_TOKEN fallback)\n    \
             -h, --help      Show this help and exit\n\
         \n\
@@ -3683,6 +3849,7 @@ fn usage_unlock() -> String {
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
             --index N       Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
+            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --token TOKEN   Lock token to release (required; env HYOUI_LOCK_TOKEN fallback)\n    \
             -h, --help      Show this help and exit\n\
         \n\
@@ -3746,6 +3913,7 @@ fn usage_record_start() -> String {
         OPTIONS:\n    \
             --socket PATH               Explicit socket path (alternative to session-id)\n    \
             --index N                   Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
+            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --output PATH               出力 file path (= **絶対 path 必須**)\n    \
             --stdin                     録画 direction: 子 PTY 入力のみ\n    \
             --stdout                    録画 direction: 子 PTY 出力のみ\n    \
@@ -3806,6 +3974,7 @@ fn usage_record_stop() -> String {
         OPTIONS:\n    \
             --socket PATH    Explicit socket path (alternative to session-id)\n    \
             --index N        Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
+            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --id N           停止対象の record_id (= record start の戻り値、または\n                             \
                 record list で確認)\n    \
             --all            同 session の全 active record を一括停止 (= `--id` と排他)\n    \
@@ -3839,6 +4008,7 @@ fn usage_record_list() -> String {
         OPTIONS:\n    \
             --socket PATH       Explicit socket path (alternative to session-id)\n    \
             --index N           Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
+            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --format table|jsonl\n                                \
                                 Output format (default table)\n                                \
                                 table — 人間可読の固定長 column 1 行 1 record\n                                \
@@ -3954,6 +4124,8 @@ pub struct InputCommand {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
+    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
+    pub namespace: Option<String>,
     /// Spec list (= 出現順で送信、空 Vec は parser 段で reject)。
     pub specs: Vec<InputSpec>,
     /// Per-spec timeout (= default 5s、特に `wait:` / `wait-idle:` で意味を持つ)。
@@ -4097,6 +4269,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
 fn parse_input(args: &[String]) -> Command {
     let mut socket: Option<String> = None;
     let mut index: Option<i32> = None;
+    let mut namespace: Option<String> = None;
     let mut timeout_ms: u64 = 5_000;
     let mut lock_token: Option<String> = None;
     // task #21: `file:` spec の 1 file あたり最大 bytes。
@@ -4135,6 +4308,15 @@ fn parse_input(args: &[String]) -> Command {
                     socket = Some(v);
                 }
                 None => return Command::Error("input: --socket requires a value".into()),
+            },
+            "--namespace" => match value {
+                Some(v) => {
+                    if let Err(e) = validate_namespace(&v) {
+                        return Command::Error(format!("input: --namespace: {e}"));
+                    }
+                    namespace = Some(v);
+                }
+                None => return Command::Error("input: --namespace requires a value".into()),
             },
             "--index" => match value {
                 Some(v) => match v.parse::<i32>() {
@@ -4284,6 +4466,7 @@ fn parse_input(args: &[String]) -> Command {
         socket,
         session_id,
         index,
+        namespace,
         specs,
         timeout: Duration::from_millis(timeout_ms),
         lock_token,
@@ -4312,6 +4495,7 @@ fn usage_input() -> String {
         OPTIONS:\n    \
             --socket PATH      Explicit socket path (alternative to session-id)\n    \
             --index N          Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
+            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --timeout DUR      Per-spec timeout (default: 5s; DUR 形式は下記参照)\n    \
             --lock-token T     明示 lock token (= env HYOUI_LOCK_TOKEN より優先、DR-0006 §8.5)\n    \
             --max-file-bytes N file: spec の 1 file あたり最大 bytes (default 16777216 = 16 MiB、\n                       \
@@ -4469,6 +4653,34 @@ pub fn validate_session_id(session_id: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// session namespace の予約名 (= socket dir 直下にマップする default ns、DR-0018)。
+///
+/// `default` は「従来通り `<base>/hyoui-<uid>/` 直下に socket を置く」ことを意味する
+/// 予約名。ユーザが `--namespace=default` を明示しても、namespace 未指定時と完全に
+/// 同じ dir 構造になる (= 既存 session との後方互換、dir 移動なし)。
+pub const DEFAULT_NAMESPACE: &str = "default";
+
+/// session `namespace` を path traversal / 制御文字 / 過長から守る whitelist validator
+/// (= DR-0018)。
+///
+/// 許可: `session_id` と同等 (= `[A-Za-z0-9._-]{1,64}`)。さらに以下を明示 reject:
+///
+/// - 空 string (= "")
+/// - `.` 単独、`..` 単独 (= path 構成要素として親 dir 参照になる)
+/// - `/` を含む (= path separator。**将来の階層 namespace 用に予約**: DR-0018 で
+///   フラット ns を採用したが、`/` を区切りとして後方互換で階層化できるよう、現状は
+///   ns 名に `/` を含めること自体を禁止する)
+///
+/// `validate_session_id` と判定は同等だが、error 文言を `namespace` 文脈にして
+/// ユーザに分かりやすくする (= 同一実装に委譲しつつ文言だけ差し替え)。
+///
+/// # Errors
+///
+/// validator に反する場合、人間可読な reason 文字列を返す。
+pub fn validate_namespace(namespace: &str) -> Result<(), String> {
+    validate_session_id(namespace).map_err(|e| e.replace("session_id", "namespace"))
 }
 
 // =============================================================================
@@ -5906,6 +6118,161 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    // =========================================================================
+    // DR-0018: --namespace / --all-namespaces parse tests
+    // =========================================================================
+
+    /// `run --namespace=t1` が `RunConfig.namespace = Some("t1")` を設定する。
+    #[test]
+    fn run_namespace_flag_sets_config() {
+        match parse_args(&args(&["run", "--namespace=t1", "--", "cat"])) {
+            Command::Run(cfg) => assert_eq!(cfg.namespace.as_deref(), Some("t1")),
+            other => panic!("expected Run(namespace=t1), got {other:?}"),
+        }
+    }
+
+    /// `run` で `--namespace` 未指定なら `None` (= 実行時に env / default へ fallback)。
+    #[test]
+    fn run_namespace_default_is_none() {
+        match parse_args(&args(&["run", "--", "cat"])) {
+            Command::Run(cfg) => assert_eq!(cfg.namespace, None),
+            other => panic!("expected Run(namespace=None), got {other:?}"),
+        }
+    }
+
+    /// namespace の validate: `/` 入り / `..` / 空文字は parse 段で reject。
+    #[test]
+    fn run_namespace_rejects_invalid_values() {
+        for bad in ["a/b", "..", "../x", ""] {
+            match parse_args(&args(&["run", &format!("--namespace={bad}"), "--", "cat"])) {
+                Command::Error(msg) => {
+                    assert!(
+                        msg.contains("namespace"),
+                        "error should mention namespace (bad={bad:?}): {msg}"
+                    );
+                }
+                other => panic!("expected Error for namespace {bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// `default` という名前は予約 (= 直下マッピング) だが parse は通常通り通す。
+    #[test]
+    fn run_namespace_default_name_is_accepted() {
+        match parse_args(&args(&["run", "--namespace=default", "--", "cat"])) {
+            Command::Run(cfg) => assert_eq!(cfg.namespace.as_deref(), Some("default")),
+            other => panic!("expected Run(namespace=default), got {other:?}"),
+        }
+    }
+
+    /// session-targeted 系 (= parse_session_targeted 経由) でも `--namespace` が効く。
+    #[test]
+    fn session_targeted_commands_accept_namespace() {
+        match parse_args(&args(&["status", "demo", "--namespace=t1"])) {
+            Command::Status(cfg) => assert_eq!(cfg.namespace.as_deref(), Some("t1")),
+            other => panic!("expected Status(namespace=t1), got {other:?}"),
+        }
+        match parse_args(&args(&["tail", "demo", "--namespace=t1"])) {
+            Command::Tail(cfg) => assert_eq!(cfg.namespace.as_deref(), Some("t1")),
+            other => panic!("expected Tail(namespace=t1), got {other:?}"),
+        }
+        match parse_args(&args(&["wait", "demo", "READY", "--namespace=t1"])) {
+            Command::Wait(cfg) => assert_eq!(cfg.namespace.as_deref(), Some("t1")),
+            other => panic!("expected Wait(namespace=t1), got {other:?}"),
+        }
+        match parse_args(&args(&["kill", "demo", "--namespace=t1"])) {
+            Command::Kill(cfg) => assert_eq!(cfg.namespace.as_deref(), Some("t1")),
+            other => panic!("expected Kill(namespace=t1), got {other:?}"),
+        }
+        match parse_args(&args(&["attach", "demo", "--namespace=t1"])) {
+            Command::Attach(cfg) => assert_eq!(cfg.namespace.as_deref(), Some("t1")),
+            other => panic!("expected Attach(namespace=t1), got {other:?}"),
+        }
+        match parse_args(&args(&["input", "demo", "text:hi", "--namespace=t1"])) {
+            Command::Input(cmd) => assert_eq!(cmd.namespace.as_deref(), Some("t1")),
+            other => panic!("expected Input(namespace=t1), got {other:?}"),
+        }
+        match parse_args(&args(&["screen", "dump", "demo", "--namespace=t1"])) {
+            Command::Screen(ScreenCommand::Dump(cfg)) => {
+                assert_eq!(cfg.namespace.as_deref(), Some("t1"));
+            }
+            other => panic!("expected ScreenDump(namespace=t1), got {other:?}"),
+        }
+        match parse_args(&args(&["record", "list", "demo", "--namespace=t1"])) {
+            Command::Record(RecordCommand::List(cfg)) => {
+                assert_eq!(cfg.namespace.as_deref(), Some("t1"));
+            }
+            other => panic!("expected RecordList(namespace=t1), got {other:?}"),
+        }
+    }
+
+    /// `list --namespace=t1` / `--all-namespaces` の設定値と排他チェック。
+    #[test]
+    fn list_namespace_and_all_namespaces() {
+        match parse_args(&args(&["list", "--namespace=t1"])) {
+            Command::List(cfg) => {
+                assert_eq!(cfg.namespace.as_deref(), Some("t1"));
+                assert!(!cfg.all_namespaces);
+            }
+            other => panic!("expected List(namespace=t1), got {other:?}"),
+        }
+        match parse_args(&args(&["list", "--all-namespaces"])) {
+            Command::List(cfg) => {
+                assert!(cfg.all_namespaces);
+                assert_eq!(cfg.namespace, None);
+            }
+            other => panic!("expected List(all_namespaces), got {other:?}"),
+        }
+        // 排他: 同時指定は error。
+        match parse_args(&args(&["list", "--namespace=t1", "--all-namespaces"])) {
+            Command::Error(msg) => {
+                assert!(
+                    msg.contains("--namespace") && msg.contains("--all-namespaces"),
+                    "error should mention both flags: {msg}"
+                );
+            }
+            other => panic!("expected Error for exclusive flags, got {other:?}"),
+        }
+        // `--all-namespaces` は値を取らない。
+        match parse_args(&args(&["list", "--all-namespaces=yes"])) {
+            Command::Error(_) => {}
+            other => panic!("expected Error for valued --all-namespaces, got {other:?}"),
+        }
+        // list の `--namespace` で validate 違反は reject。
+        match parse_args(&args(&["list", "--namespace=a/b"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("namespace"), "got: {msg}");
+            }
+            other => panic!("expected Error for invalid ns, got {other:?}"),
+        }
+    }
+
+    /// `validate_namespace`: session_id と同等の whitelist + 文言が namespace 文脈。
+    #[test]
+    fn validate_namespace_whitelist_and_wording() {
+        // 正常系: フラットな一意名。
+        for ok in ["default", "t1", "workers", "task-12.x_y"] {
+            validate_namespace(ok).unwrap_or_else(|e| panic!("{ok:?} should pass: {e}"));
+        }
+        // 異常系: `/` (= 将来の階層 ns 用に予約) / traversal / 空 / 制御文字。
+        for bad in ["a/b", "/abs", "..", ".", "", "a\nb", "a b"] {
+            let err = validate_namespace(bad).expect_err(&format!("{bad:?} must err"));
+            assert!(
+                err.contains("namespace"),
+                "error should use namespace wording (bad={bad:?}): {err}"
+            );
+            assert!(
+                !err.contains("session_id"),
+                "error must not leak session_id wording (bad={bad:?}): {err}"
+            );
+        }
+        // 過長 (= MAX_SESSION_ID_LEN 同等の 64 bytes 上限)。
+        let too_long = "a".repeat(MAX_SESSION_ID_LEN + 1);
+        assert!(validate_namespace(&too_long).is_err(), "65 bytes must err");
+        let max_ok = "a".repeat(MAX_SESSION_ID_LEN);
+        assert!(validate_namespace(&max_ok).is_ok(), "64 bytes must pass");
     }
 
     /// `--format=plain` は `ListFormat::Plain` を設定する (= default と同等だが明示)。

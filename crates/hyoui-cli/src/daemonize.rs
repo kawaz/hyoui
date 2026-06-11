@@ -30,6 +30,7 @@ pub fn run_detached_parent(
     until: Option<String>,
     scrollback_rows: Option<usize>,
     debug_dump: Option<String>,
+    namespace: String,
     cmd: Vec<String>,
 ) -> ExitCode {
     match spawn_detached_daemon_and_wait_ready(
@@ -39,6 +40,7 @@ pub fn run_detached_parent(
         until,
         scrollback_rows,
         debug_dump,
+        namespace,
         cmd,
     ) {
         Ok((session_id, _sock)) => {
@@ -68,13 +70,18 @@ pub fn spawn_detached_daemon_and_wait_ready(
     until: Option<String>,
     scrollback_rows: Option<usize>,
     debug_dump: Option<String>,
+    namespace: String,
     cmd: Vec<String>,
 ) -> Result<(String, PathBuf), ExitCode> {
     let session_id = session_id_override.unwrap_or_else(socket_path::auto_session_id);
-    let sock = match socket_path::resolve(socket_override.as_deref(), &session_id) {
+    let sock = match socket_path::resolve_in_namespace(
+        socket_override.as_deref(),
+        &session_id,
+        &namespace,
+    ) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("hyoui: socket path 解決失敗: {e}");
+            eprintln!("hyoui: socket path 解決失敗: {e} (namespace: {namespace})");
             return Err(ExitCode::from(1));
         }
     };
@@ -117,6 +124,8 @@ pub fn spawn_detached_daemon_and_wait_ready(
         until: until.filter(|s| !s.is_empty()),
         scrollback_rows,
         debug_dump: debug_dump.filter(|s| !s.is_empty()),
+        // DR-0018: 解決済 namespace を daemon child に伝える (= 子 PTY へ env 注入する値)。
+        namespace,
     };
     let init_json = match serde_json::to_string(&init) {
         Ok(s) => s,
@@ -289,6 +298,16 @@ struct DaemonizeInit {
         default
     )]
     debug_dump: Option<String>,
+    /// DR-0018: 解決済 session namespace。daemon child が `Session::start` 前に
+    /// `HYOUI_NAMESPACE=<ns>` を自 env に set し、execvp される子 PTY が継承する。
+    /// 旧 daemon child との互換のため `default` で skip (= 未設定なら "default" 扱い)。
+    #[serde(default = "default_namespace_field")]
+    namespace: String,
+}
+
+/// `DaemonizeInit.namespace` の serde default (= 旧 init JSON 互換)。
+fn default_namespace_field() -> String {
+    hyoui::cli::DEFAULT_NAMESPACE.to_string()
 }
 
 /// daemon 子 process の本体 (= env `HYOUI_DAEMONIZE_INIT` で JSON init を受け取る)。
@@ -331,6 +350,14 @@ pub fn run_daemon_child() -> ExitCode {
     let until = init.until.clone();
     let scrollback_rows = init.scrollback_rows;
     let debug_dump = init.debug_dump.clone();
+
+    // DR-0018: 子 PTY に `HYOUI_NAMESPACE` を **常時注入** (= default でも注入)。
+    // daemon child 自身の env に set しておくと、`Session::start` が fork+execvp する
+    // 子 PTY がそれを継承する。ここはまだ single-threaded (= Session::start 前) なので
+    // set_var_at_startup の契約を満たす。`HYOUI_DAEMONIZE_INIT` (= 上で unset 済) と
+    // 違い、これは子に意図的に伝える env なので unset しない。
+    // 用途: ns 内でネスト起動した hyoui が指定なしで同 ns を引き継ぐ (= 自己検出にも使える)。
+    hyoui::sys::env::set_var_at_startup("HYOUI_NAMESPACE", &init.namespace);
 
     // 子 cmd は argv `["run", "--detached", "--", cmd, args...]` の "--" 以降を取得。
     let argv: Vec<String> = std::env::args().skip(1).collect();

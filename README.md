@@ -179,13 +179,46 @@ hyoui tail "$SESS" --last-bytes=4096
 hyoui tail "$SESS" --since=10s --since-strict
 ```
 
+### Session namespaces
+
+Sessions can be grouped into **namespaces** so that unrelated groups never mix
+in `hyoui list` ([DR-0018](./docs/decisions/DR-0018-session-namespace.md)). The
+namespace resolves as `--namespace` flag > env `HYOUI_NAMESPACE` > `default`,
+and every session command (run / attach / list / kill / input / ...) shares the
+same resolution. The `default` namespace keeps the traditional socket layout,
+so existing sessions are untouched.
+
+```bash
+# day-to-day session (default namespace; behaves exactly as before)
+hyoui run --detached -- claude
+
+# a worker fleet isolated under its own namespace
+hyoui run --detached --namespace=workers --session=w1 -- worker-cmd
+hyoui run --detached --namespace=workers --session=w2 -- worker-cmd
+
+hyoui list                          # default only — no worker noise
+hyoui list --namespace=workers      # the fleet only
+hyoui list --all-namespaces         # everything, with an NS column
+hyoui attach w1 --namespace=workers # all selectors are namespace-scoped
+hyoui kill --all --namespace=workers  # killall scoped to the fleet
+
+# direnv-friendly: put `export HYOUI_NAMESPACE=myproj` in a project .envrc and
+# every run/list/attach inside that project is isolated automatically.
+```
+
+`hyoui run` always injects the resolved namespace into the child's environment
+as `HYOUI_NAMESPACE` (even for `default`), so a hyoui nested inside a namespace
+inherits it — the same convention as tmux's `TMUX` / screen's `STY`. To launch
+into a different namespace from inside one, pass `--namespace=<other>`
+explicitly (e.g. `--namespace=default`).
+
 ### Main subcommands
 
 | Command | Purpose |
 |---|---|
 | `hyoui run [--detached] [--session=ID] [--size=COLSxROWS] -- cmd args...` | Start a PTY and daemonize |
 | `hyoui attach <session> [--mode=rw\|ro\|rw-no-leader]` | I/O bridge (repaints from screen state on attach) |
-| `hyoui list` | Enumerate active sessions |
+| `hyoui list [--namespace=NS\|--all-namespaces]` | Enumerate active sessions (namespace-scoped) |
 | `hyoui kill <session> [--signal=NUM_OR_NAME]` | Send a signal to the child (default SIGTERM; name or number, e.g. `--signal KILL` / `--signal 9`) |
 | `hyoui status <session>` | Print session status (clients / leader / lock / scrollback) |
 | `hyoui input <session> <spec>...` | Inject input via `text:` / `hex:` / `file:` / `paste:` / `key:` / `wait:` / `wait-idle:` specs |

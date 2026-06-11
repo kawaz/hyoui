@@ -416,6 +416,10 @@ fn resolve_scrollback_rows(cfg_value: Option<usize>) -> Option<usize> {
 /// 4. daemon thread を join、その exit code を返す
 fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     let scrollback_rows = resolve_scrollback_rows(cfg.scrollback_rows);
+    // DR-0018: namespace を解決 (= --namespace flag > HYOUI_NAMESPACE env > default)。
+    // 解決済 namespace は (1) socket 配置 dir の決定、(2) 子プロセスへの常時 env 注入、
+    // (3) 非 detached 経路で exec する `hyoui attach` への明示伝搬、に使う。
+    let namespace = socket_path::resolve_namespace(cfg.namespace.as_deref());
     // size 解決 (= ユーザ指示 2026-05-29、stdin pipe 経由):
     // - 明示指定 (= --cols/--rows/--size) があればそれを使う
     // - 非 detached + 明示なし → 外側 TTY size (= stdin) を継承
@@ -466,6 +470,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
             cfg.until.clone(),
             scrollback_rows,
             cfg.debug_dump_server.clone(),
+            namespace,
             cfg.command,
         );
     }
@@ -485,6 +490,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
         cfg.until.clone(),
         scrollback_rows,
         cfg.debug_dump_server.clone(),
+        namespace.clone(),
         cfg.command,
     ) {
         Ok(pair) => pair,
@@ -503,6 +509,11 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     attach_cmd.arg("attach").arg(&session_id);
     if let Some(socket) = cfg.socket.as_deref() {
         attach_cmd.arg(format!("--socket={socket}"));
+    } else {
+        // DR-0018: socket 明示なしのときは namespace を attach に伝える。run が
+        // --namespace flag で解決した場合 env に値が無いので、明示渡しが必須
+        // (= flag 経路と env 経路で attach の socket 解決を一致させる)。
+        attach_cmd.arg(format!("--namespace={namespace}"));
     }
     if let Some(p) = cfg.debug_dump_client.as_deref() {
         attach_cmd.arg(format!("--debug-dump-client={p}"));
@@ -527,11 +538,11 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
 ///
 /// stale socket は除外 (= attach 失敗確実のため index に含めない)。
 /// 範囲外 / 0 件 → `Err`。
-fn resolve_session_by_index(index: i32) -> Result<String, String> {
+fn resolve_session_by_index(index: i32, namespace: &str) -> Result<String, String> {
     if index == 0 {
         return Err("index 0 は不正です (= 1-based、1 が最古、-1 が最新)".to_string());
     }
-    let dirs = list_candidate_dirs();
+    let dirs = list_candidate_dirs(namespace);
     let mut entries: Vec<(String, std::time::SystemTime)> = Vec::new();
     for dir in dirs {
         let read = match std::fs::read_dir(&dir) {
@@ -592,6 +603,8 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         return ExitCode::from(2);
     }
 
+    // DR-0018: namespace を解決 (= --namespace flag > HYOUI_NAMESPACE env > default)。
+    let namespace = socket_path::resolve_namespace(cfg.namespace.as_deref());
     let sock = if let Some(p) = cfg.socket.clone() {
         std::path::PathBuf::from(p)
     } else {
@@ -599,7 +612,7 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         // それ以外は cfg.session_id を使う (= parse_attach で同時指定は弾かれている)。
         let sid_owned: String;
         let sid = if let Some(index) = cfg.index {
-            match resolve_session_by_index(index) {
+            match resolve_session_by_index(index, &namespace) {
                 Ok(s) => {
                     sid_owned = s;
                     sid_owned.as_str()
@@ -618,10 +631,12 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
                 }
             }
         };
-        match socket_path::resolve(None, sid) {
+        match socket_path::resolve_in_namespace(None, sid, &namespace) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("hyoui: attach: socket path 解決失敗: {e} (session: {sid})");
+                eprintln!(
+                    "hyoui: attach: socket path 解決失敗: {e} (session: {sid}, namespace: {namespace})"
+                );
                 eprintln!("       起動中の session 一覧は `hyoui list` で確認してください。");
                 return ExitCode::from(1);
             }
@@ -810,7 +825,19 @@ fn probe_socket_liveness(path: &std::path::Path) -> bool {
 /// `--prune-stale` 指定時、stale と判定された socket は `unlink(2)` で削除する。
 /// この削除は best-effort (= 失敗してもユーザに warning するだけで exit code は 0)。
 fn list_command(cfg: ListConfig) -> ExitCode {
-    list_command_with_dirs(cfg, list_candidate_dirs())
+    // DR-0018: scan 対象 dir を namespace スコープで決める。
+    // - --all-namespaces → 全 namespace の (ns, dir) を列挙、NS 列を表示
+    // - それ以外 → 解決した単一 namespace の dir のみ (= 従来互換)
+    let dirs: Vec<(String, std::path::PathBuf)> = if cfg.all_namespaces {
+        list_candidate_dirs_all_namespaces()
+    } else {
+        let ns = socket_path::resolve_namespace(cfg.namespace.as_deref());
+        list_candidate_dirs(&ns)
+            .into_iter()
+            .map(|d| (ns.clone(), d))
+            .collect()
+    };
+    list_command_with_dirs(cfg, dirs)
 }
 
 /// `hyoui list` で 1 session を表す internal 構造体。
@@ -820,6 +847,8 @@ fn list_command(cfg: ListConfig) -> ExitCode {
 /// 「1=最古 / -1=最新」と解釈する。
 struct ListEntry {
     session: String,
+    /// DR-0018: この entry が属する namespace (= NS 列表示用)。
+    namespace: String,
     socket_path: std::path::PathBuf,
     /// socket file mtime を epoch ms に換算した値 (= sort key + jsonl 出力用)。
     started_unix_ms: u64,
@@ -850,13 +879,13 @@ enum ListEntryStatus {
     Stale,
 }
 
-/// `list_command` の testable な内部実装。dir 一覧を引数で受けることで
-/// env (`XDG_RUNTIME_DIR` / `TMPDIR`) 依存を切り離し、unit test 可能にする。
-fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<std::path::PathBuf>) -> ExitCode {
+/// `list_command` の testable な内部実装。`(namespace, dir)` 一覧を引数で受けることで
+/// env (`XDG_RUNTIME_DIR` / `TMPDIR`) 依存を切り離し、unit test 可能にする (= DR-0018)。
+fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<(String, std::path::PathBuf)>) -> ExitCode {
     let now = std::time::SystemTime::now();
     let mut entries: Vec<ListEntry> = Vec::new();
     let mut pruned_count = 0usize;
-    for dir in dirs {
+    for (ns, dir) in dirs {
         let read_entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
             Err(_) => continue, // dir 不存在は無視 (= 何も daemon 起動してない可能性)
@@ -899,6 +928,7 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<std::path::PathBuf>) -> Exi
             };
             entries.push(ListEntry {
                 session,
+                namespace: ns.clone(),
                 socket_path: path.clone(),
                 started_unix_ms,
                 dur,
@@ -933,11 +963,11 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<std::path::PathBuf>) -> Exi
     enrich_entries_with_status(&mut entries);
 
     match cfg.format {
-        ListFormat::Plain => print_list_plain(&entries),
+        ListFormat::Plain => print_list_plain(&entries, cfg.all_namespaces),
         ListFormat::Jsonl => print_list_jsonl(&entries),
         // `ListFormat` is `#[non_exhaustive]`; fall back to plain
         // for unknown future variants.
-        _ => print_list_plain(&entries),
+        _ => print_list_plain(&entries, cfg.all_namespaces),
     }
 
     let found = entries.len();
@@ -1183,16 +1213,31 @@ fn fmt_argv(argv: &[String]) -> String {
 /// concrete value で出す (= `-` 表示は stale entry に限定)。timeout で `-` 表示する
 /// graceful degradation 経路は廃止 (= `enrich_entries_with_status` が timeout を
 /// 持たないので、live なら必ず status.response を取れている)。
-fn print_list_plain(entries: &[ListEntry]) {
+///
+/// DR-0018: `show_ns = true` (= `--all-namespaces`) のとき先頭に NS 列を追加する。
+/// 単一 namespace 表示 (= default) では NS 列を出さず、従来の見え方を保つ。
+fn print_list_plain(entries: &[ListEntry], show_ns: bool) {
     if entries.is_empty() {
         return;
     }
-    println!(
-        "{:<20} {:<7} {:<10} {:<8} {:<32} ARGV",
-        "SESSION", "STATUS", "DUR", "CLIENTS", "CWD"
-    );
+    if show_ns {
+        println!(
+            "{:<16} {:<20} {:<7} {:<10} {:<8} {:<32} ARGV",
+            "NS", "SESSION", "STATUS", "DUR", "CLIENTS", "CWD"
+        );
+    } else {
+        println!(
+            "{:<20} {:<7} {:<10} {:<8} {:<32} ARGV",
+            "SESSION", "STATUS", "DUR", "CLIENTS", "CWD"
+        );
+    }
     for e in entries {
         let session = truncate_to(&e.session, 20);
+        let ns_prefix = if show_ns {
+            format!("{:<16} ", truncate_to(&e.namespace, 16))
+        } else {
+            String::new()
+        };
         match &e.status {
             ListEntryStatus::Live {
                 cwd,
@@ -1210,13 +1255,13 @@ fn print_list_plain(entries: &[ListEntry]) {
                 // DR-0017 §柱2: 子が stopped のまま残っていれば STATUS を "stopped" に。
                 let status = if *child_stopped { "stopped" } else { "live" };
                 println!(
-                    "{session:<20} {status:<7} {dur:<10} {clients:<8} {cwd_disp:<32} {argv_disp}"
+                    "{ns_prefix}{session:<20} {status:<7} {dur:<10} {clients:<8} {cwd_disp:<32} {argv_disp}"
                 );
             }
             ListEntryStatus::Stale => {
                 // stale は cwd/argv/clients 取得不能なので `-` 統一。
                 println!(
-                    "{session:<20} {:<7} {:<10} {:<8} {:<32} -",
+                    "{ns_prefix}{session:<20} {:<7} {:<10} {:<8} {:<32} -",
                     "stale", "-", "-", "-"
                 );
             }
@@ -1241,6 +1286,8 @@ fn print_list_jsonl(entries: &[ListEntry]) {
                 child_stopped,
             } => serde_json::json!({
                 "session": e.session,
+                // DR-0018: namespace を常時出力 (= default ns は "default")。
+                "namespace": e.namespace,
                 // DR-0017 §柱2: stopped child は status を "stopped" にして可観測化。
                 "status": if *child_stopped { "stopped" } else { "live" },
                 "child_stopped": child_stopped,
@@ -1253,6 +1300,7 @@ fn print_list_jsonl(entries: &[ListEntry]) {
             }),
             ListEntryStatus::Stale => serde_json::json!({
                 "session": e.session,
+                "namespace": e.namespace,
                 "status": "stale",
                 "started_unix_ms": e.started_unix_ms,
                 "dur_ms": e.dur.as_millis() as u64,
@@ -1266,8 +1314,11 @@ fn print_list_jsonl(entries: &[ListEntry]) {
     }
 }
 
-/// `hyoui list` で scan する候補 dir を返す。
-fn list_candidate_dirs() -> Vec<std::path::PathBuf> {
+/// hyoui base socket dir 候補 (= namespace を含めない `hyoui-<uid>` まで) を返す。
+///
+/// `XDG_RUNTIME_DIR/hyoui` (実在時) と `${TMPDIR:-/tmp}/hyoui-<uid>` の 2 候補を、
+/// 実在する方だけ列挙する (= `socket_path::resolve` の dir 選択ロジックと同順)。
+fn base_socket_dirs() -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR")
         && !xdg.is_empty()
@@ -1289,11 +1340,59 @@ fn list_candidate_dirs() -> Vec<std::path::PathBuf> {
     out
 }
 
+/// `hyoui list` 等で scan する候補 dir を **namespace スコープ**で返す (= DR-0018)。
+///
+/// - `default` namespace → base dir をそのまま (= 互換、`<base>/*.sock` を直接 scan)
+/// - それ以外 → `<base>/<namespace>` (= 実在する場合のみ)
+fn list_candidate_dirs(namespace: &str) -> Vec<std::path::PathBuf> {
+    let bases = base_socket_dirs();
+    if namespace == hyoui::cli::DEFAULT_NAMESPACE {
+        return bases;
+    }
+    bases
+        .into_iter()
+        .map(|b| b.join(namespace))
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
+/// 全 namespace 横断で scan する候補 dir を `(namespace, dir)` ペアで返す (= DR-0018)。
+///
+/// 各 base dir 直下を 1 段 read_dir し、`*.sock` (= default ns の socket) と
+/// サブ dir (= 非 default ns) を区別して列挙する:
+/// - base dir 自身 → namespace = `default`
+/// - base dir 配下の各サブ dir `<ns>` → namespace = `<ns>`
+fn list_candidate_dirs_all_namespaces() -> Vec<(String, std::path::PathBuf)> {
+    let mut out: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for base in base_socket_dirs() {
+        // base dir 自身 = default namespace。
+        out.push((hyoui::cli::DEFAULT_NAMESPACE.to_string(), base.clone()));
+        // base 配下のサブ dir = 各 namespace。
+        let read = match std::fs::read_dir(&base) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if let Some(ns) = path.file_name().and_then(|s| s.to_str()) {
+                // namespace 名として妥当なものだけ採用 (= 不正名の dir は無視)。
+                if hyoui::cli::validate_namespace(ns).is_ok() {
+                    out.push((ns.to_string(), path));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// 全 live session の id を mtime 昇順で列挙する (= `--all` 用)。
 ///
 /// `resolve_session_by_index` と同じ scan logic だが index 解決ではなく全件返す。
-fn list_all_live_sessions() -> Vec<String> {
-    let dirs = list_candidate_dirs();
+fn list_all_live_sessions(namespace: &str) -> Vec<String> {
+    let dirs = list_candidate_dirs(namespace);
     let mut entries: Vec<(String, std::time::SystemTime)> = Vec::new();
     for dir in dirs {
         let read = match std::fs::read_dir(&dir) {
@@ -1325,9 +1424,12 @@ fn list_all_live_sessions() -> Vec<String> {
 
 /// `hyoui kill <session>` の主要ロジック。
 fn kill_command(cfg: KillConfig) -> ExitCode {
+    // DR-0018: namespace を解決。--all の列挙と各 session の socket 解決を同一
+    // namespace スコープに揃える。
+    let namespace = socket_path::resolve_namespace(cfg.namespace.as_deref());
     // --all は全 live session を順次 kill (= killall 相当)。
     if cfg.all {
-        let sessions = list_all_live_sessions();
+        let sessions = list_all_live_sessions(&namespace);
         if sessions.is_empty() {
             eprintln!("hyoui: kill --all: no live sessions found");
             return ExitCode::SUCCESS;
@@ -1346,6 +1448,7 @@ fn kill_command(cfg: KillConfig) -> ExitCode {
                 // --wait は各 session の terminate 完了を順に見届ける (= killall で
                 // 1 件ずつ確実に畳んでから次へ)。
                 wait: cfg.wait,
+                namespace: cfg.namespace.clone(),
             };
             let exit = kill_command_single(sub_cfg);
             if exit != ExitCode::SUCCESS {
@@ -1365,6 +1468,7 @@ fn kill_command(cfg: KillConfig) -> ExitCode {
 
 /// 単一 session の kill 実行 (= `--all` で 1 件ずつ呼び出すための内部 helper)。
 fn kill_command_single(cfg: KillConfig) -> ExitCode {
+    let namespace = socket_path::resolve_namespace(cfg.namespace.as_deref());
     let sock = if let Some(p) = cfg.socket.clone() {
         std::path::PathBuf::from(p)
     } else {
@@ -1372,7 +1476,7 @@ fn kill_command_single(cfg: KillConfig) -> ExitCode {
         // それ以外は cfg.session_id を使う (= parse_kill で同時指定は弾かれている)。
         let sid_owned: String;
         let sid = if let Some(index) = cfg.index {
-            match resolve_session_by_index(index) {
+            match resolve_session_by_index(index, &namespace) {
                 Ok(s) => {
                     sid_owned = s;
                     sid_owned.as_str()
@@ -1391,10 +1495,12 @@ fn kill_command_single(cfg: KillConfig) -> ExitCode {
                 }
             }
         };
-        match socket_path::resolve(None, sid) {
+        match socket_path::resolve_in_namespace(None, sid, &namespace) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("hyoui: kill: socket path 解決失敗: {e} (session: {sid})");
+                eprintln!(
+                    "hyoui: kill: socket path 解決失敗: {e} (session: {sid}, namespace: {namespace})"
+                );
                 eprintln!("       起動中の session 一覧は `hyoui list` で確認してください。");
                 return ExitCode::from(1);
             }
@@ -1581,13 +1687,14 @@ fn resolve_target_socket(
     socket: Option<&str>,
     session_id: Option<&str>,
     index: Option<i32>,
+    namespace: &str,
 ) -> Result<std::path::PathBuf, ExitCode> {
     if let Some(p) = socket {
         return Ok(std::path::PathBuf::from(p));
     }
     let sid_owned: String;
     let sid: &str = if let Some(idx) = index {
-        match resolve_session_by_index(idx) {
+        match resolve_session_by_index(idx, namespace) {
             Ok(s) => {
                 sid_owned = s;
                 sid_owned.as_str()
@@ -1606,8 +1713,10 @@ fn resolve_target_socket(
             }
         }
     };
-    socket_path::resolve(None, sid).map_err(|e| {
-        eprintln!("hyoui: {cmd}: socket path 解決失敗: {e} (session: {sid})");
+    socket_path::resolve_in_namespace(None, sid, namespace).map_err(|e| {
+        eprintln!(
+            "hyoui: {cmd}: socket path 解決失敗: {e} (session: {sid}, namespace: {namespace})"
+        );
         eprintln!("       起動中の session 一覧は `hyoui list` で確認してください。");
         ExitCode::from(1)
     })
@@ -1620,6 +1729,7 @@ fn status_command(cfg: StatusConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
+        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -1762,6 +1872,7 @@ fn tail_command(cfg: TailConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
+        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -1863,6 +1974,7 @@ fn wait_command(cfg: WaitConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
+        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -1932,6 +2044,7 @@ fn screen_dump_command(cfg: ScreenDumpConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
+        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -2093,6 +2206,7 @@ fn screen_snapshot_command(cfg: ScreenSnapshotConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
+        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -2283,6 +2397,7 @@ fn input_command(cmd: InputCommand) -> ExitCode {
         cmd.socket.as_deref(),
         cmd.session_id.as_deref(),
         cmd.index,
+        socket_path::resolve_namespace(cmd.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -2372,6 +2487,7 @@ fn lock_acquire_command(cfg: LockAcquireConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
+        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -2680,6 +2796,7 @@ fn lock_release_command(cmd_label: &str, cfg: LockReleaseConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
+        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -2855,6 +2972,7 @@ fn record_start_command(cfg: RecordStartConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
+        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -2953,6 +3071,7 @@ fn record_stop_command(cfg: RecordStopConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
+        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -3108,6 +3227,7 @@ fn record_list_command(cfg: RecordListConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
+        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -3442,7 +3562,13 @@ mod tests {
             prune_stale: true,
             ..Default::default()
         };
-        let _exit = list_command_with_dirs(cfg, vec![sock_dir.path().to_path_buf()]);
+        let _exit = list_command_with_dirs(
+            cfg,
+            vec![(
+                hyoui::cli::DEFAULT_NAMESPACE.to_string(),
+                sock_dir.path().to_path_buf(),
+            )],
+        );
 
         // 確認: stale は unlink された、live はまだ残っている
         assert!(
@@ -3486,7 +3612,13 @@ mod tests {
             prune_stale: false,
             ..Default::default()
         };
-        let _exit = list_command_with_dirs(cfg, vec![sock_dir.path().to_path_buf()]);
+        let _exit = list_command_with_dirs(
+            cfg,
+            vec![(
+                hyoui::cli::DEFAULT_NAMESPACE.to_string(),
+                sock_dir.path().to_path_buf(),
+            )],
+        );
 
         assert!(
             stale_path.exists(),
@@ -3621,6 +3753,7 @@ mod tests {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
             index: None,
+            namespace: None,
             format: ScreenDumpCliFormat::Ansi,
             layer: ScreenDumpCliLayer::Visible,
             rect: None,
@@ -3689,6 +3822,7 @@ mod tests {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
             index: None,
+            namespace: None,
             format: ScreenDumpCliFormat::TextPlain,
             layer: ScreenDumpCliLayer::Visible,
             rect: None,
@@ -3769,6 +3903,7 @@ mod tests {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
             index: None,
+            namespace: None,
             format: ScreenDumpCliFormat::TextPlain,
             layer: ScreenDumpCliLayer::Scrollback,
             rect: None,
@@ -3857,6 +3992,7 @@ mod tests {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
             index: None,
+            namespace: None,
             include: vec![
                 SnapshotCliComponent::Cursor,
                 SnapshotCliComponent::Mode,
@@ -4054,6 +4190,7 @@ mod tests {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
             index: None,
+            namespace: None,
             pattern: "READY".into(),
             timeout_ms: Some(5_000),
             poll_interval_ms: Some(50),
@@ -4119,6 +4256,7 @@ mod tests {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
             index: None,
+            namespace: None,
             pattern: "NEVER_SHOWS_UP".into(),
             timeout_ms: Some(300),
             poll_interval_ms: Some(50),
@@ -4188,6 +4326,7 @@ mod tests {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
             index: None,
+            namespace: None,
             specs: vec![InputSpec::Wait("GO".into())],
             timeout: std::time::Duration::from_secs(3),
             lock_token: None,
@@ -4249,6 +4388,7 @@ mod tests {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
             index: None,
+            namespace: None,
             specs: vec![InputSpec::WaitIdle(std::time::Duration::from_millis(200))],
             timeout: std::time::Duration::from_secs(3),
             lock_token: None,
@@ -4323,6 +4463,7 @@ mod tests {
         // listener bind 完了を待つ (= retry budget は connect_with_retry 経由で吸収)。
         let mut entries = vec![ListEntry {
             session: "live-enrich-test".into(),
+            namespace: hyoui::cli::DEFAULT_NAMESPACE.to_string(),
             socket_path: sock_path.clone(),
             started_unix_ms: 0,
             dur: std::time::Duration::ZERO,
@@ -4386,6 +4527,7 @@ mod tests {
         // listener を bind しない (= connect で ECONNREFUSED or ENOENT になる)。
         let mut entries = vec![ListEntry {
             session: "fake".into(),
+            namespace: hyoui::cli::DEFAULT_NAMESPACE.to_string(),
             socket_path: sock_path,
             started_unix_ms: 0,
             dur: std::time::Duration::ZERO,
