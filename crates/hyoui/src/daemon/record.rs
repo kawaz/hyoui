@@ -1646,6 +1646,36 @@ mod tests {
         assert_eq!(v["unwritten_bytes"], hex::encode("unwritten_tail_bytes"));
     }
 
+    /// Minor 1: until / timeout / idle-timeout の各終了条件が
+    /// `session-terminated-by-condition` event として reason 付きで jsonl 化される
+    /// (= record.rs の doc が謳う 3 種の reason、特に until 経路が emit されること)。
+    #[test]
+    fn session_terminated_by_condition_event_carries_reason() {
+        for reason in ["until", "timeout", "idle-timeout"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("term.jsonl");
+            let registry = RecordRegistry::new();
+            let id = registry
+                .start(
+                    &jsonl_request(&path, RecordDirection::Stdout),
+                    1,
+                    sample_session(),
+                )
+                .unwrap();
+            registry.push_lifecycle(LifecycleEvent::SessionTerminatedByCondition {
+                reason: reason.to_string(),
+                ts_unix_ms: 123,
+            });
+            registry.stop(id).unwrap();
+            let content = std::fs::read_to_string(&path).unwrap();
+            let lines: Vec<&str> = content.lines().collect();
+            assert_eq!(lines.len(), 2, "header + 1 lifecycle event");
+            let v: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+            assert_eq!(v["ev"], "session-terminated-by-condition");
+            assert_eq!(v["reason"], reason);
+        }
+    }
+
     #[test]
     fn in_rejected_event_carries_reason_and_mode() {
         let dir = tempfile::tempdir().unwrap();

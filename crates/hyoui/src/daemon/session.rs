@@ -1410,6 +1410,15 @@ fn serve_loop(
                     if let Some(ref mut w) = until_watcher
                         && w.feed(&buf[..n])
                     {
+                        // DR-0019 §4: until match も timeout / idle-timeout と同じ
+                        // 「daemon 側終了条件」なので lifecycle event を残す (= record.rs
+                        // の SessionTerminatedByCondition doc が謳う reason "until")。
+                        state.record_registry.push_lifecycle(
+                            super::record::LifecycleEvent::SessionTerminatedByCondition {
+                                reason: "until".to_string(),
+                                ts_unix_ms: now_unix_ms(),
+                            },
+                        );
                         let _ = kill_pgrp(child, Signal::SIGTERM);
                         // finalize_child が SIGTERM → wait → SIGKILL を実施。
                         // `ClientDetachedOrKilled` を返すことで finalize 経路に
