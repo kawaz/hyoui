@@ -172,11 +172,12 @@ pub enum LifecycleEvent {
         detail: Option<String>,
         ts_unix_ms: u64,
     },
-    /// daemon 側終了条件 (= `--until` match / `--timeout` / `--idle-timeout`) が
-    /// 発火し、子 process group へ SIGTERM を送って session を畳む瞬間 (DR-0019 §4)。
+    /// daemon 側終了条件 (= `--until` match / `--timeout` / `--idle-timeout`)、または
+    /// daemon process への外部 SIGTERM / SIGINT が発火し、子 process group へ SIGTERM を
+    /// 送って session を畳む瞬間 (DR-0019 §4 + issue 2026-06-11 優先3 graceful shutdown)。
     ///
-    /// `reason` は発火理由 ("until" / "timeout" / "idle-timeout")。発火後は通常の
-    /// child exit 経路 (= finalize escalation → `SessionExitNotify`) に合流する。
+    /// `reason` は発火理由 ("until" / "timeout" / "idle-timeout" / "sigterm" / "sigint")。
+    /// 発火後は通常の child exit 経路 (= finalize escalation → `SessionExitNotify`) に合流する。
     SessionTerminatedByCondition { reason: String, ts_unix_ms: u64 },
 }
 

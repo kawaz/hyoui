@@ -120,11 +120,17 @@ impl ChildLifecycle {
     ) -> (ChildState, Option<ChildTransition>) {
         let flags = WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED;
         match waitpid(child, Some(flags)) {
-            Ok(WaitStatus::Exited(_, code)) => (
-                ChildState::Exited(Some(code)),
-                Some(ChildTransition::Exited(Some(code))),
-            ),
+            Ok(WaitStatus::Exited(_, code)) => {
+                // doc 整合: Exited を観測したら latch を下ろす (= stopped 中の子が
+                // 起こされず exit したケースでも is_stopped() が false を返す)。
+                self.stopped = false;
+                (
+                    ChildState::Exited(Some(code)),
+                    Some(ChildTransition::Exited(Some(code))),
+                )
+            }
             Ok(WaitStatus::Signaled(_, sig, _)) => {
+                self.stopped = false;
                 let code = 128 + (sig as i32);
                 (
                     ChildState::Exited(Some(code)),

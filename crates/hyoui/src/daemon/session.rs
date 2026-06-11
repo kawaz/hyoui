@@ -488,11 +488,16 @@ impl Session {
             // SessionExitNotify を読む前に EOF を観測する race が起きる。issue 2026-06-11
             // 優先1 で client の socket EOF を `ConnectionLost` (= 非 0 exit) に分離した
             // ため、この race が顕在化した (= 子の正常 exit code を返すべき場面で exit 9 が
-            // 漏れる)。linger 経路 (= 後段の `linger_for_late_attach`) と同じ流儀で drain。
-            let drain_deadline = Instant::now() + std::time::Duration::from_millis(1000);
+            // 漏れる)。
+            //
+            // budget は **per-client** で振る (= 先行の cleanup drain と同じ流儀、
+            // `DRAIN_BUDGET_PER_CLIENT`)。共有 deadline 方式だと先頭 client の hang が
+            // 後続 client の ExitNotify drain budget を食い潰し、複数 attach 時に
+            // 後続が ExitNotify を読めず exit 9 に漏れる。per-client なら 1 client の
+            // hang が他に波及しない。
             for ch in clients.iter() {
-                while ch.queued_bytes.load(Ordering::Acquire) > 0 && Instant::now() < drain_deadline
-                {
+                let deadline = Instant::now() + DRAIN_BUDGET_PER_CLIENT;
+                while ch.queued_bytes.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
