@@ -59,7 +59,7 @@ FleetView とも出ない)。間に変化した外部状態:
 なお途中で観測された FleetView 起動 (= `env -u CMUX_SURFACE_ID` 回避時) は、当時
 走っていた hyoui 経由の claude job 群が存在したためで、終了後は出ない。
 
-## 追記 2 (2026-06-11): 再現条件がほぼ確定 — OS 再起動による stale surface
+## 追記 2 (2026-06-11): 最有力仮説 — OS 再起動による stale surface (未確定)
 
 kawaz の追加情報で再現条件が判明:
 - 途中で **mac を再起動**しており、cmux は再起動後に surface 群を復元していた
@@ -67,7 +67,7 @@ kawaz の追加情報で再現条件が判明:
 - **Settings Error が出たのは再起動前から開きっぱなしの古い surface**、
   正常起動したのは**新規ワークスペース/新規タブ** (fresh な surface)
 
-### 確定した機序
+### 推定機序 (= 観測と整合する最有力仮説、直接の実証はしていない)
 
 OS 再起動で復元された surface の environ にある `CMUX_SURFACE_ID` は**前世代の
 stale ID**。その環境から起動した wrapper は stale ID で IN_CMUX=1 となり、
