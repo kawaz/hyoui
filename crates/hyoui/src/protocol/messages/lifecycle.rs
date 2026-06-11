@@ -25,7 +25,7 @@ pub struct Detach {
 }
 
 /// `kill` payload (DR-0012)。daemon は子 PTY に signal を送って自身も exit する。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Kill {
     /// 子に送る signal 名 (= null なら SIGTERM、正規表記は SIG-prefix 大文字)。
@@ -46,6 +46,12 @@ pub struct Kill {
     /// 旧 client (= field 無し) からの Kill は `#[serde(default)]` で `false`
     /// (= 即時 ack) になる。旧 client は KillAck を未知 kind として decode error
     /// → EOF 相当に倒れて成功扱いになる (= 互換)。
+    ///
+    /// 注: `hyoui kill --wait` (timeout 付き見届け) は **`wait: false` を送る**。
+    /// client が `KillAck` 後も接続を維持し、`session.exit.notify` / EOF を自前
+    /// deadline 付きで待つ (= timeout 時は session を畳まず exit 3、daemon は
+    /// 一切 block しないので孤児化しない)。`wait: true` は legacy client 互換用で、
+    /// daemon 側は terminate 経路 (= `finalize_child` の bounded escalation) で応じる。
     #[serde(default)]
     pub wait: bool,
 }

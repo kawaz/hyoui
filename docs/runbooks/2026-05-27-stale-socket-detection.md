@@ -11,7 +11,7 @@
 - 過去に daemon が `SIGKILL` を受けた、または `panic = abort` で abort した
   履歴がある (OS のジョブ kill / OOM-killer / `kill -9` 等)
 - ホスト再起動後で `${XDG_RUNTIME_DIR}` ベースなら消えているはずだが、
-  `${TMPDIR}` 配下に残骸が残っている
+  `/tmp/hyoui-<uid>` 配下に残骸が残っている
 - `hyoui list --prune-stale` 未対応の旧版 (< v0.1.7) では「list に出るが
   status は失敗」が見分けられない
 
@@ -31,7 +31,7 @@
    ```
 3. `hyoui list --prune-stale` 未対応バージョンの場合は手動 `unlink`:
    ```bash
-   rm -- "$XDG_RUNTIME_DIR/hyoui/<session>.sock"  # or $TMPDIR
+   rm -- "$XDG_RUNTIME_DIR/hyoui/<session>.sock"  # or /tmp/hyoui-<uid>/<session>.sock
    ```
 
 ## 対処
@@ -62,7 +62,7 @@
 ## 関連
 
 - [[DR-0006]] §socket-placement — `${XDG_RUNTIME_DIR}/hyoui/<session>.sock`
-  または `${TMPDIR}` フォールバック
+  または `/tmp/hyoui-<uid>` フォールバック
 - [[R5-H3]] — backlog の解消経緯 (= `list` 改修で live/stale 列追加 +
   `--prune-stale` flag)
 - [[R5-H12]] — `panic = abort` を維持する判断 (= 引き換えに stale socket

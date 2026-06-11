@@ -54,6 +54,7 @@ fn daemon_role(sock_path: &str) {
         ],
         80,
         24,
+        None,
     )
     .expect("spawn");
     let master_raw = spawned.pty.master_fd().as_raw_fd();

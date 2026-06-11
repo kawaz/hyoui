@@ -43,6 +43,62 @@ fn hyoui_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_hyoui"))
 }
 
+/// 子プロセス helper の実行に deadline を被せる (= issue 2026-06-11)。
+///
+/// `hyoui screen dump` / `hyoui status` 等の CLI helper は client 側 socket read
+/// timeout が未配線 (= 別 task)。daemon が wedge していると `Command::output()` が
+/// 無期限ブロックし、test 全体のハングに化ける。deadline 超過時は子を SIGKILL して
+/// `TimedOut` エラーを返す (= 呼出側の待ちループが fail で抜けられる)。
+///
+/// 注: stdout が pipe バッファ (~64 KiB) を超える子には使えない (= try_wait poll 中は
+/// pipe を読まないため子が write で詰まる)。screen dump / status は数 KB なので対象内。
+pub fn capture_with_deadline(
+    cmd: &mut Command,
+    deadline: Duration,
+) -> std::io::Result<std::process::Output> {
+    let mut child = cmd.spawn()?;
+    let dl = Instant::now() + deadline;
+    loop {
+        match child.try_wait()? {
+            Some(_) => return child.wait_with_output(),
+            None if Instant::now() >= dl => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("subprocess deadline {deadline:?} exceeded (killed)"),
+                ));
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+/// deadline 付き thread join (= issue 2026-06-11)。
+///
+/// daemon serve 等を `std::thread::spawn` した test が素の `JoinHandle::join` を
+/// 呼ぶと、daemon が wedge した場合に **無限ハング**する (= 2026-05-28 に ubuntu CI
+/// で 6h timeout を観測した構造)。watcher thread 経由で join し `recv_timeout` で
+/// deadline を被せる。timeout 時は message 付き panic で fail させる
+/// (= watcher / 対象 thread は leak するが、test process 終了で回収される)。
+pub fn join_with_deadline<T: Send + 'static>(
+    handle: std::thread::JoinHandle<T>,
+    timeout: Duration,
+    what: &str,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(handle.join());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(v)) => v,
+        Ok(Err(_)) => panic!("{what}: joined thread panicked"),
+        Err(_) => panic!(
+            "{what}: thread did not finish within {timeout:?} (= 無限ハング防止のため deadline fail)"
+        ),
+    }
+}
+
 /// test 用 hyoui-cli runner。runtime_dir (= socket / runtime files の隔離先)
 /// を 1 つ持ち、その下で複数 session を spawn / attach できる。
 ///
@@ -283,6 +339,42 @@ impl SpawnedHyoui {
         std::mem::take(&mut self.output_buf)
     }
 
+    /// PTY master に今読める bytes があれば全部読んで `output_buf` に蓄積する
+    /// (= 非ブロッキング pump)。読んだ byte 数を返す。
+    ///
+    /// **用途 (= issue 2026-06-11)**: 子 (hyoui attach) が `tcsetattr(TCSAFLUSH)`
+    /// 等で「外側端末への出力 drain」を待つ場面で、master を誰も読まないと子が
+    /// ioctl で永久ブロックする (= 実端末なら端末エミュレータが常時読むので
+    /// 起きない、test 環境特有の相互待ち)。process state を ps で poll する
+    /// 待ちループ内で本 method を毎周呼び、master を吸い続けること。
+    pub fn pump_pty(&mut self) -> usize {
+        let mut total = 0usize;
+        let mut tmp = [0u8; 4096];
+        loop {
+            let borrowed = self.pty.as_fd();
+            let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
+            // timeout 0 = 即時判定 (= 読めるものだけ読む)
+            match nix::poll::poll(&mut fds, PollTimeout::ZERO) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            let revents = fds[0].revents().unwrap_or(PollFlags::empty());
+            if !revents.intersects(PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR) {
+                break;
+            }
+            match self.pty.read(&mut tmp) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    self.output_buf.extend_from_slice(&tmp[..n]);
+                    total += n;
+                }
+                Err(_) => break, // EIO (= 子側 close) 等は pump 終了
+            }
+        }
+        total
+    }
+
     /// 子プロセス (= hyoui-cli 自身) に signal を送る。
     ///
     /// `kill(pid, sig)` 1 発。kernel 側で配送されるので timing は呼出側責任。
@@ -311,12 +403,16 @@ impl SpawnedHyoui {
     /// 本実装では `self.socket` を使う (= 同じ runner / 同じ session)。
     pub fn screen_dump(&self, _session: &str) -> std::io::Result<Vec<u8>> {
         let socket_arg = format!("--socket={}", self.socket.display());
-        let out = Command::new(hyoui_bin())
-            .args(["screen", "dump", &socket_arg, "--format=ansi"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()?;
+        // CLI helper には socket read timeout が無い (= 別 task)。wedged daemon で
+        // test がハングしないよう deadline 付き実行 (= issue 2026-06-11)。
+        let out = capture_with_deadline(
+            Command::new(hyoui_bin())
+                .args(["screen", "dump", &socket_arg, "--format=ansi"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+            Duration::from_secs(10),
+        )?;
         if !out.status.success() {
             return Err(std::io::Error::other(format!(
                 "hyoui screen dump failed (status={}): stderr={:?}",
@@ -327,15 +423,80 @@ impl SpawnedHyoui {
         Ok(out.stdout)
     }
 
-    /// child を kill + wait して PTY を閉じる。
+    /// `hyoui status --socket=<sock>` の stdout を取得する (= daemon が listen 中の前提)。
+    pub fn status_text(&self) -> std::io::Result<String> {
+        let socket_arg = format!("--socket={}", self.socket.display());
+        // deadline 付き実行: screen_dump と同理由 (= issue 2026-06-11)。
+        let out = capture_with_deadline(
+            Command::new(hyoui_bin())
+                .args(["status", &socket_arg])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+            Duration::from_secs(10),
+        )?;
+        if !out.status.success() {
+            return Err(std::io::Error::other(format!(
+                "hyoui status failed (status={}): stderr={:?}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// attach client (= leader) が daemon に接続済みになるまで待つ。
     ///
-    /// 既に exit している場合は `Ok(())`。SIGTERM → 100ms → SIGKILL の段階的
+    /// **readiness race 対策 (= issue 2026-06-11)**: `hyoui run` は子 PTY を
+    /// daemon が fork した直後に process として観測できるが、follow policy
+    /// (`SessionChildStoppedNotify` → attach の `raise(SIGSTOP)`) は **attach client が
+    /// daemon socket に接続して leader 登録を終えて初めて**配線される。子 process の
+    /// 出現だけを見て SIGSTOP を送ると、leader 不在の窓で notify が空振りし、attach が
+    /// STOPPED にならない (= 旧テストの偽 fail 原因)。
+    ///
+    /// `hyoui status` の clients に `leader` 付き client が現れるまで poll する
+    /// (= status 自身も一時 client を張るが、leader は attach client のみ)。timeout で
+    /// `false` を返す (= 呼出側で deadline 付き panic にする)。
+    pub fn wait_for_leader_ready(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(text) = self.status_text()
+                && text.contains("leader")
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// child + session subtree (= daemon / 子 PTY) を kill して PTY を閉じる。
+    ///
+    /// 既に exit している場合は `Ok(())`。SIGTERM → 200ms → SIGKILL の段階的
     /// shutdown (= TUI app の cleanup hook を尊重しつつ、blocking を最小化)。
+    ///
+    /// **deadline 必須**: DR-0015/0017 構造では `hyoui run` は detached daemon を
+    /// 別 session に fork し、自身は `attach` に exec する。子 PTY を STOPPED の
+    /// まま放置すると (= follow test の self-stop シナリオ)、session leader が
+    /// controlling tty cleanup で exit しきれず `child.wait()` が **無限 block** する
+    /// (= issue 2026-06-11 のハング根因)。そこで:
+    ///   1. session subtree (daemon / 子) を `find_descendants` で列挙し、
+    ///      **SIGCONT → SIGKILL** で起こしてから確実に殺す (= stopped child を残さない)。
+    ///   2. 最終 reap は blocking `wait()` ではなく `try_wait` を deadline 付き poll で
+    ///      回す (= 万一 reap できなくても無限 block しない)。
     pub fn kill(&mut self) -> std::io::Result<()> {
         // try_wait で既に終わってないか確認
         if let Ok(Some(_)) = self.child.try_wait() {
             return Ok(());
         }
+        // 1. session subtree (daemon + 子 PTY) を起こしてから皆殺し。
+        //    stopped (T) のまま残すと session leader (= self.pid) が exit しきれず
+        //    後段の reap が無限 block するため、SIGCONT を先送りする。
+        self.kill_session_subtree();
+
+        let _ = self.signal(Signal::SIGCONT);
         let _ = self.signal(Signal::SIGTERM);
         let deadline = Instant::now() + Duration::from_millis(200);
         while Instant::now() < deadline {
@@ -345,10 +506,42 @@ impl SpawnedHyoui {
                 Err(e) => return Err(e),
             }
         }
-        // まだ生きてたら SIGKILL
+        // まだ生きてたら SIGKILL + subtree 再掃除 (= exec 後に現れた子も拾う)。
+        let _ = self.signal(Signal::SIGCONT);
         let _ = self.signal(Signal::SIGKILL);
-        let _ = self.child.wait();
+        self.kill_session_subtree();
+
+        // 2. blocking wait() は使わない (= 無限 block 回避)。deadline 付き try_wait poll。
+        let reap_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < reap_deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => return Err(e),
+            }
+        }
+        // deadline 超過: reap できなくても test を無限 block させない。
+        // (= zombie / orphan が残る可能性はあるが、それは leak 検出の領分。
+        //  本 harness は「ハングしない」ことを最優先する。)
         Ok(())
+    }
+
+    /// session subtree (= daemon / 子 PTY / その孫) を SIGCONT で起こしてから
+    /// SIGKILL で確実に殺す。`find_descendants` で `self.pid` 配下を BFS する。
+    ///
+    /// DR-0015/0017 では daemon は別 session に setsid 済だが、exec 前の段階では
+    /// `self.pid` の子として現れる。stopped child を残すと session cleanup が
+    /// 詰まるため、まず CONT で全員起こす。
+    fn kill_session_subtree(&self) {
+        if let Ok(descendants) = find_descendants(self.pid.as_raw()) {
+            // まず全員を起こす (= stopped のままだと SIGTERM/KILL 以外は配送保留)。
+            for p in &descendants {
+                let _ = nix::sys::signal::kill(Pid::from_raw(p.pid), Signal::SIGCONT);
+            }
+            for p in &descendants {
+                let _ = nix::sys::signal::kill(Pid::from_raw(p.pid), Signal::SIGKILL);
+            }
+        }
     }
 }
 

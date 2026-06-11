@@ -5,11 +5,14 @@
 //! `Session::start` で立ち上げる構成。lock の取得・保持・解放・fail mode を
 //! end-to-end で検証する。
 
+mod common;
+
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use common::pty::join_with_deadline;
 use hyoui::daemon::{DaemonConfig, Session};
 
 /// 1 つの daemon session を test 用に spawn する。
@@ -46,12 +49,17 @@ fn hyoui_bin() -> PathBuf {
 }
 
 /// daemon を Kill control message で終わらせる helper。
+///
+/// **Rw で接続すること** (= issue 2026-06-11): Ro client の Kill は daemon が
+/// `mode.not-allowed` で拒否する (= `serve_ro_client_kill_rejected` が仕様の正本)。
+/// 旧実装は Ro で送っていたため kill が no-op になり、各テストの `daemon.join()` は
+/// 子 `/bin/sleep 30` の自然 exit (~28 秒) を黙って待っていた。
 fn kill_daemon(sock_path: &std::path::Path) {
     use hyoui::client::{AttachOptions, ClientConnection};
     use hyoui::protocol::ControlMessage;
     use hyoui::protocol::messages::Kill;
     let opts = AttachOptions {
-        mode: hyoui::protocol::Mode::Ro,
+        mode: hyoui::protocol::Mode::Rw,
         ..AttachOptions::default()
     };
     if let Ok(mut conn) = ClientConnection::connect(sock_path, opts) {
@@ -139,7 +147,8 @@ fn lock_acquire_prints_token_and_blocks_until_sigterm() {
         "hyoui lock acquire should exit 0 on SIGTERM, got {status:?}"
     );
     kill_daemon(&sock);
-    let _ = daemon.join();
+    // 無限ハング防止 (= issue 2026-06-11): daemon serve が wedge しても deadline fail。
+    let _ = join_with_deadline(daemon, Duration::from_secs(30), "lock_cli daemon serve");
 }
 
 // ===== Test: lock acquire stdin EOF path =====

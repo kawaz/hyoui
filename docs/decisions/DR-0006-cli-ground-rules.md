@@ -35,7 +35,7 @@ CLI Design は `~/.claude-personal/rules/cli-design-preferences.md` (= subcomman
 
 ```
 Linux:    $XDG_RUNTIME_DIR/hyoui/<name>.sock
-macOS:    $TMPDIR/hyoui-$UID/<name>.sock
+other:    /tmp/hyoui-$UID/<name>.sock   (incl. macOS; /tmp 固定, $TMPDIR は読まない)
 override: --socket /any/path.sock
 ```
 

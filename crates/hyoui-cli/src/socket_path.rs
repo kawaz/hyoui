@@ -5,11 +5,21 @@
 //!
 //! 1. `$XDG_RUNTIME_DIR` が set されていて、かつ実在 dir なら `$XDG_RUNTIME_DIR/hyoui/`
 //!    (Linux の典型、`/run/user/<uid>` が systemd-logind 等で mode 0700 で provision される)
-//! 2. それ以外 (= macOS や XDG 未設定環境) は **TMPDIR ベース**:
-//!    `${TMPDIR:-/tmp}/hyoui-<uid>/<session>.sock`
+//! 2. それ以外 (= macOS や XDG 未設定環境) は **`/tmp/hyoui-<uid>/`** 固定:
+//!    `/tmp/hyoui-<uid>/<session>.sock`
+//!    - tmux の `/tmp/tmux-<uid>` / screen と同じ前例。base を短く固定することで
+//!      unix socket の `sun_path` 上限 (macOS 104 / Linux 108 bytes) に namespace +
+//!      session 名を載せても余裕を残す (= macOS の TMPDIR
+//!      `/var/folders/.../T/` ≈50 文字が ENAMETOOLONG を誘発する問題への対処)。
+//!      macOS では `/tmp` は `/private/tmp` への symlink だが、bind は与えた path を
+//!      そのまま使うため実効長は `/tmp/...` で計算される。
 //!    - 再起動でクリーンされてよい設計 (socket は永続化対象外)
 //!    - `-<uid>` で multi-user 衝突回避
 //!    - dir は **新規作成時** mode 0700。既存 dir は所有者と mode を verify
+//!
+//! `$TMPDIR` を base に使わない理由 (= breaking change, v0.x): macOS の per-user
+//! TMPDIR が長すぎて namespace 機能が実環境で使えなかった。`/tmp` 固定で sun_path
+//! 予算を確保する。
 //!
 //! HOME 直下 (`~/.hyoui` 等) は使わない (= ユーザ HOME を汚さない)。
 //!
@@ -129,7 +139,7 @@ pub fn resolve_namespace(flag: Option<&str>) -> String {
 /// `explicit = Some(p)` ならそのまま、`None` なら自動 path:
 /// - `default` namespace → base dir 直下 (= 既存互換):
 ///   `$XDG_RUNTIME_DIR/hyoui/<sid>.sock` (= dir 実在時) /
-///   `${TMPDIR:-/tmp}/hyoui-<uid>/<sid>.sock`
+///   `/tmp/hyoui-<uid>/<sid>.sock`
 /// - それ以外 → `<base>/<namespace>/<sid>.sock`
 ///
 /// parent dir は **新規作成時のみ** mode 0700 で create、既存 dir は所有者/mode 検証。
@@ -146,7 +156,11 @@ pub fn resolve_in_namespace(
 ) -> std::io::Result<PathBuf> {
     let env = EnvSnapshot {
         xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR"),
-        tmpdir: std::env::var_os("TMPDIR"),
+        // production では `$TMPDIR` を読まない (= base は `/tmp` 固定)。macOS の
+        // 長い per-user TMPDIR が sun_path 上限を食い潰す問題を避けるため。
+        // `tmpdir` field は test が writable tempdir を base に差し込むための
+        // injection hook としてのみ使う (= 下記 `tmp_base_override`)。
+        tmp_base_override: None,
         uid: nix::unistd::geteuid().as_raw(),
         namespace: namespace.to_string(),
     };
@@ -158,8 +172,11 @@ pub fn resolve_in_namespace(
 pub struct EnvSnapshot {
     /// `$XDG_RUNTIME_DIR` の値 (= 未設定なら None)。
     pub xdg_runtime_dir: Option<OsString>,
-    /// `$TMPDIR` の値 (= 未設定なら None、fallback で `/tmp` を使う)。
-    pub tmpdir: Option<OsString>,
+    /// 非 XDG 経路の base tmp dir を差し替える test 専用 hook (= `None` なら
+    /// `/tmp` 固定)。production では `resolve_in_namespace` が常に `None` を渡す
+    /// (= `$TMPDIR` は読まない)。test が writable tempdir を base にして `/tmp` を
+    /// 汚さずに検証するためだけに使う。
+    pub tmp_base_override: Option<OsString>,
     /// 現在の effective UID。
     pub uid: u32,
     /// 解決済 session namespace (= DR-0018)。`default` なら base dir 直下、
@@ -194,13 +211,42 @@ pub fn resolve_with_env(
         ensure_socket_dir(&ns_dir, env.uid)?;
         ns_dir
     };
-    Ok(dir.join(format!("{session_id}.sock")))
+    let path = dir.join(format!("{session_id}.sock"));
+    check_sun_path_len(&path, &env.namespace, session_id)?;
+    Ok(path)
+}
+
+/// `path` の byte 長が `sun_path` に収まるか事前チェックする (= DR-0018 / ENAMETOOLONG bug)。
+///
+/// 超える場合、現在長 / 上限 / 短くする方法 (ns・session 名) を含む人間可読の
+/// `io::Error` を返す。`bind`/`connect` 直前の不親切な ENAMETOOLONG を防ぐ。
+/// 上限は `hyoui::sys::socket::sun_path_max()` (= macOS 104 / Linux 108 から
+/// NUL 終端を引いた値) を参照する (= libc 依存を hyoui crate 側に閉じる)。
+fn check_sun_path_len(path: &Path, namespace: &str, session_id: &str) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let len = path.as_os_str().as_bytes().len();
+    let max = hyoui::sys::socket::sun_path_max();
+    if len > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "socket path が unix domain socket の上限を超えています \
+                 (現在 {len} bytes > 上限 {max} bytes): {}\n\
+                 \x20      namespace ({namespace:?}) か session 名 ({session_id:?}) を \
+                 短くしてください (= base dir は /tmp/hyoui-<uid> 固定で最短化済み)。",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// namespace を含めない base socket dir を選ぶ (= `hyoui-<uid>` まで)。
 ///
 /// 1. `XDG_RUNTIME_DIR` が空でなく実在 dir → `$XDG_RUNTIME_DIR/hyoui`
-/// 2. それ以外 → `${TMPDIR:-/tmp}/hyoui-<uid>`
+/// 2. それ以外 → `<tmp_base>/hyoui-<uid>`。`tmp_base` は production では `/tmp`
+///    固定 (= sun_path 予算確保のため `$TMPDIR` を読まない)、test では
+///    `tmp_base_override` で writable tempdir を差し込む。
 fn pick_base_dir(env: &EnvSnapshot) -> PathBuf {
     if let Some(xdg) = env.xdg_runtime_dir.as_ref()
         && !xdg.is_empty()
@@ -211,7 +257,7 @@ fn pick_base_dir(env: &EnvSnapshot) -> PathBuf {
         }
     }
     let tmp = env
-        .tmpdir
+        .tmp_base_override
         .as_ref()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
@@ -266,7 +312,7 @@ mod tests {
     fn env_with_ns(xdg: Option<&Path>, tmp: Option<&Path>, ns: &str) -> EnvSnapshot {
         EnvSnapshot {
             xdg_runtime_dir: xdg.map(|p| p.as_os_str().to_os_string()),
-            tmpdir: tmp.map(|p| p.as_os_str().to_os_string()),
+            tmp_base_override: tmp.map(|p| p.as_os_str().to_os_string()),
             uid: nix::unistd::geteuid().as_raw(),
             namespace: ns.to_string(),
         }
@@ -354,14 +400,14 @@ mod tests {
             .expect("tempdir");
         let env = EnvSnapshot {
             xdg_runtime_dir: Some(OsString::new()), // 空 string は無視
-            tmpdir: Some(tmp.path().as_os_str().to_os_string()),
+            tmp_base_override: Some(tmp.path().as_os_str().to_os_string()),
             uid: nix::unistd::geteuid().as_raw(),
             namespace: hyoui::cli::DEFAULT_NAMESPACE.to_string(),
         };
         let got = resolve_with_env(None, "x", &env).expect("resolve");
         assert!(
             got.starts_with(tmp.path()),
-            "should use tmpdir, got {got:?}"
+            "should use tmp_base_override, got {got:?}"
         );
     }
 
@@ -375,12 +421,15 @@ mod tests {
         let bogus = PathBuf::from("/this/path/does/not/exist/probably/abc123");
         let env = EnvSnapshot {
             xdg_runtime_dir: Some(bogus.as_os_str().to_os_string()),
-            tmpdir: Some(tmp.path().as_os_str().to_os_string()),
+            tmp_base_override: Some(tmp.path().as_os_str().to_os_string()),
             uid: nix::unistd::geteuid().as_raw(),
             namespace: hyoui::cli::DEFAULT_NAMESPACE.to_string(),
         };
         let got = resolve_with_env(None, "x", &env).expect("resolve");
-        assert!(got.starts_with(tmp.path()), "should fall back to tmpdir");
+        assert!(
+            got.starts_with(tmp.path()),
+            "should fall back to /tmp base (test override)"
+        );
     }
 
     #[test]
@@ -638,6 +687,40 @@ mod tests {
         };
         assert_eq!(resolve_namespace(Some("")), expected);
         assert_eq!(resolve_namespace(None), expected);
+    }
+
+    /// 極端に長い session 名は sun_path 上限を超えるため、resolve 時点で
+    /// friendly error (= 現在長 / 上限 / 短くする方法を含む) を返す。
+    #[test]
+    fn resolve_rejects_too_long_sun_path() {
+        // base `/tmp/hyoui-<uid>/<ns>/<sid>.sock` を上限超えにするため、ns + sid を
+        // それぞれ MAX 長近くまで伸ばす。各 component は whitelist 長制限内に収め、
+        // 合計 path 長で sun_path 上限を超えさせる。
+        let max_comp = hyoui::cli::MAX_SESSION_ID_LEN; // ns/sid 共通の上限想定
+        let long_ns = "n".repeat(max_comp);
+        let long_sid = "s".repeat(max_comp);
+        let tmp = tempfile::Builder::new()
+            .prefix("hyoui-toolong-")
+            .tempdir()
+            .expect("tempdir");
+        let env = env_with_ns(None, Some(tmp.path()), &long_ns);
+        let err = resolve_with_env(None, &long_sid, &env)
+            .expect_err("too long sun_path must err (or component validate err)");
+        // component validate (長すぎる ns/sid) か sun_path 事前チェックのどちらかで
+        // InvalidInput になる。いずれにせよ bind 前に弾けていることが重要。
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "err={err}");
+    }
+
+    /// sun_path 上限ちょうど近辺: 短い ns/sid なら通る (= 正常系の回帰防止)。
+    #[test]
+    fn resolve_accepts_normal_length_under_limit() {
+        let tmp = tempfile::Builder::new()
+            .prefix("hyoui-oklen-")
+            .tempdir()
+            .expect("tempdir");
+        let env = env_with_ns(None, Some(tmp.path()), "ns1");
+        let got = resolve_with_env(None, "sess1", &env).expect("normal length must resolve");
+        assert!(got.to_string_lossy().ends_with("sess1.sock"));
     }
 
     /// `validate_namespace` の error は `namespace` 文脈の文言になる。

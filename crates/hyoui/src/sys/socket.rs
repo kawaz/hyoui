@@ -32,6 +32,33 @@ fn set_cloexec<F: AsFd>(fd: &F) -> Result<()> {
     Ok(())
 }
 
+/// `bind(2)` / `connect(2)` に渡せる socket path の最大バイト長 (= NUL 終端を除く)。
+///
+/// `libc::sockaddr_un` 全体サイズから `sun_path` field の offset を引いて
+/// `sun_path` 配列のバイト数 (= macOS 104 / Linux 108) を求め、NUL 終端 1 byte を
+/// 引く。`UnixAddr::new` は超過時 `ENAMETOOLONG` を返すが文言が不親切なため、
+/// caller (= socket_path 解決 / [`check_sun_path_len`]) が事前チェックに使う。
+pub const fn sun_path_max() -> usize {
+    let cap = std::mem::size_of::<libc::sockaddr_un>()
+        - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+    cap - 1
+}
+
+/// `path` の byte 長が `sun_path` 上限に収まるか検証する (= bind/connect 直前の
+/// defense-in-depth、特に `--socket=<explicit>` で長い path が来た場合)。
+///
+/// 超過時は現在長 / 上限を含む `Error::Errno(ENAMETOOLONG)` ではなく、
+/// 人間可読の `Error::Precondition` 相当を返したいが、`Precondition` は
+/// `&'static str` 固定なので、ここでは `ENAMETOOLONG` をそのまま返す
+/// (= 上位の socket_path 層が friendly message を組む。本関数は last-resort guard)。
+fn check_sun_path_len(path: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    if path.as_os_str().as_bytes().len() > sun_path_max() {
+        return Err(Error::Errno(nix::errno::Errno::ENAMETOOLONG));
+    }
+    Ok(())
+}
+
 /// RAII wrapper around `umask(2)`. On Drop the previous mask is restored.
 #[derive(Debug)]
 pub struct UmaskGuard {
@@ -80,7 +107,7 @@ impl UnixSock {
         if mode != 0o700 {
             return Err(Error::Precondition(
                 "socket parent directory must be mode 0700 \
-                 (use $XDG_RUNTIME_DIR or $TMPDIR, or run `chmod 700 <parent>`)",
+                 (use $XDG_RUNTIME_DIR or /tmp/hyoui-<uid>, or run `chmod 700 <parent>`)",
             ));
         }
         let euid = nix::unistd::geteuid();
@@ -88,7 +115,7 @@ impl UnixSock {
             return Err(Error::Precondition(
                 "socket parent directory must be owned by current euid \
                  (= 別 user 所有の dir を --socket で指定した可能性。\
-                 hyoui の自動 path ($XDG_RUNTIME_DIR/hyoui or $TMPDIR/hyoui-<uid>) を使う)",
+                 hyoui の自動 path ($XDG_RUNTIME_DIR/hyoui or /tmp/hyoui-<uid>) を使う)",
             ));
         }
         Ok(())
@@ -98,6 +125,7 @@ impl UnixSock {
     /// `bind(2)` so the socket file is created mode `0600`.
     pub fn listen<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        check_sun_path_len(&path)?;
         Self::check_parent_dir(&path)?;
 
         match nix::unistd::unlink(&path) {
@@ -156,6 +184,7 @@ impl Drop for UnixSock {
 
 /// Connect a fresh Unix-domain socket to `path`. Returns the connected fd.
 pub fn connect<P: AsRef<Path>>(path: P) -> Result<OwnedFd> {
+    check_sun_path_len(path.as_ref())?;
     let addr = UnixAddr::new(path.as_ref()).map_err(Error::from)?;
     let fd = socket::socket(
         AddressFamily::Unix,
@@ -222,8 +251,8 @@ mod tests {
         );
         // hint: 推奨 dir + 直し方
         assert!(
-            msg.contains("XDG_RUNTIME_DIR") || msg.contains("TMPDIR"),
-            "error must hint at $XDG_RUNTIME_DIR / $TMPDIR; got: {msg}"
+            msg.contains("XDG_RUNTIME_DIR") || msg.contains("/tmp/hyoui"),
+            "error must hint at $XDG_RUNTIME_DIR / /tmp/hyoui-<uid>; got: {msg}"
         );
         assert!(
             msg.contains("chmod 700"),

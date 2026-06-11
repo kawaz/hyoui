@@ -46,8 +46,9 @@ model is close to abduco / shpool.
   directory)
 - The daemon exits as soon as the child exits, even while all clients are
   detached
-- Socket placement: Linux `$XDG_RUNTIME_DIR/hyoui/<session>.sock`, macOS
-  `$TMPDIR/hyoui-$UID/<session>.sock`
+- Socket placement: Linux `$XDG_RUNTIME_DIR/hyoui/<session>.sock`, otherwise
+  (incl. macOS) `/tmp/hyoui-$UID/<session>.sock` (fixed `/tmp` base, not `$TMPDIR`,
+  to keep the `sun_path` budget short — macOS per-user TMPDIR is too long)
 - Directory mode 0700, socket mode 0600 (same-UID trust boundary)
 
 ## 2. Architecture
@@ -106,7 +107,7 @@ crates/
     src/
       main.rs       # entry point, dispatches the Command enum from cli.rs
       daemonize.rs  # double fork + setsid (--detached)
-      socket_path.rs # socket directory resolver (XDG / TMPDIR)
+      socket_path.rs # socket directory resolver (XDG / /tmp/hyoui-<uid>)
       input_handlers.rs # subcommand handlers for the input family
       wait_core.rs  # state-based wait polling (snapshot trigger + cells → text)
       completion.rs # shell completion generation

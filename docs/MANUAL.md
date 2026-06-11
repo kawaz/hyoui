@@ -187,7 +187,7 @@ namespaces. `default` is a reserved name that maps to the base socket dir.
 
 | Symptom | What to try |
 |---|---|
-| `hyoui list` shows nothing | Stale socket in `XDG_RUNTIME_DIR` / `TMPDIR` (`docs/runbooks/2026-05-27-stale-socket-detection.md`) |
+| `hyoui list` shows nothing | Stale socket in `$XDG_RUNTIME_DIR/hyoui` / `/tmp/hyoui-<uid>` (`docs/runbooks/2026-05-27-stale-socket-detection.md`) |
 | Attach is closed immediately | The daemon may have rejected cap negotiation (`docs/runbooks/2026-05-27-handshake-cap-rejection.md`) |
 | Child process died but the daemon lingers | `docs/runbooks/2026-05-27-child-orphan-detection.md` |
 

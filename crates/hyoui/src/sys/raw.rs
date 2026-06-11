@@ -115,7 +115,21 @@ pub struct ForkedChild {
 /// argv の C ポインタ配列は **fork 前に** 構築し (= `argv_ptrs`)、child では
 /// `libc::execvp` を直接呼ぶ (= nix の `execvp` は post-fork に Vec を組むため
 /// 使わない)。失敗時は `_exit(127)`。
-pub fn openpty_fork_anchor_exec(argv: &[CString], cols: u16, rows: u16) -> Result<ForkedChild> {
+///
+/// # cwd 伝搬 (= 起動元 cwd の透過、bug fix 2026-06-11)
+///
+/// `cwd = Some(dir)` の場合、child は exec 直前に `chdir(dir)` する。daemon 自身は
+/// daemonize 慣習で `chdir("/")` 済だが、子 (= claude 等の実コマンド) は `hyoui run`
+/// を叩いた起点 dir で動くべき (= zsh 直接起動と同じ透過性、DR-0005)。`chdir` は
+/// async-signal-safe なので fork→exec 区間で呼べる。**chdir 失敗時は exec を中止して
+/// `_exit(127)`** する (= 起点 dir が消えている等。誤った cwd (= `/`) で起動するより
+/// 明確に失敗させる)。`cwd = None` なら従来挙動 (= chdir せず daemon の cwd を継承)。
+pub fn openpty_fork_anchor_exec(
+    argv: &[CString],
+    cols: u16,
+    rows: u16,
+    cwd: Option<&CString>,
+) -> Result<ForkedChild> {
     if argv.is_empty() {
         return Err(Error::Invalid("argv must not be empty"));
     }
@@ -151,6 +165,9 @@ pub fn openpty_fork_anchor_exec(argv: &[CString], cols: u16, rows: u16) -> Resul
     argv_ptrs.push(std::ptr::null());
     let exec_path = argv[0].as_ptr();
     let argv_ptr = argv_ptrs.as_ptr();
+    // cwd の C ポインタも fork 前に取り出す (= post-fork alloc 禁止)。`cwd` (= 借用元
+    // CString) は本関数 scope 内で生存するため、ptr は fork→exec 区間で有効。
+    let cwd_ptr: *const libc::c_char = cwd.map(|c| c.as_ptr()).unwrap_or(std::ptr::null());
 
     // 4. fork。
     // SAFETY: `fork(2)`。child path では async-signal-safe な操作のみ
@@ -180,6 +197,16 @@ pub fn openpty_fork_anchor_exec(argv: &[CString], cols: u16, rows: u16) -> Resul
             libc::close(master_raw);
             if slave_raw > 2 {
                 libc::close(slave_raw);
+            }
+            // cwd 伝搬: 起動元 dir に chdir してから exec する (= 透過性回復)。
+            // chdir は async-signal-safe。失敗 (= 起点 dir 消失等) は exec を中止して
+            // _exit(127) (= 誤 cwd で起動するより明確に失敗)。stderr へ一言出すが、
+            // この時点で fd 2 は slave (= PTY) に dup2 済なので attach 中の画面に出る。
+            if !cwd_ptr.is_null() && libc::chdir(cwd_ptr) == -1 {
+                const MSG: &[u8] =
+                    b"hyoui: chdir to invoked cwd failed (start dir gone?), aborting exec\n";
+                libc::write(2, MSG.as_ptr() as *const libc::c_void, MSG.len());
+                libc::_exit(127);
             }
             // execvp は失敗時のみ戻る。
             libc::execvp(exec_path, argv_ptr);
@@ -242,7 +269,12 @@ pub fn openpty_fork_anchor_exec(argv: &[CString], cols: u16, rows: u16) -> Resul
 ///
 /// サイレントではなく、呼び出し側 ([`super::pty::Pty::spawn`]) が **明示 warning を
 /// stderr に出した上で** 本 fallback を使う。
-pub fn forkpty_then_exec_legacy(argv: &[CString], cols: u16, rows: u16) -> Result<ForkedChild> {
+pub fn forkpty_then_exec_legacy(
+    argv: &[CString],
+    cols: u16,
+    rows: u16,
+    cwd: Option<&CString>,
+) -> Result<ForkedChild> {
     if argv.is_empty() {
         return Err(Error::Invalid("argv must not be empty"));
     }
@@ -253,15 +285,31 @@ pub fn forkpty_then_exec_legacy(argv: &[CString], cols: u16, rows: u16) -> Resul
         ws_ypixel: 0,
     };
 
+    // cwd の C ポインタを fork 前に取り出す (= post-fork alloc 禁止)。
+    let cwd_ptr: *const libc::c_char = cwd.map(|c| c.as_ptr()).unwrap_or(std::ptr::null());
+
     // SAFETY: `nix::pty::forkpty` is documented `unsafe` because in the
     // child path only async-signal-safe code may run. Between fork and exec
-    // we only call `execvp` (async-signal-safe) and on its failure
+    // we only call `chdir` / `execvp` (async-signal-safe) and on failure
     // `_exit(127)` (async-signal-safe). No allocation, no locks, no Rust
     // destructors of our own.
     let result = unsafe { nix::pty::forkpty(&ws, None) }.map_err(Error::from)?;
     match result {
         ForkptyResult::Parent { child, master } => Ok(ForkedChild { child, master }),
         ForkptyResult::Child => {
+            // cwd 伝搬: 起動元 dir に chdir してから exec (= 透過性回復、本体は
+            // openpty_fork_anchor_exec と同じ contract)。失敗時は exec を中止して
+            // _exit(127)。
+            // SAFETY: `chdir` / `write` / `_exit` は async-signal-safe。`cwd_ptr` は
+            // fork 前に取り出した有効な C 文字列 ptr (= 借用元が parent scope で生存)。
+            unsafe {
+                if !cwd_ptr.is_null() && libc::chdir(cwd_ptr) == -1 {
+                    const MSG: &[u8] =
+                        b"hyoui: chdir to invoked cwd failed (start dir gone?), aborting exec\n";
+                    libc::write(2, MSG.as_ptr() as *const libc::c_void, MSG.len());
+                    libc::_exit(127);
+                }
+            }
             // execvp returns only on failure.
             let _ = unistd::execvp(&argv[0], argv);
             // SAFETY: `_exit` is async-signal-safe and never returns; we
@@ -415,7 +463,7 @@ mod anchor_tests {
             std::ffi::CString::new("/bin/sleep").unwrap(),
             std::ffi::CString::new("60").unwrap(),
         ];
-        let forked = match openpty_fork_anchor_exec(&argv, 80, 24) {
+        let forked = match openpty_fork_anchor_exec(&argv, 80, 24, None) {
             Ok(f) => f,
             // SAFETY: _exit は async-signal-safe。
             Err(_) => unsafe { libc::_exit(code::SPAWN_FAILED) },

@@ -308,7 +308,7 @@ mod tests {
         register_self_pipe(Signal::SIGCHLD).expect("register SIGCHLD");
 
         // forkpty で子を生成。setsid 済の独立 process group に入る。
-        let spawned = Pty::spawn(&["/bin/sleep", "30"], 80, 24).expect("spawn sleep");
+        let spawned = Pty::spawn(&["/bin/sleep", "30"], 80, 24, None).expect("spawn sleep");
         let child = spawned.child;
 
         // 子の生成自体では SIGCHLD は配信されない (exit/stop/cont のみ)。

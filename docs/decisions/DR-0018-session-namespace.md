@@ -22,9 +22,18 @@ socket 配置を namespace ごとの dir に分離する:
 | `default` (= 予約名) | `<base>/<session>.sock` (= **従来 dir 直下、既存セッションと完全互換**) |
 | その他 `<ns>` | `<base>/<ns>/<session>.sock` |
 
-`<base>` は従来通り `$XDG_RUNTIME_DIR/hyoui` (実在時) / `${TMPDIR:-/tmp}/hyoui-<uid>`。
+`<base>` は `$XDG_RUNTIME_DIR/hyoui` (実在時) / **`/tmp/hyoui-<uid>`** (それ以外、
+= macOS 含む)。後者は tmux の `/tmp/tmux-<uid>` と同じ前例で、unix socket の
+`sun_path` 上限 (macOS 104 / Linux 108 bytes) に namespace + session 名を載せる予算を
+確保するため `$TMPDIR` を使わず `/tmp` 固定にしている (= macOS の per-user TMPDIR
+`/var/folders/.../T/` が長すぎて namespace path が ENAMETOOLONG になる bug への対処、
+2026-06-11、breaking だが v0.x で許容)。
 namespace dir の作成・検証は base dir と同じ規律 (= 新規作成時 mode 0700、既存 dir は
 所有者 + mode 検証) を 2 段で適用する (`socket_path::resolve_in_namespace`)。
+
+resolve 時に最終 socket path の byte 長を `sun_path` 上限と照合し、超過する場合は
+「現在長 / 上限 / ns・session 名を短くする方法」を含む人間可読のエラーで bind 前に
+弾く (`socket_path::check_sun_path_len` + `sys::socket::sun_path_max`)。
 
 - `hyoui list` は現在の namespace のみ scan する (= dir が分かれているので
   **socket probe 自体が ns 外に発生しない**、混在コストゼロ)

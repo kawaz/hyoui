@@ -18,6 +18,7 @@
 
 use std::ffi::CString;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::path::Path;
 
 use nix::pty::{OpenptyResult, Winsize};
 
@@ -85,7 +86,11 @@ impl Pty {
     /// (`Error::Precondition`) を検知して **明示 warning を stderr に出した上で**
     /// 旧 `forkpty` 構造に fallback する (= child が独立 session leader、^Z は
     /// 効かないがテストの大半は anchor と無関係なため実害なし)。詳細は DR-0017 §柱1。
-    pub fn spawn(argv: &[&str], cols: u16, rows: u16) -> Result<Spawned> {
+    ///
+    /// `cwd = Some(dir)` の場合、子は exec 直前に `chdir(dir)` する (= `hyoui run` の
+    /// 起点 dir で実コマンドを動かす透過性回復、bug fix 2026-06-11)。`None` なら
+    /// 呼び出しプロセスの cwd を継承する (= 従来挙動)。
+    pub fn spawn(argv: &[&str], cols: u16, rows: u16, cwd: Option<&Path>) -> Result<Spawned> {
         if argv.is_empty() {
             return Err(Error::Invalid("argv must not be empty"));
         }
@@ -93,7 +98,18 @@ impl Pty {
             .iter()
             .map(|s| CString::new(*s).map_err(|_| Error::Invalid("argv contained NUL")))
             .collect::<Result<_>>()?;
-        let forked = match raw::openpty_fork_anchor_exec(&argv_c, cols, rows) {
+        // cwd を CString 化 (= path に NUL を含むと exec 経路で使えないため reject)。
+        let cwd_c: Option<CString> = match cwd {
+            Some(p) => {
+                use std::os::unix::ffi::OsStrExt;
+                Some(
+                    CString::new(p.as_os_str().as_bytes())
+                        .map_err(|_| Error::Invalid("cwd path contained NUL"))?,
+                )
+            }
+            None => None,
+        };
+        let forked = match raw::openpty_fork_anchor_exec(&argv_c, cols, rows, cwd_c.as_ref()) {
             Ok(f) => f,
             Err(Error::Precondition(_)) => {
                 // anchor 前提を満たさない (= TIOCSCTTY 失敗)。production の daemon は
@@ -105,7 +121,7 @@ impl Pty {
                      旧 forkpty 構造で child を起動します (= child が独立 session leader、^Z は効きません)。\
                      production の daemon は setsid 済のためこの経路には入りません (= テスト等の直接呼び出しのみ)。"
                 );
-                raw::forkpty_then_exec_legacy(&argv_c, cols, rows)?
+                raw::forkpty_then_exec_legacy(&argv_c, cols, rows, cwd_c.as_ref())?
             }
             Err(e) => return Err(e),
         };
@@ -185,7 +201,7 @@ mod tests {
     #[test]
     fn spawn_with_empty_argv_errors() {
         // mirrors ffi_wbtest.mbt: "pty_spawnv: empty argv returns None"
-        let err = Pty::spawn(&[], 80, 24).expect_err("expected Invalid");
+        let err = Pty::spawn(&[], 80, 24, None).expect_err("expected Invalid");
         assert!(matches!(err, Error::Invalid(_)));
     }
 
@@ -194,5 +210,31 @@ mod tests {
         // mirrors ffi_wbtest.mbt: "pty_resize: succeeds on valid handle"
         let pty = Pty::open(80, 24).expect("open");
         pty.resize(120, 40).expect("resize");
+    }
+
+    /// bug fix 2026-06-11: `cwd = Some(dir)` を渡すと子が exec 前に chdir し、
+    /// `pwd` の出力が指定 dir になる (= 起動元 cwd 透過の回帰防止)。
+    /// テスト経路は anchor 化不可で legacy forkpty fallback に落ちるが、chdir 経路は
+    /// 両 path 共通なので検証になる。
+    #[test]
+    fn spawn_with_cwd_changes_child_directory() {
+        use std::io::Read;
+        let dir = tempfile::Builder::new()
+            .prefix("hyoui-pty-cwd-")
+            .tempdir()
+            .expect("tempdir");
+        // symlink (= macOS /tmp → /private/tmp 等) を解決して比較の地ならし。
+        let want = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        let spawned = Pty::spawn(&["pwd"], 80, 24, Some(&want)).expect("spawn pwd");
+        let mut master: std::fs::File = spawned.pty.into_master().into();
+        let mut out = String::new();
+        // pwd は 1 行出して exit。master EOF まで read (PTY なので EIO で終わる)。
+        let _ = master.read_to_string(&mut out);
+        let printed = out.trim_end_matches(['\r', '\n']).trim();
+        assert_eq!(
+            printed,
+            want.to_string_lossy(),
+            "child pwd should equal requested cwd; raw output={out:?}"
+        );
     }
 }

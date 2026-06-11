@@ -253,7 +253,7 @@ _hyoui() {
                 --signal) COMPREPLY=( $(compgen -W "SIGHUP SIGINT SIGQUIT SIGABRT SIGKILL SIGUSR1 SIGUSR2 SIGTERM SIGCONT SIGTSTP SIGCHLD" -- "$cur") ); return 0 ;;
                 --namespace|--index) return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --index --all --signal --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --namespace --index --all --signal --wait --kill-on-timeout --no-terminate --help -h" -- "$cur") )
             return 0 ;;
         status)
             case "$prev" in
@@ -343,6 +343,9 @@ _hyoui() {
                         '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '--all[Kill all live sessions]' \
                         '--signal=[Signal name (SIG-prefix uppercase, DR-0012)]:signal:(SIGHUP SIGINT SIGQUIT SIGABRT SIGKILL SIGUSR1 SIGUSR2 SIGTERM SIGCONT SIGTSTP SIGCHLD)' \
+                        '--wait=[Wait for child exit (bare=10s default, =DUR to override)]:duration:' \
+                        '--kill-on-timeout[Escalate to SIGKILL when --wait times out]' \
+                        '--no-terminate[Send signal only, keep session alive]' \
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:session id:'
                     ;;
@@ -786,6 +789,9 @@ complete -c hyoui -n '__hyoui_using_subcommand kill' -l index  -x    -d 'Session
 complete -c hyoui -n '__hyoui_using_subcommand kill' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand kill' -l all          -d 'Kill all live sessions'
 complete -c hyoui -n '__hyoui_using_subcommand kill' -l signal -x -a 'SIGHUP SIGINT SIGQUIT SIGABRT SIGKILL SIGUSR1 SIGUSR2 SIGTERM SIGCONT SIGTSTP SIGCHLD' -d 'Signal name (SIG-prefix uppercase, DR-0012)'
+complete -c hyoui -n '__hyoui_using_subcommand kill' -l wait -x      -d 'Wait for child exit (bare=10s default, =DUR to override)'
+complete -c hyoui -n '__hyoui_using_subcommand kill' -l kill-on-timeout -d 'Escalate to SIGKILL when --wait times out'
+complete -c hyoui -n '__hyoui_using_subcommand kill' -l no-terminate -d 'Send signal only, keep session alive'
 complete -c hyoui -n '__hyoui_using_subcommand kill' -s h -l help    -d 'Show help and exit'
 
 # `hyoui status` options.
@@ -1055,6 +1061,21 @@ mod tests {
     /// bash/zsh spell it `--name`; fish declares it as `-l name`. Accept both.
     fn offers_long_opt(s: &str, name: &str) -> bool {
         s.contains(&format!("--{name}")) || s.contains(&format!("-l {name}"))
+    }
+
+    /// SSOT: kill must offer the wait/escalation flags (= `--wait` /
+    /// `--kill-on-timeout` / `--no-terminate`) in every shell.
+    #[test]
+    fn completion_all_shells_offer_kill_wait_flags() {
+        for sh in ALL_SHELLS {
+            let s = script(sh);
+            for flag in ["wait", "kill-on-timeout", "no-terminate"] {
+                assert!(
+                    offers_long_opt(&s, flag),
+                    "shell {sh:?} missing kill `--{flag}`"
+                );
+            }
+        }
     }
 
     /// SSOT: wait must offer the current `--poll-interval` flag.

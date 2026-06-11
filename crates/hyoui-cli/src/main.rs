@@ -873,6 +873,10 @@ enum ListEntryStatus {
         /// DR-0017 §柱2: 子が stopped (= ^Z / SIGSTOP) のまま残っているか。
         /// STATUS 列を "stopped" 表示にして放置 stopped child を可観測にする。
         child_stopped: bool,
+        /// 子 PTY の PID (= exited なら None)。`list` の PID 列 / jsonl 用。
+        child_pid: Option<u32>,
+        /// 子 PTY の pgid (= exited なら None)。jsonl 用。
+        child_pgid: Option<u32>,
     },
     /// socket file は存在するが connect / handshake / status.query が失敗。daemon が
     /// 既に死亡 (panic / SIGKILL) で stale socket が残留しているケース。
@@ -922,6 +926,8 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<(String, std::path::PathBuf
                     argv: Vec::new(),
                     clients: 0,
                     child_stopped: false,
+                    child_pid: None,
+                    child_pgid: None,
                 }
             } else {
                 ListEntryStatus::Stale
@@ -1029,6 +1035,9 @@ enum StatusFetchOutcome {
         clients: usize,
         /// DR-0017 §柱2: 子が stopped のまま残っているか。
         child_stopped: bool,
+        /// 子 PTY の PID / pgid (= exited なら None)。`list` の PID 列 / jsonl 用。
+        child_pid: Option<u32>,
+        child_pgid: Option<u32>,
     },
     /// connect / handshake / decode / I/O error。probe では live だったので「異常状態」を
     /// log に出すために理由を保持する (= silent 格下げを避ける)。
@@ -1075,12 +1084,16 @@ fn enrich_entries_with_status(entries: &mut [ListEntry]) {
                 argv,
                 clients,
                 child_stopped,
+                child_pid,
+                child_pgid,
             } => {
                 entries[idx].status = ListEntryStatus::Live {
                     cwd,
                     argv,
                     clients,
                     child_stopped,
+                    child_pid,
+                    child_pgid,
                 };
             }
             StatusFetchOutcome::Failed(reason) => {
@@ -1141,6 +1154,8 @@ fn query_status_for_list(sock: &std::path::Path) -> StatusFetchOutcome {
                     argv: sr.argv,
                     clients: sr.clients.len(),
                     child_stopped: sr.child_stopped,
+                    child_pid: sr.child_pid,
+                    child_pgid: sr.child_pgid,
                 };
             }
             Ok(ControlMessage::ModeChange(_)) | Ok(ControlMessage::LeaderNotify(_)) => continue,
@@ -1222,13 +1237,13 @@ fn print_list_plain(entries: &[ListEntry], show_ns: bool) {
     }
     if show_ns {
         println!(
-            "{:<16} {:<20} {:<7} {:<10} {:<8} {:<32} ARGV",
-            "NS", "SESSION", "STATUS", "DUR", "CLIENTS", "CWD"
+            "{:<16} {:<20} {:<7} {:<8} {:<10} {:<8} {:<32} ARGV",
+            "NS", "SESSION", "STATUS", "PID", "DUR", "CLIENTS", "CWD"
         );
     } else {
         println!(
-            "{:<20} {:<7} {:<10} {:<8} {:<32} ARGV",
-            "SESSION", "STATUS", "DUR", "CLIENTS", "CWD"
+            "{:<20} {:<7} {:<8} {:<10} {:<8} {:<32} ARGV",
+            "SESSION", "STATUS", "PID", "DUR", "CLIENTS", "CWD"
         );
     }
     for e in entries {
@@ -1244,6 +1259,8 @@ fn print_list_plain(entries: &[ListEntry], show_ns: bool) {
                 argv,
                 clients,
                 child_stopped,
+                child_pid,
+                ..
             } => {
                 let dur = fmt_dur(e.dur);
                 let cwd_disp = truncate_to(&shorten_cwd(cwd), 32);
@@ -1254,15 +1271,18 @@ fn print_list_plain(entries: &[ListEntry], show_ns: bool) {
                 };
                 // DR-0017 §柱2: 子が stopped のまま残っていれば STATUS を "stopped" に。
                 let status = if *child_stopped { "stopped" } else { "live" };
+                let pid_disp = child_pid
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "-".to_string());
                 println!(
-                    "{ns_prefix}{session:<20} {status:<7} {dur:<10} {clients:<8} {cwd_disp:<32} {argv_disp}"
+                    "{ns_prefix}{session:<20} {status:<7} {pid_disp:<8} {dur:<10} {clients:<8} {cwd_disp:<32} {argv_disp}"
                 );
             }
             ListEntryStatus::Stale => {
                 // stale は cwd/argv/clients 取得不能なので `-` 統一。
                 println!(
-                    "{ns_prefix}{session:<20} {:<7} {:<10} {:<8} {:<32} -",
-                    "stale", "-", "-", "-"
+                    "{ns_prefix}{session:<20} {:<7} {:<8} {:<10} {:<8} {:<32} -",
+                    "stale", "-", "-", "-", "-"
                 );
             }
         }
@@ -1284,6 +1304,8 @@ fn print_list_jsonl(entries: &[ListEntry]) {
                 argv,
                 clients,
                 child_stopped,
+                child_pid,
+                child_pgid,
             } => serde_json::json!({
                 "session": e.session,
                 // DR-0018: namespace を常時出力 (= default ns は "default")。
@@ -1291,6 +1313,10 @@ fn print_list_jsonl(entries: &[ListEntry]) {
                 // DR-0017 §柱2: stopped child は status を "stopped" にして可観測化。
                 "status": if *child_stopped { "stopped" } else { "live" },
                 "child_stopped": child_stopped,
+                // 子の実行時状態 (= running / stopped。list の live は exited を含まない)。
+                "child_state": if *child_stopped { "stopped" } else { "running" },
+                "child_pid": child_pid,
+                "child_pgid": child_pgid,
                 "started_unix_ms": e.started_unix_ms,
                 "dur_ms": e.dur.as_millis() as u64,
                 "socket": e.socket_path.display().to_string(),
@@ -1302,6 +1328,8 @@ fn print_list_jsonl(entries: &[ListEntry]) {
                 "session": e.session,
                 "namespace": e.namespace,
                 "status": "stale",
+                "child_pid": serde_json::Value::Null,
+                "child_pgid": serde_json::Value::Null,
                 "started_unix_ms": e.started_unix_ms,
                 "dur_ms": e.dur.as_millis() as u64,
                 "socket": e.socket_path.display().to_string(),
@@ -1316,8 +1344,10 @@ fn print_list_jsonl(entries: &[ListEntry]) {
 
 /// hyoui base socket dir 候補 (= namespace を含めない `hyoui-<uid>` まで) を返す。
 ///
-/// `XDG_RUNTIME_DIR/hyoui` (実在時) と `${TMPDIR:-/tmp}/hyoui-<uid>` の 2 候補を、
-/// 実在する方だけ列挙する (= `socket_path::resolve` の dir 選択ロジックと同順)。
+/// `XDG_RUNTIME_DIR/hyoui` (実在時) と **`/tmp/hyoui-<uid>`** の 2 候補を、実在する
+/// 方だけ列挙する (= `socket_path::resolve_with_env` の dir 選択ロジックと同順・同 base)。
+/// base は `$TMPDIR` でなく `/tmp` 固定 (= 2026-06-11 の sun_path bug fix、resolver と
+/// 一致させないと `hyoui list` が新 path の session を見つけられなくなる)。
 fn base_socket_dirs() -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR")
@@ -1328,12 +1358,8 @@ fn base_socket_dirs() -> Vec<std::path::PathBuf> {
             out.push(p);
         }
     }
-    let tmp = std::env::var_os("TMPDIR")
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
     let uid = nix::unistd::geteuid().as_raw();
-    let p = tmp.join(format!("hyoui-{uid}"));
+    let p = std::path::PathBuf::from(format!("/tmp/hyoui-{uid}"));
     if p.is_dir() {
         out.push(p);
     }
@@ -1448,6 +1474,8 @@ fn kill_command(cfg: KillConfig) -> ExitCode {
                 // --wait は各 session の terminate 完了を順に見届ける (= killall で
                 // 1 件ずつ確実に畳んでから次へ)。
                 wait: cfg.wait,
+                wait_timeout_ms: cfg.wait_timeout_ms,
+                kill_on_timeout: cfg.kill_on_timeout,
                 namespace: cfg.namespace.clone(),
             };
             let exit = kill_command_single(sub_cfg);
@@ -1541,40 +1569,106 @@ fn kill_command_single(cfg: KillConfig) -> ExitCode {
     }
 
     // DR-0012: wire は signal name string。CLI 段で正規表記 (SIG-prefix 大文字)
-    // を強制済 (= cli.rs::parse_kill の `--signal` validate) なので、ここでは
-    // そのまま wire に流す。`wait` 軸 (= 子 exit + session 終了を見届けるか) も
-    // 一緒に wire に乗せる (= daemon が ack 即返し / EOF 待ち を分岐する)。
+    // を強制済 (= cli.rs::parse_kill の `--signal` validate)。
+    //
+    // `--wait` でも **`wait: false` (= 即時 ack mode) を送る**。daemon は signal
+    // 送信 + KillAck 返送だけして serve を継続し、「見届け」は client 側が担う:
+    //
+    // - 子が死ねば daemon は PTY-EOF → ChildExited 経路で `SessionExitNotify` を
+    //   broadcast してから session を畳む → client はそれを成功 (= 見届け完了) と判定
+    // - deadline 超過なら client が timeout 判定。**session は無傷で残る** (= daemon
+    //   は kill を「送った」以外何も変わっていない)。`--kill-on-timeout` なら
+    //   SIGKILL の Kill をもう 1 発送って見届けを継続する
+    //
+    // daemon 側に blocking 見届けが無いので、TERM を ignore する子を `--wait` で
+    // 撃っても daemon が無限 waitpid で孤児化しない (= 2026-06-11 の孤児 daemon の
+    // 根源対策)。protocol 変更も不要 (= 既存 Kill{wait:false} + SessionExitNotify
+    // の組合せだけで成立)。
     let kill = hyoui::protocol::messages::Kill {
         signal: cfg.signal.clone(),
-        wait: cfg.wait,
+        wait: false,
     };
     if let Err(e) = conn.send_control(&hyoui::protocol::ControlMessage::Kill(kill)) {
         eprintln!("hyoui: kill: send 失敗: {e}");
         return ExitCode::from(1);
     }
 
-    // daemon の応答を待つ。`wait` の有無で「成功」の判定境界が変わる:
-    //
-    // [default = 即時応答 (cfg.wait=false)]
-    //   成功 path: daemon が signal 送信を受理 → `KillAck` を 1 frame 返す
-    //             (= terminate は daemon 内で非同期進行)。`kill(1)` と同じ直感で
-    //             即 return する (= 子が SIGTERM を catch して 1 発で死なない app
-    //             でも無応答にならない)。
-    //   互換 path: 旧 daemon は KillAck を知らず、従来通り socket を close するため
-    //             EOF (= recv_control Err) で抜ける。これも成功扱い。
-    //
-    // [--wait (cfg.wait=true)]
-    //   成功 path: `handle_kill` が ack を送らず `TerminateSession` で session 終了
-    //             → daemon が socket を close → `recv_control` が Err (= EOF)。
-    //             子 exit + session 終了を見届けたことになる。
-    //
-    // 失敗 path (共通): ensure_rw_mode 失敗 / invalid signal name 等で daemon が
-    //             `ControlMessage::Error` を 1 frame 送って `Continue` →
-    //             recv_control が `Ok(Error)` を返す。
-    //
-    // handshake 中 / 過渡的に LeaderNotify / ModeChange 等の broadcast control
-    // message が来る可能性があるため、Error / KillAck / EOF 以外は skip する。
+    if !cfg.wait {
+        // [default = 即時応答] KillAck (新 daemon) or EOF (旧 daemon 互換) で成功。
+        // 失敗 path: ensure_rw_mode 失敗 / invalid signal name 等で daemon が
+        // `ControlMessage::Error` を返す。LeaderNotify / ModeChange 等の broadcast
+        // は skip。
+        loop {
+            match conn.recv_control(None) {
+                Ok(hyoui::protocol::ControlMessage::Error(err)) => {
+                    eprintln!(
+                        "hyoui: kill: daemon rejected ({:?}): {}",
+                        err.code, err.message
+                    );
+                    return ExitCode::from(1);
+                }
+                Ok(hyoui::protocol::ControlMessage::KillAck(_)) => break,
+                Ok(_) => continue,
+                // EOF (= 旧 daemon が session terminate して socket close)。成功扱い。
+                Err(_) => break,
+            }
+        }
+        drop(conn);
+        println!("hyoui: kill 送信完了: {}", sock.display());
+        return ExitCode::SUCCESS;
+    }
+
+    // [--wait] 子 exit 見届け mode。timeout は parse 段で必ず Some (= 裸 --wait は
+    // default 10s)。通算 deadline で管理し、broadcast 受信で wait が延びないように
+    // 毎 iteration 残り時間を read timeout に設定し直す。
+    let timeout_ms = cfg
+        .wait_timeout_ms
+        .unwrap_or(hyoui::cli::KILL_WAIT_DEFAULT_TIMEOUT_MS);
+    // SIGKILL 昇格後の見届け上限。SIGKILL は catch / ignore 不能なので、子が
+    // D-state (= uninterruptible sleep) 等の異常でない限りここに届く前に死ぬ。
+    const ESCALATE_REAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+    let mut deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let mut escalated = false;
     loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            if cfg.kill_on_timeout && !escalated {
+                // SIGKILL 昇格: もう 1 発 Kill (wait:false) を送って見届けを継続。
+                let kill9 = hyoui::protocol::messages::Kill {
+                    signal: Some("SIGKILL".to_string()),
+                    wait: false,
+                };
+                if let Err(e) = conn.send_control(&hyoui::protocol::ControlMessage::Kill(kill9)) {
+                    eprintln!("hyoui: kill --kill-on-timeout: SIGKILL 送信失敗: {e}");
+                    return ExitCode::from(1);
+                }
+                eprintln!(
+                    "hyoui: kill --wait: timeout ({timeout_ms}ms)、SIGKILL に昇格して見届けます"
+                );
+                escalated = true;
+                deadline = std::time::Instant::now() + ESCALATE_REAP_BUDGET;
+                continue;
+            }
+            if escalated {
+                // SIGKILL 後も exit を確認できない = D-state 等の異常。
+                eprintln!(
+                    "hyoui: kill --wait: SIGKILL 昇格後も子の終了を確認できませんでした (= uninterruptible sleep 等の異常の可能性): {}",
+                    sock.display()
+                );
+                return ExitCode::from(1);
+            }
+            eprintln!(
+                "hyoui: kill --wait: timeout ({timeout_ms}ms 以内に子が終了しませんでした)。子と session はそのまま残っています。確実に終わらせるには --kill-on-timeout を付けて再実行してください: {}",
+                sock.display()
+            );
+            return ExitCode::from(3);
+        }
+        // 残り時間だけ recv を block する (= 0 は「無限」を意味するので 1ms に clamp)。
+        let to = remaining.max(std::time::Duration::from_millis(1));
+        if let Err(e) = conn.set_read_timeout(Some(to)) {
+            eprintln!("hyoui: kill: set_read_timeout 失敗: {e}");
+            return ExitCode::from(1);
+        }
         match conn.recv_control(None) {
             Ok(hyoui::protocol::ControlMessage::Error(err)) => {
                 eprintln!(
@@ -1583,33 +1677,46 @@ fn kill_command_single(cfg: KillConfig) -> ExitCode {
                 );
                 return ExitCode::from(1);
             }
-            Ok(hyoui::protocol::ControlMessage::KillAck(_ack)) if !cfg.wait => {
-                // 即時応答: signal 送信受理を確認、terminate は待たずに return。
-                break;
-            }
-            Ok(_) => {
-                // LeaderNotify / ModeChange / (--wait 時の) KillAck 等の broadcast。
-                // skip して次の frame を待つ。
-                continue;
-            }
-            Err(_) => {
-                // EOF (= daemon が session terminate して socket close)。成功 path
-                // (default なら旧 daemon 互換、--wait なら terminate 見届け完了)。
+            // 子 exit の確定通知 (= ChildExited 経路の broadcast)。見届け完了。
+            Ok(hyoui::protocol::ControlMessage::SessionExitNotify(_)) => break,
+            // KillAck / LeaderNotify / ModeChange 等は skip して次 frame。
+            Ok(_) => continue,
+            Err(e) => {
+                if is_timeout_error(&e) {
+                    // read timeout → loop 先頭で deadline 判定 (= escalation / exit 3)。
+                    continue;
+                }
+                // EOF。`wait: false` kill では daemon は子が死んだ時しか session を
+                // 畳まないので、notify を取りこぼした EOF も「子 exit」と判定して
+                // 成功扱い (= 旧 daemon 互換も同じ理由で成功)。
                 break;
             }
         }
     }
     drop(conn);
-
-    if cfg.wait {
-        println!(
-            "hyoui: kill 完了 (session 終了を見届け): {}",
-            sock.display()
-        );
-    } else {
-        println!("hyoui: kill 送信完了: {}", sock.display());
-    }
+    println!(
+        "hyoui: kill 完了 (子 exit + session 終了を見届け): {}",
+        sock.display()
+    );
     ExitCode::SUCCESS
+}
+
+/// `recv_control` の `Error` が read timeout 由来 (= WouldBlock / TimedOut) か。
+///
+/// `--wait` の client 側 deadline 超過を EOF (= daemon 都合の socket close) と
+/// 区別するために使う。
+fn is_timeout_error(e: &hyoui::Error) -> bool {
+    match e {
+        hyoui::Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        // EAGAIN == EWOULDBLOCK な platform もある (= macOS) ため EAGAIN のみ判定
+        // (= 両方 or で書くと unreachable pattern。別値 platform でも socket recv
+        // timeout は EAGAIN で来る)。
+        hyoui::Error::Errno(errno) => *errno == nix::errno::Errno::EAGAIN,
+        _ => false,
+    }
 }
 
 /// DR-0017 §柱2: `hyoui kill <session> --signal=<SIG> --no-terminate` の実体。
@@ -1779,14 +1886,35 @@ fn status_command(cfg: StatusConfig) -> ExitCode {
 }
 
 fn print_status_plain(sr: &hyoui::protocol::messages::StatusResponse) {
+    use hyoui::protocol::messages::ChildLiveState;
     println!("session-id: {}", sr.session_id);
-    if let Some(pid) = sr.child_pid {
-        // DR-0017 §柱2: 子が stopped (= ^Z / SIGSTOP) のまま残っている場合に明示。
-        // auto-resume 廃止後は stopped が観測されたまま放置され得るため可視化する。
-        let stopped = if sr.child_stopped { " (stopped)" } else { "" };
-        println!("child-pid: {pid}{stopped}");
-    } else {
-        println!("child-pid: (exited)");
+    println!("daemon-pid: {}", sr.daemon_pid);
+    // child_state を正本に表示する (= child_pid / child_stopped を包含)。
+    match ChildLiveState::from_legacy(sr.child_pid, sr.child_stopped) {
+        ChildLiveState::Running | ChildLiveState::Stopped => {
+            let pid = sr.child_pid.map(|p| p.to_string()).unwrap_or_default();
+            let pgid = sr
+                .child_pgid
+                .map(|p| format!(" pgid={p}"))
+                .unwrap_or_default();
+            println!("child-pid: {pid}{pgid}");
+            let st = if matches!(
+                ChildLiveState::from_legacy(sr.child_pid, sr.child_stopped),
+                ChildLiveState::Stopped
+            ) {
+                "stopped"
+            } else {
+                "running"
+            };
+            println!("child-state: {st}");
+        }
+        ChildLiveState::Exited { code } => {
+            println!("child-pid: (exited)");
+            match code {
+                Some(c) => println!("child-state: exited (code {c})"),
+                None => println!("child-state: exited"),
+            }
+        }
     }
     println!("scrollback-bytes: {}", sr.scrollback_bytes);
     if let Some(holder) = sr.lock_holder {
@@ -1808,12 +1936,30 @@ fn print_status_json(sr: &hyoui::protocol::messages::StatusResponse) {
     let mut out = String::new();
     out.push('{');
     write!(&mut out, "\"session_id\":{}", json_string(&sr.session_id)).ok();
+    write!(&mut out, ",\"daemon_pid\":{}", sr.daemon_pid).ok();
     match sr.child_pid {
         Some(pid) => write!(&mut out, ",\"child_pid\":{pid}").ok(),
         None => write!(&mut out, ",\"child_pid\":null").ok(),
     };
+    match sr.child_pgid {
+        Some(pgid) => write!(&mut out, ",\"child_pgid\":{pgid}").ok(),
+        None => write!(&mut out, ",\"child_pgid\":null").ok(),
+    };
     // DR-0017 §柱2: stopped child の可観測性 (= jq で `.child_stopped` を拾える)。
     write!(&mut out, ",\"child_stopped\":{}", sr.child_stopped).ok();
+    // child_state: running / stopped / exited(code) の正本 (= 旧 2 field を包含)。
+    {
+        use hyoui::protocol::messages::ChildLiveState;
+        let cs = match ChildLiveState::from_legacy(sr.child_pid, sr.child_stopped) {
+            ChildLiveState::Running => "running".to_string(),
+            ChildLiveState::Stopped => "stopped".to_string(),
+            ChildLiveState::Exited { code } => match code {
+                Some(c) => format!("exited:{c}"),
+                None => "exited".to_string(),
+            },
+        };
+        write!(&mut out, ",\"child_state\":{}", json_string(&cs)).ok();
+    }
     write!(&mut out, ",\"scrollback_bytes\":{}", sr.scrollback_bytes).ok();
     match sr.lock_holder {
         Some(h) => write!(&mut out, ",\"lock_holder\":{h}").ok(),
@@ -2634,25 +2780,20 @@ fn lock_acquire_command(cfg: LockAcquireConfig) -> ExitCode {
         }
     };
 
-    // 取得済: token を stdout に 1 行 print + flush。shell capture (`$(hyoui lock acquire ...)`)
-    // 用に確実に flush しておく。
-    println!("{acquired_token}");
-    if let Err(e) = std::io::stdout().flush() {
-        eprintln!("hyoui: lock acquire: stdout flush 失敗: {e}");
-        // flush 失敗は重大ではない (= token は出力済の可能性)、続行
-        let _ = e;
-    }
-    eprintln!(
-        "hyoui: lock acquire: lock を保持中。Ctrl-C / SIGTERM / stdin EOF で release します。"
-    );
-
-    // block phase: stdin / socket / self-pipe を poll で並行監視。
+    // block phase 準備: stdin / socket / self-pipe を poll で並行監視するための
     // self-pipe を install して SIGINT/SIGTERM を捕る。
+    //
+    // **token print より前に install すること** (= issue 2026-06-11): token 行は
+    // 「graceful release 可能になった」合図として shell / test が SIGTERM を送る
+    // トリガーに使う。print 後に install する旧順序では、print〜install の窓に
+    // SIGTERM が刺さると default action で process が signal 死し、lock release が
+    // 走らない (= lock_cli の SIGTERM flaky の根因)。
     let pipe: hyoui::sys::SelfPipe = match hyoui::sys::install_self_pipe() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("hyoui: lock acquire: self-pipe 作成失敗: {e} (続行、Ctrl-C は効きません)");
             // self-pipe が作れなくても lock 解放はしないと困るので、明示的に release を試みて exit。
+            // token 未出力なので caller は lock を見ていない (= release して exit 1 が安全)。
             let _ = conn.send_control(&hyoui::protocol::ControlMessage::LockRelease(
                 hyoui::protocol::messages::LockRelease {
                     token: acquired_token.clone(),
@@ -2671,6 +2812,18 @@ fn lock_acquire_command(cfg: LockAcquireConfig) -> ExitCode {
             eprintln!("hyoui: lock acquire: signal {sig:?} register 失敗: {e} (続行)");
         }
     }
+
+    // 取得済 + handler 設置済: token を stdout に 1 行 print + flush。shell capture
+    // (`$(hyoui lock acquire ...)`) 用に確実に flush しておく。
+    println!("{acquired_token}");
+    if let Err(e) = std::io::stdout().flush() {
+        eprintln!("hyoui: lock acquire: stdout flush 失敗: {e}");
+        // flush 失敗は重大ではない (= token は出力済の可能性)、続行
+        let _ = e;
+    }
+    eprintln!(
+        "hyoui: lock acquire: lock を保持中。Ctrl-C / SIGTERM / stdin EOF で release します。"
+    );
 
     let exit_code = wait_until_release_signal(&mut conn, &pipe);
 
@@ -4456,7 +4609,11 @@ mod tests {
 
         let mut cfg = DaemonConfig::new("live-enrich-test", sock_path.clone(), argv_vec.clone());
         // daemon が cwd を載せられるよう Some を渡す (= daemonize 経路と同じ semantics)。
-        cfg.cwd = Some(std::path::PathBuf::from("/tmp/test-cwd"));
+        // bug fix 2026-06-11 以降、子 PTY は exec 前に `cfg.cwd` へ chdir するため、
+        // **実在する dir** を渡す必要がある (= 存在しないと chdir 失敗で child が
+        // _exit(127) し、handshake が成立しない)。`/tmp` は両 OS で実在。
+        let test_cwd = std::path::PathBuf::from("/tmp");
+        cfg.cwd = Some(test_cwd.clone());
         let session = Session::start(cfg).expect("daemon start");
         let daemon_handle = std::thread::spawn(move || session.serve());
 
@@ -4472,6 +4629,8 @@ mod tests {
                 argv: Vec::new(),
                 clients: 0,
                 child_stopped: false,
+                child_pid: None,
+                child_pgid: None,
             },
         }];
 
@@ -4486,8 +4645,14 @@ mod tests {
                 argv,
                 clients,
                 child_stopped: _,
+                child_pid: _,
+                child_pgid: _,
             } => {
-                assert_eq!(cwd, "/tmp/test-cwd", "live daemon must report exact cwd");
+                assert_eq!(
+                    cwd,
+                    &test_cwd.to_string_lossy(),
+                    "live daemon must report exact cwd"
+                );
                 assert_eq!(argv, &argv_vec, "live daemon must report exact argv");
                 // probe 自身が 1 client として handshake を張っているため、`clients` は 1。
                 // この挙動は `hyoui status` と同じ (= プローブ接続も client list に乗る)。
@@ -4536,6 +4701,8 @@ mod tests {
                 argv: Vec::new(),
                 clients: 0,
                 child_stopped: false,
+                child_pid: None,
+                child_pgid: None,
             },
         }];
         enrich_entries_with_status(&mut entries);

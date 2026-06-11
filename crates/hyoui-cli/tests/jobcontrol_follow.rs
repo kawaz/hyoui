@@ -29,24 +29,6 @@ fn settle() {
     std::thread::sleep(Duration::from_millis(200));
 }
 
-/// 短時間内に process state を待ち合わせる helper。
-/// `expected_stat_char` (= 例: 'T' for STOPPED) が `stat` field の先頭文字に
-/// 現れるまで poll、timeout で `None` を返す。
-fn wait_for_stat(pid: i32, expected: char, timeout: Duration) -> Option<String> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if let Ok(state) = process_state_of(pid)
-            && state.stat.starts_with(expected)
-        {
-            return Some(state.stat);
-        }
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
 /// DR-0015 §2.2 軸 1 follow: 子 self-stop → SessionChildStoppedNotify →
 /// attach client が follow policy で `raise(SIGSTOP)` → attach process が
 /// STOPPED 状態になる、を確認する。
@@ -71,7 +53,9 @@ fn follow_child_self_stop_makes_attach_stopped() {
     // 子孫 process が現れるまで poll)
     let attach_pid = h.pid().as_raw();
     let mut child_pid: Option<i32> = None;
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    // 10s: spawn → daemonize → fork+exec の完了待ち。3s だと並行 cargo build 等の
+    // 高負荷下で間に合わないことがある (= 2026-06-11 実測)。
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
         if let Ok(descendants) = find_descendants(attach_pid)
             && let Some(sleep_proc) = descendants.iter().find(|p| p.comm.contains("sleep"))
@@ -83,15 +67,65 @@ fn follow_child_self_stop_makes_attach_stopped() {
     }
     let child_pid = child_pid.expect("/bin/sleep 子孫 process が見つからない");
 
+    // readiness race 対策 (= issue 2026-06-11): 子 process が現れても、attach client が
+    // daemon に leader 登録を終えるまで follow policy (notify → raise(SIGSTOP)) は配線
+    // されない。子の出現だけで SIGSTOP すると leader 不在の窓で notify が空振りし、
+    // attach が STOPPED にならず偽 fail する。leader 接続完了を待ってから stop を送る。
+    assert!(
+        h.wait_for_leader_ready(Duration::from_secs(5)),
+        "attach client が leader として daemon に接続しない (= follow 配線前)"
+    );
+
     // 子に SIGSTOP を送って self-stop を模擬 (= line discipline 経由の Ctrl-Z
     // 相当、kernel が子 pgrp に SIGTSTP を配送した時と等価な状態に持っていく)
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(child_pid), Signal::SIGSTOP)
         .expect("kill -STOP child");
 
     // daemon が waitpid(WUNTRACED) で観測 → notify を leader (= attach) に送信
-    // → attach が raise(SIGSTOP) するまで wait (= follow policy 完了)
-    let stat = wait_for_stat(attach_pid, 'T', Duration::from_secs(5))
-        .expect("attach process が follow policy で STOPPED にならない (= 軸 1 follow 破綻)");
+    // → attach が raise(SIGSTOP) するまで wait (= follow policy 完了)。
+    //
+    // **PTY pump 必須 (= issue 2026-06-11)**: attach は follow 発動時、SIGSTOP の前に
+    // 外側端末へ reset escape を書き `tcsetattr(TCSAFLUSH)` で drain を待つ。test が
+    // master を読まないと drain が完了せず attach が ioctl で永久ブロックする
+    // (= 実端末では端末エミュレータが常時読むので起きない)。よって stat poll の
+    // 各周回で `pump_pty` で master を吸い続ける。
+    let stat = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut found: Option<String> = None;
+        loop {
+            let _ = h.pump_pty();
+            if let Ok(state) = process_state_of(attach_pid)
+                && state.stat.starts_with('T')
+            {
+                found = Some(state.stat);
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        found
+    };
+    let stat = stat.unwrap_or_else(|| {
+        // 診断: daemon が stop を観測したか (= status の child-state) と各 process の
+        // 実状態を出してから fail する (= どの段で follow が切れたか判別可能にする)。
+        let status = h
+            .status_text()
+            .unwrap_or_else(|e| format!("(status query failed: {e})"));
+        let attach_stat = process_state_of(attach_pid)
+            .map(|s| s.stat)
+            .unwrap_or_else(|e| format!("(gone: {e})"));
+        let child_stat = process_state_of(child_pid)
+            .map(|s| s.stat)
+            .unwrap_or_else(|e| format!("(gone: {e})"));
+        panic!(
+            "attach process が follow policy で STOPPED にならない (= 軸 1 follow 破綻)\n\
+             attach pid={attach_pid} stat={attach_stat}\n\
+             child pid={child_pid} stat={child_stat}\n\
+             daemon status:\n{status}"
+        );
+    });
     assert!(
         stat.starts_with('T'),
         "attach stat should start with T (STOPPED), got: {stat:?}"

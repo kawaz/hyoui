@@ -457,6 +457,21 @@ fn ensure_leader(ch: &ClientHandle, message: &str) -> Result<(), ()> {
 
 // === kind 別 handler 群 ===
 
+/// 「殺す意図」の signal を stopped な子に送る前に SIGCONT 併送すべきか。
+///
+/// shell の job control 慣行 (= job への TERM/HUP に CONT を併送して起こす) に倣う。
+/// stopped のまま terminate 系を送ると signal が pending になって配送されない。
+/// SIGCONT / SIGKILL / SIGSTOP / SIGTSTP それ自体や SIGUSR 等は対象外:
+/// - SIGCONT: 併送する意味がない (= まさに起こす signal)
+/// - SIGKILL: stopped でも無条件で殺せる (= 併送不要)
+/// - SIGSTOP/SIGTSTP: 止める意図なので起こさない
+fn signal_should_cont_first(sig: Signal) -> bool {
+    matches!(
+        sig,
+        Signal::SIGTERM | Signal::SIGINT | Signal::SIGHUP | Signal::SIGQUIT | Signal::SIGABRT
+    )
+}
+
 /// signal name string から nix `Signal` を返す (DR-0012)。
 ///
 /// wire protocol は signal 数値ではなく **signal name** (`"SIGTERM"` / `"SIGINT"` 等)
@@ -547,6 +562,13 @@ fn handle_kill(
             }
         },
     };
+    // stopped な子に terminate 系 signal を送ると、stopped のまま signal が
+    // pending になり配送されない (= shell の job control 慣行)。SIGTERM/SIGINT/
+    // SIGHUP 等の「殺す意図」の signal は SIGCONT を併送して子を起こしてから
+    // 効かせる。SIGCONT / SIGKILL / SIGSTOP 自体や SIGUSR 等は併送しない。
+    if signal_should_cont_first(sig) {
+        let _ = kill(child, Signal::SIGCONT);
+    }
     let _ = kill(child, sig);
 
     // === wait 軸の分岐 (= 即時応答 / 終了見届け) ===
@@ -559,10 +581,14 @@ fn handle_kill(
     // process が残るのと同じ)。daemon を block しないため、続けて
     // `hyoui kill --signal=KILL <session>` で始末する経路も生きる。
     //
-    // [--wait (k.wait == true)]: 従来挙動。ack を送らず `TerminateSession` を返し、
-    // serve 後段の `finalize_child` が子 exit を見届けて (= 必要なら SIGTERM →
-    // waitpid) socket を close する。client は EOF を以て「session 終了」と判定
-    // する (= kill 直後に同名 session を作り直すスクリプト等の用途)。
+    // [wait: true (= legacy client 互換)]: ack を送らず `TerminateSession` を返し、
+    // serve 後段の `finalize_child` が子 exit を見届けて socket を close する。
+    // finalize は bounded escalation (= SIGCONT+SIGTERM → grace → SIGKILL) で
+    // 必ず有限時間で返るため、TERM を ignore する子でも daemon は孤児化しない。
+    //
+    // 注: 現行 `hyoui kill --wait` はこの経路を **使わない** (= `wait: false` を
+    // 送って KillAck 後に client 側 deadline で session.exit.notify / EOF を待つ)。
+    // timeout 時に session を畳まず残せるのは client 駆動だからこそ。
     if k.wait {
         return ClientFrameOutcome::TerminateSession(RelayOutcome::ClientDetachedOrKilled);
     }
@@ -1024,6 +1050,13 @@ fn handle_status_query(
         Ok(WaitStatus::StillAlive) => Some(child.as_raw() as u32),
         _ => None,
     };
+    // 子が生存中のみ pgid を引く (= 子は独立 session leader なので通常 pid と一致、
+    // DR-0001 §実装ノート)。getpgid 失敗 (= 既に exit 等) は None に倒す。
+    let child_pgid = child_pid.and_then(|_| {
+        nix::unistd::getpgid(Some(child))
+            .ok()
+            .map(|p| p.as_raw() as u32)
+    });
     let clients_info: Vec<ClientInfo> = clients
         .iter()
         .map(|c| ClientInfo {
@@ -1039,10 +1072,18 @@ fn handle_status_query(
     // DR-0017 §柱2: 子が exit 済 (= child_pid None) なら stopped は意味を持たない
     // ので false。生存中のみ `SessionState` の観測フラグを反映する。
     let child_stopped = child_pid.is_some() && state.child_stopped();
+    // child_state は child_pid (None=exited) + child_stopped から導出 (= 旧 2 field
+    // と矛盾しない正本)。exit code は status query 経路では未取得 (= reap してない)
+    // なので None。
+    let child_state =
+        crate::protocol::messages::ChildLiveState::from_legacy(child_pid, child_stopped);
     let resp = StatusResponse {
         session_id: config.session_id.clone(),
         child_pid,
+        child_pgid,
+        daemon_pid: std::process::id(),
         child_stopped,
+        child_state,
         clients: clients_info,
         scrollback_bytes: scrollback.total_bytes() as u64,
         lock_holder: state.lock_holder,
@@ -1280,6 +1321,36 @@ fn handle_state_snapshot_request(
 mod tests {
     use super::*;
     use crate::protocol::messages::{InputSecrecy, RecordDirection, RecordFormat};
+
+    /// SIGCONT 併送対象: 「殺す意図」signal のみ (= shell job control 慣行)。
+    /// CONT/KILL/STOP/TSTP/USR 系は併送しない。
+    #[test]
+    fn signal_should_cont_first_targets_terminate_intent_only() {
+        // 併送する (= stopped な子を起こしてから効かせる)
+        for sig in [
+            Signal::SIGTERM,
+            Signal::SIGINT,
+            Signal::SIGHUP,
+            Signal::SIGQUIT,
+            Signal::SIGABRT,
+        ] {
+            assert!(signal_should_cont_first(sig), "{sig} should cont-first");
+        }
+        // 併送しない
+        for sig in [
+            Signal::SIGCONT, // まさに起こす signal
+            Signal::SIGKILL, // stopped でも無条件で殺せる
+            Signal::SIGSTOP, // 止める意図
+            Signal::SIGTSTP, // 止める意図
+            Signal::SIGUSR1, // 殺す意図ではない
+            Signal::SIGWINCH,
+        ] {
+            assert!(
+                !signal_should_cont_first(sig),
+                "{sig} should NOT cont-first"
+            );
+        }
+    }
 
     /// DR-0016 §7: `RecordStartError` を protocol `ErrorCode` に写像する table。
     #[test]

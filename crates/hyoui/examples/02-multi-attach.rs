@@ -48,8 +48,13 @@ fn set_nonblocking(fd: &OwnedFd) {
 fn daemon_role(sock_path: &str) {
     let _ = std::fs::remove_file(sock_path);
     let listener = UnixSock::listen(sock_path).expect("listen");
-    let spawned =
-        Pty::spawn(&["sh", "-c", "stty -icanon -echo 2>/dev/null; cat"], 80, 24).expect("spawn");
+    let spawned = Pty::spawn(
+        &["sh", "-c", "stty -icanon -echo 2>/dev/null; cat"],
+        80,
+        24,
+        None,
+    )
+    .expect("spawn");
     let master = spawned.pty.into_master();
     set_nonblocking(&master);
     let master_raw = master.as_raw_fd();

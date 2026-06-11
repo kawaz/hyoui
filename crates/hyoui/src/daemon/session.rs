@@ -266,7 +266,12 @@ impl Session {
             crate::sys::raw::setrlimit_core_zero()?;
         }
         let argv: Vec<&str> = config.cmd.iter().map(String::as_str).collect();
-        let Spawned { pty, child } = Pty::spawn(&argv, config.cols, config.rows)?;
+        // bug fix 2026-06-11: 子 PTY を `hyoui run` の起点 cwd で起動する (= 透過性回復、
+        // DR-0005)。daemon 自身は daemonize 慣習で chdir("/") 済だが、子 (= claude 等)
+        // は起動元 dir で動くべき。`config.cwd` が None (= test 経路や cwd 取得失敗) なら
+        // chdir せず daemon の cwd を継承 (= 従来挙動、後方互換)。
+        let Spawned { pty, child } =
+            Pty::spawn(&argv, config.cols, config.rows, config.cwd.as_deref())?;
         // master FD を nonblock にして、POLLHUP 偽陽性 (macOS) で read_some が
         // block するのを防ぐ。read_some は EAGAIN を返す → serve_loop で continue。
         pty.master_fd().set_nonblocking(true)?;
@@ -1433,12 +1438,29 @@ pub(super) enum RelayOutcome {
     Error(Error),
 }
 
-/// 子 PTY を reap して exit code を返す。
+/// 子 PTY exit を見届けて SIGTERM → SIGKILL に昇格するまでの grace 期間。
+///
+/// `finalize_child` の `ClientDetachedOrKilled` 経路 (= legacy `Kill { wait: true }`
+/// client / `--until` match) で、SIGTERM を ignore する子のために daemon が
+/// **無限 blocking waitpid で孤児化する**のを防ぐ上限。2026-06-11 の孤児 daemon
+/// 騒ぎの根源がこの無限 wait だった。
+///
+/// 値の根拠: `Session::drop` (= panic 経路) は 500ms → SIGKILL だが、正常 terminate
+/// 経路は子の後始末 (state flush 等) にもう少し余裕を持たせる。5s は対話 app の
+/// graceful shutdown に十分で、daemon が「見届け中」に占有される時間としても許容範囲。
+const FINALIZE_TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 子 PTY を reap して exit code を返す。**必ず有限時間で返る** (= 孤児 daemon 防止)。
 ///
 /// outcome に応じて:
 /// - `ChildExited(Some(code))`: 既に `child_actually_exited` で reap 済、code をそのまま返す
 /// - `ChildExited(None)`: exit 検知だが code 未取得 → waitpid で確認
-/// - `ClientDetachedOrKilled`: 子はまだ生きている可能性 → SIGTERM → wait
+/// - `ClientDetachedOrKilled`: 子はまだ生きている可能性 → SIGCONT+SIGTERM →
+///   [`FINALIZE_TERM_GRACE`] まで `waitpid(WNOHANG)` polling → 超過したら SIGKILL
+///   昇格 → blocking reap (= SIGKILL 後は必ず即 reap できる)
+///
+/// SIGCONT 併送は shell の job control 慣行 (= stopped な子に TERM を送っても
+/// pending のまま配送されないため、起こしてから効かせる)。
 ///
 /// signal で終了の場合は shell convention に従い `128 + signum` を返す。
 fn finalize_child(child: Pid, outcome: &RelayOutcome) -> Result<i32, Error> {
@@ -1448,15 +1470,44 @@ fn finalize_child(child: Pid, outcome: &RelayOutcome) -> Result<i32, Error> {
         return Ok(*code);
     }
 
-    // ChildExited 以外 (= client 都合の終了) は子に SIGTERM を送ってから wait。
-    // 既に exit 済なら kill は ESRCH で失敗 → 無視。
-    // R5-H7: process group 全体に向けて、子が exec した孫 (= shell の background
-    // job 等) も同じ SIGTERM で reap 対象にする。
-    if !matches!(outcome, RelayOutcome::ChildExited(_)) {
-        let _ = kill_pgrp(child, Signal::SIGTERM);
+    // ChildExited (= 子は既に死んでいる、reap だけ) は blocking reap で即返る。
+    if matches!(outcome, RelayOutcome::ChildExited(_)) {
+        return reap_blocking(child, outcome);
     }
 
-    // 子を reap。
+    // client 都合の終了 (= legacy wait:true kill / --until)。子に SIGCONT+SIGTERM を
+    // 送ってから grace 付きで wait。既に exit 済なら kill は ESRCH で失敗 → 無視。
+    // R5-H7: process group 全体に向けて、子が exec した孫 (= shell の background
+    // job 等) も同じ SIGTERM で reap 対象にする。
+    let _ = kill_pgrp(child, Signal::SIGCONT);
+    let _ = kill_pgrp(child, Signal::SIGTERM);
+
+    let deadline = Instant::now() + FINALIZE_TERM_GRACE;
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+    loop {
+        let timed_out = match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Exited(_, code)) => return Ok(code),
+            Ok(WaitStatus::Signaled(_, sig, _)) => return Ok(128 + (sig as i32)),
+            // StillAlive / stopped / continued の中間状態は deadline 判定して継続 polling。
+            Ok(_) => Instant::now() >= deadline,
+            Err(nix::errno::Errno::EINTR) => continue,
+            // 既に reap 済 (= SIGCHLD ハンドラが拾った等)。SIGTERM kill の慣行 code。
+            Err(nix::errno::Errno::ECHILD) => return Ok(143),
+            Err(e) => return Err(Error::from(e)),
+        };
+        if timed_out {
+            // grace 超過 = 子が SIGTERM を ignore。SIGKILL 昇格して blocking で
+            // 見届ける (= SIGKILL は catch 不能、D-state 以外は即死するので有限)。
+            let _ = kill_pgrp(child, Signal::SIGKILL);
+            return reap_blocking(child, outcome);
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// 子を blocking で reap し切る。`finalize_child` の ChildExited 経路と SIGKILL
+/// 昇格後の見届けで使う。
+fn reap_blocking(child: Pid, outcome: &RelayOutcome) -> Result<i32, Error> {
     loop {
         match waitpid(child, Some(WaitPidFlag::empty())) {
             Ok(WaitStatus::Exited(_, code)) => return Ok(code),
@@ -1616,7 +1667,7 @@ mod tests {
         use nix::sys::signal::Signal;
         use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 
-        let spawned = Pty::spawn(&["cat"], 80, 24).expect("spawn cat");
+        let spawned = Pty::spawn(&["cat"], 80, 24, None).expect("spawn cat");
         let child = spawned.child;
 
         // 子を SIGSTOP で停止させる (= ^Z 相当の停止状態を作る)。
@@ -1686,7 +1737,7 @@ mod tests {
         use nix::sys::signal::Signal;
 
         // cat: stdin blocking で確実に alive。
-        let spawned = Pty::spawn(&["cat"], 80, 24).expect("spawn cat");
+        let spawned = Pty::spawn(&["cat"], 80, 24, None).expect("spawn cat");
         let child = spawned.child;
 
         let mut lc = ChildLifecycle::default();
@@ -1754,7 +1805,7 @@ mod tests {
         use crate::sys::Pty;
         use nix::sys::signal::Signal;
 
-        let spawned = Pty::spawn(&["cat"], 80, 24).expect("spawn cat");
+        let spawned = Pty::spawn(&["cat"], 80, 24, None).expect("spawn cat");
         let child = spawned.child;
         nix::sys::signal::kill(child, Signal::SIGSTOP).expect("SIGSTOP");
 
@@ -3043,6 +3094,30 @@ mod tests {
 
     // ---- Phase 12: byte bound backpressure ----
 
+    /// deadline 付き thread join (= issue 2026-06-11、ignored test 用)。
+    ///
+    /// daemon serve thread を素の `JoinHandle::join` で待つと、serve が wedge した
+    /// 場合に **無限ハング**する (= 2026-05-28 ubuntu CI で 6h timeout を観測した構造)。
+    /// watcher thread 経由で join し `recv_timeout` で deadline を被せる。timeout 時は
+    /// message 付き panic で fail させる (= thread は leak するが process 終了で回収)。
+    fn join_with_deadline<T: Send + 'static>(
+        handle: std::thread::JoinHandle<T>,
+        timeout: Duration,
+        what: &str,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(handle.join());
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(v)) => v,
+            Ok(Err(_)) => panic!("{what}: joined thread panicked"),
+            Err(_) => panic!(
+                "{what}: thread did not finish within {timeout:?} (= 無限ハング防止のため deadline fail)"
+            ),
+        }
+    }
+
     /// Phase 12: client_buffer_bytes を超過すると当該 client は backpressure.disconnect
     /// で切断され、socket は close される。他の client は影響を受けず通常動作。
     #[test]
@@ -3138,7 +3213,9 @@ mod tests {
         .encode_to(&mut k)
         .expect("send kill");
         k.flush().expect("flush");
-        let _ = handle.join().expect("daemon thread");
+        // 無限ハング防止 (= issue 2026-06-11): まさに本 test が CI で 6h hang した
+        // join 箇所。deadline 超過は fail で落とす (= ハングさせない)。
+        let _ = join_with_deadline(handle, Duration::from_secs(30), "backpressure daemon serve");
     }
 
     // ---- Round1 fixes: authorization / token / signal / silent skip ----

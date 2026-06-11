@@ -66,7 +66,7 @@ pub use screen::{
 pub use session_lifecycle::{
     SessionChildResumeRequest, SessionChildStoppedNotify, SessionExitNotify,
 };
-pub use status::{ClientInfo, StatusQuery, StatusResponse};
+pub use status::{ChildLiveState, ClientInfo, StatusQuery, StatusResponse};
 pub use tail::{TailData, TailEnd, TailEndReason, TailRequest};
 
 /// CBOR control message の全 kind を包む tagged enum。
@@ -456,7 +456,10 @@ mod tests {
         let msg = ControlMessage::StatusResponse(StatusResponse {
             session_id: "demo".into(),
             child_pid: Some(12345),
+            child_pgid: Some(12345),
+            daemon_pid: 999,
             child_stopped: false,
+            child_state: ChildLiveState::Running,
             clients: vec![
                 ClientInfo {
                     client_id: 0,

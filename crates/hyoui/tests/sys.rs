@@ -17,7 +17,7 @@ use nix::sys::signal::{Signal, kill};
 /// "pty_spawnv: echo hello returns valid pid and waitpid succeeds").
 #[test]
 fn forkpty_echo_returns_status_zero() {
-    let spawned = Pty::spawn(&["echo", "hello"], 80, 24).expect("spawn");
+    let spawned = Pty::spawn(&["echo", "hello"], 80, 24, None).expect("spawn");
     let outcome = wait_for_status(spawned.child, false).expect("wait");
     match outcome {
         WaitOutcome::Exited { status, .. } => {
@@ -45,7 +45,7 @@ fn forkpty_echo_returns_status_zero() {
 fn forkpty_child_has_ctty_and_can_be_stopped() {
     // `cat` reads from stdin forever — the child stays alive until the
     // parent closes the master fd or kills it.
-    let spawned = Pty::spawn(&["cat"], 80, 24).expect("spawn cat");
+    let spawned = Pty::spawn(&["cat"], 80, 24, None).expect("spawn cat");
     let child = spawned.child;
 
     // Wait until tcgetpgrp returns the child pgid; this happens once
@@ -109,7 +109,7 @@ fn forkpty_child_has_ctty_and_can_be_stopped() {
 /// we observe "hi" or the child exits.
 #[test]
 fn forkpty_echo_output_observable_from_master() {
-    let spawned = Pty::spawn(&["echo", "hi"], 80, 24).expect("spawn");
+    let spawned = Pty::spawn(&["echo", "hi"], 80, 24, None).expect("spawn");
     spawned
         .pty
         .master_fd()

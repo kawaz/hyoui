@@ -298,10 +298,31 @@ pub struct KillConfig {
     /// `--no-terminate` とは併用不可 (= terminate しない経路に「終了を待つ」は
     /// 意味を成さない)。terminate 経路 (= `ControlMessage::Kill`) 専用。
     pub wait: bool,
+    /// `--wait` の timeout (ms)。`wait == true` のときのみ意味を持つ。
+    ///
+    /// - 裸 `--wait` (= 値なし): [`KILL_WAIT_DEFAULT_TIMEOUT_MS`] (= 10s)
+    /// - `--wait=<DUR>`: `parse_duration_ms` で解釈した値
+    ///
+    /// timeout 超過時は `kill_on_timeout` に従う (= default はエラー終了、
+    /// `--kill-on-timeout` 指定時は SIGKILL 昇格)。
+    pub wait_timeout_ms: Option<u64>,
+    /// `--kill-on-timeout`: `--wait` の timeout 超過時に SIGKILL 昇格して見届けるか。
+    ///
+    /// default `false` (= timeout 時はエラー終了、子は生かす)。`--wait` 無しでの
+    /// 指定は parse エラー (= timeout 概念が無い経路に昇格指定は無意味)。
+    pub kill_on_timeout: bool,
     /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。session / index / --all の
     /// 解決を namespace スコープに絞る。
     pub namespace: Option<String>,
 }
+
+/// 裸 `--wait` (= 値なし) のデフォルト timeout (ms)。
+///
+/// 10s の根拠: 対話 app (claude / vim 等) が SIGTERM を受けて後始末 (= state flush /
+/// 子 process 回収) してから exit するのに十分余裕がある一方、TERM を完全 ignore する
+/// 子で client / daemon が無駄に待ち続けない閾値。CI / script では `--wait=<DUR>` で
+/// 短く絞れる。
+pub const KILL_WAIT_DEFAULT_TIMEOUT_MS: u64 = 10_000;
 
 /// `status` subcommand の出力形式 (= `--format=plain|json`)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1020,8 +1041,8 @@ fn parse_kill(args: &[String]) -> Command {
 
         let (name, inline_value) = split_eq(arg);
         let mut consumed_extra = false;
-        let value: Option<String> = match inline_value {
-            Some(v) => Some(v),
+        let value: Option<String> = match &inline_value {
+            Some(v) => Some(v.clone()),
             None => {
                 if i + 1 < args.len() {
                     consumed_extra = true;
@@ -1091,6 +1112,24 @@ fn parse_kill(args: &[String]) -> Command {
             }
             "--wait" => {
                 cfg.wait = true;
+                // `--wait=<DUR>` の **inline 値のみ** timeout として解釈する。
+                // `--wait demo` の `demo` は session-id 扱いにしたいので、次 arg は
+                // 消費しない (= 裸 `--wait` は default timeout に倒す)。
+                match inline_value {
+                    Some(v) => match parse_duration_ms(&v) {
+                        Ok(ms) => cfg.wait_timeout_ms = Some(ms),
+                        Err(e) => {
+                            return Command::Error(format!("kill: --wait: {e}"));
+                        }
+                    },
+                    None => {
+                        cfg.wait_timeout_ms = Some(KILL_WAIT_DEFAULT_TIMEOUT_MS);
+                    }
+                }
+                consumed_extra = false;
+            }
+            "--kill-on-timeout" => {
+                cfg.kill_on_timeout = true;
                 consumed_extra = false;
             }
             // POSIX kill 慣習 + 略名拡張: `-X` short flag (= `--` で始まらない short
@@ -1160,6 +1199,15 @@ fn parse_kill(args: &[String]) -> Command {
     if cfg.wait && cfg.no_terminate {
         return Command::Error(
             "kill: --wait は --no-terminate と併用できません (= terminate しない経路に「終了を待つ」は意味を成さない)"
+                .into(),
+        );
+    }
+
+    // --kill-on-timeout は --wait の timeout 超過時の escalation 指定なので、
+    // --wait 無しでは意味を成さない (= timeout 概念が無い経路への SIGKILL 昇格指定)。
+    if cfg.kill_on_timeout && !cfg.wait {
+        return Command::Error(
+            "kill: --kill-on-timeout は --wait と併用してください (= --wait の timeout 超過時の SIGKILL 昇格指定)"
                 .into(),
         );
     }
@@ -3240,8 +3288,8 @@ fn usage_run() -> String {
         \n\
         ENVIRONMENT:\n    \
             SHELL                  Fallback command when none is given (legacy)\n    \
-            XDG_RUNTIME_DIR        Base directory for the auto-generated socket path\n    \
-            TMPDIR                 Socket path base when XDG_RUNTIME_DIR is unset\n    \
+            XDG_RUNTIME_DIR        Base directory for the auto-generated socket path\n                                   \
+                (otherwise /tmp/hyoui-<uid> is used; TMPDIR is not consulted)\n    \
             HYOUI_NAMESPACE        Session namespace (= --namespace の env 経路、flag 優先)\n    \
             HYOUI_SCROLLBACK_ROWS  --scrollback-rows と同じ値を env で渡す\n                                   \
                 (--scrollback-rows 指定時は flag 優先)\n\
@@ -3333,7 +3381,9 @@ fn usage_status() -> String {
         \n\
         OUTPUT (plaintext key:value 1 行ごと):\n    \
             session-id: <name>\n    \
-            child-pid: <pid>  または  child-pid: (exited)\n    \
+            daemon-pid: <pid>\n    \
+            child-pid: <pid> pgid=<pgid>  または  child-pid: (exited)\n    \
+            child-state: running | stopped | exited [(code N)]\n    \
             scrollback-bytes: <N>\n    \
             lock-holder: client <id>  または  lock-holder: (none)\n    \
             clients:\n              \
@@ -3466,20 +3516,21 @@ fn usage_list() -> String {
             -h, --help          Show this help and exit\n\
         \n\
         OUTPUT (plain, fixed-width columns, sorted by socket mtime ascending):\n    \
-            SESSION              STATUS  DUR        CLIENTS  CWD                              ARGV\n    \
-            test-claude          live    1h2m       2        kawaz/hyoui/main                 claude\n    \
-            stale-test           stale   -          -        -                                -\n\
+            SESSION              STATUS  PID      DUR        CLIENTS  CWD                              ARGV\n    \
+            test-claude          live    12345    1h2m       2        kawaz/hyoui/main                 claude\n    \
+            stale-test           stale   -        -          -        -                                -\n\
         \n\
         COLUMNS (plain):\n    \
             SESSION   session id (= socket file 名から拡張子を除いた値、20ch で truncate)\n    \
-            STATUS    live | stale\n    \
+            STATUS    live | stopped | stale (= stopped は子が ^Z/SIGSTOP で停止中)\n    \
+            PID       子 PTY の PID (= ps 突き合わせ用、exited / stale は -)\n    \
             DUR       socket mtime からの経過時間 (= 1h2m / 15m / 3d4h 形式)\n    \
             CLIENTS   現在 attach 中の client 数 (= status.query の結果)\n    \
             CWD       daemon 起動時の cwd (= `repos/<host>/` 前カット、~ 前カット、32ch truncate)\n    \
             ARGV      daemon が起動した子 PTY の argv (= space-join、空白含む arg は \"...\" quote)\n\
         \n\
         OUTPUT (jsonl, 1 session = 1 line):\n    \
-            {\"session\":\"<id>\",\"status\":\"live|stale\",\"started_unix_ms\":<ms>,\"dur_ms\":<ms>,\"socket\":\"<path>\",\"cwd\":\"<path>|null\",\"argv\":[...]|null,\"clients\":<n>|null}\n\
+            {\"session\":\"<id>\",\"status\":\"live|stopped|stale\",\"child_state\":\"running|stopped|null\",\"child_pid\":<n>|null,\"child_pgid\":<n>|null,\"started_unix_ms\":<ms>,\"dur_ms\":<ms>,\"socket\":\"<path>\",\"cwd\":\"<path>|null\",\"argv\":[...]|null,\"clients\":<n>|null}\n\
         \n\
         SORT ORDER:\n    \
             socket mtime ascending (= 古い session が上、新しい session が下)。\n    \
@@ -3494,7 +3545,7 @@ fn usage_list() -> String {
         SCAN ORDER (= socket_path::resolve_in_namespace と同順、最初に見つかった dir のみ):\n    \
             default namespace: base dir 直下 (= 既存互換):\n    \
             \x20 1. $XDG_RUNTIME_DIR/hyoui/\n    \
-            \x20 2. $TMPDIR/hyoui-<uid>/  (TMPDIR 未設定なら /tmp/hyoui-<uid>/)\n    \
+            \x20 2. /tmp/hyoui-<uid>/  (= /tmp 固定、$TMPDIR は読まない)\n    \
             その他 namespace: <base>/<ns>/。--all-namespaces は base 配下のサブ dir も走査。\n\
         \n\
         EXIT CODE:\n    \
@@ -3533,7 +3584,9 @@ fn usage_kill() -> String {
             [wait 軸]       既定 (即時)  : signal 送信受理で即 return (= `kill(1)` と同じ。\n    \
             \x20                              子が 1 発で死なない app でも無応答にならない)\n    \
             \x20               --wait        : 子 exit + session 終了を見届けてから return\n    \
-            \x20                              (= kill 直後に同名 session を作り直すスクリプト等)\n\
+            \x20                              (= 既定 timeout 10s。超過で exit 3 = エラー、子は生存)\n    \
+            \x20               --wait=DUR    : timeout を明示 (= 既存 DUR 形式)\n    \
+            \x20               --kill-on-timeout : timeout 後 SIGKILL 昇格して見届け (= 確実に殺す)\n\
         \n\
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
@@ -3541,9 +3594,12 @@ fn usage_kill() -> String {
             --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --all           全 live session を順次 kill (= killall 相当)\n    \
             --signal SPEC   送信 signal (= default SIGTERM)。数字 / 略名 / SIG-prefix 大文字 OK\n    \
-            --wait          子 exit + session 終了まで見届けて return (= 従来挙動)。\n    \
-            \x20               既定 (= 省略時) は signal 送信受理で即 return。\n    \
-            \x20               `--no-terminate` とは併用不可\n    \
+            --wait[=DUR]    子 exit + session 終了まで見届けて return。\n    \
+            \x20               裸 --wait は既定 timeout 10s、--wait=DUR で指定 (= 既存 DUR 形式)。\n    \
+            \x20               timeout 超過は exit 3 (= エラー、子は生かす)。\n    \
+            \x20               既定 (= 省略時) は signal 送信受理で即 return。`--no-terminate` 不可\n    \
+            --kill-on-timeout  --wait の timeout 超過時に SIGKILL 昇格して見届ける\n    \
+            \x20               (= 確実に殺す)。`--wait` と併用必須\n    \
             --no-terminate  signal を送るだけで session を畳まない (= stopped child を\n    \
             \x20               CONT で起こす用途等)。`--all` / `--wait` とは併用不可\n    \
             -N              POSIX kill 慣習: 短縮 signal 番号 (e.g. -9 = SIGKILL)\n    \
@@ -3567,7 +3623,8 @@ fn usage_kill() -> String {
         EXIT CODE:\n    \
             0   既定: signal 送信受理を確認 / --wait: session 終了を見届けた\n    \
             1   connect / send 失敗 / daemon が reject\n    \
-            2   引数不足 / 排他違反\n\
+            2   引数不足 / 排他違反\n    \
+            3   --wait の timeout 超過 (= 子が終了せず、子は生存。--kill-on-timeout で SIGKILL 昇格可)\n\
         \n\
         EXAMPLES:\n    \
             hyoui kill demo                          # session_id=demo に SIGTERM (= 即時 return)\n    \
@@ -3577,7 +3634,9 @@ fn usage_kill() -> String {
             hyoui kill -9 demo                       # SIGKILL を送る (= 番号 短縮)\n    \
             hyoui kill -KILL demo                    # SIGKILL を送る (= 略名 短縮)\n    \
             hyoui kill -SIGTERM demo                 # SIGTERM を送る (= 正規 短縮)\n    \
-            hyoui kill demo --wait                   # 子 exit + session 終了まで待つ\n    \
+            hyoui kill demo --wait                   # 子 exit を最大 10s 待つ (超過で exit 3)\n    \
+            hyoui kill demo --wait=2s                 # timeout 2s で見届け (超過で exit 3、子生存)\n    \
+            hyoui kill demo --wait=2s --kill-on-timeout  # 2s 後 SIGKILL 昇格して確実に殺す\n    \
             hyoui kill 1                             # session_id=\"1\" を SIGTERM (= 数字も名前)\n    \
             hyoui kill --index=1                     # 1 番古い session を SIGTERM\n    \
             hyoui kill --index=-1                    # 最新 session を SIGTERM\n    \
@@ -6599,6 +6658,79 @@ mod tests {
                 assert!(cfg.wait);
             }
             other => panic!("expected Kill(all=true, wait=true), got {other:?}"),
+        }
+    }
+
+    /// 裸 `--wait` (= 値なし) は default timeout 10s が入る。
+    #[test]
+    fn parse_kill_bare_wait_sets_default_timeout() {
+        match parse_args(&args(&["kill", "demo", "--wait"])) {
+            Command::Kill(cfg) => {
+                assert!(cfg.wait);
+                assert_eq!(
+                    cfg.wait_timeout_ms,
+                    Some(KILL_WAIT_DEFAULT_TIMEOUT_MS),
+                    "bare --wait must default to {KILL_WAIT_DEFAULT_TIMEOUT_MS}ms"
+                );
+            }
+            other => panic!("expected Kill, got {other:?}"),
+        }
+    }
+
+    /// `--wait=<DUR>` は既存 DUR 形式で timeout を上書きする。
+    #[test]
+    fn parse_kill_wait_with_duration() {
+        match parse_args(&args(&["kill", "demo", "--wait=2s"])) {
+            Command::Kill(cfg) => {
+                assert!(cfg.wait);
+                assert_eq!(cfg.wait_timeout_ms, Some(2_000));
+            }
+            other => panic!("expected Kill(wait=2s), got {other:?}"),
+        }
+        match parse_args(&args(&["kill", "demo", "--wait=500ms"])) {
+            Command::Kill(cfg) => assert_eq!(cfg.wait_timeout_ms, Some(500)),
+            other => panic!("expected Kill(wait=500ms), got {other:?}"),
+        }
+        // 不正 DUR は parse error。
+        match parse_args(&args(&["kill", "demo", "--wait=abc"])) {
+            Command::Error(msg) => assert!(msg.contains("--wait"), "msg: {msg}"),
+            other => panic!("expected Error for --wait=abc, got {other:?}"),
+        }
+    }
+
+    /// `--wait demo` の `demo` は session-id (= 次 arg を timeout として消費しない)。
+    #[test]
+    fn parse_kill_bare_wait_does_not_consume_next_arg() {
+        match parse_args(&args(&["kill", "--wait", "demo"])) {
+            Command::Kill(cfg) => {
+                assert!(cfg.wait);
+                assert_eq!(cfg.wait_timeout_ms, Some(KILL_WAIT_DEFAULT_TIMEOUT_MS));
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+            }
+            other => panic!("expected Kill(wait, session=demo), got {other:?}"),
+        }
+    }
+
+    /// `--kill-on-timeout` は `--wait` 必須 (= 単独指定は parse error)。
+    #[test]
+    fn parse_kill_kill_on_timeout_requires_wait() {
+        match parse_args(&args(&["kill", "demo", "--kill-on-timeout"])) {
+            Command::Error(msg) => {
+                assert!(
+                    msg.contains("--kill-on-timeout") && msg.contains("--wait"),
+                    "error should mention both flags: {msg}"
+                );
+            }
+            other => panic!("expected Error for --kill-on-timeout without --wait, got {other:?}"),
+        }
+        // --wait と併用すれば OK。
+        match parse_args(&args(&["kill", "demo", "--wait=2s", "--kill-on-timeout"])) {
+            Command::Kill(cfg) => {
+                assert!(cfg.wait);
+                assert!(cfg.kill_on_timeout);
+                assert_eq!(cfg.wait_timeout_ms, Some(2_000));
+            }
+            other => panic!("expected Kill(kill_on_timeout), got {other:?}"),
         }
     }
 

@@ -29,7 +29,7 @@ fn main() {
 
     // argv をスペース分割して直接 exec (sh -c 経由しない)
     let argv: Vec<&str> = cmd.split_whitespace().collect();
-    let spawned = Pty::spawn(&argv, 80, 24).expect("spawn");
+    let spawned = Pty::spawn(&argv, 80, 24, None).expect("spawn");
     let master = spawned.pty.into_master();
     fcntl(master.as_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).expect("nonblock");
     let master_raw = master.as_raw_fd();
