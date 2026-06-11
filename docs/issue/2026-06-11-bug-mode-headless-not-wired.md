@@ -33,7 +33,39 @@ default まで記載されているが、**main.rs / daemonize.rs のランタ�
   実装完了までは `--mode=headless` を「未実装」エラーにする選択肢も検討
 - [ ] 当面の回避: worker 用途は `--detached` + `--size` (実装されていれば) で代替
 
+## 監査結果 (2026-06-11 二次追記)
+
+Fable + Codex の 2 系統監査を実施。本 issue の範囲を超える no-op オプション群
+(--on-child-suspend / --timeout / --idle-timeout / --exclusive / --detach-others) と
+シグナル系の bug 候補 (SIGWINCH 未配線、daemon SIGTSTP 吸い込み、daemon kill -9 →
+child SIGHUP 巻き添え疑い等) が見つかった。全容と整理提案は
+**[[2026-06-11-signal-suspend-interaction-audit]] (docs/findings/)** を正本とする。
+本 issue は `--mode` 削除の実施票として継続。
+
+## 調査メモ (2026-06-11 追記)
+
+DR / コードを精読した結果、期待仕様の確定に効く事実:
+
+- **DR-0001 の `--mode=headless` 定義は「suspend 系 preset」であって「attach しない」ではない**。
+  preset 表は 軸1 = `auto-resume` / 軸2 = `decouple`。「tty に attach しない」という意味は
+  DR-0001 には無い (fg で attach されること自体は DR-0015 の run = fork daemon + exec attach
+  仕様通り。detach は `--detached` の担当)。
+- **その preset 自体も DR-0017 §柱2 で意図的に廃止済み** (cli.rs:2285-2289 のコメント:
+  「どの mode でも default にはしない (= headless でも勝手に resume しない)」)。
+  つまり DR-0001 が headless に与えていた意味は現方針では空になっており、
+  「未配線」ではなく「**配線すべき仕様が現存しない**」状態の可能性がある。
+  → 期待仕様の復元は DR-0001 からではなく、「headless に今どんな意味を持たせたいか」の
+  再定義 (= DR 起票) が先。
+- **pipe-through pattern も未配線**: attach.rs のコメント / テスト (R5-FB2) に
+  `echo "1+2" | hyoui run --mode=headless -- bc` 用の `StdinEofAction::SendEof` が
+  実装済みだが、production 経路から `with_stdin_eof_action(SendEof)` を呼ぶ箇所が 0 件。
+  headless の意味候補の 1 つとして「stdin EOF で EOT 送出 (pipe-through)」がここに眠っている。
+- **run → exec attach で mode が伝搬されない**: run_command (main.rs:500-520) が組む
+  `hyoui attach` 引数は session / socket / namespace / debug-dump-client のみ。
+  attach 側に mode を解釈させる設計にするなら伝搬の追加が必要。
+
 ## 関連
 
 - [[DR-0006]] / [[DR-0010]]
+- [[DR-0001]] (headless preset の原典) / [[DR-0017]] (preset 廃止) / [[DR-0015]] (run = fork + exec attach)
 - 同型の前例: record redaction no-op (docs/issue/2026-06-10-feature-record-redaction-phase5.md)
