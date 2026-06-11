@@ -75,7 +75,6 @@ fn restore_simple_echo_visible_in_screen_dump() {
         "restore-echo",
         &[
             "run",
-            "--mode=headless",
             "--",
             "/bin/sh",
             "-c",
@@ -112,7 +111,6 @@ fn restore_dump_is_idempotent_across_calls() {
         "restore-idem",
         &[
             "run",
-            "--mode=headless",
             "--",
             "/bin/sh",
             "-c",
@@ -162,14 +160,7 @@ fn restore_dump_contains_ansi_control_sequences() {
     let runner = HyouiTestRunner::new();
     let mut h = runner.spawn_hyoui(
         "restore-ansi",
-        &[
-            "run",
-            "--mode=headless",
-            "--",
-            "/bin/sh",
-            "-c",
-            "printf 'marker\\n'; sleep 30",
-        ],
+        &["run", "--", "/bin/sh", "-c", "printf 'marker\\n'; sleep 30"],
     );
     let socket = runner.socket_path("restore-ansi");
 
@@ -200,7 +191,6 @@ fn restore_snapshot_normalized() {
         "restore-snapshot",
         &[
             "run",
-            "--mode=headless",
             "--",
             "/bin/sh",
             "-c",

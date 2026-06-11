@@ -2205,12 +2205,41 @@ fn parse_run(args: &[String]) -> Command {
             "--on-child-suspend" => match value.as_deref() {
                 Some("notify") => on_child_suspend = Some(OnChildSuspend::Notify),
                 Some("auto-resume") => on_child_suspend = Some(OnChildSuspend::AutoResume),
+                // DR-0019: 旧値 `follow` は `notify` に rename。移行先を明示する。
+                Some("follow") => {
+                    return Command::Error(
+                        "--on-child-suspend=follow is removed (DR-0019); use `notify` \
+                         (= leader client に通知するだけ、子は起こさない。default)"
+                            .into(),
+                    );
+                }
                 Some(other) => {
-                    return Command::Error(format!("invalid --on-child-suspend value: {other}"));
+                    return Command::Error(format!(
+                        "invalid --on-child-suspend value: {other} (= notify | auto-resume)"
+                    ));
                 }
                 None => return Command::Error("--on-child-suspend requires a value".into()),
             },
-            // DR-0015 §2.3: `--on-parent-suspend` 廃止 (= 軸 2 廃止)。
+            // DR-0019 §1: `--mode=interactive|headless` preset 削除。直交フラグへ誘導。
+            "--mode" => {
+                return Command::Error(
+                    "run --mode is removed (DR-0019); the preset had no effect. \
+                     起動の各軸を直交フラグで指定してください: attach しない起動は \
+                     `--detached`、画面サイズは `--size`/`--cols`/`--rows`、\
+                     suspend policy は `--on-child-suspend=notify|auto-resume`"
+                        .into(),
+                );
+            }
+            // DR-0015 §2.3 / DR-0019 §7: `--on-parent-suspend` 廃止 (= 軸 2 廃止)。
+            // unknown option に落とさず移行先を明示する (= migration hint)。
+            "--on-parent-suspend" => {
+                return Command::Error(
+                    "run --on-parent-suspend is removed (DR-0015 §2.3, 軸 2 廃止)。\
+                     親 (= attach client) の suspend は client ローカル挙動として\
+                     固定 (= follow)、daemon 側に policy は無い"
+                        .into(),
+                );
+            }
             "--detached" => {
                 detached = true;
                 consumed_extra = false; // bool flag は次 arg を食わない
@@ -5175,16 +5204,6 @@ mod tests {
     }
 
     #[test]
-    fn run_mode_flag_is_unknown_option() {
-        // `--mode` は run から削除済 (= attach の --mode とは別物)。run で渡すと
-        // unknown option として弾かれる。
-        match parse_args(&args(&["run", "--mode=headless", "--", "cat"])) {
-            Command::Error(_) => {}
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn run_empty_command_after_dashdash_is_error() {
         match parse_args(&args(&["run", "--"])) {
             Command::Error(_) => {}
@@ -5237,9 +5256,57 @@ mod tests {
 
     #[test]
     fn run_on_child_suspend_old_follow_value_is_error() {
-        // 旧値 `follow` は廃止 (= notify に rename、alias なし)。
+        // DR-0019: 旧値 `follow` は `notify` に rename。エラー文に移行先を明記する
+        // (= migration hint、`--signum` 廃止 (DR-0012) と同じ流儀)。
         match parse_args(&args(&["run", "--on-child-suspend=follow", "--", "cat"])) {
-            Command::Error(_) => {}
+            Command::Error(msg) => {
+                assert!(msg.contains("follow"), "should mention old value: {msg}");
+                assert!(msg.contains("notify"), "should hint new value: {msg}");
+                assert!(msg.contains("DR-0019"), "should cite DR: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_mode_flag_is_removed_with_migration_hint() {
+        // DR-0019 §1: `--mode` preset を削除。指定時は unknown option ではなく
+        // 移行先を示す明示エラーを返す (= migration hint)。
+        match parse_args(&args(&["run", "--mode=headless", "--", "claude"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("--mode"), "should mention --mode: {msg}");
+                assert!(msg.contains("DR-0019"), "should cite DR: {msg}");
+                // 移行先 (= --detached / --size / --on-child-suspend) を示す。
+                assert!(msg.contains("--detached"), "should hint --detached: {msg}");
+                assert!(
+                    msg.contains("--on-child-suspend"),
+                    "should hint --on-child-suspend: {msg}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_on_parent_suspend_flag_is_removed_with_migration_hint() {
+        // DR-0019 §7 / DR-0015 §2.3: `--on-parent-suspend` は削除済。指定時は
+        // unknown option ではなく「軸 2 廃止」を示す明示エラーを返す。
+        match parse_args(&args(&[
+            "run",
+            "--on-parent-suspend=decouple",
+            "--",
+            "claude",
+        ])) {
+            Command::Error(msg) => {
+                assert!(
+                    msg.contains("--on-parent-suspend"),
+                    "should mention flag: {msg}"
+                );
+                assert!(
+                    msg.contains("DR-0015") || msg.contains("DR-0019"),
+                    "should cite DR: {msg}"
+                );
+            }
             other => panic!("expected Error, got {other:?}"),
         }
     }
