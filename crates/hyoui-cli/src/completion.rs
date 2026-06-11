@@ -214,6 +214,8 @@ _hyoui() {
             case "$prev" in
                 --on-child-suspend)
                     COMPREPLY=( $(compgen -W "notify auto-resume" -- "$cur") ); return 0 ;;
+                --stdin-eof)
+                    COMPREPLY=( $(compgen -W "detach send-eof" -- "$cur") ); return 0 ;;
                 --socket)
                     _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
                 --namespace|--timeout|--idle-timeout|--until|--size|--cols|--rows|--scrollback-rows)
@@ -222,8 +224,10 @@ _hyoui() {
             case "$cur" in
                 --on-child-suspend=*)
                     COMPREPLY=( $(compgen -W "notify auto-resume" -- "${cur#*=}") ); return 0 ;;
+                --stdin-eof=*)
+                    COMPREPLY=( $(compgen -W "detach send-eof" -- "${cur#*=}") ); return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --timeout --idle-timeout --until --on-child-suspend --scrollback-rows --size --cols --rows --help -h --" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --namespace --timeout --idle-timeout --until --on-child-suspend --stdin-eof --scrollback-rows --size --cols --rows --help -h --" -- "$cur") )
             return 0 ;;
         completion)
             COMPREPLY=( $(compgen -W "bash zsh fish --help -h" -- "$cur") )
@@ -232,9 +236,14 @@ _hyoui() {
             case "$prev" in
                 --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
                 --mode) COMPREPLY=( $(compgen -W "rw ro rw-no-leader" -- "$cur") ); return 0 ;;
+                --stdin-eof) COMPREPLY=( $(compgen -W "detach send-eof" -- "$cur") ); return 0 ;;
                 --namespace|--index) return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --index --mode --exclusive --detach-others --help -h" -- "$cur") )
+            case "$cur" in
+                --stdin-eof=*)
+                    COMPREPLY=( $(compgen -W "detach send-eof" -- "${cur#*=}") ); return 0 ;;
+            esac
+            COMPREPLY=( $(compgen -W "--socket --namespace --index --mode --exclusive --detach-others --stdin-eof --help -h" -- "$cur") )
             return 0 ;;
         list)
             case "$cur" in
@@ -321,6 +330,7 @@ _hyoui() {
                         '--mode=[Operating mode]:mode:(rw ro rw-no-leader)' \
                         '--exclusive[Demand exclusive ownership]' \
                         '--detach-others[Drop other clients on connect]' \
+                        '--stdin-eof=[stdin EOF action]:action:(detach send-eof)' \
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:session id:'
                     ;;
@@ -627,6 +637,7 @@ _hyoui_run() {
         '--cols=[Virtual screen columns]:cols:' \
         '--rows=[Virtual screen rows]:rows:' \
         '--on-child-suspend=[Action when child is stopped]:action:(notify auto-resume)' \
+        '--stdin-eof=[stdin EOF action]:action:(detach send-eof)' \
         '--scrollback-rows=[vt100 scrollback ring max rows (default 1000)]:rows:' \
         '(-h --help)'{-h,--help}'[Show help]' \
         '*::child command:_normal'
@@ -754,6 +765,7 @@ complete -c hyoui -n '__hyoui_using_subcommand run' -l size              -x     
 complete -c hyoui -n '__hyoui_using_subcommand run' -l cols              -x                              -d 'Virtual screen columns'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l rows              -x                              -d 'Virtual screen rows'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l on-child-suspend  -x -a 'notify auto-resume'       -d 'Action when child is stopped'
+complete -c hyoui -n '__hyoui_using_subcommand run' -l stdin-eof         -x -a 'detach send-eof'          -d 'stdin EOF action'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l scrollback-rows   -x                              -d 'vt100 scrollback ring max rows (default 1000)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -s h -l help                                          -d 'Show help and exit'
 
@@ -768,6 +780,7 @@ complete -c hyoui -n '__hyoui_using_subcommand attach' -l namespace -x -d 'Sessi
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l mode           -x -a 'rw ro rw-no-leader'   -d 'Operating mode'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l exclusive                                    -d 'Demand exclusive ownership'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l detach-others                                -d 'Drop other clients on connect'
+complete -c hyoui -n '__hyoui_using_subcommand attach' -l stdin-eof      -x -a 'detach send-eof'        -d 'stdin EOF action'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -s h -l help                                    -d 'Show help and exit'
 
 # `hyoui list` options.
@@ -1021,11 +1034,19 @@ mod tests {
                 while let Some(off) = s[start..].find(*sub) {
                     let i = start + off;
                     let before = s[..i].chars().next_back();
-                    let after = s[i + sub.len()..].chars().next();
-                    assert!(
-                        !(is_boundary(before) && is_boundary(after)),
-                        "shell {sh:?} leaks reserved subcommand `{sub}` as a bare candidate"
-                    );
+                    let rest = &s[i + sub.len()..];
+                    let after = rest.chars().next();
+                    // DR-0019 §5: `--stdin-eof` の値リスト `detach send-eof` に含まれる
+                    // `detach` は reserved subcommand `detach` と文字列衝突するが、値
+                    // 補完であって subcommand 候補ではない。直後が ` send-eof` なら値
+                    // リストの一部として除外する (= false positive 回避)。
+                    let is_stdin_eof_value = rest.trim_start().starts_with("send-eof");
+                    if !is_stdin_eof_value {
+                        assert!(
+                            !(is_boundary(before) && is_boundary(after)),
+                            "shell {sh:?} leaks reserved subcommand `{sub}` as a bare candidate"
+                        );
+                    }
                     start = i + 1;
                 }
             }

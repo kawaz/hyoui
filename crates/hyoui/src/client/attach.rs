@@ -390,12 +390,23 @@ impl ClientConnection {
         let detach_prefix = resolve_detach_prefix_from_env()
             .map_err(|_| Error::Invalid("invalid HYOUI_DETACH_PREFIX env"))?;
         let mut detach_prefix_armed: bool = false;
+        // DR-0019 §5: SendEof で stdin EOF 観測後、stdin はもう読まない (= EOT 送出
+        // 済) が、子の出力 (= bc の計算結果) と SessionExitNotify を拾い切るため
+        // loop は継続する。stdin を poll し続けると EOF が POLLIN で返り続けて busy
+        // loop になるので、`stdin_done` を立てて以降は socket だけ poll する。
+        let mut stdin_done = false;
         loop {
             let socket_fd = self.reader.as_fd();
             let stdin_fd = stdin.as_fd();
+            // stdin_done のときは stdin に空 events を渡して poll 対象から実質外す。
+            let stdin_poll_flags = if stdin_done {
+                PollFlags::empty()
+            } else {
+                PollFlags::POLLIN
+            };
             let mut fds = [
                 PollFd::new(socket_fd, PollFlags::POLLIN),
-                PollFd::new(stdin_fd, PollFlags::POLLIN),
+                PollFd::new(stdin_fd, stdin_poll_flags),
             ];
 
             match poll(&mut fds, PollTimeout::NONE) {
@@ -497,20 +508,21 @@ impl ClientConnection {
                 let mut buf = [0u8; 8192];
                 match stdin.read(&mut buf) {
                     Ok(0) => {
-                        // R5-FB2: stdin EOF の挙動は `eof_action` で分岐。
-                        // - Detach (default): 即 return (= MVP attach 挙動)
-                        // - SendEof: EOT (0x04) を子 PTY に送ってから return
-                        //   (= `hyoui run -- bc` の pipe pattern
-                        //   で子が canonical mode の場合に自然 exit させる)
+                        // R5-FB2 / DR-0019 §5: stdin EOF の挙動は `eof_action` で分岐。
+                        // - Detach (default): 即 return (= MVP attach 挙動。子は残る)
+                        // - SendEof: EOT (0x04) を子 PTY に送り、stdin は閉じたまま
+                        //   loop を継続する。子 (= canonical mode の bc 等) は EOT を
+                        //   read EOF として解釈し、計算結果を出力してから exit する。
+                        //   その出力と SessionExitNotify を socket 経路で拾い切るため、
+                        //   ここで return せず stdin_done を立てて socket だけ poll
+                        //   し続ける (= 即 return すると bc の出力が stdout に届く前に
+                        //   client が抜けてしまう、DR-0019 §5 の透過性回復要件)。
                         if self.eof_action == StdinEofAction::SendEof {
                             let frame = Frame::raw_data(vec![0x04]);
                             let _ = frame.encode_to(&mut self.writer);
                             let _ = self.writer.flush();
-                            // daemon の出力を少し読み続ける選択肢もあるが、ここで
-                            // 即 return しても socket は close されず caller 側で
-                            // daemon thread を join するため、追加の write は
-                            // 不要 (= 子が EOT を見て read EOF → 普通に exit、
-                            // daemon の `master_fd::read_some` が 0 → 終了経路)。
+                            stdin_done = true;
+                            continue;
                         }
                         return Ok(None);
                     }

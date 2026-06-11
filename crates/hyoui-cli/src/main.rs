@@ -524,6 +524,17 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     if let Some(p) = cfg.debug_dump_client.as_deref() {
         attach_cmd.arg(format!("--debug-dump-client={p}"));
     }
+    // DR-0019 §5: pipe-through。run --stdin-eof を明示指定時のみ exec attach に
+    // 伝搬する (= 未指定なら attach 側が stdin tty 判定で解決する)。
+    if let Some(eof) = cfg.stdin_eof {
+        let v = match eof {
+            hyoui::cli::StdinEofArg::SendEof => "send-eof",
+            // Detach + 将来追加 variant は detach 扱い (= 未指定時の安全側 fallback と
+            // 整合。新値が増えたら明示 arm を足す)。
+            _ => "detach",
+        };
+        attach_cmd.arg(format!("--stdin-eof={v}"));
+    }
     // CommandExt::exec で自プロセスを置換。成功時は戻らない、失敗時は io::Error を返す。
     use std::os::unix::process::CommandExt;
     let err = attach_cmd.exec();
@@ -757,6 +768,21 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
     } else {
         conn
     };
+
+    // DR-0019 §5: pipe-through stdin EOF policy を解決して配線する。
+    // - 明示 `--stdin-eof=detach|send-eof` があればそれを使う
+    // - 未指定なら stdin が tty でない場合 SendEof (= pipe-through の透過性回復、
+    //   `echo "1+2" | hyoui run -- bc` で bc が自然 exit)、tty なら従来の Detach
+    //   (tty では EOF が通常来ないので実質影響なし)
+    let eof_action = match cfg.stdin_eof {
+        Some(hyoui::cli::StdinEofArg::SendEof) => hyoui::client::StdinEofAction::SendEof,
+        // 明示 `--stdin-eof=detach` (+ 将来 variant) は Detach。
+        Some(_) => hyoui::client::StdinEofAction::Detach,
+        // 未指定: 非 tty なら SendEof (= pipe-through 透過性回復)、tty なら Detach。
+        None if !stdin_is_tty => hyoui::client::StdinEofAction::SendEof,
+        None => hyoui::client::StdinEofAction::Detach,
+    };
+    let conn = conn.with_stdin_eof_action(eof_action);
 
     let _ = stdout.flush();
     let client_dump = cfg

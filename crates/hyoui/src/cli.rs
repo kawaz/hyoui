@@ -53,6 +53,20 @@ pub enum OnChildSuspend {
 // 新構成では attach client が外部 SIGTSTP を受けても daemon は無関係 (= 旧
 // `decouple` 相当の動作のみ、policy 選択肢自体が不要)。
 
+/// `--stdin-eof` flag の明示値 (DR-0019 §5)。attach / run 共通。
+///
+/// 未指定 (= `None`) のときの解決は呼出側 (= `attach_command`) が stdin の tty
+/// 判定で行う: 非 tty なら `SendEof` (= pipe-through の透過性回復)、tty なら従来
+/// 挙動 (= EOF が通常来ないので実質 `Detach`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StdinEofArg {
+    /// EOF 観測時にそのまま切断 (= 現行挙動。子は daemon 配下に残る)。
+    Detach,
+    /// EOF 観測時に EOT (0x04) を子 PTY へ送出 (= canonical mode の子が自然 exit)。
+    SendEof,
+}
+
 /// Shell whose completion script is being requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -173,6 +187,10 @@ pub struct RunConfig {
     /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。socket 配置先 dir と、
     /// 子プロセスへ常時注入する `HYOUI_NAMESPACE` env の値を決める。
     pub namespace: Option<String>,
+    /// `--stdin-eof=detach|send-eof` (DR-0019 §5)。`None` (= 未指定) なら exec attach
+    /// 側の tty 判定で解決 (= 非 tty で `SendEof`、tty で従来挙動)。`Some` のときは
+    /// 値をそのまま exec attach に伝搬する。
+    pub stdin_eof: Option<StdinEofArg>,
     /// argv of the child command.
     pub command: Vec<String>,
 }
@@ -207,6 +225,9 @@ pub struct AttachConfig {
     /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。session / index 解決を
     /// namespace スコープに絞る。
     pub namespace: Option<String>,
+    /// `--stdin-eof=detach|send-eof` (DR-0019 §5)。`None` (= 未指定) なら stdin の
+    /// tty 判定で解決 (= 非 tty で `SendEof`、tty で従来挙動の `Detach`)。
+    pub stdin_eof: Option<StdinEofArg>,
 }
 
 /// `list` subcommand の出力形式 (= `--format=plain|jsonl`)。
@@ -1940,6 +1961,7 @@ fn parse_attach(args: &[String]) -> Command {
         debug_dump_client: None,
         index: None,
         namespace: None,
+        stdin_eof: None,
     };
 
     let mut positionals: Vec<String> = Vec::new();
@@ -1996,6 +2018,16 @@ fn parse_attach(args: &[String]) -> Command {
                 None => {
                     return Command::Error("--debug-dump-client requires a value".into());
                 }
+            },
+            "--stdin-eof" => match value.as_deref() {
+                Some("detach") => cfg.stdin_eof = Some(StdinEofArg::Detach),
+                Some("send-eof") => cfg.stdin_eof = Some(StdinEofArg::SendEof),
+                Some(other) => {
+                    return Command::Error(format!(
+                        "attach: invalid --stdin-eof value: {other} (= detach | send-eof)"
+                    ));
+                }
+                None => return Command::Error("--stdin-eof requires a value".into()),
             },
             "--index" => match value {
                 Some(v) => match v.parse::<i32>() {
@@ -2110,6 +2142,7 @@ fn parse_run(args: &[String]) -> Command {
     let mut until: Option<String> = None;
     let mut socket: Option<String> = None;
     let mut on_child_suspend: Option<OnChildSuspend> = None;
+    let mut stdin_eof: Option<StdinEofArg> = None;
     let mut command: Vec<String> = Vec::new();
     let mut detached = false;
     let mut session: Option<String> = None;
@@ -2201,6 +2234,16 @@ fn parse_run(args: &[String]) -> Command {
             "--socket" => match value {
                 Some(v) => socket = Some(v),
                 None => return Command::Error("--socket requires a value".into()),
+            },
+            "--stdin-eof" => match value.as_deref() {
+                Some("detach") => stdin_eof = Some(StdinEofArg::Detach),
+                Some("send-eof") => stdin_eof = Some(StdinEofArg::SendEof),
+                Some(other) => {
+                    return Command::Error(format!(
+                        "invalid --stdin-eof value: {other} (= detach | send-eof)"
+                    ));
+                }
+                None => return Command::Error("--stdin-eof requires a value".into()),
             },
             "--on-child-suspend" => match value.as_deref() {
                 Some("notify") => on_child_suspend = Some(OnChildSuspend::Notify),
@@ -2317,6 +2360,7 @@ fn parse_run(args: &[String]) -> Command {
         debug_dump_server,
         debug_dump_client,
         namespace,
+        stdin_eof,
         command,
     })
 }
@@ -3293,6 +3337,10 @@ fn usage_run() -> String {
                 (state 翻訳前の bytes、ANSI escape 込み)\n    \
             --debug-dump-client PATH      daemon → client の raw bytes を file に append\n                                  \
                 (state-based redraw / attach 復元込み = user の terminal 表示)\n    \
+            --stdin-eof=detach|send-eof\n                                  \
+                stdin EOF 時の挙動 (DR-0019)。default: 非 tty stdin なら\n                                  \
+                send-eof (= EOT を子に送り `echo ... | hyoui run -- bc` で\n                                  \
+                子が自然 exit)、tty なら detach。detach は EOF で切断のみ\n    \
             -h, --help                    Show this help and exit\n\
         \n\
         ENVIRONMENT:\n    \
@@ -3329,6 +3377,9 @@ fn usage_attach() -> String {
                 Operating mode (default: rw)\n    \
             --exclusive           Demand exclusive session ownership at start\n    \
             --detach-others       Drop other attached clients on connect\n    \
+            --stdin-eof=detach|send-eof\n                          \
+                stdin EOF 時の挙動 (DR-0019)。default: 非 tty stdin なら\n                          \
+                send-eof (= EOT を子に送る)、tty なら detach\n    \
             -h, --help            Show this help and exit\n\
         \n\
         SESSION SELECTOR:\n    \
@@ -5217,8 +5268,44 @@ mod tests {
             Command::Run(cfg) => {
                 assert_eq!(cfg.command, vec!["echo".to_string(), "hello".to_string()]);
                 assert_eq!(cfg.on_child_suspend, OnChildSuspend::Notify);
+                // DR-0019 §5: 未指定なら None (= exec attach 側で tty 判定して解決)。
+                assert_eq!(cfg.stdin_eof, None);
             }
             other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_stdin_eof_send_eof_and_detach_parse() {
+        // DR-0019 §5: run --stdin-eof=send-eof|detach を明示値として保持する。
+        match parse_args(&args(&["run", "--stdin-eof=send-eof", "--", "bc"])) {
+            Command::Run(cfg) => assert_eq!(cfg.stdin_eof, Some(StdinEofArg::SendEof)),
+            other => panic!("expected Run, got {other:?}"),
+        }
+        match parse_args(&args(&["run", "--stdin-eof=detach", "--", "bc"])) {
+            Command::Run(cfg) => assert_eq!(cfg.stdin_eof, Some(StdinEofArg::Detach)),
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_stdin_eof_invalid_value_is_error() {
+        match parse_args(&args(&["run", "--stdin-eof=bogus", "--", "bc"])) {
+            Command::Error(msg) => assert!(msg.contains("stdin-eof"), "msg: {msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_stdin_eof_parse() {
+        // DR-0019 §5: attach --stdin-eof も同じ値を受ける (= run/attach 共通 flag)。
+        match parse_args(&args(&["attach", "demo", "--stdin-eof=send-eof"])) {
+            Command::Attach(cfg) => assert_eq!(cfg.stdin_eof, Some(StdinEofArg::SendEof)),
+            other => panic!("expected Attach, got {other:?}"),
+        }
+        match parse_args(&args(&["attach", "demo"])) {
+            Command::Attach(cfg) => assert_eq!(cfg.stdin_eof, None),
+            other => panic!("expected Attach, got {other:?}"),
         }
     }
 
