@@ -126,6 +126,32 @@ fn parse_detach_prefix(raw: &str) -> Option<Option<u8>> {
     None
 }
 
+/// stdin の `poll(2)` revents が「EOF 相当 (= もう読めない)」を意味するか判定する
+/// (= C-1: 非 tty stdin の POLLNVAL/POLLERR/POLLHUP 取りこぼし対策)。
+///
+/// `POLLIN` 単独は通常の読み取り readiness なので EOF 相当ではない (= read で 0 を
+/// 観測して初めて EOF。本関数では false を返し、呼び出し側の read 経路に進ませる)。
+/// 一方、以下は read に到達できない / read しても EOF なので、stdin EOF 経路に倒す:
+///
+/// - `POLLNVAL`: fd が poll 不可 (= macOS で `/dev/null` 等 chardev を `POLLIN` 要求
+///   すると即時返る、実機確認: macOS=0x20)。read を試すべきでないので即 EOF 扱い。
+/// - `POLLERR`: エラー状態。read しても無意味なので EOF 扱い。
+/// - `POLLHUP`: 対向 close (= pipe write 端が閉じた)。read で 0 (= EOF) になる。
+///
+/// `POLLHUP`/`POLLERR` は OS によっては `POLLIN` と同時に立つ (= まだ未読 byte が
+/// ある) ことがあるため、`POLLIN` が立っているときは EOF と即断せず read 経路に
+/// 任せる (= read が残り byte を返し切ってから 0 で EOF を観測する)。`POLLNVAL` は
+/// fd 自体が無効なので `POLLIN` 有無に関わらず EOF 扱いにする。
+fn stdin_revents_is_eof(revents: PollFlags) -> bool {
+    if revents.contains(PollFlags::POLLNVAL) {
+        return true;
+    }
+    if revents.contains(PollFlags::POLLIN) {
+        return false;
+    }
+    revents.intersects(PollFlags::POLLHUP | PollFlags::POLLERR)
+}
+
 /// detach prefix の既定 byte (= `Ctrl-A`, 0x01)。screen 慣例。
 ///
 /// stdin で prefix byte を 1 度押すと「prefix armed」状態になり、次の 1 byte で:
@@ -387,13 +413,18 @@ impl ClientConnection {
         self
     }
 
-    /// stdin EOF 時の挙動を設定 (R5-FB2)。default は `Detach` (= MVP attach
-    /// 挙動)。`SendEof` を設定すると `run` が stdin EOF を検出した瞬間に EOT
-    /// (= 0x04) を子 PTY に送ってから return する。
+    /// stdin EOF 時の挙動を設定 (R5-FB2 / DR-0019 §5)。
     ///
-    /// 通常 `hyoui run -- <cmd>` のような pipe-through pattern
-    /// でのみ意味を持つ (= `hyoui attach` 側は detach 同等が望ましいので変更
-    /// しない)。
+    /// `SendEof` を設定すると `run` が stdin EOF を検出した時点で EOT (= 0x04) を
+    /// 子 PTY に送り、stdin を poll 対象から外したまま loop を継続する (= 即 return
+    /// しない)。子 (= canonical mode の bc 等) は EOT を read EOF として解釈し、
+    /// 計算結果を出力してから exit する。その出力と `SessionExitNotify` を socket 経路で
+    /// 拾い切ってから抜けることで、pipe-through (`echo ... | hyoui run -- bc`) の
+    /// 透過性を回復する。`Detach` は EOF を検出した時点で即 return する (= 子は
+    /// daemon 配下に残る)。
+    ///
+    /// `run` / `attach` いずれも非 tty stdin (= pipe / `< /dev/null`) では default が
+    /// `SendEof`、tty stdin では `Detach` を CLI 層が選ぶ (DR-0019 §5)。
     #[must_use]
     pub fn with_stdin_eof_action(mut self, action: StdinEofAction) -> Self {
         self.eof_action = action;
@@ -435,12 +466,18 @@ impl ClientConnection {
     /// stdin / stdout を daemon と中継する。
     ///
     /// 終了条件:
-    /// - socket EOF (= daemon が終了)
-    /// - stdin EOF (= 呼び出し側が input stream を close、ただし通常 terminal では起きない)
-    /// - protocol violation
+    /// - socket EOF (= daemon が終了) → `Ok(None)`
+    /// - 子 PTY exit (= `SessionExitNotify` 受信) → `Ok(Some(exit_status))`
+    /// - stdin EOF (= 呼び出し側が input stream を close)。`eof_action` が `Detach`
+    ///   なら即 return、`SendEof` なら EOT を送って子の出力を拾い切ってから抜ける
+    ///   (= `with_stdin_eof_action` 参照、DR-0019 §5)。tty stdin では通常 EOF は
+    ///   起きないが、pipe / `< /dev/null` 等の非 tty stdin では起きる。
+    /// - protocol violation → `Err`
     ///
-    /// MVP: control message の送信は呼び出し側で `send_control` を別途叩く想定
-    /// (= resize/signal/detach/kill 等)。`run` は raw data の中継に専念する。
+    /// control message の送信は基本 `send_control` を別途叩く想定
+    /// (= resize/signal/detach/kill 等) だが、`run` 自身も daemon → client の
+    /// `LeaderNotify` / `SessionChildStoppedNotify` を受けて leader 状態更新 / suspend
+    /// follow / WINCH→Resize を処理する。
     ///
     /// # Errors
     ///
@@ -457,28 +494,47 @@ impl ClientConnection {
         let mut detach_prefix_armed: bool = false;
         // DR-0019 §5: SendEof で stdin EOF 観測後、stdin はもう読まない (= EOT 送出
         // 済) が、子の出力 (= bc の計算結果) と SessionExitNotify を拾い切るため
-        // loop は継続する。stdin を poll し続けると EOF が POLLIN で返り続けて busy
-        // loop になるので、`stdin_done` を立てて以降は socket だけ poll する。
+        // loop は継続する。
+        //
+        // M-1: stdin_done になったら stdin fd を poll 配列から**完全に除外**する
+        // (= PollFlags::empty() で残す方式は不可)。理由は 2 つ:
+        //   1. Linux の poll(2) は POLLHUP/POLLERR を events マスク無視で revents に
+        //      報告するため、EOF 済み pipe を events=0 で poll し続けると即時 return の
+        //      busy loop になる。
+        //   2. events=0 で残すと、stdin pipe の EOF 後に POLLHUP が立ち、drain 継続中の
+        //      stdin EOF 判定経路が即 Ok(None) return して bc の出力を取りこぼす race が
+        //      残る (= DR-0019 §5 が直したはずの透過性回復が壊れる)。
+        // fd を見ない構造にすることで両方を断つ。
         let mut stdin_done = false;
+        // 新規二重防御: winch notify fd が POLLHUP/POLLERR を返したら監視を諦める
+        // (= signal thread 起動失敗等で write 端が drop され read 端だけ残ると、
+        // POLLIN しか処理しない loop が POLLHUP で idle busy loop になるのを防ぐ)。
+        let mut winch_disabled = false;
         loop {
             let socket_fd = self.reader.as_fd();
+            // poll 配列を動的に組む。socket は常に index 0。stdin は stdin_done なら
+            // 除外、winch notify は winch_source があり winch_disabled でなければ末尾。
+            // 各 fd の index は変数で管理する (= 含めなかった fd の revents を誤読しない)。
             let stdin_fd = stdin.as_fd();
-            // stdin_done のときは stdin に空 events を渡して poll 対象から実質外す。
-            let stdin_poll_flags = if stdin_done {
-                PollFlags::empty()
+            let winch_fd = if winch_disabled {
+                None
             } else {
-                PollFlags::POLLIN
+                self.winch_source.as_ref().map(|s| s.notify_fd.as_fd())
             };
-            // DR-0019 §6: winch_source があれば notify pipe (= signal thread が WINCH
-            // を受けて書く) も poll する。fds 末尾に積んで index を別管理する
-            // (= stdin/socket の固定 index を崩さない)。
-            let winch_fd = self.winch_source.as_ref().map(|s| s.notify_fd.as_fd());
             let mut fds: Vec<PollFd> = Vec::with_capacity(3);
             fds.push(PollFd::new(socket_fd, PollFlags::POLLIN));
-            fds.push(PollFd::new(stdin_fd, stdin_poll_flags));
-            if let Some(wfd) = winch_fd {
+            let stdin_idx = if stdin_done {
+                None
+            } else {
+                let idx = fds.len();
+                fds.push(PollFd::new(stdin_fd, PollFlags::POLLIN));
+                Some(idx)
+            };
+            let winch_idx = winch_fd.map(|wfd| {
+                let idx = fds.len();
                 fds.push(PollFd::new(wfd, PollFlags::POLLIN));
-            }
+                idx
+            });
 
             match poll(&mut fds, PollTimeout::NONE) {
                 Ok(PollOutcome::Ready(_)) => {}
@@ -488,13 +544,22 @@ impl ClientConnection {
             }
 
             let sock_revents = fds[0].revents().unwrap_or(PollFlags::empty());
-            let stdin_revents = fds[1].revents().unwrap_or(PollFlags::empty());
-            let winch_revents = if winch_fd.is_some() {
-                fds[2].revents().unwrap_or(PollFlags::empty())
-            } else {
-                PollFlags::empty()
-            };
+            let stdin_revents = stdin_idx.map_or(PollFlags::empty(), |i| {
+                fds[i].revents().unwrap_or(PollFlags::empty())
+            });
+            let winch_revents = winch_idx.map_or(PollFlags::empty(), |i| {
+                fds[i].revents().unwrap_or(PollFlags::empty())
+            });
             let _ = fds;
+
+            // 新規二重防御: winch notify fd の異常 (= POLLHUP/POLLERR/POLLNVAL) を検出
+            // したら以降の loop で監視対象から外す (= busy loop 回避)。次 iteration の
+            // poll 配列構築で除外される。
+            if winch_revents
+                .intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL)
+            {
+                winch_disabled = true;
+            }
 
             // DR-0019 §6: WINCH notify を観測したら、pipe を drain して外側端末サイズを
             // 取得し、leader なら Resize を daemon に送る。size 取得 → send を分離する
@@ -586,6 +651,32 @@ impl ClientConnection {
                                         let _ = self.writer.flush();
                                     }
                                 }
+                                Ok(ControlMessage::LeaderNotify(n)) => {
+                                    // Minor 4: leader 変更通知で自分の leader 状態を更新する。
+                                    // client_id が自分なら leader、それ以外 (= 他 client or
+                                    // None=leader 不在) なら非 leader。これをしないと初代
+                                    // leader が detach して自分が昇格した後も response.leader
+                                    // が false 固定のままで、WINCH を受けても Resize を
+                                    // 送らない (= 昇格後 resize 不全)。
+                                    let was_leader = self.response.leader;
+                                    let now_leader = n.client_id == Some(self.response.client_id);
+                                    self.response.leader = now_leader;
+                                    // 昇格時 (false → true) は初回 Resize を送る (= attach 成立
+                                    // 時の send_initial_resize と同じ意図: 別端末サイズとの
+                                    // 不一致を昇格直後に解消する)。降格 (true → false) では
+                                    // 何もしない (= daemon が以後の Resize を reject する)。
+                                    if !was_leader && now_leader {
+                                        let size =
+                                            self.winch_source.as_mut().and_then(|s| (s.size_fn)());
+                                        if let Some((cols, rows)) = size {
+                                            let msg = ControlMessage::Resize(
+                                                crate::protocol::messages::Resize { cols, rows },
+                                            );
+                                            // 送信失敗は致命的でない (= 次の WINCH で再送)。
+                                            let _ = self.send_control(&msg);
+                                        }
+                                    }
+                                }
                                 Ok(_) => { /* 他 control message は無視 (= 既存 MVP 挙動) */
                                 }
                                 Err(_) => { /* decode 失敗は無視 (= forward-compat、未知 kind) */
@@ -606,20 +697,39 @@ impl ClientConnection {
                 return Ok(None);
             }
 
+            // C-1: stdin の revents が EOF 相当 (= POLLNVAL/POLLERR/POLLHUP で read に
+            // 到達できない or read しても EOF) なら、read を試さず stdin EOF 経路へ倒す。
+            // 非 tty stdin (= `< /dev/null` など) で macOS が POLLNVAL を即時返す場合、
+            // POLLIN が立たないため従来は read に到達できず EOF を観測できなかった
+            // (= EOT 未送出 + poll 即 return の busy loop)。
+            if stdin_revents_is_eof(stdin_revents) {
+                // R5-FB2 / DR-0019 §5: stdin EOF の挙動は `eof_action` で分岐。
+                // - Detach (default): 即 return (= MVP attach 挙動。子は残る)
+                // - SendEof: EOT (0x04) を子 PTY に送り、stdin は閉じたまま loop を
+                //   継続する。子 (= canonical mode の bc 等) は EOT を read EOF として
+                //   解釈し、計算結果を出力してから exit する。その出力と
+                //   SessionExitNotify を socket 経路で拾い切るため、ここで return せず
+                //   stdin_done を立てて stdin fd を poll 配列から外し socket だけ poll
+                //   し続ける (= 即 return すると bc の出力が stdout に届く前に client が
+                //   抜けてしまう、DR-0019 §5 の透過性回復要件)。
+                if self.eof_action == StdinEofAction::SendEof {
+                    let frame = Frame::raw_data(vec![0x04]);
+                    let _ = frame.encode_to(&mut self.writer);
+                    let _ = self.writer.flush();
+                    stdin_done = true;
+                    continue;
+                }
+                return Ok(None);
+            }
+
             // stdin → socket: raw data frame で送る
             if stdin_revents.contains(PollFlags::POLLIN) {
                 let mut buf = [0u8; 8192];
                 match stdin.read(&mut buf) {
                     Ok(0) => {
-                        // R5-FB2 / DR-0019 §5: stdin EOF の挙動は `eof_action` で分岐。
-                        // - Detach (default): 即 return (= MVP attach 挙動。子は残る)
-                        // - SendEof: EOT (0x04) を子 PTY に送り、stdin は閉じたまま
-                        //   loop を継続する。子 (= canonical mode の bc 等) は EOT を
-                        //   read EOF として解釈し、計算結果を出力してから exit する。
-                        //   その出力と SessionExitNotify を socket 経路で拾い切るため、
-                        //   ここで return せず stdin_done を立てて socket だけ poll
-                        //   し続ける (= 即 return すると bc の出力が stdout に届く前に
-                        //   client が抜けてしまう、DR-0019 §5 の透過性回復要件)。
+                        // read が 0 = EOF。revents が POLLIN だけ立っていたケース
+                        // (= 上の stdin_revents_is_eof で拾えなかった通常の pipe EOF)。
+                        // 挙動は上と同じく eof_action で分岐する。
                         if self.eof_action == StdinEofAction::SendEof {
                             let frame = Frame::raw_data(vec![0x04]);
                             let _ = frame.encode_to(&mut self.writer);
@@ -669,9 +779,8 @@ impl ClientConnection {
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => return Ok(None),
                 }
-            } else if stdin_revents.contains(PollFlags::POLLHUP) {
-                return Ok(None);
             }
+            // POLLHUP/POLLERR/POLLNVAL は上の stdin_revents_is_eof 経路で処理済み。
         }
     }
 
@@ -806,6 +915,99 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    // ---- C-1: stdin_revents_is_eof unit tests ----
+
+    #[test]
+    fn stdin_revents_pollin_only_is_not_eof() {
+        // POLLIN 単独は通常の readiness。read 経路に任せる (= EOF ではない)。
+        assert!(!stdin_revents_is_eof(PollFlags::POLLIN));
+    }
+
+    #[test]
+    fn stdin_revents_pollnval_is_eof_even_with_pollin() {
+        // POLLNVAL (= macOS の /dev/null 等) は fd 無効なので POLLIN 有無に関わらず EOF。
+        assert!(stdin_revents_is_eof(PollFlags::POLLNVAL));
+        assert!(stdin_revents_is_eof(
+            PollFlags::POLLNVAL | PollFlags::POLLIN
+        ));
+    }
+
+    #[test]
+    fn stdin_revents_pollhup_pollerr_are_eof_without_pollin() {
+        assert!(stdin_revents_is_eof(PollFlags::POLLHUP));
+        assert!(stdin_revents_is_eof(PollFlags::POLLERR));
+    }
+
+    #[test]
+    fn stdin_revents_pollhup_with_pollin_defers_to_read() {
+        // POLLHUP + POLLIN は「まだ未読 byte がある」可能性 → read に任せる (= EOF 即断しない)。
+        assert!(!stdin_revents_is_eof(
+            PollFlags::POLLHUP | PollFlags::POLLIN
+        ));
+        assert!(!stdin_revents_is_eof(
+            PollFlags::POLLERR | PollFlags::POLLIN
+        ));
+    }
+
+    #[test]
+    fn stdin_revents_empty_is_not_eof() {
+        assert!(!stdin_revents_is_eof(PollFlags::empty()));
+    }
+
+    // ---- M-1: stdin EOF (POLLNVAL) で run が spin せず SendEof 経路に倒れる ----
+
+    /// 非 tty stdin が即 POLLNVAL/EOF を返すケースで、SendEof 設定の run が EOT を 1 回
+    /// 送ってから stdin を poll 配列から外し (= 即時 return の busy loop にならず)、socket
+    /// EOF で正常終了することを検証する。stdin として「既に EOF な pipe (write 端を即
+    /// close)」を渡すと read=0 / POLLHUP 経路を踏む (= macOS の POLLNVAL と同じ EOF 経路に
+    /// 合流)。run が return することで「stdin_done 後に stdin fd を見続けて spin しない」
+    /// (= M-1 で poll 配列から除外した効果) を間接的に保証する。
+    #[test]
+    fn run_send_eof_on_already_eof_stdin_sends_single_eot_and_exits() {
+        use std::os::unix::net::UnixStream;
+
+        let (client_sock, daemon_sock) = UnixStream::pair().expect("socketpair");
+        let transport = UnixStreamTransport::new(client_sock);
+        let (reader, writer) = transport.split().expect("split");
+        let conn = ClientConnection {
+            reader,
+            writer,
+            response: HandshakeResponse {
+                caps: vec![],
+                session_id: "t".into(),
+                client_id: 1,
+                leader: false,
+                mode: Mode::Rw,
+            },
+            eof_action: StdinEofAction::SendEof,
+            suspend_hooks: None,
+            winch_source: None,
+        };
+
+        // 既に EOF な stdin: pipe の write 端を即 close。
+        let (stdin_rd, stdin_wr) = nix::unistd::pipe().expect("stdin pipe");
+        drop(stdin_wr);
+        let mut stdin_file = std::fs::File::from(stdin_rd);
+        let mut stdout: Vec<u8> = Vec::new();
+
+        let run_handle = std::thread::spawn(move || conn.run(&mut stdin_file, &mut stdout));
+
+        // daemon 役: EOT (= 0x04) frame を 1 つ受信できるはず。
+        let mut daemon_reader = daemon_sock;
+        let frame = Frame::decode_from(&mut daemon_reader).expect("decode EOT frame");
+        assert_eq!(frame.ty, TYPE_RAW_DATA);
+        assert_eq!(
+            frame.body,
+            vec![0x04],
+            "stdin EOF で EOT が 1 回送られるはず"
+        );
+
+        // socket を close → run は socket EOF で正常終了する (= stdin spin で hang しない)。
+        drop(daemon_reader);
+        let res = run_handle.join().expect("run thread join");
+        assert!(res.is_ok(), "run は socket EOF で Ok 終了するはず: {res:?}");
+    }
+
     // ---- DR-0019 §6: SIGWINCH → Resize 配線 unit tests ----
 
     /// leader でない client は initial resize を送らない (= daemon が reject するため)。
@@ -939,6 +1141,136 @@ mod tests {
         drop(daemon_reader);
         drop(stdin_wr_keep);
         let _ = run_handle.join();
+    }
+
+    // ---- Minor 4: LeaderNotify による昇格 → 初回 Resize ----
+
+    /// 非 leader client が `LeaderNotify { client_id = 自分 }` を受けたら leader に昇格し、
+    /// 昇格直後に現在サイズで初回 Resize を送る (= 初代 leader detach 後の resize 不全修復)。
+    #[test]
+    fn run_promotes_to_leader_and_sends_resize_on_leader_notify() {
+        use crate::protocol::ControlMessage;
+        use crate::protocol::messages::LeaderNotify;
+        use std::os::unix::net::UnixStream;
+
+        let (client_sock, daemon_sock) = UnixStream::pair().expect("socketpair");
+        let transport = UnixStreamTransport::new(client_sock);
+        let (reader, writer) = transport.split().expect("split");
+
+        let (notify_rd, _notify_wr) = nix::unistd::pipe().expect("pipe");
+        {
+            use nix::fcntl::{FcntlArg, OFlag, fcntl};
+            let flags = fcntl(notify_rd.as_fd(), FcntlArg::F_GETFL).unwrap();
+            let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+            fcntl(notify_rd.as_fd(), FcntlArg::F_SETFL(flags)).unwrap();
+        }
+        let size_fn: Box<dyn FnMut() -> Option<(u16, u16)> + Send> = Box::new(|| Some((90, 25)));
+        let conn = ClientConnection {
+            reader,
+            writer,
+            response: HandshakeResponse {
+                caps: vec![],
+                session_id: "t".into(),
+                client_id: 42,
+                // 初期は非 leader (= 他 client が leader)。
+                leader: false,
+                mode: Mode::Rw,
+            },
+            eof_action: StdinEofAction::Detach,
+            suspend_hooks: None,
+            winch_source: Some(WinchSource::new(notify_rd, size_fn)),
+        };
+
+        // stdin は EOF させない (= 書き込み端を保持)。
+        let (stdin_rd, stdin_wr_keep) = nix::unistd::pipe().expect("stdin pipe");
+        let mut stdin_file = std::fs::File::from(stdin_rd);
+        let mut stdout: Vec<u8> = Vec::new();
+
+        // daemon 役: client_id=42 を新 leader とする LeaderNotify を送る。
+        let mut daemon_sock = daemon_sock;
+        let notify = ControlMessage::LeaderNotify(LeaderNotify {
+            client_id: Some(42),
+        });
+        let body = notify.encode_to_vec().expect("encode leader.notify");
+        Frame::cbor_control(body)
+            .encode_to(&mut daemon_sock)
+            .expect("send leader.notify");
+
+        let run_handle = std::thread::spawn(move || conn.run(&mut stdin_file, &mut stdout));
+
+        // 昇格に伴う初回 Resize を受信検証。
+        let frame = Frame::decode_from(&mut daemon_sock).expect("decode resize frame");
+        assert_eq!(frame.ty, TYPE_CBOR_CONTROL);
+        match ControlMessage::decode_from(frame.body.as_slice()).expect("decode msg") {
+            ControlMessage::Resize(r) => {
+                assert_eq!(r.cols, 90);
+                assert_eq!(r.rows, 25);
+            }
+            other => panic!("昇格直後に Resize を送るはず, got {other:?}"),
+        }
+
+        drop(daemon_sock);
+        drop(stdin_wr_keep);
+        let _ = run_handle.join();
+    }
+
+    /// `LeaderNotify { client_id = 他 client }` を受けても (= 昇格しない) Resize を送らない。
+    /// 既に leader だった client が降格する場合に余計な Resize を出さないことも併せて確認。
+    #[test]
+    fn run_does_not_send_resize_when_not_promoted() {
+        use crate::protocol::ControlMessage;
+        use crate::protocol::messages::LeaderNotify;
+        use std::os::unix::net::UnixStream;
+
+        let (client_sock, daemon_sock) = UnixStream::pair().expect("socketpair");
+        let transport = UnixStreamTransport::new(client_sock);
+        let (reader, writer) = transport.split().expect("split");
+
+        let (notify_rd, _notify_wr) = nix::unistd::pipe().expect("pipe");
+        {
+            use nix::fcntl::{FcntlArg, OFlag, fcntl};
+            let flags = fcntl(notify_rd.as_fd(), FcntlArg::F_GETFL).unwrap();
+            let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+            fcntl(notify_rd.as_fd(), FcntlArg::F_SETFL(flags)).unwrap();
+        }
+        // size_fn は呼ばれてはいけない (= 昇格しないので Resize を組まない)。
+        let size_fn: Box<dyn FnMut() -> Option<(u16, u16)> + Send> =
+            Box::new(|| panic!("size_fn は昇格しない限り呼ばれない"));
+        let conn = ClientConnection {
+            reader,
+            writer,
+            response: HandshakeResponse {
+                caps: vec![],
+                session_id: "t".into(),
+                client_id: 42,
+                // 初期 leader だが、他 client への leader 移動通知で降格する。
+                leader: true,
+                mode: Mode::Rw,
+            },
+            eof_action: StdinEofAction::Detach,
+            suspend_hooks: None,
+            winch_source: Some(WinchSource::new(notify_rd, size_fn)),
+        };
+
+        let (stdin_rd, stdin_wr_keep) = nix::unistd::pipe().expect("stdin pipe");
+        let mut stdin_file = std::fs::File::from(stdin_rd);
+        let mut stdout: Vec<u8> = Vec::new();
+
+        // daemon 役: client_id=7 (= 他 client) を新 leader とする通知 → 自分は降格。
+        let mut daemon_sock = daemon_sock;
+        let notify = ControlMessage::LeaderNotify(LeaderNotify { client_id: Some(7) });
+        let body = notify.encode_to_vec().expect("encode leader.notify");
+        Frame::cbor_control(body)
+            .encode_to(&mut daemon_sock)
+            .expect("send leader.notify");
+        // 続けて socket close → run は降格処理後に socket EOF で終了する。
+        drop(daemon_sock);
+
+        let run_handle = std::thread::spawn(move || conn.run(&mut stdin_file, &mut stdout));
+        let res = run_handle.join().expect("join");
+        drop(stdin_wr_keep);
+        // size_fn の panic が起きず Ok 終了すれば「降格時に Resize を組まなかった」証拠。
+        assert!(res.is_ok(), "run は socket EOF で Ok 終了するはず: {res:?}");
     }
 
     // ---- process_detach_prefix unit tests ----
