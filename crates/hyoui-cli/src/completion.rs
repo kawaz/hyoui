@@ -243,7 +243,7 @@ _hyoui() {
                 --stdin-eof=*)
                     COMPREPLY=( $(compgen -W "detach send-eof" -- "${cur#*=}") ); return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --index --mode --exclusive --detach-others --stdin-eof --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --namespace --index --mode --stdin-eof --help -h" -- "$cur") )
             return 0 ;;
         list)
             case "$cur" in
@@ -328,8 +328,6 @@ _hyoui() {
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
                         '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '--mode=[Operating mode]:mode:(rw ro rw-no-leader)' \
-                        '--exclusive[Demand exclusive ownership]' \
-                        '--detach-others[Drop other clients on connect]' \
                         '--stdin-eof=[stdin EOF action]:action:(detach send-eof)' \
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:session id:'
@@ -778,8 +776,6 @@ complete -c hyoui -n '__hyoui_using_subcommand attach' -l socket         -r -F  
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l index          -x                           -d 'Session selector (1=oldest, -1=newest)'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l mode           -x -a 'rw ro rw-no-leader'   -d 'Operating mode'
-complete -c hyoui -n '__hyoui_using_subcommand attach' -l exclusive                                    -d 'Demand exclusive ownership'
-complete -c hyoui -n '__hyoui_using_subcommand attach' -l detach-others                                -d 'Drop other clients on connect'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l stdin-eof      -x -a 'detach send-eof'        -d 'stdin EOF action'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -s h -l help                                    -d 'Show help and exit'
 

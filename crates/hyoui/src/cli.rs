@@ -2004,13 +2004,25 @@ fn parse_attach(args: &[String]) -> Command {
                 Some(v) => cfg.mode_str = Some(v),
                 None => return Command::Error("--mode requires a value".into()),
             },
+            // DR-0019 §6: `--exclusive` / `--detach-others` は dead field
+            // (= wire には乗るが daemon 側に読む production コード無し)。silent
+            // no-op の放置は DR-0014 検証主義違反なので、実装が入るまで parse 段で
+            // 「未実装」を明示する (= DR-0004 の予約エラーと同じ流儀)。実装は別 issue。
             "--exclusive" => {
-                cfg.exclusive = true;
-                consumed_extra = false; // bool flag は次 arg 食わない
+                return Command::Error(
+                    "attach: --exclusive is not yet implemented (DR-0019 §6)。\
+                     daemon 側に占有要求を読む処理が無い (= dead field) ため、\
+                     実装が入るまで明示的に reject する"
+                        .into(),
+                );
             }
             "--detach-others" => {
-                cfg.detach_others = true;
-                consumed_extra = false;
+                return Command::Error(
+                    "attach: --detach-others is not yet implemented (DR-0019 §6)。\
+                     daemon 側に他 client 奪取を読む処理が無い (= dead field) ため、\
+                     実装が入るまで明示的に reject する"
+                        .into(),
+                );
             }
             "--debug-dump-client" => match value {
                 Some(v) if !v.is_empty() => cfg.debug_dump_client = Some(v),
@@ -3375,8 +3387,8 @@ fn usage_attach() -> String {
             --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --mode rw|ro|rw-no-leader\n                          \
                 Operating mode (default: rw)\n    \
-            --exclusive           Demand exclusive session ownership at start\n    \
-            --detach-others       Drop other attached clients on connect\n    \
+            --exclusive           (未実装、DR-0019 §6) 指定するとエラー\n    \
+            --detach-others       (未実装、DR-0019 §6) 指定するとエラー\n    \
             --stdin-eof=detach|send-eof\n                          \
                 stdin EOF 時の挙動 (DR-0019)。default: 非 tty stdin なら\n                          \
                 send-eof (= EOT を子に送る)、tty なら detach\n    \
@@ -3411,7 +3423,6 @@ fn usage_attach() -> String {
             hyoui attach --index=2                  # 2 番古い live session に attach\n    \
             hyoui attach --socket=/tmp/x.sock       # 直接 socket 指定\n    \
             hyoui attach demo --mode=ro             # 読み取り専用 attach\n    \
-            hyoui attach demo --detach-others       # 他 client を蹴って奪う\n    \
             HYOUI_DETACH_PREFIX=Ctrl-B hyoui attach demo  # prefix を Ctrl-B に変更\n\
         \n\
         RELATED:\n    \
@@ -6121,22 +6132,44 @@ mod tests {
     }
 
     #[test]
-    fn attach_with_mode_and_flags() {
-        match parse_args(&args(&[
-            "attach",
-            "demo",
-            "--mode",
-            "ro",
-            "--exclusive",
-            "--detach-others",
-        ])) {
+    fn attach_with_mode_parses() {
+        match parse_args(&args(&["attach", "demo", "--mode", "ro"])) {
             Command::Attach(cfg) => {
                 assert_eq!(cfg.session_id.as_deref(), Some("demo"));
                 assert_eq!(cfg.mode_str.as_deref(), Some("ro"));
-                assert!(cfg.exclusive);
-                assert!(cfg.detach_others);
             }
             other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_exclusive_is_unimplemented_error() {
+        // DR-0019 §6: `--exclusive` は dead field (= daemon 側に読むコード無し)。
+        // silent no-op を避けるため parse 段で「未実装」を明示する (DR-0004 流儀)。
+        match parse_args(&args(&["attach", "demo", "--exclusive"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("--exclusive"), "msg: {msg}");
+                assert!(
+                    msg.contains("not yet implemented") || msg.contains("未実装"),
+                    "msg: {msg}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_detach_others_is_unimplemented_error() {
+        // DR-0019 §6: `--detach-others` も同様に未実装エラー。
+        match parse_args(&args(&["attach", "demo", "--detach-others"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("--detach-others"), "msg: {msg}");
+                assert!(
+                    msg.contains("not yet implemented") || msg.contains("未実装"),
+                    "msg: {msg}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
         }
     }
 
