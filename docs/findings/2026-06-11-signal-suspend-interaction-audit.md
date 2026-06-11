@@ -112,7 +112,23 @@ anchor 構造の実機確認: daemon は `ppid=1` の session leader (`Ss`、PID
 - daemon を `kill -STOP` → `kill -CONT` で実際に stop/resume させても → child は `T+` のまま
 - child へ直接 `kill -CONT` すれば即復帰 (= child 自体は正常)
 
-self-pipe → drain → killpg 経路のどこかで切れている疑い (SIGCONT 受信時に self-pipe write が走らない、または waitpid が Stopped を返さない)。→ docs/issue/2026-06-11-bug-daemon-signal-robustness.md に起票。
+self-pipe → drain → killpg 経路のどこかで切れている疑い (SIGCONT 受信時に self-pipe write が走らない、または waitpid が Stopped を返さない)。
+
+**→ root cause 確定・修正済み (2026-06-12)**: kernel は Stopped transition を一度しか報告しないため、child STOP 時に SIGCHLD 経由の `poll_with_transition` が `WaitStatus::Stopped` を消費済みで、SIGCONT 受信時の自前 `waitpid(WNOHANG|WUNTRACED|WCONTINUED)` は `StillAlive` を返し killpg に到達しなかった。`ChildLifecycle::is_stopped()` の latch 参照に修正 (旧ロジック退行で e2e fail / 新ロジックで pass の裏取り済み)。
+
+### 修正実施記録 (2026-06-12、daemon-signal-robustness issue 昇華)
+
+監査・実機検証で見つかった daemon シグナル系の問題は全て修正済み:
+
+| 問題 | 修正 |
+|---|---|
+| daemon 死で client が exit 0 (子の正常終了と区別不能) | `run()` を RunOutcome enum (ChildExited/Detached/ConnectionLost) に分解、ConnectionLost = **exit 9** + stderr 1 行。9 は子の頻出 code (0-255、130/137/143) と hyoui 既存慣習 (1/2/3) を避けた専用値 |
+| 子 exit 時の SessionExitNotify drain race (exit 9 分離で顕在化) | broadcast 後に終端 drain wait を追加 |
+| SIGCONT 連動不発 | 上記 root cause 修正 |
+| SIGTERM/SIGINT 即死 (graceful shutdown 不在 + socket 残骸) | self-pipe に register、killpg(SIGTERM) → finalize escalation → SessionExitNotify → socket unlink (reason=sigterm/sigint を record) |
+| SIGTSTP 吸い込みコメント乖離 | 「意図的に握り潰す (= daemon を外部 TSTP で止めさせない)」と実態通りに修正 (register をやめると default STOPPED に戻るため維持) |
+
+daemon `kill -9` → child SIGHUP 巻き添えの根本対策は anchor 構造と排他のため**やらない** (DR-0017 の構造判断、Consequences に記録済み)。意図的停止は SIGTERM graceful 経路を使う。
 
 ## 関連
 
