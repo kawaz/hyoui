@@ -31,6 +31,7 @@ pub fn run_detached_parent(
     scrollback_rows: Option<usize>,
     debug_dump: Option<String>,
     namespace: String,
+    on_child_suspend: hyoui::cli::OnChildSuspend,
     cmd: Vec<String>,
 ) -> ExitCode {
     match spawn_detached_daemon_and_wait_ready(
@@ -41,6 +42,7 @@ pub fn run_detached_parent(
         scrollback_rows,
         debug_dump,
         namespace,
+        on_child_suspend,
         cmd,
     ) {
         Ok((session_id, _sock)) => {
@@ -71,6 +73,7 @@ pub fn spawn_detached_daemon_and_wait_ready(
     scrollback_rows: Option<usize>,
     debug_dump: Option<String>,
     namespace: String,
+    on_child_suspend: hyoui::cli::OnChildSuspend,
     cmd: Vec<String>,
 ) -> Result<(String, PathBuf), ExitCode> {
     let session_id = session_id_override.unwrap_or_else(socket_path::auto_session_id);
@@ -126,6 +129,8 @@ pub fn spawn_detached_daemon_and_wait_ready(
         debug_dump: debug_dump.filter(|s| !s.is_empty()),
         // DR-0018: 解決済 namespace を daemon child に伝える (= 子 PTY へ env 注入する値)。
         namespace,
+        // DR-0019: 子 STOPPED 時の daemon 挙動を伝える。
+        on_child_suspend: Some(child_suspend_str(on_child_suspend).to_string()),
     };
     let init_json = match serde_json::to_string(&init) {
         Ok(s) => s,
@@ -303,11 +308,40 @@ struct DaemonizeInit {
     /// 旧 daemon child との互換のため `default` で skip (= 未設定なら "default" 扱い)。
     #[serde(default = "default_namespace_field")]
     namespace: String,
+
+    /// DR-0019: 子 STOPPED 時の daemon 挙動 (= `hyoui run --on-child-suspend`)。
+    /// "notify" (default) または "auto-resume"。未設定 / 未知値は notify 扱い。
+    #[serde(
+        rename = "on_child_suspend",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    on_child_suspend: Option<String>,
 }
 
 /// `DaemonizeInit.namespace` の serde default (= 旧 init JSON 互換)。
 fn default_namespace_field() -> String {
     hyoui::cli::DEFAULT_NAMESPACE.to_string()
+}
+
+/// `cli::OnChildSuspend` を DaemonizeInit JSON で運ぶ文字列に変換。
+///
+/// `OnChildSuspend` は `#[non_exhaustive]` のため wildcard が必要。
+/// 未知 variant は安全側の "notify" (= 勝手に子を起こさない) に倒す。
+fn child_suspend_str(p: hyoui::cli::OnChildSuspend) -> &'static str {
+    match p {
+        hyoui::cli::OnChildSuspend::AutoResume => "auto-resume",
+        _ => "notify",
+    }
+}
+
+/// DaemonizeInit JSON の文字列を daemon 層の `ChildSuspendPolicy` に解決。
+/// 未設定 / 未知値は notify (= 安全側、勝手に子を起こさない) に倒す。
+fn parse_child_suspend(s: Option<&str>) -> hyoui::daemon::ChildSuspendPolicy {
+    match s {
+        Some("auto-resume") => hyoui::daemon::ChildSuspendPolicy::AutoResume,
+        _ => hyoui::daemon::ChildSuspendPolicy::Notify,
+    }
 }
 
 /// daemon 子 process の本体 (= env `HYOUI_DAEMONIZE_INIT` で JSON init を受け取る)。
@@ -350,6 +384,7 @@ pub fn run_daemon_child() -> ExitCode {
     let until = init.until.clone();
     let scrollback_rows = init.scrollback_rows;
     let debug_dump = init.debug_dump.clone();
+    let on_child_suspend = parse_child_suspend(init.on_child_suspend.as_deref());
 
     // DR-0018: 子 PTY に `HYOUI_NAMESPACE` を **常時注入** (= default でも注入)。
     // daemon child 自身の env に set しておくと、`Session::start` が fork+execvp する
@@ -413,7 +448,8 @@ pub fn run_daemon_child() -> ExitCode {
     {
         dcfg.until = Some(needle);
     }
-    // DR-0015: daemon は jobcontrol policy を持たない (= client 側発動)。
+    // DR-0019: 子 STOPPED 時の daemon 挙動 (notify / auto-resume) を配線。
+    dcfg.on_child_suspend = on_child_suspend;
     // DR-0013 §8 + §8 Update: scrollback rows 上限を daemon に配線。
     if let Some(n) = scrollback_rows {
         dcfg.screen_vt100_scrollback_rows = n;
@@ -446,6 +482,74 @@ pub fn run_daemon_child() -> ExitCode {
     }
 }
 
-// DR-0015: suspend policy 値 round-trip helper (= child_suspend_str /
-// parent_suspend_str / parse_*) は廃止。policy は client 側で発動するため
-// daemon child に伝搬する必要なし。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyoui::cli::OnChildSuspend;
+    use hyoui::daemon::ChildSuspendPolicy;
+
+    /// DR-0019: `--on-child-suspend=auto-resume` が DaemonizeInit JSON を round-trip
+    /// して daemon 層の `ChildSuspendPolicy::AutoResume` に解決される (= 配線の正本)。
+    #[test]
+    fn daemonize_init_propagates_auto_resume() {
+        let init = DaemonizeInit {
+            socket: "/tmp/x.sock".into(),
+            session: "demo".into(),
+            ready_fd: 7,
+            on_child_suspend: Some(child_suspend_str(OnChildSuspend::AutoResume).to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&init).expect("serialize");
+        assert!(json.contains("auto-resume"));
+        let decoded: DaemonizeInit = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            parse_child_suspend(decoded.on_child_suspend.as_deref()),
+            ChildSuspendPolicy::AutoResume
+        );
+    }
+
+    /// notify は明示でも round-trip して `Notify` に解決される。
+    #[test]
+    fn daemonize_init_propagates_notify() {
+        let init = DaemonizeInit {
+            socket: "/tmp/x.sock".into(),
+            session: "demo".into(),
+            ready_fd: 7,
+            on_child_suspend: Some(child_suspend_str(OnChildSuspend::Notify).to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&init).expect("serialize");
+        let decoded: DaemonizeInit = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            parse_child_suspend(decoded.on_child_suspend.as_deref()),
+            ChildSuspendPolicy::Notify
+        );
+    }
+
+    /// 旧 init JSON (= on_child_suspend field 無し) は None → Notify に倒れる
+    /// (= 安全側、勝手に子を起こさない)。
+    #[test]
+    fn daemonize_init_missing_field_defaults_to_notify() {
+        let json = r#"{"socket":"/tmp/x.sock","session":"demo","ready_fd":7}"#;
+        let decoded: DaemonizeInit = serde_json::from_str(json).expect("deserialize legacy");
+        assert_eq!(decoded.on_child_suspend, None);
+        assert_eq!(
+            parse_child_suspend(decoded.on_child_suspend.as_deref()),
+            ChildSuspendPolicy::Notify
+        );
+    }
+
+    /// 未知値も安全側の Notify に倒す。
+    #[test]
+    fn parse_child_suspend_unknown_falls_back_to_notify() {
+        assert_eq!(
+            parse_child_suspend(Some("bogus")),
+            ChildSuspendPolicy::Notify
+        );
+        assert_eq!(parse_child_suspend(None), ChildSuspendPolicy::Notify);
+        assert_eq!(
+            parse_child_suspend(Some("auto-resume")),
+            ChildSuspendPolicy::AutoResume
+        );
+    }
+}

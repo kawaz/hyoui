@@ -36,7 +36,6 @@ use crate::sys::{
     poll::PollOutcome, poll::poll, pty::Spawned, register_self_pipe,
 };
 
-use super::DaemonConfig;
 use super::accept::{
     MAX_PENDING_HANDSHAKES, PendingHandshake, process_pending_handshakes, spawn_handshake_worker,
 };
@@ -49,6 +48,7 @@ use super::pty::{
     ALIVE_RETRY_INTERVAL, ChildLifecycle, ChildState, ChildTransition, STOPPED_POLL_INTERVAL,
 };
 use super::screen::{ScreenState, StalledOutcome, check_stalled};
+use super::{ChildSuspendPolicy, DaemonConfig};
 
 /// R5-H7: send `sig` to the child's whole process group instead of only the
 /// session-leader PID, so descendants that the shell may have backgrounded
@@ -831,10 +831,12 @@ fn notify_child_stopped(
     clients: &mut [ClientHandle],
     state: &SessionState,
     sig_observed: i32,
+    policy: ChildSuspendPolicy,
 ) -> Vec<u64> {
     use crate::protocol::messages::SessionChildStoppedNotify;
 
     // 子が stopped であることを記録 (= status/list の可観測性、DR-0017 §柱2)。
+    // AutoResume でも一旦立てる (= 直後の SIGCONT で Continued 観測時に下りる)。
     state.set_child_stopped(true);
 
     // DR-0016 §3: child-stopped-observed lifecycle event (= 4 段階の 1 段階目)。
@@ -848,6 +850,19 @@ fn notify_child_stopped(
             pid: child.as_raw() as u32,
             ts_unix_ms: now_unix_ms(),
         });
+
+    // DR-0019: auto-resume policy では daemon が即座に子を起こす。
+    //
+    // Design rationale: ここで `SessionChildStoppedNotify` を送ら**ない**。
+    // 通知すると leader client が follow して自身を SIGSTOP した直後に、daemon が
+    // 子だけ SIGCONT で復帰させてしまい、client が置き去り (= 子は動くのに人間の
+    // 端末は止まったまま) になる race が生じる。auto-resume の意図は「誰も follow
+    // させず、子を即復帰させる」なので、stopped event の record だけ残して通知は
+    // 抑止する。子の Continued は次回 poll の `record_child_continued` 経路で記録される。
+    if policy == ChildSuspendPolicy::AutoResume {
+        let _ = kill_pgrp(child, Signal::SIGCONT);
+        return Vec::new();
+    }
 
     // leader を探す。複数 leader はあり得ない設計 (= broadcast.rs::elevate_next_leader)。
     let leader_idx = clients.iter().position(|ch| ch.leader);
@@ -1051,7 +1066,13 @@ fn serve_loop(
                 }
                 match transition {
                     Some(ChildTransition::Stopped { sig }) => {
-                        let overflow = notify_child_stopped(child, clients, state, sig);
+                        let overflow = notify_child_stopped(
+                            child,
+                            clients,
+                            state,
+                            sig,
+                            config.on_child_suspend,
+                        );
                         overflow_ids.extend(overflow);
                     }
                     Some(ChildTransition::Continued) => record_child_continued(state, child),
@@ -1073,7 +1094,13 @@ fn serve_loop(
                     }
                     match transition {
                         Some(ChildTransition::Stopped { sig }) => {
-                            let overflow = notify_child_stopped(child, clients, state, sig);
+                            let overflow = notify_child_stopped(
+                                child,
+                                clients,
+                                state,
+                                sig,
+                                config.on_child_suspend,
+                            );
                             overflow_ids.extend(overflow);
                         }
                         Some(ChildTransition::Continued) => record_child_continued(state, child),
@@ -1173,7 +1200,8 @@ fn serve_loop(
             }
             match transition {
                 Some(ChildTransition::Stopped { sig }) => {
-                    let overflow = notify_child_stopped(child, clients, state, sig);
+                    let overflow =
+                        notify_child_stopped(child, clients, state, sig, config.on_child_suspend);
                     overflow_ids.extend(overflow);
                 }
                 Some(ChildTransition::Continued) => record_child_continued(state, child),
@@ -1222,7 +1250,13 @@ fn serve_loop(
                     let (child_state, transition) = lifecycle.poll_with_transition(child);
                     match transition {
                         Some(ChildTransition::Stopped { sig }) => {
-                            let overflow = notify_child_stopped(child, clients, state, sig);
+                            let overflow = notify_child_stopped(
+                                child,
+                                clients,
+                                state,
+                                sig,
+                                config.on_child_suspend,
+                            );
                             overflow_ids.extend(overflow);
                         }
                         Some(ChildTransition::Continued) => record_child_continued(state, child),
@@ -1286,7 +1320,13 @@ fn serve_loop(
                     let (child_state, transition) = lifecycle.poll_with_transition(child);
                     match transition {
                         Some(ChildTransition::Stopped { sig }) => {
-                            let overflow = notify_child_stopped(child, clients, state, sig);
+                            let overflow = notify_child_stopped(
+                                child,
+                                clients,
+                                state,
+                                sig,
+                                config.on_child_suspend,
+                            );
                             overflow_ids.extend(overflow);
                         }
                         Some(ChildTransition::Continued) => record_child_continued(state, child),
@@ -1688,7 +1728,13 @@ mod tests {
         // leader 不在 (= clients 空) で notify_child_stopped を呼ぶ。
         let state = SessionState::default();
         let mut clients: Vec<ClientHandle> = Vec::new();
-        let overflow = notify_child_stopped(child, &mut clients, &state, Signal::SIGTSTP as i32);
+        let overflow = notify_child_stopped(
+            child,
+            &mut clients,
+            &state,
+            Signal::SIGTSTP as i32,
+            ChildSuspendPolicy::Notify,
+        );
         assert!(overflow.is_empty(), "no leader = no notify overflow");
 
         // DR-0017: stopped 観測フラグが立つ (= 可観測性)。

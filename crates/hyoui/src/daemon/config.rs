@@ -2,6 +2,22 @@
 
 use std::path::PathBuf;
 
+/// 子 process が STOPPED に入ったときの daemon の挙動 (DR-0017 §柱2 / DR-0019)。
+///
+/// CLI 層の `crate::cli::OnChildSuspend` と 1:1 対応するが、daemon 層が CLI 層に
+/// 依存しないよう config 側に独立した型を持つ (= 依存方向を CLI → daemon に保つ)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ChildSuspendPolicy {
+    /// leader client に `SessionChildStoppedNotify` を送るだけ (= 子を起こさない)。
+    /// DR-0017 §柱2 の default 挙動。
+    #[default]
+    Notify,
+    /// daemon が即座に子 process group へ SIGCONT を送って復帰させる
+    /// (= notify は送らない、`session.rs::notify_child_stopped` 参照)。
+    AutoResume,
+}
+
 /// daemon 1 つ分の起動設定。
 ///
 /// `cmd` で指定した process を子 PTY として spawn し、`socket_path` で
@@ -116,6 +132,12 @@ pub struct DaemonConfig {
     /// `DaemonConfig::new` で起動毎に新規生成。clone 時は同 ID を保持
     /// (= 同一 daemon の中で config を clone する経路は restart ではない)。
     pub daemon_boot_id: String,
+
+    /// 子が STOPPED に入ったときの daemon の挙動 (DR-0017 §柱2 / DR-0019)。
+    ///
+    /// `hyoui run --on-child-suspend=notify|auto-resume` から配線される
+    /// (= DaemonizeInit → run_daemon_child → ここ)。default は `Notify`。
+    pub on_child_suspend: ChildSuspendPolicy,
 }
 
 impl std::fmt::Debug for DaemonConfig {
@@ -141,6 +163,7 @@ impl std::fmt::Debug for DaemonConfig {
             .field("debug_dump_path", &self.debug_dump_path)
             .field("cwd", &self.cwd)
             .field("daemon_boot_id", &self.daemon_boot_id)
+            .field("on_child_suspend", &self.on_child_suspend)
             .finish()
     }
 }
@@ -171,6 +194,8 @@ impl DaemonConfig {
             // DR-0016 §3: daemon プロセス起動毎に UUID v4 を生成し、jsonl header の
             // `daemon_boot_id` に乗せる。pid 再利用に強い識別子。
             daemon_boot_id: uuid::Uuid::new_v4().to_string(),
+            // DR-0017 §柱2: default は notify-only (= 子を勝手に起こさない)。
+            on_child_suspend: ChildSuspendPolicy::Notify,
         }
     }
 }
@@ -193,6 +218,8 @@ mod tests {
         assert_eq!(cfg.screen_input_log_bytes, 1024 * 1024); // DR-0013 §7 既定 1 MiB
         assert_eq!(cfg.screen_vt100_scrollback_rows, 1000); // DR-0013 §8 既定 1000 行
         assert_eq!(cfg.client_buffer_bytes, 8 * 1024 * 1024); // DR-0008 §8.2 既定
+        // DR-0017 §柱2: default は notify-only。
+        assert_eq!(cfg.on_child_suspend, ChildSuspendPolicy::Notify);
     }
 
     #[test]

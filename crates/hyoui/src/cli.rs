@@ -35,12 +35,17 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Behavior when the child process is suspended (STOPPED).
+///
+/// daemon 視点の policy 名。daemon が子の stop を観測したときに何をするか:
+/// - `Notify`: leader client に `SessionChildStoppedNotify` を送るだけ
+///   (= 勝手に子を起こさない、DR-0017 §柱2)。client 側がそれを受けて follow する。
+/// - `AutoResume`: daemon が即座に子 process group へ SIGCONT を送って復帰させる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum OnChildSuspend {
-    /// Follow the child: the parent also stops (SIGSTOP raised on self).
-    Follow,
-    /// Resume the child immediately by sending SIGCONT.
+    /// Notify the leader client; do not resume the child automatically.
+    Notify,
+    /// Resume the child immediately by sending SIGCONT (daemon-driven).
     AutoResume,
 }
 
@@ -2198,7 +2203,7 @@ fn parse_run(args: &[String]) -> Command {
                 None => return Command::Error("--socket requires a value".into()),
             },
             "--on-child-suspend" => match value.as_deref() {
-                Some("follow") => on_child_suspend = Some(OnChildSuspend::Follow),
+                Some("notify") => on_child_suspend = Some(OnChildSuspend::Notify),
                 Some("auto-resume") => on_child_suspend = Some(OnChildSuspend::AutoResume),
                 Some(other) => {
                     return Command::Error(format!("invalid --on-child-suspend value: {other}"));
@@ -2264,10 +2269,8 @@ fn parse_run(args: &[String]) -> Command {
     }
 
     // DR-0017 §柱2: default は **notify のみ** (= 子の suspend を勝手に起こさない)。
-    // `OnChildSuspend::Follow` が notify-only に相当する。`AutoResume` は opt-in
-    // (`--on-child-suspend=auto-resume`) として残すが、どの mode でも default には
-    // しない (= headless でも勝手に resume しない)。
-    let final_child_suspend = on_child_suspend.unwrap_or(OnChildSuspend::Follow);
+    // `AutoResume` は opt-in (`--on-child-suspend=auto-resume`) でのみ選べる。
+    let final_child_suspend = on_child_suspend.unwrap_or(OnChildSuspend::Notify);
 
     // Virtual size: explicit 指定のみ Some、未指定なら None で caller (= run_command)
     // が外側 TTY size を継承する経路に流す (= ユーザ指示 2026-05-29)。
@@ -3250,9 +3253,10 @@ fn usage_run() -> String {
             --socket PATH                 Unix socket path for input injection\n    \
             --namespace NS                Session namespace (default: \"default\";\n                                  \
                 env HYOUI_NAMESPACE で継承可、子に常時注入される)\n    \
-            --on-child-suspend=follow|auto-resume\n                                  \
+            --on-child-suspend=notify|auto-resume\n                                  \
                 Action when the child is stopped\n                                  \
-                (default: follow; headless: auto-resume)\n    \
+                (notify: tell the leader client; auto-resume: daemon\n                                  \
+                sends SIGCONT to resume the child. default: notify)\n    \
             --scrollback-rows N           vt100 内蔵 scrollback ring 行数上限\n                                  \
                 (= screen dump --layer=scrollback / --layer=both で\n                                  \
                 取り出せる過去 row の最大数、default 1000、0 で無効)\n    \
@@ -5193,7 +5197,7 @@ mod tests {
         match parse_args(&args(&["run", "--", "echo", "hello"])) {
             Command::Run(cfg) => {
                 assert_eq!(cfg.command, vec!["echo".to_string(), "hello".to_string()]);
-                assert_eq!(cfg.on_child_suspend, OnChildSuspend::Follow);
+                assert_eq!(cfg.on_child_suspend, OnChildSuspend::Notify);
             }
             other => panic!("expected Run, got {other:?}"),
         }
@@ -5201,11 +5205,11 @@ mod tests {
 
     #[test]
     fn run_default_suspend_is_notify_only() {
-        // DR-0017 §柱2: default は notify-only (= Follow)。auto-resume は
+        // DR-0017 §柱2: default は notify-only。auto-resume は
         // opt-in に限定 (= 勝手に子を起こさない)。
         match parse_args(&args(&["run", "--", "cat"])) {
             Command::Run(cfg) => {
-                assert_eq!(cfg.on_child_suspend, OnChildSuspend::Follow);
+                assert_eq!(cfg.on_child_suspend, OnChildSuspend::Notify);
                 // size 未指定なら None = caller (= run_command) が外側 TTY size or
                 // 80x24 fallback で解決する経路 (= ユーザ指示 2026-05-29)。
                 assert_eq!(cfg.cols, None);
@@ -5232,11 +5236,20 @@ mod tests {
     }
 
     #[test]
-    fn run_explicit_suspend_overrides_default() {
-        // --on-child-suspend のみ override 可
+    fn run_on_child_suspend_old_follow_value_is_error() {
+        // 旧値 `follow` は廃止 (= notify に rename、alias なし)。
         match parse_args(&args(&["run", "--on-child-suspend=follow", "--", "cat"])) {
+            Command::Error(_) => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_explicit_suspend_overrides_default() {
+        // --on-child-suspend=notify を明示しても default (= Notify) と同じ。
+        match parse_args(&args(&["run", "--on-child-suspend=notify", "--", "cat"])) {
             Command::Run(cfg) => {
-                assert_eq!(cfg.on_child_suspend, OnChildSuspend::Follow);
+                assert_eq!(cfg.on_child_suspend, OnChildSuspend::Notify);
             }
             other => panic!("expected Run, got {other:?}"),
         }

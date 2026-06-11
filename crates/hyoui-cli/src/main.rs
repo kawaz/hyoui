@@ -471,6 +471,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
             scrollback_rows,
             cfg.debug_dump_server.clone(),
             namespace,
+            cfg.on_child_suspend,
             cfg.command,
         );
     }
@@ -491,6 +492,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
         scrollback_rows,
         cfg.debug_dump_server.clone(),
         namespace.clone(),
+        cfg.on_child_suspend,
         cfg.command,
     ) {
         Ok(pair) => pair,

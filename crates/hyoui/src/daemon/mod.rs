@@ -34,5 +34,5 @@ mod screen;
 mod session;
 mod tail;
 
-pub use config::DaemonConfig;
+pub use config::{ChildSuspendPolicy, DaemonConfig};
 pub use session::Session;

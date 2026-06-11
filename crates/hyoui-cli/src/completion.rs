@@ -213,7 +213,7 @@ _hyoui() {
         run)
             case "$prev" in
                 --on-child-suspend)
-                    COMPREPLY=( $(compgen -W "follow auto-resume" -- "$cur") ); return 0 ;;
+                    COMPREPLY=( $(compgen -W "notify auto-resume" -- "$cur") ); return 0 ;;
                 --socket)
                     _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
                 --namespace|--timeout|--idle-timeout|--until|--size|--cols|--rows|--scrollback-rows)
@@ -221,7 +221,7 @@ _hyoui() {
             esac
             case "$cur" in
                 --on-child-suspend=*)
-                    COMPREPLY=( $(compgen -W "follow auto-resume" -- "${cur#*=}") ); return 0 ;;
+                    COMPREPLY=( $(compgen -W "notify auto-resume" -- "${cur#*=}") ); return 0 ;;
             esac
             COMPREPLY=( $(compgen -W "--socket --namespace --timeout --idle-timeout --until --on-child-suspend --scrollback-rows --size --cols --rows --help -h --" -- "$cur") )
             return 0 ;;
@@ -626,7 +626,7 @@ _hyoui_run() {
         '--size=[Virtual screen size COLSxROWS]:size:' \
         '--cols=[Virtual screen columns]:cols:' \
         '--rows=[Virtual screen rows]:rows:' \
-        '--on-child-suspend=[Action when child is stopped]:action:(follow auto-resume)' \
+        '--on-child-suspend=[Action when child is stopped]:action:(notify auto-resume)' \
         '--scrollback-rows=[vt100 scrollback ring max rows (default 1000)]:rows:' \
         '(-h --help)'{-h,--help}'[Show help]' \
         '*::child command:_normal'
@@ -753,7 +753,7 @@ complete -c hyoui -n '__hyoui_using_subcommand run' -l until             -x     
 complete -c hyoui -n '__hyoui_using_subcommand run' -l size              -x                              -d 'Virtual screen size COLSxROWS'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l cols              -x                              -d 'Virtual screen columns'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l rows              -x                              -d 'Virtual screen rows'
-complete -c hyoui -n '__hyoui_using_subcommand run' -l on-child-suspend  -x -a 'follow auto-resume'      -d 'Action when child is stopped'
+complete -c hyoui -n '__hyoui_using_subcommand run' -l on-child-suspend  -x -a 'notify auto-resume'       -d 'Action when child is stopped'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l scrollback-rows   -x                              -d 'vt100 scrollback ring max rows (default 1000)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -s h -l help                                          -d 'Show help and exit'
 
