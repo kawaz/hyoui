@@ -58,3 +58,28 @@ FleetView とも出ない)。間に変化した外部状態:
 
 なお途中で観測された FleetView 起動 (= `env -u CMUX_SURFACE_ID` 回避時) は、当時
 走っていた hyoui 経由の claude job 群が存在したためで、終了後は出ない。
+
+## 追記 2 (2026-06-11): 再現条件がほぼ確定 — OS 再起動による stale surface
+
+kawaz の追加情報で再現条件が判明:
+- 途中で **mac を再起動**しており、cmux は再起動後に surface 群を復元していた
+  (一部は claude 起動状態まで復元、復元しきれない surface も多数)
+- **Settings Error が出たのは再起動前から開きっぱなしの古い surface**、
+  正常起動したのは**新規ワークスペース/新規タブ** (fresh な surface)
+
+### 確定した機序
+
+OS 再起動で復元された surface の environ にある `CMUX_SURFACE_ID` は**前世代の
+stale ID**。その環境から起動した wrapper は stale ID で IN_CMUX=1 となり、
+cmux socket への auth selection 問い合わせが「unknown surface」となって
+CLAUDE_CONFIG_DIR が失われる。新規 surface (fresh ID) では起きない。
+
+wrapper には「socket unavailable → passthrough」の stale 対策が既にあるが、
+「**socket はあるが surface ID が unknown**」のケースが穴。
+
+### cmux への報告事項 (要約)
+
+OS 再起動で復元された surface の stale `CMUX_SURFACE_ID` を引き継いだプロセス
+(hyoui daemon の子に限らず、その surface のシェルからの起動全般で起きうる) から
+claude wrapper を起動すると CLAUDE_CONFIG_DIR が失われる。unknown-surface 応答も
+socket-unavailable と同様に passthrough へフォールバックすべき。
