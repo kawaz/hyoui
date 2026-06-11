@@ -739,10 +739,18 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         match nix::unistd::pipe() {
             Ok((rd, wr)) => {
                 use nix::fcntl::{FcntlArg, OFlag, fcntl};
-                // read 端を non-blocking に (= run loop の drain で block しない)。
-                if let Ok(flags) = fcntl(rd.as_fd(), FcntlArg::F_GETFL) {
-                    let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
-                    let _ = fcntl(rd.as_fd(), FcntlArg::F_SETFL(flags));
+                // 両端を non-blocking に:
+                // - read 端: run loop の drain で block しない。
+                // - write 端: signal thread が pipe full でも block しない (= WINCH 連打で
+                //   run loop が drain する前に書ききると buffer full になり得る。EAGAIN は
+                //   「既に未読 byte あり = WINCH 通知は届く」ので無視してよい。この設定が
+                //   無いと write が block して signal thread が固まる)。これで `main.rs` の
+                //   WINCH 中継コメント「EAGAIN は無視」と実装が一致する。
+                for fd in [rd.as_fd(), wr.as_fd()] {
+                    if let Ok(flags) = fcntl(fd, FcntlArg::F_GETFL) {
+                        let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+                        let _ = fcntl(fd, FcntlArg::F_SETFL(flags));
+                    }
                 }
                 // size closure 用に stdin を dup (= run / signal と fd 所有を分離)。
                 let size_fd = nix::unistd::dup(stdin.as_fd()).ok();
@@ -770,11 +778,20 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
     // 復元 → STOPPED に入り、SIGCONT 復帰時に raw mode 再設定。daemon には何も
     // 送らない (= 軸 2 廃止、子プロセスとは無関係)。
     let signal_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // signal thread の起動に成功したか。失敗時は winch notify pipe の write 端が
+    // この match 内で drop され、read 端 (= winch_source) だけが残る。その read 端を
+    // conn に注入すると、誰も write しない pipe を run loop が poll し、Linux では
+    // POLLHUP が revents に立ち続けて busy loop になる (= codex 指摘)。なので失敗時は
+    // winch_source を無効化する (= 下の注入で None に倒す)。
+    let mut winch_enabled = false;
     let signal_thread = if let Some(guard) = raw_guard.as_ref() {
         let guard_for_thread = std::sync::Arc::clone(guard);
         let shutdown_for_thread = std::sync::Arc::clone(&signal_shutdown);
         match install_attach_signal_thread(guard_for_thread, shutdown_for_thread, winch_notify_wr) {
-            Ok(handle) => Some(handle),
+            Ok(handle) => {
+                winch_enabled = true;
+                Some(handle)
+            }
             Err(e) => {
                 eprintln!(
                     "hyoui: SIGTSTP/WINCH handler 設定失敗: {e} (続行、suspend / resize 追従なし)"
@@ -837,9 +854,11 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
 
     // DR-0019 §6: SIGWINCH → Resize 配線。winch_source を注入し、attach 成立直後に
     // 初回 Resize を送る (= 別端末から attach した時のサイズ不一致を解消、leader 限定)。
+    // signal thread 起動に失敗した場合 (= winch_enabled=false) は、誰も write しない
+    // notify pipe を poll させないため winch_source を注入しない (= busy loop 回避)。
     let mut conn = match winch_source {
-        Some(src) => conn.with_winch_source(src),
-        None => conn,
+        Some(src) if winch_enabled => conn.with_winch_source(src),
+        _ => conn,
     };
     if let Err(e) = conn.send_initial_resize() {
         eprintln!("hyoui: 初回 Resize 送信失敗: {e} (続行)");
