@@ -44,3 +44,17 @@
 wrapper の env 操作箇所 (調査時点): CLAUDE_CONFIG_DIR の直接操作は legacy パス
 normalize のみ。auth selection unset 対象は ANTHROPIC_API_KEY 等で CLAUDE_CONFIG_DIR を
 含まない。失われる正確な機序は guard JS (NODE_OPTIONS 注入) 側と推定 (cmux 内部、未追跡)。
+
+## 追記 (2026-06-11 夜): 自然解消
+
+同日夜、`hyoui run -- claude` (回避なし) が正常起動するようになった (Settings Error /
+FleetView とも出ない)。間に変化した外部状態:
+- cmux のアカウント切替 (前日リミットで一時切替 → 復帰) の状態変化
+- claude 2.1.172 → 2.1.173 自動更新
+
+決定的な再現条件は特定できず。**「cmux の auth selection が切替中の状態 × surface に
+属さないプロセスからの wrapper 起動」の複合条件**と推定。再発時は「直前に cmux の
+アカウント切替をしたか」を確認すること。
+
+なお途中で観測された FleetView 起動 (= `env -u CMUX_SURFACE_ID` 回避時) は、当時
+走っていた hyoui 経由の claude job 群が存在したためで、終了後は出ない。
