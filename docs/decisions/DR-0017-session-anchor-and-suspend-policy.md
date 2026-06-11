@@ -101,6 +101,14 @@ A4 は session anchor 案に未知の障害が出た場合の fallback として
 
 session anchor 案 (= daemon が anchor を兼任) はプロセスを追加せず、この故障モードも持たない。
 
+> **📌 訂正 (2026-06-11、実機検証により)**: 「この故障モードも持たない」は誤りだった。
+> anchor 案でも daemon が session leader + controlling process である以上、daemon の
+> `kill -9` / `kill -TERM` 死で foreground pgrp (= child) に POSIX 規定の SIGHUP が配送され
+> **child は巻き添え死する** (hyoui 0.6.1 / macOS 26.5 で vim・cat・python3 の 3 カテゴリ
+> 全滅 + trap での SIGHUP 受信を直接観測)。supervisor 案に対する anchor 案の優位は
+> 「親死亡時の子保護」ではなく「プロセス追加なし・pid/exit code 中継不要」にある。
+> 詳細: docs/findings/2026-06-11-signal-suspend-interaction-audit.md §実機検証。
+
 ### 案: 割り切り (= docs 明記 + 外側 API 誘導)
 
 「TUI の ^Z は仕様上効かない」と docs に明記し、`hyoui kill -s STOP` 等の外側 API に寄せる案。
@@ -126,6 +134,14 @@ session anchor 案 (= daemon が anchor を兼任) はプロセスを追加せ�
 - **実装後の検証要件 (= DR-0014 流マトリクス)**: `TIOCSCTTY` の platform 差は 3 platform PoC で
   検証済だが、実装後に **cat / less / vim / python / bash × ^Z 1 回目/2 回目 × fg 復帰** の
   実機マトリクスを埋め、期待 vs 実態の乖離がないことを確認すること。
+- **親死亡 → child SIGHUP 巻き添え (2026-06-11 実機確認)**: daemon が session leader +
+  controlling process である構造の必然的帰結として、daemon の異常死 (`kill -9` / `kill -TERM`)
+  で foreground pgrp に SIGHUP が配送され、SIGHUP を trap しない child は巻き添え死する
+  (vim / cat / python3 の 3 カテゴリ全滅 + trap での SIGHUP 受信を直接観測、hyoui 0.6.1 /
+  macOS 26.5)。anchor 案の優位は「親死亡時の子保護」ではなく「プロセス追加なし・pid/exit code
+  中継不要・PTY 正本化」にある (= §Rejected の訂正注記参照)。daemon 即死時は socket 残骸も
+  残る (graceful shutdown 不在)。堅牢化の検討は
+  docs/issue/2026-06-11-bug-daemon-signal-robustness.md に切り出し。
 
 ## 関連
 

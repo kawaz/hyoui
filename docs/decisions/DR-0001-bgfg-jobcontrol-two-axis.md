@@ -1,13 +1,20 @@
 # DR-0001: bg/fg ジョブ制御の 2 軸設計と invariant
 
-- Status: Active (= 軸 1 follow/auto-resume のみ。軸 2 transparent/decouple は [[DR-0015]] で廃止 2026-05-28)
-- Date: 2026-05-21 (= 初版) / 2026-05-28 (= 軸 2 廃止)
-- Related: docs/journal/2026-05-21-bootstrap.md, DR-0002 (ネーミング — 「一心同体」概念がこの設計と地続き), DR-0015 (= `hyoui run` の fork 化に伴い軸 2 廃止 + 軸 1 の実装方式変更), DR-0017 (= 軸 1 の auto-resume fallback 改訂)
+- Status: Active (= 軸 1 のみ。軸 2 transparent/decouple は [[DR-0015]] で廃止 2026-05-28、モード別 preset は [[DR-0019]] で廃止 2026-06-11)
+- Date: 2026-05-21 (= 初版) / 2026-05-28 (= 軸 2 廃止) / 2026-06-11 (= preset 廃止)
+- Related: docs/journal/2026-05-21-bootstrap.md, DR-0002 (ネーミング — 「一心同体」概念がこの設計と地続き), DR-0015 (= `hyoui run` の fork 化に伴い軸 2 廃止 + 軸 1 の実装方式変更), DR-0017 (= 軸 1 の auto-resume fallback 改訂), DR-0019 (= preset 表廃止 + 軸 1 policy の daemon 配線)
 
 > **📌 注記 (2026-06-10、[[DR-0017]] により軸 1 一部改訂)**: 軸 1 の「leader 不在時 fallback =
 > 無条件 `killpg(child, SIGCONT)`」を [[DR-0017]] で廃止する (= ユーザ/端末起因の stop を尊重、
 > 勝手に起こさない)。`SessionChildStoppedNotify` の follow 通知は維持。`OnChildSuspend::AutoResume`
 > は opt-in 設定として残すが default は notify のみ。
+
+> **📌 注記 (2026-06-11、[[DR-0019]] により preset 表廃止)**: §デフォルト (モード別 preset) の
+> `--mode=interactive|headless` preset を [[DR-0019]] で廃止 (= `run --mode` flag / `Mode` enum
+> 削除)。軸 2 は [[DR-0015]] で廃止、軸 1 の default は [[DR-0017]] で notify-only に統一済の
+> ため、preset が切り替える対象は両方消滅していた。軸 1 の policy は [[DR-0019]] で
+> `run --on-child-suspend=notify|auto-resume` (default notify、旧値 `follow` は `notify` に
+> rename) として daemon 側に配線される。
 
 ## Update (2026-05-28): 軸 2 廃止 + 軸 1 実装方式変更 (= [[DR-0015]])
 

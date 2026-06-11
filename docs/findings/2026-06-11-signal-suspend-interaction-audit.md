@@ -81,11 +81,38 @@
 | `--exclusive` / `--detach-others` | 実装するか parse 段で「未実装」エラー化。silent no-op 放置は不可 |
 | SIGWINCH | 既存 signal thread に WINCH を 1 本足して leader 時 `Resize` 送信 + attach 成立時に初回 Resize。**新規介入でなく DR-0006 §6 の実装漏れ修復なので最優先級** |
 
-## 要実機検証 (コード読みでは確定不可)
+## 実機検証結果 (2026-06-11、hyoui 0.6.1 / macOS 26.5 arm64)
 
-1. **`kill -9 <daemon>` → child の生死** (SIGHUP 巻き添え疑い)。TUI / line-oriented / REPL の 3 カテゴリでマトリクス検証 → 結果を DR-0017 Consequences に追記
-2. daemon への SIGTSTP 送信の実挙動 (吸い込み仮説の確認)
-3. daemon SIGSTOP 時の全体挙動
+上記「要実機検証」3 項目を専用 jj workspace でビルドした実機バイナリで検証した。
+
+### 仮説 1: daemon kill -9 → child SIGHUP 巻き添え死 — **確定 (全カテゴリ巻き添え死)**
+
+anchor 構造の実機確認: daemon は `ppid=1` の session leader (`Ss`、PID=PGID=SID)、child は別 pgrp の foreground (`S+`)。
+
+| child | カテゴリ | 期待 (仮説) | 実態 |
+|---|---|---|---|
+| `vim -u NONE -N` | TUI alt screen | 死亡 | **死亡** |
+| `cat` | line-oriented | 死亡 | **死亡** |
+| `python3` | interactive REPL | 死亡 | **死亡** |
+| `sh -c 'trap ... HUP; while sleep'` | SIGHUP 直接観測 | HUP 受信 | **HUP 受信 (trap ログで直接観測、生存)** |
+
+`kill -TERM <daemon>` でも同様 (handler 無し → 即死 → child SIGHUP 巻き添え)。いずれも **socket file が残骸として残る** (graceful cleanup 不走)。daemon kill -9 時の attach client は exit code **0** (コード読み通り、正常終了と区別不能)。
+
+→ DR-0017 の supervisor 案却下理由 (「leader kill -9 → child 巻き添え死」) を anchor 案自身が持つことが確定。DR-0017 §Rejected に訂正注記、Consequences に帰結を追記済み。
+
+### 仮説 2: daemon への SIGTSTP 吸い込み — **確定**
+
+`kill -TSTP <daemon>` → daemon は `Ss` のまま (T にならない)、child も無影響。handler 登録 + 処理側 byte 無視により default stop も起きず、シグナルが実質吸い込まれる。
+
+### 派生発見: daemon SIGCONT → child 連動起こしが不発 (コードと実機の乖離)
+
+「daemon が SIGCONT で再開した時、child が stopped なら killpg(SIGCONT)」の防衛策コード (session.rs:795-803) が実機で発火しない:
+
+- child を `kill -STOP` (`T+`) → daemon に `kill -CONT` → child は `T+` のまま
+- daemon を `kill -STOP` → `kill -CONT` で実際に stop/resume させても → child は `T+` のまま
+- child へ直接 `kill -CONT` すれば即復帰 (= child 自体は正常)
+
+self-pipe → drain → killpg 経路のどこかで切れている疑い (SIGCONT 受信時に self-pipe write が走らない、または waitpid が Stopped を返さない)。→ docs/issue/2026-06-11-bug-daemon-signal-robustness.md に起票。
 
 ## 関連
 
