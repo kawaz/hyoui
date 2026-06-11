@@ -36,7 +36,6 @@
 //! module は protocol-level の意思決定に集中)。
 
 use nix::sys::signal::{Signal, kill};
-use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
 use crate::protocol::messages::{
@@ -1037,7 +1036,11 @@ fn handle_tail_request_dispatch(
 
 /// `ControlMessage::StatusQuery` を処理する。
 ///
-/// 子 pid の生死は waitpid(WNOHANG) で確認 (= reap せず存在チェックのみ)。
+/// 子 pid の生死チェックに waitpid は **使わない** (= WNOHANG でも exit 済みの子を
+/// その場で reap してしまい、serve_loop の lifecycle が exit を観測できなくなる =
+/// SessionExitNotify が永遠に出ない)。`kill(pid, 0)` (= signal 送らず存在確認のみ) を
+/// 使う。zombie (= exit 済み・lifecycle 未観測) は alive 扱いになるが、それで正しい
+/// (= reap と exit 観測は lifecycle の責務。直後の serve_loop 周回で exit 処理される)。
 fn handle_status_query(
     child: Pid,
     idx: usize,
@@ -1046,10 +1049,9 @@ fn handle_status_query(
     scrollback: &Scrollback,
     config: &DaemonConfig,
 ) -> ClientFrameOutcome {
-    let child_pid = match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
-        Ok(WaitStatus::StillAlive) => Some(child.as_raw() as u32),
-        _ => None,
-    };
+    let child_pid = nix::sys::signal::kill(child, None)
+        .is_ok()
+        .then(|| child.as_raw() as u32);
     // 子が生存中のみ pgid を引く (= 子は独立 session leader なので通常 pid と一致、
     // DR-0001 §実装ノート)。getpgid 失敗 (= 既に exit 等) は None に倒す。
     let child_pgid = child_pid.and_then(|_| {
@@ -1726,6 +1728,37 @@ mod tests {
         assert!(
             frame.body.is_empty(),
             "pristine screen state must yield an empty redraw body"
+        );
+    }
+
+    /// status の生死チェックが exit 済みの子を reap してはいけない (= reap すると
+    /// serve_loop の lifecycle が exit を観測できず session が永遠に畳まれない)。
+    /// zombie の子に対して生死チェックを行った後でも、waitpid が Exited を返せる
+    /// ことを検証する (旧実装 = waitpid(WNOHANG) ベースだとここで ECHILD になる)。
+    #[test]
+    fn status_liveness_check_must_not_reap_exited_child() {
+        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+        // fork して即 exit する子を作り zombie にする
+        let child = match unsafe { nix::unistd::fork() }.expect("fork") {
+            nix::unistd::ForkResult::Parent { child } => child,
+            nix::unistd::ForkResult::Child => unsafe { libc::_exit(0) },
+        };
+        // 子が exit して zombie になるのを少し待つ
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // handle_status_query と同じ生死チェック (= kill(pid, 0))。zombie は
+        // 「alive 扱い」(= kill 0 が成功) でよい — exit の観測は lifecycle の責務。
+        let alive = nix::sys::signal::kill(child, None).is_ok();
+        assert!(alive, "zombie child must still be visible to kill(pid, 0)");
+
+        // 生死チェックの後でも lifecycle 相当の waitpid が exit を観測できること。
+        let status = waitpid(child, Some(WaitPidFlag::WNOHANG)).expect(
+            "waitpid must still observe the exit (ECHILD here means the liveness \
+             check reaped the child)",
+        );
+        assert!(
+            matches!(status, WaitStatus::Exited(_, 0)),
+            "exit must be observable exactly once by the lifecycle path, got {status:?}"
         );
     }
 }
