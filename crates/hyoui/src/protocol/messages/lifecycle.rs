@@ -32,4 +32,34 @@ pub struct Kill {
     /// 未知 name は daemon 側で `signal.invalid` で reject される。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal: Option<String>,
+
+    /// client が「子 exit + session 終了まで見届けて返る」ことを要求するか
+    /// (= `hyoui kill --wait`)。
+    ///
+    /// - `false` (default): daemon は signal 受理時点で `KillAck` を 1 frame
+    ///   返す (= client は即時 return)。terminate (= waitpid → reap) は daemon
+    ///   内で非同期に進行する。`kill(1)` と同じ直感 (= 子が 1 発で死なない app
+    ///   でも無応答にならない)。
+    /// - `true`: daemon は `KillAck` を送らず、従来通り session terminate 完了
+    ///   (= socket EOF) まで socket を開いたまま保つ。client は EOF を待つ。
+    ///
+    /// 旧 client (= field 無し) からの Kill は `#[serde(default)]` で `false`
+    /// (= 即時 ack) になる。旧 client は KillAck を未知 kind として decode error
+    /// → EOF 相当に倒れて成功扱いになる (= 互換)。
+    #[serde(default)]
+    pub wait: bool,
+}
+
+/// `kill.ack` payload (= 即時応答 kill)。daemon が `Kill { wait: false }` を
+/// 受理し、子に signal を送った直後に返す ack。
+///
+/// この frame を受け取った client は「signal 送信依頼が受理された」と判断して
+/// 即時 return する (= 子の実 exit は待たない)。terminate は daemon 内で非同期
+/// 進行する。`wait: true` の Kill にはこの ack は返らない (= 従来通り EOF 待ち)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct KillAck {
+    /// daemon が子に送った signal 名 (= 正規表記 SIG-prefix 大文字)。
+    /// client の情報表示用 (= 「SIGTERM 送信完了」等)。
+    pub signal: String,
 }

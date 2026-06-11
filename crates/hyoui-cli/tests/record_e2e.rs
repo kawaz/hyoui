@@ -88,7 +88,10 @@ fn kill_daemon(sock_path: &Path) {
         return;
     };
     if conn
-        .send_control(&ControlMessage::Kill(Kill { signal: None }))
+        .send_control(&ControlMessage::Kill(Kill {
+            signal: None,
+            wait: true,
+        }))
         .is_err()
     {
         return;

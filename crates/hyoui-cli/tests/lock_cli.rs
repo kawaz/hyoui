@@ -55,7 +55,10 @@ fn kill_daemon(sock_path: &std::path::Path) {
         ..AttachOptions::default()
     };
     if let Ok(mut conn) = ClientConnection::connect(sock_path, opts) {
-        let _ = conn.send_control(&ControlMessage::Kill(Kill { signal: None }));
+        let _ = conn.send_control(&ControlMessage::Kill(Kill {
+            signal: None,
+            wait: true,
+        }));
     }
 }
 

@@ -711,6 +711,32 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         }
     };
 
+    // 子 self-stop follow 時 (= ^Z で claude/vim 等を suspend) の外側端末状態管理
+    // (= issue 2026-06-11)。raw guard を保持しているとき (= stdin が tty)、`run` が
+    // SIGSTOP 直前に termios を cooked へ戻し、SIGCONT 復帰後に raw 再設定するよう
+    // suspend hook を渡す。reset escape の出力と daemon redraw 要求は `run` 内が担う。
+    // この hook は `install_attach_signal_thread` (= client 自身が外部 SIGTSTP を
+    // 受けた経路) とは別経路: こちらは「子が止まったので client も追従して止まる」経路。
+    let conn = if let Some(guard) = raw_guard.as_ref() {
+        let guard_suspend = std::sync::Arc::clone(guard);
+        let guard_resume = std::sync::Arc::clone(guard);
+        let hooks = hyoui::client::SuspendHooks::new(
+            Box::new(move || {
+                if let Ok(g) = guard_suspend.lock() {
+                    g.suspend();
+                }
+            }),
+            Box::new(move || {
+                if let Ok(g) = guard_resume.lock() {
+                    g.resume();
+                }
+            }),
+        );
+        conn.with_suspend_hooks(hooks)
+    } else {
+        conn
+    };
+
     let _ = stdout.flush();
     let client_dump = cfg
         .debug_dump_client
@@ -1317,6 +1343,9 @@ fn kill_command(cfg: KillConfig) -> ExitCode {
                 all: false,
                 // --all + --no-terminate は parse 段で reject 済 (= ここは常に false)。
                 no_terminate: false,
+                // --wait は各 session の terminate 完了を順に見届ける (= killall で
+                // 1 件ずつ確実に畳んでから次へ)。
+                wait: cfg.wait,
             };
             let exit = kill_command_single(sub_cfg);
             if exit != ExitCode::SUCCESS {
@@ -1407,27 +1436,38 @@ fn kill_command_single(cfg: KillConfig) -> ExitCode {
 
     // DR-0012: wire は signal name string。CLI 段で正規表記 (SIG-prefix 大文字)
     // を強制済 (= cli.rs::parse_kill の `--signal` validate) なので、ここでは
-    // そのまま wire に流す。
+    // そのまま wire に流す。`wait` 軸 (= 子 exit + session 終了を見届けるか) も
+    // 一緒に wire に乗せる (= daemon が ack 即返し / EOF 待ち を分岐する)。
     let kill = hyoui::protocol::messages::Kill {
         signal: cfg.signal.clone(),
+        wait: cfg.wait,
     };
     if let Err(e) = conn.send_control(&hyoui::protocol::ControlMessage::Kill(kill)) {
         eprintln!("hyoui: kill: send 失敗: {e}");
         return ExitCode::from(1);
     }
 
-    // daemon の応答を待つ。
-    // 成功 path: `handle_kill` が `TerminateSession` を返して session 終了 →
-    //            daemon が socket を close → `recv_control` が Err (= EOF) で抜ける。
-    // 失敗 path: ensure_rw_mode 失敗 / invalid signal name 等で daemon が
-    //            `ControlMessage::Error` を 1 frame 送って `Continue` (= client
-    //            は切らない) → recv_control が `Ok(Error)` を返す。
+    // daemon の応答を待つ。`wait` の有無で「成功」の判定境界が変わる:
+    //
+    // [default = 即時応答 (cfg.wait=false)]
+    //   成功 path: daemon が signal 送信を受理 → `KillAck` を 1 frame 返す
+    //             (= terminate は daemon 内で非同期進行)。`kill(1)` と同じ直感で
+    //             即 return する (= 子が SIGTERM を catch して 1 発で死なない app
+    //             でも無応答にならない)。
+    //   互換 path: 旧 daemon は KillAck を知らず、従来通り socket を close するため
+    //             EOF (= recv_control Err) で抜ける。これも成功扱い。
+    //
+    // [--wait (cfg.wait=true)]
+    //   成功 path: `handle_kill` が ack を送らず `TerminateSession` で session 終了
+    //             → daemon が socket を close → `recv_control` が Err (= EOF)。
+    //             子 exit + session 終了を見届けたことになる。
+    //
+    // 失敗 path (共通): ensure_rw_mode 失敗 / invalid signal name 等で daemon が
+    //             `ControlMessage::Error` を 1 frame 送って `Continue` →
+    //             recv_control が `Ok(Error)` を返す。
     //
     // handshake 中 / 過渡的に LeaderNotify / ModeChange 等の broadcast control
-    // message が来る可能性があるため、Error / EOF 以外は skip して次の frame を待つ。
-    //
-    // 旧実装は send 直後 drop(conn) + 「送信完了」printだったため、失敗 path で
-    // daemon の ErrorMessage を読まず誤って成功扱いにする regression があった。
+    // message が来る可能性があるため、Error / KillAck / EOF 以外は skip する。
     loop {
         match conn.recv_control(None) {
             Ok(hyoui::protocol::ControlMessage::Error(err)) => {
@@ -1437,19 +1477,32 @@ fn kill_command_single(cfg: KillConfig) -> ExitCode {
                 );
                 return ExitCode::from(1);
             }
+            Ok(hyoui::protocol::ControlMessage::KillAck(_ack)) if !cfg.wait => {
+                // 即時応答: signal 送信受理を確認、terminate は待たずに return。
+                break;
+            }
             Ok(_) => {
-                // LeaderNotify / ModeChange 等の broadcast、skip して次の frame を待つ。
+                // LeaderNotify / ModeChange / (--wait 時の) KillAck 等の broadcast。
+                // skip して次の frame を待つ。
                 continue;
             }
             Err(_) => {
-                // EOF (= daemon が session terminate して socket close)。成功 path。
+                // EOF (= daemon が session terminate して socket close)。成功 path
+                // (default なら旧 daemon 互換、--wait なら terminate 見届け完了)。
                 break;
             }
         }
     }
     drop(conn);
 
-    println!("hyoui: kill 送信完了: {}", sock.display());
+    if cfg.wait {
+        println!(
+            "hyoui: kill 完了 (session 終了を見届け): {}",
+            sock.display()
+        );
+    } else {
+        println!("hyoui: kill 送信完了: {}", sock.display());
+    }
     ExitCode::SUCCESS
 }
 
@@ -3409,6 +3462,7 @@ mod tests {
         if let Ok(mut conn) = connect_with_retry(&live_path, opts) {
             let _ = conn.send_control(&ControlMessage::Kill(hyoui::protocol::messages::Kill {
                 signal: None,
+                wait: true,
             }));
             drop(conn);
         }
@@ -3499,7 +3553,10 @@ mod tests {
             ..AttachOptions::default()
         };
         if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
-            let kill = hyoui::protocol::messages::Kill { signal: None };
+            let kill = hyoui::protocol::messages::Kill {
+                signal: None,
+                wait: true,
+            };
             let _ = conn.send_control(&ControlMessage::Kill(kill));
             drop(conn);
         }
@@ -3587,7 +3644,10 @@ mod tests {
             ..AttachOptions::default()
         };
         if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
-            let kill = hyoui::protocol::messages::Kill { signal: None };
+            let kill = hyoui::protocol::messages::Kill {
+                signal: None,
+                wait: true,
+            };
             let _ = conn.send_control(&ControlMessage::Kill(kill));
             drop(conn);
         }
@@ -3658,7 +3718,10 @@ mod tests {
             ..AttachOptions::default()
         };
         if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
-            let kill = hyoui::protocol::messages::Kill { signal: None };
+            let kill = hyoui::protocol::messages::Kill {
+                signal: None,
+                wait: true,
+            };
             let _ = conn.send_control(&ControlMessage::Kill(kill));
             drop(conn);
         }
@@ -3731,7 +3794,10 @@ mod tests {
             ..AttachOptions::default()
         };
         if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
-            let kill = hyoui::protocol::messages::Kill { signal: None };
+            let kill = hyoui::protocol::messages::Kill {
+                signal: None,
+                wait: true,
+            };
             let _ = conn.send_control(&ControlMessage::Kill(kill));
             drop(conn);
         }
@@ -3829,7 +3895,10 @@ mod tests {
             ..AttachOptions::default()
         };
         if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
-            let kill = hyoui::protocol::messages::Kill { signal: None };
+            let kill = hyoui::protocol::messages::Kill {
+                signal: None,
+                wait: true,
+            };
             let _ = conn.send_control(&ControlMessage::Kill(kill));
             drop(conn);
         }
@@ -3938,7 +4007,10 @@ mod tests {
         );
 
         // cleanup: kill 送って thread を終わらせる。
-        let kill = hyoui::protocol::messages::Kill { signal: None };
+        let kill = hyoui::protocol::messages::Kill {
+            signal: None,
+            wait: true,
+        };
         let _ = conn.send_control(&ControlMessage::Kill(kill));
         drop(conn);
         let _ = daemon_handle.join();
@@ -4010,7 +4082,10 @@ mod tests {
             ..AttachOptions::default()
         };
         if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
-            let kill = hyoui::protocol::messages::Kill { signal: None };
+            let kill = hyoui::protocol::messages::Kill {
+                signal: None,
+                wait: true,
+            };
             let _ = conn.send_control(&ControlMessage::Kill(kill));
             drop(conn);
         }
@@ -4071,7 +4146,10 @@ mod tests {
             ..AttachOptions::default()
         };
         if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
-            let kill = hyoui::protocol::messages::Kill { signal: None };
+            let kill = hyoui::protocol::messages::Kill {
+                signal: None,
+                wait: true,
+            };
             let _ = conn.send_control(&ControlMessage::Kill(kill));
             drop(conn);
         }
@@ -4133,7 +4211,10 @@ mod tests {
             ..AttachOptions::default()
         };
         if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
-            let kill = hyoui::protocol::messages::Kill { signal: None };
+            let kill = hyoui::protocol::messages::Kill {
+                signal: None,
+                wait: true,
+            };
             let _ = conn.send_control(&ControlMessage::Kill(kill));
             drop(conn);
         }
@@ -4185,7 +4266,10 @@ mod tests {
             ..AttachOptions::default()
         };
         if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
-            let kill = hyoui::protocol::messages::Kill { signal: None };
+            let kill = hyoui::protocol::messages::Kill {
+                signal: None,
+                wait: true,
+            };
             let _ = conn.send_control(&ControlMessage::Kill(kill));
             drop(conn);
         }
@@ -4286,6 +4370,7 @@ mod tests {
         if let Ok(mut conn) = connect_with_retry(&sock_path, opts) {
             let _ = conn.send_control(&ControlMessage::Kill(hyoui::protocol::messages::Kill {
                 signal: None,
+                wait: true,
             }));
             drop(conn);
         }

@@ -273,7 +273,7 @@ pub(super) fn handle_control_message(
             handle_state_snapshot_request(idx, req, clients, screen_state)
         }
         ControlMessage::SessionChildResumeRequest(_) => {
-            handle_session_child_resume_request(child, idx, clients, state)
+            handle_session_child_resume_request(child, idx, clients, state, screen_state)
         }
         // DR-0016 Phase 4: record handler 配線 (= Phase 1 で reject されていた variant を
         // 取り出して個別 handler に振る)。
@@ -294,6 +294,7 @@ pub(super) fn handle_control_message(
         ControlMessage::HandshakeRequest(_)
         | ControlMessage::HandshakeResponse(_)
         | ControlMessage::Error(_)
+        | ControlMessage::KillAck(_)
         | ControlMessage::LockResponse(_)
         | ControlMessage::LeaderNotify(_)
         | ControlMessage::ModeChange(_)
@@ -315,6 +316,13 @@ pub(super) fn handle_control_message(
 /// leader が follow / auto-resume 政策の延長で「子を SIGCONT で起こせ」と daemon に
 /// 要求する経路。daemon は `killpg(child_pgid, SIGCONT)` で子 pgrp 全体に SIGCONT。
 ///
+/// suspend/resume の外側端末状態管理 (= issue 2026-06-11): SIGCONT で子を起こす
+/// **前に** 要求元 client へ attach redraw bytes (`build_attach_redraw` = DR-0013
+/// Phase A と同一機構) を送る。これにより client は子が出力を再開する前に
+/// 画面・端末モード (alt screen / cursor 可視 / bracketed paste off 等) を
+/// screen state から復元できる。順序を「redraw → SIGCONT」とするのは、子復帰
+/// 直後の出力が redraw bytes より後に届くことを保証するため。
+///
 /// cap 未保持 client は `UnsupportedCapability` で reject (= leader 選定で本来弾かれる
 /// はずだが defense-in-depth)。
 fn handle_session_child_resume_request(
@@ -322,6 +330,7 @@ fn handle_session_child_resume_request(
     idx: usize,
     clients: &mut [ClientHandle],
     state: &SessionState,
+    screen_state: &ScreenState,
 ) -> ClientFrameOutcome {
     let ch = &clients[idx];
     if ensure_cap(
@@ -341,6 +350,14 @@ fn handle_session_child_resume_request(
             client_id,
             ts_unix_ms: now_unix_ms(),
         });
+    // resume 後の画面・モード復元: SIGCONT より前に要求元 client へ attach redraw を
+    // push (= handshake redraw と同じ DR-0013 Phase A 機構を再利用)。enqueue が
+    // overflow / writer dead だった場合は当該 client を drop する。
+    let mut overflow_ids: Vec<u64> = Vec::new();
+    super::accept::send_attach_redraw(&clients[idx], screen_state, &mut overflow_ids);
+    if !overflow_ids.is_empty() {
+        return ClientFrameOutcome::DropClient;
+    }
     // 子 pgrp に SIGCONT。DR-0001 §実装ノート「子は独立セッションリーダーなので
     // 子の pgid == 子の pid」を踏襲。
     let _ = nix::sys::signal::killpg(child, nix::sys::signal::Signal::SIGCONT);
@@ -531,7 +548,34 @@ fn handle_kill(
         },
     };
     let _ = kill(child, sig);
-    ClientFrameOutcome::TerminateSession(RelayOutcome::ClientDetachedOrKilled)
+
+    // === wait 軸の分岐 (= 即時応答 / 終了見届け) ===
+    //
+    // [default = 即時応答 (k.wait == false)]: `kill(1)` と同じ直感。signal 送信
+    // 受理を `KillAck` で即 ack し、session は **畳まず serve を継続**する
+    // (= `Continue`)。子が signal で死ねば既存の PTY-EOF → ChildExited 経路で
+    // session は自然終了する。子が signal を catch / ignore して生き残れば
+    // session はそのまま残る (= `kill(1)` で 1 発で死なない app を撃っても
+    // process が残るのと同じ)。daemon を block しないため、続けて
+    // `hyoui kill --signal=KILL <session>` で始末する経路も生きる。
+    //
+    // [--wait (k.wait == true)]: 従来挙動。ack を送らず `TerminateSession` を返し、
+    // serve 後段の `finalize_child` が子 exit を見届けて (= 必要なら SIGTERM →
+    // waitpid) socket を close する。client は EOF を以て「session 終了」と判定
+    // する (= kill 直後に同名 session を作り直すスクリプト等の用途)。
+    if k.wait {
+        return ClientFrameOutcome::TerminateSession(RelayOutcome::ClientDetachedOrKilled);
+    }
+
+    // ack の signal 名は正規表記で返す (= client 表示用)。`Signal::as_str()` は
+    // SIG-prefix 大文字 (= `"SIGTERM"`) を返す。
+    let _ = send_control(
+        &clients[idx],
+        ControlMessage::KillAck(crate::protocol::messages::KillAck {
+            signal: sig.as_str().to_string(),
+        }),
+    );
+    ClientFrameOutcome::Continue
 }
 
 /// `ControlMessage::Signal` を処理する。
@@ -1524,5 +1568,93 @@ mod tests {
             ControlMessage::Error(e) => assert_eq!(e.code, ErrorCode::RecordNotFound),
             other => panic!("expected Error {{ RecordNotFound }}, got {other:?}"),
         }
+    }
+
+    /// `child-state-v1` cap を持つ test 用 `ClientHandle` を組み立てる
+    /// (= `record_test_client` の cap 違い版、resume request 用)。
+    fn child_state_test_client() -> (ClientHandle, Receiver<SharedBytes>) {
+        let (tx, rx) = std::sync::mpsc::channel::<SharedBytes>();
+        let (_a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let ch = ClientHandle {
+            id: 1,
+            mode: Mode::Rw,
+            leader: true,
+            subscription: Subscription::Raw,
+            negotiated_caps: vec!["child-state-v1".into()],
+            writer_tx: tx,
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            buffer_limit: 1 << 20,
+            writer_thread: None,
+            reader: b,
+        };
+        (ch, rx)
+    }
+
+    /// issue 2026-06-11: `session.child.resume.request` 受信時、daemon は SIGCONT
+    /// より前に要求元 client へ attach redraw bytes (= raw_data frame) を push する。
+    /// screen state に出力がある状態なら redraw frame が非空で届くことを固定する。
+    #[test]
+    fn resume_request_pushes_attach_redraw_before_sigcont() {
+        let state = SessionState::default();
+        let (mut ch, rx) = child_state_test_client();
+        let clients = std::slice::from_mut(&mut ch);
+
+        // 子が何か出力した state を作る (= pristine ではない → redraw 非空)。
+        let mut screen_state = ScreenState::new(24, 80, 100);
+        screen_state.process(b"hello world");
+
+        // killpg は self pgrp に SIGCONT (= 実行中 process には無害な no-op)。
+        let pgid = nix::unistd::getpgrp();
+        let outcome = handle_session_child_resume_request(pgid, 0, clients, &state, &screen_state);
+        assert!(
+            matches!(outcome, ClientFrameOutcome::Continue),
+            "resume request must not drop a healthy client"
+        );
+
+        // 最初に届く frame は raw_data の redraw bytes。
+        let payload = rx
+            .try_recv()
+            .expect("resume must enqueue an attach redraw raw_data frame");
+        let frame = Frame::decode_from(&mut payload.as_slice()).expect("decode frame");
+        assert_eq!(frame.ty, TYPE_RAW_DATA, "redraw must be a raw_data frame");
+        assert!(
+            !frame.body.is_empty(),
+            "redraw body must be non-empty for a non-pristine screen state"
+        );
+        // build_attach_redraw は primary buffer 復元の `?1049l` から始まる。
+        assert!(
+            frame.body.starts_with(b"\x1b[?1049l"),
+            "redraw must start with primary-buffer restore (?1049l), got: {:?}",
+            &frame.body[..frame.body.len().min(16)]
+        );
+    }
+
+    /// pristine な screen state (= 子が 1 byte も出力していない) では redraw body は
+    /// 空 raw_data frame になる (= `build_attach_redraw` の pristine 早期 return、
+    /// 外側 shell 画面 history を clear しない契約)。
+    #[test]
+    fn resume_request_pushes_empty_redraw_for_pristine_state() {
+        let state = SessionState::default();
+        let (mut ch, rx) = child_state_test_client();
+        let clients = std::slice::from_mut(&mut ch);
+
+        let screen_state = ScreenState::new(24, 80, 100);
+
+        let pgid = nix::unistd::getpgrp();
+        let outcome = handle_session_child_resume_request(pgid, 0, clients, &state, &screen_state);
+        assert!(
+            matches!(outcome, ClientFrameOutcome::Continue),
+            "resume request must not drop a healthy client"
+        );
+
+        let payload = rx
+            .try_recv()
+            .expect("resume must still enqueue a (possibly empty) raw_data frame");
+        let frame = Frame::decode_from(&mut payload.as_slice()).expect("decode frame");
+        assert_eq!(frame.ty, TYPE_RAW_DATA);
+        assert!(
+            frame.body.is_empty(),
+            "pristine screen state must yield an empty redraw body"
+        );
     }
 }

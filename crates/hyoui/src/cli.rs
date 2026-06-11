@@ -272,6 +272,18 @@ pub struct KillConfig {
     /// (= 非 terminate) 経路に切り替わる。`--all` とは併用不可 (= killall に
     /// 非 terminate は意味を成さない)。
     pub no_terminate: bool,
+    /// `--wait`: 子 exit + session 終了まで見届けて返る (= 従来挙動)。
+    ///
+    /// **terminate するか / 待つか の 2 軸**のうち「待つか」軸を制御する
+    /// (`no_terminate` が「terminate するか」軸)。既定 (= `wait=false`) は daemon
+    /// が signal 受理時点で `KillAck` を返すので client は即時 return する
+    /// (= `kill(1)` と同じ直感、子が 1 発で死なない app でも無応答にならない)。
+    /// `--wait` 指定時は daemon は ack を送らず、session terminate 完了
+    /// (= socket EOF) まで待つ (= kill 直後に同名 session を作り直すスクリプト等)。
+    ///
+    /// `--no-terminate` とは併用不可 (= terminate しない経路に「終了を待つ」は
+    /// 意味を成さない)。terminate 経路 (= `ControlMessage::Kill`) 専用。
+    pub wait: bool,
 }
 
 /// `status` subcommand の出力形式 (= `--format=plain|json`)。
@@ -1004,6 +1016,10 @@ fn parse_kill(args: &[String]) -> Command {
                 cfg.no_terminate = true;
                 consumed_extra = false;
             }
+            "--wait" => {
+                cfg.wait = true;
+                consumed_extra = false;
+            }
             // POSIX kill 慣習 + 略名拡張: `-X` short flag (= `--` で始まらない short
             // option) は signal spec として解釈する (kawaz 方針 2026-05-30):
             // - `-9`       = SIGKILL (= 番号)
@@ -1061,6 +1077,16 @@ fn parse_kill(args: &[String]) -> Command {
     if cfg.all && cfg.no_terminate {
         return Command::Error(
             "kill: --no-terminate は --all と併用できません (= 非 terminate な signal 送信は単一 session 向け)"
+                .into(),
+        );
+    }
+
+    // 2 軸の整理: --wait (= 終了を待つ) は terminate 経路専用。--no-terminate
+    // (= terminate しない) と併用すると「畳まない session の終了を待つ」という
+    // 矛盾になるため reject。
+    if cfg.wait && cfg.no_terminate {
+        return Command::Error(
+            "kill: --wait は --no-terminate と併用できません (= terminate しない経路に「終了を待つ」は意味を成さない)"
                 .into(),
         );
     }
@@ -3330,7 +3356,7 @@ fn usage_list() -> String {
 
 fn usage_kill() -> String {
     String::from(
-        "hyoui kill — send signal to a daemon session and terminate it\n\
+        "hyoui kill — send a signal to a daemon session's child (kill(1)-style)\n\
         \n\
         USAGE:\n    \
             hyoui kill <session-id> [options]\n    \
@@ -3339,13 +3365,25 @@ fn usage_kill() -> String {
             hyoui kill --socket=<path> [options]\n    \
             hyoui kill -- <session-id> [options]      # `-` で始まる session-id を escape\n\
         \n\
+        2 軸モデル (= terminate するか / 終了を待つか は独立):\n    \
+            [terminate 軸]  既定         : signal を送る。子が死ねば session も終わる\n    \
+            \x20               --no-terminate: signal を送るだけで session を畳まない\n    \
+            \x20                              (= stopped child を CONT で起こす等)\n    \
+            [wait 軸]       既定 (即時)  : signal 送信受理で即 return (= `kill(1)` と同じ。\n    \
+            \x20                              子が 1 発で死なない app でも無応答にならない)\n    \
+            \x20               --wait        : 子 exit + session 終了を見届けてから return\n    \
+            \x20                              (= kill 直後に同名 session を作り直すスクリプト等)\n\
+        \n\
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
             --index N       session selector index (= mtime 昇順、1 最古 / -1 最新)\n    \
             --all           全 live session を順次 kill (= killall 相当)\n    \
             --signal SPEC   送信 signal (= default SIGTERM)。数字 / 略名 / SIG-prefix 大文字 OK\n    \
+            --wait          子 exit + session 終了まで見届けて return (= 従来挙動)。\n    \
+            \x20               既定 (= 省略時) は signal 送信受理で即 return。\n    \
+            \x20               `--no-terminate` とは併用不可\n    \
             --no-terminate  signal を送るだけで session を畳まない (= stopped child を\n    \
-            \x20               CONT で起こす用途等。`--all` とは併用不可)\n    \
+            \x20               CONT で起こす用途等)。`--all` / `--wait` とは併用不可\n    \
             -N              POSIX kill 慣習: 短縮 signal 番号 (e.g. -9 = SIGKILL)\n    \
             -NAME           短縮 signal 名 (e.g. -KILL / -TERM / -SIGKILL も OK)\n    \
             -h, --help      Show this help and exit\n\
@@ -3365,18 +3403,19 @@ fn usage_kill() -> String {
             `-` で始まる session-id は `--` セパレータで escape (e.g. `kill -- -foo`)\n\
         \n\
         EXIT CODE:\n    \
-            0   送信完了 (= daemon が close するのを待ってから exit)\n    \
+            0   既定: signal 送信受理を確認 / --wait: session 終了を見届けた\n    \
             1   connect / send 失敗 / daemon が reject\n    \
             2   引数不足 / 排他違反\n\
         \n\
         EXAMPLES:\n    \
-            hyoui kill demo                          # session_id=demo に SIGTERM\n    \
+            hyoui kill demo                          # session_id=demo に SIGTERM (= 即時 return)\n    \
             hyoui kill demo --signal=SIGKILL         # SIGKILL を送る (= 正規表記)\n    \
             hyoui kill demo --signal=KILL            # SIGKILL を送る (= 略名)\n    \
             hyoui kill demo --signal=9               # SIGKILL を送る (= 数字)\n    \
             hyoui kill -9 demo                       # SIGKILL を送る (= 番号 短縮)\n    \
             hyoui kill -KILL demo                    # SIGKILL を送る (= 略名 短縮)\n    \
             hyoui kill -SIGTERM demo                 # SIGTERM を送る (= 正規 短縮)\n    \
+            hyoui kill demo --wait                   # 子 exit + session 終了まで待つ\n    \
             hyoui kill 1                             # session_id=\"1\" を SIGTERM (= 数字も名前)\n    \
             hyoui kill --index=1                     # 1 番古い session を SIGTERM\n    \
             hyoui kill --index=-1                    # 最新 session を SIGTERM\n    \
@@ -6129,6 +6168,70 @@ mod tests {
                 );
             }
             other => panic!("expected Error for --all --no-terminate, got {other:?}"),
+        }
+    }
+
+    /// 即時応答化: `--wait` 未指定なら cfg.wait=false (= default 即時 return)。
+    #[test]
+    fn parse_kill_default_is_immediate() {
+        match parse_args(&args(&["kill", "demo"])) {
+            Command::Kill(cfg) => {
+                assert!(!cfg.wait, "default kill must be immediate (wait=false)");
+                assert!(!cfg.no_terminate, "default kill must not be no_terminate");
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+            }
+            other => panic!("expected Kill(wait=false), got {other:?}"),
+        }
+    }
+
+    /// 即時応答化: `--wait` が cfg.wait=true で格納される (= 従来挙動)。
+    #[test]
+    fn parse_kill_wait_flag() {
+        match parse_args(&args(&["kill", "demo", "--wait"])) {
+            Command::Kill(cfg) => {
+                assert!(cfg.wait, "--wait must set wait=true");
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+            }
+            other => panic!("expected Kill(wait=true), got {other:?}"),
+        }
+        // --signal との併用 OK。
+        match parse_args(&args(&["kill", "demo", "--signal=KILL", "--wait"])) {
+            Command::Kill(cfg) => {
+                assert!(cfg.wait);
+                assert_eq!(cfg.signal.as_deref(), Some("SIGKILL"));
+            }
+            other => panic!("expected Kill(wait=true, signal=SIGKILL), got {other:?}"),
+        }
+    }
+
+    /// 2 軸の整理: `--wait` は `--no-terminate` と併用不可。
+    #[test]
+    fn parse_kill_wait_rejects_no_terminate() {
+        match parse_args(&args(&["kill", "demo", "--wait", "--no-terminate"])) {
+            Command::Error(msg) => {
+                assert!(
+                    msg.contains("wait") && msg.contains("no-terminate"),
+                    "error should mention both flags: {msg}"
+                );
+            }
+            other => panic!("expected Error for --wait --no-terminate, got {other:?}"),
+        }
+        // 順序を入れ替えても同じ。
+        match parse_args(&args(&["kill", "demo", "--no-terminate", "--wait"])) {
+            Command::Error(_) => {}
+            other => panic!("expected Error for --no-terminate --wait, got {other:?}"),
+        }
+    }
+
+    /// 即時応答化: `--wait` は `--all` と併用可 (= killall で各 session の終了を見届け)。
+    #[test]
+    fn parse_kill_wait_with_all_ok() {
+        match parse_args(&args(&["kill", "--all", "--wait"])) {
+            Command::Kill(cfg) => {
+                assert!(cfg.all);
+                assert!(cfg.wait);
+            }
+            other => panic!("expected Kill(all=true, wait=true), got {other:?}"),
         }
     }
 

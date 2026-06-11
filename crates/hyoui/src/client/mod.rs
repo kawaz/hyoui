@@ -6,4 +6,7 @@
 
 mod attach;
 
-pub use attach::{AttachOptions, ClientConnection, StdinEofAction, resolve_detach_prefix_from_env};
+pub use attach::{
+    AttachOptions, ClientConnection, SUSPEND_OUTER_TTY_RESET, StdinEofAction, SuspendHooks,
+    resolve_detach_prefix_from_env,
+};

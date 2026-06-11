@@ -48,7 +48,7 @@ pub use error::{ErrorCode, ErrorMessage};
 pub use handshake::{
     HandshakeRequest, HandshakeResponse, MAX_CAP_LEN, MAX_CAPS_COUNT, MAX_TOKEN_LEN, Mode,
 };
-pub use lifecycle::{Detach, DetachTarget, Kill};
+pub use lifecycle::{Detach, DetachTarget, Kill, KillAck};
 pub use lock::{
     LeaderNotify, LockAcquire, LockRelease, LockResponse, LockResult, ModeChange, SessionMode,
 };
@@ -144,6 +144,12 @@ pub enum ControlMessage {
     /// `kind = "kill"` — client → daemon、子に signal → daemon exit。
     #[serde(rename = "kill")]
     Kill(Kill),
+
+    /// `kind = "kill.ack"` — daemon → client、`Kill { wait: false }` の即時応答。
+    /// signal 送信受理を ack して client を即 return させる (= terminate は daemon
+    /// 内で非同期進行)。
+    #[serde(rename = "kill.ack")]
+    KillAck(KillAck),
 
     /// `kind = "screen.dump.request"` — client → daemon、画面 bytes を取得
     /// (DR-0013 §9、cap `screen-dump-v1` 要)。
@@ -530,11 +536,61 @@ mod tests {
         // DR-0012: wire は signal name string
         let msg = ControlMessage::Kill(Kill {
             signal: Some("SIGTERM".into()),
+            wait: false,
         });
         assert_eq!(roundtrip(&msg), msg);
 
-        let default_kill = ControlMessage::Kill(Kill { signal: None });
+        let default_kill = ControlMessage::Kill(Kill {
+            signal: None,
+            wait: false,
+        });
         assert_eq!(roundtrip(&default_kill), default_kill);
+
+        // --wait 指定 (= 従来挙動、EOF まで待つ)
+        let wait_kill = ControlMessage::Kill(Kill {
+            signal: Some("SIGKILL".into()),
+            wait: true,
+        });
+        assert_eq!(roundtrip(&wait_kill), wait_kill);
+    }
+
+    /// 即時応答 kill の ack frame (= daemon → client) が roundtrip する。
+    #[test]
+    fn kill_ack_roundtrip() {
+        let msg = ControlMessage::KillAck(KillAck {
+            signal: "SIGTERM".into(),
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    /// 旧 client (= `wait` field 無し) が送る Kill CBOR を新 daemon が decode
+    /// すると `wait = false` (= `#[serde(default)]`) になる (= 互換)。
+    #[test]
+    fn kill_decodes_legacy_without_wait_field_as_false() {
+        // `wait` field を持たない旧 Kill 表現を別 struct で再現して CBOR 化。
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "kebab-case")]
+        struct LegacyKill {
+            kind: &'static str,
+            signal: String,
+        }
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(
+            &LegacyKill {
+                kind: "kill",
+                signal: "SIGTERM".into(),
+            },
+            &mut buf,
+        )
+        .expect("encode legacy");
+        let decoded = ControlMessage::decode_from(buf.as_slice()).expect("decode legacy kill");
+        assert_eq!(
+            decoded,
+            ControlMessage::Kill(Kill {
+                signal: Some("SIGTERM".into()),
+                wait: false,
+            })
+        );
     }
 
     #[test]

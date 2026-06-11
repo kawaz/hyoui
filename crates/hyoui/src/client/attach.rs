@@ -139,6 +139,41 @@ fn parse_detach_prefix(raw: &str) -> Option<Option<u8>> {
 pub const DETACH_PREFIX_BYTE: u8 = 0x01;
 /// detach prefix の後に来ると detach を起動する byte (= `'d'`, 0x64)。
 pub const DETACH_TRIGGER_BYTE: u8 = b'd';
+
+/// suspend (= 子 self-stop に follow して client 自身が SIGSTOP する) 直前に外側端末へ
+/// 吐く「安全側固定 reset シーケンス」(= issue 2026-06-11)。
+///
+/// client は daemon の screen state を持たないため、解除すべきモードを screen state
+/// から導出できない。そこで tmux / screen 等の先行実装が detach / suspend 時に吐く
+/// reset 群を参考に、有効化されている可能性のある端末モードを**安全側で網羅的に
+/// 解除**する。誤って無効モードを解除しても害はない (= 端末は no-op 扱い)。
+///
+/// 順序と各シーケンスの意味:
+/// - `\x1b[?2004l` : bracketed paste mode 解除 (= fg 後に貼り付けが `[200~` で汚れない)
+/// - `\x1b[?1000l` `\x1b[?1002l` `\x1b[?1003l` `\x1b[?1006l` `\x1b[?1015l` :
+///   mouse tracking / SGR・urxvt 拡張座標 解除 (= shell にマウス escape が流れない)
+/// - `\x1b[>4;0m` : modifyOtherKeys 解除 (= xterm 拡張キーエンコード OFF)
+/// - `\x1b[<u` : kitty keyboard protocol を全 flag pop で解除 (= ghostty 等で
+///   ctrl+c/d/z が CSI u 化して line discipline に効かなくなる現象を防ぐ)
+/// - `\x1b[?25h` : cursor 表示
+/// - `\x1b[?1049l` : alt screen を抜けて primary buffer に戻す
+/// - `\x1b[?1l` : DECCKM (application cursor keys) OFF
+/// - `\x1b>` : application keypad OFF (= DECKPNM)
+/// - `\x1b[?7h` : autowrap ON (= 端末標準に戻す)
+/// - `\x1b[m` : SGR (色・属性) リセット
+///
+/// alt screen を抜けるので外側 shell の元画面 (scrollback) がそのまま見える。
+/// resume 後は daemon の redraw が screen state から alt screen 等を再有効化する。
+pub const SUSPEND_OUTER_TTY_RESET: &[u8] = b"\x1b[?2004l\
+\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\
+\x1b[>4;0m\
+\x1b[<u\
+\x1b[?25h\
+\x1b[?1049l\
+\x1b[?1l\
+\x1b>\
+\x1b[?7h\
+\x1b[m";
 use crate::sys::{poll::PollFlags, poll::PollOutcome, poll::poll, socket as sys_socket};
 
 /// `ClientConnection::connect` で渡す接続オプション (HandshakeRequest 相当)。
@@ -181,6 +216,38 @@ pub enum StdinEofAction {
     SendEof,
 }
 
+/// 子 self-stop に follow して client 自身が `raise(SIGSTOP)` する際の、外側端末
+/// termios の suspend/resume hook (= issue 2026-06-11)。
+///
+/// `run` は CLI 層が所有する `TtyGuard` (= raw mode guard) を直接知らないため、
+/// termios の「saved 復元 (suspend)」「raw 再設定 (resume)」を closure として
+/// 受け取る。closure は best-effort (= 失敗しても panic させない) で実装する。
+///
+/// reset escape の出力と daemon への redraw 要求は `run` 内で行うため、本 hook は
+/// **termios の切替だけ**を担う (= 責務分離)。
+pub struct SuspendHooks {
+    /// SIGSTOP 直前に呼ぶ: 外側端末を pre-raw (cooked) termios に戻す。
+    on_suspend: Box<dyn FnMut() + Send>,
+    /// SIGCONT 復帰直後に呼ぶ: 外側端末を raw mode に再設定する。
+    on_resume: Box<dyn FnMut() + Send>,
+}
+
+impl SuspendHooks {
+    /// suspend / resume closure から `SuspendHooks` を作る。
+    pub fn new(on_suspend: Box<dyn FnMut() + Send>, on_resume: Box<dyn FnMut() + Send>) -> Self {
+        Self {
+            on_suspend,
+            on_resume,
+        }
+    }
+}
+
+impl std::fmt::Debug for SuspendHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SuspendHooks").finish_non_exhaustive()
+    }
+}
+
 /// daemon と確立した 1 接続。
 ///
 /// `connect` で handshake 完了状態を持ち、`run` で stdin/stdout 中継に入る。
@@ -194,6 +261,10 @@ pub struct ClientConnection {
     /// `set_stdin_eof_action(SendEof)` で `hyoui run --mode=headless -- bc`
     /// のような pipe-through pattern で子に EOF を伝える。
     eof_action: StdinEofAction,
+    /// 子 self-stop follow 時の外側端末 termios suspend/resume hook
+    /// (= issue 2026-06-11)。`None` の場合は従来挙動 (= termios を触らず
+    /// `raise(SIGSTOP)` のみ)。CLI 層が raw mode guard 保持時に設定する。
+    suspend_hooks: Option<SuspendHooks>,
 }
 
 impl ClientConnection {
@@ -264,7 +335,23 @@ impl ClientConnection {
             writer,
             response,
             eof_action: StdinEofAction::Detach,
+            suspend_hooks: None,
         })
+    }
+
+    /// 子 self-stop follow 時の外側端末 termios suspend/resume hook を設定する
+    /// (= issue 2026-06-11)。CLI 層が raw mode guard を保持しているときに呼ぶ。
+    ///
+    /// 設定すると、`run` は `SessionChildStoppedNotify` 受信時に:
+    /// 1. 外側端末へ安全側 reset escape (`SUSPEND_OUTER_TTY_RESET`) を吐く
+    /// 2. `on_suspend` で termios を cooked に復元 + flush
+    /// 3. `raise(SIGSTOP)` で自身を停止
+    /// 4. SIGCONT 復帰後 `on_resume` で termios を raw に再設定
+    /// 5. `SessionChildResumeRequest` を送信 (= daemon が redraw → SIGCONT)
+    #[must_use]
+    pub fn with_suspend_hooks(mut self, hooks: SuspendHooks) -> Self {
+        self.suspend_hooks = Some(hooks);
+        self
     }
 
     /// stdin EOF 時の挙動を設定 (R5-FB2)。default は `Detach` (= MVP attach
@@ -350,10 +437,32 @@ impl ClientConnection {
                                 Ok(ControlMessage::SessionChildStoppedNotify(_)) => {
                                     // follow policy: client 自身を SIGSTOP で止める。
                                     // 復帰時は loop に戻り、子を起こす resume.request を送る。
+                                    //
+                                    // suspend/resume の外側端末状態管理 (= issue 2026-06-11):
+                                    // suspend 前に termios を cooked へ戻し reset escape を吐く、
+                                    // resume 後に raw 再設定 → redraw 要求込みの ResumeRequest
+                                    // を送る、という順序にする。`suspend_hooks` 未設定 (= 非 tty
+                                    // / raw guard 無し) の場合は従来挙動 (= SIGSTOP のみ)。
+                                    if let Some(hooks) = self.suspend_hooks.as_mut() {
+                                        // 1. 外側端末を通常モードへ戻す reset escape。
+                                        let _ = stdout.write_all(SUSPEND_OUTER_TTY_RESET);
+                                        let _ = stdout.flush();
+                                        // 2. termios を cooked へ復元。
+                                        (hooks.on_suspend)();
+                                    }
+                                    // 3. 自身を停止 (= STOPPED)。
                                     let _ =
                                         nix::sys::signal::raise(nix::sys::signal::Signal::SIGSTOP);
-                                    // 復帰後 (= 外側 fg で client が起き上がった): daemon に
-                                    // 子も起こすよう要求。
+                                    // --- SIGCONT 復帰後 (= 外側 fg で client が起き上がった) ---
+                                    // 4. termios を raw に再設定。
+                                    if let Some(hooks) = self.suspend_hooks.as_mut() {
+                                        (hooks.on_resume)();
+                                    }
+                                    // 5. daemon に子も起こすよう要求。daemon は受信すると
+                                    //    SIGCONT より **前に** attach redraw を当該 client へ
+                                    //    push する (= 子の復帰出力より redraw が先に届く順序、
+                                    //    screen state から画面・モードを復元)。redraw raw_data
+                                    //    frame は次以降の loop iteration で stdout に書かれる。
                                     let resume = ControlMessage::SessionChildResumeRequest(
                                         crate::protocol::messages::SessionChildResumeRequest::default(),
                                     );
@@ -653,6 +762,39 @@ mod tests {
         assert!(!armed);
     }
 
+    // ---- SUSPEND_OUTER_TTY_RESET (issue 2026-06-11) ----
+
+    /// suspend reset シーケンスに、外側端末で suspend 跨ぎに悪さをする主要モードの
+    /// 解除 escape が含まれていることを固定する。特に kitty keyboard protocol 解除
+    /// (`\x1b[<u`) と alt screen 解除 (`?1049l`) は現象の核心 (= fg 後の操作不能 /
+    /// 画面崩れ) なので必須。
+    #[test]
+    fn suspend_reset_contains_critical_mode_resets() {
+        let r = SUSPEND_OUTER_TTY_RESET;
+        // kitty keyboard protocol pop (= CSI u 化で ctrl+c/d/z が効かなくなる現象)
+        assert!(
+            r.windows(4).any(|w| w == b"\x1b[<u"),
+            "must reset kitty keyboard protocol"
+        );
+        // alt screen 解除
+        assert!(
+            r.windows(8).any(|w| w == b"\x1b[?1049l"),
+            "must leave alt screen"
+        );
+        // bracketed paste 解除
+        assert!(
+            r.windows(8).any(|w| w == b"\x1b[?2004l"),
+            "must disable bracketed paste"
+        );
+        // cursor 表示
+        assert!(r.windows(6).any(|w| w == b"\x1b[?25h"), "must show cursor");
+        // mouse tracking 解除 (= 1000 系のいずれか)
+        assert!(
+            r.windows(8).any(|w| w == b"\x1b[?1000l"),
+            "must disable mouse tracking"
+        );
+    }
+
     // ---- parse_detach_prefix ----
 
     #[test]
@@ -763,6 +905,7 @@ mod tests {
         // kill して daemon 終了させる (DR-0012: signal: None = SIGTERM default)
         conn.send_control(&ControlMessage::Kill(crate::protocol::messages::Kill {
             signal: None,
+            wait: true,
         }))
         .expect("send kill");
         let exit = handle.join().expect("daemon thread").expect("daemon run");
@@ -925,6 +1068,7 @@ mod tests {
         // Ok(()) で抜ける、という経路。
         conn.send_control(&ControlMessage::Kill(crate::protocol::messages::Kill {
             signal: None,
+            wait: true,
         }))
         .expect("send kill");
 

@@ -2074,7 +2074,10 @@ mod tests {
         let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
         let mut stream = client_connect_with_retry(&sock_path);
         let _resp = do_client_handshake(&mut stream);
-        let kill_msg = ControlMessage::Kill(Kill { signal: None });
+        let kill_msg = ControlMessage::Kill(Kill {
+            signal: None,
+            wait: true,
+        });
         let body = kill_msg.encode_to_vec().expect("encode kill");
         Frame::cbor_control(body)
             .encode_to(&mut stream)
@@ -2110,9 +2113,12 @@ mod tests {
         {
             let mut s = client_connect_with_retry(&sock_path);
             let _r = do_client_handshake(&mut s);
-            let body = ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode");
+            let body = ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode");
             Frame::cbor_control(body).encode_to(&mut s).expect("send");
             s.flush().expect("flush");
         }
@@ -2136,9 +2142,12 @@ mod tests {
         assert_ne!(r2.client_id, 0);
 
         // s1 が kill 送信
-        let body = ControlMessage::Kill(Kill { signal: None })
-            .encode_to_vec()
-            .expect("encode");
+        let body = ControlMessage::Kill(Kill {
+            signal: None,
+            wait: true,
+        })
+        .encode_to_vec()
+        .expect("encode");
         Frame::cbor_control(body).encode_to(&mut s1).expect("send");
         s1.flush().expect("flush");
 
@@ -2256,9 +2265,12 @@ mod tests {
         assert_ne!(r1.client_id, r2.client_id);
 
         // cleanup: kill
-        let body = ControlMessage::Kill(Kill { signal: None })
-            .encode_to_vec()
-            .expect("encode");
+        let body = ControlMessage::Kill(Kill {
+            signal: None,
+            wait: true,
+        })
+        .encode_to_vec()
+        .expect("encode");
         Frame::cbor_control(body).encode_to(&mut s1).expect("send");
         s1.flush().expect("flush");
         let _ = handle.join().expect("daemon thread");
@@ -2316,9 +2328,12 @@ mod tests {
         }
 
         // cleanup
-        let body = ControlMessage::Kill(Kill { signal: None })
-            .encode_to_vec()
-            .expect("encode");
+        let body = ControlMessage::Kill(Kill {
+            signal: None,
+            wait: true,
+        })
+        .encode_to_vec()
+        .expect("encode");
         Frame::cbor_control(body).encode_to(&mut s1).expect("send");
         s1.flush().expect("flush");
         let _ = handle.join().expect("daemon thread");
@@ -2381,9 +2396,12 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s1)
         .expect("send");
@@ -2447,9 +2465,12 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s1)
         .expect("send");
@@ -2501,9 +2522,12 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s2)
         .expect("send");
@@ -2549,9 +2573,12 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s1)
         .expect("send");
@@ -2597,9 +2624,12 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s1)
         .expect("send");
@@ -2684,9 +2714,12 @@ mod tests {
 
         // cleanup: s2 から kill 送信 → daemon 終了
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s2)
         .expect("send");
@@ -2751,9 +2784,12 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s2)
         .expect("send");
@@ -2852,9 +2888,12 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s)
         .expect("send");
@@ -2989,9 +3028,12 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s1)
         .expect("send");
@@ -3086,9 +3128,12 @@ mod tests {
         let mut k = client_connect_with_retry(&sock_path);
         let _ = do_client_handshake(&mut k);
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut k)
         .expect("send kill");
@@ -3187,9 +3232,12 @@ mod tests {
         let _ = Frame::decode_from(&mut s2).expect("handshake response"); // discard
         discard_attach_redraw(&mut s2);
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s2)
         .expect("send kill");
@@ -3206,9 +3254,12 @@ mod tests {
 
         // s1 から正規 Kill で session 終了
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s1)
         .expect("send");
@@ -3244,9 +3295,12 @@ mod tests {
         }
 
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s)
         .expect("send");
@@ -3303,9 +3357,12 @@ mod tests {
         // cleanup: leader.notify を捨てて kill
         let _ = Frame::decode_from(&mut s2);
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s2)
         .expect("send");
@@ -3378,9 +3435,12 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s1)
         .expect("send");
@@ -3415,9 +3475,12 @@ mod tests {
 
         // s2 (RwNoLeader) が Kill 試行 → mode.not-allowed
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s2)
         .expect("send");
@@ -3431,9 +3494,12 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s1)
         .expect("send");
@@ -3530,9 +3596,12 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s1)
         .expect("send");
@@ -3608,9 +3677,12 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s1)
         .expect("send");
@@ -3654,9 +3726,12 @@ mod tests {
         // cleanup
         good.set_read_timeout(None).expect("clear timeout");
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut good)
         .expect("send kill");
@@ -3727,9 +3802,12 @@ mod tests {
         // cleanup: kill で daemon を畳む
         newcomer.set_read_timeout(None).expect("clear");
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut attached[0])
         .expect("send kill");
@@ -3787,9 +3865,12 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s)
         .expect("send");
@@ -3849,9 +3930,12 @@ mod tests {
         }
 
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s)
         .expect("send");
@@ -3985,9 +4069,12 @@ mod tests {
 
         // cleanup
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s)
         .expect("send");
@@ -4044,9 +4131,12 @@ mod tests {
         }
 
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s)
         .expect("send");
@@ -4082,9 +4172,12 @@ mod tests {
         }
 
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s)
         .expect("send");
@@ -4151,9 +4244,12 @@ mod tests {
         }
 
         Frame::cbor_control(
-            ControlMessage::Kill(Kill { signal: None })
-                .encode_to_vec()
-                .expect("encode"),
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode"),
         )
         .encode_to(&mut s)
         .expect("send");
