@@ -941,6 +941,60 @@ fn cap_poll_timeout(current: PollTimeout, cap_ms: u16) -> PollTimeout {
     }
 }
 
+/// DR-0019 §4: daemon 側終了条件 (overall `--timeout` / idle `--idle-timeout`) の
+/// 発火判定。発火するなら理由文字列 (`"timeout"` / `"idle-timeout"`)、しなければ
+/// `None` を返す。
+///
+/// - `elapsed_since_start`: serve_loop 開始からの経過 (= overall 基準)
+/// - `elapsed_since_output`: 最終 master 出力からの経過 (= idle 基準)
+/// - 両方発火条件を満たす場合は overall を優先 (= 理由を一意に決める。SIGTERM 手順は
+///   どちらも同じなので優先順位は表示上の問題のみ)
+fn eval_timeout(
+    elapsed_since_start: std::time::Duration,
+    elapsed_since_output: std::time::Duration,
+    timeout_ms: Option<u64>,
+    idle_timeout_ms: Option<u64>,
+) -> Option<&'static str> {
+    if let Some(ms) = timeout_ms
+        && elapsed_since_start.as_millis() >= u128::from(ms)
+    {
+        return Some("timeout");
+    }
+    if let Some(ms) = idle_timeout_ms
+        && elapsed_since_output.as_millis() >= u128::from(ms)
+    {
+        return Some("idle-timeout");
+    }
+    None
+}
+
+/// DR-0019 §4: timeout / idle-timeout が有効なとき、最も近い deadline までの残り
+/// ミリ秒を返す (= `poll(2)` timeout の cap に使い、deadline で確実に wake させる)。
+///
+/// 両方有効なら近い方 (= 小さい残り)。既に超過していたら `Some(0)` (= 即 wake)。
+/// 両方無効なら `None` (= cap しない)。
+fn timeout_poll_cap_ms(
+    elapsed_since_start: std::time::Duration,
+    elapsed_since_output: std::time::Duration,
+    timeout_ms: Option<u64>,
+    idle_timeout_ms: Option<u64>,
+) -> Option<u64> {
+    let overall_rem = timeout_ms.map(|ms| {
+        let elapsed = u64::try_from(elapsed_since_start.as_millis()).unwrap_or(u64::MAX);
+        ms.saturating_sub(elapsed)
+    });
+    let idle_rem = idle_timeout_ms.map(|ms| {
+        let elapsed = u64::try_from(elapsed_since_output.as_millis()).unwrap_or(u64::MAX);
+        ms.saturating_sub(elapsed)
+    });
+    match (overall_rem, idle_rem) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
 /// serve loop の本体。`Session::serve` から切り出して所有権整理を平坦化。
 #[allow(clippy::too_many_arguments)]
 fn serve_loop(
@@ -976,7 +1030,35 @@ fn serve_loop(
         .as_ref()
         .filter(|s| !s.is_empty())
         .map(|s| UntilWatcher::new(s.clone()));
+    // DR-0019 §4: 終了条件 (overall `--timeout` / idle `--idle-timeout`) の基準時刻。
+    // overall は serve_loop 開始から、idle は最終 master 出力から計測する。起動後
+    // 一度も出力が無いケースでも idle が発火するよう、`last_output` の初期値は
+    // `serve_start` と同じにする。
+    let serve_start = Instant::now();
+    let mut last_output = serve_start;
     loop {
+        // DR-0019 §4: 終了条件の発火判定 (= ループ冒頭で毎回チェック)。発火したら
+        // `--until` match と同じ手順 (= killpg(SIGTERM) → finalize escalation) に乗せ、
+        // 発火理由を lifecycle event に残す。
+        if config.timeout_ms.is_some() || config.idle_timeout_ms.is_some() {
+            let now = Instant::now();
+            if let Some(reason) = eval_timeout(
+                now.duration_since(serve_start),
+                now.duration_since(last_output),
+                config.timeout_ms,
+                config.idle_timeout_ms,
+            ) {
+                state.record_registry.push_lifecycle(
+                    super::record::LifecycleEvent::SessionTerminatedByCondition {
+                        reason: reason.to_string(),
+                        ts_unix_ms: now_unix_ms(),
+                    },
+                );
+                let _ = kill_pgrp(child, Signal::SIGTERM);
+                return RelayOutcome::ClientDetachedOrKilled;
+            }
+        }
+
         // poll fd 構築: listener + master + 各 client reader (+ SIGCHLD self-pipe)
         let listener_fd = listener.as_fd();
         let master_fd = pty.master_fd();
@@ -1021,6 +1103,22 @@ fn serve_loop(
         if sigchld_pipe.is_none() {
             const NO_SELFPIPE_POLL_CAP_MS: u16 = 500;
             poll_timeout = cap_poll_timeout(poll_timeout, NO_SELFPIPE_POLL_CAP_MS);
+        }
+        // DR-0019 §4: overall / idle timeout が有効なら、deadline までの残りで
+        // poll を cap し、deadline 到達時に確実に wake してループ冒頭の eval_timeout
+        // で発火させる。u16 上限 (= 約 65s) を超える残りは 65s ごとに wake して
+        // 再評価する (= 最終的に必ず発火、過剰精度は不要)。
+        if config.timeout_ms.is_some() || config.idle_timeout_ms.is_some() {
+            let now = Instant::now();
+            if let Some(rem) = timeout_poll_cap_ms(
+                now.duration_since(serve_start),
+                now.duration_since(last_output),
+                config.timeout_ms,
+                config.idle_timeout_ms,
+            ) {
+                let cap = u16::try_from(rem).unwrap_or(u16::MAX);
+                poll_timeout = cap_poll_timeout(poll_timeout, cap);
+            }
         }
         // R4-C3: Timeout 経路では poll_fds の revents は使わないので、まず borrows を
         // 解いてから check_wait_timeouts / process_pending_handshakes を呼ぶ。
@@ -1292,6 +1390,9 @@ fn serve_loop(
                     state.record_registry.push_bytes_out(&buf[..n]);
                     // scrollback に push してから broadcast (subscription 種類で encoding 分岐)
                     let now = Instant::now();
+                    // DR-0019 §4: idle-timeout は master 出力の最終時刻基準。新 bytes
+                    // 受信のたびに基準を更新する (= 子が喋り続ける限り idle は発火しない)。
+                    last_output = now;
                     scrollback.push(now, buf[..n].to_vec());
                     // DR-0013 §3: bytes は本 wrapper を経由してから broadcast へ。
                     // sync_in_progress / cell / cursor / mode 等の state を更新する。
@@ -1617,6 +1718,138 @@ mod tests {
         // 子 process が orphan で残らないように SIGKILL → wait。
         let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
         let _ = nix::sys::wait::waitpid(pid, None);
+    }
+
+    // ---- DR-0019 §4: timeout / idle-timeout 判定 helper unit tests ----
+
+    #[test]
+    fn eval_timeout_none_when_disabled() {
+        // 両方 None なら発火しない (= default)。
+        assert_eq!(
+            eval_timeout(
+                Duration::from_secs(999),
+                Duration::from_secs(999),
+                None,
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn eval_timeout_overall_fires_at_threshold() {
+        // overall: start からの経過が timeout_ms 以上で "timeout"。
+        assert_eq!(
+            eval_timeout(
+                Duration::from_millis(1000),
+                Duration::from_millis(0),
+                Some(1000),
+                None
+            ),
+            Some("timeout")
+        );
+        // 未達なら None。
+        assert_eq!(
+            eval_timeout(
+                Duration::from_millis(999),
+                Duration::from_millis(0),
+                Some(1000),
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn eval_timeout_idle_fires_on_output_gap() {
+        // idle: 最終出力からの経過が idle_timeout_ms 以上で "idle-timeout"。
+        assert_eq!(
+            eval_timeout(
+                Duration::from_secs(100),
+                Duration::from_millis(500),
+                None,
+                Some(500)
+            ),
+            Some("idle-timeout")
+        );
+        assert_eq!(
+            eval_timeout(
+                Duration::from_secs(100),
+                Duration::from_millis(499),
+                None,
+                Some(500)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn eval_timeout_overall_takes_priority_over_idle() {
+        // 両方発火条件を満たす場合は overall ("timeout") を優先する
+        // (= 発火理由を一意に決める。どちらでも SIGTERM 手順は同じ)。
+        assert_eq!(
+            eval_timeout(
+                Duration::from_millis(2000),
+                Duration::from_millis(2000),
+                Some(1000),
+                Some(1000)
+            ),
+            Some("timeout")
+        );
+    }
+
+    #[test]
+    fn timeout_poll_cap_ms_returns_remaining_until_nearest_deadline() {
+        // overall のみ: 残り = timeout - elapsed_start。
+        assert_eq!(
+            timeout_poll_cap_ms(
+                Duration::from_millis(300),
+                Duration::from_millis(0),
+                Some(1000),
+                None
+            ),
+            Some(700)
+        );
+        // idle のみ: 残り = idle - elapsed_output。
+        assert_eq!(
+            timeout_poll_cap_ms(
+                Duration::from_millis(0),
+                Duration::from_millis(200),
+                None,
+                Some(500)
+            ),
+            Some(300)
+        );
+        // 両方: より近い deadline を採る (= 小さい方)。
+        assert_eq!(
+            timeout_poll_cap_ms(
+                Duration::from_millis(300),
+                Duration::from_millis(200),
+                Some(1000),
+                Some(500)
+            ),
+            Some(300) // idle 残り 300 < overall 残り 700
+        );
+        // 無効なら None (= cap しない)。
+        assert_eq!(
+            timeout_poll_cap_ms(
+                Duration::from_millis(0),
+                Duration::from_millis(0),
+                None,
+                None
+            ),
+            None
+        );
+        // 既に超過していたら 0 (= 即 wake)。
+        assert_eq!(
+            timeout_poll_cap_ms(
+                Duration::from_millis(2000),
+                Duration::from_millis(0),
+                Some(1000),
+                None
+            ),
+            Some(0)
+        );
     }
 
     // ---- cap_poll_timeout unit tests ----

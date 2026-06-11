@@ -32,6 +32,8 @@ pub fn run_detached_parent(
     debug_dump: Option<String>,
     namespace: String,
     on_child_suspend: hyoui::cli::OnChildSuspend,
+    timeout_ms: Option<u64>,
+    idle_timeout_ms: Option<u64>,
     cmd: Vec<String>,
 ) -> ExitCode {
     match spawn_detached_daemon_and_wait_ready(
@@ -43,6 +45,8 @@ pub fn run_detached_parent(
         debug_dump,
         namespace,
         on_child_suspend,
+        timeout_ms,
+        idle_timeout_ms,
         cmd,
     ) {
         Ok((session_id, _sock)) => {
@@ -74,6 +78,8 @@ pub fn spawn_detached_daemon_and_wait_ready(
     debug_dump: Option<String>,
     namespace: String,
     on_child_suspend: hyoui::cli::OnChildSuspend,
+    timeout_ms: Option<u64>,
+    idle_timeout_ms: Option<u64>,
     cmd: Vec<String>,
 ) -> Result<(String, PathBuf), ExitCode> {
     let session_id = session_id_override.unwrap_or_else(socket_path::auto_session_id);
@@ -131,6 +137,9 @@ pub fn spawn_detached_daemon_and_wait_ready(
         namespace,
         // DR-0019: 子 STOPPED 時の daemon 挙動を伝える。
         on_child_suspend: Some(child_suspend_str(on_child_suspend).to_string()),
+        // DR-0019 §4: overall / idle timeout を daemon に伝える (= --until と同経路)。
+        timeout_ms,
+        idle_timeout_ms,
     };
     let init_json = match serde_json::to_string(&init) {
         Ok(s) => s,
@@ -317,6 +326,24 @@ struct DaemonizeInit {
         default
     )]
     on_child_suspend: Option<String>,
+
+    /// DR-0019 §4: overall timeout ミリ秒 (= `hyoui run --timeout`)。
+    /// 旧 init JSON 互換のため `default` で skip (= 未設定なら無効)。
+    #[serde(
+        rename = "timeout_ms",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    timeout_ms: Option<u64>,
+
+    /// DR-0019 §4: idle timeout ミリ秒 (= `hyoui run --idle-timeout`)。
+    /// 旧 init JSON 互換のため `default` で skip (= 未設定なら無効)。
+    #[serde(
+        rename = "idle_timeout_ms",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    idle_timeout_ms: Option<u64>,
 }
 
 /// `DaemonizeInit.namespace` の serde default (= 旧 init JSON 互換)。
@@ -385,6 +412,8 @@ pub fn run_daemon_child() -> ExitCode {
     let scrollback_rows = init.scrollback_rows;
     let debug_dump = init.debug_dump.clone();
     let on_child_suspend = parse_child_suspend(init.on_child_suspend.as_deref());
+    let timeout_ms = init.timeout_ms;
+    let idle_timeout_ms = init.idle_timeout_ms;
 
     // DR-0018: 子 PTY に `HYOUI_NAMESPACE` を **常時注入** (= default でも注入)。
     // daemon child 自身の env に set しておくと、`Session::start` が fork+execvp する
@@ -450,6 +479,9 @@ pub fn run_daemon_child() -> ExitCode {
     }
     // DR-0019: 子 STOPPED 時の daemon 挙動 (notify / auto-resume) を配線。
     dcfg.on_child_suspend = on_child_suspend;
+    // DR-0019 §4: overall / idle timeout を配線 (= daemon 側終了条件、--until と同経路)。
+    dcfg.timeout_ms = timeout_ms;
+    dcfg.idle_timeout_ms = idle_timeout_ms;
     // DR-0013 §8 + §8 Update: scrollback rows 上限を daemon に配線。
     if let Some(n) = scrollback_rows {
         dcfg.screen_vt100_scrollback_rows = n;
@@ -551,5 +583,34 @@ mod tests {
             parse_child_suspend(Some("auto-resume")),
             ChildSuspendPolicy::AutoResume
         );
+    }
+
+    /// DR-0019 §4: timeout / idle-timeout が DaemonizeInit JSON を round-trip する
+    /// (= --until と同経路の配線の正本)。
+    #[test]
+    fn daemonize_init_propagates_timeouts() {
+        let init = DaemonizeInit {
+            socket: "/tmp/x.sock".into(),
+            session: "demo".into(),
+            ready_fd: 7,
+            timeout_ms: Some(60_000),
+            idle_timeout_ms: Some(5_000),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&init).expect("serialize");
+        assert!(json.contains("timeout_ms"), "json: {json}");
+        assert!(json.contains("idle_timeout_ms"), "json: {json}");
+        let decoded: DaemonizeInit = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.timeout_ms, Some(60_000));
+        assert_eq!(decoded.idle_timeout_ms, Some(5_000));
+    }
+
+    /// 旧 init JSON (= timeout field 無し) は None に倒れる (= 無効、互換維持)。
+    #[test]
+    fn daemonize_init_missing_timeout_fields_default_to_none() {
+        let json = r#"{"socket":"/tmp/x.sock","session":"demo","ready_fd":7}"#;
+        let decoded: DaemonizeInit = serde_json::from_str(json).expect("deserialize legacy");
+        assert_eq!(decoded.timeout_ms, None);
+        assert_eq!(decoded.idle_timeout_ms, None);
     }
 }

@@ -138,6 +138,21 @@ pub struct DaemonConfig {
     /// `hyoui run --on-child-suspend=notify|auto-resume` から配線される
     /// (= DaemonizeInit → run_daemon_child → ここ)。default は `Notify`。
     pub on_child_suspend: ChildSuspendPolicy,
+
+    /// `hyoui run --timeout DUR`: **daemon 起動時刻基準**の overall 上限 (DR-0019 §4)。
+    ///
+    /// `Some(ms)` なら serve_loop 開始から `ms` ミリ秒経過した瞬間、`--until` match
+    /// と同じ手順 (= `kill_pgrp(SIGTERM)` → finalize escalation) で session を畳む。
+    /// `None` なら overall timeout 無し (= default)。
+    pub timeout_ms: Option<u64>,
+
+    /// `hyoui run --idle-timeout DUR`: **master 出力の最終時刻基準**の idle 上限 (DR-0019 §4)。
+    ///
+    /// `Some(ms)` なら子 PTY からの新 bytes が `ms` ミリ秒途絶した瞬間、`--until`
+    /// match と同じ手順で session を畳む。最終出力時刻は master byte 受信ごとに更新。
+    /// serve_loop 開始時刻を初期基準とする (= 起動後一度も出力が無くても発火する)。
+    /// `None` なら idle timeout 無し (= default)。
+    pub idle_timeout_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for DaemonConfig {
@@ -164,6 +179,8 @@ impl std::fmt::Debug for DaemonConfig {
             .field("cwd", &self.cwd)
             .field("daemon_boot_id", &self.daemon_boot_id)
             .field("on_child_suspend", &self.on_child_suspend)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("idle_timeout_ms", &self.idle_timeout_ms)
             .finish()
     }
 }
@@ -196,6 +213,9 @@ impl DaemonConfig {
             daemon_boot_id: uuid::Uuid::new_v4().to_string(),
             // DR-0017 §柱2: default は notify-only (= 子を勝手に起こさない)。
             on_child_suspend: ChildSuspendPolicy::Notify,
+            // DR-0019 §4: 終了条件 (overall / idle timeout) は default 無効。
+            timeout_ms: None,
+            idle_timeout_ms: None,
         }
     }
 }

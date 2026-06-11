@@ -172,6 +172,12 @@ pub enum LifecycleEvent {
         detail: Option<String>,
         ts_unix_ms: u64,
     },
+    /// daemon 側終了条件 (= `--until` match / `--timeout` / `--idle-timeout`) が
+    /// 発火し、子 process group へ SIGTERM を送って session を畳む瞬間 (DR-0019 §4)。
+    ///
+    /// `reason` は発火理由 ("until" / "timeout" / "idle-timeout")。発火後は通常の
+    /// child exit 経路 (= finalize escalation → `SessionExitNotify`) に合流する。
+    SessionTerminatedByCondition { reason: String, ts_unix_ms: u64 },
 }
 
 /// sink push される event (DR-0016 §3 / §4 / §6)。
@@ -1073,6 +1079,12 @@ fn encode_lifecycle(seq: u32, ev: &LifecycleEvent) -> serde_json::Value {
             "record_id": record_id,
             "reason": reason,
             "detail": detail,
+        }),
+        LifecycleEvent::SessionTerminatedByCondition { reason, ts_unix_ms } => json!({
+            "ts_unix_ms": ts_unix_ms,
+            "seq": seq,
+            "ev": "session-terminated-by-condition",
+            "reason": reason,
         }),
     }
 }

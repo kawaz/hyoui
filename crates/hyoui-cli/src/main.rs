@@ -472,6 +472,8 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
             cfg.debug_dump_server.clone(),
             namespace,
             cfg.on_child_suspend,
+            cfg.timeout_ms,
+            cfg.idle_timeout_ms,
             cfg.command,
         );
     }
@@ -493,6 +495,8 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
         cfg.debug_dump_server.clone(),
         namespace.clone(),
         cfg.on_child_suspend,
+        cfg.timeout_ms,
+        cfg.idle_timeout_ms,
         cfg.command,
     ) {
         Ok(pair) => pair,
