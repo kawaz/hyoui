@@ -914,6 +914,23 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
             eprintln!("hyoui: daemon との接続が失われました (daemon が終了した可能性があります)");
             ExitCode::from(EXIT_CONNECTION_LOST)
         }
+        // daemon が backpressure で client を切断した。daemon 自体は健在で、原因は
+        // client の出力 buffer 超過 (= suspend 中の出力過多等)。exit code は
+        // ConnectionLost と同じ 9 だが、原因が異なるので stderr を出し分ける。
+        Ok(RunOutcome::BackpressureDisconnected) => {
+            eprintln!(
+                "hyoui: daemon が出力 buffer 超過で client を切断しました (suspend 中の出力過多等)"
+            );
+            ExitCode::from(EXIT_CONNECTION_LOST)
+        }
+        // 出力先 (= stdout) への書き込みに失敗した。daemon は健在で自分側の出力経路が
+        // 壊れただけなので、daemon 消滅 (= exit 9) とは区別して一般エラー exit 1。
+        Ok(RunOutcome::StdoutWriteFailed) => {
+            eprintln!(
+                "hyoui: 出力先への書き込みに失敗しました (端末 / pipe が閉じた可能性があります)"
+            );
+            ExitCode::from(1)
+        }
         Err(e) => {
             eprintln!("hyoui: attach 実行エラー: {e}");
             ExitCode::from(1)

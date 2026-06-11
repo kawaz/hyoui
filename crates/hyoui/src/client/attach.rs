@@ -239,7 +239,8 @@ impl Default for AttachOptions {
 /// CLI 層 (`attach_command`) はこの variant ごとに exit code を出し分ける:
 /// - `ChildExited(status)` → `status & 0xFF` を伝搬 (= 子の exit code をそのまま)
 /// - `Detached` → exit 0 (= 自分から離脱した、正常)
-/// - `ConnectionLost` → 非 0 exit + stderr 一行 (= daemon 消滅の疑い)
+/// - `ConnectionLost` → exit 9 + stderr 一行 (= daemon 消滅の疑い)
+/// - `StdoutWriteFailed` → exit 1 + stderr 一行 (= 出力先の故障、daemon は健在)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
     /// `SessionExitNotify` を受信した (= 子 PTY process が exit)。CLI 層は
@@ -254,8 +255,19 @@ pub enum RunOutcome {
     Detached,
     /// **予期しない**接続喪失 (= daemon の socket EOF / POLLHUP / POLLERR、または
     /// socket への書き込み失敗)。自分から detach していないのに接続が切れた状態で、
-    /// daemon が SIGKILL 等で落ちた疑いがある。CLI 層は非 0 exit + stderr 警告。
+    /// daemon が SIGKILL 等で落ちた疑いがある。CLI 層は exit 9 + stderr 警告。
     ConnectionLost,
+    /// **出力先 (= stdout: 端末 / pipe) への書き込みに失敗**した。daemon との接続は
+    /// 健在で、自分側の出力経路が壊れた状態 (= pipe の読み手が先に消えた等)。daemon
+    /// 消滅 (= `ConnectionLost`) とは別物なので exit code を分ける。CLI 層は
+    /// exit 1 (= 一般エラー) + stderr 一行。
+    StdoutWriteFailed,
+    /// daemon が **backpressure で当該 client を切断**した (= `error`
+    /// kind=`backpressure.disconnect` control message を受信)。client の send queue
+    /// が limit (= 既定 8 MiB) を超過した状態で、suspend 中の出力過多等が原因。
+    /// daemon 自体は健在だが当該 client は切断される。`ConnectionLost` と同じ exit 9
+    /// を返すが、stderr メッセージを backpressure 専用に出し分けるため variant を分ける。
+    BackpressureDisconnected,
 }
 
 /// `ClientConnection::run` で stdin EOF を検出したときの挙動 (R5-FB2)。
@@ -626,9 +638,10 @@ impl ClientConnection {
                     Ok(frame) => match frame.ty {
                         TYPE_RAW_DATA => {
                             if stdout.write_all(&frame.body).is_err() {
-                                // 出力先 (= 端末 / pipe) が閉じた。自分から detach した
-                                // わけではないので接続喪失扱い。
-                                return Ok(RunOutcome::ConnectionLost);
+                                // 出力先 (= 端末 / pipe) が閉じた。daemon との接続は
+                                // 健在なので `ConnectionLost` (= daemon 消滅) とは別扱い。
+                                // 自分側の出力経路が壊れただけ。
+                                return Ok(RunOutcome::StdoutWriteFailed);
                             }
                             let _ = stdout.flush();
                         }
@@ -712,6 +725,15 @@ impl ClientConnection {
                                             let _ = self.send_control(&msg);
                                         }
                                     }
+                                }
+                                Ok(ControlMessage::Error(e))
+                                    if e.code == ErrorCode::BackpressureDisconnect =>
+                                {
+                                    // daemon が backpressure で当該 client を切断した。
+                                    // 後続の socket EOF (= ConnectionLost) を待たず、
+                                    // 切断理由が分かる専用 outcome で即 return する
+                                    // (= EOF だけ拾うと「daemon 消滅の疑い」と区別不能)。
+                                    return Ok(RunOutcome::BackpressureDisconnected);
                                 }
                                 Ok(_) => { /* 他 control message は無視 (= 既存 MVP 挙動) */
                                 }
@@ -1870,6 +1892,120 @@ mod tests {
         assert!(
             matches!(res, Ok(RunOutcome::Detached)),
             "stdin EOF + Detach action は Detached を返すはず: {res:?}"
+        );
+    }
+
+    /// daemon が `error` kind=`backpressure.disconnect` を送ってきたら
+    /// `RunOutcome::BackpressureDisconnected` を返す (= CLI 層が exit 9 +
+    /// backpressure 専用 stderr を出すための分離。socket EOF を待たず即 return)。
+    #[test]
+    fn run_returns_backpressure_disconnected_on_error_control() {
+        use crate::protocol::ControlMessage;
+        use crate::protocol::messages::{ErrorCode, ErrorMessage};
+        use std::os::unix::net::UnixStream;
+
+        let (client_sock, daemon_sock) = UnixStream::pair().expect("socketpair");
+        let transport = UnixStreamTransport::new(client_sock);
+        let (reader, writer) = transport.split().expect("split");
+        let conn = ClientConnection {
+            reader,
+            writer,
+            response: HandshakeResponse {
+                caps: vec![],
+                session_id: "t".into(),
+                client_id: 1,
+                leader: false,
+                mode: Mode::Rw,
+            },
+            eof_action: StdinEofAction::Detach,
+            suspend_hooks: None,
+            winch_source: None,
+        };
+
+        let (stdin_rd, stdin_wr_keep) = nix::unistd::pipe().expect("stdin pipe");
+        let mut stdin_file = std::fs::File::from(stdin_rd);
+        let mut stdout: Vec<u8> = Vec::new();
+
+        let mut daemon_sock = daemon_sock;
+        let err = ControlMessage::Error(ErrorMessage {
+            code: ErrorCode::BackpressureDisconnect,
+            message: "send queue overflow".into(),
+            details: None,
+        });
+        let body = err.encode_to_vec().expect("encode error");
+        Frame::cbor_control(body)
+            .encode_to(&mut daemon_sock)
+            .expect("send error");
+
+        let run_handle = std::thread::spawn(move || conn.run(&mut stdin_file, &mut stdout));
+        let res = run_handle.join().expect("join");
+        drop(stdin_wr_keep);
+        drop(daemon_sock);
+        assert!(
+            matches!(res, Ok(RunOutcome::BackpressureDisconnected)),
+            "backpressure.disconnect error は BackpressureDisconnected を返すはず: {res:?}"
+        );
+    }
+
+    /// daemon が RAW_DATA を送ってきたが stdout への write が失敗する場合、
+    /// `RunOutcome::StdoutWriteFailed` を返す (= daemon 健在 / 自分側出力経路の故障。
+    /// `ConnectionLost` (= daemon 消滅) と区別して CLI 層 exit 1)。
+    #[test]
+    fn run_returns_stdout_write_failed_on_output_error() {
+        use std::os::unix::net::UnixStream;
+
+        /// write が必ず失敗する Writer (= 出力先 pipe の読み手が消えた等を模す)。
+        struct FailWriter;
+        impl std::io::Write for FailWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "broken",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "broken",
+                ))
+            }
+        }
+
+        let (client_sock, daemon_sock) = UnixStream::pair().expect("socketpair");
+        let transport = UnixStreamTransport::new(client_sock);
+        let (reader, writer) = transport.split().expect("split");
+        let conn = ClientConnection {
+            reader,
+            writer,
+            response: HandshakeResponse {
+                caps: vec![],
+                session_id: "t".into(),
+                client_id: 1,
+                leader: false,
+                mode: Mode::Rw,
+            },
+            eof_action: StdinEofAction::Detach,
+            suspend_hooks: None,
+            winch_source: None,
+        };
+
+        let (stdin_rd, stdin_wr_keep) = nix::unistd::pipe().expect("stdin pipe");
+        let mut stdin_file = std::fs::File::from(stdin_rd);
+        let mut stdout = FailWriter;
+
+        // daemon 役: RAW_DATA frame を送る (= stdout への write を誘発)。
+        let mut daemon_sock = daemon_sock;
+        Frame::raw_data(b"hello".to_vec())
+            .encode_to(&mut daemon_sock)
+            .expect("send raw data");
+
+        let run_handle = std::thread::spawn(move || conn.run(&mut stdin_file, &mut stdout));
+        let res = run_handle.join().expect("join");
+        drop(stdin_wr_keep);
+        drop(daemon_sock);
+        assert!(
+            matches!(res, Ok(RunOutcome::StdoutWriteFailed)),
+            "stdout write 失敗は StdoutWriteFailed を返すはず: {res:?}"
         );
     }
 }

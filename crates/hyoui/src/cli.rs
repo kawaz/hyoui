@@ -3368,7 +3368,20 @@ fn usage_run() -> String {
             day(s)/week(s)。decimal (1.5h)、underscore (1_000ms)、連結 (1h30m)、\n    \
             加減 (1d-4h)。sub-ms (ns/us/μs) は accept、内部 ns 集積 → ms に floor\n    \
             (例: 500us 600us = 1.1ms → 1ms)。bare 数字 / 年 (y) / 月 (M) は **error**。\n    \
-            case-insensitive。\n",
+            case-insensitive。\n\
+        \n\
+        EXIT STATUS:\n    \
+            run は daemon を fork した後 exec で attach に化けるため、attach と同じ\n    \
+            exit code が適用される。\n    \
+            <子の exit code>      子 PTY が exit した (= SessionExitNotify)。\n                          \
+                signal 死は 128+signum (= 130=SIGINT, 137=SIGKILL, 143=SIGTERM)。\n                          \
+                非 tty stdin の default (= send-eof) では stdin EOF で子が\n                          \
+                自然 exit し、その子の code がここに伝搬する\n    \
+            0                     detach key、または `--stdin-eof=detach` 時の stdin EOF で\n                          \
+                自分から離脱した (= 子は daemon 配下に残る)\n    \
+            9                     daemon との接続が予期せず失われた (= daemon 消滅の疑い)\n    \
+            1                     実行エラー (= protocol violation / 出力先への書き込み失敗 等)\n    \
+            2                     usage / 引数エラー\n",
     )
 }
 
@@ -3417,10 +3430,13 @@ fn usage_attach() -> String {
         \n\
         EXIT STATUS:\n    \
             <子の exit code>      子 PTY が exit した (= SessionExitNotify)。\n                          \
-                signal 死は 128+signum (= 130=SIGINT, 137=SIGKILL, 143=SIGTERM)\n    \
-            0                     detach key / stdin EOF で自分から離脱 (= 子は残る)\n    \
+                signal 死は 128+signum (= 130=SIGINT, 137=SIGKILL, 143=SIGTERM)。\n                          \
+                非 tty stdin の default (= send-eof) では stdin EOF で子が\n                          \
+                自然 exit し、その子の code がここに伝搬する\n    \
+            0                     detach key、または `--stdin-eof=detach` 時の stdin EOF で\n                          \
+                自分から離脱した (= 子は daemon 配下に残る)\n    \
             9                     daemon との接続が予期せず失われた (= daemon 消滅の疑い)\n    \
-            1                     attach 実行エラー (= protocol violation 等)\n    \
+            1                     attach 実行エラー (= protocol violation / 出力先への書き込み失敗 等)\n    \
             2                     usage / 引数エラー\n\
         \n\
         EXAMPLES:\n    \
