@@ -211,7 +211,7 @@ pub enum StdinEofAction {
     Detach,
     /// EOT (= ASCII 0x04, Ctrl-D) を子 PTY に raw_data として送ってから return。
     /// canonical mode の子 (例: bc / cat) は行頭の EOT を read EOF として
-    /// 解釈するため、`echo "1+2" | hyoui run --mode=headless -- bc` のような
+    /// 解釈するため、`echo "1+2" | hyoui run -- bc` のような
     /// pattern で子が自然終了する。
     SendEof,
 }
@@ -258,7 +258,7 @@ pub struct ClientConnection {
     /// daemon が返した handshake response (= 確定した cap / mode / leader / session_id)。
     pub response: HandshakeResponse,
     /// stdin EOF 時の挙動 (R5-FB2)。default `Detach` (= MVP attach 挙動)。
-    /// `set_stdin_eof_action(SendEof)` で `hyoui run --mode=headless -- bc`
+    /// `set_stdin_eof_action(SendEof)` で `hyoui run -- bc`
     /// のような pipe-through pattern で子に EOF を伝える。
     eof_action: StdinEofAction,
     /// 子 self-stop follow 時の外側端末 termios suspend/resume hook
@@ -358,7 +358,7 @@ impl ClientConnection {
     /// 挙動)。`SendEof` を設定すると `run` が stdin EOF を検出した瞬間に EOT
     /// (= 0x04) を子 PTY に送ってから return する。
     ///
-    /// 通常 `hyoui run --mode=headless -- <cmd>` のような pipe-through pattern
+    /// 通常 `hyoui run -- <cmd>` のような pipe-through pattern
     /// でのみ意味を持つ (= `hyoui attach` 側は detach 同等が望ましいので変更
     /// しない)。
     #[must_use]
@@ -500,7 +500,7 @@ impl ClientConnection {
                         // R5-FB2: stdin EOF の挙動は `eof_action` で分岐。
                         // - Detach (default): 即 return (= MVP attach 挙動)
                         // - SendEof: EOT (0x04) を子 PTY に送ってから return
-                        //   (= `hyoui run --mode=headless -- bc` の pipe pattern
+                        //   (= `hyoui run -- bc` の pipe pattern
                         //   で子が canonical mode の場合に自然 exit させる)
                         if self.eof_action == StdinEofAction::SendEof {
                             let frame = Frame::raw_data(vec![0x04]);

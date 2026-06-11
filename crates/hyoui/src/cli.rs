@@ -34,16 +34,6 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Operating mode for the `run` subcommand.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Mode {
-    /// Pass the parent terminal through (default).
-    Interactive,
-    /// Drive the child with a virtual PTY of fixed size; no terminal needed.
-    Headless,
-}
-
 /// Behavior when the child process is suspended (STOPPED).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -133,8 +123,6 @@ pub enum HelpTopic {
 /// Fully parsed `run` subcommand configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunConfig {
-    /// Operating mode.
-    pub mode: Mode,
     /// Virtual screen columns (explicit `--cols/--size` 指定時のみ Some)。
     /// `None` なら caller (= `run_command`) が外側 TTY size or 80 fallback で解決。
     pub cols: Option<i32>,
@@ -2110,7 +2098,6 @@ fn parse_run(args: &[String]) -> Command {
         };
     }
 
-    let mut mode = Mode::Interactive;
     let mut explicit_cols: Option<i32> = None;
     let mut explicit_rows: Option<i32> = None;
     let mut timeout_ms: Option<u64> = None;
@@ -2160,12 +2147,6 @@ fn parse_run(args: &[String]) -> Command {
 
         // Process the option. On success, advance past the value too.
         match name.as_str() {
-            "--mode" => match value.as_deref() {
-                Some("interactive") => mode = Mode::Interactive,
-                Some("headless") => mode = Mode::Headless,
-                Some(other) => return Command::Error(format!("invalid --mode value: {other}")),
-                None => return Command::Error("--mode requires a value".into()),
-            },
             "--size" => match value.as_deref() {
                 Some(v) => match parse_size(v) {
                     Some((c, r)) => {
@@ -2291,7 +2272,6 @@ fn parse_run(args: &[String]) -> Command {
     // Virtual size: explicit 指定のみ Some、未指定なら None で caller (= run_command)
     // が外側 TTY size を継承する経路に流す (= ユーザ指示 2026-05-29)。
     Command::Run(RunConfig {
-        mode,
         cols: explicit_cols,
         rows: explicit_rows,
         timeout_ms,
@@ -3261,10 +3241,9 @@ fn usage_run() -> String {
             hyoui run [options] -- cmd [args...]\n\
         \n\
         OPTIONS:\n    \
-            --mode=interactive|headless   Operating mode (default: interactive)\n    \
-            --size COLSxROWS              Virtual screen size, e.g. 80x24 (headless)\n    \
-            --cols N                      Virtual screen columns (headless)\n    \
-            --rows M                      Virtual screen rows (headless)\n    \
+            --size COLSxROWS              Virtual screen size, e.g. 80x24\n    \
+            --cols N                      Virtual screen columns\n    \
+            --rows M                      Virtual screen rows\n    \
             --timeout DUR                 Overall timeout (DUR フォーマットは下記参照)\n    \
             --idle-timeout DUR            Output idle timeout (= 子 PTY 出力が止まったら exit)\n    \
             --until PATTERN               Terminate when PATTERN appears in output\n    \
@@ -5188,7 +5167,17 @@ mod tests {
 
     #[test]
     fn run_missing_command_is_error() {
-        match parse_args(&args(&["run", "--mode=headless"])) {
+        match parse_args(&args(&["run"])) {
+            Command::Error(_) => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_mode_flag_is_unknown_option() {
+        // `--mode` は run から削除済 (= attach の --mode とは別物)。run で渡すと
+        // unknown option として弾かれる。
+        match parse_args(&args(&["run", "--mode=headless", "--", "cat"])) {
             Command::Error(_) => {}
             other => panic!("expected Error, got {other:?}"),
         }
@@ -5207,7 +5196,6 @@ mod tests {
         match parse_args(&args(&["run", "--", "echo", "hello"])) {
             Command::Run(cfg) => {
                 assert_eq!(cfg.command, vec!["echo".to_string(), "hello".to_string()]);
-                assert_eq!(cfg.mode, Mode::Interactive);
                 assert_eq!(cfg.on_child_suspend, OnChildSuspend::Follow);
             }
             other => panic!("expected Run, got {other:?}"),
@@ -5215,12 +5203,11 @@ mod tests {
     }
 
     #[test]
-    fn run_headless_default_is_notify_only() {
-        // DR-0017 §柱2: headless でも default は notify-only (= Follow)。auto-resume は
+    fn run_default_suspend_is_notify_only() {
+        // DR-0017 §柱2: default は notify-only (= Follow)。auto-resume は
         // opt-in に限定 (= 勝手に子を起こさない)。
-        match parse_args(&args(&["run", "--mode=headless", "--", "cat"])) {
+        match parse_args(&args(&["run", "--", "cat"])) {
             Command::Run(cfg) => {
-                assert_eq!(cfg.mode, Mode::Headless);
                 assert_eq!(cfg.on_child_suspend, OnChildSuspend::Follow);
                 // size 未指定なら None = caller (= run_command) が外側 TTY size or
                 // 80x24 fallback で解決する経路 (= ユーザ指示 2026-05-29)。
@@ -5236,7 +5223,6 @@ mod tests {
         // DR-0017 §柱2: auto-resume は明示 opt-in でのみ選べる (= default にはならない)。
         match parse_args(&args(&[
             "run",
-            "--mode=headless",
             "--on-child-suspend=auto-resume",
             "--",
             "cat",
@@ -5249,15 +5235,9 @@ mod tests {
     }
 
     #[test]
-    fn run_explicit_suspend_overrides_headless_preset() {
-        // DR-0015 §2.3: --on-parent-suspend は廃止、--on-child-suspend のみ override 可
-        match parse_args(&args(&[
-            "run",
-            "--mode=headless",
-            "--on-child-suspend=follow",
-            "--",
-            "cat",
-        ])) {
+    fn run_explicit_suspend_overrides_default() {
+        // --on-child-suspend のみ override 可
+        match parse_args(&args(&["run", "--on-child-suspend=follow", "--", "cat"])) {
             Command::Run(cfg) => {
                 assert_eq!(cfg.on_child_suspend, OnChildSuspend::Follow);
             }
@@ -5373,14 +5353,6 @@ mod tests {
                 );
             }
             other => panic!("expected Run, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn run_invalid_mode_is_error() {
-        match parse_args(&args(&["run", "--mode=weird", "--", "cat"])) {
-            Command::Error(_) => {}
-            other => panic!("expected Error, got {other:?}"),
         }
     }
 
@@ -6103,19 +6075,12 @@ mod tests {
     }
 
     #[test]
-    fn run_mode_separate_value() {
-        // `--mode interactive` (space-separated) should work too.
-        match parse_args(&args(&["run", "--mode", "headless", "--", "cat"])) {
-            Command::Run(cfg) => assert_eq!(cfg.mode, Mode::Headless),
-            other => panic!("expected Run, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn usage_run_non_empty() {
         let text = usage(&HelpTopic::Run);
         assert!(text.contains("hyoui run"));
-        assert!(text.contains("--mode"));
+        assert!(text.contains("--on-child-suspend"));
+        // run には --mode を出さない (= 削除済、attach の --mode とは別物)。
+        assert!(!text.contains("--mode"));
     }
 
     #[test]
@@ -6416,7 +6381,7 @@ mod tests {
     #[test]
     fn subcommand_help_text_is_subcommand_specific() {
         let cases: &[(HelpTopic, &str, &[&str])] = &[
-            (HelpTopic::Run, "hyoui run", &["--mode", "--timeout"]),
+            (HelpTopic::Run, "hyoui run", &["--cols", "--timeout"]),
             (
                 HelpTopic::Attach,
                 "hyoui attach",

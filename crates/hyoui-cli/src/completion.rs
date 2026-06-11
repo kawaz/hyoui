@@ -212,8 +212,6 @@ _hyoui() {
     case "$sub" in
         run)
             case "$prev" in
-                --mode)
-                    COMPREPLY=( $(compgen -W "interactive headless" -- "$cur") ); return 0 ;;
                 --on-child-suspend)
                     COMPREPLY=( $(compgen -W "follow auto-resume" -- "$cur") ); return 0 ;;
                 --socket)
@@ -222,12 +220,10 @@ _hyoui() {
                     return 0 ;;
             esac
             case "$cur" in
-                --mode=*)
-                    COMPREPLY=( $(compgen -W "interactive headless" -- "${cur#*=}") ); return 0 ;;
                 --on-child-suspend=*)
                     COMPREPLY=( $(compgen -W "follow auto-resume" -- "${cur#*=}") ); return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--mode --socket --namespace --timeout --idle-timeout --until --on-child-suspend --scrollback-rows --size --cols --rows --help -h --" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --namespace --timeout --idle-timeout --until --on-child-suspend --scrollback-rows --size --cols --rows --help -h --" -- "$cur") )
             return 0 ;;
         completion)
             COMPREPLY=( $(compgen -W "bash zsh fish --help -h" -- "$cur") )
@@ -622,7 +618,6 @@ _hyoui_input_spec() {
 
 _hyoui_run() {
     _arguments \
-        '--mode=[Operating mode]:mode:(interactive headless)' \
         '--socket=[Unix socket path]:socket:_files' \
         '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
         '--timeout=[Overall timeout (e.g. 30s / 1m / 1h30m)]:duration:' \
@@ -750,7 +745,6 @@ complete -c hyoui -n __hyoui_no_subcommand -s h -l help    -d 'Show help and exi
 complete -c hyoui -n __hyoui_no_subcommand -s V -l version -d 'Show version and exit'
 
 # `hyoui run` options.
-complete -c hyoui -n '__hyoui_using_subcommand run' -l mode              -x -a 'interactive headless' -d 'Operating mode'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l socket            -r -F                          -d 'Unix socket path'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l namespace         -x                              -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l timeout           -x                              -d 'Overall timeout (e.g. 30s / 1m / 1h30m)'
@@ -981,7 +975,7 @@ mod tests {
         let s = script(Shell::Zsh);
         assert!(s.starts_with("#compdef hyoui"));
         assert!(s.contains("_arguments"));
-        assert!(s.contains("interactive headless"));
+        assert!(s.contains("rw ro rw-no-leader"));
     }
 
     #[test]
