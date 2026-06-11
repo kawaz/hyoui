@@ -79,3 +79,92 @@ fn daemon_sigcont_wakes_stopped_child() {
 
     let _ = h.kill();
 }
+
+/// child が回り続ける子 (= 外部から SIGSTOP/SIGCONT で止め・再開する観測用)。
+const ECHO_LOOP: &[&str] = &[
+    "sh",
+    "-c",
+    "i=0; while :; do echo TICK_$i; i=$((i+1)); sleep 0.2; done",
+];
+
+/// M2 (同一 drain batch ケース): 「daemon を STOP → child を STOP → daemon に CONT」
+/// の順序で、CONT 時に SIGCHLD(child STOP) と SIGCONT(daemon) が同一 drain batch に
+/// 入る。`handle_suspend_signals` は `poll_with_transition` より先に走るため
+/// `is_stopped()` latch がまだ立っておらず、latch 参照だけでは起こしが不発する。
+/// 直接 waitpid フォールバックで child を起こせることを確認する。
+///
+/// 検証は child の `ps` stat を直接観測する (= 出力ストリームの "TICK_" は screen
+/// state の redraw や残バッファでも再出現しうるため、stat 観測のほうが厳密。
+/// 実機確認: フォールバック無しだと CONT 後も child は `T` (stopped) のまま、
+/// フォールバック有りだと `S`/`R` に復帰する)。
+#[ignore = "PTY child + signal を使う、ローカルで --ignored 実行"]
+#[test]
+fn daemon_cont_wakes_child_stopped_during_daemon_stop() {
+    use common::pty::{find_descendants, process_state_of};
+
+    let runner = HyouiTestRunner::new();
+    let mut h = runner.spawn_hyoui(
+        "jobcontrol-batch-cont",
+        &["run", "--", ECHO_LOOP[0], ECHO_LOOP[1], ECHO_LOOP[2]],
+    );
+
+    assert!(
+        h.wait_for_leader_ready(Duration::from_secs(10)),
+        "attach client が leader として daemon に接続しない"
+    );
+
+    // 子が回り始める (= TICK が出る) のを待つ。
+    h.wait_for("TICK_", Duration::from_secs(8))
+        .expect("子が動き始めて TICK を出すはず");
+
+    let daemon = h.daemon_pid().expect("daemon process が見つからない");
+    // 子孫から実際に echo loop を回している sh process を特定する。
+    let descendants = find_descendants(daemon).expect("子孫プロセス列挙");
+    let child = descendants
+        .iter()
+        .find(|p| p.comm.contains("sh"))
+        .map(|p| p.pid)
+        .or_else(|| descendants.first().map(|p| p.pid))
+        .expect("daemon の子孫 (= PTY child) が見つからない");
+    let daemon_pid = nix::unistd::Pid::from_raw(daemon);
+    let child_pid = nix::unistd::Pid::from_raw(child);
+
+    // 1. daemon を STOP (= daemon process が止まり SIGCHLD を drain できなくなる)。
+    nix::sys::signal::kill(daemon_pid, nix::sys::signal::Signal::SIGSTOP)
+        .expect("kill -STOP daemon");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // 2. daemon STOP 中に child を STOP (= child STOP の SIGCHLD が pending のまま溜まる)。
+    nix::sys::signal::kill(child_pid, nix::sys::signal::Signal::SIGSTOP).expect("kill -STOP child");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        process_state_of(child).expect("child stat").is_state('T'),
+        "前提: child STOP 後は stopped (T) であるべき"
+    );
+
+    // 3. daemon に CONT (= SIGCHLD(child STOP) と SIGCONT(daemon) を同一 batch で drain)。
+    nix::sys::signal::kill(daemon_pid, nix::sys::signal::Signal::SIGCONT)
+        .expect("kill -CONT daemon");
+
+    // 4. daemon が child を SIGCONT で起こすこと (= フォールバックが効いた証跡)。
+    //    最大 5 秒、child が stopped (T) でなくなるまで poll する。
+    let mut woke = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match process_state_of(child) {
+            Ok(st) if !st.is_state('T') => {
+                woke = true;
+                break;
+            }
+            _ => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    assert!(
+        woke,
+        "daemon CONT 後に child が起きていない (= 同一 batch フォールバック不発)。\
+         child stat={:?}",
+        process_state_of(child).map(|s| s.stat).ok()
+    );
+
+    let _ = h.kill();
+}

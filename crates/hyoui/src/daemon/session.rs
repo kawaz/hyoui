@@ -797,6 +797,22 @@ fn detect_and_warn_stalled(screen_state: &mut ScreenState, warned: &mut bool) {
 /// `RelayOutcome::ClientDetachedOrKilled` を返して `--until` match と同じ
 /// finalize escalation (CONT+TERM → grace → KILL) → SessionExitNotify broadcast →
 /// socket unlink 経路に乗せる)。
+/// `handle_suspend_signals` の SIGCONT 経路で使うフォールバック判定。
+///
+/// 「daemon STOPPED 中に child が STOP → daemon に CONT」順序では SIGCHLD と
+/// SIGCONT が同一 drain batch に入り、本判定の時点ではまだ child の Stopped
+/// transition が `ChildLifecycle::poll_with_transition` に消費されていない (=
+/// `is_stopped()` latch が false)。この window では transition がまだ kernel の
+/// wait queue に残っているので、`waitpid(WNOHANG | WUNTRACED)` で直接 Stopped を
+/// 拾える。`ChildLifecycle` の latch state は更新しない (= 先取りした transition
+/// は後段 poll では二度と観測されないが、起こすだけが目的なので問題ない)。
+///
+/// Stopped 以外 (= Alive / Exited / error) は false を返す。
+fn child_is_stopped_via_waitpid(child: Pid) -> bool {
+    let flags = WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED;
+    matches!(waitpid(child, Some(flags)), Ok(WaitStatus::Stopped(_, _)))
+}
+
 /// DR-0015 §2.3: 軸 2 (= 親 hyoui 自身の外部 SIGTSTP 経路) は廃止。
 ///
 /// 新構成では daemon process は常駐し、attach client process が外部 SIGTSTP を
@@ -833,7 +849,26 @@ fn handle_suspend_signals(
             // 経由で既に `lifecycle.poll_with_transition` が消費済で、再度 waitpid を
             // 呼んでも `StillAlive` が返る (= kernel は Stopped transition を一度しか
             // 報告しない)。そのため latch 済の `lifecycle.is_stopped()` を参照する。
-            if lifecycle.is_stopped() {
+            //
+            // ただし latch だけでは「daemon STOPPED 中に child が STOP → daemon に
+            // CONT」を取りこぼす。この順序では SIGCHLD (child STOP) と SIGCONT
+            // (daemon) が同一 drain batch に入り、serve_loop は本 helper を
+            // `poll_with_transition` より **先** に呼ぶため、ここに来た時点ではまだ
+            // Stopped transition が消費されておらず `is_stopped()` は false (= latch
+            // 未設定)。この window だけ、Stopped transition がまだ kernel の wait
+            // queue に残っている (= poll 未実行) ので、自前 `waitpid(WNOHANG |
+            // WUNTRACED)` が **当該ケースに限り** Stopped を拾える (= 後段の
+            // `poll_with_transition` が拾うはずだった transition を先取りする形)。
+            //
+            // Design rationale: latch (= 通常ケース) と直接 waitpid フォールバック
+            // (= 同一 batch ケース) の両建てで両ケースをカバーする。drain を poll の
+            // 後ろへ移す案より既存 serve_loop 構造への影響が小さい (= drain → poll の
+            // 順序、SIGTERM/SIGINT 処理位置を変えずに済む)。直接 waitpid は
+            // `lifecycle` の latch state を更新しない (= &ChildLifecycle のまま) が、
+            // ここで先取りした Stopped transition は後段 poll では二度と観測されない
+            // ので、起こすだけで十分 (= 子は CONT 後 Continued transition を出し、
+            // 後段で `record_child_continued` 経路に乗る)。
+            if lifecycle.is_stopped() || child_is_stopped_via_waitpid(child) {
                 let _ = kill_pgrp(child, Signal::SIGCONT);
             }
         } else if sig_i32 == Signal::SIGTERM as i32 || sig_i32 == Signal::SIGINT as i32 {
