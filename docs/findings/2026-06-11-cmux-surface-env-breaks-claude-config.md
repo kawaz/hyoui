@@ -1,0 +1,46 @@
+# cmux 端末から hyoui run -- claude すると CLAUDE_CONFIG_DIR が失われる (cmux 側の問題)
+
+> 調査日: 2026-06-11。dogfooding 初日に発見。**hyoui のバグではない** (environ の
+> 受け渡しは正常と検証済み) が、「cmux 内から hyoui で claude を起動する」は主要
+> ユースケースのため調査記録を残す。
+
+## 判明した事実
+
+1. cmux (libghostty ベースの端末アプリ) は shell integration で `claude` を **zsh 関数 →
+   バンドル wrapper (`/Applications/cmux.app/Contents/Resources/bin/claude`)** に差し替え、
+   さらに PATH 先頭にも同 wrapper を置く (= execvp 経由でも wrapper が起動する)
+2. wrapper は `CMUX_SURFACE_ID` が environ にあると `IN_CMUX=1` で cmux 連携モードに
+   入り、`NODE_OPTIONS` に guard JS を注入して claude プロセスを surface に紐付ける
+3. cmux 端末から `hyoui run -- claude` すると、`CMUX_SURFACE_ID` が hyoui daemon の
+   子まで継承される → wrapper は連携モードに入るが、**hyoui daemon の子は cmux から
+   見てどの surface にも属さない**ため、アカウント解決が壊れて `CLAUDE_CONFIG_DIR` が
+   失われる → 素の `~/.claude` (kawaz 環境では walk-up 対策の regular file) に落ちて
+   `ENOTDIR` の Settings Error
+4. **hyoui の environ 受け渡しは正常**: `hyoui run -- /bin/sh -c 'echo $CLAUDE_CONFIG_DIR'`
+   は正しい値を出す。直接実行との environ diff も HYOUI_NAMESPACE 追加 / OLDPWD /
+   SHLVL のみ (2026-06-11 検証)
+5. `CMUX_SURFACE_ID` を unset すれば正常起動する (実機確認済み):
+   `hyoui run -- /bin/sh -c 'unset CMUX_SURFACE_ID; exec claude'`
+
+## 実用的な示唆
+
+- 運用回避: `hyoui run -- env -u CMUX_SURFACE_ID claude` (zsh 関数化推奨)
+- 本筋: cmux 側の修正 — wrapper / guard が「CMUX_SURFACE_ID はあるが自プロセスは
+  その surface の直接の子孫でない」ケースを検出して passthrough に落とすべき
+- hyoui 側は透過原則に従い何もしない (= env を触る機能は env(1) で代替可能)
+- 同種の問題は tmux / screen / nohup 等「surface の environ を引き継いだ別プロセス
+  ツリー」全般で起きるはずで、hyoui 固有ではない
+
+## 検証の詳細
+
+| 実験 | 結果 |
+|---|---|
+| `hyoui run -- /bin/sh -c 'echo $CLAUDE_CONFIG_DIR; which claude'` (cmux 端末) | 値は正しく届く / claude = cmux wrapper |
+| 直接実行と hyoui 経由の environ diff (Claude Code セッション環境) | HYOUI_NAMESPACE / OLDPWD / SHLVL のみ |
+| hyoui 経由 claude 起動 (CC セッション環境 = CMUX_SURFACE_ID なし) | Settings Error なし (素の claude / cmux wrapper 経由の両方) |
+| `hyoui run -- claude` (kawaz の cmux 端末 = CMUX_SURFACE_ID あり) | Settings Error (ENOTDIR ~/.claude) |
+| `hyoui run -- /bin/sh -c 'unset CMUX_SURFACE_ID; exec claude'` (同) | **正常起動** (個人面 config で動作確認) |
+
+wrapper の env 操作箇所 (調査時点): CLAUDE_CONFIG_DIR の直接操作は legacy パス
+normalize のみ。auth selection unset 対象は ANTHROPIC_API_KEY 等で CLAUDE_CONFIG_DIR を
+含まない。失われる正確な機序は guard JS (NODE_OPTIONS 注入) 側と推定 (cmux 内部、未追跡)。
