@@ -138,6 +138,13 @@ attach で対話する」用途では `detach` が正しい。
 
 なお stdin が tty の場合は EOF が通常発生せず本 flag は無関係 (= 従来挙動)。
 
+> **📌 注記 (2026-06-12、push 前レビューにより)**: 「非 tty stdin × raw TUI 子」のセルでは
+> 本節の「透過性の回復」justify は成立しない。直接実行なら子は pipe EOF を観測できるが、
+> hyoui 経由では子の stdin は PTY であり EOF が存在せず、EOT は入力 byte として刺さる。
+> この構造的乖離は PTY ラップの本質で解消不能のため、pipe 入力で TUI を駆動する用途は
+> `--stdin-eof=detach` を明示するのが正 (= usage にも明記)。default `send-eof` のまま
+> raw TUI に pipe を繋ぐと、子が exit しないため client は子の終了まで残り続ける。
+
 ### 6. `attach --exclusive` / `--detach-others` は parse 段で「未実装」エラー化
 
 silent no-op (= 指定が黙って無視される) の放置は [[DR-0014]] 検証主義違反のため、
