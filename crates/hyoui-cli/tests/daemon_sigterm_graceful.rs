@@ -74,3 +74,75 @@ fn daemon_sigterm_terminates_child_and_unlinks_socket() {
 
     let _ = h.kill();
 }
+
+/// M1 (issue 2026-06-11 優先3 後退修正): graceful shutdown シーケンス中に届く
+/// **2 発目の SIGTERM** で daemon が即死せず、escalation → socket unlink が完走する。
+///
+/// OS shutdown は「TERM → 猶予 → 再 TERM」が普通なので現実的なシナリオ。
+/// 子は `trap '' TERM INT` で SIGTERM/SIGINT を無視するため、finalize_child の
+/// killpg(SIGTERM) では死なず ~5s grace 後の SIGKILL escalation で死ぬ。その grace
+/// 区間に daemon へ 2 発目 SIGTERM を送る。
+///
+/// 旧実装は `release_suspend_signal_handlers` を finalize_child より **前** に
+/// 呼んで handler を SIG_DFL に戻していたため、2 発目 SIGTERM で daemon が即死し
+/// escalation も socket unlink もすっ飛んだ。修正で release を socket unlink 後に
+/// 遅延させ、shutdown 中の handler を据え置く (= 2 発目以降は no-op で握り潰す)。
+#[ignore = "PTY child + signal を使う、grace 5s を跨ぐためローカルで --ignored 実行"]
+#[test]
+fn daemon_second_sigterm_during_shutdown_completes_unlink() {
+    let runner = HyouiTestRunner::new();
+    // SIGTERM/SIGINT を無視し、起こされても寝続ける子 (= escalation grace を強制)。
+    let mut h = runner.spawn_hyoui(
+        "daemon-sigterm-2nd",
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "trap '' TERM INT; while :; do sleep 1; done",
+        ],
+    );
+
+    assert!(
+        h.wait_for_leader_ready(Duration::from_secs(10)),
+        "attach client が leader として daemon に接続しない"
+    );
+    assert!(
+        h.socket().exists(),
+        "daemon 稼働中は socket file が存在するはず"
+    );
+
+    let daemon = h.daemon_pid().expect("daemon process が見つからない");
+    let daemon_pid = nix::unistd::Pid::from_raw(daemon);
+
+    // 1 発目 SIGTERM → graceful shutdown 開始 (= finalize escalation grace に入る)。
+    nix::sys::signal::kill(daemon_pid, nix::sys::signal::Signal::SIGTERM)
+        .expect("kill -TERM daemon (1st)");
+
+    // escalation grace (~5s) の最中に 2 発目 SIGTERM を送る。
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        nix::sys::signal::kill(daemon_pid, None).is_ok(),
+        "1 発目直後の daemon は生存しているはず (= 即死していない)"
+    );
+    nix::sys::signal::kill(daemon_pid, nix::sys::signal::Signal::SIGTERM)
+        .expect("kill -TERM daemon (2nd, during shutdown)");
+
+    // 2 発目で即死していたら socket は残骸として残る。修正後は escalation 完走 →
+    // SIGKILL で子を倒し socket unlink まで到達する。grace 5s + 余裕を見て待つ。
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut unlinked = false;
+    while std::time::Instant::now() < deadline {
+        if !h.socket().exists() {
+            unlinked = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        unlinked,
+        "2 発目 SIGTERM で daemon が即死せず escalation → socket unlink が完走するはず"
+    );
+
+    let _ = h.kill();
+}

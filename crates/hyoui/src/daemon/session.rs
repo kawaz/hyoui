@@ -429,16 +429,12 @@ impl Session {
 
         // Drop the SIGCHLD self-pipe explicitly before any further cleanup so
         // the global `SELFPIPE_WRITE_FD` is cleared and a subsequent serve in
-        // the same process can claim the slot.
+        // the same process can claim the slot. self-pipe が消えた後は SIGTERM /
+        // SIGINT / SIGTSTP / SIGCONT handler が走っても write skip (= no-op) なので、
+        // handler disposition (= SIG_DFL への復帰) は shutdown シーケンス完了後まで
+        // 据え置く (= 下記 `release_suspend_signal_handlers` 参照)。
         let had_owner = sigchld_owner.is_some();
         drop(sigchld_owner);
-        // DR-0001 軸 1/2 配線で install した SIGTSTP / SIGCONT handler を default
-        // に戻す。SIGCHLD は既存配線 (R5-H6) と整合するため install_default は
-        // しない (= test 終了後に同 disposition が残留することを許容、handler 自体は
-        // SELFPIPE_WRITE_FD == -1 で write skip するため副作用なし)。
-        if had_owner {
-            release_suspend_signal_handlers();
-        }
 
         // tail follow subscriber へ TailEnd を 1 発投げてから cleanup する。
         // 終了理由の導出 (= ChildExited / ClientCancel / Error は送らない) と
@@ -517,6 +513,26 @@ impl Session {
         }
 
         drop(listener);
+
+        // DR-0001 軸 1/2 配線で install した SIGTSTP / SIGCONT / SIGTERM / SIGINT
+        // handler を default に戻す。**socket unlink (= drop(listener)) を含む shutdown
+        // シーケンス完了後**まで遅延させるのが要点 (= issue 2026-06-11 優先3 後退修正)。
+        //
+        // 早すぎる SIG_DFL 復帰は危険: SIGTERM/SIGINT 経路の shutdown は
+        // killpg(SIGTERM) → finalize_child の escalation (最長 ~6s) → SessionExitNotify
+        // broadcast → drain → socket unlink と続く。この間に 2 発目の SIGTERM が来た時
+        // (= OS shutdown は TERM → 猶予 → 再 TERM が普通)、handler を既に SIG_DFL に
+        // 戻していると daemon が即死し、escalation も socket unlink もすっ飛ぶ
+        // (= child 巻き添え + socket 残骸)。handler を据え置けば 2 発目以降は
+        // self-pipe write skip の no-op で握り潰され、shutdown シーケンスが完走する。
+        //
+        // SIGCHLD は既存配線 (R5-H6) と整合するため install_default はしない
+        // (= test 終了後に同 disposition が残留することを許容、handler 自体は
+        // SELFPIPE_WRITE_FD == -1 で write skip するため副作用なし)。
+        if had_owner {
+            release_suspend_signal_handlers();
+        }
+
         match outcome {
             RelayOutcome::ChildExited(_) | RelayOutcome::ClientDetachedOrKilled => Ok(exit_code),
             RelayOutcome::Error(e) => Err(e),
