@@ -179,6 +179,12 @@ fn acquire_sigchld_selfpipe() -> Option<SigchldOwner> {
     // SIGCHLD 経路 (= 軸 1 既存配線) は維持される。
     let _ = register_self_pipe(Signal::SIGTSTP);
     let _ = register_self_pipe(Signal::SIGCONT);
+    // issue 2026-06-11 優先3: SIGTERM / SIGINT を同 self-pipe に乗せ、graceful
+    // shutdown 経路 (= `--until` match と同じ killpg(SIGTERM) → finalize escalation
+    // → SessionExitNotify → socket unlink) へ流す。handler 未登録だと daemon が即死し
+    // child は SIGHUP 巻き添え死 + socket 残骸になる。best-effort install。
+    let _ = register_self_pipe(Signal::SIGTERM);
+    let _ = register_self_pipe(Signal::SIGINT);
     Some(SigchldOwner {
         pipe,
         _guard: guard,
@@ -192,6 +198,9 @@ fn acquire_sigchld_selfpipe() -> Option<SigchldOwner> {
 fn release_suspend_signal_handlers() {
     let _ = install_default(Signal::SIGTSTP);
     let _ = install_default(Signal::SIGCONT);
+    // 優先3: graceful shutdown 用に install した SIGTERM / SIGINT も default に戻す。
+    let _ = install_default(Signal::SIGTERM);
+    let _ = install_default(Signal::SIGINT);
 }
 use super::tail::{broadcast_tail_end_to_followers, tail_end_reason_from_outcome};
 
@@ -781,8 +790,11 @@ fn detect_and_warn_stalled(screen_state: &mut ScreenState, warned: &mut bool) {
 /// SIGCHLD バイトは本 helper では処理しない (= caller 側で `lifecycle.poll_with_transition`
 /// を介して transition 判定 → `handle_child_transition` に流す)。
 ///
-/// 戻り値 `Some(RelayOutcome)` は serve_loop を即時終了させる場合のみ (= 現在は
-/// 該当なし。将来 SIGTERM 経路を統合した場合の余地)。
+/// 戻り値 `Some(RelayOutcome)` は serve_loop を即時終了させる場合 (= issue 2026-06-11
+/// 優先3 で SIGTERM / SIGINT を統合した。受信時に child pgrp へ SIGTERM を送り、
+/// `RelayOutcome::ClientDetachedOrKilled` を返して `--until` match と同じ
+/// finalize escalation (CONT+TERM → grace → KILL) → SessionExitNotify broadcast →
+/// socket unlink 経路に乗せる)。
 /// DR-0015 §2.3: 軸 2 (= 親 hyoui 自身の外部 SIGTSTP 経路) は廃止。
 ///
 /// 新構成では daemon process は常駐し、attach client process が外部 SIGTSTP を
@@ -796,13 +808,15 @@ fn detect_and_warn_stalled(screen_state: &mut ScreenState, warned: &mut bool) {
 /// これは管理者操作なので daemon は **default 動作 (= SIG_DFL で STOPPED)** で十分。
 ///
 /// よって本 helper は SIGCONT 経路 (= daemon 自身が SIGCONT で復帰した時の子の
-/// invariant 回復) のみ残す。SIGTSTP 経路は handler を register していても何も
-/// しない (= 配信されたら kernel default で STOPPED に入る)。
+/// invariant 回復) と SIGTERM / SIGINT (= graceful shutdown) を扱う。SIGTSTP 経路は
+/// handler を register していても何もしない (= 配信されたら kernel default で
+/// STOPPED に入る)。
 fn handle_suspend_signals(
     drained: &[u8],
     child: Pid,
     _config: &DaemonConfig,
     lifecycle: &ChildLifecycle,
+    state: &SessionState,
 ) -> Option<RelayOutcome> {
     for &b in drained {
         let sig_i32 = b as i32;
@@ -819,6 +833,24 @@ fn handle_suspend_signals(
             if lifecycle.is_stopped() {
                 let _ = kill_pgrp(child, Signal::SIGCONT);
             }
+        } else if sig_i32 == Signal::SIGTERM as i32 || sig_i32 == Signal::SIGINT as i32 {
+            // issue 2026-06-11 優先3: graceful shutdown。`--until` match と同じ経路
+            // (= killpg(SIGTERM) → finalize escalation → SessionExitNotify → socket
+            // unlink) に乗せる。handler 未登録だと daemon 即死 → child SIGHUP 巻き添え
+            // 死 + socket 残骸になっていた。
+            let reason = if sig_i32 == Signal::SIGINT as i32 {
+                "sigint"
+            } else {
+                "sigterm"
+            };
+            state.record_registry.push_lifecycle(
+                super::record::LifecycleEvent::SessionTerminatedByCondition {
+                    reason: reason.to_string(),
+                    ts_unix_ms: now_unix_ms(),
+                },
+            );
+            let _ = kill_pgrp(child, Signal::SIGTERM);
+            return Some(RelayOutcome::ClientDetachedOrKilled);
         }
         // SIGTSTP は無視 (= 軸 2 廃止、§2.3)。kernel default の STOPPED 動作に任せる。
         // 万一 handler 経由で来た場合は何もしない (= 親 daemon が STOPPED に入る
@@ -1169,7 +1201,7 @@ fn serve_loop(
                 if let Some(sp) = sigchld_pipe {
                     let drained = sp.drain().unwrap_or_default();
                     if let Some(outcome) =
-                        handle_suspend_signals(&drained, child, config, &lifecycle)
+                        handle_suspend_signals(&drained, child, config, &lifecycle, state)
                     {
                         return outcome;
                     }
@@ -1302,7 +1334,9 @@ fn serve_loop(
         if sigchld_ready {
             if let Some(sp) = sigchld_pipe {
                 let drained = sp.drain().unwrap_or_default();
-                if let Some(outcome) = handle_suspend_signals(&drained, child, config, &lifecycle) {
+                if let Some(outcome) =
+                    handle_suspend_signals(&drained, child, config, &lifecycle, state)
+                {
                     return outcome;
                 }
             }
