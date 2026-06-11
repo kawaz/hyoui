@@ -3253,9 +3253,6 @@ fn usage_run() -> String {
             --on-child-suspend=follow|auto-resume\n                                  \
                 Action when the child is stopped\n                                  \
                 (default: follow; headless: auto-resume)\n    \
-            --on-parent-suspend=transparent|decouple\n                                  \
-                Action when the parent is stopped\n                                  \
-                (default: transparent; headless: decouple)\n    \
             --scrollback-rows N           vt100 内蔵 scrollback ring 行数上限\n                                  \
                 (= screen dump --layer=scrollback / --layer=both で\n                                  \
                 取り出せる過去 row の最大数、default 1000、0 で無効)\n    \
@@ -6081,6 +6078,8 @@ mod tests {
         assert!(text.contains("--on-child-suspend"));
         // run には --mode を出さない (= 削除済、attach の --mode とは別物)。
         assert!(!text.contains("--mode"));
+        // parser が受理しない --on-parent-suspend を help に載せない。
+        assert!(!text.contains("--on-parent-suspend"));
     }
 
     #[test]
