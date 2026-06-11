@@ -8,5 +8,5 @@ mod attach;
 
 pub use attach::{
     AttachOptions, ClientConnection, SUSPEND_OUTER_TTY_RESET, StdinEofAction, SuspendHooks,
-    resolve_detach_prefix_from_env,
+    WinchSource, resolve_detach_prefix_from_env,
 };

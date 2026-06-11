@@ -265,6 +265,38 @@ pub struct ClientConnection {
     /// (= issue 2026-06-11)。`None` の場合は従来挙動 (= termios を触らず
     /// `raise(SIGSTOP)` のみ)。CLI 層が raw mode guard 保持時に設定する。
     suspend_hooks: Option<SuspendHooks>,
+    /// SIGWINCH → Resize 配線 (DR-0006 §6 / DR-0019 §6 射程外修復)。`Some` のとき
+    /// run loop が `notify_fd` を poll し、POLLIN (= signal thread が WINCH を受けて
+    /// 1 byte 書いた) を観測したら `size_fn()` で外側端末サイズを取得し、leader なら
+    /// `Resize` message を daemon に送る。`None` なら従来挙動 (= resize 送らない)。
+    winch_source: Option<WinchSource>,
+}
+
+/// SIGWINCH → Resize の中継元 (DR-0019 §6)。signal thread が WINCH を受けて
+/// `notify_fd` の write 端へ 1 byte 書き、run loop が read 端 (= 本 `notify_fd`) の
+/// POLLIN で起きて `size_fn` から現在の外側端末サイズを取得する (= 責務分離:
+/// signal handler は async-signal-safe な write のみ、ioctl は run loop で実行)。
+pub struct WinchSource {
+    /// signal thread が書く notify pipe の read 端 (= run loop が poll する)。
+    notify_fd: std::os::fd::OwnedFd,
+    /// 現在の外側端末サイズ (cols, rows) を取得する closure。取得失敗時は `None`。
+    size_fn: Box<dyn FnMut() -> Option<(u16, u16)> + Send>,
+}
+
+impl WinchSource {
+    /// notify pipe read 端と size 取得 closure から `WinchSource` を作る。
+    pub fn new(
+        notify_fd: std::os::fd::OwnedFd,
+        size_fn: Box<dyn FnMut() -> Option<(u16, u16)> + Send>,
+    ) -> Self {
+        Self { notify_fd, size_fn }
+    }
+}
+
+impl std::fmt::Debug for WinchSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WinchSource").finish_non_exhaustive()
+    }
 }
 
 impl ClientConnection {
@@ -336,6 +368,7 @@ impl ClientConnection {
             response,
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
+            winch_source: None,
         })
     }
 
@@ -365,6 +398,38 @@ impl ClientConnection {
     pub fn with_stdin_eof_action(mut self, action: StdinEofAction) -> Self {
         self.eof_action = action;
         self
+    }
+
+    /// SIGWINCH → Resize の中継元を設定する (DR-0019 §6)。設定すると `run` の poll
+    /// loop が notify pipe を監視し、WINCH 観測時に外側端末サイズを取得して leader
+    /// なら `Resize` message を daemon に送る。CLI 層が raw mode guard 保持時 (= tty
+    /// stdin) に設定する。
+    #[must_use]
+    pub fn with_winch_source(mut self, source: WinchSource) -> Self {
+        self.winch_source = Some(source);
+        self
+    }
+
+    /// この client が leader なら、現在の外側端末サイズで初回 `Resize` を daemon に
+    /// 送る (DR-0019 §6: 別端末から attach した時のサイズ不一致解消)。leader でない
+    /// 場合 (= daemon が reject する) は送らない。`winch_source` 未設定 / size 取得
+    /// 失敗時も no-op。
+    ///
+    /// # Errors
+    ///
+    /// `Resize` message の送信に失敗した場合。
+    pub fn send_initial_resize(&mut self) -> Result<(), Error> {
+        if !self.response.leader {
+            return Ok(());
+        }
+        let Some(src) = self.winch_source.as_mut() else {
+            return Ok(());
+        };
+        let Some((cols, rows)) = (src.size_fn)() else {
+            return Ok(());
+        };
+        let msg = ControlMessage::Resize(crate::protocol::messages::Resize { cols, rows });
+        self.send_control(&msg)
     }
 
     /// stdin / stdout を daemon と中継する。
@@ -404,10 +469,16 @@ impl ClientConnection {
             } else {
                 PollFlags::POLLIN
             };
-            let mut fds = [
-                PollFd::new(socket_fd, PollFlags::POLLIN),
-                PollFd::new(stdin_fd, stdin_poll_flags),
-            ];
+            // DR-0019 §6: winch_source があれば notify pipe (= signal thread が WINCH
+            // を受けて書く) も poll する。fds 末尾に積んで index を別管理する
+            // (= stdin/socket の固定 index を崩さない)。
+            let winch_fd = self.winch_source.as_ref().map(|s| s.notify_fd.as_fd());
+            let mut fds: Vec<PollFd> = Vec::with_capacity(3);
+            fds.push(PollFd::new(socket_fd, PollFlags::POLLIN));
+            fds.push(PollFd::new(stdin_fd, stdin_poll_flags));
+            if let Some(wfd) = winch_fd {
+                fds.push(PollFd::new(wfd, PollFlags::POLLIN));
+            }
 
             match poll(&mut fds, PollTimeout::NONE) {
                 Ok(PollOutcome::Ready(_)) => {}
@@ -418,7 +489,39 @@ impl ClientConnection {
 
             let sock_revents = fds[0].revents().unwrap_or(PollFlags::empty());
             let stdin_revents = fds[1].revents().unwrap_or(PollFlags::empty());
+            let winch_revents = if winch_fd.is_some() {
+                fds[2].revents().unwrap_or(PollFlags::empty())
+            } else {
+                PollFlags::empty()
+            };
             let _ = fds;
+
+            // DR-0019 §6: WINCH notify を観測したら、pipe を drain して外側端末サイズを
+            // 取得し、leader なら Resize を daemon に送る。size 取得 → send を分離する
+            // のは borrow checker 対策 (= winch_source の closure と send_control が
+            // 両方 &mut self を要求するため)。
+            if winch_revents.contains(PollFlags::POLLIN) {
+                if let Some(src) = self.winch_source.as_mut() {
+                    // notify pipe を drain (= 複数 WINCH を 1 回の resize に畳む)。
+                    let mut buf = [0u8; 64];
+                    while let Ok(n) = nix::unistd::read(&src.notify_fd, &mut buf) {
+                        if n < buf.len() {
+                            break;
+                        }
+                    }
+                }
+                if self.response.leader {
+                    let size = self.winch_source.as_mut().and_then(|s| (s.size_fn)());
+                    if let Some((cols, rows)) = size {
+                        let msg = ControlMessage::Resize(crate::protocol::messages::Resize {
+                            cols,
+                            rows,
+                        });
+                        // 送信失敗は致命的でない (= 次の WINCH で再送される)。
+                        let _ = self.send_control(&msg);
+                    }
+                }
+            }
 
             // socket → stdout: frame を 1 つ decode → raw data なら stdout に出す
             if sock_revents.contains(PollFlags::POLLIN) {
@@ -702,6 +805,141 @@ mod tests {
     use crate::daemon::{DaemonConfig, Session};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    // ---- DR-0019 §6: SIGWINCH → Resize 配線 unit tests ----
+
+    /// leader でない client は initial resize を送らない (= daemon が reject するため)。
+    #[test]
+    fn send_initial_resize_noop_when_not_leader() {
+        use std::os::unix::net::UnixStream;
+        let (client_sock, _daemon_sock) = UnixStream::pair().expect("socketpair");
+        let transport = UnixStreamTransport::new(client_sock);
+        let (reader, writer) = transport.split().expect("split");
+        // size_fn は呼ばれてはいけない (= leader でないので即 return)。
+        let (rd, _wr) = nix::unistd::pipe().expect("pipe");
+        let size_fn: Box<dyn FnMut() -> Option<(u16, u16)> + Send> =
+            Box::new(|| panic!("size_fn must not be called when not leader"));
+        let mut conn = ClientConnection {
+            reader,
+            writer,
+            response: HandshakeResponse {
+                caps: vec![],
+                session_id: "t".into(),
+                client_id: 1,
+                leader: false,
+                mode: Mode::Ro,
+            },
+            eof_action: StdinEofAction::Detach,
+            suspend_hooks: None,
+            winch_source: Some(WinchSource::new(rd, size_fn)),
+        };
+        // leader=false なので Ok(()) で何も送らない (panic しなければ成功)。
+        conn.send_initial_resize().expect("send_initial_resize");
+    }
+
+    /// leader client は initial resize で現在サイズの Resize message を送る。
+    #[test]
+    fn send_initial_resize_sends_resize_when_leader() {
+        use crate::protocol::ControlMessage;
+        use std::os::unix::net::UnixStream;
+        let (client_sock, daemon_sock) = UnixStream::pair().expect("socketpair");
+        let transport = UnixStreamTransport::new(client_sock);
+        let (reader, writer) = transport.split().expect("split");
+        let (rd, _wr) = nix::unistd::pipe().expect("pipe");
+        let size_fn: Box<dyn FnMut() -> Option<(u16, u16)> + Send> = Box::new(|| Some((120, 40)));
+        let mut conn = ClientConnection {
+            reader,
+            writer,
+            response: HandshakeResponse {
+                caps: vec![],
+                session_id: "t".into(),
+                client_id: 1,
+                leader: true,
+                mode: Mode::Rw,
+            },
+            eof_action: StdinEofAction::Detach,
+            suspend_hooks: None,
+            winch_source: Some(WinchSource::new(rd, size_fn)),
+        };
+        conn.send_initial_resize().expect("send_initial_resize");
+
+        // daemon 役で Resize frame を読む。
+        let mut daemon_reader = daemon_sock;
+        let frame = Frame::decode_from(&mut daemon_reader).expect("decode frame");
+        assert_eq!(frame.ty, TYPE_CBOR_CONTROL);
+        match ControlMessage::decode_from(frame.body.as_slice()).expect("decode msg") {
+            ControlMessage::Resize(r) => {
+                assert_eq!(r.cols, 120);
+                assert_eq!(r.rows, 40);
+            }
+            other => panic!("expected Resize, got {other:?}"),
+        }
+    }
+
+    /// run loop が WINCH notify (= notify pipe の POLLIN) を観測したら、leader なら
+    /// 現在サイズの Resize を送る。daemon 役は Resize 受信後に socket を close して
+    /// client run を EOF で終了させる。
+    #[test]
+    fn run_sends_resize_on_winch_notify() {
+        use crate::protocol::ControlMessage;
+        use std::os::unix::net::UnixStream;
+
+        let (client_sock, daemon_sock) = UnixStream::pair().expect("socketpair");
+        let transport = UnixStreamTransport::new(client_sock);
+        let (reader, writer) = transport.split().expect("split");
+
+        // winch notify pipe。read 端は non-blocking (= run の drain が block しない)。
+        let (notify_rd, notify_wr) = nix::unistd::pipe().expect("pipe");
+        {
+            use nix::fcntl::{FcntlArg, OFlag, fcntl};
+            let flags = fcntl(notify_rd.as_fd(), FcntlArg::F_GETFL).unwrap();
+            let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+            fcntl(notify_rd.as_fd(), FcntlArg::F_SETFL(flags)).unwrap();
+        }
+        let size_fn: Box<dyn FnMut() -> Option<(u16, u16)> + Send> = Box::new(|| Some((100, 30)));
+        let conn = ClientConnection {
+            reader,
+            writer,
+            response: HandshakeResponse {
+                caps: vec![],
+                session_id: "t".into(),
+                client_id: 1,
+                leader: true,
+                mode: Mode::Rw,
+            },
+            eof_action: StdinEofAction::Detach,
+            suspend_hooks: None,
+            winch_source: Some(WinchSource::new(notify_rd, size_fn)),
+        };
+
+        // stdin は即 EOF させない (= run が stdin EOF で抜けないよう) ため、書き込み端を
+        // 保持し続ける pipe の read 端を渡す。
+        let (stdin_rd, stdin_wr_keep) = nix::unistd::pipe().expect("stdin pipe");
+        let mut stdin_file = std::fs::File::from(stdin_rd);
+        let mut stdout: Vec<u8> = Vec::new();
+
+        // WINCH 発生をシミュレート: notify pipe に 1 byte 書く。
+        nix::unistd::write(&notify_wr, &[1u8]).expect("notify write");
+
+        let run_handle = std::thread::spawn(move || conn.run(&mut stdin_file, &mut stdout));
+
+        // daemon 役で Resize frame を受信検証。
+        let mut daemon_reader = daemon_sock;
+        let frame = Frame::decode_from(&mut daemon_reader).expect("decode frame");
+        assert_eq!(frame.ty, TYPE_CBOR_CONTROL);
+        match ControlMessage::decode_from(frame.body.as_slice()).expect("decode msg") {
+            ControlMessage::Resize(r) => {
+                assert_eq!(r.cols, 100);
+                assert_eq!(r.rows, 30);
+            }
+            other => panic!("expected Resize, got {other:?}"),
+        }
+
+        // socket を close して run を EOF 終了させる。
+        drop(daemon_reader);
+        drop(stdin_wr_keep);
+        let _ = run_handle.join();
+    }
 
     // ---- process_detach_prefix unit tests ----
 
