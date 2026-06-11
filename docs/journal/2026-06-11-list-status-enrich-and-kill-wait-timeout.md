@@ -113,3 +113,30 @@ fail したが、`#[ignore = "flaky: SIGTERM タイミング依存"]` 明記済�
 - **socket /tmp 化 (ENAMETOOLONG)**: macOS の TMPDIR (~50 文字) + ns + session 名が
   sun_path 上限 104B を超えた。base を /tmp/hyoui-<uid> に固定 (tmux 前例)、
   resolve 時 + bind/connect 直前の二重事前チェックで friendly error。breaking (v0.x)
+
+## dogfooding 2 日目: 「hyoui 経由の claude が ~/.claude を見る」の切り分け (hyoui 無実)
+
+症状: cmux 端末で `hyoui run -- claude` すると Settings Error
+(`~/.claude/settings.json` ENOTDIR — kawaz 環境では ~/.claude は walk-up 対策の regular file)。
+`hyoui run -- env` では CLAUDE_CONFIG_DIR が正しく見えるのに claude だけ壊れる、という矛盾。
+
+切り分けの経緯 (今後の同種報告で再利用できる手順):
+1. environ の完全 diff (`hyoui run -- sh -c 'env | sort > f'` vs 直接) → 無傷と確認 (hyoui 無実)
+2. `type claude` → cmux の zsh 関数 (wrapper) と判明
+3. `hyoui run -- sh -c 'echo $CLAUDE_CONFIG_DIR; which claude'` → 値は届いている +
+   PATH 解決も cmux wrapper (/Applications/cmux.app/Contents/Resources/bin/claude)
+4. wrapper を読む → CMUX_SURFACE_ID で IN_CMUX 判定、NODE_OPTIONS に guard JS を注入して
+   cmux socket 経由のアカウント解決 (= CLAUDE_CONFIG_DIR の決定) を行う構造
+5. `hyoui run -- sh -c 'unset CMUX_SURFACE_ID; exec claude'` → **正常起動 + 個人面で動作 = 確定**
+
+根因: cmux 端末の CMUX_SURFACE_ID が hyoui daemon の子へ environ 継承され、cmux wrapper が
+「surface 内のプロセス」と誤認して連携モードに入るが、hyoui daemon の子は cmux の知らない
+プロセスツリーのためアカウント解決が壊れ CLAUDE_CONFIG_DIR が落ちる。
+
+対処: cmux 側の修正が本筋 (wrapper が surface の直接の子孫かを検証する等)。
+当面の回避: `hyoui run -- env -u CMUX_SURFACE_ID claude` (env(1) で十分、hyoui に新機能不要)。
+
+教訓: 「ラッパー (hyoui) 経由でだけアプリが壊れる」報告は、(a) environ の完全 diff、
+(b) `type`/`which` での実体特定、(c) 容疑 env を 1 個ずつ unset、の順で切り分けると速い。
+他の surface/session 紐付け系ツール (tmux の TMUX、screen の STY、各種 IDE 統合) でも
+同型の誤作動がありうる。
