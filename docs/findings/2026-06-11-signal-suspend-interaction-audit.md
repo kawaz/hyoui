@@ -116,5 +116,5 @@ self-pipe → drain → killpg 経路のどこかで切れている疑い (SIGCO
 
 ## 関連
 
-- docs/issue/2026-06-11-bug-mode-headless-not-wired.md (発端)
+- 発端 issue (mode-headless-not-wired) は DR-0019 に昇華して削除済
 - DR-0001 (旧 2 軸 preset) / DR-0015 (run = fork + exec attach、軸2廃止) / DR-0017 (notify-only default、anchor 化)
