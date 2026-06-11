@@ -41,55 +41,21 @@ jobs:
         run: |
           set -euo pipefail
           # Cargo.toml workspace.package.version を正本として読む。
-          # CI 環境でのみ bump-semver get が fallback rule に落ちて失敗する未解明問題
-          # があるため (手元の同一 binary + 同一ファイルでは再現せず)、失敗時は
-          # (1) 切り分け用診断を残し (2) [workspace.package].version の直読みに
-          # フォールバックして release gate 自体は機能させる。
-          CURRENT_VERSION=$(bump-semver get Cargo.toml --no-hint) || {
-            echo "::group::bump-semver get failure diagnostics"
-            bump-semver --version || true
-            sha256sum /usr/local/bin/bump-semver || true
-            sha256sum Cargo.toml || true
-            head -8 Cargo.toml | od -c | head -20 || true
-            bump-semver get Cargo.toml || true
-            echo "::endgroup::"
-            CURRENT_VERSION=""
-          }
-          if [ -z "$CURRENT_VERSION" ]; then
-            CURRENT_VERSION=$(perl -00 -ne 'if (/^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"/ms) { print $1; exit }' Cargo.toml)
-            echo "::warning::bump-semver get failed; fell back to direct TOML read: ${CURRENT_VERSION}"
-          fi
-          if [ -z "$CURRENT_VERSION" ]; then
-            echo "::error::could not determine current version from Cargo.toml"
-            exit 2
-          fi
+          # 要 bump-semver >= v0.38.0 (= GHA の run step は stdin が writer 不在の
+          # FIFO になり、旧版は stdin pipe shortcut が誤発火して空読みする)
+          CURRENT_VERSION=$(bump-semver get Cargo.toml --no-hint)
           echo "current=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
 
-          # 既存 tag より大きいか検証 (二重リリース防止)。
-          # `vcs tag latest` は SemVer-parseable な tag のみ filter して最大を返す。
-          set +e
-          LATEST=$(bump-semver vcs tag latest --include-prerelease --vcs git 2>/dev/null)
-          LATEST_EXIT=$?
-          set -e
-          if [ "$LATEST_EXIT" -ne 0 ]; then
-            echo "vcs tag latest exited ${LATEST_EXIT} (SemVer tag がまだ無い等); first release とみなす"
+          # 既存 tag より大きいか検証 (二重リリース防止) — compare の一発形。
+          # 比較失敗 (= 以下) も予期せぬエラーも release skip に倒す (= 安全側)。
+          if ! bump-semver vcs get latest-tag >/dev/null 2>&1; then
+            echo "SemVer tag がまだ無い; first release とみなす"
+          elif bump-semver compare gt Cargo.toml 'vcs:latest-tag()'; then
+            : # CURRENT > latest tag: release 続行
           else
-            set +e
-            bump-semver compare gt "$CURRENT_VERSION" "$LATEST"
-            CMP_EXIT=$?
-            set -e
-            case "$CMP_EXIT" in
-              0) ;; # CURRENT > latest tag: release 続行
-              1)
-                echo "changed=false" >> "$GITHUB_OUTPUT"
-                echo "Version v${CURRENT_VERSION} は latest tag ${LATEST} 以下; release skip"
-                exit 0
-                ;;
-              *)
-                echo "::error::Unexpected exit code from bump-semver compare: ${CMP_EXIT}"
-                exit 1
-                ;;
-            esac
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Version v${CURRENT_VERSION} は latest tag 以下; release skip"
+            exit 0
           fi
 
           # gh release で既存確認 (compare で通っても念のため二重防止)
