@@ -802,7 +802,7 @@ fn handle_suspend_signals(
     drained: &[u8],
     child: Pid,
     _config: &DaemonConfig,
-    _lifecycle: &mut ChildLifecycle,
+    lifecycle: &ChildLifecycle,
 ) -> Option<RelayOutcome> {
     for &b in drained {
         let sig_i32 = b as i32;
@@ -810,12 +810,14 @@ fn handle_suspend_signals(
             // 外部 `kill -CONT <daemon-pid>` で daemon が再開した時、子が STOPPED
             // なら一緒に起こす (= 防衛策、軸 2 廃止後も「daemon だけ動いて子 STOP」
             // 状態を残さない)。
-            let flags = WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED;
-            if let Ok(status) = waitpid(child, Some(flags)) {
-                let is_stopped = matches!(status, WaitStatus::Stopped(_, _));
-                if is_stopped {
-                    let _ = kill_pgrp(child, Signal::SIGCONT);
-                }
+            //
+            // issue 2026-06-11 優先2: ここで自前 `waitpid(WUNTRACED)` を呼んで
+            // stopped 判定すると **不発する**。child の Stopped transition は SIGCHLD
+            // 経由で既に `lifecycle.poll_with_transition` が消費済で、再度 waitpid を
+            // 呼んでも `StillAlive` が返る (= kernel は Stopped transition を一度しか
+            // 報告しない)。そのため latch 済の `lifecycle.is_stopped()` を参照する。
+            if lifecycle.is_stopped() {
+                let _ = kill_pgrp(child, Signal::SIGCONT);
             }
         }
         // SIGTSTP は無視 (= 軸 2 廃止、§2.3)。kernel default の STOPPED 動作に任せる。
@@ -1167,7 +1169,7 @@ fn serve_loop(
                 if let Some(sp) = sigchld_pipe {
                     let drained = sp.drain().unwrap_or_default();
                     if let Some(outcome) =
-                        handle_suspend_signals(&drained, child, config, &mut lifecycle)
+                        handle_suspend_signals(&drained, child, config, &lifecycle)
                     {
                         return outcome;
                     }
@@ -1300,9 +1302,7 @@ fn serve_loop(
         if sigchld_ready {
             if let Some(sp) = sigchld_pipe {
                 let drained = sp.drain().unwrap_or_default();
-                if let Some(outcome) =
-                    handle_suspend_signals(&drained, child, config, &mut lifecycle)
-                {
+                if let Some(outcome) = handle_suspend_signals(&drained, child, config, &lifecycle) {
                     return outcome;
                 }
             }

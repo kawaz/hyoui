@@ -74,6 +74,19 @@ pub(super) struct ChildLifecycle {
 }
 
 impl ChildLifecycle {
+    /// 直近に観測した latched 状態が「stopped 中」か返す
+    /// (= 最後の `poll_with_transition` で Stopped を観測してから、まだ Continued /
+    /// Exited を観測していない)。
+    ///
+    /// `waitpid` の Stopped transition は **一度しか報告されない** (= kernel が wait
+    /// queue から消費すると以降 StillAlive を返す)。そのため「daemon が SIGCONT で
+    /// 起きた時、子が stopped なら起こす」判定で自前 `waitpid` を再度呼んでも既に
+    /// transition が消費済で取り出せない。本 accessor で latch 済の状態を参照することで
+    /// この取りこぼしを回避する (= issue 2026-06-11 優先2 の root cause)。
+    pub(super) fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+
     /// `poll_with_transition` の latched state だけを返す薄い wrapper。
     /// transition 情報を必要としない呼び出し元 (= test 内 helper 等) 向け。
     ///
