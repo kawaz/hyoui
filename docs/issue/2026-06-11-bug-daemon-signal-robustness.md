@@ -33,10 +33,17 @@
 
 ## TODO
 
-- [ ] SIGTERM graceful shutdown (finalize 経路統合)
-- [ ] SIGCONT 連動不発の経路調査 + 修正
-- [ ] daemon 死亡時の client exit code 非 0 化
-- [ ] SIGTSTP 吸い込みコメントの実装整合 (handler 登録をやめるか、コメントを実態に合わせる)
+- [x] SIGTERM graceful shutdown (finalize 経路統合) — SIGTERM/SIGINT を self-pipe に
+  register、handle_suspend_signals で killpg(SIGTERM) + ClientDetachedOrKilled →
+  finalize escalation → SessionExitNotify → socket unlink。e2e + 実機裏取り済
+- [x] SIGCONT 連動不発の経路調査 + 修正 — root cause: SIGCHLD 経由で Stopped
+  transition が消費済のため SIGCONT 時の自前 waitpid が StillAlive を返していた。
+  ChildLifecycle::is_stopped() の latch 参照に修正。e2e で旧/新の差を裏取り済
+- [x] daemon 死亡時の client exit code 非 0 化 — run の戻り値を RunOutcome enum
+  (ChildExited/Detached/ConnectionLost) に分解。ConnectionLost → exit 9 + stderr。
+  副次で子 exit 時の SessionExitNotify drain race も修正。e2e 3 ケース済
+- [x] SIGTSTP 吸い込みコメントの実装整合 — handler 登録を維持し「意図的に握り潰す
+  (= daemon を外部 TSTP で止めさせない)」と実態に合わせてコメント修正
 
 ## 関連
 

@@ -174,9 +174,11 @@ fn acquire_sigchld_selfpipe() -> Option<SigchldOwner> {
         // pipe drops here, clearing SELFPIPE_WRITE_FD; guard released too.
         return None;
     }
-    // DR-0001 軸 2 (SIGTSTP) + invariant 回復 (SIGCONT) を同 self-pipe に乗せる。
-    // best-effort: install 失敗時は当該 signal の policy が動かないだけで、
-    // SIGCHLD 経路 (= 軸 1 既存配線) は維持される。
+    // SIGTSTP (= 握り潰し) + SIGCONT (= stopped child の invariant 回復) を同
+    // self-pipe に乗せる。SIGTSTP は handler 登録により kernel default の STOPPED を
+    // 抑止し、handle_suspend_signals が何もしない (= daemon を外部 TSTP で止めさせない、
+    // DR-0015 §2.3 で軸 2 廃止後の意図的挙動)。best-effort: install 失敗時は当該
+    // signal の挙動が default に戻るだけで、SIGCHLD 経路 (= 軸 1 既存配線) は維持される。
     let _ = register_self_pipe(Signal::SIGTSTP);
     let _ = register_self_pipe(Signal::SIGCONT);
     // issue 2026-06-11 優先3: SIGTERM / SIGINT を同 self-pipe に乗せ、graceful
@@ -805,12 +807,13 @@ fn detect_and_warn_stalled(screen_state: &mut ScreenState, warned: &mut bool) {
 /// ただし daemon 自身が `--detached` で fork され session leader として動く時、
 /// 親 (= attach client) からの SIGTSTP/SIGCONT は届かない (= 別 process group)。
 /// 残るのは「外部から `kill -TSTP <daemon-pid>` で daemon を直接止める」case のみで、
-/// これは管理者操作なので daemon は **default 動作 (= SIG_DFL で STOPPED)** で十分。
+/// daemon は SIGTSTP の self-pipe handler を登録しているため **STOPPED に入らず
+/// signal を握り潰す** (= 常駐 anchor を外部 TSTP で止めさせない意図、実機確認済み)。
 ///
 /// よって本 helper は SIGCONT 経路 (= daemon 自身が SIGCONT で復帰した時の子の
 /// invariant 回復) と SIGTERM / SIGINT (= graceful shutdown) を扱う。SIGTSTP 経路は
-/// handler を register していても何もしない (= 配信されたら kernel default で
-/// STOPPED に入る)。
+/// handler 登録を維持しつつ何もしない (= 握り潰す。register をやめると kernel
+/// default の STOPPED に戻るため、登録は意図的に残す)。
 fn handle_suspend_signals(
     drained: &[u8],
     child: Pid,
@@ -852,9 +855,18 @@ fn handle_suspend_signals(
             let _ = kill_pgrp(child, Signal::SIGTERM);
             return Some(RelayOutcome::ClientDetachedOrKilled);
         }
-        // SIGTSTP は無視 (= 軸 2 廃止、§2.3)。kernel default の STOPPED 動作に任せる。
-        // 万一 handler 経由で来た場合は何もしない (= 親 daemon が STOPPED に入る
-        // 経路は外部管理者操作のみ、子に介入しない)。
+        // SIGTSTP は意図的に無視する (= 軸 2 廃止、DR-0015 §2.3)。
+        //
+        // daemon は SIGTSTP を self-pipe handler 経由で受け、本 loop は何もしない。
+        // この結果、外部 `kill -TSTP <daemon-pid>` を送っても daemon は STOPPED に
+        // **入らない** (= signal が self-pipe へ吸い込まれて消える、実機確認済み:
+        // findings 2026-06-11 §仮説2)。これは「daemon を外部 TSTP で止めさせない」
+        // 意図的な挙動 (= daemon は常駐 anchor であるべきで、外部からの suspend で
+        // 子もろとも止まると透過性が壊れる)。
+        //
+        // register をやめると kernel default の STOPPED に戻ってしまうため、handler
+        // 登録は維持して「受けるが何もしない」状態を保つ。daemon を本当に止めたい
+        // なら `kill -STOP` (= catch 不能) を使う。
         // SIGCHLD / 他の signum もここでは処理しない (= caller 側 lifecycle 経路)。
     }
     None
