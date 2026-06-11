@@ -475,6 +475,20 @@ impl Session {
                 "session-exit-v1",
             );
             // 送信後の overflow は client 切断扱いだが、ここは shutdown 直前なので無視。
+
+            // 終端 drain: SessionExitNotify を writer thread が flush し切るまで wait。
+            // これをしないと、enqueue 直後の `clients.clear()` で socket が閉じ、client が
+            // SessionExitNotify を読む前に EOF を観測する race が起きる。issue 2026-06-11
+            // 優先1 で client の socket EOF を `ConnectionLost` (= 非 0 exit) に分離した
+            // ため、この race が顕在化した (= 子の正常 exit code を返すべき場面で exit 9 が
+            // 漏れる)。linger 経路 (= 後段の `linger_for_late_attach`) と同じ流儀で drain。
+            let drain_deadline = Instant::now() + std::time::Duration::from_millis(1000);
+            for ch in clients.iter() {
+                while ch.queued_bytes.load(Ordering::Acquire) > 0 && Instant::now() < drain_deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
         }
         clients.clear();
 

@@ -3415,6 +3415,14 @@ fn usage_attach() -> String {
                 未設定なら Ctrl-A (0x01)\n    \
             HYOUI_LOCK_TOKEN      lock token を env で渡す (= handshake.token)\n\
         \n\
+        EXIT STATUS:\n    \
+            <子の exit code>      子 PTY が exit した (= SessionExitNotify)。\n                          \
+                signal 死は 128+signum (= 130=SIGINT, 137=SIGKILL, 143=SIGTERM)\n    \
+            0                     detach key / stdin EOF で自分から離脱 (= 子は残る)\n    \
+            9                     daemon との接続が予期せず失われた (= daemon 消滅の疑い)\n    \
+            1                     attach 実行エラー (= protocol violation 等)\n    \
+            2                     usage / 引数エラー\n\
+        \n\
         EXAMPLES:\n    \
             hyoui attach demo                       # session_id=demo に attach\n    \
             hyoui attach 1                          # session_id=\"1\" に attach (= 数字も名前扱い)\n    \

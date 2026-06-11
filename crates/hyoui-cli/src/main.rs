@@ -24,7 +24,7 @@ use hyoui::cli::{
     ScreenDumpConfig, ScreenSnapshotConfig, SnapshotCliComponent, StatusConfig, TailConfig,
     WaitConfig, parse_args, usage,
 };
-use hyoui::client::{AttachOptions, ClientConnection};
+use hyoui::client::{AttachOptions, ClientConnection, RunOutcome};
 use hyoui::protocol::messages::{
     DumpRect, InputSecrecy, RecordDirection, RecordFormat, RecordInfo, RecordListRequest,
     RecordStartRequest, RecordStopAllRequest, RecordStopRequest, ScreenDumpFormat, ScreenDumpLayer,
@@ -38,6 +38,17 @@ mod daemonize;
 mod input_handlers;
 mod socket_path;
 mod wait_core;
+
+/// `hyoui attach` / `hyoui run` が daemon との接続を予期せず失った
+/// (= `RunOutcome::ConnectionLost`、daemon 消滅の疑い) ときの exit code
+/// (issue 2026-06-11 優先1)。
+///
+/// Design rationale: 子 PTY の exit code (= 0..=255、signal 死は 128+signum、
+/// よく見る 130/137/143) や hyoui の既存自己エラー慣習 (1=一般 / 2=usage・parse /
+/// 3=kill 系特殊) のいずれとも重ならない値として 9 を専用予約する。これにより
+/// 「子が正常終了した (exit 0)」と「daemon が落ちて attach が切れた」を呼び出し側
+/// (= スクリプト) が status code で区別できる。
+const EXIT_CONNECTION_LOST: u8 = 9;
 
 /// `--debug-dump-client=<path>` 経路で stdout に書く bytes を file にも複製する
 /// **Tee writer**。
@@ -881,11 +892,28 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
     };
     let exit_code = match run_result {
         // DR-0015 §2.1: session.exit.notify 受信時は exit-status をそのまま伝搬。
-        Ok(Some(status)) => {
-            let masked = u8::try_from(status & 0xFF).unwrap_or(255);
+        Ok(RunOutcome::ChildExited { exit_status }) => {
+            let masked = u8::try_from(exit_status & 0xFF).unwrap_or(255);
             ExitCode::from(masked)
         }
-        Ok(None) => ExitCode::SUCCESS,
+        // 自発 detach (= detach key / `--stdin-eof=detach` の EOF) は正常離脱。子は
+        // daemon 配下に残る。スクリプトから見ても「意図通り離れた」なので exit 0。
+        Ok(RunOutcome::Detached) => ExitCode::SUCCESS,
+        // issue 2026-06-11 優先1: 予期しない接続喪失 (= daemon 消滅の疑い) は非 0 で
+        // 終わり、stderr に 1 行出す。旧実装はこれを exit 0 にしていたため、スクリプト
+        // から「子が exit 0 で正常終了した」と「daemon が落ちて attach が切れた」を
+        // 区別できなかった。
+        //
+        // Design rationale: exit code を `EXIT_CONNECTION_LOST` (= 9) に固定する。
+        // 子 PTY の exit code (= 0..=255、signal 死は 128+signum、よく見る 130=SIGINT /
+        // 137=SIGKILL / 143=SIGTERM) や、hyoui の既存自己エラー慣習 (1=一般エラー /
+        // 2=usage・parse error / 3=kill 系の特殊) のいずれとも重ならない値を選んだ。
+        // 完全な衝突回避は exit code が u8 である以上不可能だが、9 を daemon 接続喪失
+        // 専用に予約することで「子の正常 exit と取り違える」最頻ケースを排除する。
+        Ok(RunOutcome::ConnectionLost) => {
+            eprintln!("hyoui: daemon との接続が失われました (daemon が終了した可能性があります)");
+            ExitCode::from(EXIT_CONNECTION_LOST)
+        }
         Err(e) => {
             eprintln!("hyoui: attach 実行エラー: {e}");
             ExitCode::from(1)

@@ -229,6 +229,35 @@ impl Default for AttachOptions {
     }
 }
 
+/// `ClientConnection::run` の終了種別 (= issue 2026-06-11 優先1)。
+///
+/// 旧実装は `Ok(None)` に「自発 detach」と「予期しない socket 喪失 (= daemon
+/// 消滅)」を混在させており、CLI 層がどちらも exit 0 に倒していた。スクリプトから
+/// 「子が正常終了した (= exit 0)」と「daemon が落ちて attach が切れた」を区別
+/// できないため、終了原因を意味のある enum に分解する。
+///
+/// CLI 層 (`attach_command`) はこの variant ごとに exit code を出し分ける:
+/// - `ChildExited(status)` → `status & 0xFF` を伝搬 (= 子の exit code をそのまま)
+/// - `Detached` → exit 0 (= 自分から離脱した、正常)
+/// - `ConnectionLost` → 非 0 exit + stderr 一行 (= daemon 消滅の疑い)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// `SessionExitNotify` を受信した (= 子 PTY process が exit)。CLI 層は
+    /// `& 0xFF` で伝搬する。
+    ChildExited {
+        /// 子の exit code (signal 死は 128+signum)。
+        exit_status: i32,
+    },
+    /// client が **自分から** 接続を畳んだ (= detach key `Ctrl-A d`、または
+    /// `--stdin-eof=detach` での stdin EOF)。子は daemon 配下に残る。正常離脱なので
+    /// CLI 層は exit 0。
+    Detached,
+    /// **予期しない**接続喪失 (= daemon の socket EOF / POLLHUP / POLLERR、または
+    /// socket への書き込み失敗)。自分から detach していないのに接続が切れた状態で、
+    /// daemon が SIGKILL 等で落ちた疑いがある。CLI 層は非 0 exit + stderr 警告。
+    ConnectionLost,
+}
+
 /// `ClientConnection::run` で stdin EOF を検出したときの挙動 (R5-FB2)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -465,13 +494,15 @@ impl ClientConnection {
 
     /// stdin / stdout を daemon と中継する。
     ///
-    /// 終了条件:
-    /// - socket EOF (= daemon が終了) → `Ok(None)`
-    /// - 子 PTY exit (= `SessionExitNotify` 受信) → `Ok(Some(exit_status))`
-    /// - stdin EOF (= 呼び出し側が input stream を close)。`eof_action` が `Detach`
-    ///   なら即 return、`SendEof` なら EOT を送って子の出力を拾い切ってから抜ける
-    ///   (= `with_stdin_eof_action` 参照、DR-0019 §5)。tty stdin では通常 EOF は
-    ///   起きないが、pipe / `< /dev/null` 等の非 tty stdin では起きる。
+    /// 終了条件 ([`RunOutcome`] で種別を返す、issue 2026-06-11 優先1):
+    /// - 子 PTY exit (= `SessionExitNotify` 受信) → `Ok(RunOutcome::ChildExited)`
+    /// - 自発 detach (= detach key `Ctrl-A d`、または `--stdin-eof=detach` での
+    ///   stdin EOF) → `Ok(RunOutcome::Detached)`。tty stdin では通常 EOF は起きないが、
+    ///   pipe / `< /dev/null` 等の非 tty stdin では起きる。`eof_action` が `SendEof`
+    ///   の場合は EOT を送って子の出力を拾い切ってから抜ける (= `with_stdin_eof_action`
+    ///   参照、DR-0019 §5)。
+    /// - 予期しない socket 喪失 (= daemon の EOF / POLLHUP / POLLERR、socket 書き込み
+    ///   失敗) → `Ok(RunOutcome::ConnectionLost)` (= daemon 消滅の疑い)
     /// - protocol violation → `Err`
     ///
     /// control message の送信は基本 `send_control` を別途叩く想定
@@ -481,12 +512,13 @@ impl ClientConnection {
     ///
     /// # Errors
     ///
-    /// I/O / decode error は [`Error`] で返す。socket EOF は `Ok(())` で正常終了扱い。
+    /// I/O / decode error は [`Error`] で返す。socket EOF は `Ok(RunOutcome::ConnectionLost)`
+    /// で「予期しない切断」として返す (= Err ではない)。
     pub fn run<R: Read + AsFd, W: Write>(
         mut self,
         stdin: &mut R,
         stdout: &mut W,
-    ) -> Result<Option<i32>, Error> {
+    ) -> Result<RunOutcome, Error> {
         // 万一 caller が事前 validate を忘れていた場合の defense-in-depth。
         // 通常は CLI が attach 開始前に明示 validate して exit する (H3)。
         let detach_prefix = resolve_detach_prefix_from_env()
@@ -594,7 +626,9 @@ impl ClientConnection {
                     Ok(frame) => match frame.ty {
                         TYPE_RAW_DATA => {
                             if stdout.write_all(&frame.body).is_err() {
-                                return Ok(None);
+                                // 出力先 (= 端末 / pipe) が閉じた。自分から detach した
+                                // わけではないので接続喪失扱い。
+                                return Ok(RunOutcome::ConnectionLost);
                             }
                             let _ = stdout.flush();
                         }
@@ -611,7 +645,9 @@ impl ClientConnection {
                             // - 他 (= leader.notify / mode.change / error 等) は無視
                             match ControlMessage::decode_from(frame.body.as_slice()) {
                                 Ok(ControlMessage::SessionExitNotify(notify)) => {
-                                    return Ok(Some(notify.exit_status));
+                                    return Ok(RunOutcome::ChildExited {
+                                        exit_status: notify.exit_status,
+                                    });
                                 }
                                 Ok(ControlMessage::SessionChildStoppedNotify(_)) => {
                                     // follow policy: client 自身を SIGSTOP で止める。
@@ -686,15 +722,17 @@ impl ClientConnection {
                         _ => return Err(Error::Invalid("unknown frame type from daemon")),
                     },
                     Err(FrameError::Protocol(ProtocolError::UnexpectedEof(_))) => {
-                        // daemon が close → 正常終了
-                        return Ok(None);
+                        // daemon が socket を close した。自分から detach したわけでは
+                        // ないので「予期しない接続喪失」(= daemon 消滅の疑い) として返す。
+                        return Ok(RunOutcome::ConnectionLost);
                     }
                     Err(_) => return Err(Error::Invalid("protocol error from daemon")),
                 }
             } else if sock_revents.contains(PollFlags::POLLHUP)
                 || sock_revents.contains(PollFlags::POLLERR)
             {
-                return Ok(None);
+                // socket が POLLHUP/POLLERR → 対向 (= daemon) が消えた。接続喪失扱い。
+                return Ok(RunOutcome::ConnectionLost);
             }
 
             // C-1: stdin の revents が EOF 相当 (= POLLNVAL/POLLERR/POLLHUP で read に
@@ -719,7 +757,9 @@ impl ClientConnection {
                     stdin_done = true;
                     continue;
                 }
-                return Ok(None);
+                // `--stdin-eof=detach`: stdin が閉じたので自分から離脱する (= 自発 detach、
+                // 子は daemon 配下に残す)。
+                return Ok(RunOutcome::Detached);
             }
 
             // stdin → socket: raw data frame で送る
@@ -737,7 +777,8 @@ impl ClientConnection {
                             stdin_done = true;
                             continue;
                         }
-                        return Ok(None);
+                        // `--stdin-eof=detach`: 自発 detach (= 子は残す)。
+                        return Ok(RunOutcome::Detached);
                     }
                     Ok(n) => {
                         // detach prefix が disabled (= env HYOUI_DETACH_PREFIX=none) なら
@@ -758,26 +799,31 @@ impl ClientConnection {
                                     let _ = Frame::cbor_control(body).encode_to(&mut self.writer);
                                     let _ = self.writer.flush();
                                 }
-                                return Ok(None);
+                                // detach key (`Ctrl-A d`) 由来の自発 detach。
+                                return Ok(RunOutcome::Detached);
                             }
                             if let DetachAction::Forward(forward_bytes) = action
                                 && !forward_bytes.is_empty()
                             {
                                 let frame = Frame::raw_data(forward_bytes);
                                 if frame.encode_to(&mut self.writer).is_err() {
-                                    return Ok(None);
+                                    // socket への書き込み失敗 = daemon 消滅の疑い。
+                                    return Ok(RunOutcome::ConnectionLost);
                                 }
                             }
                         } else {
                             // detach key 無効 → 全 bytes をそのまま forward
                             let frame = Frame::raw_data(buf[..n].to_vec());
                             if frame.encode_to(&mut self.writer).is_err() {
-                                return Ok(None);
+                                // socket への書き込み失敗 = daemon 消滅の疑い。
+                                return Ok(RunOutcome::ConnectionLost);
                             }
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => return Ok(None),
+                    // stdin read error: 入力経路が壊れた。子は daemon 配下に残せるので
+                    // 自発 detach 相当 (= 接続喪失ではない)。
+                    Err(_) => return Ok(RunOutcome::Detached),
                 }
             }
             // POLLHUP/POLLERR/POLLNVAL は上の stdin_revents_is_eof 経路で処理済み。
@@ -1645,30 +1691,185 @@ mod tests {
             spawn_daemon_and_connect_client(vec!["/bin/sleep".into(), "30".into()]);
 
         // daemon に Kill を送る (DR-0012: signal=None で default SIGTERM)。
-        // 受信した daemon は child に SIGTERM → reap → serve_loop 終了 →
-        // listener / socket close → client.run が socket EOF を観測して
-        // Ok(()) で抜ける、という経路。
+        // 受信した daemon は child に SIGTERM → reap → SessionExitNotify(143) を
+        // broadcast → serve_loop 終了 → listener / socket close、という経路。
         conn.send_control(&ControlMessage::Kill(crate::protocol::messages::Kill {
             signal: None,
             wait: true,
         }))
         .expect("send kill");
 
-        // stdin 側は pipe の read 端 (= write 端を即 close で EOF 状態)。
-        // ただし本 test の終了条件は socket EOF 側であり、stdin EOF は副次的。
-        let (rd, wr) = nix::unistd::pipe().expect("pipe");
-        drop(wr);
+        // stdin 側は pipe の read 端。本 test の終了条件は daemon 側なので、stdin EOF
+        // (= Detached) が先に競合しないよう write 端を保持する (= issue 2026-06-11
+        // 優先1 で stdin EOF と socket EOF を別 outcome に分けたため)。
+        let (rd, wr_keep) = nix::unistd::pipe().expect("pipe");
         let mut stdin = std::fs::File::from(rd);
         let mut stdout = Vec::<u8>::new();
         let result = conn.run(&mut stdin, &mut stdout);
+        drop(wr_keep);
+        // issue 2026-06-11 優先1: daemon が child を kill して SessionExitNotify を
+        // 送り切れば ChildExited(143)、送り切る前に socket が閉じれば ConnectionLost。
+        // 優先1 で broadcast 後に drain wait を入れたので通常は ChildExited だが、
+        // 高負荷で drain が間に合わなければ ConnectionLost もあり得る。本 test の主旨は
+        // 「daemon 終了で run が hang せず Ok で抜ける」ことなので両方許容する。
         assert!(
-            result.is_ok(),
-            "run must return Ok on daemon close: {result:?}"
+            matches!(
+                result,
+                Ok(RunOutcome::ChildExited { .. }) | Ok(RunOutcome::ConnectionLost)
+            ),
+            "run must return ChildExited or ConnectionLost on daemon close: {result:?}"
         );
         let exit = handle.join().expect("daemon thread").expect("daemon run");
         // SIGTERM kill → shell convention で 128 + SIGTERM(15) = 143。
         // race で child が SIGTERM 前に exit していれば 0 もありうるが、
         // `/bin/sleep 30` は明確に alive なので 143 が期待値。緩衝として 0 も許容。
         assert!(exit == 0 || exit == 143, "expected 0 or 143, got {exit}");
+    }
+
+    // ---- issue 2026-06-11 優先1: RunOutcome の分解 ----
+
+    /// detach prefix (`Ctrl-A d`) を stdin から受けたら `RunOutcome::Detached` を
+    /// 返す (= 自発 detach、CLI 層は exit 0)。daemon 役には Detach control message が
+    /// 届く。
+    #[test]
+    fn run_returns_detached_on_detach_key() {
+        use crate::protocol::ControlMessage;
+        use std::os::unix::net::UnixStream;
+
+        let (client_sock, daemon_sock) = UnixStream::pair().expect("socketpair");
+        let transport = UnixStreamTransport::new(client_sock);
+        let (reader, writer) = transport.split().expect("split");
+        let conn = ClientConnection {
+            reader,
+            writer,
+            response: HandshakeResponse {
+                caps: vec![],
+                session_id: "t".into(),
+                client_id: 1,
+                leader: false,
+                mode: Mode::Rw,
+            },
+            eof_action: StdinEofAction::Detach,
+            suspend_hooks: None,
+            winch_source: None,
+        };
+
+        // stdin に prefix(0x01) + 'd' を流す pipe。
+        let (stdin_rd, stdin_wr) = nix::unistd::pipe().expect("stdin pipe");
+        nix::unistd::write(&stdin_wr, &[DETACH_PREFIX_BYTE, DETACH_TRIGGER_BYTE])
+            .expect("write detach seq");
+        // write 端は保持 (= EOF させず detach key 経路を確実に通す)。
+        let mut stdin_file = std::fs::File::from(stdin_rd);
+        let mut stdout: Vec<u8> = Vec::new();
+
+        let run_handle = std::thread::spawn(move || conn.run(&mut stdin_file, &mut stdout));
+
+        // daemon 役: Detach message を受け取る。
+        let mut daemon_reader = daemon_sock;
+        let frame = Frame::decode_from(&mut daemon_reader).expect("decode detach frame");
+        assert_eq!(frame.ty, TYPE_CBOR_CONTROL);
+        assert!(
+            matches!(
+                ControlMessage::decode_from(frame.body.as_slice()),
+                Ok(ControlMessage::Detach(_))
+            ),
+            "detach key で Detach message が届くはず"
+        );
+
+        let res = run_handle.join().expect("join");
+        let _ = stdin_wr; // keep alive until join
+        assert!(
+            matches!(res, Ok(RunOutcome::Detached)),
+            "detach key は Detached を返すはず: {res:?}"
+        );
+    }
+
+    /// `SessionExitNotify` を受信したら `RunOutcome::ChildExited { exit_status }` を
+    /// 返す (= CLI 層が子の exit code を伝搬)。
+    #[test]
+    fn run_returns_child_exited_on_session_exit_notify() {
+        use crate::protocol::ControlMessage;
+        use crate::protocol::messages::SessionExitNotify;
+        use std::os::unix::net::UnixStream;
+
+        let (client_sock, daemon_sock) = UnixStream::pair().expect("socketpair");
+        let transport = UnixStreamTransport::new(client_sock);
+        let (reader, writer) = transport.split().expect("split");
+        let conn = ClientConnection {
+            reader,
+            writer,
+            response: HandshakeResponse {
+                caps: vec![],
+                session_id: "t".into(),
+                client_id: 1,
+                leader: false,
+                mode: Mode::Rw,
+            },
+            eof_action: StdinEofAction::Detach,
+            suspend_hooks: None,
+            winch_source: None,
+        };
+
+        // stdin は EOF させない (= 書き込み端を保持)。
+        let (stdin_rd, stdin_wr_keep) = nix::unistd::pipe().expect("stdin pipe");
+        let mut stdin_file = std::fs::File::from(stdin_rd);
+        let mut stdout: Vec<u8> = Vec::new();
+
+        // daemon 役: exit_status=42 の SessionExitNotify を送る。
+        let mut daemon_sock = daemon_sock;
+        let notify = ControlMessage::SessionExitNotify(SessionExitNotify {
+            exit_status: 42,
+            signal: None,
+        });
+        let body = notify.encode_to_vec().expect("encode exit notify");
+        Frame::cbor_control(body)
+            .encode_to(&mut daemon_sock)
+            .expect("send exit notify");
+
+        let run_handle = std::thread::spawn(move || conn.run(&mut stdin_file, &mut stdout));
+        let res = run_handle.join().expect("join");
+        drop(stdin_wr_keep);
+        drop(daemon_sock);
+        assert!(
+            matches!(res, Ok(RunOutcome::ChildExited { exit_status: 42 })),
+            "SessionExitNotify は ChildExited{{42}} を返すはず: {res:?}"
+        );
+    }
+
+    /// stdin が EOF + `--stdin-eof=detach` (default Detach) なら自発 detach として
+    /// `RunOutcome::Detached` を返す。
+    #[test]
+    fn run_returns_detached_on_stdin_eof_with_detach_action() {
+        use std::os::unix::net::UnixStream;
+
+        let (client_sock, _daemon_sock) = UnixStream::pair().expect("socketpair");
+        let transport = UnixStreamTransport::new(client_sock);
+        let (reader, writer) = transport.split().expect("split");
+        let conn = ClientConnection {
+            reader,
+            writer,
+            response: HandshakeResponse {
+                caps: vec![],
+                session_id: "t".into(),
+                client_id: 1,
+                leader: false,
+                mode: Mode::Rw,
+            },
+            eof_action: StdinEofAction::Detach,
+            suspend_hooks: None,
+            winch_source: None,
+        };
+
+        // 即 EOF な stdin。
+        let (stdin_rd, stdin_wr) = nix::unistd::pipe().expect("stdin pipe");
+        drop(stdin_wr);
+        let mut stdin_file = std::fs::File::from(stdin_rd);
+        let mut stdout: Vec<u8> = Vec::new();
+
+        let res = conn.run(&mut stdin_file, &mut stdout);
+        assert!(
+            matches!(res, Ok(RunOutcome::Detached)),
+            "stdin EOF + Detach action は Detached を返すはず: {res:?}"
+        );
     }
 }

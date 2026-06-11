@@ -382,6 +382,53 @@ impl SpawnedHyoui {
         nix::sys::signal::kill(self.pid, sig)
     }
 
+    /// hyoui-cli (= 自プロセス) が exit するのを deadline まで待ち、exit code を返す。
+    ///
+    /// `hyoui run` / `hyoui attach` は exec で attach client に化けるので、本 pid を
+    /// reap すれば attach client の exit code が取れる (= issue 2026-06-11 優先1 の
+    /// exit code semantics 検証用)。
+    ///
+    /// 戻り値:
+    /// - `Some(code)`: 正常 exit (= WIFEXITED) の exit code
+    /// - `None`: deadline 超過 or signal 死 (= WIFSIGNALED)。test 側で None を fail
+    ///   扱いにする
+    pub fn wait_exit_code(&mut self, timeout: Duration) -> Option<i32> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            // pump_pty で PTY の出力を吸い続けないと、子が write block して exit
+            // できないことがある (= PTY buffer full)。
+            self.pump_pty();
+            match self.child.try_wait() {
+                Ok(Some(status)) => return status.code(),
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    /// この session の daemon process pid を返す (= socket を listen している process)。
+    ///
+    /// daemon は `__daemonize-run` で起動後 ps の argv を user-facing に書き換えるため、
+    /// ps の command 文字列に socket path が出ない。確実に特定するため、`lsof` で socket
+    /// file を開いている process を引く (= listen 中の daemon が必ず 1 つ持つ)。
+    pub fn daemon_pid(&self) -> Option<i32> {
+        let out = std::process::Command::new("lsof")
+            .args(["-t", &self.socket.display().to_string()])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        // `lsof -t` は pid を 1 行 1 つで返す。複数あれば最初の 1 つ (= daemon)。
+        for line in text.lines() {
+            if let Ok(pid) = line.trim().parse::<i32>()
+                && pid != self.pid.as_raw()
+            {
+                return Some(pid);
+            }
+        }
+        None
+    }
+
     /// 子の process state を取得する (= `ps -o pid,ppid,pgid,stat,comm` 相当)。
     ///
     /// macOS / Linux 両対応のため、`ps` コマンドを subprocess で呼ぶ
@@ -470,6 +517,23 @@ impl SpawnedHyoui {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// 正規経路 (`hyoui kill --socket=<sock>`) で daemon を畳む。
+    ///
+    /// detach key テスト等、client が抜けた後も daemon + 子が残るケースで使う。daemon
+    /// は `__daemonize-run` で起動後 ps の argv を user-facing に書き換えるため、ps の
+    /// command 文字列に socket path が出ない (= `daemon_pid` で socket 一致が効かない)。
+    /// 確実に畳むため CLI の kill subcommand を叩く。best-effort (= 失敗は無視)。
+    pub fn kill_daemon_via_cli(&self) {
+        let socket_arg = format!("--socket={}", self.socket.display());
+        let _ = std::process::Command::new(hyoui_bin())
+            .args(["kill", &socket_arg])
+            .env(
+                "XDG_RUNTIME_DIR",
+                self.socket.parent().unwrap_or(Path::new("/tmp")),
+            )
+            .output();
     }
 
     /// child + session subtree (= daemon / 子 PTY) を kill して PTY を閉じる。
