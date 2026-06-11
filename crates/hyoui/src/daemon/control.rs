@@ -1736,13 +1736,17 @@ mod tests {
     /// zombie の子に対して生死チェックを行った後でも、waitpid が Exited を返せる
     /// ことを検証する (旧実装 = waitpid(WNOHANG) ベースだとここで ECHILD になる)。
     #[test]
+    // zombie を意図的に作って「reap せずに観測できるか」を検証するテストなので、
+    // wait() しない spawn が本体 (実際の reap は末尾の waitpid で行われる)。
+    #[allow(clippy::zombie_processes)]
     fn status_liveness_check_must_not_reap_exited_child() {
         use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-        // fork して即 exit する子を作り zombie にする
-        let child = match unsafe { nix::unistd::fork() }.expect("fork") {
-            nix::unistd::ForkResult::Parent { child } => child,
-            nix::unistd::ForkResult::Child => unsafe { libc::_exit(0) },
-        };
+        // 即 exit する子を spawn して zombie にする (= std の Child は drop でも
+        // reap しないので、waitpid で観測するまで zombie が残る)
+        let spawned = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn /usr/bin/true");
+        let child = nix::unistd::Pid::from_raw(spawned.id() as i32);
         // 子が exit して zombie になるのを少し待つ
         std::thread::sleep(std::time::Duration::from_millis(50));
 
