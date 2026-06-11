@@ -144,6 +144,9 @@ attach で対話する」用途では `detach` が正しい。
 > この構造的乖離は PTY ラップの本質で解消不能のため、pipe 入力で TUI を駆動する用途は
 > `--stdin-eof=detach` を明示するのが正 (= usage にも明記)。default `send-eof` のまま
 > raw TUI に pipe を繋ぐと、子が exit しないため client は子の終了まで残り続ける。
+> なお「EOT 送出後に grace timeout で自動 detach」する緩和案も検討の上**不採用**
+> (= 「子は正常だが時間がかかっているだけ」を false-positive で切り捨てる partial state
+> 介入であり、[[DR-0014]] の規律に反する。子が exit しない限り client が残るのは意図)。
 
 ### 6. `attach --exclusive` / `--detach-others` は parse 段で「未実装」エラー化
 
