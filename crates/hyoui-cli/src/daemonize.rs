@@ -423,6 +423,15 @@ pub fn run_daemon_child() -> ExitCode {
     // 用途: ns 内でネスト起動した hyoui が指定なしで同 ns を引き継ぐ (= 自己検出にも使える)。
     hyoui::sys::env::set_var_at_startup("HYOUI_NAMESPACE", &init.namespace);
 
+    // DR-0020 §1: 子 PTY に `HYOUI_SESSION_ID` を **常時注入** (= 自己参照の必然、
+    // tmux `$TMUX` / screen `$STY` 慣行と同枠の透過例外)。daemon child 自身の env に
+    // set しておくと `Session::start` が fork+execvp する子 PTY がそれを継承する。
+    // ここは `Session::start` 前で single-threaded なので set_var_at_startup の契約を
+    // 満たす。子 process (= shell / AI agent) が自セッションを操作する省略時解決
+    // (DR-0020 §2) の入力になる。`HYOUI_NAMESPACE` と同じく、子に意図的に伝える env
+    // なので unset しない。
+    hyoui::sys::env::set_var_at_startup("HYOUI_SESSION_ID", &session_id);
+
     // 子 cmd は argv `["run", "--detached", "--", cmd, args...]` の "--" 以降を取得。
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut cmd: Vec<String> = Vec::new();

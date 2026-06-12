@@ -3524,7 +3524,10 @@ fn usage_run() -> String {
                 (otherwise /tmp/hyoui-<uid> is used; TMPDIR is not consulted)\n    \
             HYOUI_NAMESPACE        Session namespace (= --namespace の env 経路、flag 優先)\n    \
             HYOUI_SCROLLBACK_ROWS  --scrollback-rows と同じ値を env で渡す\n                                   \
-                (--scrollback-rows 指定時は flag 優先)\n\
+                (--scrollback-rows 指定時は flag 優先)\n    \
+            HYOUI_SESSION_ID       (子へ注入) daemon が子プロセスへ常時 export する\n                                   \
+                自セッション id。中から `hyoui status` 等を session 省略で\n                                   \
+                叩くと自セッションに解決される (DR-0020)\n\
         \n\
         DURATION FORMAT (kawaz/timespec.mbt 仕様 + sub-ms 拡張):\n    \
             短形 ns/us/μs/ms/s/m/h/d/w または長形 second(s)/minute(s)/hour(s)/\n    \
