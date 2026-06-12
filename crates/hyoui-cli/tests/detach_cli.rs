@@ -1,8 +1,7 @@
-//! DR-0020 §4 e2e: `hyoui detach` の target 別実動作。
+//! DR-0020 §4 e2e: `hyoui detach` の実動作。
 //!
-//! - `--target=all`: 全 attach client が drop され、各 client process が EOF で終了。
-//!   daemon と子 PTY は生存継続する (= DR-0015 §2.3.1)。
-//! - `--target=others`: 指定 client 以外が drop される。
+//! `hyoui detach <session>` (= 常に all) で全 attach client が drop され、各 client
+//! process が EOF で終了する。daemon と子 PTY は生存継続する (= DR-0015 §2.3.1)。
 
 mod common;
 
@@ -44,14 +43,10 @@ fn wait_for_client_count(socket: &std::path::Path, n: usize, timeout: Duration) 
     }
 }
 
-/// `hyoui detach --socket=<sock> --target=<t>` を別 process で実行する。
-fn run_detach(socket: &std::path::Path, target: &str) -> std::process::Output {
+/// `hyoui detach --socket=<sock>` (= 常に all) を別 process で実行する。
+fn run_detach(socket: &std::path::Path) -> std::process::Output {
     Command::new(hyoui_bin())
-        .args([
-            "detach",
-            &format!("--socket={}", socket.display()),
-            &format!("--target={target}"),
-        ])
+        .args(["detach", &format!("--socket={}", socket.display())])
         .env_remove("HYOUI_LOCK_TOKEN")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -83,8 +78,8 @@ fn detach_all_drops_every_client_but_daemon_survives() {
     // pump して 2nd の PTY buffer を詰まらせない。
     second.pump_pty();
 
-    // detach --target=all で全 client を引き剥がす。
-    let out = run_detach(leader.socket(), "all");
+    // detach (= 常に all) で全 client を引き剥がす。
+    let out = run_detach(leader.socket());
     assert!(
         out.status.success(),
         "detach all は成功すべき。stderr={:?}",

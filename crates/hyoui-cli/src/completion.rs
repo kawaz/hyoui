@@ -303,13 +303,9 @@ _hyoui() {
         detach)
             case "$prev" in
                 --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                --target) COMPREPLY=( $(compgen -W "self others all" -- "$cur") ); return 0 ;;
                 --namespace|--index) return 0 ;;
             esac
-            case "$cur" in
-                --target=*) COMPREPLY=( $(compgen -W "self others all" -- "${cur#*=}") ); return 0 ;;
-            esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --index --target --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --namespace --index --help -h" -- "$cur") )
             return 0 ;;
         *)
             return 0 ;;
@@ -441,7 +437,6 @@ _hyoui() {
                         '--socket=[Explicit socket path]:socket:_files' \
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
                         '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
-                        '--target=[Detach target]:target:(self others all)' \
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:session id:'
                     ;;
@@ -468,7 +463,7 @@ _hyoui_subcommands() {
         'input:Send input via spec list (DR-0006 §8)'
         'lock:Acquire / release a session lock (acquire, release)'
         'unlock:Release a session lock (= lock release alias)'
-        'detach:Detach attached client(s) (--target=others|all|self)'
+        'detach:Detach all attached clients from a session'
         'record:Record tty I/O timeline (start, stop, list)'
         'completion:Print a shell completion script'
     )
@@ -791,7 +786,7 @@ complete -c hyoui -n __hyoui_no_subcommand -f -a screen     -d 'Dump / inspect v
 complete -c hyoui -n __hyoui_no_subcommand -f -a input      -d 'Send input via spec list (DR-0006 §8)'
 complete -c hyoui -n __hyoui_no_subcommand -f -a lock       -d 'Acquire / release a session lock'
 complete -c hyoui -n __hyoui_no_subcommand -f -a unlock     -d 'Release a session lock (= lock release alias)'
-complete -c hyoui -n __hyoui_no_subcommand -f -a detach     -d 'Detach attached client(s) (--target=others|all|self)'
+complete -c hyoui -n __hyoui_no_subcommand -f -a detach     -d 'Detach all attached clients from a session'
 complete -c hyoui -n __hyoui_no_subcommand -f -a record     -d 'Record tty I/O timeline'
 complete -c hyoui -n __hyoui_no_subcommand -f -a completion -d 'Print a shell completion script'
 
@@ -950,7 +945,6 @@ complete -c hyoui -n '__hyoui_using_subcommand unlock' -s h -l help    -d 'Show 
 complete -c hyoui -n '__hyoui_using_subcommand detach' -l socket -r -F -d 'Explicit socket path'
 complete -c hyoui -n '__hyoui_using_subcommand detach' -l index  -x    -d 'Session selector (1=oldest, -1=newest)'
 complete -c hyoui -n '__hyoui_using_subcommand detach' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
-complete -c hyoui -n '__hyoui_using_subcommand detach' -l target -x -a 'self others all' -d 'Detach target (default all)'
 complete -c hyoui -n '__hyoui_using_subcommand detach' -s h -l help    -d 'Show help and exit'
 
 # `hyoui record` 子 subcommand

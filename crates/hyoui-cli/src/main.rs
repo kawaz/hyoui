@@ -2181,13 +2181,13 @@ fn socket_path_is_self(p: &std::path::Path) -> bool {
     canon(p) == canon(&self_sock)
 }
 
-/// `detach [session] [--target=others|all|self]` subcommand (DR-0020 §4)。
+/// `detach [session]` subcommand (DR-0020 §4)。常に all (= 全 attach client を切断)。
 ///
-/// 指定 session に一時接続して `Detach` message を送り、対象 client を引き剥がす。
+/// 指定 session に一時接続して `Detach{All}` を送り、全 attach client を引き剥がす。
 /// daemon と子 PTY は影響を受けず継続する (= DR-0015 §2.3.1)。session 省略時は
 /// `$HYOUI_SESSION_ID` で自セッションに解決 (= self default 許容、TUI 脱出用途)。
+/// target 指定は持たない (= `DetachConfig` doc 参照、Fable review M1 2026-06-12)。
 fn detach_command(cfg: hyoui::cli::DetachConfig) -> ExitCode {
-    use hyoui::cli::DetachTargetArg;
     use hyoui::protocol::messages::{Detach, DetachTarget};
 
     let namespace = socket_path::resolve_namespace(cfg.namespace.as_deref());
@@ -2204,18 +2204,8 @@ fn detach_command(cfg: hyoui::cli::DetachConfig) -> ExitCode {
         Err(code) => return code,
     };
 
-    // CLI 層 target を protocol target に変換。
-    let target = match cfg.target {
-        DetachTargetArg::Myself => DetachTarget::Myself,
-        DetachTargetArg::Others => DetachTarget::Others,
-        DetachTargetArg::All => DetachTarget::All,
-        // `DetachTargetArg` is `#[non_exhaustive]`; 未知 variant は all に倒す
-        // (= 「全部引き剥がす」が最も無難な detach の意味)。
-        _ => DetachTarget::All,
-    };
-
     // detach は他 client を引き剥がす操作。leader は取らない (= RwNoLeader)。
-    // detach CLI 自身が leader を奪うと others/all の cascade が歪むため。
+    // detach CLI 自身が leader を奪うと cascade が歪むため。
     let opts = AttachOptions {
         mode: Mode::RwNoLeader,
         caps: hyoui::protocol::MVP_CAPS
@@ -2235,25 +2225,17 @@ fn detach_command(cfg: hyoui::cli::DetachConfig) -> ExitCode {
         }
     };
 
-    if let Err(e) = conn.send_control(&ControlMessage::Detach(Detach { target })) {
+    if let Err(e) = conn.send_control(&ControlMessage::Detach(Detach {
+        target: DetachTarget::All,
+    })) {
         eprintln!("hyoui: detach: send 失敗: {e}");
         return ExitCode::from(1);
     }
 
-    // daemon は Detach に明示 ack を返さず、対象 client を drop するだけ。
-    // - Myself / All: detach CLI 自身も drop 対象 → socket EOF を待って成功確定。
-    // - Others: detach CLI 自身は残る → daemon が他 client を drop したのを EOF で
-    //   観測できないため、送信成功をもって受理とみなし即終了する。
-    match target {
-        DetachTarget::Myself | DetachTarget::All => {
-            // EOF (= 自分が drop された) を short deadline で待つ。届かなくても
-            // 要求は送信済なので成功扱い (= daemon が非同期に drop する)。
-            let _ = poll_recv_ready(&conn, std::time::Duration::from_secs(2));
-        }
-        DetachTarget::Others => {}
-        // `DetachTarget` is `#[non_exhaustive]`; 未知は待たずに返す。
-        _ => {}
-    }
+    // All では detach CLI 自身も drop 対象 → socket EOF を short deadline で待って
+    // daemon が処理したことを確認する。届かなくても要求は送信済なので成功扱い
+    // (= daemon が非同期に drop する)。
+    let _ = poll_recv_ready(&conn, std::time::Duration::from_secs(2));
     ExitCode::SUCCESS
 }
 

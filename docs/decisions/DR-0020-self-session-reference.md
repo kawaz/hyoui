@@ -52,16 +52,33 @@ justify: DR-0018 で確立した透過例外の同枠 (= tmux `$TMUX` / screen `
 DR-0004 で予約していた `detach` を実装する:
 
 ```
-hyoui detach [session] [--target=others|all|self]
+hyoui detach [session]
 ```
 
-- 引数なし + 中から = 自セッションの **all** (= 全 client を detach。TUI 直起動からの
-  脱出ユースケース)。外から = target 必須エラーではなく **others** ... ではなく
-  **明示 target なしは all** に統一 (= 「この session の attach を全部引き剥がす」が
-  最も直感的な動詞の意味。others は attach 中の端末から「自分以外を蹴る」用)
-- daemon 側 `Detach{target: Others/All}` の部分実装 (`DetachTargetPartial`) を完成させる
+> **Update 2026-06-12 (Fable review M1)**: 当初案の `--target=others|all|self` flag は
+> **撤去**し、CLI の detach は **all 固定** (= この session の全 attach client を
+> 引き剥がす) とした。detach CLI は一時接続で daemon に要求を送る構造のため、
+> CLI から見た self は「一時接続が自分を切る」no-op、others は「一時接続以外 ≒ 全部」
+> となり all と実質同義 — flag として嘘になる。self / others は client addressing
+> (= どの client かを外から指定する仕組み、§Consequences の将来 DR 範囲) が無い
+> 現状の CLI では表現不能なので出さない。中から自分の端末だけ抜けるのは attach の
+> detach key (Ctrl-A d) の役割。
+
+- 引数なし + 中から = 自セッションの全 client detach (= TUI 直起動からの脱出
+  ユースケース)。外から = 明示 session の全 client 引き剥がし
+- daemon 側 `Detach{target: Others/All}` の部分実装 (`DetachTargetPartial`) を完成させる。
+  protocol の `DetachTarget::{Myself, Others}` は内部用として残る
+  (= Myself: attach の detach key、Others: 将来の client addressing 用)
+- Others/All は他 client を引き剥がす破壊的操作なので Signal と同じ権限ゲート
+  (= Rw / RwNoLeader 可、Ro 観察者は不可) を適用する (Fable review M2、2026-06-12)
 - これにより `attach --detach-others` (DR-0019 §6 で未実装エラー化) も同じ daemon 機構で
   実装可能になる (= docs/issue/2026-06-12-feature-attach-exclusive-detach-others.md と統合)
+- `--exclusive` の占有判定は **attach 時点のスナップショット** (= 確立済 client +
+  in-flight handshake、mode 未確定の pending は安全側で拒否)。成立後の継続的な
+  占有保証はしない (= それは lock の領域、codex review 2026-06-12)
+- `--exclusive` と `--detach-others` の併用は **奪取 → 占有の順** (= 「排他的に
+  乗っ取る」が自然な意味、Fable review Minor2)。併用時は exclusive 判定をスキップ
+  (= 奪取後は自分だけが残るので占有は自動的に成立する)
 
 ### 5. 発見性の改善 (UX、透過原則の範囲内)
 
@@ -80,8 +97,11 @@ hyoui detach [session] [--target=others|all|self]
   手段は既存の Ctrl-A prefix に集約済みで、これ以上の入力介入は透過原則に反する。
   完全透過が欲しい場合の `HYOUI_DETACH_PREFIX=none` opt-out も既存
 - **`hyoui detach` の引数なし = others**: 「中から打ったら自分以外」は shell からは便利
-  だが、detach の主ユースケース (TUI 脱出 / 外からの引き剥がし) では all が直感的。
-  others は `--target=others` で明示
+  だが、detach の主ユースケース (TUI 脱出 / 外からの引き剥がし) では all が直感的
+- **`hyoui detach --target=others|all|self` flag** (当初案): detach CLI の一時接続
+  semantics では self = no-op / others ≒ all となり flag が嘘になるため撤去
+  (= §4 Update 2026-06-12)。self/others 相当の操作は client addressing 設計
+  (将来 DR) を待つ
 
 ## Consequences
 

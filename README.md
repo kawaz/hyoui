@@ -227,7 +227,7 @@ explicitly (e.g. `--namespace=default`).
 | `hyoui screen dump <session>` | Dump the screen as ANSI bytes (terminal-replayable) |
 | `hyoui screen snapshot <session>` | Structured screen-state snapshot (JSON / CBOR) |
 | `hyoui lock acquire\|release <session>` | Exclusion for atomic automation (`unlock` is an alias for `lock release`; `tx` is not yet implemented) |
-| `hyoui detach [session] [--target=others\|all\|self]` | Detach attached client(s) (default all; daemon and child keep running) |
+| `hyoui detach [session]` | Detach all attached clients (daemon and child keep running) |
 | `hyoui record start\|stop\|list <session>` | Persist the tty I/O timeline (jsonl / raw). **⚠ stdin redaction is not yet wired** |
 | `hyoui tail <session>` | Raw byte stream (logging / grep / asciinema preprocessing) |
 

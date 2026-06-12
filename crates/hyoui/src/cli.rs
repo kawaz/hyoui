@@ -237,24 +237,15 @@ pub struct AttachConfig {
     pub quiet: bool,
 }
 
-/// `detach` の対象指定 (= `--target=others|all|self`、DR-0020 §4)。
-///
-/// protocol 層の [`crate::protocol::messages::DetachTarget`] と 1:1 対応する
-/// CLI 層の独立型。default は [`DetachTargetArg::All`] (= 「この session の attach
-/// を全部引き剥がす」が detach の最も直感的な意味)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub enum DetachTargetArg {
-    /// 自分のみ切断 (= attach 中の端末から自分だけ抜ける)。
-    Myself,
-    /// 自分以外の全 client を切断、自分は残る。
-    Others,
-    /// 自分含む全 client を切断 (= default、daemon は子 PTY 接続維持で常駐継続)。
-    #[default]
-    All,
-}
-
 /// `detach` subcommand configuration (DR-0020 §4)。
+///
+/// CLI の detach は常に **all** (= この session の全 attach client を引き剥がす)。
+/// `--target=self|others` は CLI から出さない (Fable review M1 2026-06-12):
+/// detach CLI は一時接続で daemon に Detach を送る構造のため、self は「一時接続が
+/// 自分を切る」no-op、others は「一時接続以外 ≒ 全部」となり all と実質同義で、
+/// flag として嘘になる。中から自分の端末だけ抜けるのは attach の detach key
+/// (Ctrl-A d) の役割。protocol の `DetachTarget::{Myself, Others}` は detach key /
+/// `--detach-others` 用として内部に残る。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DetachConfig {
     /// Target socket path. `Some(p)` で explicit、`None` なら session_id から resolve。
@@ -265,8 +256,6 @@ pub struct DetachConfig {
     pub index: Option<i32>,
     /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
     pub namespace: Option<String>,
-    /// `--target=others|all|self` (= default All)。
-    pub target: DetachTargetArg,
 }
 
 /// `list` subcommand の出力形式 (= `--format=plain|jsonl`)。
@@ -913,11 +902,11 @@ pub enum Command {
     /// 完全に同じ意味の subcommand を別名でも露出する: 「取得は `lock acquire`、
     /// 解放は `unlock`」という命名が直感的なため。
     Unlock(LockReleaseConfig),
-    /// `detach [session] [--target=others|all|self]` — attach を引き剥がす (DR-0020 §4)。
+    /// `detach [session]` — この session の全 attach client を引き剥がす (DR-0020 §4)。
     ///
-    /// default target は `all` (= この session の attach を全部切断)。中から実行
+    /// 常に all (= 全 client 切断、daemon / 子は継続)。中から実行
     /// (= `$HYOUI_SESSION_ID`) で自セッションを TUI 直起動から脱出する用途、または
-    /// 外から「全 client / 自分以外」を引き剥がす用途。
+    /// 外から全 client を引き剥がす用途。target 指定は持たない (= [`DetachConfig`])。
     Detach(DetachConfig),
     /// `record` 親 subcommand (= DR-0016 §2、tty I/O timeline 録画)。
     ///
@@ -3122,31 +3111,15 @@ fn parse_unlock(args: &[String]) -> Command {
     }
 }
 
-/// `detach [session] [--target=others|all|self]` parser (= DR-0020 §4)。
+/// `detach [session]` parser (= DR-0020 §4)。常に all (= 全 attach client を引き剥がす)。
 ///
 /// session 省略時は `$HYOUI_SESSION_ID` (= 中から実行) で自セッションに解決される
-/// (= `parse_session_targeted` 内の `has_self_session_env` で許容)。`--target` 未指定
-/// は `all` (= この session の attach を全部引き剥がす)。
+/// (= `parse_session_targeted` 内の `has_self_session_env` で許容)。`--target` flag は
+/// 持たない (= [`DetachConfig`] の doc を参照、Fable review M1 2026-06-12)。
 #[allow(clippy::result_large_err)]
 fn parse_detach(args: &[String]) -> Command {
-    let mut target = DetachTargetArg::All;
-    let res = parse_session_targeted("detach", args, HelpTopic::Detach, |opt, value| match opt {
-        "--target" => {
-            let v =
-                value.ok_or_else(|| Command::Error("detach: --target requires a value".into()))?;
-            target = match v.as_str() {
-                "self" => DetachTargetArg::Myself,
-                "others" => DetachTargetArg::Others,
-                "all" => DetachTargetArg::All,
-                other => {
-                    return Err(Command::Error(format!(
-                        "detach: invalid --target value: {other:?} (= self | others | all)"
-                    )));
-                }
-            };
-            Ok(true)
-        }
-        other => Err(Command::Error(format!("detach: unknown option: {other}"))),
+    let res = parse_session_targeted("detach", args, HelpTopic::Detach, |opt, _value| {
+        Err(Command::Error(format!("detach: unknown option: {opt}")))
     });
     match res {
         Ok(t) => Command::Detach(DetachConfig {
@@ -3154,7 +3127,6 @@ fn parse_detach(args: &[String]) -> Command {
             session_id: t.session_id,
             index: t.index,
             namespace: t.namespace,
-            target,
         }),
         Err(c) => c,
     }
@@ -3605,7 +3577,7 @@ fn usage_top(unknown: Option<&str>) -> String {
             input       Send input via spec list (DR-0006 §8; text:/key:/wait: ...)\n    \
             lock        Acquire / release a session lock (DR-0006 §7)\n    \
             unlock      Release a session lock (= `lock release` alias)\n    \
-            detach      Detach attached client(s) (--target=others|all|self; DR-0020)\n    \
+            detach      Detach all attached clients from a session (DR-0020)\n    \
             record      Record tty I/O timeline (DR-0016; start/stop/list)\n    \
             completion  Print a shell completion script (bash|zsh|fish)\n\
         \n\
@@ -4387,22 +4359,23 @@ fn usage_unlock() -> String {
 
 fn usage_detach() -> String {
     String::from(
-        "hyoui detach — detach attached client(s) from a session (DR-0020 §4)\n\
+        "hyoui detach — detach all attached clients from a session (DR-0020 §4)\n\
         \n\
-        指定 session の attach 接続を引き剥がす。daemon と子 PTY は影響を受けず\n\
-        継続する (= DR-0015 §2.3.1、全員 detach 後も daemon 常駐 / 新規 attach 待ち)。\n\
+        指定 session の attach 接続を **全部** 引き剥がす。daemon と子 PTY は影響を\n\
+        受けず継続する (= DR-0015 §2.3.1、全員 detach 後も daemon 常駐 / 新規 attach 待ち)。\n\
+        \n\
+        対象は常に全 client: detach CLI は一時接続で要求を送る構造のため、self /\n\
+        others のような部分指定は CLI からは意味を成さない (= self は一時接続の\n\
+        no-op、others は実質 all)。attach 中の端末から自分だけ抜けるのは attach の\n\
+        detach key (Ctrl-A d) の役割。\n\
         \n\
         USAGE:\n    \
-            hyoui detach <session-id> [--target=others|all|self]\n    \
-            hyoui detach --index=<N> [--target=...]\n    \
-            hyoui detach --socket=<path> [--target=...]\n    \
-            hyoui detach [--target=...]   (中から: $HYOUI_SESSION_ID で自セッション)\n\
+            hyoui detach <session-id>\n    \
+            hyoui detach --index=<N>\n    \
+            hyoui detach --socket=<path>\n    \
+            hyoui detach              (中から: $HYOUI_SESSION_ID で自セッション)\n\
         \n\
         OPTIONS:\n    \
-            --target VAL    切断対象 (default: all)\n                    \
-                self    = 自分のみ切断 (= attach 端末から自分だけ抜ける)\n                    \
-                others  = 自分以外の全 client を切断 (= 自分は残る、奪取)\n                    \
-                all     = 自分含む全 client を切断 (= この session の attach を全部引き剥がす)\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
             --index N       Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
             --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
@@ -4410,17 +4383,16 @@ fn usage_detach() -> String {
         \n\
         SELF-SESSION (DR-0020 §2):\n    \
             session を省略すると `$HYOUI_SESSION_ID` で自セッションに解決される\n    \
-            (= 中から `hyoui detach` で TUI 直起動から脱出 = default all)。\n\
+            (= 中から `hyoui detach` で TUI 直起動から脱出)。\n\
         \n\
         EXIT CODE:\n    \
-            0   detach 要求送信成功\n    \
+            0   detach 成功 (= 0 clients でも成功 = 冪等)\n    \
             1   connect / I/O 失敗\n    \
-            2   引数不足 / 不正 (session 指定なし + env なし、--target 不正値 等)\n\
+            2   引数不足 (session 指定なし + env なし 等)\n\
         \n\
         EXAMPLES:\n    \
-            hyoui detach demo                  # demo の全 client を切断 (= all)\n    \
-            hyoui detach demo --target=others  # 自分以外を蹴って奪取\n    \
-            hyoui detach                       # 中から: 自セッションの全 client 切断\n\
+            hyoui detach demo    # demo の全 client を切断\n    \
+            hyoui detach         # 中から: 自セッションの全 client 切断 (= TUI 脱出)\n\
         \n\
         RELATED:\n    \
             hyoui attach <id> --detach-others  Attach しつつ他 client を奪取\n    \
