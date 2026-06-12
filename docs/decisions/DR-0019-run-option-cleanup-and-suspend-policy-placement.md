@@ -159,7 +159,23 @@ silent no-op (= 指定が黙って無視される) の放置は [[DR-0014]] 検�
 `usage_run()` に残る `--on-parent-suspend` の記載 (= parser からは [[DR-0015]] で削除済)
 を除去する。「指定するとエラーになるオプションが help に載っている」状態の解消。
 
-## Rejected alternatives
+## Update (2026-06-12): policy の runtime 変更 + 可視化 (`hyoui set` / status / list)
+
+§3 の「daemon 常駐 policy (run 時固定)」を「**run 時初期値 + 実行時変更可**」に拡張する
+(kawaz 指示、2026-06-12):
+
+- **CLI**: `hyoui set <session> on-child-suspend=notify|auto-resume` (汎用 key=value 動詞。
+  将来の runtime 設定変更も同じ動詞に載せる)。`hyoui status` に現在値を表示、
+  `hyoui list` に policy 列を追加。
+- **protocol**: 設定変更の request/ack message を追加する。本 DR 初版の
+  「新 protocol message / cap flag は不要」はこの拡張で**部分的に失効** (= 必然性が
+  生じたため追加する。DR-0008 の cap negotiate 流儀に従う)。
+
+決定根拠 (= 実証事例): v0.6.3 リリース直後の実機検証で、PATH に残った旧バイナリ
+(0.6.1 = flag が parse-only no-op) で worker を起動してしまい、**policy が外から確認
+できないため「auto-resume が効いていない実験」に誰も気づけなかった**。可視化 (status/list)
+は誤運用の検出に、runtime 変更は「立てっぱなしの worker を作り直さずに policy を直す」
+(detached worker の長期運用) に、それぞれ必然がある。
 
 ### auto-resume を client ローカルに縮退 (= codex 案)
 
