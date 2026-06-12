@@ -49,7 +49,7 @@ pub use error::{ErrorCode, ErrorMessage};
 pub use handshake::{
     HandshakeRequest, HandshakeResponse, MAX_CAP_LEN, MAX_CAPS_COUNT, MAX_TOKEN_LEN, Mode,
 };
-pub use lifecycle::{Detach, DetachTarget, Kill, KillAck};
+pub use lifecycle::{Detach, DetachAck, DetachTarget, Kill, KillAck};
 pub use lock::{
     LeaderNotify, LockAcquire, LockRelease, LockResponse, LockResult, ModeChange, SessionMode,
 };
@@ -142,6 +142,11 @@ pub enum ControlMessage {
     /// `kind = "detach"` — client → daemon、自身 (or `others`/`all`) を detach。
     #[serde(rename = "detach")]
     Detach(Detach),
+
+    /// `kind = "detach.ack"` — daemon → client、`Detach{Others/All}` の受理応答
+    /// (= drop 対象数を返す、DR-0020 §4)。`Detach{Myself}` には返さない。
+    #[serde(rename = "detach.ack")]
+    DetachAck(DetachAck),
 
     /// `kind = "kill"` — client → daemon、子に signal → daemon exit。
     #[serde(rename = "kill")]
@@ -580,6 +585,17 @@ mod tests {
             signal: "SIGTERM".into(),
         });
         assert_eq!(roundtrip(&msg), msg);
+    }
+
+    /// `detach.ack` (= daemon → client、DR-0020 §4 / Fable Minor3) が roundtrip する。
+    #[test]
+    fn detach_ack_roundtrip() {
+        for count in [0u64, 1, 3] {
+            let msg = ControlMessage::DetachAck(DetachAck {
+                dropped_count: count,
+            });
+            assert_eq!(roundtrip(&msg), msg);
+        }
     }
 
     /// 旧 client (= `wait` field 無し) が送る Kill CBOR を新 daemon が decode

@@ -24,6 +24,19 @@ pub struct Detach {
     pub target: DetachTarget,
 }
 
+/// `detach.ack` payload (= DR-0020 §4 / Fable review Minor3、`kill.ack` の流儀)。
+///
+/// daemon が `Detach{Others/All}` を受理した直後 (= drop 実行前、対象数確定後) に
+/// 要求元 client へ返す ack。client は「N clients detached」を表示できる。
+/// `dropped_count = 0` でも成功 (= 冪等)。`Detach{Myself}` には返さない
+/// (= attach の detach key 経路は ack を期待しない既存 semantics を維持)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct DetachAck {
+    /// drop 対象になった client 数 (= All は要求元自身を含む全 client 数)。
+    pub dropped_count: u64,
+}
+
 /// `kill` payload (DR-0012)。daemon は子 PTY に signal を送って自身も exit する。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

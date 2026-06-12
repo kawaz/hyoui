@@ -2232,10 +2232,31 @@ fn detach_command(cfg: hyoui::cli::DetachConfig) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    // All では detach CLI 自身も drop 対象 → socket EOF を short deadline で待って
-    // daemon が処理したことを確認する。届かなくても要求は送信済なので成功扱い
-    // (= daemon が非同期に drop する)。
-    let _ = poll_recv_ready(&conn, std::time::Duration::from_secs(2));
+    // DR-0020 §4 / Fable Minor3: daemon は drop 実行前に DetachAck{dropped_count} を
+    // 返す (= socket buffer に乗ってから自分も drop されるので All でも読める)。
+    // ack を short deadline で待って成功報告を出す。0 件でも exit 0 (= 冪等)。
+    // ack が届かない場合 (= 旧 daemon / 途中切断) も要求は送信済なので成功扱い。
+    let deadline = std::time::Duration::from_secs(2);
+    while matches!(poll_recv_ready(&conn, deadline), Ok(true)) {
+        match conn.recv_control(None) {
+            Ok(ControlMessage::DetachAck(ack)) => {
+                println!("{} client(s) detached", ack.dropped_count);
+                break;
+            }
+            Ok(ControlMessage::Error(e)) => {
+                eprintln!(
+                    "hyoui: detach: daemon rejected ({:?}): {}",
+                    e.code, e.message
+                );
+                return ExitCode::from(1);
+            }
+            // broadcast (LeaderNotify / ModeChange 等) は読み飛ばして次 frame へ。
+            Ok(_) => continue,
+            // EOF / decode error = 自分が drop された (= 処理完了)。ack を
+            // 取りこぼしても成功扱い。
+            Err(_) => break,
+        }
+    }
     ExitCode::SUCCESS
 }
 

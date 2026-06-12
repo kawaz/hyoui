@@ -311,6 +311,7 @@ pub(super) fn handle_control_message(
         | ControlMessage::HandshakeResponse(_)
         | ControlMessage::Error(_)
         | ControlMessage::KillAck(_)
+        | ControlMessage::DetachAck(_)
         | ControlMessage::LockResponse(_)
         | ControlMessage::LeaderNotify(_)
         | ControlMessage::ModeChange(_)
@@ -546,6 +547,7 @@ fn handle_detach_target(
         DetachTarget::Others => {
             // 自分以外の全 client index を集める (= 自分は残す)。
             let others: Vec<usize> = (0..clients.len()).filter(|&i| i != idx).collect();
+            send_detach_ack_and_flush(&clients[idx], others.len() as u64);
             ClientFrameOutcome::DropClients {
                 indices: others,
                 cancel_pending: true,
@@ -554,11 +556,35 @@ fn handle_detach_target(
         DetachTarget::All => {
             // 自分含む全 client を drop。daemon は serve_loop を継続 (= 子 PTY 接続維持、
             // DR-0015 §2.3.1)。
+            send_detach_ack_and_flush(&clients[idx], clients.len() as u64);
             ClientFrameOutcome::DropClients {
                 indices: (0..clients.len()).collect(),
                 cancel_pending: true,
             }
         }
+    }
+}
+
+/// `detach.ack` を要求元に enqueue し、writer thread が flush し切るまで bounded wait
+/// する (DR-0020 §4 / Fable Minor3)。
+///
+/// drop は serve_loop 後段で `ClientHandle::Drop` が `shutdown(Both)` を呼ぶため、
+/// enqueue 直後に drop されると writer thread が ack を書く前に socket が閉じ、
+/// client が ack を読む前に EOF を観測する race が起きる (= `SessionExitNotify` の
+/// 終端 drain と同根、issue 2026-06-11)。同じ流儀の per-client bounded drain
+/// (= 200ms 上限) を ack 送信直後に行い、要求元が drop 対象 (= All) でも ack が
+/// 確実に socket に書かれてから drop されるようにする。
+fn send_detach_ack_and_flush(ch: &ClientHandle, dropped_count: u64) {
+    let _ = send_control(
+        ch,
+        ControlMessage::DetachAck(crate::protocol::messages::DetachAck { dropped_count }),
+    );
+    const ACK_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+    let deadline = std::time::Instant::now() + ACK_DRAIN_BUDGET;
+    while ch.queued_bytes.load(std::sync::atomic::Ordering::Acquire) > 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
 

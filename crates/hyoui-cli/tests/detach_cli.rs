@@ -85,6 +85,12 @@ fn detach_all_drops_every_client_but_daemon_survives() {
         "detach all は成功すべき。stderr={:?}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // Fable Minor3: 成功報告に drop 件数が出る (= leader + 2nd + detach CLI 自身 = 3)。
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("3 client(s) detached"),
+        "DetachAck の件数報告が出るべき。stdout={stdout:?}"
+    );
 
     // 両 client process が EOF で終了する (= daemon が drop して socket close)。
     let leader_code = leader.wait_exit_code(Duration::from_secs(10));
