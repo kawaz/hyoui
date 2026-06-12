@@ -48,6 +48,12 @@ pub struct ClientInfo {
     pub mode: Mode,
     /// leader かどうか。
     pub leader: bool,
+    /// この client が daemon に attach した時刻 (= unix epoch ミリ秒、DR-0020 §5)。
+    ///
+    /// `serde(default)` で後方互換 (= field を送らない旧 daemon は `0` に倒れ、CLI は
+    /// 「接続時刻不明」として `-` 表示する)。`daemon_version` と同流儀の前方互換追加。
+    #[serde(default)]
+    pub connected_at_unix_ms: u64,
 }
 
 /// 子 PTY process の実行時状態 (= `status` / `list` の状態表現)。
@@ -257,5 +263,40 @@ mod tests {
             .expect("legacy StatusResponse must decode with serde defaults");
         assert_eq!(decoded.on_child_suspend, None);
         assert_eq!(decoded.daemon_version, "");
+    }
+
+    /// DR-0020 §5: `ClientInfo.connected_at_unix_ms` は serde default で後方互換。
+    /// 旧 daemon (= field 無し) の ClientInfo を decode しても 0 に倒れる。
+    #[test]
+    fn legacy_client_info_without_connected_at_decodes_to_zero() {
+        use ciborium::Value;
+        // connected-at-unix-ms を含まない古い ClientInfo map。
+        let map = Value::Map(vec![
+            (Value::Text("client-id".into()), Value::Integer(7.into())),
+            (Value::Text("mode".into()), Value::Text("rw".into())),
+            (Value::Text("leader".into()), Value::Bool(true)),
+        ]);
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&map, &mut bytes).expect("encode legacy ClientInfo");
+        let decoded: ClientInfo = ciborium::de::from_reader(bytes.as_slice())
+            .expect("legacy ClientInfo must decode with serde default");
+        assert_eq!(decoded.client_id, 7);
+        assert!(decoded.leader);
+        assert_eq!(decoded.connected_at_unix_ms, 0);
+    }
+
+    /// `ClientInfo` の CBOR roundtrip (= connected_at_unix_ms 込みの wire 固定)。
+    #[test]
+    fn client_info_cbor_roundtrip_with_connected_at() {
+        let ci = ClientInfo {
+            client_id: 3,
+            mode: Mode::Ro,
+            leader: false,
+            connected_at_unix_ms: 1_700_000_000_000,
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&ci, &mut buf).expect("encode");
+        let back: ClientInfo = ciborium::de::from_reader(buf.as_slice()).expect("decode");
+        assert_eq!(back, ci);
     }
 }

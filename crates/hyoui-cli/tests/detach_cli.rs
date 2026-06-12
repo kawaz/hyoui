@@ -128,3 +128,140 @@ fn detach_all_drops_every_client_but_daemon_survives() {
         .stderr(Stdio::null())
         .status();
 }
+
+#[test]
+fn attach_detach_others_steals_leadership() {
+    let runner = HyouiTestRunner::new();
+    let session = "detach-others-steal";
+
+    // run = 元 leader client + daemon + 子。
+    let mut leader = runner.spawn_hyoui(session, &["run", "--", "sh", "-c", "sleep 60"]);
+    assert!(
+        leader.wait_for_leader_ready(Duration::from_secs(10)),
+        "leader attach ready"
+    );
+
+    // attach --detach-others = 接続成立時に元 leader を奪取 (= drop)。
+    let mut stealer = runner.spawn_hyoui(session, &["attach", "--detach-others"]);
+
+    // 元 leader process が EOF で終了する (= daemon が drop して socket close)。
+    let leader_code = leader.wait_exit_code(Duration::from_secs(10));
+    assert!(
+        leader_code.is_some(),
+        "--detach-others 後、元 leader client は奪取されて終了すべき"
+    );
+
+    // 後始末: stealer を pump して終了させ、daemon を kill。
+    stealer.pump_pty();
+    let _ = Command::new(hyoui_bin())
+        .args([
+            "kill",
+            &format!("--socket={}", runner.socket_path(session).display()),
+        ])
+        .env_remove("HYOUI_LOCK_TOKEN")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = stealer.wait_exit_code(Duration::from_secs(5));
+}
+
+#[test]
+fn attach_exclusive_denied_when_rw_client_present() {
+    let runner = HyouiTestRunner::new();
+    let session = "exclusive-denied";
+
+    // run = rw leader client が居る状態。
+    let mut leader = runner.spawn_hyoui(session, &["run", "--", "sh", "-c", "sleep 60"]);
+    assert!(
+        leader.wait_for_leader_ready(Duration::from_secs(10)),
+        "leader attach ready"
+    );
+
+    // attach --exclusive = 他 rw client が居るので handshake 段で拒否される。
+    let out = Command::new(hyoui_bin())
+        .args([
+            "attach",
+            "--exclusive",
+            &format!("--socket={}", runner.socket_path(session).display()),
+        ])
+        .env_remove("HYOUI_LOCK_TOKEN")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("attach --exclusive");
+
+    assert!(
+        !out.status.success(),
+        "他 rw client が居るとき --exclusive は拒否されるべき"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("exclusive") || stderr.contains("rw client"),
+        "exclusive 拒否の理由が示されるべき。stderr={stderr:?}"
+    );
+
+    // 後始末。
+    let _ = Command::new(hyoui_bin())
+        .args([
+            "kill",
+            &format!("--socket={}", runner.socket_path(session).display()),
+        ])
+        .env_remove("HYOUI_LOCK_TOKEN")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = leader.wait_exit_code(Duration::from_secs(5));
+}
+
+#[test]
+fn status_lists_clients_with_mode_leader_and_connected_time() {
+    // DR-0020 §5: status の client 一覧に mode / leader / 接続時刻 (connected=) が出る。
+    let runner = HyouiTestRunner::new();
+    let session = "status-clients";
+
+    let mut leader = runner.spawn_hyoui(session, &["run", "--", "sh", "-c", "sleep 30"]);
+    assert!(
+        leader.wait_for_leader_ready(Duration::from_secs(10)),
+        "leader attach ready"
+    );
+
+    let out = Command::new(hyoui_bin())
+        .args([
+            "status",
+            &format!("--socket={}", runner.socket_path(session).display()),
+        ])
+        .env_remove("HYOUI_LOCK_TOKEN")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("status");
+    assert!(out.status.success(), "status 成功");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(stdout.contains("clients:"), "clients セクションがある");
+    assert!(
+        stdout.contains("leader"),
+        "leader client が示される。stdout={stdout:?}"
+    );
+    assert!(
+        stdout.contains("connected="),
+        "接続時刻 (connected=) が示される。stdout={stdout:?}"
+    );
+
+    // 後始末。
+    let _ = Command::new(hyoui_bin())
+        .args([
+            "kill",
+            &format!("--socket={}", runner.socket_path(session).display()),
+        ])
+        .env_remove("HYOUI_LOCK_TOKEN")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = leader.wait_exit_code(Duration::from_secs(5));
+}

@@ -243,7 +243,7 @@ _hyoui() {
                 --stdin-eof=*)
                     COMPREPLY=( $(compgen -W "detach send-eof" -- "${cur#*=}") ); return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --index --mode --stdin-eof --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --namespace --index --mode --stdin-eof --exclusive --detach-others --quiet --help -h" -- "$cur") )
             return 0 ;;
         list)
             case "$cur" in
@@ -351,6 +351,9 @@ _hyoui() {
                         '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '--mode=[Operating mode]:mode:(rw ro rw-no-leader)' \
                         '--stdin-eof=[stdin EOF action]:action:(detach send-eof)' \
+                        '--exclusive[Deny attach if another rw client is present]' \
+                        '--detach-others[Detach other clients on attach (steal)]' \
+                        '--quiet[Suppress the detach/peek hint on attach]' \
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:session id:'
                     ;;
@@ -820,6 +823,9 @@ complete -c hyoui -n '__hyoui_using_subcommand attach' -l index          -x     
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l mode           -x -a 'rw ro rw-no-leader'   -d 'Operating mode'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l stdin-eof      -x -a 'detach send-eof'        -d 'stdin EOF action'
+complete -c hyoui -n '__hyoui_using_subcommand attach' -l exclusive                                     -d 'Deny attach if another rw client is present'
+complete -c hyoui -n '__hyoui_using_subcommand attach' -l detach-others                                 -d 'Detach other clients on attach (steal)'
+complete -c hyoui -n '__hyoui_using_subcommand attach' -l quiet                                          -d 'Suppress the detach/peek hint on attach'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -s h -l help                                    -d 'Show help and exit'
 
 # `hyoui list` options.

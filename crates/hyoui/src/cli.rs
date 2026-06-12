@@ -232,6 +232,9 @@ pub struct AttachConfig {
     /// `--stdin-eof=detach|send-eof` (DR-0019 §5)。`None` (= 未指定) なら stdin の
     /// tty 判定で解決 (= 非 tty で `SendEof`、tty で従来挙動の `Detach`)。
     pub stdin_eof: Option<StdinEofArg>,
+    /// `--quiet` (DR-0020 §5)。attach 成立時の stderr ヒント (= detach/peek 案内) を
+    /// 抑止する。非 tty stderr では flag に関わらずヒントを出さない。
+    pub quiet: bool,
 }
 
 /// `detach` の対象指定 (= `--target=others|all|self`、DR-0020 §4)。
@@ -2196,6 +2199,7 @@ fn parse_attach(args: &[String]) -> Command {
         index: None,
         namespace: None,
         stdin_eof: None,
+        quiet: false,
     };
 
     let mut positionals: Vec<String> = Vec::new();
@@ -2203,6 +2207,9 @@ fn parse_attach(args: &[String]) -> Command {
     while i < args.len() {
         let arg = args[i].as_str();
         let (name, inline_value) = split_eq(arg);
+        // bool flag (= `--exclusive` / `--detach-others`) の inline value 検出用に
+        // move 前に保存する (= `--exclusive=x` のような不正形を弾く)。
+        let had_inline = inline_value.is_some();
         let mut consumed_extra = false;
         let value: Option<String> = match inline_value {
             Some(v) => Some(v),
@@ -2238,25 +2245,31 @@ fn parse_attach(args: &[String]) -> Command {
                 Some(v) => cfg.mode_str = Some(v),
                 None => return Command::Error("--mode requires a value".into()),
             },
-            // DR-0019 §6: `--exclusive` / `--detach-others` は dead field
-            // (= wire には乗るが daemon 側に読む production コード無し)。silent
-            // no-op の放置は DR-0014 検証主義違反なので、実装が入るまで parse 段で
-            // 「未実装」を明示する (= DR-0004 の予約エラーと同じ流儀)。実装は別 issue。
+            // DR-0020 §4: `--exclusive` (= 他 rw client が居れば attach 拒否) /
+            // `--detach-others` (= attach 成立時に他 client を奪取)。daemon 側
+            // handshake 統合経路に実装済 (= accept.rs)。bool flag なので next token は
+            // consume しない (= consumed_extra=false)、inline value は不正。
             "--exclusive" => {
-                return Command::Error(
-                    "attach: --exclusive is not yet implemented (DR-0019 §6)。\
-                     daemon 側に占有要求を読む処理が無い (= dead field) ため、\
-                     実装が入るまで明示的に reject する"
-                        .into(),
-                );
+                if had_inline {
+                    return Command::Error("attach: --exclusive does not take a value".into());
+                }
+                cfg.exclusive = true;
+                consumed_extra = false;
             }
             "--detach-others" => {
-                return Command::Error(
-                    "attach: --detach-others is not yet implemented (DR-0019 §6)。\
-                     daemon 側に他 client 奪取を読む処理が無い (= dead field) ため、\
-                     実装が入るまで明示的に reject する"
-                        .into(),
-                );
+                if had_inline {
+                    return Command::Error("attach: --detach-others does not take a value".into());
+                }
+                cfg.detach_others = true;
+                consumed_extra = false;
+            }
+            // DR-0020 §5: attach 成立時の stderr ヒント (= detach/peek 案内) を抑止。
+            "--quiet" => {
+                if had_inline {
+                    return Command::Error("attach: --quiet does not take a value".into());
+                }
+                cfg.quiet = true;
+                consumed_extra = false;
             }
             "--debug-dump-client" => match value {
                 Some(v) if !v.is_empty() => cfg.debug_dump_client = Some(v),
@@ -3679,8 +3692,9 @@ fn usage_attach() -> String {
             --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --mode rw|ro|rw-no-leader\n                          \
                 Operating mode (default: rw)\n    \
-            --exclusive           (未実装、DR-0019 §6) 指定するとエラー\n    \
-            --detach-others       (未実装、DR-0019 §6) 指定するとエラー\n    \
+            --exclusive           他に rw client が attach 中なら attach を拒否 (DR-0020 §4)\n    \
+            --detach-others       attach 成立時に他 client を全て detach して奪取 (DR-0020 §4)\n    \
+            --quiet               attach 成立時の detach/peek ヒント (stderr) を抑止 (DR-0020 §5)\n    \
             --stdin-eof=detach|send-eof\n                          \
                 stdin EOF 時の挙動 (DR-0019)。default: 非 tty stdin なら\n                          \
                 send-eof (= EOT を子に送る)、tty なら detach\n    \
@@ -6636,33 +6650,28 @@ mod tests {
     }
 
     #[test]
-    fn attach_exclusive_is_unimplemented_error() {
-        // DR-0019 §6: `--exclusive` は dead field (= daemon 側に読むコード無し)。
-        // silent no-op を避けるため parse 段で「未実装」を明示する (DR-0004 流儀)。
+    fn attach_exclusive_sets_flag() {
+        // DR-0020 §4: `--exclusive` は実装済 (= daemon handshake で占有判定)。
         match parse_args(&args(&["attach", "demo", "--exclusive"])) {
-            Command::Error(msg) => {
-                assert!(msg.contains("--exclusive"), "msg: {msg}");
-                assert!(
-                    msg.contains("not yet implemented") || msg.contains("未実装"),
-                    "msg: {msg}"
-                );
+            Command::Attach(cfg) => {
+                assert!(cfg.exclusive, "exclusive フラグが立つべき");
+                assert!(!cfg.detach_others);
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
             }
-            other => panic!("expected Error, got {other:?}"),
+            other => panic!("expected Attach, got {other:?}"),
         }
     }
 
     #[test]
-    fn attach_detach_others_is_unimplemented_error() {
-        // DR-0019 §6: `--detach-others` も同様に未実装エラー。
+    fn attach_detach_others_sets_flag() {
+        // DR-0020 §4: `--detach-others` は実装済 (= daemon handshake で奪取)。
         match parse_args(&args(&["attach", "demo", "--detach-others"])) {
-            Command::Error(msg) => {
-                assert!(msg.contains("--detach-others"), "msg: {msg}");
-                assert!(
-                    msg.contains("not yet implemented") || msg.contains("未実装"),
-                    "msg: {msg}"
-                );
+            Command::Attach(cfg) => {
+                assert!(cfg.detach_others, "detach_others フラグが立つべき");
+                assert!(!cfg.exclusive);
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
             }
-            other => panic!("expected Error, got {other:?}"),
+            other => panic!("expected Attach, got {other:?}"),
         }
     }
 

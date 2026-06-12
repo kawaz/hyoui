@@ -85,6 +85,9 @@ pub(super) struct ClientHandle {
     pub(super) writer_thread: Option<std::thread::JoinHandle<()>>,
     /// daemon が client → daemon を decode するときに使う socket reader。
     pub(super) reader: UnixStream,
+    /// この client が attach した時刻 (= unix epoch ミリ秒、DR-0020 §5)。
+    /// `status` の client 一覧で「接続時刻」を表示する用途。
+    pub(super) connected_at_unix_ms: u64,
 }
 
 /// `ClientHandle` の drop でリソース cleanup を一括化する (R5-H18 / R5-FRM-H2)。
@@ -462,6 +465,7 @@ mod tests {
             buffer_limit: 100,
             writer_thread: None,
             reader: b,
+            connected_at_unix_ms: 0,
         };
 
         // 50 byte → OK、累計 50
@@ -509,6 +513,7 @@ mod tests {
             buffer_limit,
             writer_thread: None,
             reader,
+            connected_at_unix_ms: 0,
         };
         (ch, rx, peer)
     }
@@ -613,6 +618,7 @@ mod tests {
             buffer_limit: 1024,
             writer_thread: Some(writer_thread),
             reader,
+            connected_at_unix_ms: 0,
         };
 
         // 短時間 sleep して writer_pump が rx.recv() で block している状態を確実にする
@@ -648,6 +654,7 @@ mod tests {
             buffer_limit: 100,
             writer_thread: None,
             reader: b,
+            connected_at_unix_ms: 0,
         };
         // panic なしで drop できることだけ確認
         drop(ch);

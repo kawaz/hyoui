@@ -895,6 +895,19 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
     }
 
     let _ = stdout.flush();
+
+    // DR-0020 §5: attach 成立時に detach / peek の発見性ヒントを stderr へ 1 行出す。
+    // 子の出力経路 (PTY/stdout) ではなく client の stderr なので透過性を壊さない
+    // (= screen 慣行)。`--quiet` で抑止、非 tty stderr (= pipe) では出さない。
+    // raw mode 設定 + signal thread 起動 + 初期 redraw flush の後に出すことで、
+    // 起動シーケンス序盤の cooked stdin window に割り込まず (= detach key race 回避)、
+    // raw mode 下でも改行が崩れないよう CRLF で終端する。
+    if !cfg.quiet && is_tty(std::io::stderr().as_fd()) {
+        eprint!(
+            "[hyoui] detach: Ctrl-A d  |  peek (read-only): hyoui attach <session> --mode=ro\r\n"
+        );
+    }
+
     let client_dump = cfg
         .debug_dump_client
         .as_deref()
@@ -2387,9 +2400,21 @@ fn print_status_plain(sr: &hyoui::protocol::messages::StatusResponse) {
         println!("lock-holder: (none)");
     }
     println!("clients:");
+    let now = hyoui::sys::clock::now_unix_ms();
     for c in &sr.clients {
         let leader = if c.leader { " leader" } else { "" };
-        println!("  - id={} mode={:?}{leader}", c.client_id, c.mode);
+        // DR-0020 §5: 接続時刻を「接続からの経過時間」で表示する (= どの端末が
+        // 古株か把握しやすい)。connected_at が 0 (= field 無しの旧 daemon) は不明。
+        let conn = if c.connected_at_unix_ms == 0 {
+            "connected=?".to_string()
+        } else {
+            let elapsed = now.saturating_sub(c.connected_at_unix_ms);
+            format!(
+                "connected={} ago",
+                fmt_dur(std::time::Duration::from_millis(elapsed))
+            )
+        };
+        println!("  - id={} mode={:?}{leader} {conn}", c.client_id, c.mode);
     }
 }
 
@@ -2465,8 +2490,8 @@ fn print_status_json(sr: &hyoui::protocol::messages::StatusResponse) {
         };
         write!(
             &mut out,
-            "{{\"client_id\":{},\"mode\":\"{}\",\"leader\":{}}}",
-            c.client_id, mode_str, c.leader
+            "{{\"client_id\":{},\"mode\":\"{}\",\"leader\":{},\"connected_at_unix_ms\":{}}}",
+            c.client_id, mode_str, c.leader, c.connected_at_unix_ms
         )
         .ok();
     }

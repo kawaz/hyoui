@@ -1067,6 +1067,7 @@ fn handle_status_query(
             client_id: c.id,
             mode: c.mode,
             leader: c.leader,
+            connected_at_unix_ms: c.connected_at_unix_ms,
         })
         .collect();
     // cwd / argv は required field (= v1.0 breaking OK 方針)。daemonize 経路で
@@ -1655,6 +1656,7 @@ mod tests {
             buffer_limit: 1 << 20,
             writer_thread: None,
             reader: b,
+            connected_at_unix_ms: 0,
         };
         (ch, rx)
     }
@@ -1821,6 +1823,7 @@ mod tests {
             buffer_limit: 1 << 20,
             writer_thread: None,
             reader: b,
+            connected_at_unix_ms: 0,
         };
         (ch, rx)
     }
@@ -1947,6 +1950,7 @@ mod tests {
             buffer_limit: 1 << 20,
             writer_thread: None,
             reader: b,
+            connected_at_unix_ms: 0,
         };
         (ch, rx)
     }

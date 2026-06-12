@@ -45,7 +45,7 @@ use super::broadcast::{
     ClientHandle, SharedBytes, Subscription, broadcast_control, enqueue_for_client, send_control,
     writer_pump,
 };
-use super::lock::{SessionState, should_assign_leader};
+use super::lock::{SessionState, elevate_next_leader, should_assign_leader};
 use super::screen::{ScreenState, build_attach_redraw};
 
 /// R4-C3: handshake (= 1 client の HandshakeRequest 受信 + token 検証) を完了
@@ -93,6 +93,9 @@ pub(super) struct AcceptedClient {
     pub(super) handle: ClientHandle,
     /// この client が leader として確定されたか (= Phase 10 leader assignment)。
     pub(super) became_leader: bool,
+    /// `--detach-others` 要求 (DR-0020 §4)。push 完了後に自分以外の全 client を
+    /// drop して奪取する。
+    pub(super) detach_others: bool,
 }
 
 /// R4-C3: handshake worker thread が完了時に返す中間結果。
@@ -294,6 +297,36 @@ fn finalize_accepted_client(
     let _ = writer_main.set_read_timeout(None);
     let _ = writer_main.set_write_timeout(None);
 
+    // DR-0020 §4 / docs/issue/2026-06-12: `--exclusive` (= 自分以外の rw client が
+    // 居る場合は attach を拒否)。rw client = 書き込み権を持つ client (= Mode::Rw /
+    // RwNoLeader、Ro 観察者は除外)。拒否時は error response を送って Err を返し、
+    // process_pending_handshakes が drop で完了させる (= client は push されない)。
+    if req.exclusive {
+        use crate::protocol::Mode;
+        let other_rw = clients
+            .iter()
+            .any(|c| matches!(c.mode, Mode::Rw | Mode::RwNoLeader));
+        if other_rw {
+            use crate::protocol::messages::{ErrorCode, ErrorMessage};
+            let body = ControlMessage::Error(ErrorMessage {
+                code: ErrorCode::ModeNotAllowed,
+                message: "attach --exclusive denied: 他に rw client が attach 中です \
+                          (= 占有要求を満たせない)。--detach-others で奪取するか、\
+                          rw client が抜けてから再試行してください。"
+                    .into(),
+                details: None,
+            })
+            .encode_to_vec()
+            .map_err(|_| Error::Invalid("exclusive-denied error encode failed"))?;
+            Frame::cbor_control(body)
+                .encode_to(&mut writer_main)
+                .map_err(|_| Error::Invalid("exclusive-denied error frame encode failed"))?;
+            return Err(Error::Invalid(
+                "attach --exclusive denied (other rw client present)",
+            ));
+        }
+    }
+
     let became_leader = should_assign_leader(clients, req.mode);
 
     let response = HandshakeResponse {
@@ -332,8 +365,10 @@ fn finalize_accepted_client(
             buffer_limit: config.client_buffer_bytes,
             writer_thread: Some(writer_thread),
             reader,
+            connected_at_unix_ms: now_unix_ms(),
         },
         became_leader,
+        detach_others: req.detach_others,
     })
 }
 
@@ -376,6 +411,8 @@ pub(super) fn process_pending_handshakes(
                         *next_client_id += 1;
                         let new_id = accepted.handle.id;
                         let became_leader = accepted.became_leader;
+                        // DR-0020 §4: `--detach-others` (= push 後に自分以外を奪取)。
+                        let want_detach_others = accepted.detach_others;
                         let mode_change_for_locked = state.lock_holder.map(|holder| ModeChange {
                             session_mode: SessionMode::Locked,
                             lock_holder: Some(holder),
@@ -417,6 +454,58 @@ pub(super) fn process_pending_handshakes(
                                     client_id: Some(new_id),
                                 }),
                             ));
+                        }
+
+                        // DR-0020 §4: `--detach-others` (= 奪取)。新 client (= new_id) 以外の
+                        // 全 client を drop し、leader cascade / lock auto-release を serve_loop
+                        // と同じ規律で処理する。leader が消えた場合は elevate_next_leader が
+                        // 残った client (= 新 client) を昇格させる (= 奪取側が leader を取る)。
+                        if want_detach_others {
+                            let mut dropped_held_lock = false;
+                            let mut dropped_any_leader = false;
+                            let mut k = clients.len();
+                            while k > 0 {
+                                k -= 1;
+                                if clients[k].id == new_id {
+                                    continue;
+                                }
+                                let ch = clients.remove(k);
+                                let detached_id = ch.id;
+                                if ch.leader {
+                                    dropped_any_leader = true;
+                                }
+                                if state.lock_holder == Some(ch.id) {
+                                    dropped_held_lock = true;
+                                    state.lock_holder = None;
+                                    state.lock_token = None;
+                                }
+                                drop(ch);
+                                state.record_registry.push_lifecycle(
+                                    super::record::LifecycleEvent::ClientDetached {
+                                        client_id: detached_id,
+                                        ts_unix_ms: now_unix_ms(),
+                                    },
+                                );
+                            }
+                            if dropped_any_leader {
+                                let new_leader = elevate_next_leader(clients);
+                                overflow_ids.extend(broadcast_control(
+                                    clients,
+                                    &ControlMessage::LeaderNotify(LeaderNotify {
+                                        client_id: new_leader,
+                                    }),
+                                ));
+                            }
+                            if dropped_held_lock {
+                                overflow_ids.extend(broadcast_control(
+                                    clients,
+                                    &ControlMessage::ModeChange(ModeChange {
+                                        session_mode: state.session_mode(),
+                                        lock_holder: None,
+                                        client_mode: None,
+                                    }),
+                                ));
+                            }
                         }
                     }
                     Err(_) => {

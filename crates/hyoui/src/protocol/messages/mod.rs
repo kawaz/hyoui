@@ -477,11 +477,13 @@ mod tests {
                     client_id: 0,
                     mode: Mode::Rw,
                     leader: true,
+                    connected_at_unix_ms: 0,
                 },
                 ClientInfo {
                     client_id: 1,
                     mode: Mode::Ro,
                     leader: false,
+                    connected_at_unix_ms: 0,
                 },
             ],
             scrollback_bytes: 65536,
