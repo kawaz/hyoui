@@ -1253,7 +1253,9 @@ fn parse_kill(args: &[String]) -> Command {
 
     match positionals.len() {
         0 => {
-            if cfg.socket.is_none() && cfg.index.is_none() && !cfg.all {
+            // DR-0020 §2/§3: env (= 中から実行) なら通す。kill の self default は許容
+            // (= `exit` 相当)。値解決 / stale 検証は main.rs。
+            if cfg.socket.is_none() && cfg.index.is_none() && !cfg.all && !has_self_session_env() {
                 return Command::Error(
                     "kill: session id (positional) / --index=N / --socket=<path> / --all のいずれかが必要です。\
                      例: `hyoui kill <session-id>` / `hyoui kill 1` / `hyoui kill --all` / `hyoui list` で session 一覧を確認できます"
@@ -1280,6 +1282,28 @@ fn parse_kill(args: &[String]) -> Command {
     }
 
     Command::Kill(cfg)
+}
+
+/// `$HYOUI_SESSION_ID` が set + 非空か (= 中から実行されているか、DR-0020 §2)。
+///
+/// parse 段では値の解決 / stale 検証はせず「中から実行か否か」の有無だけ見る
+/// (= 値解決と socket liveness 検証は main.rs の resolve 層が担う)。env を読むのは
+/// namespace 解決 (`HYOUI_NAMESPACE`) と同枠で、CLI parser が env を参照する既存の
+/// 流儀に揃える。
+fn has_self_session_env() -> bool {
+    // Design rationale: lib ユニットテスト (= `cfg(test)`) では常に false を返す。
+    // 多数の parse テストが「session 省略 = required エラー」を期待しており、
+    // テスト実行環境 (= hyoui を `hyoui run` 配下で開発する等) に
+    // `HYOUI_SESSION_ID` が漏れていると一斉に壊れる。env を read するだけの
+    // 本関数を多数の parse テストが間接的に踏むため、個別 test での
+    // `remove_var` は並列 read と race する (Rust 2024 で env mutation は unsafe)。
+    // env 経路の検証は integration test (= `tests/self_session_resolve.rs`、
+    // リリースバイナリを別プロセス起動 = `cfg(test)` でない) が担うので、lib
+    // ユニットテストで env を無視しても検証カバレッジは落ちない。
+    if cfg!(test) {
+        return false;
+    }
+    matches!(std::env::var("HYOUI_SESSION_ID"), Ok(v) if !v.is_empty())
 }
 
 /// shared helper: `--socket` / `--index` / `--help` / positional session_id を抜き出す。
@@ -1379,7 +1403,11 @@ where
     }
     let session_id = match positionals.len() {
         0 => {
-            if socket.is_none() && index.is_none() {
+            // DR-0020 §2: socket / index / 位置引数いずれも無くても、`$HYOUI_SESSION_ID`
+            // が set (= 中から実行) なら通す (= 実行時に self-session へ解決)。env 未 set
+            // のときだけ従来の必須エラー。値の解決と stale 検証は main.rs の resolve 層が担う
+            // (= parse 段では「中から実行か否か」の有無判定のみ)。
+            if socket.is_none() && index.is_none() && !has_self_session_env() {
                 return Err(Command::Error(format!(
                     "{name}: session id (positional) / --index=N / --socket=<path> のいずれかが必要です。\
                      例: `hyoui {name} <session-id>` / `hyoui {name} --index=1` / `hyoui list` で session 一覧を確認できます"
@@ -1576,7 +1604,9 @@ fn parse_set(args: &[String]) -> Command {
             "set: session id (位置引数) と --index を同時に指定できません".into(),
         );
     }
-    if session_id.is_none() && index.is_none() && socket.is_none() {
+    // DR-0020 §2: env (= 中から実行) なら通す (= 「中から `hyoui set` で宣言」が主要
+    // ユースケース)。値解決 / stale 検証は main.rs。
+    if session_id.is_none() && index.is_none() && socket.is_none() && !has_self_session_env() {
         return Command::Error(
             "set: session id (positional) / --index=N / --socket=<path> のいずれかが必要です。\
              例: `hyoui set <session-id> on-child-suspend=auto-resume`"
@@ -1751,7 +1781,9 @@ fn parse_wait(args: &[String]) -> Command {
     }
     // positionals: socket / index あり (= selector 確定) → pattern 1 個だけ、
     // それ以外 (= session_id 位置引数) → 2 個 (= session_id, pattern)。
-    let selector_present = socket.is_some() || index.is_some();
+    // DR-0020 §2: `$HYOUI_SESSION_ID` (= 中から実行) も selector 確定扱い
+    // (= session は env で後解決、positional は pattern 1 個だけ)。
+    let selector_present = socket.is_some() || index.is_some() || has_self_session_env();
     let (session_id, pattern) = match (selector_present, positionals.len()) {
         (true, 0) => {
             return Command::Error(
@@ -3632,13 +3664,19 @@ fn usage_status() -> String {
         USAGE:\n    \
             hyoui status <session-id>\n    \
             hyoui status --index=<N>\n    \
-            hyoui status --socket=<path>\n\
+            hyoui status --socket=<path>\n    \
+            hyoui status                  (中から: $HYOUI_SESSION_ID で自セッション)\n\
         \n\
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
             --index N       Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
             --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             -h, --help      Show this help and exit\n\
+        \n\
+        SELF-SESSION (DR-0020 §2):\n    \
+            session を省略すると `$HYOUI_SESSION_ID` (= daemon が子へ常時注入)\n    \
+            で自セッションに解決される (= 中から `hyoui status` を打てる)。\n    \
+            env が指す session が不在 (= stale) なら fallback せず明示エラー。\n\
         \n\
         OUTPUT (plaintext key:value 1 行ごと):\n    \
             session-id: <name>\n    \
@@ -3673,7 +3711,8 @@ fn usage_set() -> String {
         USAGE:\n    \
             hyoui set <session-id> <key>=<value>\n    \
             hyoui set --index=<N> <key>=<value>\n    \
-            hyoui set --socket=<path> <key>=<value>\n\
+            hyoui set --socket=<path> <key>=<value>\n    \
+            hyoui set <key>=<value>       (中から: $HYOUI_SESSION_ID で自セッション、DR-0020)\n\
         \n\
         SUPPORTED KEYS:\n    \
             on-child-suspend=notify|auto-resume\n              \
@@ -3707,7 +3746,8 @@ fn usage_tail() -> String {
         USAGE:\n    \
             hyoui tail <session-id> [options]\n    \
             hyoui tail --index=<N> [options]\n    \
-            hyoui tail --socket=<path> [options]\n\
+            hyoui tail --socket=<path> [options]\n    \
+            hyoui tail [options]      (中から: $HYOUI_SESSION_ID で自セッション、DR-0020)\n\
         \n\
         OPTIONS:\n    \
             --socket PATH        Explicit socket path (alternative to session-id)\n    \
@@ -3756,7 +3796,8 @@ fn usage_wait() -> String {
         USAGE:\n    \
             hyoui wait <session-id> <pattern> [options]\n    \
             hyoui wait --index=<N> <pattern> [options]\n    \
-            hyoui wait --socket=<path> <pattern> [options]\n\
+            hyoui wait --socket=<path> <pattern> [options]\n    \
+            hyoui wait <pattern> [options]   (中から: $HYOUI_SESSION_ID で自セッション、DR-0020)\n\
         \n\
         PATTERN:\n    \
             正規表現 (regex crate、unicode-perl features)。multiline mode は default\n    \
@@ -3874,7 +3915,8 @@ fn usage_kill() -> String {
             hyoui kill --index=<N> [options]          # 1=最古, -1=最新\n    \
             hyoui kill --all [options]                # 全 live session を kill\n    \
             hyoui kill --socket=<path> [options]\n    \
-            hyoui kill -- <session-id> [options]      # `-` で始まる session-id を escape\n\
+            hyoui kill -- <session-id> [options]      # `-` で始まる session-id を escape\n    \
+            hyoui kill [options]                      # 中から: $HYOUI_SESSION_ID で自セッション (= exit 相当、DR-0020)\n\
         \n\
         2 軸モデル (= terminate するか / 終了を待つか は独立):\n    \
             [terminate 軸]  既定         : signal を送る。子が死ねば session も終わる\n    \
@@ -3976,7 +4018,8 @@ fn usage_screen_dump() -> String {
         USAGE:\n    \
             hyoui screen dump <session-id> [options]\n    \
             hyoui screen dump --index=<N> [options]\n    \
-            hyoui screen dump --socket=<path> [options]\n\
+            hyoui screen dump --socket=<path> [options]\n    \
+            hyoui screen dump [options]   (中から: $HYOUI_SESSION_ID で自セッション、DR-0020)\n\
         \n\
         OPTIONS:\n    \
             --socket PATH       Explicit socket path (alternative to session-id)\n    \
@@ -4032,7 +4075,8 @@ fn usage_screen_snapshot() -> String {
         USAGE:\n    \
             hyoui screen snapshot <session-id> [options]\n    \
             hyoui screen snapshot --index=<N> [options]\n    \
-            hyoui screen snapshot --socket=<path> [options]\n\
+            hyoui screen snapshot --socket=<path> [options]\n    \
+            hyoui screen snapshot [options]   (中から: $HYOUI_SESSION_ID で自セッション、DR-0020)\n\
         \n\
         OPTIONS:\n    \
             --socket PATH       Explicit socket path (alternative to session-id)\n    \
@@ -4100,7 +4144,8 @@ fn usage_lock_acquire() -> String {
         USAGE:\n    \
             hyoui lock acquire <session-id> [options]\n    \
             hyoui lock acquire --index=<N> [options]\n    \
-            hyoui lock acquire --socket=<path> [options]\n\
+            hyoui lock acquire --socket=<path> [options]\n    \
+            hyoui lock acquire [options]   (中から: $HYOUI_SESSION_ID で自セッション、DR-0020)\n\
         \n\
         OPTIONS:\n    \
             --socket PATH       Explicit socket path (alternative to session-id)\n    \
@@ -4158,7 +4203,8 @@ fn usage_lock_release() -> String {
         USAGE:\n    \
             hyoui lock release <session-id> --token=<T>\n    \
             hyoui lock release --index=<N> --token=<T>\n    \
-            hyoui lock release --socket=<path> --token=<T>\n\
+            hyoui lock release --socket=<path> --token=<T>\n    \
+            hyoui lock release --token=<T>   (中から: $HYOUI_SESSION_ID で自セッション、DR-0020)\n\
         \n\
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
@@ -4202,7 +4248,8 @@ fn usage_unlock() -> String {
         USAGE:\n    \
             hyoui unlock <session-id> --token=<T>\n    \
             hyoui unlock --index=<N> --token=<T>\n    \
-            hyoui unlock --socket=<path> --token=<T>\n\
+            hyoui unlock --socket=<path> --token=<T>\n    \
+            hyoui unlock --token=<T>   (中から: $HYOUI_SESSION_ID で自セッション、DR-0020)\n\
         \n\
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
@@ -4760,8 +4807,11 @@ fn parse_input(args: &[String]) -> Command {
     // 1. `--socket` or `--index` 指定 → 全 positional を spec として parse
     // 2. それ以外 → 第 1 positional を session_id 候補とみなし、`validate_session_id`
     //    が通れば session_id、通らない場合は error
+    // DR-0020 §2: `$HYOUI_SESSION_ID` (= 中から実行) も selector 扱い (= 全 positional
+    // を spec とみなし、session は env で後解決)。
     let (session_id, spec_strs): (Option<String>, &[String]) = if socket.is_some()
         || index.is_some()
+        || has_self_session_env()
     {
         (None, positionals.as_slice())
     } else {
@@ -4839,7 +4889,8 @@ fn usage_input() -> String {
         USAGE:\n    \
             hyoui input <session-id> <spec>... [options]\n    \
             hyoui input --index=<N> <spec>... [options]\n    \
-            hyoui input --socket=<path> <spec>... [options]\n\
+            hyoui input --socket=<path> <spec>... [options]\n    \
+            hyoui input <spec>... [options]   (中から: $HYOUI_SESSION_ID で自セッション、DR-0020)\n\
         \n\
         SPECS (= 出現順で送信、order-preserved):\n    \
             text:<string>      Direct UTF-8 text (no bracketed paste)\n    \

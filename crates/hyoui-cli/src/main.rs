@@ -1713,11 +1713,21 @@ fn kill_command_single(cfg: KillConfig) -> ExitCode {
             }
         } else {
             match cfg.session_id.as_deref() {
+                // 明示 session id (= 外から使う既存挙動、env より優先、DR-0020 §2)。
                 Some(s) => s,
-                None => {
-                    print_session_required("kill");
-                    return ExitCode::from(2);
-                }
+                // 省略時: $HYOUI_SESSION_ID を解決 (DR-0020 §2)。kill の self
+                // default は許容 (= `exit` 相当の意図的用途、DR-0020 §3)。
+                None => match resolve_session_from_env("kill", &namespace) {
+                    Ok(Some(s)) => {
+                        sid_owned = s;
+                        sid_owned.as_str()
+                    }
+                    Ok(None) => {
+                        print_session_required("kill");
+                        return ExitCode::from(2);
+                    }
+                    Err(code) => return code,
+                },
             }
         };
         match socket_path::resolve_in_namespace(None, sid, &namespace) {
@@ -1998,6 +2008,7 @@ fn resolve_target_socket(
     }
     let sid_owned: String;
     let sid: &str = if let Some(idx) = index {
+        // 明示 index 解決 (= 外から使う既存挙動、env より優先、DR-0020 §2)。
         match resolve_session_by_index(idx, namespace) {
             Ok(s) => {
                 sid_owned = s;
@@ -2010,11 +2021,19 @@ fn resolve_target_socket(
         }
     } else {
         match session_id {
+            // 明示 session id (= 外から使う既存挙動、env より優先、DR-0020 §2)。
             Some(s) => s,
-            None => {
-                print_session_required(cmd);
-                return Err(ExitCode::from(2));
-            }
+            // 省略時: $HYOUI_SESSION_ID (= 中から実行) を解決 (DR-0020 §2)。
+            None => match resolve_session_from_env(cmd, namespace)? {
+                Some(s) => {
+                    sid_owned = s;
+                    sid_owned.as_str()
+                }
+                None => {
+                    print_session_required(cmd);
+                    return Err(ExitCode::from(2));
+                }
+            },
         }
     };
     socket_path::resolve_in_namespace(None, sid, namespace).map_err(|e| {
@@ -2024,6 +2043,50 @@ fn resolve_target_socket(
         eprintln!("       起動中の session 一覧は `hyoui list` で確認してください。");
         ExitCode::from(1)
     })
+}
+
+/// `$HYOUI_SESSION_ID` 由来の session 省略時解決 (DR-0020 §2)。
+///
+/// daemon が子プロセスへ常時注入する `HYOUI_SESSION_ID` (DR-0020 §1) を読み、
+/// 「中から session を省略実行した」ケースを自セッションに解決する。
+///
+/// 戻り値:
+/// - `Ok(Some(sid))`: env が set + 非空 + その session の socket が live。
+/// - `Ok(None)`: env が unset / 空 (= 中から実行ではない)。caller は既存 fallback
+///   (= `print_session_required` 等) に進む。
+/// - `Err(ExitCode)`: env は set だが socket が存在しない (= stale env)。既存
+///   fallback に **落とさず明示エラー** にする (= 「自分を指したつもりが別 session」
+///   の誤爆防止、DR-0020 §2)。
+fn resolve_session_from_env(cmd: &str, namespace: &str) -> Result<Option<String>, ExitCode> {
+    let sid = match std::env::var("HYOUI_SESSION_ID") {
+        Ok(v) if !v.is_empty() => v,
+        // unset / 空 → 中から実行ではない。caller の既存 fallback に委ねる。
+        _ => return Ok(None),
+    };
+    // stale env 検出のため socket path を解決して liveness を確認する。
+    let sock = match socket_path::resolve_in_namespace(None, &sid, namespace) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "hyoui: {cmd}: $HYOUI_SESSION_ID={sid:?} の socket path 解決失敗: {e} \
+                 (namespace: {namespace})"
+            );
+            return Err(ExitCode::from(1));
+        }
+    };
+    if !probe_socket_liveness(&sock) {
+        // stale env: env は set だが session が居ない。既存 fallback に落とすと
+        // 「自分を指したつもりが別 session」になり得るので明示エラー (DR-0020 §2)。
+        eprintln!(
+            "hyoui: {cmd}: $HYOUI_SESSION_ID={sid:?} が指す session が見つかりません \
+             (= stale env、daemon が既に終了した可能性)。"
+        );
+        eprintln!(
+            "       明示的に session を指定するか、`hyoui list` で起動中の session を確認してください。"
+        );
+        return Err(ExitCode::from(1));
+    }
+    Ok(Some(sid))
 }
 
 /// `status` subcommand: connect → handshake → status.query → print response。
