@@ -1823,12 +1823,16 @@ fn parse_wait(args: &[String]) -> Command {
             i += 1;
         }
     }
-    // positionals: socket / index あり (= selector 確定) → pattern 1 個だけ、
+    // positionals: socket / index あり (= 明示 selector) → pattern 1 個だけ、
     // それ以外 (= session_id 位置引数) → 2 個 (= session_id, pattern)。
-    // DR-0020 §2: `$HYOUI_SESSION_ID` (= 中から実行) も selector 確定扱い
-    // (= session は env で後解決、positional は pattern 1 個だけ)。
-    let selector_present = socket.is_some() || index.is_some() || has_self_session_env();
-    let (session_id, pattern) = match (selector_present, positionals.len()) {
+    //
+    // DR-0020 §2 + Fable review C1 (2026-06-12): `$HYOUI_SESSION_ID` (= 中から実行)
+    // は **positional に明示 session id が無いときだけ** self に効く (= 明示 > env)。
+    // 旧実装は env set で selector 確定扱いにしたため、positional 2 個
+    // (= `hyoui wait beta 'x'`) が「余分な positional」エラーになり、中から
+    // 別 session への明示 wait が壊れていた。env なし時の挙動は従来と不変。
+    let explicit_selector = socket.is_some() || index.is_some();
+    let (session_id, pattern) = match (explicit_selector, positionals.len()) {
         (true, 0) => {
             return Command::Error(
                 "wait: pattern が必要です。例: `hyoui wait --socket=<path> 'Continue\\?'` / \
@@ -1852,12 +1856,19 @@ fn parse_wait(args: &[String]) -> Command {
             );
         }
         (false, 1) => {
-            // session_id だけある状態 → pattern が無い
-            return Command::Error(
-                "wait: pattern が必要です。例: `hyoui wait <session-id> 'Continue\\?'`".into(),
-            );
+            if has_self_session_env() {
+                // 中から (= env set) + positional 1 個 → pattern のみ、session は
+                // self 解決 (= main.rs の resolve 層)。
+                (None, positionals.pop().expect("non-empty"))
+            } else {
+                // session_id だけある状態 → pattern が無い
+                return Command::Error(
+                    "wait: pattern が必要です。例: `hyoui wait <session-id> 'Continue\\?'`".into(),
+                );
+            }
         }
         (false, 2) => {
+            // 明示 session id + pattern (= env の有無に関わらず明示が優先)。
             let pattern = positionals.pop().expect("non-empty");
             let sid = positionals.pop().expect("non-empty");
             // R5-AUD-C2: positional session_id を validate (= path traversal 早期 reject)
@@ -4937,35 +4948,55 @@ fn parse_input(args: &[String]) -> Command {
 
     // positional の最初は session_id。それ以降が spec list。
     // ただし `--socket` / `--index` 指定時は session_id を省略でき、全 positional が spec。
-    // 判別は positional 第 1 引数が「spec prefix を含むか」ではなく
-    // session_id とみなしてから validate (= `text:` 等が session_id 形式の
-    // validation に引っかかる)。
     //
     // 戦略:
     // 1. `--socket` or `--index` 指定 → 全 positional を spec として parse
-    // 2. それ以外 → 第 1 positional を session_id 候補とみなし、`validate_session_id`
-    //    が通れば session_id、通らない場合は error
-    // DR-0020 §2: `$HYOUI_SESSION_ID` (= 中から実行) も selector 扱い (= 全 positional
-    // を spec とみなし、session は env で後解決)。
+    // 2. それ以外: 第 1 positional に spec prefix (= `:` 区切り) が無く
+    //    `validate_session_id` を通るなら **明示 session id** として受理
+    //    (= env の有無に関わらず明示が優先、Fable review C1 2026-06-12)。
+    // 3. 第 1 が spec 形なら: `$HYOUI_SESSION_ID` (= 中から実行) があるときだけ
+    //    全 positional を spec として受理し session は self 解決 (DR-0020 §2)。
+    //    env なしなら従来通り validate エラー (= 旧挙動不変)。
+    //
+    // 旧実装は env set で無条件に全 positional を spec 扱いにしたため、
+    // `hyoui input beta text:hi` の "beta" が spec parse に回って壊れていた。
     let (session_id, spec_strs): (Option<String>, &[String]) = if socket.is_some()
         || index.is_some()
-        || has_self_session_env()
     {
         (None, positionals.as_slice())
     } else {
         match positionals.first() {
             None => {
-                return Command::Error(
-                    "input: session id (positional) / --index=N / --socket=<path> のいずれかが必要です。\
-                     例: `hyoui input <session-id> text:hello key:Enter` / `hyoui input --index=1 text:hello`"
-                        .into(),
-                );
+                if has_self_session_env() {
+                    // 中から + positional ゼロ → 後段の「spec list が空」エラーに
+                    // 落とす (= session 解決の問題ではなく spec 不足が本質)。
+                    (None, positionals.as_slice())
+                } else {
+                    return Command::Error(
+                        "input: session id (positional) / --index=N / --socket=<path> のいずれかが必要です。\
+                         例: `hyoui input <session-id> text:hello key:Enter` / `hyoui input --index=1 text:hello`"
+                            .into(),
+                    );
+                }
             }
             Some(first) => {
-                if let Err(e) = validate_session_id(first) {
-                    return Command::Error(format!("input: {e}"));
+                // spec は必ず `<prefix>:<value>` 形式 (= `:` を含む)。session id の
+                // whitelist は `:` を許さないため、`:` の有無で両者を判別できる。
+                let looks_like_spec = first.contains(':');
+                if !looks_like_spec && validate_session_id(first).is_ok() {
+                    // 明示 session id (= env より優先)。
+                    (Some(first.clone()), &positionals[1..])
+                } else if has_self_session_env() {
+                    // 中から + 第 1 が spec 形 → 全部 spec、session は self 解決。
+                    (None, positionals.as_slice())
+                } else {
+                    // env なし: 従来通り第 1 を session id 候補として validate し、
+                    // 失敗理由をそのまま返す (= 旧挙動不変)。
+                    if let Err(e) = validate_session_id(first) {
+                        return Command::Error(format!("input: {e}"));
+                    }
+                    (Some(first.clone()), &positionals[1..])
                 }
-                (Some(first.clone()), &positionals[1..])
             }
         }
     };

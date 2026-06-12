@@ -3078,12 +3078,10 @@ fn write_screen_snapshot_payload(payload: &[u8], output: Option<&str>) -> ExitCo
 ///
 /// **wait / wait-idle は task #17 の scope**。本 task では到達したら明示 error。
 fn input_command(cmd: InputCommand) -> ExitCode {
-    // socket path 解決。session_id / --socket / --index のいずれかが必須 (= 通常 parser
-    // 段で確定済だが defense-in-depth)。
-    if cmd.socket.is_none() && cmd.session_id.is_none() && cmd.index.is_none() {
-        print_session_required("input");
-        return ExitCode::from(2);
-    }
+    // session 必須判定は `resolve_target_socket` に一元化されている (= 明示 >
+    // $HYOUI_SESSION_ID > required エラー、DR-0020 §2)。ここで socket/session/index
+    // 不在を先に弾くと env (= 中から実行) の self 解決経路を遮断してしまうため、
+    // 先行チェックは置かない (Fable review C1 2026-06-12)。
     if cmd.specs.is_empty() {
         eprintln!("hyoui: input: spec list が空です (内部 invariant 違反)");
         return ExitCode::from(2);

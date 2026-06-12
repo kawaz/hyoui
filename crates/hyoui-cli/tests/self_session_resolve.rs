@@ -30,6 +30,11 @@ fn runtime_dir() -> tempfile::TempDir {
 
 /// `run --detached --session=<sid>` で daemon を起こし、socket 出現を待つ。
 fn spawn_detached(runtime: &std::path::Path, sid: &str) {
+    spawn_detached_cmd(runtime, sid, "sleep 30");
+}
+
+/// 子 shell script を指定して detached daemon を起こす variant。
+fn spawn_detached_cmd(runtime: &std::path::Path, sid: &str, script: &str) {
     let status = Command::new(hyoui_bin())
         .args([
             "run",
@@ -38,7 +43,7 @@ fn spawn_detached(runtime: &std::path::Path, sid: &str) {
             "--",
             "sh",
             "-c",
-            "sleep 30",
+            script,
         ])
         .env("XDG_RUNTIME_DIR", runtime)
         .env_remove("HYOUI_SESSION_ID")
@@ -277,5 +282,118 @@ fn attach_other_socket_from_inside_is_allowed() {
     assert!(
         !stderr.contains("自セッション") && !stderr.contains("ネスト"),
         "別セッションの socket への attach は self 拒否されないべき。stderr={stderr:?}"
+    );
+}
+
+// ── Fable review C1 (2026-06-12): env set 時も wait/input の明示 session が効く ──
+
+/// `$HYOUI_SESSION_ID` が set でも、`hyoui wait <明示sid> <pattern>` は明示 session
+/// に向かう (= 明示 > env)。旧実装は env set で positional 2 個が「余分な positional」
+/// エラーになり、中から別 session への明示 wait が壊れていた (ドッグフーディング即死級)。
+#[test]
+fn wait_explicit_session_wins_over_env() {
+    let runtime = runtime_dir();
+    let me = "c1-wait-me";
+    let target = "c1-wait-target";
+    spawn_detached(runtime.path(), me);
+    // target の画面に "hello" を出しておく (= wait の match 対象)。
+    spawn_detached_cmd(runtime.path(), target, "echo hello; sleep 30");
+
+    let out = Command::new(hyoui_bin())
+        .args(["wait", target, "hello", "--timeout=5s"])
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("HYOUI_SESSION_ID", me)
+        .env_remove("HYOUI_LOCK_TOKEN")
+        .stdin(Stdio::null())
+        .output()
+        .expect("wait explicit");
+
+    cleanup(runtime.path(), me);
+    cleanup(runtime.path(), target);
+
+    assert!(
+        out.status.success(),
+        "env set 下でも明示 session への wait は成功すべき (= 明示 > env)。stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// 中から (= env set) `hyoui wait <pattern>` (positional 1 個) は self に解決される。
+#[test]
+fn wait_single_positional_resolves_self_with_env() {
+    let runtime = runtime_dir();
+    let me = "c1-wait-self";
+    spawn_detached_cmd(runtime.path(), me, "echo selfhello; sleep 30");
+
+    let out = Command::new(hyoui_bin())
+        .args(["wait", "selfhello", "--timeout=5s"])
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("HYOUI_SESSION_ID", me)
+        .env_remove("HYOUI_LOCK_TOKEN")
+        .stdin(Stdio::null())
+        .output()
+        .expect("wait self");
+
+    cleanup(runtime.path(), me);
+
+    assert!(
+        out.status.success(),
+        "中からの wait <pattern> は self に解決され成功すべき。stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `$HYOUI_SESSION_ID` が set でも、`hyoui input <明示sid> <spec>...` は明示 session
+/// に向かう (= 明示 > env)。旧実装は "beta" が spec parse に回って壊れていた。
+#[test]
+fn input_explicit_session_wins_over_env() {
+    let runtime = runtime_dir();
+    let me = "c1-input-me";
+    let target = "c1-input-target";
+    spawn_detached(runtime.path(), me);
+    // 入力を受ける子 (= cat で stdin を読む)。
+    spawn_detached_cmd(runtime.path(), target, "cat >/dev/null; sleep 30");
+
+    let out = Command::new(hyoui_bin())
+        .args(["input", target, "text:hi"])
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("HYOUI_SESSION_ID", me)
+        .env_remove("HYOUI_LOCK_TOKEN")
+        .stdin(Stdio::null())
+        .output()
+        .expect("input explicit");
+
+    cleanup(runtime.path(), me);
+    cleanup(runtime.path(), target);
+
+    assert!(
+        out.status.success(),
+        "env set 下でも明示 session への input は成功すべき (= 明示 > env)。stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// 中から (= env set) `hyoui input <spec>...` (session 省略) は self に解決される。
+#[test]
+fn input_spec_only_resolves_self_with_env() {
+    let runtime = runtime_dir();
+    let me = "c1-input-self";
+    spawn_detached_cmd(runtime.path(), me, "cat >/dev/null; sleep 30");
+
+    let out = Command::new(hyoui_bin())
+        .args(["input", "text:hi"])
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("HYOUI_SESSION_ID", me)
+        .env_remove("HYOUI_LOCK_TOKEN")
+        .stdin(Stdio::null())
+        .output()
+        .expect("input self");
+
+    cleanup(runtime.path(), me);
+
+    assert!(
+        out.status.success(),
+        "中からの input <spec> は self に解決され成功すべき。stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
