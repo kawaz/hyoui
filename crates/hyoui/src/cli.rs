@@ -129,6 +129,8 @@ pub enum HelpTopic {
     LockRelease,
     /// Help for the `unlock` subcommand (= release の alias、DR-0006 §7)。
     Unlock,
+    /// Help for the `detach` subcommand (= attach 引き剥がし、DR-0020 §4)。
+    Detach,
     /// Help for the `record` parent subcommand (= 子: `start` / `stop` / `list`、DR-0016)。
     Record,
     /// Help for the `record start` subcommand (= DR-0016 §2)。
@@ -230,6 +232,38 @@ pub struct AttachConfig {
     /// `--stdin-eof=detach|send-eof` (DR-0019 §5)。`None` (= 未指定) なら stdin の
     /// tty 判定で解決 (= 非 tty で `SendEof`、tty で従来挙動の `Detach`)。
     pub stdin_eof: Option<StdinEofArg>,
+}
+
+/// `detach` の対象指定 (= `--target=others|all|self`、DR-0020 §4)。
+///
+/// protocol 層の [`crate::protocol::messages::DetachTarget`] と 1:1 対応する
+/// CLI 層の独立型。default は [`DetachTargetArg::All`] (= 「この session の attach
+/// を全部引き剥がす」が detach の最も直感的な意味)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum DetachTargetArg {
+    /// 自分のみ切断 (= attach 中の端末から自分だけ抜ける)。
+    Myself,
+    /// 自分以外の全 client を切断、自分は残る。
+    Others,
+    /// 自分含む全 client を切断 (= default、daemon は子 PTY 接続維持で常駐継続)。
+    #[default]
+    All,
+}
+
+/// `detach` subcommand configuration (DR-0020 §4)。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DetachConfig {
+    /// Target socket path. `Some(p)` で explicit、`None` なら session_id から resolve。
+    pub socket: Option<String>,
+    /// Target session id (= socket path resolver の入力)。
+    pub session_id: Option<String>,
+    /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
+    pub index: Option<i32>,
+    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
+    pub namespace: Option<String>,
+    /// `--target=others|all|self` (= default All)。
+    pub target: DetachTargetArg,
 }
 
 /// `list` subcommand の出力形式 (= `--format=plain|jsonl`)。
@@ -876,6 +910,12 @@ pub enum Command {
     /// 完全に同じ意味の subcommand を別名でも露出する: 「取得は `lock acquire`、
     /// 解放は `unlock`」という命名が直感的なため。
     Unlock(LockReleaseConfig),
+    /// `detach [session] [--target=others|all|self]` — attach を引き剥がす (DR-0020 §4)。
+    ///
+    /// default target は `all` (= この session の attach を全部切断)。中から実行
+    /// (= `$HYOUI_SESSION_ID`) で自セッションを TUI 直起動から脱出する用途、または
+    /// 外から「全 client / 自分以外」を引き剥がす用途。
+    Detach(DetachConfig),
     /// `record` 親 subcommand (= DR-0016 §2、tty I/O timeline 録画)。
     ///
     /// 子: `start` / `stop` / `list`。protocol 層では `record-v1` cap 必須。
@@ -932,16 +972,17 @@ pub fn parse_args(args: &[String]) -> Command {
         "lock" => parse_lock(rest),
         "unlock" => parse_unlock(rest),
         "record" => parse_record(rest),
+        "detach" => parse_detach(rest),
         "completion" => parse_completion(rest),
         // Reserved for future stages.
         //
-        // `send` / `detach` は旧 leaf 設計の名残として予約。
+        // `send` は旧 leaf 設計の名残として予約。
         //
         // `tx` は DR-0006 §7 の自動操作排他 wrapper (= 子 process 起動 + env 注入 +
         // 子 exit で自動 unlock)。`lock` / `unlock` は実装済 (= task #20)、tx 本体は
         // `--process-bound` 等の daemon-side 機能が要るので別 task に切り出し中。
         // 詳細は `docs/issue/2026-05-27-tx-lock-unlock-cli-subcommands.md` 参照。
-        "send" | "detach" | "tx" => Command::Error(format!(
+        "send" | "tx" => Command::Error(format!(
             "subcommand `{head}` is reserved but not yet implemented"
         )),
         other => Command::Help {
@@ -2312,6 +2353,7 @@ pub fn usage(topic: &HelpTopic) -> String {
         HelpTopic::LockAcquire => usage_lock_acquire(),
         HelpTopic::LockRelease => usage_lock_release(),
         HelpTopic::Unlock => usage_unlock(),
+        HelpTopic::Detach => usage_detach(),
         HelpTopic::Record => usage_record(),
         HelpTopic::RecordStart => usage_record_start(),
         HelpTopic::RecordStop => usage_record_stop(),
@@ -3056,6 +3098,44 @@ fn parse_unlock(args: &[String]) -> Command {
     }
 }
 
+/// `detach [session] [--target=others|all|self]` parser (= DR-0020 §4)。
+///
+/// session 省略時は `$HYOUI_SESSION_ID` (= 中から実行) で自セッションに解決される
+/// (= `parse_session_targeted` 内の `has_self_session_env` で許容)。`--target` 未指定
+/// は `all` (= この session の attach を全部引き剥がす)。
+#[allow(clippy::result_large_err)]
+fn parse_detach(args: &[String]) -> Command {
+    let mut target = DetachTargetArg::All;
+    let res = parse_session_targeted("detach", args, HelpTopic::Detach, |opt, value| match opt {
+        "--target" => {
+            let v =
+                value.ok_or_else(|| Command::Error("detach: --target requires a value".into()))?;
+            target = match v.as_str() {
+                "self" => DetachTargetArg::Myself,
+                "others" => DetachTargetArg::Others,
+                "all" => DetachTargetArg::All,
+                other => {
+                    return Err(Command::Error(format!(
+                        "detach: invalid --target value: {other:?} (= self | others | all)"
+                    )));
+                }
+            };
+            Ok(true)
+        }
+        other => Err(Command::Error(format!("detach: unknown option: {other}"))),
+    });
+    match res {
+        Ok(t) => Command::Detach(DetachConfig {
+            socket: t.socket,
+            session_id: t.session_id,
+            index: t.index,
+            namespace: t.namespace,
+            target,
+        }),
+        Err(c) => c,
+    }
+}
+
 /// `record` 親 subcommand の dispatcher (= DR-0016 §2)。
 ///
 /// 引数なし / `--help` は親 help を出す (= `parse_screen` / `parse_lock` と同流儀)。
@@ -3501,11 +3581,12 @@ fn usage_top(unknown: Option<&str>) -> String {
             input       Send input via spec list (DR-0006 §8; text:/key:/wait: ...)\n    \
             lock        Acquire / release a session lock (DR-0006 §7)\n    \
             unlock      Release a session lock (= `lock release` alias)\n    \
+            detach      Detach attached client(s) (--target=others|all|self; DR-0020)\n    \
             record      Record tty I/O timeline (DR-0016; start/stop/list)\n    \
             completion  Print a shell completion script (bash|zsh|fish)\n\
         \n\
         RESERVED (not yet implemented):\n    \
-            send, detach, tx   将来 protocol 拡張用に予約\n\
+            send, tx   将来 protocol 拡張用に予約\n\
         \n\
         GLOBAL OPTIONS:\n    \
             -h, --help     Show this help and exit\n    \
@@ -4276,6 +4357,49 @@ fn usage_unlock() -> String {
         RELATED:\n    \
             hyoui lock acquire <id>                Acquire a lock\n    \
             hyoui lock release <id> --token=<T>    Same operation\n",
+    )
+}
+
+fn usage_detach() -> String {
+    String::from(
+        "hyoui detach — detach attached client(s) from a session (DR-0020 §4)\n\
+        \n\
+        指定 session の attach 接続を引き剥がす。daemon と子 PTY は影響を受けず\n\
+        継続する (= DR-0015 §2.3.1、全員 detach 後も daemon 常駐 / 新規 attach 待ち)。\n\
+        \n\
+        USAGE:\n    \
+            hyoui detach <session-id> [--target=others|all|self]\n    \
+            hyoui detach --index=<N> [--target=...]\n    \
+            hyoui detach --socket=<path> [--target=...]\n    \
+            hyoui detach [--target=...]   (中から: $HYOUI_SESSION_ID で自セッション)\n\
+        \n\
+        OPTIONS:\n    \
+            --target VAL    切断対象 (default: all)\n                    \
+                self    = 自分のみ切断 (= attach 端末から自分だけ抜ける)\n                    \
+                others  = 自分以外の全 client を切断 (= 自分は残る、奪取)\n                    \
+                all     = 自分含む全 client を切断 (= この session の attach を全部引き剥がす)\n    \
+            --socket PATH   Explicit socket path (alternative to session-id)\n    \
+            --index N       Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
+            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
+            -h, --help      Show this help and exit\n\
+        \n\
+        SELF-SESSION (DR-0020 §2):\n    \
+            session を省略すると `$HYOUI_SESSION_ID` で自セッションに解決される\n    \
+            (= 中から `hyoui detach` で TUI 直起動から脱出 = default all)。\n\
+        \n\
+        EXIT CODE:\n    \
+            0   detach 要求送信成功\n    \
+            1   connect / I/O 失敗\n    \
+            2   引数不足 / 不正 (session 指定なし + env なし、--target 不正値 等)\n\
+        \n\
+        EXAMPLES:\n    \
+            hyoui detach demo                  # demo の全 client を切断 (= all)\n    \
+            hyoui detach demo --target=others  # 自分以外を蹴って奪取\n    \
+            hyoui detach                       # 中から: 自セッションの全 client 切断\n\
+        \n\
+        RELATED:\n    \
+            hyoui attach <id> --detach-others  Attach しつつ他 client を奪取\n    \
+            hyoui kill <id>                    session ごと終了 (= 子に signal)\n",
     )
 }
 
@@ -5208,7 +5332,7 @@ pub(crate) const TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
 /// 実装済 (= dispatch 経路が存在する) top-level subcommand 一覧。
 ///
 /// completion script はこの全要素を補完候補として出力しなければならない
-/// (= completion.rs のテストで機械検証)。reserved 語 (`send` / `detach` / `tx`) は
+/// (= completion.rs のテストで機械検証)。reserved 語 (`send` / `tx`) は
 /// **含めない** (= 実装では `parse_args` が「予約だが未実装」error を返すため、
 /// 補完候補に出すと user を誤誘導する)。
 pub const IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
@@ -5224,6 +5348,7 @@ pub const IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
     "input",
     "lock",
     "unlock",
+    "detach",
     "record",
     "completion",
 ];
@@ -5232,7 +5357,8 @@ pub const IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
 ///
 /// completion script はこれらを補完候補に **出してはならない**
 /// (= completion.rs のテストで機械検証、出ると user を誤誘導する)。
-pub const RESERVED_TOP_LEVEL_SUBCOMMANDS: &[&str] = &["send", "detach", "tx"];
+/// `detach` は DR-0020 §4 で実装済 (= IMPLEMENTED へ移動)。
+pub const RESERVED_TOP_LEVEL_SUBCOMMANDS: &[&str] = &["send", "tx"];
 
 /// `hyoui screen` の子 subcommand 一覧 (= `parse_screen` が dispatch する値)。
 pub const SCREEN_SUBCOMMANDS: &[&str] = &["dump", "snapshot"];

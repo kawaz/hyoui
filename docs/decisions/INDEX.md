@@ -18,7 +18,7 @@ hyoui の設計判断記録一覧。ファイル名は `DR-NNNN-title.md`（4 �
 | [DR-0001](./DR-0001-bgfg-jobcontrol-two-axis.md) | 🟡 軸 2 廃止 (DR-0015、2026-05-28)・preset 廃止 (DR-0019、2026-06-11) | bg/fg ジョブ制御 (= 軸 1 は DR-0019 で `notify\|auto-resume` として daemon 配線、軸 2 transparent/decouple は DR-0015 で廃止、モード別 preset (`--mode`) は DR-0019 で廃止。invariant は「子が死ねば全部 exit」の片方向に縮小) |
 | [DR-0002](./DR-0002-project-naming.md) | N/A (= 命名) | プロジェクト名 "hyoui"（憑依）の決定 |
 | [DR-0003](./DR-0003-rust-only-and-forkpty-login_tty.md) | ✅ 実装済 | Rust 一本化 (MoonBit 却下) と forkpty + login_tty 採用 |
-| [DR-0004](./DR-0004-cli-subcommand-design.md) | ✅ 実装済 | CLI サブコマンド設計 (run / attach / list / kill / status / tail / wait / screen / input / lock / unlock / record / completion 実装済。send / detach / tx は予約 = parse 成功で廃止/予約エラーを返す) |
+| [DR-0004](./DR-0004-cli-subcommand-design.md) | ✅ 実装済 | CLI サブコマンド設計 (run / attach / list / kill / status / tail / wait / screen / input / lock / unlock / detach / record / completion 実装済。detach は DR-0020 §4 で実体化。send / tx は予約 = 予約エラーを返す) |
 | [DR-0005](./DR-0005-design-philosophy-external-automation.md) | N/A (= 思想) | hyoui の思想再定義 (外側自動操作主軸、TUI multiplexer ではない、透明性最優先) |
 | [DR-0006](./DR-0006-cli-ground-rules.md) | 🟡 部分実装 | CLI 設計の地盤ルール。自動操作 API は `input` family (text/hex/file/paste/key/wait/wait-idle spec) に統合実装済 (= 旧構想の send/keys/paste は廃止、独立 subcommand 化せず)。`wait` / `lock` / `unlock` 実装済。`tx` (= lock + 子 process wrapper) は未実装 (docs/issue/2026-05-27-tx-lock-unlock-cli-subcommands.md) |
 | [DR-0007](./DR-0007-mvp-scope-and-staged-release.md) | N/A (= ROADMAP) | MVP scope と段階リリース (v0.1.0 / v0.2.0 serve / v0.3.0 leader CLI) |

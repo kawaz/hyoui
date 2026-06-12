@@ -89,6 +89,11 @@ pub(super) enum ClientFrameOutcome {
     Continue,
     /// この client は detach / protocol error → list から remove。
     DropClient,
+    /// 指定した複数 client (= clients 内 index) を remove する (DR-0020 §4)。
+    /// `detach --target=others/all` で「自分以外」「全員」を引き剥がす用途。
+    /// serve_loop が `indices_to_drop` に展開し、leader cascade / lock auto-release
+    /// を既存経路で処理する (= 単一 `DropClient` と同じ後段ロジックに乗る)。
+    DropClients(Vec<usize>),
     /// session 全体終了 (= kill received など)。
     TerminateSession(RelayOutcome),
 }
@@ -492,12 +497,18 @@ pub(super) fn signal_name_to_nix_signal(name: &str) -> Option<Signal> {
     name.parse::<Signal>().ok()
 }
 
-/// `detach` message の target に応じて drop 対象を決める。
+/// `detach` message の target に応じて drop 対象を決める (DR-0020 §4)。
 ///
 /// - `Myself`: 自分 1 client のみ drop (= DropClient)
-/// - `Others`: 自分以外の全 client を drop (= caller が複数 drop できる API が
-///   無いため、本実装では `error: not-implemented` を返して継続)
-/// - `All`: 全 client + session 終了 (= 同様に `error: not-implemented` で継続)
+/// - `Others`: 自分以外の全 client を drop (= 自分は残る、attach 中の端末から
+///   「自分以外を蹴る」用途)
+/// - `All`: 全 client を drop (= 自分含む全員引き剥がし、TUI 直起動からの脱出)。
+///   全 client が消えても daemon は子 PTY 接続を維持して常駐継続する
+///   (= DR-0015 §2.3.1、新規 attach 待ち)
+///
+/// Others/All は複数 client を drop するため [`ClientFrameOutcome::DropClients`] を
+/// 返す。serve_loop が `indices_to_drop` に展開し、leader cascade / lock auto-release
+/// を既存経路で処理する。
 fn handle_detach_target(
     idx: usize,
     detach: crate::protocol::messages::Detach,
@@ -506,26 +517,15 @@ fn handle_detach_target(
     use crate::protocol::messages::DetachTarget;
     match detach.target {
         DetachTarget::Myself => ClientFrameOutcome::DropClient,
-        DetachTarget::Others | DetachTarget::All => {
-            // Round2 #7: error 通知 + 自分も drop する。
-            // 旧 Round1 実装は `Continue` で client を生かしたまま error だけ送って
-            // いたが、旧仕様 (silent skip → DropClient だった) を仮定する client は
-            // socket open のまま hang する。「target が `Others`/`All` で部分実装」
-            // という事実を error で伝えつつ、後方互換 (= 最低限自分は drop される)
-            // を維持する。Others/All の本来の動作 (= 他 client / 全 client drop)
-            // は v0.2.0+ で実装予定。
-            let _ = send_control(
-                &clients[idx],
-                ControlMessage::Error(ErrorMessage {
-                    code: ErrorCode::DetachTargetPartial,
-                    message: "detach target=others/all not fully implemented yet; \
-                              only self will be detached (Phase 11 MVP は Myself のみ対応、\
-                              v0.2.0+ で他 client も drop する semantic に拡張予定)"
-                        .into(),
-                    details: None,
-                }),
-            );
-            ClientFrameOutcome::DropClient
+        DetachTarget::Others => {
+            // 自分以外の全 client index を集める (= 自分は残す)。
+            let others: Vec<usize> = (0..clients.len()).filter(|&i| i != idx).collect();
+            ClientFrameOutcome::DropClients(others)
+        }
+        DetachTarget::All => {
+            // 自分含む全 client を drop。daemon は serve_loop を継続 (= 子 PTY 接続維持、
+            // DR-0015 §2.3.1)。
+            ClientFrameOutcome::DropClients((0..clients.len()).collect())
         }
     }
 }
@@ -1657,6 +1657,69 @@ mod tests {
             reader: b,
         };
         (ch, rx)
+    }
+
+    // ===== DR-0020 §4: handle_detach_target の target 別 drop 対象 =====
+
+    /// `handle_detach_target` の outcome を idx の `Vec` に正規化する test helper。
+    /// `DropClient` は「自分の idx 1 個」、`DropClients(v)` はソート済 `v`、それ以外は panic。
+    fn detach_outcome_indices(out: ClientFrameOutcome, self_idx: usize) -> Vec<usize> {
+        match out {
+            ClientFrameOutcome::DropClient => vec![self_idx],
+            ClientFrameOutcome::DropClients(mut v) => {
+                v.sort_unstable();
+                v
+            }
+            _ => panic!("detach は DropClient / DropClients を返すべき"),
+        }
+    }
+
+    /// detach target 別に「drop 対象 client index 集合」が正しいか (DR-0020 §4)。
+    /// 3 client・self_idx=1 (= 中央) で:
+    /// - Myself → 自分のみ ([1])
+    /// - Others → 自分以外全部 ([0, 2])
+    /// - All    → 全部 ([0, 1, 2])
+    #[test]
+    fn handle_detach_target_resolves_drop_set_per_target() {
+        use crate::protocol::messages::{Detach, DetachTarget};
+
+        let make_clients = || {
+            let (c0, _r0) = record_test_client();
+            let (c1, _r1) = record_test_client();
+            let (c2, _r2) = record_test_client();
+            vec![c0, c1, c2]
+        };
+        let self_idx = 1;
+
+        let mut clients = make_clients();
+        let out = handle_detach_target(
+            self_idx,
+            Detach {
+                target: DetachTarget::Myself,
+            },
+            &mut clients,
+        );
+        assert_eq!(detach_outcome_indices(out, self_idx), vec![1]);
+
+        let mut clients = make_clients();
+        let out = handle_detach_target(
+            self_idx,
+            Detach {
+                target: DetachTarget::Others,
+            },
+            &mut clients,
+        );
+        assert_eq!(detach_outcome_indices(out, self_idx), vec![0, 2]);
+
+        let mut clients = make_clients();
+        let out = handle_detach_target(
+            self_idx,
+            Detach {
+                target: DetachTarget::All,
+            },
+            &mut clients,
+        );
+        assert_eq!(detach_outcome_indices(out, self_idx), vec![0, 1, 2]);
     }
 
     /// queue に積まれた次の frame を decode して `ControlMessage` を返す。

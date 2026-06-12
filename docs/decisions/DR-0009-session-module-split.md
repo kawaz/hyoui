@@ -20,7 +20,7 @@ Phase E で `wait.rs` を切り出した時点では daemon 側に `wait.request
 v0.2.0 で次の handler を追加する予定:
 
 - `keys` / `send` / `paste` (input 注入系、現在は `TYPE_RAW_DATA` 経由のみ)
-- `detach` の `Others` / `All` ターゲット本実装 (現在は `not-implemented` error 返却)
+- `detach` の `Others` / `All` ターゲット本実装 (= DR-0020 §4 で実装済)
 - `status` / `tail` / `wait` の機能拡張
 - `lock` / `unlock` / `tx` の wait queue 化
 - `completion` / `serve` gateway

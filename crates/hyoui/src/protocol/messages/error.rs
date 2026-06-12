@@ -67,8 +67,6 @@ pub enum ErrorCode {
     LockNotHeld,
     /// `signal.invalid` — signal 番号 / 名前が不正。
     SignalInvalid,
-    /// `detach.target-partial` — detach 対象指定の一部が見つからない / 失敗。
-    DetachTargetPartial,
     /// `master.write-timeout` — client → master PTY への raw_data write が、
     /// 子の slow-reader (line discipline buffer 満杯) で idle timeout を超えた。
     /// daemon は当該 client を disconnect する (= 子に届かなかった bytes は
@@ -128,7 +126,6 @@ impl ErrorCode {
             ErrorCode::LockDenied => "lock.denied",
             ErrorCode::LockNotHeld => "lock.not-held",
             ErrorCode::SignalInvalid => "signal.invalid",
-            ErrorCode::DetachTargetPartial => "detach.target-partial",
             ErrorCode::MasterWriteTimeout => "master.write-timeout",
             ErrorCode::InternalError => "internal.error",
             ErrorCode::RecordPathNotAbsolute => "record.path-not-absolute",
@@ -161,7 +158,6 @@ impl ErrorCode {
             "lock.denied" => ErrorCode::LockDenied,
             "lock.not-held" => ErrorCode::LockNotHeld,
             "signal.invalid" => ErrorCode::SignalInvalid,
-            "detach.target-partial" => ErrorCode::DetachTargetPartial,
             "master.write-timeout" => ErrorCode::MasterWriteTimeout,
             "internal.error" => ErrorCode::InternalError,
             "record.path-not-absolute" => ErrorCode::RecordPathNotAbsolute,
@@ -239,7 +235,6 @@ mod tests {
             (ErrorCode::LockDenied, "lock.denied"),
             (ErrorCode::LockNotHeld, "lock.not-held"),
             (ErrorCode::SignalInvalid, "signal.invalid"),
-            (ErrorCode::DetachTargetPartial, "detach.target-partial"),
             (ErrorCode::MasterWriteTimeout, "master.write-timeout"),
             (ErrorCode::InternalError, "internal.error"),
             (ErrorCode::RecordPathNotAbsolute, "record.path-not-absolute"),

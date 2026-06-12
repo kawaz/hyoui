@@ -381,6 +381,8 @@ fn main() -> ExitCode {
 
         Command::Unlock(cfg) => lock_release_command("unlock", cfg),
 
+        Command::Detach(cfg) => detach_command(cfg),
+
         Command::Record(sub) => match sub {
             RecordCommand::Start(cfg) => record_start_command(cfg),
             RecordCommand::Stop(cfg) => record_stop_command(cfg),
@@ -2122,6 +2124,82 @@ fn attach_target_is_self(sid: &str, namespace: &str) -> bool {
     // 解決順 (= HYOUI_NAMESPACE env > default) で引く。
     let env_ns = socket_path::resolve_namespace(None);
     env_ns == namespace
+}
+
+/// `detach [session] [--target=others|all|self]` subcommand (DR-0020 §4)。
+///
+/// 指定 session に一時接続して `Detach` message を送り、対象 client を引き剥がす。
+/// daemon と子 PTY は影響を受けず継続する (= DR-0015 §2.3.1)。session 省略時は
+/// `$HYOUI_SESSION_ID` で自セッションに解決 (= self default 許容、TUI 脱出用途)。
+fn detach_command(cfg: hyoui::cli::DetachConfig) -> ExitCode {
+    use hyoui::cli::DetachTargetArg;
+    use hyoui::protocol::messages::{Detach, DetachTarget};
+
+    let namespace = socket_path::resolve_namespace(cfg.namespace.as_deref());
+    // session 解決: 明示 socket > 明示 session/index > $HYOUI_SESSION_ID (= 中から)。
+    // detach の self default は許容 (= 中から TUI 脱出)。stale env は明示エラー。
+    let sock = match resolve_target_socket(
+        "detach",
+        cfg.socket.as_deref(),
+        cfg.session_id.as_deref(),
+        cfg.index,
+        &namespace,
+    ) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+
+    // CLI 層 target を protocol target に変換。
+    let target = match cfg.target {
+        DetachTargetArg::Myself => DetachTarget::Myself,
+        DetachTargetArg::Others => DetachTarget::Others,
+        DetachTargetArg::All => DetachTarget::All,
+        // `DetachTargetArg` is `#[non_exhaustive]`; 未知 variant は all に倒す
+        // (= 「全部引き剥がす」が最も無難な detach の意味)。
+        _ => DetachTarget::All,
+    };
+
+    // detach は他 client を引き剥がす操作。leader は取らない (= RwNoLeader)。
+    // detach CLI 自身が leader を奪うと others/all の cascade が歪むため。
+    let opts = AttachOptions {
+        mode: Mode::RwNoLeader,
+        caps: hyoui::protocol::MVP_CAPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
+        exclusive: false,
+        detach_others: false,
+    };
+
+    let mut conn = match connect_with_retry(&sock, opts) {
+        Ok(c) => c,
+        Err(e) => {
+            print_connect_failure("detach", &sock, &e);
+            return ExitCode::from(1);
+        }
+    };
+
+    if let Err(e) = conn.send_control(&ControlMessage::Detach(Detach { target })) {
+        eprintln!("hyoui: detach: send 失敗: {e}");
+        return ExitCode::from(1);
+    }
+
+    // daemon は Detach に明示 ack を返さず、対象 client を drop するだけ。
+    // - Myself / All: detach CLI 自身も drop 対象 → socket EOF を待って成功確定。
+    // - Others: detach CLI 自身は残る → daemon が他 client を drop したのを EOF で
+    //   観測できないため、送信成功をもって受理とみなし即終了する。
+    match target {
+        DetachTarget::Myself | DetachTarget::All => {
+            // EOF (= 自分が drop された) を short deadline で待つ。届かなくても
+            // 要求は送信済なので成功扱い (= daemon が非同期に drop する)。
+            let _ = poll_recv_ready(&conn, std::time::Duration::from_secs(2));
+        }
+        DetachTarget::Others => {}
+        // `DetachTarget` is `#[non_exhaustive]`; 未知は待たずに返す。
+        _ => {}
+    }
+    ExitCode::SUCCESS
 }
 
 /// `status` subcommand: connect → handshake → status.query → print response。
