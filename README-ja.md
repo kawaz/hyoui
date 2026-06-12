@@ -217,8 +217,14 @@ namespace 内から別 namespace で起動したい場合は `--namespace=<別ns
 | `hyoui screen dump <session>` | 画面 ANSI dump (= terminal で cat 再生可) |
 | `hyoui screen snapshot <session>` | 構造化 state snapshot (= JSON / CBOR) |
 | `hyoui lock acquire\|release <session>` | 排他制御 (= 自動操作の atomic 性。`unlock` は `lock release` の alias、`tx` は未実装) |
+| `hyoui detach [session] [--target=others\|all\|self]` | attach client を引き剥がす (default all、daemon / 子は継続) |
 | `hyoui record start\|stop\|list <session>` | tty I/O timeline を永続録画 (= jsonl / raw)。**⚠ stdin redaction は未配線** |
 | `hyoui tail <session>` | raw bytes stream (= log / grep / asciinema 前段) |
+
+> **self-session (DR-0020)**: `hyoui run -- cmd` 配下の子プロセスには `HYOUI_SESSION_ID`
+> が常時注入される。session を取る subcommand (status / set / wait / detach 等) は
+> session を省略すると自セッションに解決される (= 中から自分を観測・操作できる)。
+> `attach` だけは自セッションへの attach をネスト防止のため拒否する。
 
 詳細仕様は [`docs/DESIGN.md`](./docs/DESIGN.md) と
 [`docs/decisions/INDEX.md`](./docs/decisions/INDEX.md) を参照。
