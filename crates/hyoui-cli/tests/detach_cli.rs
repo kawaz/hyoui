@@ -21,6 +21,7 @@ fn wait_for_client_count(socket: &std::path::Path, n: usize, timeout: Duration) 
         let out = Command::new(hyoui_bin())
             .args(["status", &format!("--socket={}", socket.display())])
             .env_remove("HYOUI_LOCK_TOKEN")
+            .env_remove("HYOUI_SESSION_ID")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -48,6 +49,7 @@ fn run_detach(socket: &std::path::Path) -> std::process::Output {
     Command::new(hyoui_bin())
         .args(["detach", &format!("--socket={}", socket.display())])
         .env_remove("HYOUI_LOCK_TOKEN")
+        .env_remove("HYOUI_SESSION_ID")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -109,6 +111,7 @@ fn detach_all_drops_every_client_but_daemon_survives() {
     let status = Command::new(hyoui_bin())
         .args(["status", &format!("--socket={}", leader.socket().display())])
         .env_remove("HYOUI_LOCK_TOKEN")
+        .env_remove("HYOUI_SESSION_ID")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -124,6 +127,7 @@ fn detach_all_drops_every_client_but_daemon_survives() {
     let _ = Command::new(hyoui_bin())
         .args(["kill", &format!("--socket={}", leader.socket().display())])
         .env_remove("HYOUI_LOCK_TOKEN")
+        .env_remove("HYOUI_SESSION_ID")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -160,6 +164,7 @@ fn attach_detach_others_steals_leadership() {
             &format!("--socket={}", runner.socket_path(session).display()),
         ])
         .env_remove("HYOUI_LOCK_TOKEN")
+        .env_remove("HYOUI_SESSION_ID")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -190,6 +195,7 @@ fn attach_exclusive_denied_when_rw_client_present() {
             &format!("--socket={}", runner.socket_path(session).display()),
         ])
         .env_remove("HYOUI_LOCK_TOKEN")
+        .env_remove("HYOUI_SESSION_ID")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -215,6 +221,39 @@ fn attach_exclusive_denied_when_rw_client_present() {
             &format!("--socket={}", runner.socket_path(session).display()),
         ])
         .env_remove("HYOUI_LOCK_TOKEN")
+        .env_remove("HYOUI_SESSION_ID")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = leader.wait_exit_code(Duration::from_secs(5));
+}
+
+/// DR-0020 §5 / Fable M4: attach 成立時の発見性ヒントが stderr (= PTY) に出る。
+/// 出力は raw mode 前 (= 外側端末の scrollback に残る位置)。文言は実 prefix
+/// (= default Ctrl-A) を反映する。
+#[test]
+fn attach_emits_discovery_hint_with_actual_prefix() {
+    let runner = HyouiTestRunner::new();
+    let session = "hint-emit";
+
+    let mut leader = runner.spawn_hyoui(session, &["run", "--", "sh", "-c", "sleep 30"]);
+    let out = leader
+        .wait_for("[hyoui] detach:", Duration::from_secs(10))
+        .expect("ヒントが PTY (stderr) に出るべき");
+    assert!(
+        out.contains("[hyoui] detach: Ctrl-A d"),
+        "ヒントは実 prefix (default Ctrl-A) を反映すべき。out={out:?}"
+    );
+
+    // 後始末。
+    let _ = Command::new(hyoui_bin())
+        .args([
+            "kill",
+            &format!("--socket={}", runner.socket_path(session).display()),
+        ])
+        .env_remove("HYOUI_LOCK_TOKEN")
+        .env_remove("HYOUI_SESSION_ID")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -240,6 +279,7 @@ fn status_lists_clients_with_mode_leader_and_connected_time() {
             &format!("--socket={}", runner.socket_path(session).display()),
         ])
         .env_remove("HYOUI_LOCK_TOKEN")
+        .env_remove("HYOUI_SESSION_ID")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -265,6 +305,7 @@ fn status_lists_clients_with_mode_leader_and_connected_time() {
             &format!("--socket={}", runner.socket_path(session).display()),
         ])
         .env_remove("HYOUI_LOCK_TOKEN")
+        .env_remove("HYOUI_SESSION_ID")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

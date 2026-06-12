@@ -83,9 +83,15 @@ hyoui detach [session]
 ### 5. 発見性の改善 (UX、透過原則の範囲内)
 
 - attach 成立時に **stderr** へ 1 行ヒントを出す:
-  `[hyoui] detach: Ctrl-A d | peek: --mode=ro` (文言は実装時調整)。
+  `[hyoui] detach: <prefix> d | peek: --mode=ro`。文言は `HYOUI_DETACH_PREFIX` の
+  解決値を反映し、`none` (= detach key 無効) ならヒント自体出さない (Fable M4)。
   子の出力経路 (PTY) ではなく client の stderr なので透過性を壊さない (screen 慣行)。
   `--quiet` で抑止。非 tty stderr (= pipe 利用) では出さない
+- ヒントの出力位置は **raw mode に入る前** (= 外側端末の scrollback に残り、attach 後の
+  redraw に消されない)。raw 前の stderr 出力が detach key を取りこぼす回帰が一度
+  起きたが、root cause は `enter_raw` の `TCSAFLUSH` が cooked 窓の入力 queue を
+  破棄していたこと (= TCSANOW 化で解消、`sys/tty.rs` の regression test で固定。
+  Fable M4 2026-06-12)
 - `hyoui status` に client 一覧 (mode / leader / 接続時刻) を表示 — 「どの端末が
   rw/leader か」を外から確認できる
 

@@ -125,7 +125,15 @@ pub fn enter_raw(fd: OwnedFd) -> Result<TtyGuard> {
     {
         raw_t.input_flags |= termios::InputFlags::IUTF8;
     }
-    termios::tcsetattr(fd.as_fd(), SetArg::TCSAFLUSH, &raw_t).map_err(Error::from)?;
+    // M4 root cause (Fable review 2026-06-12): raw 切替は **TCSANOW** で行う。
+    // TCSAFLUSH は (a) 未読の入力 queue を破棄し、(b) 出力 queue の drain を待つ。
+    // (a) により attach 起動シーケンスの「接続確立 〜 raw 切替」の cooked 窓に
+    // 届いた入力 (= 自動化が leader 確認直後に打つ detach key 等) が破棄され、
+    // (b) により読み手の居ない echo bytes が出力 queue に残っていると block する
+    // (= 両方とも実機観測済み、`enter_raw_preserves_input_queued_during_cooked_mode`)。
+    // raw 化前の入力を「ゴミ」として捨てる動機は attach には無い (= 透過原則:
+    // ユーザ / 自動化の入力を勝手に破棄しない)。
+    termios::tcsetattr(fd.as_fd(), SetArg::TCSANOW, &raw_t).map_err(Error::from)?;
     Ok(TtyGuard {
         fd: Some(fd),
         saved,
@@ -169,6 +177,73 @@ mod tests {
         let master = pty.into_master();
         let guard = enter_raw(master).expect("enter raw");
         drop(guard); // restore on drop
+    }
+
+    /// M4 root cause regression (Fable review 2026-06-12): attach 起動シーケンスの
+    /// 「接続確立 〜 raw 切替」の cooked 窓に届いた入力 (= 自動化が打つ detach key
+    /// 等) が raw 切替で破棄されてはならない。
+    ///
+    /// `TCSAFLUSH` は仕様上 **未読の入力 queue を破棄** する (POSIX termios)。
+    /// 旧実装の `enter_raw` は TCSAFLUSH を使っていたため、cooked 期間に PTY に
+    /// 届いた bytes (ICANON の行 buffer に滞留中) が raw 切替で消え、
+    /// `daemon_death_exit::detach_key_makes_client_exit_zero` の「raw 前に stderr
+    /// 出力を挟むと detach key を取りこぼす」回帰の root cause だった。
+    /// `enter_raw` は TCSANOW (= 入力 queue 保持) を使う。
+    #[test]
+    fn enter_raw_preserves_input_queued_during_cooked_mode() {
+        use std::os::fd::AsRawFd;
+        let pty = crate::sys::pty::Pty::open(80, 24).expect("open pty");
+        let slave = pty.slave_fd().expect("slave fd");
+
+        // slave が cooked (ICANON on) のまま master へ書く = slave の入力 queue
+        // (行 buffer) に滞留する (改行が無いので canonical read は返さない)。
+        nix::unistd::write(pty.master_fd(), b"\x01d").expect("write to master");
+        // line discipline 通過を待つ。
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        // cooked + ECHO on のため echo bytes が master 向け出力 queue に積まれる。
+        // 読み手の居ない出力 queue が非空だと macOS では slave への tcsetattr が
+        // (TCSANOW でも) ioctl で block する (= 実機観測)。実運用の attach では
+        // 外側端末エミュレータが常に echo を消費するため起きない、テスト固有の
+        // 状況なので master から読み捨てて消化しておく。
+        {
+            let mut echo_buf = [0u8; 16];
+            let _ = nix::unistd::read(pty.master_fd(), &mut echo_buf);
+        }
+
+        // slave を raw へ切替 (= ICANON off)。TCSANOW なら即時適用 + 入力 queue
+        // 保持。TCSAFLUSH だと (a) 入力破棄、(b) echo bytes (= master が読まない)
+        // の出力 drain 待ちで **永久 block** する (= 実機観測済み)。
+        let slave_owned = nix::unistd::dup(slave).expect("dup slave");
+        let guard = enter_raw(slave_owned).expect("enter raw");
+
+        // poll で readable を確認してから読む (= 入力が破棄されていたら timeout)。
+        {
+            use nix::poll::{PollFd, PollFlags, PollTimeout};
+            let mut fds = [PollFd::new(guard.fd(), PollFlags::POLLIN)];
+            let n = nix::poll::poll(&mut fds, PollTimeout::from(1000u16)).expect("poll");
+            assert!(
+                n > 0
+                    && fds[0]
+                        .revents()
+                        .unwrap_or(PollFlags::empty())
+                        .contains(PollFlags::POLLIN),
+                "cooked 期間に queue された入力は raw 切替後も readable であるべき \
+                 (= TCSAFLUSH だと破棄されて timeout する)"
+            );
+        }
+        let mut buf = [0u8; 8];
+        let n = nix::unistd::read(guard.fd(), &mut buf).unwrap_or_else(|e| {
+            panic!(
+                "raw 切替後の read は成功すべき: read error {e} on fd {}",
+                guard.fd().as_raw_fd()
+            )
+        });
+        assert_eq!(
+            &buf[..n],
+            b"\x01d",
+            "raw 切替で入力 queue が破棄されてはならない"
+        );
     }
 
     #[test]

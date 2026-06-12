@@ -177,7 +177,15 @@ impl HyouiTestRunner {
             .env("TMPDIR", self.runtime_dir.path())
             // HYOUI_LOCK_TOKEN は test ごとに無効化したい (= 既存 hyoui-cli が
             // 環境変数から authenticate token を拾うので、隔離 dir でも干渉回避)
-            .env_remove("HYOUI_LOCK_TOKEN");
+            .env_remove("HYOUI_LOCK_TOKEN")
+            // DR-0020: test 自体が hyoui 配下で動いている環境 (= dogfooding) では
+            // HYOUI_SESSION_ID / HYOUI_NAMESPACE が継承され、session 省略形の解決や
+            // attach の self 判定が外側 session に向かう。test の隔離のため常に外す。
+            .env_remove("HYOUI_SESSION_ID")
+            .env_remove("HYOUI_NAMESPACE")
+            // detach key の表記 / 有効性が外側設定に左右されないように外す
+            // (= ヒント文言 e2e が default Ctrl-A を仮定する)。
+            .env_remove("HYOUI_DETACH_PREFIX");
 
         let child = cmd.spawn(pts).expect("spawn hyoui in pty");
         let pid = Pid::from_raw(child.id() as i32);

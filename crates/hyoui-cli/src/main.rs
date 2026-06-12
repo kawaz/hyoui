@@ -643,11 +643,15 @@ fn resolve_session_by_index(index: i32, namespace: &str) -> Result<String, Strin
 fn attach_command(cfg: AttachConfig) -> ExitCode {
     // H3: HYOUI_DETACH_PREFIX を raw mode 入る **前** に validate。invalid なら
     // 通常 terminal で stderr に出してから exit (= 旧 silent fallback で warning が
-    // raw mode 後の scrollback に流される罠を回避)。
-    if let Err(e) = hyoui::client::resolve_detach_prefix_from_env() {
-        eprintln!("hyoui: attach: {e}");
-        return ExitCode::from(2);
-    }
+    // raw mode 後の scrollback に流される罠を回避)。解決値は §5 の発見性ヒント
+    // (= 実 prefix を文言に反映) でも使う。
+    let detach_prefix = match hyoui::client::resolve_detach_prefix_from_env() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("hyoui: attach: {e}");
+            return ExitCode::from(2);
+        }
+    };
 
     // DR-0018: namespace を解決 (= --namespace flag > HYOUI_NAMESPACE env > default)。
     let namespace = socket_path::resolve_namespace(cfg.namespace.as_deref());
@@ -750,6 +754,32 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    // DR-0020 §5: attach 成立時に detach / peek の発見性ヒントを stderr へ 1 行出す。
+    // 子の出力経路 (PTY/stdout) ではなく client の stderr なので透過性を壊さない
+    // (= screen 慣行)。`--quiet` で抑止、非 tty stderr (= pipe) では出さない。
+    //
+    // 出力位置は raw mode に入る **前** (= 外側端末がまだ cooked のうち)。これで
+    // ヒントは外側端末の scrollback に残り、attach 後の redraw (= 全画面クリア) で
+    // 消されない。raw 前の stderr 出力が detach key を取りこぼす旧回帰は、root cause
+    // (= `enter_raw` の TCSAFLUSH が cooked 窓の入力 queue を破棄していた) を
+    // TCSANOW で解消済み (Fable review M4、`sys/tty.rs` の regression test 参照)。
+    //
+    // 文言は `HYOUI_DETACH_PREFIX` の解決値から生成 (= custom prefix を反映)。
+    // `none` (= detach key 無効化) ならヒント自体出さない (= 嘘の脱出方法を教えない)。
+    if !cfg.quiet
+        && is_tty(std::io::stderr().as_fd())
+        && let Some(prefix) = detach_prefix
+    {
+        let prefix_disp = match prefix {
+            // Ctrl byte (0x01..=0x1a) は "Ctrl-X" 表記。
+            1..=26 => format!("Ctrl-{}", (b'A' + prefix - 1) as char),
+            other => format!("0x{other:02x}"),
+        };
+        eprintln!(
+            "[hyoui] detach: {prefix_disp} d  |  peek (read-only): hyoui attach <session> --mode=ro"
+        );
+    }
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -909,18 +939,6 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
     }
 
     let _ = stdout.flush();
-
-    // DR-0020 §5: attach 成立時に detach / peek の発見性ヒントを stderr へ 1 行出す。
-    // 子の出力経路 (PTY/stdout) ではなく client の stderr なので透過性を壊さない
-    // (= screen 慣行)。`--quiet` で抑止、非 tty stderr (= pipe) では出さない。
-    // raw mode 設定 + signal thread 起動 + 初期 redraw flush の後に出すことで、
-    // 起動シーケンス序盤の cooked stdin window に割り込まず (= detach key race 回避)、
-    // raw mode 下でも改行が崩れないよう CRLF で終端する。
-    if !cfg.quiet && is_tty(std::io::stderr().as_fd()) {
-        eprint!(
-            "[hyoui] detach: Ctrl-A d  |  peek (read-only): hyoui attach <session> --mode=ro\r\n"
-        );
-    }
 
     let client_dump = cfg
         .debug_dump_client
