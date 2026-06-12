@@ -675,6 +675,21 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
                 }
             }
         };
+        // DR-0020 §3: attach 対象が自セッションならネスト防止エラー (= tmux $TMUX
+        // ネスト防止と同型)。明示引数でも index 解決結果でも、解決した sid + namespace
+        // が子へ注入された $HYOUI_SESSION_ID + $HYOUI_NAMESPACE と一致したら拒否する。
+        // self default は作らない (= session 省略は上の required エラー)、ro 観戦の
+        // 例外も設けない (= DR-0020 §3、需要が出たら再検討)。
+        if attach_target_is_self(sid, &namespace) {
+            eprintln!(
+                "hyoui: attach: 自セッション ({sid}) への attach はできません \
+                 (= hyoui in hyoui のネスト防止、DR-0020 §3)。"
+            );
+            eprintln!(
+                "       中から脱出したい場合は `hyoui detach`、終了したい場合は `hyoui kill` を使ってください。"
+            );
+            return ExitCode::from(2);
+        }
         match socket_path::resolve_in_namespace(None, sid, &namespace) {
             Ok(p) => p,
             Err(e) => {
@@ -2087,6 +2102,26 @@ fn resolve_session_from_env(cmd: &str, namespace: &str) -> Result<Option<String>
         return Err(ExitCode::from(1));
     }
     Ok(Some(sid))
+}
+
+/// attach 対象 (`sid` + `namespace`) が自セッションかを判定する (DR-0020 §3)。
+///
+/// daemon が子へ注入する `$HYOUI_SESSION_ID` (DR-0020 §1) + `$HYOUI_NAMESPACE`
+/// (DR-0018) と照合する。両方が一致したときだけ self (= ネスト) と判定する。
+/// 子が別 namespace を明示して attach する場合は self ではない (= namespace まで
+/// 突き合わせる)。env が未 set (= 外から実行) なら常に false。
+fn attach_target_is_self(sid: &str, namespace: &str) -> bool {
+    let env_sid = match std::env::var("HYOUI_SESSION_ID") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return false,
+    };
+    if env_sid != sid {
+        return false;
+    }
+    // namespace も一致して初めて self。子の namespace は resolve_namespace と同じ
+    // 解決順 (= HYOUI_NAMESPACE env > default) で引く。
+    let env_ns = socket_path::resolve_namespace(None);
+    env_ns == namespace
 }
 
 /// `status` subcommand: connect → handshake → status.query → print response。

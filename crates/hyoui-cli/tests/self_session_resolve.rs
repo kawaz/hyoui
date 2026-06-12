@@ -148,3 +148,66 @@ fn status_without_env_keeps_required_error() {
         "従来の required メッセージを維持すべき。stderr={stderr:?}"
     );
 }
+
+// ── DR-0020 §3: attach の self default 禁止 (ネスト防止) ────────────────────
+
+#[test]
+fn attach_self_session_via_explicit_arg_is_rejected() {
+    let runtime = runtime_dir();
+    let sid = "selfres-attach-self";
+    spawn_detached(runtime.path(), sid);
+
+    // 中から (= $HYOUI_SESSION_ID set) 明示引数で自セッションに attach → 拒否。
+    let out = Command::new(hyoui_bin())
+        .args(["attach", sid])
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("HYOUI_SESSION_ID", sid)
+        .env_remove("HYOUI_LOCK_TOKEN")
+        .stdin(Stdio::null())
+        .output()
+        .expect("attach");
+
+    cleanup(runtime.path(), sid);
+
+    assert!(
+        !out.status.success(),
+        "自セッションへの attach は拒否されるべき"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("自セッション") || stderr.contains("ネスト"),
+        "ネスト防止の理由が示されるべき。stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn attach_other_session_from_inside_is_allowed() {
+    let runtime = runtime_dir();
+    let me = "selfres-attach-me";
+    let other = "selfres-attach-other";
+    spawn_detached(runtime.path(), me);
+    spawn_detached(runtime.path(), other);
+
+    // 中から ($HYOUI_SESSION_ID=me) 別セッション (other) への attach は self ではない。
+    // attach は raw mode に入って block するため、stdin を即 EOF にして detach させ、
+    // 「self 拒否で即エラー終了しない」ことだけを確認する (= exit が拒否の 2 でない)。
+    let out = Command::new(hyoui_bin())
+        .args(["attach", other, "--mode=ro"])
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("HYOUI_SESSION_ID", me)
+        .env_remove("HYOUI_LOCK_TOKEN")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("attach other");
+
+    cleanup(runtime.path(), me);
+    cleanup(runtime.path(), other);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("自セッション") && !stderr.contains("ネスト"),
+        "別セッションへの attach は self 拒否されないべき。stderr={stderr:?}"
+    );
+}
