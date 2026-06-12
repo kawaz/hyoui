@@ -124,4 +124,4 @@ hyoui detach [session]
 - [[DR-0018]] — env 注入の透過例外先例
 - [[DR-0019]] — `hyoui set` / 汎用 key=value
 - [[DR-0006]] / [[DR-0004]] — detach / exclusive の原典と予約
-- docs/issue/2026-06-12-feature-attach-exclusive-detach-others.md — §4 で統合実装
+- attach --exclusive / --detach-others issue — §4 で統合実装し昇華済み (削除)
