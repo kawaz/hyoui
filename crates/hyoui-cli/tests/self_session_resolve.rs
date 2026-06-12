@@ -211,3 +211,71 @@ fn attach_other_session_from_inside_is_allowed() {
         "別セッションへの attach は self 拒否されないべき。stderr={stderr:?}"
     );
 }
+
+/// codex review #3 regression: `--socket` 明示経路でも self-attach ガードが効く
+/// (= `hyoui attach --socket=<自分の sock>` で sid 経路のガードを迂回できない)。
+/// best-effort の UX ガード (canonical path 比較、path 偽装までは追わない)。
+#[test]
+fn attach_self_session_via_explicit_socket_is_rejected() {
+    let runtime = runtime_dir();
+    let sid = "selfres-attach-sock";
+    spawn_detached(runtime.path(), sid);
+
+    // 自セッションの socket path を --socket で直接指定して迂回を試みる。
+    let self_sock = runtime.path().join("hyoui").join(format!("{sid}.sock"));
+    let out = Command::new(hyoui_bin())
+        .args(["attach", &format!("--socket={}", self_sock.display())])
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("HYOUI_SESSION_ID", sid)
+        .env_remove("HYOUI_LOCK_TOKEN")
+        .stdin(Stdio::null())
+        .output()
+        .expect("attach --socket self");
+
+    cleanup(runtime.path(), sid);
+
+    assert!(
+        !out.status.success(),
+        "--socket 明示でも自セッションへの attach は拒否されるべき"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("自セッション") || stderr.contains("ネスト"),
+        "ネスト防止の理由が示されるべき。stderr={stderr:?}"
+    );
+}
+
+/// 対照: `--socket` 明示で **別セッション** の socket を指す場合は self 拒否されない。
+#[test]
+fn attach_other_socket_from_inside_is_allowed() {
+    let runtime = runtime_dir();
+    let me = "selfres-sock-me";
+    let other = "selfres-sock-other";
+    spawn_detached(runtime.path(), me);
+    spawn_detached(runtime.path(), other);
+
+    let other_sock = runtime.path().join("hyoui").join(format!("{other}.sock"));
+    let out = Command::new(hyoui_bin())
+        .args([
+            "attach",
+            &format!("--socket={}", other_sock.display()),
+            "--mode=ro",
+        ])
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("HYOUI_SESSION_ID", me)
+        .env_remove("HYOUI_LOCK_TOKEN")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("attach --socket other");
+
+    cleanup(runtime.path(), me);
+    cleanup(runtime.path(), other);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("自セッション") && !stderr.contains("ネスト"),
+        "別セッションの socket への attach は self 拒否されないべき。stderr={stderr:?}"
+    );
+}

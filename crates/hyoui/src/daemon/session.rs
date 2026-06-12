@@ -1601,7 +1601,19 @@ fn serve_loop(
                         ClientFrameOutcome::DropClient => indices_to_drop.push(idx),
                         // DR-0020 §4: detach --target=others/all で複数 client を drop。
                         // 後段の dedup / 逆順 remove / leader cascade に乗る。
-                        ClientFrameOutcome::DropClients(v) => indices_to_drop.extend(v),
+                        ClientFrameOutcome::DropClients {
+                            indices,
+                            cancel_pending,
+                        } => {
+                            indices_to_drop.extend(indices);
+                            // codex review 2026-06-12: others/all は in-flight handshake
+                            // (= pending) もキャンセルする。entry drop で worker 側
+                            // socket が close され、成立しかけの接続は handshake 失敗
+                            // として終わる (= detach をすり抜ける race を防ぐ)。
+                            if cancel_pending {
+                                pending_handshakes.clear();
+                            }
+                        }
                         ClientFrameOutcome::TerminateSession(o) => should_return = Some(o),
                     }
                 }

@@ -288,6 +288,7 @@ fn finalize_accepted_client(
     config: &DaemonConfig,
     client_id: u64,
     clients: &[ClientHandle],
+    other_pending: usize,
 ) -> Result<AcceptedClient, Error> {
     let (reader, mut writer_main, req, intersect) = stage;
 
@@ -301,18 +302,26 @@ fn finalize_accepted_client(
     // 居る場合は attach を拒否)。rw client = 書き込み権を持つ client (= Mode::Rw /
     // RwNoLeader、Ro 観察者は除外)。拒否時は error response を送って Err を返し、
     // process_pending_handshakes が drop で完了させる (= client は push されない)。
+    //
+    // Semantics (codex review 2026-06-12): exclusive は **attach 時点のスナップショット
+    // 判定** であり、成立後の継続的な占有保証 (= 後着 rw を弾き続ける) はしない
+    // (= それは lock の領域、DR-0006 §7)。スナップショットには確立済 `clients` に
+    // 加えて、同時点で観測可能な **in-flight handshake (= `other_pending`)** も含める:
+    // pending は mode 未確定 (= worker が HandshakeRequest を受信処理中) のため、
+    // rw か ro か判別できず **安全側 (= 拒否) に倒す**。これにより「pending 中の rw が
+    // 後から成立して exclusive が素通り」する判定漏れを防ぐ。
     if req.exclusive {
         use crate::protocol::Mode;
         let other_rw = clients
             .iter()
             .any(|c| matches!(c.mode, Mode::Rw | Mode::RwNoLeader));
-        if other_rw {
+        if other_rw || other_pending > 0 {
             use crate::protocol::messages::{ErrorCode, ErrorMessage};
             let body = ControlMessage::Error(ErrorMessage {
                 code: ErrorCode::ModeNotAllowed,
-                message: "attach --exclusive denied: 他に rw client が attach 中です \
-                          (= 占有要求を満たせない)。--detach-others で奪取するか、\
-                          rw client が抜けてから再試行してください。"
+                message: "attach --exclusive denied: 他に rw client が attach 中、\
+                          または handshake 進行中の接続があります (= 占有要求を満たせない)。\
+                          --detach-others で奪取するか、他 client が抜けてから再試行してください。"
                     .into(),
                 details: None,
             })
@@ -322,7 +331,7 @@ fn finalize_accepted_client(
                 .encode_to(&mut writer_main)
                 .map_err(|_| Error::Invalid("exclusive-denied error frame encode failed"))?;
             return Err(Error::Invalid(
-                "attach --exclusive denied (other rw client present)",
+                "attach --exclusive denied (other rw client or pending handshake present)",
             ));
         }
     }
@@ -405,8 +414,17 @@ pub(super) fn process_pending_handshakes(
         match pending_handshakes[i].rx.try_recv() {
             Ok(Ok(stage)) => {
                 let _entry = pending_handshakes.remove(i);
-                // finalize: leader 判定 + response 送信 + ClientHandle 構築
-                match finalize_accepted_client(stage, config, *next_client_id, clients) {
+                // finalize: leader 判定 + response 送信 + ClientHandle 構築。
+                // exclusive 判定用に「自分以外の in-flight handshake 数」(= 自 entry を
+                // remove した後の残数) を渡す (= 同一周回で観測可能な pending の取りこぼし防止)。
+                let other_pending = pending_handshakes.len();
+                match finalize_accepted_client(
+                    stage,
+                    config,
+                    *next_client_id,
+                    clients,
+                    other_pending,
+                ) {
                     Ok(accepted) => {
                         *next_client_id += 1;
                         let new_id = accepted.handle.id;
@@ -461,6 +479,15 @@ pub(super) fn process_pending_handshakes(
                         // と同じ規律で処理する。leader が消えた場合は elevate_next_leader が
                         // 残った client (= 新 client) を昇格させる (= 奪取側が leader を取る)。
                         if want_detach_others {
+                            // codex review 2026-06-12: 奪取対象には確立済 `clients` だけで
+                            // なく **in-flight handshake (= pending)** も含める。entry の
+                            // drop で rx が閉じ、worker 側が socket を close するため
+                            // (= channel send 失敗 or buffer 内 stage の drop で stream が
+                            // 落ちる)、成立しかけの接続は handshake 失敗として終わる。
+                            // 「error response を返してから drop」よりも、既存の timeout
+                            // 強制 drop と同じ経路 (= entry drop に一本化) が素直で、
+                            // worker が socket を所有している構造とも整合する。
+                            pending_handshakes.clear();
                             let mut dropped_held_lock = false;
                             let mut dropped_any_leader = false;
                             let mut k = clients.len();
@@ -635,5 +662,148 @@ mod tests {
     #[test]
     fn handshake_accepts_no_token() {
         validate_handshake_lengths(&req_with(Vec::new(), None)).expect("must accept");
+    }
+
+    // ===== DR-0020 §4 / codex review 2026-06-12: pending handshake との race =====
+
+    /// 完了済 stage を内包した `PendingHandshake` を組み立てる test helper。
+    ///
+    /// daemon 側 socket (= stage に入れる reader / writer) と client 側 peer socket
+    /// を `UnixStream::pair` で作る。実物は同一 stream の split だが、機能的には
+    /// 独立 pair 2 本で等価 (= response はテストが保持する peer のバッファに溜まる)。
+    /// peer を返すのは drop による EPIPE を避けるため (= caller が生かしておく)。
+    fn make_completed_pending(req: HandshakeRequest) -> (PendingHandshake, UnixStream, UnixStream) {
+        let (daemon_reader, peer_w) = UnixStream::pair().expect("pair");
+        let (daemon_writer, peer_r) = UnixStream::pair().expect("pair");
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<HandshakeStageOk, Error>>(1);
+        tx.send(Ok((daemon_reader, daemon_writer, req, Vec::new())))
+            .expect("send stage");
+        let worker = std::thread::spawn(|| {});
+        (
+            PendingHandshake {
+                rx,
+                started_at: Instant::now(),
+                _worker: worker,
+            },
+            peer_w,
+            peer_r,
+        )
+    }
+
+    /// 未完了 (= worker が handshake 処理中) の `PendingHandshake` を組み立てる。
+    /// 返した tx を caller が保持している間は `TryRecvError::Empty` (= in-flight) になる。
+    #[allow(clippy::type_complexity)]
+    fn make_inflight_pending() -> (
+        PendingHandshake,
+        std::sync::mpsc::SyncSender<Result<HandshakeStageOk, Error>>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<HandshakeStageOk, Error>>(1);
+        let worker = std::thread::spawn(|| {});
+        (
+            PendingHandshake {
+                rx,
+                started_at: Instant::now(),
+                _worker: worker,
+            },
+            tx,
+        )
+    }
+
+    /// `process_pending_handshakes` を test 用の最小 state 一式で呼ぶ。
+    fn run_process(
+        pending: &mut Vec<PendingHandshake>,
+        clients: &mut Vec<ClientHandle>,
+    ) -> SessionState {
+        let config = DaemonConfig::new(
+            "t",
+            std::path::PathBuf::from("/tmp/t.sock"),
+            vec!["cmd".into()],
+        );
+        let mut next_client_id = 1u64;
+        let mut state = SessionState::default();
+        let mut overflow_ids = Vec::new();
+        let screen_state = ScreenState::new(24, 80, 100);
+        let mut pending_redraws = Vec::new();
+        process_pending_handshakes(
+            pending,
+            &config,
+            &mut next_client_id,
+            clients,
+            &mut state,
+            &mut overflow_ids,
+            &screen_state,
+            &mut pending_redraws,
+        );
+        state
+    }
+
+    /// codex review #1 regression: `--exclusive` の占有判定は確立済 `clients` だけで
+    /// なく **同一周回で観測可能な in-flight handshake (= pending)** も含めて原子的に
+    /// 行う。pending は mode 未確定のため安全側 (= 拒否) に倒す。
+    /// (semantics: exclusive = attach 時点のスナップショット判定。成立後の継続的な
+    /// 占有保証はしない = それは lock の領域)
+    #[test]
+    fn exclusive_denied_when_pending_handshake_in_flight() {
+        let req = HandshakeRequest {
+            caps: Vec::new(),
+            mode: Mode::Rw,
+            exclusive: true,
+            detach_others: false,
+            token: None,
+        };
+
+        // (a) in-flight pending が居る → exclusive は拒否され client は push されない。
+        let (excl, _pw, _pr) = make_completed_pending(req.clone());
+        let (inflight, _tx_keep) = make_inflight_pending();
+        let mut pending = vec![excl, inflight];
+        let mut clients: Vec<ClientHandle> = Vec::new();
+        let _ = run_process(&mut pending, &mut clients);
+        assert!(
+            clients.is_empty(),
+            "pending handshake が観測可能な間は exclusive を素通りさせない"
+        );
+        assert_eq!(
+            pending.len(),
+            1,
+            "in-flight pending 自体は exclusive 拒否で消えない (= timeout / 完了で別途処理)"
+        );
+
+        // (b) 対照: pending が居なければ同じ exclusive 要求は成立する
+        //     (= (a) の拒否理由が pending であることの裏取り)。
+        let (excl_alone, _pw2, _pr2) = make_completed_pending(req);
+        let mut pending = vec![excl_alone];
+        let mut clients: Vec<ClientHandle> = Vec::new();
+        let _ = run_process(&mut pending, &mut clients);
+        assert_eq!(
+            clients.len(),
+            1,
+            "pending が無ければ exclusive attach は成立する"
+        );
+        assert!(pending.is_empty());
+    }
+
+    /// codex review #2 regression: `--detach-others` の奪取対象は確立済 client だけで
+    /// なく in-flight handshake (= pending) も含む。成立しかけの接続が奪取をすり抜けて
+    /// 生き残らない。
+    #[test]
+    fn detach_others_cancels_pending_handshakes() {
+        let req = HandshakeRequest {
+            caps: Vec::new(),
+            mode: Mode::Rw,
+            exclusive: false,
+            detach_others: true,
+            token: None,
+        };
+        let (stealer, _pw, _pr) = make_completed_pending(req);
+        let (inflight, _tx_keep) = make_inflight_pending();
+        let mut pending = vec![stealer, inflight];
+        let mut clients: Vec<ClientHandle> = Vec::new();
+        let _ = run_process(&mut pending, &mut clients);
+
+        assert_eq!(clients.len(), 1, "奪取側 client は成立する");
+        assert!(
+            pending.is_empty(),
+            "--detach-others は in-flight pending もキャンセルする (= 奪取のすり抜け防止)"
+        );
     }
 }

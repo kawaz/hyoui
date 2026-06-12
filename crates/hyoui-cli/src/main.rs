@@ -652,7 +652,21 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
     // DR-0018: namespace を解決 (= --namespace flag > HYOUI_NAMESPACE env > default)。
     let namespace = socket_path::resolve_namespace(cfg.namespace.as_deref());
     let sock = if let Some(p) = cfg.socket.clone() {
-        std::path::PathBuf::from(p)
+        let p = std::path::PathBuf::from(p);
+        // DR-0020 §3 (codex review 2026-06-12): `--socket` 明示経路でも self-attach
+        // ガードを効かせる (= sid 経路だけだと `--socket=<自分の sock>` で迂回できた)。
+        // $HYOUI_SESSION_ID が指す自セッションの socket path と canonical 比較する。
+        if socket_path_is_self(&p) {
+            eprintln!(
+                "hyoui: attach: 自セッションの socket への attach はできません \
+                 (= hyoui in hyoui のネスト防止、DR-0020 §3)。"
+            );
+            eprintln!(
+                "       中から脱出したい場合は `hyoui detach`、終了したい場合は `hyoui kill` を使ってください。"
+            );
+            return ExitCode::from(2);
+        }
+        p
     } else {
         // index 指定なら resolve_session_by_index で session-id を確定、
         // それ以外は cfg.session_id を使う (= parse_attach で同時指定は弾かれている)。
@@ -2137,6 +2151,34 @@ fn attach_target_is_self(sid: &str, namespace: &str) -> bool {
     // 解決順 (= HYOUI_NAMESPACE env > default) で引く。
     let env_ns = socket_path::resolve_namespace(None);
     env_ns == namespace
+}
+
+/// `--socket` 明示 path が自セッションの socket を指しているかを判定する
+/// (DR-0020 §3、codex review 2026-06-12)。
+///
+/// `$HYOUI_SESSION_ID` + 子の namespace (= `$HYOUI_NAMESPACE` 解決順) から自セッション
+/// の socket path を解決し、与えられた path と canonical 比較する。
+///
+/// **best-effort の UX ガード** であってセキュリティ境界ではない: symlink farm /
+/// bind mount / hardlink 等での path 偽装までは追わない (= `canonicalize` が解決できる
+/// 範囲のみ)。canonicalize 失敗時 (= path 不存在等) は素の path 文字列比較に
+/// fallback する。env 未 set (= 外から実行) なら常に false。
+fn socket_path_is_self(p: &std::path::Path) -> bool {
+    let env_sid = match std::env::var("HYOUI_SESSION_ID") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return false,
+    };
+    let env_ns = socket_path::resolve_namespace(None);
+    let self_sock = match socket_path::resolve_in_namespace(None, &env_sid, &env_ns) {
+        Ok(s) => s,
+        // 解決失敗 (= sid 不正等) は self 判定不能 → ガードしない (= 過剰 block 回避)。
+        Err(_) => return false,
+    };
+    // canonicalize で symlink / `..` を解決して比較。失敗したら素の path で比較。
+    let canon = |path: &std::path::Path| -> std::path::PathBuf {
+        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    };
+    canon(p) == canon(&self_sock)
 }
 
 /// `detach [session] [--target=others|all|self]` subcommand (DR-0020 §4)。

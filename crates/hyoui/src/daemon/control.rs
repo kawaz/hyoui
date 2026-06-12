@@ -91,9 +91,20 @@ pub(super) enum ClientFrameOutcome {
     DropClient,
     /// 指定した複数 client (= clients 内 index) を remove する (DR-0020 §4)。
     /// `detach --target=others/all` で「自分以外」「全員」を引き剥がす用途。
-    /// serve_loop が `indices_to_drop` に展開し、leader cascade / lock auto-release
-    /// を既存経路で処理する (= 単一 `DropClient` と同じ後段ロジックに乗る)。
-    DropClients(Vec<usize>),
+    /// serve_loop が `indices` を `indices_to_drop` に展開し、leader cascade /
+    /// lock auto-release を既存経路で処理する (= 単一 `DropClient` と同じ後段
+    /// ロジックに乗る)。
+    DropClients {
+        /// drop する client の `clients` 内 index 集合。
+        indices: Vec<usize>,
+        /// in-flight handshake (= pending) もキャンセルするか (codex review
+        /// 2026-06-12)。others/all の意味は「この時点で session に attach
+        /// しよう/している接続を引き剥がす」なので、成立しかけの pending を
+        /// 生き残らせると race 下で意味が崩れる。serve_loop が true を見たら
+        /// `pending_handshakes` を clear する (= entry drop で worker 側 socket
+        /// が close、timeout 強制 drop と同じ経路に一本化)。
+        cancel_pending: bool,
+    },
     /// session 全体終了 (= kill received など)。
     TerminateSession(RelayOutcome),
 }
@@ -507,8 +518,10 @@ pub(super) fn signal_name_to_nix_signal(name: &str) -> Option<Signal> {
 ///   (= DR-0015 §2.3.1、新規 attach 待ち)
 ///
 /// Others/All は複数 client を drop するため [`ClientFrameOutcome::DropClients`] を
-/// 返す。serve_loop が `indices_to_drop` に展開し、leader cascade / lock auto-release
-/// を既存経路で処理する。
+/// 返す。serve_loop が `indices` を `indices_to_drop` に展開し、leader cascade /
+/// lock auto-release を既存経路で処理する。`cancel_pending: true` により in-flight
+/// handshake (= pending) も同時にキャンセルされる (= 成立しかけの接続が detach を
+/// すり抜ける race を防ぐ、codex review 2026-06-12)。
 fn handle_detach_target(
     idx: usize,
     detach: crate::protocol::messages::Detach,
@@ -520,12 +533,18 @@ fn handle_detach_target(
         DetachTarget::Others => {
             // 自分以外の全 client index を集める (= 自分は残す)。
             let others: Vec<usize> = (0..clients.len()).filter(|&i| i != idx).collect();
-            ClientFrameOutcome::DropClients(others)
+            ClientFrameOutcome::DropClients {
+                indices: others,
+                cancel_pending: true,
+            }
         }
         DetachTarget::All => {
             // 自分含む全 client を drop。daemon は serve_loop を継続 (= 子 PTY 接続維持、
             // DR-0015 §2.3.1)。
-            ClientFrameOutcome::DropClients((0..clients.len()).collect())
+            ClientFrameOutcome::DropClients {
+                indices: (0..clients.len()).collect(),
+                cancel_pending: true,
+            }
         }
     }
 }
@@ -1663,24 +1682,28 @@ mod tests {
 
     // ===== DR-0020 §4: handle_detach_target の target 別 drop 対象 =====
 
-    /// `handle_detach_target` の outcome を idx の `Vec` に正規化する test helper。
-    /// `DropClient` は「自分の idx 1 個」、`DropClients(v)` はソート済 `v`、それ以外は panic。
-    fn detach_outcome_indices(out: ClientFrameOutcome, self_idx: usize) -> Vec<usize> {
+    /// `handle_detach_target` の outcome を `(drop idx 集合, cancel_pending)` に
+    /// 正規化する test helper。`DropClient` は「自分の idx 1 個 + pending 不干渉」、
+    /// `DropClients` はソート済 `indices` + `cancel_pending`、それ以外は panic。
+    fn detach_outcome_indices(out: ClientFrameOutcome, self_idx: usize) -> (Vec<usize>, bool) {
         match out {
-            ClientFrameOutcome::DropClient => vec![self_idx],
-            ClientFrameOutcome::DropClients(mut v) => {
-                v.sort_unstable();
-                v
+            ClientFrameOutcome::DropClient => (vec![self_idx], false),
+            ClientFrameOutcome::DropClients {
+                mut indices,
+                cancel_pending,
+            } => {
+                indices.sort_unstable();
+                (indices, cancel_pending)
             }
             _ => panic!("detach は DropClient / DropClients を返すべき"),
         }
     }
 
-    /// detach target 別に「drop 対象 client index 集合」が正しいか (DR-0020 §4)。
-    /// 3 client・self_idx=1 (= 中央) で:
-    /// - Myself → 自分のみ ([1])
-    /// - Others → 自分以外全部 ([0, 2])
-    /// - All    → 全部 ([0, 1, 2])
+    /// detach target 別に「drop 対象 client index 集合 + pending キャンセル」が正しいか
+    /// (DR-0020 §4 + codex review 2026-06-12)。3 client・self_idx=1 (= 中央) で:
+    /// - Myself → 自分のみ ([1])、pending 不干渉
+    /// - Others → 自分以外全部 ([0, 2]) + pending キャンセル
+    /// - All    → 全部 ([0, 1, 2]) + pending キャンセル
     #[test]
     fn handle_detach_target_resolves_drop_set_per_target() {
         use crate::protocol::messages::{Detach, DetachTarget};
@@ -1701,7 +1724,7 @@ mod tests {
             },
             &mut clients,
         );
-        assert_eq!(detach_outcome_indices(out, self_idx), vec![1]);
+        assert_eq!(detach_outcome_indices(out, self_idx), (vec![1], false));
 
         let mut clients = make_clients();
         let out = handle_detach_target(
@@ -1711,7 +1734,9 @@ mod tests {
             },
             &mut clients,
         );
-        assert_eq!(detach_outcome_indices(out, self_idx), vec![0, 2]);
+        // Others は in-flight handshake もキャンセル (= 成立しかけの接続が detach を
+        // すり抜ける race を防ぐ)。
+        assert_eq!(detach_outcome_indices(out, self_idx), (vec![0, 2], true));
 
         let mut clients = make_clients();
         let out = handle_detach_target(
@@ -1721,7 +1746,7 @@ mod tests {
             },
             &mut clients,
         );
-        assert_eq!(detach_outcome_indices(out, self_idx), vec![0, 1, 2]);
+        assert_eq!(detach_outcome_indices(out, self_idx), (vec![0, 1, 2], true));
     }
 
     /// queue に積まれた次の frame を decode して `ControlMessage` を返す。
