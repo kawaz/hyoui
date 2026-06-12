@@ -345,6 +345,8 @@ fn main() -> ExitCode {
 
         Command::Status(cfg) => status_command(cfg),
 
+        Command::Set(cfg) => set_command(cfg),
+
         Command::Tail(cfg) => tail_command(cfg),
 
         Command::Wait(cfg) => wait_command(cfg),
@@ -1034,6 +1036,11 @@ enum ListEntryStatus {
         child_pid: Option<u32>,
         /// 子 PTY の pgid (= exited なら None)。jsonl 用。
         child_pgid: Option<u32>,
+        /// DR-0019 Update: 現在の on-child-suspend policy (= SUSPEND 列)。
+        on_child_suspend: Option<hyoui::protocol::messages::OnChildSuspendPolicy>,
+        /// DR-0019 Update: daemon バイナリ version (= VERSION 列、
+        /// 空文字なら旧 daemon で `-` 表示)。
+        daemon_version: String,
     },
     /// socket file は存在するが connect / handshake / status.query が失敗。daemon が
     /// 既に死亡 (panic / SIGKILL) で stale socket が残留しているケース。
@@ -1085,6 +1092,8 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<(String, std::path::PathBuf
                     child_stopped: false,
                     child_pid: None,
                     child_pgid: None,
+                    on_child_suspend: None,
+                    daemon_version: String::new(),
                 }
             } else {
                 ListEntryStatus::Stale
@@ -1195,6 +1204,10 @@ enum StatusFetchOutcome {
         /// 子 PTY の PID / pgid (= exited なら None)。`list` の PID 列 / jsonl 用。
         child_pid: Option<u32>,
         child_pgid: Option<u32>,
+        /// DR-0019 Update: 現在の on-child-suspend policy。
+        on_child_suspend: Option<hyoui::protocol::messages::OnChildSuspendPolicy>,
+        /// DR-0019 Update: daemon バイナリ version (= 空文字なら旧 daemon)。
+        daemon_version: String,
     },
     /// connect / handshake / decode / I/O error。probe では live だったので「異常状態」を
     /// log に出すために理由を保持する (= silent 格下げを避ける)。
@@ -1243,6 +1256,8 @@ fn enrich_entries_with_status(entries: &mut [ListEntry]) {
                 child_stopped,
                 child_pid,
                 child_pgid,
+                on_child_suspend,
+                daemon_version,
             } => {
                 entries[idx].status = ListEntryStatus::Live {
                     cwd,
@@ -1251,6 +1266,8 @@ fn enrich_entries_with_status(entries: &mut [ListEntry]) {
                     child_stopped,
                     child_pid,
                     child_pgid,
+                    on_child_suspend,
+                    daemon_version,
                 };
             }
             StatusFetchOutcome::Failed(reason) => {
@@ -1313,6 +1330,8 @@ fn query_status_for_list(sock: &std::path::Path) -> StatusFetchOutcome {
                     child_stopped: sr.child_stopped,
                     child_pid: sr.child_pid,
                     child_pgid: sr.child_pgid,
+                    on_child_suspend: sr.on_child_suspend,
+                    daemon_version: sr.daemon_version,
                 };
             }
             Ok(ControlMessage::ModeChange(_)) | Ok(ControlMessage::LeaderNotify(_)) => continue,
@@ -1394,13 +1413,13 @@ fn print_list_plain(entries: &[ListEntry], show_ns: bool) {
     }
     if show_ns {
         println!(
-            "{:<16} {:<20} {:<7} {:<8} {:<10} {:<8} {:<32} ARGV",
-            "NS", "SESSION", "STATUS", "PID", "DUR", "CLIENTS", "CWD"
+            "{:<16} {:<20} {:<7} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} ARGV",
+            "NS", "SESSION", "STATUS", "PID", "SUSPEND", "VERSION", "DUR", "CLIENTS", "CWD"
         );
     } else {
         println!(
-            "{:<20} {:<7} {:<8} {:<10} {:<8} {:<32} ARGV",
-            "SESSION", "STATUS", "PID", "DUR", "CLIENTS", "CWD"
+            "{:<20} {:<7} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} ARGV",
+            "SESSION", "STATUS", "PID", "SUSPEND", "VERSION", "DUR", "CLIENTS", "CWD"
         );
     }
     for e in entries {
@@ -1417,6 +1436,8 @@ fn print_list_plain(entries: &[ListEntry], show_ns: bool) {
                 clients,
                 child_stopped,
                 child_pid,
+                on_child_suspend,
+                daemon_version,
                 ..
             } => {
                 let dur = fmt_dur(e.dur);
@@ -1431,15 +1452,25 @@ fn print_list_plain(entries: &[ListEntry], show_ns: bool) {
                 let pid_disp = child_pid
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| "-".to_string());
+                // DR-0019 Update: SUSPEND 列 (= on-child-suspend policy)。
+                // None (= field を送らない旧 daemon) は `-` (unknown) に倒す —
+                // 既定値 notify を断定表示すると実際と逆の値を出しうる (M3)。
+                let suspend = on_child_suspend.map(|p| p.as_str()).unwrap_or("-");
+                // DR-0019 Update: VERSION 列。空 (= 旧 daemon) なら `-`。
+                let ver = if daemon_version.is_empty() {
+                    "-"
+                } else {
+                    daemon_version.as_str()
+                };
                 println!(
-                    "{ns_prefix}{session:<20} {status:<7} {pid_disp:<8} {dur:<10} {clients:<8} {cwd_disp:<32} {argv_disp}"
+                    "{ns_prefix}{session:<20} {status:<7} {pid_disp:<8} {suspend:<11} {ver:<8} {dur:<10} {clients:<8} {cwd_disp:<32} {argv_disp}"
                 );
             }
             ListEntryStatus::Stale => {
                 // stale は cwd/argv/clients 取得不能なので `-` 統一。
                 println!(
-                    "{ns_prefix}{session:<20} {:<7} {:<8} {:<10} {:<8} {:<32} -",
-                    "stale", "-", "-", "-", "-"
+                    "{ns_prefix}{session:<20} {:<7} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} -",
+                    "stale", "-", "-", "-", "-", "-", "-"
                 );
             }
         }
@@ -1463,6 +1494,8 @@ fn print_list_jsonl(entries: &[ListEntry]) {
                 child_stopped,
                 child_pid,
                 child_pgid,
+                on_child_suspend,
+                daemon_version,
             } => serde_json::json!({
                 "session": e.session,
                 // DR-0018: namespace を常時出力 (= default ns は "default")。
@@ -1474,6 +1507,13 @@ fn print_list_jsonl(entries: &[ListEntry]) {
                 "child_state": if *child_stopped { "stopped" } else { "running" },
                 "child_pid": child_pid,
                 "child_pgid": child_pgid,
+                // DR-0019 Update: policy + daemon version (旧 daemon = 不明 → null)。
+                "on_child_suspend": on_child_suspend.map(|p| p.as_str()),
+                "daemon_version": if daemon_version.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(daemon_version.clone())
+                },
                 "started_unix_ms": e.started_unix_ms,
                 "dur_ms": e.dur.as_millis() as u64,
                 "socket": e.socket_path.display().to_string(),
@@ -2042,6 +2082,83 @@ fn status_command(cfg: StatusConfig) -> ExitCode {
     }
 }
 
+/// `set` subcommand: connect (rw) → handshake → cap check (`set-v1`) → set.request →
+/// set.ack 受信 (DR-0019 Update)。
+///
+/// exit code: 0=成功 / 1=connect or daemon reject / 2=引数不正 (parse 段で済) /
+/// 4=daemon が `set-v1` 未対応 (= 古い daemon)。
+fn set_command(cfg: hyoui::cli::SetConfig) -> ExitCode {
+    use hyoui::protocol::messages::{SetAck, SetRequest};
+
+    let sock = match resolve_target_socket(
+        "set",
+        cfg.socket.as_deref(),
+        cfg.session_id.as_deref(),
+        cfg.index,
+        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
+    ) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    // set は書き込み操作なので Rw で接続する (= leader は取らなくてよい、kill と同じ)。
+    let opts = AttachOptions {
+        mode: Mode::Rw,
+        ..AttachOptions::default()
+    };
+    let mut conn = match connect_with_retry(&sock, opts) {
+        Ok(c) => c,
+        Err(e) => {
+            print_connect_failure("set", &sock, &e);
+            return ExitCode::from(1);
+        }
+    };
+    // cap negotiation: daemon が `set-v1` を advertise していなければ set 不可。
+    // 新 client → 旧 daemon のケースを明示エラーにする (= silent no-op を避ける)。
+    if !conn.response.caps.iter().any(|c| c == "set-v1") {
+        eprintln!(
+            "hyoui: set: この daemon は `set-v1` をサポートしていません (= 古い hyoui で起動された session)。\n       \
+             新しい hyoui で session を起動し直すと set が使えます。"
+        );
+        return ExitCode::from(4);
+    }
+    let req = SetRequest {
+        key: cfg.key.clone(),
+        value: cfg.value.clone(),
+    };
+    if let Err(e) = conn.send_control(&ControlMessage::SetRequest(req)) {
+        eprintln!("hyoui: set: send 失敗: {e}");
+        return ExitCode::from(1);
+    }
+    loop {
+        let msg = match conn.recv_control(None) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("hyoui: set: recv 失敗: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        match msg {
+            ControlMessage::SetAck(SetAck { key, value }) => {
+                println!("set ok: {key}={value}");
+                return ExitCode::SUCCESS;
+            }
+            ControlMessage::Error(e) => {
+                eprintln!(
+                    "hyoui: set: daemon が reject しました: {:?} ({})",
+                    e.code, e.message
+                );
+                return ExitCode::from(1);
+            }
+            // broadcast 系 (mode.change / leader.notify) は無視して ack を待つ。
+            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+            other => {
+                eprintln!("hyoui: set: unexpected response: {other:?}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+}
+
 fn print_status_plain(sr: &hyoui::protocol::messages::StatusResponse) {
     use hyoui::protocol::messages::ChildLiveState;
     println!("session-id: {}", sr.session_id);
@@ -2073,6 +2190,20 @@ fn print_status_plain(sr: &hyoui::protocol::messages::StatusResponse) {
             }
         }
     }
+    // DR-0019 Update: on-child-suspend policy (= `hyoui set` で変更可) を可視化。
+    // None (= field を送らない旧 daemon) は `-` (unknown) — 既定値を断定表示しない。
+    println!(
+        "on-child-suspend: {}",
+        sr.on_child_suspend.map(|p| p.as_str()).unwrap_or("-")
+    );
+    // DR-0019 Update: daemon バイナリ version。field 無しの旧 daemon は
+    // 空文字なので `-` 表示に倒す (= それ自体が「古い daemon」のシグナル)。
+    let ver = if sr.daemon_version.is_empty() {
+        "-"
+    } else {
+        sr.daemon_version.as_str()
+    };
+    println!("daemon-version: {ver}");
     println!("scrollback-bytes: {}", sr.scrollback_bytes);
     if let Some(holder) = sr.lock_holder {
         println!("lock-holder: client {holder}");
@@ -2116,6 +2247,27 @@ fn print_status_json(sr: &hyoui::protocol::messages::StatusResponse) {
             },
         };
         write!(&mut out, ",\"child_state\":{}", json_string(&cs)).ok();
+    }
+    // DR-0019 Update: policy + daemon version。旧 daemon (= field 無し) は null —
+    // 既定値を断定表示しない (jq 側で null = unknown を判別できる)。
+    match sr.on_child_suspend {
+        Some(p) => write!(
+            &mut out,
+            ",\"on_child_suspend\":{}",
+            json_string(p.as_str())
+        )
+        .ok(),
+        None => write!(&mut out, ",\"on_child_suspend\":null").ok(),
+    };
+    if sr.daemon_version.is_empty() {
+        out.push_str(",\"daemon_version\":null");
+    } else {
+        write!(
+            &mut out,
+            ",\"daemon_version\":{}",
+            json_string(&sr.daemon_version)
+        )
+        .ok();
     }
     write!(&mut out, ",\"scrollback_bytes\":{}", sr.scrollback_bytes).ok();
     match sr.lock_holder {
@@ -4788,6 +4940,8 @@ mod tests {
                 child_stopped: false,
                 child_pid: None,
                 child_pgid: None,
+                on_child_suspend: None,
+                daemon_version: String::new(),
             },
         }];
 
@@ -4798,12 +4952,7 @@ mod tests {
 
         match &entries[0].status {
             ListEntryStatus::Live {
-                cwd,
-                argv,
-                clients,
-                child_stopped: _,
-                child_pid: _,
-                child_pgid: _,
+                cwd, argv, clients, ..
             } => {
                 assert_eq!(
                     cwd,
@@ -4860,6 +5009,8 @@ mod tests {
                 child_stopped: false,
                 child_pid: None,
                 child_pgid: None,
+                on_child_suspend: None,
+                daemon_version: String::new(),
             },
         }];
         enrich_entries_with_status(&mut entries);

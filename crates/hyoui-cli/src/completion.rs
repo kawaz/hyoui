@@ -58,7 +58,7 @@ _hyoui() {
     if [[ -z "$sub" ]]; then
         # Top-level: implemented subcommands + global flags.
         # (reserved subcommands send/detach/tx are intentionally omitted.)
-        COMPREPLY=( $(compgen -W "run attach list kill status tail wait screen input lock unlock record completion --help -h --version -V" -- "$cur") )
+        COMPREPLY=( $(compgen -W "run attach list kill status set tail wait screen input lock unlock record completion --help -h --version -V" -- "$cur") )
         return 0
     fi
 
@@ -268,6 +268,17 @@ _hyoui() {
             esac
             COMPREPLY=( $(compgen -W "--socket --namespace --index --format --help -h" -- "$cur") )
             return 0 ;;
+        set)
+            case "$prev" in
+                --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                --namespace|--index) return 0 ;;
+            esac
+            # key=value 位置引数の補完: 既知 key を `key=` 形まで、値も候補に出す。
+            case "$cur" in
+                on-child-suspend=*) COMPREPLY=( $(compgen -W "on-child-suspend=notify on-child-suspend=auto-resume" -- "$cur") ); return 0 ;;
+            esac
+            COMPREPLY=( $(compgen -W "--socket --namespace --index --help -h on-child-suspend=" -- "$cur") )
+            return 0 ;;
         tail)
             case "$prev" in
                 --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
@@ -362,6 +373,14 @@ _hyoui() {
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:session id:'
                     ;;
+                set)
+                    _arguments \
+                        '--socket=[Explicit socket path]:socket:_files' \
+                        '--index=[Session selector (1=oldest, -1=newest)]:index:' \
+                        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '*:session id or key=value:(on-child-suspend=notify on-child-suspend=auto-resume)'
+                    ;;
                 tail)
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
@@ -419,6 +438,7 @@ _hyoui_subcommands() {
         'list:List daemon sessions'
         'kill:Send signal to a session and terminate it'
         'status:Print session status'
+        'set:Change a runtime setting (set <session> <key>=<value>)'
         'tail:Stream scrollback / live output'
         'wait:Wait until predicate matches'
         'screen:Dump / inspect virtual screen state (dump, snapshot)'
@@ -655,7 +675,7 @@ function __hyoui_using_subcommand
     set -e cmd[1]
     for arg in $cmd
         switch $arg
-            case run attach list kill status tail wait screen input lock unlock record completion
+            case run attach list kill status set tail wait screen input lock unlock record completion
                 if test "$arg" = "$argv[1]"
                     return 0
                 end
@@ -670,7 +690,7 @@ function __hyoui_no_subcommand
     set -e cmd[1]
     for arg in $cmd
         switch $arg
-            case run attach list kill status tail wait screen input lock unlock record completion
+            case run attach list kill status set tail wait screen input lock unlock record completion
                 return 1
         end
     end
@@ -740,6 +760,7 @@ complete -c hyoui -n __hyoui_no_subcommand -f -a attach     -d 'Attach to a runn
 complete -c hyoui -n __hyoui_no_subcommand -f -a list       -d 'List daemon sessions'
 complete -c hyoui -n __hyoui_no_subcommand -f -a kill       -d 'Send signal to a session and terminate it'
 complete -c hyoui -n __hyoui_no_subcommand -f -a status     -d 'Print session status'
+complete -c hyoui -n __hyoui_no_subcommand -f -a set        -d 'Change a runtime setting (set <session> <key>=<value>)'
 complete -c hyoui -n __hyoui_no_subcommand -f -a tail       -d 'Stream scrollback / live output'
 complete -c hyoui -n __hyoui_no_subcommand -f -a wait       -d 'Wait until predicate matches'
 complete -c hyoui -n __hyoui_no_subcommand -f -a screen     -d 'Dump / inspect virtual screen state'
@@ -803,6 +824,13 @@ complete -c hyoui -n '__hyoui_using_subcommand status' -l index  -x    -d 'Sessi
 complete -c hyoui -n '__hyoui_using_subcommand status' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand status' -l format -x -a 'plain json' -d 'Output format'
 complete -c hyoui -n '__hyoui_using_subcommand status' -s h -l help    -d 'Show help and exit'
+
+# `hyoui set` options + key=value 候補。
+complete -c hyoui -n '__hyoui_using_subcommand set' -l socket -r -F -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_using_subcommand set' -l index  -x    -d 'Session selector (1=oldest, -1=newest)'
+complete -c hyoui -n '__hyoui_using_subcommand set' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
+complete -c hyoui -n '__hyoui_using_subcommand set' -s h -l help    -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_using_subcommand set' -f -a 'on-child-suspend=notify on-child-suspend=auto-resume' -d 'Runtime setting key=value'
 
 # `hyoui tail` options.
 complete -c hyoui -n '__hyoui_using_subcommand tail' -l socket          -r -F  -d 'Explicit socket path'

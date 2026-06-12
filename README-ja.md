@@ -211,6 +211,7 @@ namespace 内から別 namespace で起動したい場合は `--namespace=<別ns
 | `hyoui list [--namespace=NS\|--all-namespaces]` | アクティブ session を列挙 (= namespace スコープ) |
 | `hyoui kill <session> [--signal=NUM_OR_NAME]` | 子に signal 送出（default SIGTERM、name / number 両対応。例 `--signal KILL` / `--signal 9`） |
 | `hyoui status <session>` | session 状態表示 (= clients / leader / lock / scrollback) |
+| `hyoui set <session> <key>=<value>` | runtime 設定の変更 (例: `on-child-suspend=notify\|auto-resume`) |
 | `hyoui input <session> <spec>...` | 入力注入 (= `text:` / `hex:` / `file:` / `paste:` / `key:` / `wait:` / `wait-idle:` spec) |
 | `hyoui wait <session> <pattern>` | 現在 visible state に対する regex match 待ち |
 | `hyoui screen dump <session>` | 画面 ANSI dump (= terminal で cat 再生可) |

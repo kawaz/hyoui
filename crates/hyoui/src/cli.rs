@@ -105,6 +105,8 @@ pub enum HelpTopic {
     Kill,
     /// Help for the `status` subcommand.
     Status,
+    /// Help for the `set` subcommand (= runtime 設定変更、DR-0019 Update)。
+    Set,
     /// Help for the `tail` subcommand.
     Tail,
     /// Help for the `wait` subcommand (predicate / timeout / exit code 一覧)。
@@ -363,6 +365,26 @@ pub struct StatusConfig {
     pub namespace: Option<String>,
     /// `--format=plain|json` (= default `Plain`、H5: scripting で grep/cut の罠回避)。
     pub format: StatusFormat,
+}
+
+/// `set` subcommand configuration (DR-0019 Update)。
+///
+/// `hyoui set <session> <key>=<value>` で runtime 設定を変更する。汎用 key=value
+/// 形式で、初期サポート key は `on-child-suspend` (値 `notify` / `auto-resume`)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetConfig {
+    /// Target socket path (explicit) または session_id から resolve。
+    pub socket: Option<String>,
+    /// Target session id。
+    pub session_id: Option<String>,
+    /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
+    pub index: Option<i32>,
+    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
+    pub namespace: Option<String>,
+    /// 変更する設定 key (= `on-child-suspend` 等、`key=value` の左辺)。
+    pub key: String,
+    /// 設定 value (= `notify` / `auto-resume` 等、`key=value` の右辺)。
+    pub value: String,
 }
 
 /// `tail` subcommand configuration (DR-0006 §11)。
@@ -829,6 +851,8 @@ pub enum Command {
     Kill(KillConfig),
     /// Print session status (clients/leader/lock/scrollback) and exit。
     Status(StatusConfig),
+    /// Change a runtime setting (`set <session> <key>=<value>`、DR-0019 Update)。
+    Set(SetConfig),
     /// Tail scrollback (optional --follow for live stream)。
     Tail(TailConfig),
     /// Wait until predicate (text/pattern/idle) matches, then exit。
@@ -900,6 +924,7 @@ pub fn parse_args(args: &[String]) -> Command {
         "list" => parse_list(rest),
         "kill" => parse_kill(rest),
         "status" => parse_status(rest),
+        "set" => parse_set(rest),
         "tail" => parse_tail(rest),
         "wait" => parse_wait(rest),
         "screen" => parse_screen(rest),
@@ -1437,6 +1462,142 @@ fn parse_status(args: &[String]) -> Command {
         }),
         Err(c) => c,
     }
+}
+
+/// `hyoui set <session> <key>=<value>` を parse する (DR-0019 Update)。
+///
+/// session 選択は他 CLI と同流儀 (= 位置引数 / `--index` / `--socket`、`--namespace`)。
+/// `set` は session 位置引数に加えて `key=value` 位置引数を取るため、共通の
+/// [`parse_session_targeted`] (= 位置引数 1 個前提) ではなく専用 loop で parse する。
+/// 位置引数のうち `=` を含むものを `key=value`、それ以外を session_id として扱う。
+#[allow(clippy::result_large_err)]
+fn parse_set(args: &[String]) -> Command {
+    let mut socket: Option<String> = None;
+    let mut session_id: Option<String> = None;
+    let mut index: Option<i32> = None;
+    let mut namespace: Option<String> = None;
+    let mut kv: Option<(String, String)> = None;
+    let mut positional_session: Option<String> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (opt_name, inline_value) = split_eq(arg);
+        let mut consumed_extra = false;
+        // option 用の値取り (= `--opt value` も許容、ただし `--` 始まりは値にしない)。
+        let value: Option<String> = match &inline_value {
+            Some(v) => Some(v.clone()),
+            None => {
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    consumed_extra = true;
+                    Some(args[i + 1].clone())
+                } else {
+                    None
+                }
+            }
+        };
+        match opt_name.as_str() {
+            "--help" | "-h" => {
+                return Command::Help {
+                    topic: HelpTopic::Set,
+                };
+            }
+            "--socket" => match value {
+                Some(v) => socket = Some(v),
+                None => return Command::Error("set: --socket requires a value".into()),
+            },
+            "--namespace" => match value {
+                Some(v) => {
+                    if let Err(e) = validate_namespace(&v) {
+                        return Command::Error(format!("set: --namespace: {e}"));
+                    }
+                    namespace = Some(v);
+                }
+                None => return Command::Error("set: --namespace requires a value".into()),
+            },
+            "--index" => match value {
+                Some(v) => match v.parse::<i32>() {
+                    Ok(0) => {
+                        return Command::Error(
+                            "set: --index=0 は不正です (= 1-based、1 が最古、-1 が最新)".into(),
+                        );
+                    }
+                    Ok(n) => index = Some(n),
+                    Err(_) => {
+                        return Command::Error(format!(
+                            "set: --index には整数を指定してください (got: {v:?})"
+                        ));
+                    }
+                },
+                None => return Command::Error("set: --index requires a value".into()),
+            },
+            other if other.starts_with('-') => {
+                return Command::Error(format!("set: unknown option: {other}"));
+            }
+            _ => {
+                // 位置引数。`=` を含めば key=value、それ以外は session_id。
+                consumed_extra = false;
+                let raw = args[i].clone();
+                if let Some(eq) = raw.find('=') {
+                    if kv.is_some() {
+                        return Command::Error(
+                            "set: key=value を複数指定できません (= 1 回につき 1 設定)".into(),
+                        );
+                    }
+                    let key = raw[..eq].to_string();
+                    let val = raw[eq + 1..].to_string();
+                    if key.is_empty() {
+                        return Command::Error(format!("set: 空の key は不正です: {raw:?}"));
+                    }
+                    kv = Some((key, val));
+                } else {
+                    if positional_session.is_some() {
+                        return Command::Error("set: too many positional arguments".into());
+                    }
+                    positional_session = Some(raw);
+                }
+            }
+        }
+        i += 1;
+        if consumed_extra {
+            i += 1;
+        }
+    }
+
+    if let Some(sid) = positional_session {
+        if let Err(e) = validate_session_id(&sid) {
+            return Command::Error(format!("set: {e}"));
+        }
+        session_id = Some(sid);
+    }
+
+    if session_id.is_some() && index.is_some() {
+        return Command::Error(
+            "set: session id (位置引数) と --index を同時に指定できません".into(),
+        );
+    }
+    if session_id.is_none() && index.is_none() && socket.is_none() {
+        return Command::Error(
+            "set: session id (positional) / --index=N / --socket=<path> のいずれかが必要です。\
+             例: `hyoui set <session-id> on-child-suspend=auto-resume`"
+                .into(),
+        );
+    }
+
+    let Some((key, value)) = kv else {
+        return Command::Error(
+            "set: <key>=<value> が必要です (= 例: on-child-suspend=auto-resume)".into(),
+        );
+    };
+
+    Command::Set(SetConfig {
+        socket,
+        session_id,
+        index,
+        namespace,
+        key,
+        value,
+    })
 }
 
 #[allow(clippy::result_large_err)]
@@ -2108,6 +2269,7 @@ pub fn usage(topic: &HelpTopic) -> String {
         HelpTopic::List => usage_list(),
         HelpTopic::Kill => usage_kill(),
         HelpTopic::Status => usage_status(),
+        HelpTopic::Set => usage_set(),
         HelpTopic::Tail => usage_tail(),
         HelpTopic::Wait => usage_wait(),
         HelpTopic::Screen => usage_screen(),
@@ -3300,6 +3462,7 @@ fn usage_top(unknown: Option<&str>) -> String {
             list        List daemon sessions (= socket dir scan)\n    \
             kill        Send signal to a daemon session and terminate it\n    \
             status      Print session status (clients/leader/lock/scrollback)\n    \
+            set         Change a runtime setting (set <session> <key>=<value>)\n    \
             tail        Stream scrollback / live output (--follow で継続)\n    \
             wait        Wait until predicate (text/pattern/idle) matches\n    \
             screen      Dump / inspect virtual screen state (subcommands: dump)\n    \
@@ -3479,6 +3642,8 @@ fn usage_status() -> String {
             daemon-pid: <pid>\n    \
             child-pid: <pid> pgid=<pgid>  または  child-pid: (exited)\n    \
             child-state: running | stopped | exited [(code N)]\n    \
+            on-child-suspend: notify | auto-resume  (= 現在の policy、`hyoui set` で変更可)\n    \
+            daemon-version: <version>  または  daemon-version: -  (= field 無しの古い daemon)\n    \
             scrollback-bytes: <N>\n    \
             lock-holder: client <id>  または  lock-holder: (none)\n    \
             clients:\n              \
@@ -3488,6 +3653,42 @@ fn usage_status() -> String {
             0   正常終了\n    \
             1   connect / I/O 失敗\n    \
             2   引数不足 (session-id も --socket も無し)\n",
+    )
+}
+
+fn usage_set() -> String {
+    String::from(
+        "hyoui set — change a runtime setting of a session (DR-0019)\n\
+        \n\
+        汎用 key=value 形式で daemon の runtime 設定を変更する。書き込み可能な接続\n\
+        (= rw / rw-no-leader) なら誰でも変更可 (= leader を取らない一発 CLI)。\n\
+        \n\
+        反映タイミング: 成功出力 (= daemon の ack) が「適用完了」。ack より前に\n\
+        daemon が観測済みの child stop は旧 policy で処理され得る (= 新 policy が\n\
+        効くのは ack 以降に観測される stop から)。\n\
+        \n\
+        USAGE:\n    \
+            hyoui set <session-id> <key>=<value>\n    \
+            hyoui set --index=<N> <key>=<value>\n    \
+            hyoui set --socket=<path> <key>=<value>\n\
+        \n\
+        SUPPORTED KEYS:\n    \
+            on-child-suspend=notify|auto-resume\n              \
+                子が self-stop (^Z 相当) したときの daemon の挙動。\n              \
+                notify      = leader に通知のみ (= 子を起こさない、default)\n              \
+                auto-resume = daemon が即 SIGCONT で子を復帰させる (= 無人 worker 向け)\n\
+        \n\
+        OPTIONS:\n    \
+            --socket PATH     Explicit socket path (alternative to session-id)\n    \
+            --index N         Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
+            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
+            -h, --help        Show this help and exit\n\
+        \n\
+        EXIT CODE:\n    \
+            0   設定変更成功\n    \
+            1   connect / I/O 失敗、または daemon が当該 key/value を reject\n    \
+            2   引数不足 / 不正 (session 指定なし、key=value なし 等)\n    \
+            4   daemon が `set-v1` 未対応 (= 古い daemon、新 client で起動し直す)\n",
     )
 }
 
@@ -4962,6 +5163,7 @@ pub const IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
     "list",
     "kill",
     "status",
+    "set",
     "tail",
     "wait",
     "screen",
@@ -5778,6 +5980,93 @@ mod tests {
         match parse_args(&args(&["status"])) {
             Command::Error(msg) => assert!(msg.contains("session id") || msg.contains("socket")),
             other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // DR-0019 Update: `set` subcommand parse
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_set_session_and_key_value() {
+        match parse_args(&args(&["set", "demo", "on-child-suspend=auto-resume"])) {
+            Command::Set(cfg) => {
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.key, "on-child-suspend");
+                assert_eq!(cfg.value, "auto-resume");
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_set_key_value_order_independent() {
+        // key=value が session より前でも parse できる (= 位置非依存)。
+        match parse_args(&args(&["set", "on-child-suspend=notify", "demo"])) {
+            Command::Set(cfg) => {
+                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.key, "on-child-suspend");
+                assert_eq!(cfg.value, "notify");
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_set_with_index_selector() {
+        match parse_args(&args(&["set", "--index=-1", "on-child-suspend=notify"])) {
+            Command::Set(cfg) => {
+                assert_eq!(cfg.index, Some(-1));
+                assert!(cfg.session_id.is_none());
+                assert_eq!(cfg.key, "on-child-suspend");
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_set_value_can_contain_equals() {
+        // value 側に `=` を含んでも、最初の `=` で key/value 分割する。
+        match parse_args(&args(&["set", "demo", "k=a=b"])) {
+            Command::Set(cfg) => {
+                assert_eq!(cfg.key, "k");
+                assert_eq!(cfg.value, "a=b");
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_set_requires_key_value() {
+        // session だけで key=value が無ければ error。
+        match parse_args(&args(&["set", "demo"])) {
+            Command::Error(msg) => assert!(msg.contains("key") && msg.contains("value")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_set_requires_session() {
+        // key=value だけで session 指定が無ければ error。
+        match parse_args(&args(&["set", "on-child-suspend=notify"])) {
+            Command::Error(msg) => assert!(msg.contains("session id") || msg.contains("socket")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_set_rejects_two_key_values() {
+        match parse_args(&args(&["set", "demo", "a=1", "b=2"])) {
+            Command::Error(msg) => assert!(msg.contains("key=value")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_set_help_routes_to_set_topic() {
+        match parse_args(&args(&["set", "--help"])) {
+            Command::Help { topic } => assert!(matches!(topic, HelpTopic::Set)),
+            other => panic!("expected Help(Set), got {other:?}"),
         }
     }
 

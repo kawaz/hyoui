@@ -221,6 +221,7 @@ explicitly (e.g. `--namespace=default`).
 | `hyoui list [--namespace=NS\|--all-namespaces]` | Enumerate active sessions (namespace-scoped) |
 | `hyoui kill <session> [--signal=NUM_OR_NAME]` | Send a signal to the child (default SIGTERM; name or number, e.g. `--signal KILL` / `--signal 9`) |
 | `hyoui status <session>` | Print session status (clients / leader / lock / scrollback) |
+| `hyoui set <session> <key>=<value>` | Change a runtime setting (e.g. `on-child-suspend=notify\|auto-resume`) |
 | `hyoui input <session> <spec>...` | Inject input via `text:` / `hex:` / `file:` / `paste:` / `key:` / `wait:` / `wait-idle:` specs |
 | `hyoui wait <session> <pattern>` | Wait until a regex matches the current visible state |
 | `hyoui screen dump <session>` | Dump the screen as ANSI bytes (terminal-replayable) |
