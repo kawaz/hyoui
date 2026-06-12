@@ -169,7 +169,10 @@ fn attach_detach_others_steals_leadership() {
 #[test]
 fn attach_exclusive_denied_when_rw_client_present() {
     let runner = HyouiTestRunner::new();
-    let session = "exclusive-denied";
+    // Fable review M3: 旧 session 名 "exclusive-denied" は stderr の socket path に
+    // 必ず含まれるため `stderr.contains("exclusive")` がトートロジーだった。
+    // 検証対象の文言と重ならない名前にして実検証にする。
+    let session = "excl-deny";
 
     // run = rw leader client が居る状態。
     let mut leader = runner.spawn_hyoui(session, &["run", "--", "sh", "-c", "sleep 60"]);
@@ -196,10 +199,12 @@ fn attach_exclusive_denied_when_rw_client_present() {
         !out.status.success(),
         "他 rw client が居るとき --exclusive は拒否されるべき"
     );
+    // Fable review M3: daemon の ErrorMessage.message が client の stderr まで
+    // 中継されること (= 旧実装は汎用「hyoui status で確認」文言に握り潰されていた)。
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("exclusive") || stderr.contains("rw client"),
-        "exclusive 拒否の理由が示されるべき。stderr={stderr:?}"
+        stderr.contains("--exclusive denied") || stderr.contains("rw client が attach 中"),
+        "daemon の exclusive 拒否理由が中継されるべき。stderr={stderr:?}"
     );
 
     // 後始末。

@@ -26,6 +26,13 @@ pub enum Error {
     /// unavailable, ...).
     #[error("precondition violated: {0}")]
     Precondition(&'static str),
+
+    /// daemon (= remote 側) が返した拒否理由をそのまま運ぶ (Fable review M3
+    /// 2026-06-12)。`Invalid` は `&'static str` 限定のため、`ErrorMessage.message`
+    /// のような動的文字列 (= 例: `attach --exclusive denied: ...`) を client の
+    /// stderr まで中継する用途で使う。
+    #[error("{0}")]
+    Remote(String),
 }
 
 /// `sys`-layer result alias.

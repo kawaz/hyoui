@@ -409,6 +409,15 @@ impl ClientConnection {
                 // 出し分ける (H2)。code は ErrorCode enum (H13) で受けるため variant
                 // match で書く。Error::Invalid は &'static str しか受け取れないので
                 // variant → static str の switch で対応する。
+                //
+                // Fable review M3 (2026-06-12): ModeNotAllowed は daemon が
+                // `ErrorMessage.message` に具体的な拒否理由 (= `--exclusive` 占有
+                // 失敗 / ro の `--detach-others` 等) を載せてくる code なので、
+                // 文言を握り潰さず `Error::Remote` でそのまま中継する (= 旧実装は
+                // 汎用 fallback の「`hyoui status` で確認して」に倒れて誤誘導だった)。
+                if matches!(e.code, ErrorCode::ModeNotAllowed) {
+                    return Err(Error::Remote(e.message));
+                }
                 return Err(Error::Invalid(match &e.code {
                     ErrorCode::LockDenied => {
                         "lock denied (= 他 client が exclusive lock を保持中。`hyoui status <session>` で lock-holder を確認、または別 session を使う)"
