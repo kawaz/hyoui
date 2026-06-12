@@ -11,12 +11,13 @@
 //! に残る、Phase B で `control.rs` へ移動予定)。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::protocol::Mode;
 use crate::protocol::messages::SessionMode;
 
 use super::broadcast::ClientHandle;
+use super::config::ChildSuspendPolicy;
 use super::record::RecordRegistry;
 
 /// session 全体の状態 (Phase 10)。lock 周りの state machine を保持する。
@@ -41,6 +42,32 @@ pub(super) struct SessionState {
     /// 内部可変 (`AtomicBool`)。auto-resume 廃止後は stopped のまま残り得るため、
     /// `status` / `list` での可観測性に使う。
     child_stopped: AtomicBool,
+    /// DR-0019 Update: 子 STOPPED 時の daemon 挙動 (= `on-child-suspend` policy)。
+    ///
+    /// 旧設計では `DaemonConfig::on_child_suspend` 固定値だったが、`hyoui set` で
+    /// **runtime 変更可能**にするため SessionState の内部可変 state に移した。
+    /// `notify_child_stopped` はここから読む。`u8` で `ChildSuspendPolicy` を
+    /// encode する (= 0=Notify / 1=AutoResume、`policy_to_u8` / `policy_from_u8`)。
+    ///
+    /// 初期値は `Default` で `Notify` (= u8=0)。daemon 起動時に config の値で
+    /// `init_child_suspend_policy` で上書きする。
+    child_suspend_policy: AtomicU8,
+}
+
+/// `ChildSuspendPolicy` を `AtomicU8` 格納用の u8 に変換する。
+fn policy_to_u8(p: ChildSuspendPolicy) -> u8 {
+    match p {
+        ChildSuspendPolicy::Notify => 0,
+        ChildSuspendPolicy::AutoResume => 1,
+    }
+}
+
+/// `AtomicU8` の値から `ChildSuspendPolicy` を復元する (= 未知値は安全側 Notify)。
+fn policy_from_u8(v: u8) -> ChildSuspendPolicy {
+    match v {
+        1 => ChildSuspendPolicy::AutoResume,
+        _ => ChildSuspendPolicy::Notify,
+    }
 }
 
 impl SessionState {
@@ -64,6 +91,24 @@ impl SessionState {
     /// DR-0017 §柱2: 子が現在 stopped と観測されているか (= `status`/`list` 用)。
     pub(super) fn child_stopped(&self) -> bool {
         self.child_stopped.load(Ordering::Relaxed)
+    }
+
+    /// DR-0019 Update: 起動時に config の `on_child_suspend` で初期化する。
+    pub(super) fn init_child_suspend_policy(&self, policy: ChildSuspendPolicy) {
+        self.child_suspend_policy
+            .store(policy_to_u8(policy), Ordering::Relaxed);
+    }
+
+    /// DR-0019 Update: `set.request` で runtime 変更する。
+    pub(super) fn set_child_suspend_policy(&self, policy: ChildSuspendPolicy) {
+        self.child_suspend_policy
+            .store(policy_to_u8(policy), Ordering::Relaxed);
+    }
+
+    /// DR-0019 Update: 現在の `on-child-suspend` policy を読む
+    /// (= `notify_child_stopped` / `status` / `list` 用)。
+    pub(super) fn child_suspend_policy(&self) -> ChildSuspendPolicy {
+        policy_from_u8(self.child_suspend_policy.load(Ordering::Relaxed))
     }
 }
 

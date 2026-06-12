@@ -18,6 +18,26 @@ pub enum ChildSuspendPolicy {
     AutoResume,
 }
 
+impl ChildSuspendPolicy {
+    /// wire / CLI 表記 (`notify` / `auto-resume`) を返す (DR-0019)。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChildSuspendPolicy::Notify => "notify",
+            ChildSuspendPolicy::AutoResume => "auto-resume",
+        }
+    }
+
+    /// wire / CLI 表記から `ChildSuspendPolicy` を引く。未知値は `None`
+    /// (= `set.request` の不正値検出に使う、DR-0019 Update)。
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "notify" => Some(ChildSuspendPolicy::Notify),
+            "auto-resume" => Some(ChildSuspendPolicy::AutoResume),
+            _ => None,
+        }
+    }
+}
+
 /// daemon 1 つ分の起動設定。
 ///
 /// `cmd` で指定した process を子 PTY として spawn し、`socket_path` で

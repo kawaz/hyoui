@@ -40,6 +40,7 @@ mod lock;
 mod record;
 mod screen;
 mod session_lifecycle;
+mod settings;
 mod status;
 mod tail;
 
@@ -66,7 +67,8 @@ pub use screen::{
 pub use session_lifecycle::{
     SessionChildResumeRequest, SessionChildStoppedNotify, SessionExitNotify,
 };
-pub use status::{ChildLiveState, ClientInfo, StatusQuery, StatusResponse};
+pub use settings::{SetAck, SetRequest};
+pub use status::{ChildLiveState, ClientInfo, OnChildSuspendPolicy, StatusQuery, StatusResponse};
 pub use tail::{TailData, TailEnd, TailEndReason, TailRequest};
 
 /// CBOR control message の全 kind を包む tagged enum。
@@ -220,6 +222,16 @@ pub enum ControlMessage {
     /// (DR-0016 §7、cap `record-v1` 要)。
     #[serde(rename = "record.list.response")]
     RecordListResponse(RecordListResponse),
+
+    /// `kind = "set.request"` — client → daemon、runtime 設定変更要求
+    /// (DR-0019 Update、cap `set-v1` 要)。
+    #[serde(rename = "set.request")]
+    SetRequest(SetRequest),
+
+    /// `kind = "set.ack"` — daemon → client、設定変更の受理 ack
+    /// (DR-0019 Update、cap `set-v1` 要)。
+    #[serde(rename = "set.ack")]
+    SetAck(SetAck),
 }
 
 /// CBOR control message の encode/decode error。
@@ -476,6 +488,8 @@ mod tests {
             lock_holder: None,
             cwd: "/Users/kawaz/work".into(),
             argv: vec!["bash".into(), "-l".into()],
+            on_child_suspend: Some(OnChildSuspendPolicy::AutoResume),
+            daemon_version: "0.6.4".into(),
         });
         assert_eq!(roundtrip(&msg), msg);
     }
@@ -806,6 +820,44 @@ mod tests {
         assert!(
             bytes.windows(needle.len()).any(|w| w == needle),
             "wire payload must contain `record.start.request` kind: {bytes:?}"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // DR-0019 Update: set.* protocol (= 2 message + cap `set-v1`)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn set_request_roundtrip_via_control_message() {
+        let msg = ControlMessage::SetRequest(SetRequest {
+            key: "on-child-suspend".into(),
+            value: "auto-resume".into(),
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn set_ack_roundtrip_via_control_message() {
+        let msg = ControlMessage::SetAck(SetAck {
+            key: "on-child-suspend".into(),
+            value: "notify".into(),
+        });
+        assert_eq!(roundtrip(&msg), msg);
+    }
+
+    #[test]
+    fn set_request_kind_wire_format() {
+        // wire 上の `kind` discriminator が dotted naming `set.request` で encode
+        // されていることを確認 (= 既存 `record.*` と同パターン)。
+        let msg = ControlMessage::SetRequest(SetRequest {
+            key: "on-child-suspend".into(),
+            value: "notify".into(),
+        });
+        let bytes = msg.encode_to_vec().expect("encode");
+        let needle = b"set.request";
+        assert!(
+            bytes.windows(needle.len()).any(|w| w == needle),
+            "wire payload must contain `set.request` kind: {bytes:?}"
         );
     }
 

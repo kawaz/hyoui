@@ -179,6 +179,16 @@ pub enum LifecycleEvent {
     /// `reason` は発火理由 ("until" / "timeout" / "idle-timeout" / "sigterm" / "sigint")。
     /// 発火後は通常の child exit 経路 (= finalize escalation → `SessionExitNotify`) に合流する。
     SessionTerminatedByCondition { reason: String, ts_unix_ms: u64 },
+    /// `set.request` で runtime 設定が変更された瞬間 (DR-0019 Update)。
+    ///
+    /// 「誰がいつ何を変えたか」を追えるようにする (= record の lifecycle event)。
+    /// `key` / `value` は適用後の正規値、`changed_by_client_id` は要求元 client。
+    PolicyChanged {
+        key: String,
+        value: String,
+        changed_by_client_id: u64,
+        ts_unix_ms: u64,
+    },
 }
 
 /// sink push される event (DR-0016 §3 / §4 / §6)。
@@ -1086,6 +1096,19 @@ fn encode_lifecycle(seq: u32, ev: &LifecycleEvent) -> serde_json::Value {
             "seq": seq,
             "ev": "session-terminated-by-condition",
             "reason": reason,
+        }),
+        LifecycleEvent::PolicyChanged {
+            key,
+            value,
+            changed_by_client_id,
+            ts_unix_ms,
+        } => json!({
+            "ts_unix_ms": ts_unix_ms,
+            "seq": seq,
+            "ev": "policy-changed",
+            "key": key,
+            "value": value,
+            "changed_by_client_id": changed_by_client_id,
         }),
     }
 }

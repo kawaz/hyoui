@@ -1547,6 +1547,7 @@ mod tests {
                 "session-exit-v1".into(),
                 "child-state-v1".into(),
                 "record-v1".into(),
+                "set-v1".into(),
             ]
         );
         assert!(conn.response.leader);

@@ -359,6 +359,9 @@ impl Session {
         let mut clients: Vec<ClientHandle> = Vec::new();
         let mut next_client_id: u64 = 0;
         let mut state = SessionState::default();
+        // DR-0019 Update: on-child-suspend policy は runtime 変更可能 (= `hyoui set`)。
+        // 起動時 config 値で初期化し、以降は SessionState 内の atomic を正本とする。
+        state.init_child_suspend_policy(config.on_child_suspend);
         let mut scrollback = Scrollback::new(config.scrollback_bytes);
         // DR-0013 Phase B: daemon が screen state の正本を保持する。
         // 子 PTY bytes は本 state に流し込んでから broadcast / wait / tail に
@@ -947,9 +950,12 @@ fn notify_child_stopped(
     clients: &mut [ClientHandle],
     state: &SessionState,
     sig_observed: i32,
-    policy: ChildSuspendPolicy,
 ) -> Vec<u64> {
     use crate::protocol::messages::SessionChildStoppedNotify;
+
+    // DR-0019 Update: policy は runtime 変更可能なので SessionState から読む
+    // (= `hyoui set` で変更された最新値を反映)。
+    let policy = state.child_suspend_policy();
 
     // 子が stopped であることを記録 (= status/list の可観測性、DR-0017 §柱2)。
     // AutoResume でも一旦立てる (= 直後の SIGCONT で Continued 観測時に下りる)。
@@ -1280,13 +1286,7 @@ fn serve_loop(
                 }
                 match transition {
                     Some(ChildTransition::Stopped { sig }) => {
-                        let overflow = notify_child_stopped(
-                            child,
-                            clients,
-                            state,
-                            sig,
-                            config.on_child_suspend,
-                        );
+                        let overflow = notify_child_stopped(child, clients, state, sig);
                         overflow_ids.extend(overflow);
                     }
                     Some(ChildTransition::Continued) => record_child_continued(state, child),
@@ -1308,13 +1308,7 @@ fn serve_loop(
                     }
                     match transition {
                         Some(ChildTransition::Stopped { sig }) => {
-                            let overflow = notify_child_stopped(
-                                child,
-                                clients,
-                                state,
-                                sig,
-                                config.on_child_suspend,
-                            );
+                            let overflow = notify_child_stopped(child, clients, state, sig);
                             overflow_ids.extend(overflow);
                         }
                         Some(ChildTransition::Continued) => record_child_continued(state, child),
@@ -1414,8 +1408,7 @@ fn serve_loop(
             }
             match transition {
                 Some(ChildTransition::Stopped { sig }) => {
-                    let overflow =
-                        notify_child_stopped(child, clients, state, sig, config.on_child_suspend);
+                    let overflow = notify_child_stopped(child, clients, state, sig);
                     overflow_ids.extend(overflow);
                 }
                 Some(ChildTransition::Continued) => record_child_continued(state, child),
@@ -1464,13 +1457,7 @@ fn serve_loop(
                     let (child_state, transition) = lifecycle.poll_with_transition(child);
                     match transition {
                         Some(ChildTransition::Stopped { sig }) => {
-                            let overflow = notify_child_stopped(
-                                child,
-                                clients,
-                                state,
-                                sig,
-                                config.on_child_suspend,
-                            );
+                            let overflow = notify_child_stopped(child, clients, state, sig);
                             overflow_ids.extend(overflow);
                         }
                         Some(ChildTransition::Continued) => record_child_continued(state, child),
@@ -1546,13 +1533,7 @@ fn serve_loop(
                     let (child_state, transition) = lifecycle.poll_with_transition(child);
                     match transition {
                         Some(ChildTransition::Stopped { sig }) => {
-                            let overflow = notify_child_stopped(
-                                child,
-                                clients,
-                                state,
-                                sig,
-                                config.on_child_suspend,
-                            );
+                            let overflow = notify_child_stopped(child, clients, state, sig);
                             overflow_ids.extend(overflow);
                         }
                         Some(ChildTransition::Continued) => record_child_continued(state, child),
@@ -2086,13 +2067,8 @@ mod tests {
         // leader 不在 (= clients 空) で notify_child_stopped を呼ぶ。
         let state = SessionState::default();
         let mut clients: Vec<ClientHandle> = Vec::new();
-        let overflow = notify_child_stopped(
-            child,
-            &mut clients,
-            &state,
-            Signal::SIGTSTP as i32,
-            ChildSuspendPolicy::Notify,
-        );
+        // policy は SessionState default (= Notify)。
+        let overflow = notify_child_stopped(child, &mut clients, &state, Signal::SIGTSTP as i32);
         assert!(overflow.is_empty(), "no leader = no notify overflow");
 
         // DR-0017: stopped 観測フラグが立つ (= 可観測性)。

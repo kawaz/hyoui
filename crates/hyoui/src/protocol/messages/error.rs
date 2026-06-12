@@ -99,6 +99,12 @@ pub enum ErrorCode {
     /// `record.not-found` — `record.stop.request.record_id` に該当する active
     /// record が存在しない (DR-0016 §7)。
     RecordNotFound,
+    /// `set.invalid-key` — `set.request.key` が未知 (= daemon が解釈できない設定 key、
+    /// DR-0019 Update)。
+    SetInvalidKey,
+    /// `set.invalid-value` — `set.request.value` が当該 key で不正
+    /// (= 例: `on-child-suspend` に `notify`/`auto-resume` 以外、DR-0019 Update)。
+    SetInvalidValue,
     /// 未知の error code。wire 上の dotted text を保持する。
     ///
     /// 前方互換のため、新しい daemon / client が将来追加した code を
@@ -134,6 +140,8 @@ impl ErrorCode {
             ErrorCode::RecordInvalidPromptPattern => "record.invalid-prompt-pattern",
             ErrorCode::RecordLimitExceeded => "record.limit-exceeded",
             ErrorCode::RecordNotFound => "record.not-found",
+            ErrorCode::SetInvalidKey => "set.invalid-key",
+            ErrorCode::SetInvalidValue => "set.invalid-value",
             ErrorCode::Unknown(s) => s.as_str(),
         }
     }
@@ -165,6 +173,8 @@ impl ErrorCode {
             "record.invalid-prompt-pattern" => ErrorCode::RecordInvalidPromptPattern,
             "record.limit-exceeded" => ErrorCode::RecordLimitExceeded,
             "record.not-found" => ErrorCode::RecordNotFound,
+            "set.invalid-key" => ErrorCode::SetInvalidKey,
+            "set.invalid-value" => ErrorCode::SetInvalidValue,
             other => ErrorCode::Unknown(other.to_string()),
         }
     }
@@ -251,6 +261,8 @@ mod tests {
             ),
             (ErrorCode::RecordLimitExceeded, "record.limit-exceeded"),
             (ErrorCode::RecordNotFound, "record.not-found"),
+            (ErrorCode::SetInvalidKey, "set.invalid-key"),
+            (ErrorCode::SetInvalidValue, "set.invalid-value"),
         ];
 
         for (variant, wire) in known {

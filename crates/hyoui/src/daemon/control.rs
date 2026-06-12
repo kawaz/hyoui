@@ -50,7 +50,6 @@ use crate::scrollback::Scrollback;
 use crate::sys::clock::now_unix_ms;
 use crate::sys::{FdExt, Pty, WriteError};
 
-use super::DaemonConfig;
 use super::broadcast::{ClientHandle, broadcast_control, send_control};
 use super::lock::{SessionState, generate_lock_token};
 use super::record::{
@@ -63,6 +62,7 @@ use super::screen::{
 };
 use super::session::RelayOutcome;
 use super::tail::handle_tail_request;
+use super::{ChildSuspendPolicy, DaemonConfig};
 
 // === Tunables ===
 
@@ -286,6 +286,7 @@ pub(super) fn handle_control_message(
             handle_record_stop_all_request(idx, clients, state)
         }
         ControlMessage::RecordListRequest(_req) => handle_record_list_request(idx, clients, state),
+        ControlMessage::SetRequest(req) => handle_set_request(idx, req, clients, state),
         // daemon → client 方向のはずの message が client → daemon に来た or 未実装 kind。
         // DR-0008 §3.2 「未知 kind は decode error」だが、ここに来るのは serde で既知
         // variant なので decode 段階では catch されない。protocol violation として
@@ -306,7 +307,8 @@ pub(super) fn handle_control_message(
         | ControlMessage::SessionChildStoppedNotify(_)
         | ControlMessage::RecordStartResponse(_)
         | ControlMessage::RecordStopResponse(_)
-        | ControlMessage::RecordListResponse(_) => reject_unexpected_kind(idx, clients),
+        | ControlMessage::RecordListResponse(_)
+        | ControlMessage::SetAck(_) => reject_unexpected_kind(idx, clients),
     }
 }
 
@@ -1095,9 +1097,106 @@ fn handle_status_query(
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "/".to_string()),
         argv: config.cmd.clone(),
+        // DR-0019 Update: policy は runtime 変更可能なので SessionState の現在値を載せる
+        // (= config 固定値ではない)。`hyoui set` 後は変更後の値が反映される。
+        // 新 daemon は必ず Some (= None は「field を送らない旧 daemon」専用)。
+        on_child_suspend: Some(match state.child_suspend_policy() {
+            ChildSuspendPolicy::Notify => crate::protocol::messages::OnChildSuspendPolicy::Notify,
+            ChildSuspendPolicy::AutoResume => {
+                crate::protocol::messages::OnChildSuspendPolicy::AutoResume
+            }
+        }),
+        // DR-0019 Update: daemon 自身のバイナリ version (= 人間の診断用)。
+        daemon_version: env!("CARGO_PKG_VERSION").to_string(),
     };
     let _ = send_control(&clients[idx], ControlMessage::StatusResponse(resp));
     ClientFrameOutcome::Continue
+}
+
+/// `ControlMessage::SetRequest` を処理する (DR-0019 Update、cap `set-v1`)。
+///
+/// 汎用 key=value の runtime 設定変更。Ro 以外の書き込み可能 client (= Rw /
+/// RwNoLeader) なら誰でも変更可 (= leader 限定にしない)。
+///
+/// - cap `set-v1` 未保持 → `UnsupportedCapability`
+/// - mode が Ro → `ModeNotAllowed` (= 観察者は変更不可、Rw / RwNoLeader は OK)
+/// - 未知 key → `SetInvalidKey`
+/// - 不正 value → `SetInvalidValue`
+/// - 成功 → SessionState を更新 + lifecycle event `PolicyChanged` を push + `SetAck` を返す
+///
+/// 初期サポート key は `on-child-suspend` のみ (値 `notify` / `auto-resume`)。
+/// 将来の runtime 設定は本 handler の match 枝を増やすだけで載る。
+///
+/// **反映タイミング (= happened-before)**: `SetAck` は「適用完了」を意味する。
+/// serve loop は child transition (= stop 観測) を client frame より先に処理する
+/// 意図的な順序のため、**ack より前に daemon が観測済みの child stop は旧 policy で
+/// 処理され得る**。新 policy が効くのは ack 以降に観測される stop から。
+fn handle_set_request(
+    idx: usize,
+    req: crate::protocol::messages::SetRequest,
+    clients: &mut [ClientHandle],
+    state: &SessionState,
+) -> ClientFrameOutcome {
+    let ch = &clients[idx];
+    if ensure_cap(ch, "set-v1", "set.request requires `set-v1` cap").is_err() {
+        return ClientFrameOutcome::Continue;
+    }
+    // Ro のみ拒否 (= Rw / RwNoLeader は OK)。set は「子への書き込み」ではなく
+    // daemon 設定の変更だが、観察者 (Ro) に session の挙動を変えさせない境界は
+    // signal 送信 (= ensure_not_ro) と同じ。
+    if ensure_not_ro(ch, "set requires a writable mode (= rw / rw-no-leader)").is_err() {
+        return ClientFrameOutcome::Continue;
+    }
+    let client_id = ch.id;
+
+    // 設定 key の dispatch。現状 `on-child-suspend` のみ。
+    match req.key.as_str() {
+        "on-child-suspend" => {
+            let Some(policy) = ChildSuspendPolicy::from_wire(&req.value) else {
+                let _ = send_control(
+                    &clients[idx],
+                    ControlMessage::Error(ErrorMessage {
+                        code: ErrorCode::SetInvalidValue,
+                        message: format!(
+                            "invalid value for on-child-suspend: {} (expected notify|auto-resume)",
+                            req.value
+                        ),
+                        details: None,
+                    }),
+                );
+                return ClientFrameOutcome::Continue;
+            };
+            state.set_child_suspend_policy(policy);
+            // 誰がいつ何を変えたか追える lifecycle event (DR-0019 Update)。
+            state
+                .record_registry
+                .push_lifecycle(LifecycleEvent::PolicyChanged {
+                    key: "on-child-suspend".to_string(),
+                    value: policy.as_str().to_string(),
+                    changed_by_client_id: client_id,
+                    ts_unix_ms: now_unix_ms(),
+                });
+            let _ = send_control(
+                &clients[idx],
+                ControlMessage::SetAck(crate::protocol::messages::SetAck {
+                    key: "on-child-suspend".to_string(),
+                    value: policy.as_str().to_string(),
+                }),
+            );
+            ClientFrameOutcome::Continue
+        }
+        other => {
+            let _ = send_control(
+                &clients[idx],
+                ControlMessage::Error(ErrorMessage {
+                    code: ErrorCode::SetInvalidKey,
+                    message: format!("unknown set key: {other}"),
+                    details: None,
+                }),
+            );
+            ClientFrameOutcome::Continue
+        }
+    }
 }
 
 /// daemon → client 方向のはずの message が client → daemon に来た or 未実装 kind を
@@ -1764,5 +1863,186 @@ mod tests {
             matches!(status, WaitStatus::Exited(_, 0)),
             "exit must be observable exactly once by the lifecycle path, got {status:?}"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // DR-0019 Update: `set.request` handler (= on-child-suspend runtime 変更)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// `set-v1` cap + `Rw` mode を持つ test 用 `ClientHandle`。
+    fn set_test_client(caps: Vec<String>, mode: Mode) -> (ClientHandle, Receiver<SharedBytes>) {
+        let (tx, rx) = std::sync::mpsc::channel::<SharedBytes>();
+        let (_a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let ch = ClientHandle {
+            id: 5,
+            mode,
+            leader: false,
+            subscription: Subscription::Raw,
+            negotiated_caps: caps,
+            writer_tx: tx,
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            buffer_limit: 1 << 20,
+            writer_thread: None,
+            reader: b,
+        };
+        (ch, rx)
+    }
+
+    fn set_req(value: &str) -> crate::protocol::messages::SetRequest {
+        crate::protocol::messages::SetRequest {
+            key: "on-child-suspend".into(),
+            value: value.into(),
+        }
+    }
+
+    /// rw + set-v1 で `auto-resume` を set → SessionState の policy が更新され、
+    /// SetAck が返り、lifecycle event `policy-changed` が記録される。
+    #[test]
+    fn set_on_child_suspend_updates_state_and_acks() {
+        let state = SessionState::default();
+        // default は Notify。
+        assert_eq!(state.child_suspend_policy(), ChildSuspendPolicy::Notify);
+        let (mut ch, rx) = set_test_client(vec!["set-v1".into()], Mode::Rw);
+        let clients = std::slice::from_mut(&mut ch);
+
+        let outcome = handle_set_request(0, set_req("auto-resume"), clients, &state);
+        assert!(matches!(outcome, ClientFrameOutcome::Continue));
+
+        // state が更新されている (= runtime 変更が実効)。
+        assert_eq!(state.child_suspend_policy(), ChildSuspendPolicy::AutoResume);
+
+        // SetAck が返る。
+        match recv_control_from_queue(&rx) {
+            ControlMessage::SetAck(ack) => {
+                assert_eq!(ack.key, "on-child-suspend");
+                assert_eq!(ack.value, "auto-resume");
+            }
+            other => panic!("expected SetAck, got {other:?}"),
+        }
+    }
+
+    /// `set` 成功時に lifecycle event `policy-changed` が record sink (jsonl) に
+    /// 書かれる (= 「誰がいつ変えたか追える」要件の固定。push_lifecycle は sink 無し
+    /// だと no-op なので、record を張った上で実出力を検証する)。
+    #[test]
+    fn set_on_child_suspend_records_policy_changed_lifecycle_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("set.jsonl");
+        let state = SessionState::default();
+        let id = start_record(&state, &path);
+        let (mut ch, rx) = set_test_client(vec!["set-v1".into()], Mode::Rw);
+        let clients = std::slice::from_mut(&mut ch);
+
+        handle_set_request(0, set_req("auto-resume"), clients, &state);
+        // ack を drain (= enqueue 確認も兼ねる)。
+        let _ = recv_control_from_queue(&rx);
+        state.record_registry.stop(id).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let line = content
+            .lines()
+            .find(|l| l.contains("policy-changed"))
+            .expect("policy-changed lifecycle event must be written to jsonl");
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["ev"], "policy-changed");
+        assert_eq!(v["key"], "on-child-suspend");
+        assert_eq!(v["value"], "auto-resume");
+        assert_eq!(v["changed_by_client_id"], 5); // set_test_client の id
+    }
+
+    /// 不正値は `SetInvalidValue` で reject、state は変わらない。
+    #[test]
+    fn set_on_child_suspend_invalid_value_rejected() {
+        let state = SessionState::default();
+        let (mut ch, rx) = set_test_client(vec!["set-v1".into()], Mode::Rw);
+        let clients = std::slice::from_mut(&mut ch);
+
+        handle_set_request(0, set_req("bogus"), clients, &state);
+
+        assert_eq!(
+            state.child_suspend_policy(),
+            ChildSuspendPolicy::Notify,
+            "invalid value must not mutate state"
+        );
+        match recv_control_from_queue(&rx) {
+            ControlMessage::Error(e) => assert_eq!(e.code, ErrorCode::SetInvalidValue),
+            other => panic!("expected Error(SetInvalidValue), got {other:?}"),
+        }
+    }
+
+    /// 未知 key は `SetInvalidKey` で reject。
+    #[test]
+    fn set_unknown_key_rejected() {
+        let state = SessionState::default();
+        let (mut ch, rx) = set_test_client(vec!["set-v1".into()], Mode::Rw);
+        let clients = std::slice::from_mut(&mut ch);
+
+        handle_set_request(
+            0,
+            crate::protocol::messages::SetRequest {
+                key: "no-such-key".into(),
+                value: "x".into(),
+            },
+            clients,
+            &state,
+        );
+        match recv_control_from_queue(&rx) {
+            ControlMessage::Error(e) => assert_eq!(e.code, ErrorCode::SetInvalidKey),
+            other => panic!("expected Error(SetInvalidKey), got {other:?}"),
+        }
+    }
+
+    /// cap `set-v1` 未保持は `UnsupportedCapability` で reject。
+    #[test]
+    fn set_without_cap_rejected() {
+        let state = SessionState::default();
+        let (mut ch, rx) = set_test_client(vec!["data".into()], Mode::Rw);
+        let clients = std::slice::from_mut(&mut ch);
+
+        handle_set_request(0, set_req("auto-resume"), clients, &state);
+        assert_eq!(state.child_suspend_policy(), ChildSuspendPolicy::Notify);
+        match recv_control_from_queue(&rx) {
+            ControlMessage::Error(e) => assert_eq!(e.code, ErrorCode::UnsupportedCapability),
+            other => panic!("expected Error(UnsupportedCapability), got {other:?}"),
+        }
+    }
+
+    /// RwNoLeader は set 可 (= Ro 以外の書き込み可能 client なら誰でも変更できる。
+    /// leader を取らない自動化 client が policy を直すユースケース)。
+    #[test]
+    fn set_rw_no_leader_mode_allowed() {
+        let state = SessionState::default();
+        let (mut ch, rx) = set_test_client(vec!["set-v1".into()], Mode::RwNoLeader);
+        let clients = std::slice::from_mut(&mut ch);
+
+        handle_set_request(0, set_req("auto-resume"), clients, &state);
+
+        assert_eq!(
+            state.child_suspend_policy(),
+            ChildSuspendPolicy::AutoResume,
+            "RwNoLeader client must be able to change policy"
+        );
+        match recv_control_from_queue(&rx) {
+            ControlMessage::SetAck(ack) => {
+                assert_eq!(ack.key, "on-child-suspend");
+                assert_eq!(ack.value, "auto-resume");
+            }
+            other => panic!("expected SetAck, got {other:?}"),
+        }
+    }
+
+    /// Ro mode は `ModeNotAllowed` で reject (= 書き込み権限が必要)。
+    #[test]
+    fn set_ro_mode_rejected() {
+        let state = SessionState::default();
+        let (mut ch, rx) = set_test_client(vec!["set-v1".into()], Mode::Ro);
+        let clients = std::slice::from_mut(&mut ch);
+
+        handle_set_request(0, set_req("auto-resume"), clients, &state);
+        assert_eq!(state.child_suspend_policy(), ChildSuspendPolicy::Notify);
+        match recv_control_from_queue(&rx) {
+            ControlMessage::Error(e) => assert_eq!(e.code, ErrorCode::ModeNotAllowed),
+            other => panic!("expected Error(ModeNotAllowed), got {other:?}"),
+        }
     }
 }

@@ -26,6 +26,9 @@ use std::collections::BTreeSet;
 /// - `"record-v1"`: `record.*` messages (DR-0016 §7、tty I/O timeline 録画。
 ///   **optional cap** — daemon は default で advertise、client は negotiate で
 ///   得たら使う。未 cap の client が他機能を使うのは無影響)
+/// - `"set-v1"`: `set.request` / `set.ack` messages (DR-0019 Update、runtime 設定
+///   変更。新 client → 旧 daemon は cap intersect でこの cap が落ちるため、CLI は
+///   「daemon が set 未対応」と判定して明示エラーにする)
 pub const MVP_CAPS: &[&str] = &[
     "data",
     "lock",
@@ -35,6 +38,7 @@ pub const MVP_CAPS: &[&str] = &[
     "session-exit-v1",
     "child-state-v1",
     "record-v1",
+    "set-v1",
 ];
 
 /// 2 つの cap 集合の intersect を取って `Vec<String>` で返す。
@@ -87,6 +91,7 @@ mod tests {
         assert!(MVP_CAPS.contains(&"session-exit-v1"));
         assert!(MVP_CAPS.contains(&"child-state-v1"));
         assert!(MVP_CAPS.contains(&"record-v1"));
+        assert!(MVP_CAPS.contains(&"set-v1"));
     }
 
     /// wait-l0 cap は DR-0006 §9 改訂 (state-based wait 移行) に伴い削除済。

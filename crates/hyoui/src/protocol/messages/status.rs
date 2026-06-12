@@ -12,6 +12,32 @@ use super::Mode;
 #[serde(rename_all = "kebab-case")]
 pub struct StatusQuery {}
 
+/// `on-child-suspend` policy の wire 表現 (= `status` / `list` で可視化、DR-0019 Update)。
+///
+/// daemon 側 `ChildSuspendPolicy` と 1:1 だが、protocol 層が daemon 層に依存しない
+/// よう独立した型を持つ。`StatusResponse` 上は `Option<OnChildSuspendPolicy>` で運び、
+/// field を送らない旧 daemon は `None` (= unknown) になる — 既定値に倒すと実際と
+/// 逆の値を断定表示しうるため、Default は意図的に持たない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum OnChildSuspendPolicy {
+    /// leader に通知のみ (= 子を起こさない、DR-0017 default)。
+    Notify,
+    /// daemon が即座に SIGCONT で子を復帰させる。
+    AutoResume,
+}
+
+impl OnChildSuspendPolicy {
+    /// wire / 表示用の文字列 (`notify` / `auto-resume`)。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OnChildSuspendPolicy::Notify => "notify",
+            OnChildSuspendPolicy::AutoResume => "auto-resume",
+        }
+    }
+}
+
 /// 1 client の情報 (status.response の clients 配列要素)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -127,6 +153,23 @@ pub struct StatusResponse {
     /// 必須 field。daemon は argv なしで起動しない (= 空 `Vec` は invalid value)。
     /// `hyoui list` で「何の process が動いているか」を識別する用途。
     pub argv: Vec<String>,
+    /// 現在の `on-child-suspend` policy (= `notify` / `auto-resume`、DR-0019 Update)。
+    ///
+    /// `hyoui set` で runtime 変更されうるため、daemon は **現在の実効値** を
+    /// `Some(...)` で載せる。field を送らない旧 daemon は `None` に倒れ、CLI は
+    /// `-` (unknown) 表示にする。`Option` で「不明」を構造的に表現する理由:
+    /// 既定値 `Notify` に倒すと、released 0.6.3 daemon (= boot 時 policy 対応済・
+    /// 報告未対応) を `auto-resume` で起動した worker に対して **実際と逆の値を
+    /// 断定表示**してしまい、本機能の決定根拠 (= 旧バイナリ事故の検出) と正面衝突する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_child_suspend: Option<OnChildSuspendPolicy>,
+    /// daemon バイナリの version (= `env!("CARGO_PKG_VERSION")`、DR-0019 Update)。
+    ///
+    /// 人間の診断用 (= 「PATH の旧バイナリで worker を起動して policy が no-op」事故の
+    /// 検出)。serde default は空文字で、field を送らない旧 daemon は CLI 側で `-` 表示
+    /// に倒れる (= それ自体が「古い daemon」のシグナル)。
+    #[serde(default)]
+    pub daemon_version: String,
 }
 
 #[cfg(test)]
@@ -176,5 +219,43 @@ mod tests {
     #[test]
     fn child_live_state_default_is_running() {
         assert_eq!(ChildLiveState::default(), ChildLiveState::Running);
+    }
+
+    /// `OnChildSuspendPolicy` の wire 文字列表現。
+    #[test]
+    fn on_child_suspend_policy_as_str() {
+        assert_eq!(OnChildSuspendPolicy::Notify.as_str(), "notify");
+        assert_eq!(OnChildSuspendPolicy::AutoResume.as_str(), "auto-resume");
+    }
+
+    /// DR-0019 Update: 旧 daemon の StatusResponse (= `on-child-suspend` /
+    /// `daemon-version` field 無し) を decode しても壊れず、policy=None (= unknown、
+    /// CLI は `-` 表示) / version="" に倒れる。既定値 `Notify` に倒さない (= 実際と
+    /// 逆の値を断定表示しない、M3)。
+    #[test]
+    fn legacy_status_response_without_new_fields_decodes_with_defaults() {
+        use ciborium::Value;
+        // 新 2 field を含まない古い StatusResponse map を手で組み立てる。
+        let map = Value::Map(vec![
+            (Value::Text("session-id".into()), Value::Text("demo".into())),
+            (Value::Text("daemon-pid".into()), Value::Integer(999.into())),
+            (Value::Text("child-stopped".into()), Value::Bool(false)),
+            (Value::Text("clients".into()), Value::Array(vec![])),
+            (
+                Value::Text("scrollback-bytes".into()),
+                Value::Integer(0.into()),
+            ),
+            (Value::Text("cwd".into()), Value::Text("/".into())),
+            (
+                Value::Text("argv".into()),
+                Value::Array(vec![Value::Text("sh".into())]),
+            ),
+        ]);
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&map, &mut bytes).expect("encode legacy");
+        let decoded: StatusResponse = ciborium::de::from_reader(bytes.as_slice())
+            .expect("legacy StatusResponse must decode with serde defaults");
+        assert_eq!(decoded.on_child_suspend, None);
+        assert_eq!(decoded.daemon_version, "");
     }
 }
