@@ -298,10 +298,38 @@ fn finalize_accepted_client(
     let _ = writer_main.set_read_timeout(None);
     let _ = writer_main.set_write_timeout(None);
 
+    // handshake 段の attach 拒否 helper (= error response を client に送って Err を
+    // 返す。process_pending_handshakes が drop で完了させ、client は push されない)。
+    let reject = |writer_main: &mut UnixStream, message: &str, why: &'static str| {
+        use crate::protocol::messages::{ErrorCode, ErrorMessage};
+        let body = ControlMessage::Error(ErrorMessage {
+            code: ErrorCode::ModeNotAllowed,
+            message: message.into(),
+            details: None,
+        })
+        .encode_to_vec()
+        .map_err(|_| Error::Invalid("handshake reject encode failed"))?;
+        Frame::cbor_control(body)
+            .encode_to(writer_main)
+            .map_err(|_| Error::Invalid("handshake reject frame encode failed"))?;
+        Err::<(), Error>(Error::Invalid(why))
+    };
+
+    // Fable review M2 (2026-06-12): `--detach-others` (= 他 client の奪取) は破壊的
+    // 操作なので Ro 観察者には許さない (= `Detach{Others/All}` の ensure_not_ro と
+    // 同じ権限ゲートを handshake 経路にも適用)。
+    if req.detach_others && matches!(req.mode, crate::protocol::Mode::Ro) {
+        reject(
+            &mut writer_main,
+            "attach --detach-others denied: read-only client は他 client を奪取できません \
+             (= rw / rw-no-leader で attach してください)。",
+            "attach --detach-others denied (ro client)",
+        )?;
+    }
+
     // DR-0020 §4 / docs/issue/2026-06-12: `--exclusive` (= 自分以外の rw client が
     // 居る場合は attach を拒否)。rw client = 書き込み権を持つ client (= Mode::Rw /
-    // RwNoLeader、Ro 観察者は除外)。拒否時は error response を送って Err を返し、
-    // process_pending_handshakes が drop で完了させる (= client は push されない)。
+    // RwNoLeader、Ro 観察者は除外)。
     //
     // Semantics (codex review 2026-06-12): exclusive は **attach 時点のスナップショット
     // 判定** であり、成立後の継続的な占有保証 (= 後着 rw を弾き続ける) はしない
@@ -310,29 +338,24 @@ fn finalize_accepted_client(
     // pending は mode 未確定 (= worker が HandshakeRequest を受信処理中) のため、
     // rw か ro か判別できず **安全側 (= 拒否) に倒す**。これにより「pending 中の rw が
     // 後から成立して exclusive が素通り」する判定漏れを防ぐ。
-    if req.exclusive {
+    //
+    // Fable review Minor2 (2026-06-12): `--detach-others` 併用時は exclusive 判定を
+    // **スキップ** する (= 奪取 → 占有の順)。併用の意味は「排他的に乗っ取る」が自然
+    // であり、奪取が先に立つ以上、既存 rw / pending の存在は拒否理由にならない
+    // (= 奪取後は自分だけが残るので占有は自動的に成立する)。
+    if req.exclusive && !req.detach_others {
         use crate::protocol::Mode;
         let other_rw = clients
             .iter()
             .any(|c| matches!(c.mode, Mode::Rw | Mode::RwNoLeader));
         if other_rw || other_pending > 0 {
-            use crate::protocol::messages::{ErrorCode, ErrorMessage};
-            let body = ControlMessage::Error(ErrorMessage {
-                code: ErrorCode::ModeNotAllowed,
-                message: "attach --exclusive denied: 他に rw client が attach 中、\
-                          または handshake 進行中の接続があります (= 占有要求を満たせない)。\
-                          --detach-others で奪取するか、他 client が抜けてから再試行してください。"
-                    .into(),
-                details: None,
-            })
-            .encode_to_vec()
-            .map_err(|_| Error::Invalid("exclusive-denied error encode failed"))?;
-            Frame::cbor_control(body)
-                .encode_to(&mut writer_main)
-                .map_err(|_| Error::Invalid("exclusive-denied error frame encode failed"))?;
-            return Err(Error::Invalid(
+            reject(
+                &mut writer_main,
+                "attach --exclusive denied: 他に rw client が attach 中、\
+                 または handshake 進行中の接続があります (= 占有要求を満たせない)。\
+                 --detach-others で奪取するか、他 client が抜けてから再試行してください。",
                 "attach --exclusive denied (other rw client or pending handshake present)",
-            ));
+            )?;
         }
     }
 
@@ -805,5 +828,81 @@ mod tests {
             pending.is_empty(),
             "--detach-others は in-flight pending もキャンセルする (= 奪取のすり抜け防止)"
         );
+    }
+
+    /// 確立済 client を直接組み立てる test helper (= writer thread 無しの素の mpsc)。
+    fn established_client(id: u64, mode: Mode) -> ClientHandle {
+        let (tx, _rx_keep) = std::sync::mpsc::channel::<SharedBytes>();
+        // _rx_keep を leak して channel を開いたままにする (= send_control が
+        // closed channel error にならないように。leak は test process 終了で回収)。
+        std::mem::forget(_rx_keep);
+        let (_a, b) = UnixStream::pair().expect("pair");
+        ClientHandle {
+            id,
+            mode,
+            leader: matches!(mode, Mode::Rw),
+            subscription: Subscription::Raw,
+            negotiated_caps: Vec::new(),
+            writer_tx: tx,
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            buffer_limit: 1 << 20,
+            writer_thread: None,
+            reader: b,
+            connected_at_unix_ms: 0,
+        }
+    }
+
+    /// Fable review M2 regression: Ro 観察者の `--detach-others` は handshake 段で
+    /// 拒否され、既存 client は drop されない。
+    #[test]
+    fn detach_others_denied_for_ro_client() {
+        let req = HandshakeRequest {
+            caps: Vec::new(),
+            mode: Mode::Ro,
+            exclusive: false,
+            detach_others: true,
+            token: None,
+        };
+        let (ro_stealer, _pw, _pr) = make_completed_pending(req);
+        let mut pending = vec![ro_stealer];
+        let mut clients = vec![established_client(10, Mode::Rw)];
+        let _ = run_process(&mut pending, &mut clients);
+
+        assert_eq!(
+            clients.len(),
+            1,
+            "ro の --detach-others は拒否され、既存 rw client は drop されない"
+        );
+        assert_eq!(clients[0].id, 10, "既存 client がそのまま残る");
+        assert!(pending.is_empty(), "拒否された handshake は drop で完了");
+    }
+
+    /// Fable review Minor2 regression: `--exclusive --detach-others` 併用 =
+    /// 「排他的に乗っ取る」(= 奪取 → 占有の順)。既存 rw client が居ても exclusive
+    /// 判定で拒否されず、奪取が成立して既存 client が drop される。
+    #[test]
+    fn exclusive_with_detach_others_steals_instead_of_denying() {
+        let req = HandshakeRequest {
+            caps: Vec::new(),
+            mode: Mode::Rw,
+            exclusive: true,
+            detach_others: true,
+            token: None,
+        };
+        let (combo, _pw, _pr) = make_completed_pending(req);
+        let mut pending = vec![combo];
+        let mut clients = vec![established_client(10, Mode::Rw)];
+        let _ = run_process(&mut pending, &mut clients);
+
+        assert_eq!(
+            clients.len(),
+            1,
+            "併用は exclusive 拒否でなく奪取が成立する (= 奪取 → 占有の順)"
+        );
+        assert_ne!(
+            clients[0].id, 10,
+            "既存 client は奪取で drop され、新 client が残る"
+        );
+        assert!(clients[0].leader, "奪取側が leader を取る");
     }
 }

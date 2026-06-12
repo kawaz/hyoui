@@ -528,6 +528,19 @@ fn handle_detach_target(
     clients: &mut [ClientHandle],
 ) -> ClientFrameOutcome {
     use crate::protocol::messages::DetachTarget;
+    // Fable review M2 (2026-06-12): Others/All は他 client を引き剥がす破壊的操作
+    // なので Signal と同じ権限ゲート (= Rw / RwNoLeader 可、Ro 観察者は不可) を
+    // 適用する。Myself は自分が抜けるだけなので mode 不問 (= 従来通り)。
+    if !matches!(detach.target, DetachTarget::Myself)
+        && ensure_not_ro(
+            &clients[idx],
+            "detach target=others/all requires rw mode (= read-only client cannot \
+             detach other clients)",
+        )
+        .is_err()
+    {
+        return ClientFrameOutcome::Continue;
+    }
     match detach.target {
         DetachTarget::Myself => ClientFrameOutcome::DropClient,
         DetachTarget::Others => {
@@ -1700,7 +1713,7 @@ mod tests {
     }
 
     /// detach target 別に「drop 対象 client index 集合 + pending キャンセル」が正しいか
-    /// (DR-0020 §4 + codex review 2026-06-12)。3 client・self_idx=1 (= 中央) で:
+    /// (DR-0020 §4 + codex review 2026-06-12)。3 client・self_idx=1 (= 中央、rw) で:
     /// - Myself → 自分のみ ([1])、pending 不干渉
     /// - Others → 自分以外全部 ([0, 2]) + pending キャンセル
     /// - All    → 全部 ([0, 1, 2]) + pending キャンセル
@@ -1710,7 +1723,9 @@ mod tests {
 
         let make_clients = || {
             let (c0, _r0) = record_test_client();
-            let (c1, _r1) = record_test_client();
+            // self (= idx 1) は rw (= Others/All の権限ゲートを通す、Fable M2)。
+            let (mut c1, _r1) = record_test_client();
+            c1.mode = Mode::Rw;
             let (c2, _r2) = record_test_client();
             vec![c0, c1, c2]
         };
@@ -1747,6 +1762,45 @@ mod tests {
             &mut clients,
         );
         assert_eq!(detach_outcome_indices(out, self_idx), (vec![0, 1, 2], true));
+    }
+
+    /// Fable review M2 regression: Ro 観察者は Others/All で他 client を蹴れない
+    /// (= Signal と同じ権限ゲート)。ModeNotAllowed が返り、誰も drop されない。
+    /// Myself は自分が抜けるだけなので Ro でも許容 (= 従来通り)。
+    #[test]
+    fn handle_detach_target_rejects_others_all_from_ro_client() {
+        use crate::protocol::messages::{Detach, DetachTarget};
+
+        for target in [DetachTarget::Others, DetachTarget::All] {
+            // 全員 Ro (= record_test_client の default)。self_idx=0 が Ro で要求。
+            let (c0, r0) = record_test_client();
+            let (c1, _r1) = record_test_client();
+            let mut clients = vec![c0, c1];
+            let out = handle_detach_target(0, Detach { target }, &mut clients);
+            assert!(
+                matches!(out, ClientFrameOutcome::Continue),
+                "ro client の {target:?} は Continue (= 誰も drop しない) になるべき"
+            );
+            // 要求元には ModeNotAllowed error が返る。
+            match recv_control_from_queue(&r0) {
+                ControlMessage::Error(e) => {
+                    assert_eq!(e.code, crate::protocol::messages::ErrorCode::ModeNotAllowed);
+                }
+                other => panic!("expected ModeNotAllowed error, got {other:?}"),
+            }
+        }
+
+        // Myself は Ro でも許容 (= 自分が抜けるだけ)。
+        let (c0, _r0) = record_test_client();
+        let mut clients = vec![c0];
+        let out = handle_detach_target(
+            0,
+            Detach {
+                target: DetachTarget::Myself,
+            },
+            &mut clients,
+        );
+        assert!(matches!(out, ClientFrameOutcome::DropClient));
     }
 
     /// queue に積まれた次の frame を decode して `ControlMessage` を返す。
