@@ -80,6 +80,54 @@ hyoui input "$SESS" "file:./payload.txt"
 
 spec prefix: `text:` / `hex:` / `file:` / `paste:` / `key:` / `wait:` / `wait-idle:`。
 
+#### 4.1 ack 機構による sequencing 保証 (DR-0021)
+
+bytes 系 spec (`text:` / `paste:` / `hex:` / `file:` / `key:`) は 1 invocation で
+連続指定しても順序が崩れない。daemon は各 spec の master PTY 書き込み完了で ack を返し、
+client は ack 受信後に次 spec に進む (= race なし)。
+
+```sh
+# text 直後に key:Enter — ack 機構により Enter は text の全 bytes 書き込み完了後に届く
+hyoui input "$SESS" "text:ls -la" "key:Enter"
+```
+
+ack:Error が返ったら CLI は exit 1 で abort する。代表的なエラーコード:
+
+| code | 意味 |
+|---|---|
+| `master.write-timeout` | 子が input を 500 ms 読まなかった (ICANON buffer 飽和 / 子停止) |
+| `master.write-error` | daemon の I/O エラー |
+| `master.write-partial` | partial 書き込み (defense-in-depth) |
+| `client.ro-rejected` | Ro client (read-only attach) から input 送信を試みた |
+| `client.lock-not-held` | lock 保持者と異なる client から input 送信を試みた |
+
+`RAW_ACK_TIMEOUT` (5 秒) 内に ack が返らない場合は接続を poison して exit 1 する。
+再利用不可なので、次の操作は新規 invocation で行う。
+
+#### 4.2 ICANON アプリへの大量 byte 送信制限
+
+bash / python / sh など **ICANON モード**で動く子は、line discipline の input buffer
+(典型 1024 B) が満杯になると `master.write-timeout` を返す。1 spec で 1024 B 超を
+送ると失敗するので、以下のいずれかで回避する:
+
+- text を改行単位で **複数 spec に分割**して送る
+- 1 spec あたりのサイズを 1 KB 未満に抑える
+
+```sh
+# NG: bash に 1024 B 超を 1 spec で送ると master.write-timeout になる可能性がある
+hyoui input "$SESS" "text:$(cat large_payload.txt)"
+
+# OK: 改行で分割して spec を分ける
+hyoui input "$SESS" "text:line1" "key:Enter" "text:line2" "key:Enter"
+```
+
+alt screen TUI (vim / claude 等) は ICANON が無効なので大量 byte でも問題なし。
+
+> **`wait:` / `wait-idle:` の目的はこれとは別。** 子の出力 state を待つ用途 (= 確認 prompt
+> が出るまで待つ、出力が落ち着くまで待つ) に使う。ack 機構が保証するのは「bytes が
+> 子の input stream に届いたこと」であり、「子がその bytes を処理し終えたこと」ではない。
+> コマンド実行完了を待ちたい場合は `wait:` spec を別途使う。
+
 ### 5. 画面が特定 state になるまで待つ
 
 `wait` は **現在 visible な画面 state** に対して regex を match させるので、過去の

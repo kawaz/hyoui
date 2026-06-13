@@ -16,10 +16,11 @@ pub mod transports;
 
 pub use caps::{MVP_CAPS, MissingCapability, intersect_caps, require_cap};
 pub use frame::{
-    Frame, FrameError, MAX_FRAME_SIZE, ProtocolError, TYPE_CBOR_CONTROL, TYPE_RAW_DATA,
+    Frame, FrameError, MAX_FRAME_SIZE, ProtocolError, TYPE_CBOR_CONTROL, TYPE_RAW_ACK,
+    TYPE_RAW_DATA,
 };
 pub use messages::{
     ControlMessage, ControlMessageError, ErrorCode, ErrorMessage, HandshakeRequest,
-    HandshakeResponse, Mode,
+    HandshakeResponse, Mode, RawAck, RawAckError, RawAckResult,
 };
 pub use transports::{Transport, UnixStreamTransport};

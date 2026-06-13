@@ -83,6 +83,57 @@ hyoui input "$SESS" "file:./payload.txt"
 
 Spec prefixes: `text:` / `hex:` / `file:` / `paste:` / `key:` / `wait:` / `wait-idle:`.
 
+#### 4.1 Sequencing guarantee via ack (DR-0021)
+
+Bytes-type specs (`text:` / `paste:` / `hex:` / `file:` / `key:`) are safe to
+chain in a single invocation — ordering is guaranteed. The daemon returns an ack
+once it has finished writing each spec's bytes to the master PTY fd; the client
+waits for that ack before sending the next spec (no race).
+
+```sh
+# text followed by key:Enter — ack ensures Enter arrives after all text bytes
+hyoui input "$SESS" "text:ls -la" "key:Enter"
+```
+
+If the daemon returns ack:Error, the CLI exits with code 1. Common error codes:
+
+| code | meaning |
+|---|---|
+| `master.write-timeout` | child did not consume input within 500 ms (ICANON buffer full / child stopped) |
+| `master.write-error` | I/O error on the daemon side |
+| `master.write-partial` | partial write (defense-in-depth) |
+| `client.ro-rejected` | attempted input injection from a read-only (Ro) client |
+| `client.lock-not-held` | attempted input injection from a client that does not hold the lock |
+
+If no ack arrives within `RAW_ACK_TIMEOUT` (5 s), the connection is poisoned and
+the CLI exits 1. Start a fresh invocation for the next operation.
+
+#### 4.2 Large-byte-write limit for ICANON apps
+
+Children running in **ICANON mode** (bash, python, sh, …) have a line discipline
+input buffer of roughly 1024 B. Sending more than that in a single spec triggers
+`master.write-timeout`. Work around it by:
+
+- splitting text at newline boundaries into **multiple specs**, or
+- keeping each spec under 1 KB.
+
+```sh
+# bad: sending >1024 B in one spec to bash may hit master.write-timeout
+hyoui input "$SESS" "text:$(cat large_payload.txt)"
+
+# good: split by newline
+hyoui input "$SESS" "text:line1" "key:Enter" "text:line2" "key:Enter"
+```
+
+Alt-screen TUI children (vim, claude, …) disable ICANON, so large payloads are
+fine.
+
+> **`wait:` / `wait-idle:` serve a different purpose.** They wait for the child's
+> *output* to reach a certain state (e.g. a prompt appears, output goes quiet).
+> The ack mechanism only guarantees that bytes have been *delivered to the child's
+> input stream*, not that the child has finished processing them. Use a `wait:`
+> spec when you need to know the command has completed.
+
 ### 5. Wait for the screen to reach a state
 
 `wait` matches a regex against the **current visible screen state**, so past

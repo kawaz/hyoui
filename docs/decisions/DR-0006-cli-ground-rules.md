@@ -243,6 +243,25 @@ stdin から大量データを paste する場合は `file:-` (= stdin) を使�
 
 これらの flag は **input spec 全体に適用**される (= `paste:` 複数あれば全部に適用)。spec 単位で改行制御を変えたい場合は分割実行する。
 
+#### 8.8a bytes 系 spec の完了点 = PTY drain ack (DR-0021)
+
+bytes 系 spec (`text:` / `paste:` / `hex:` / `file:` / `key:`) を 1 invocation で順次指定したとき、
+後段 spec の bytes は前段 spec の bytes が **「子の input stream に確実に到達した」状態を前提**にする。
+この完了点は **socket flush** ではなく **daemon の master fd への `write_all_with_idle_timeout` return**
+で定義する (= 「PTY drain ack」)。詳細は [[DR-0021]] を参照。
+
+protocol 上は新 frame type `TYPE_RAW_ACK = 0x02` を導入。client (`send_raw_bytes`) は raw_data frame
+を送信した後、daemon からの `RawAck { result: "ok" | "error" }` を同期で待ってから次の bytes を送る。
+これにより:
+
+- 「`text:長文` → `key:Enter`」の連続送信で Enter が落ちる race (= issue 2026-06-16) が根治
+- `MASTER_WRITE_IDLE_TIMEOUT_MS` 超過 / I/O error などの daemon 側 write 失敗が ack `Error` で client に
+  伝搬し、CLI は明示 exit 1 で abort できる
+- `RAW_ACK_TIMEOUT` (= 5 秒) 内に ack が来なければ「daemon dead-lock or version skew」として timeout エラー
+
+cap negotiation を経由せず固定挙動 (= v1.0 前の breaking、`feedback_v1_0_breaking_change_ok` 方針)。
+新 daemon と旧 client / 旧 daemon と新 client の組み合わせは「想定外」として明示エラーで止める。
+
 #### 8.8 例 (= CLI 露出形)
 
 ```bash

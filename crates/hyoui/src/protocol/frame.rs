@@ -15,6 +15,17 @@ pub const TYPE_RAW_DATA: u8 = 0x00;
 /// CBOR-encoded control message frame の type tag (body は 1 個の CBOR item)。
 pub const TYPE_CBOR_CONTROL: u8 = 0x01;
 
+/// Raw-data write 完了 ack frame の type tag (DR-0021)。
+///
+/// body は 1 個の CBOR map で、`RawAck` schema (`{ "result": "ok" | "error",
+/// "code": ..., "message": ... }`) を持つ。`TYPE_RAW_DATA` を受け取った daemon が
+/// master PTY への `write_all_with_idle_timeout` を return した時点で client に
+/// 返す (= bytes 系 spec の完了点を「socket flush」から「PTY drain」に強める)。
+///
+/// 明示 seq id は持たない (= connection-level の同期 = 1 raw_data → 1 ack)。client
+/// は次の raw_data を送る前に ack 受信を待つことで race を排除する。
+pub const TYPE_RAW_ACK: u8 = 0x02;
+
 /// Protocol-level violation (recoverable: 通常は当該 peer を disconnect)。
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -78,6 +89,14 @@ impl Frame {
         }
     }
 
+    /// 新しい raw-ack frame を組み立てる (DR-0021、body は CBOR encode 済 `RawAck`)。
+    pub fn raw_ack(body: Vec<u8>) -> Self {
+        Frame {
+            ty: TYPE_RAW_ACK,
+            body,
+        }
+    }
+
     /// frame をバイトストリームに書き出す。
     ///
     /// Wire layout: `[u32 LE size][u8 type][body]`、`size = 1 + body.len()`。
@@ -132,7 +151,7 @@ impl Frame {
         let mut ty_buf = [0u8; 1];
         read_exact_eof(r, &mut ty_buf, "type byte")?;
         let ty = ty_buf[0];
-        if ty != TYPE_RAW_DATA && ty != TYPE_CBOR_CONTROL {
+        if ty != TYPE_RAW_DATA && ty != TYPE_CBOR_CONTROL && ty != TYPE_RAW_ACK {
             return Err(ProtocolError::UnknownType(ty).into());
         }
 
@@ -239,15 +258,34 @@ mod tests {
 
     #[test]
     fn decode_rejects_unknown_type() {
+        // 0x02 は TYPE_RAW_ACK (DR-0021) で許可されるようになったので、未知 type の
+        // 検証は 0x03 以降の予約値を使う。
         let mut buf = Vec::new();
         buf.extend_from_slice(&1u32.to_le_bytes()); // size = 1 (type byte のみ)
-        buf.push(0x02); // 予約 type
+        buf.push(0x03); // 予約 type
         let mut cur = Cursor::new(buf);
         let err = Frame::decode_from(&mut cur).expect_err("must reject");
         match err {
-            FrameError::Protocol(ProtocolError::UnknownType(0x02)) => {}
+            FrameError::Protocol(ProtocolError::UnknownType(0x03)) => {}
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn raw_ack_empty_roundtrip() {
+        let f = Frame::raw_ack(Vec::new());
+        assert_eq!(roundtrip(&f), f);
+        assert_eq!(f.ty, TYPE_RAW_ACK);
+    }
+
+    #[test]
+    fn raw_ack_with_cbor_body_roundtrip() {
+        // CBOR map {"result": "ok"} = a1 66 72 65 73 75 6c 74 62 6f 6b
+        let body = vec![
+            0xa1, 0x66, b'r', b'e', b's', b'u', b'l', b't', 0x62, b'o', b'k',
+        ];
+        let f = Frame::raw_ack(body);
+        assert_eq!(roundtrip(&f), f);
     }
 
     #[test]

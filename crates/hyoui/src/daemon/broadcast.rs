@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::time::Instant;
 
-use crate::protocol::messages::{ErrorCode, ErrorMessage, TailData};
+use crate::protocol::messages::{ErrorCode, ErrorMessage, RawAck, TailData};
 use crate::protocol::{ControlMessage, Frame, Mode};
 
 /// daemon が同時 attach を許す client 数上限 (= D6 集合 backpressure DoS 対策)。
@@ -103,30 +103,63 @@ pub(super) struct ClientHandle {
 /// - **forget 防止**: 個別 site で `drop(writer_tx)` / `shutdown` / `join` の 3 行を
 ///   コピペしていた重複が 1 箇所に集約され、片方を書き忘れる事故が起きない
 ///
-/// 順序の根拠:
+/// 順序の根拠 (DR-0021 M1 改訂):
 ///
-/// 1. `reader.shutdown(Both)`: 共有 FD (= UnixStreamTransport::split で try_clone した
-///    片割れ) を Both で shutdown。writer_pump が `write_all` で block 中なら即 error
-///    で抜ける
-/// 2. `writer_tx` を closed dummy へ `mem::replace`: 旧 Sender を即時 drop。
-///    writer_pump が `rx.recv()` で block 中 (= channel 空) でも channel close で抜ける
-/// 3. `writer_thread.join()`: writer_pump が (1) or (2) で必ず終了するので join は
-///    短時間で完了する。`JoinHandle::join` 自体は thread の panic を伝播せず Result で
-///    返すので、unwinding 中の Drop でも double-panic は発生しない
+/// 旧実装は `reader.shutdown(Both)` を**先に**呼んでいた。これは writer_pump が
+/// `write_all` で block 中の場合に即 unblock するメリットがあったが、その代償として
+/// **queue に積まれて未送信の frame** (= 直前に `enqueue_for_client` で push した
+/// 失敗 ack frame など) も socket close により drop されていた。具体的には
+/// 「partial write → 失敗 ack enqueue → DropClient → ClientHandle::Drop で shutdown
+/// → writer_pump の write_all が EPIPE / EBADF → writer_pump 即時 return →
+/// 未送信 ack が捨てられる」というシナリオが成立し、client は理由不明の EOF
+/// (= decode error) を観測していた。
+///
+/// 改訂後の順序:
+///
+/// 1. **`writer_tx` を closed dummy へ `mem::replace`**: 旧 Sender を即時 drop。
+///    channel が close 状態になる。writer_pump の `rx.recv()` は **既に queue に
+///    積まれた frame は順次 Ok で返し**、queue が空になった時点で初めて Err を返す
+///    (= std::sync::mpsc の標準仕様)。これにより failure ack を含む pending frame が
+///    socket に flush される
+/// 2. **`reader.set_write_timeout`** で writer 側 fd に upper-bound を設定
+///    (`DROP_FLUSH_TIMEOUT`)。client が socket を読まない / 死んでいる場合に
+///    `write_all` が無限 block するのを防ぐ。`reader` と writer_pump の `sock` は
+///    UnixStreamTransport::split の try_clone で同一 fd を共有しているため、
+///    一方への `set_write_timeout` がもう一方の write にも適用される
+/// 3. **`writer_thread.join()`** で writer_pump 終了を reap。flush 完走 / timeout /
+///    socket error のいずれかで pump は終了する。double-panic は join では起きない
+/// 4. **`reader.shutdown(Both)`** で念のため socket を最終 close。flush 後の clean-up
+///    として動作する。
 impl Drop for ClientHandle {
     fn drop(&mut self) {
-        // (1) 共有 socket FD を shutdown して writer_pump の write_all を unblock。
-        let _ = self.reader.shutdown(std::net::Shutdown::Both);
-        // (2) writer_tx を closed channel と入れ替えて旧 Sender を即 drop。
-        //     channel close で writer_pump の rx.recv() が Err を返し loop 終了。
+        // (1) writer_tx を先に drop して channel を close。writer_pump は
+        //     queue に残っている frame (= 失敗 ack 等) を順次 write_all してから
+        //     終了する (= DR-0021 M1: 失敗 ack が drop で失われないことを保証)。
         let (dummy_tx, _dummy_rx) = mpsc::channel::<SharedBytes>();
         let _ = std::mem::replace(&mut self.writer_tx, dummy_tx);
-        // (3) writer_pump 終了を join で reap。double-panic は join では起きない。
+        // (2) write_all が無限 block しないよう upper bound を設定。client が読まない
+        //     / 死んでいる場合に flush を諦めて pump が抜けられるようにする。
+        //     `reader` と writer_pump の `sock` は同一 fd を共有 (try_clone) するので
+        //     一方の write_timeout 設定がもう一方の write にも効く。
+        let _ = self.reader.set_write_timeout(Some(DROP_FLUSH_TIMEOUT));
+        // (3) writer_pump の終了を join で reap。flush 完了 / write_timeout / EPIPE
+        //     のいずれかで pump は loop を抜ける。
         if let Some(t) = self.writer_thread.take() {
             let _ = t.join();
         }
+        // (4) 最終 cleanup として shutdown(Both) を呼ぶ (= 念押し、reader/writer 両側を
+        //     close)。flush 後なので失う frame はない。
+        let _ = self.reader.shutdown(std::net::Shutdown::Both);
     }
 }
+
+/// `ClientHandle::Drop` で writer_pump の queue flush を待つ upper bound (DR-0021 M1)。
+///
+/// client が socket を読まない / 死んでいる場合の最大待ち時間。short ack frame
+/// (≤ ~200 bytes) は kernel socket buffer が空でない限り即書ける想定なので、500 ms は
+/// 十分余裕。これを超えるなら client が backpressure に陥っており、どの道 client は
+/// 既に応答できない状態にある。
+const DROP_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// client の出力 subscription (Phase 11)。
 ///
@@ -253,6 +286,26 @@ pub(super) fn send_control(ch: &ClientHandle, msg: ControlMessage) -> bool {
         .encode_to(&mut frame_bytes)
         .is_err()
     {
+        return false;
+    }
+    let payload: SharedBytes = Arc::new(frame_bytes);
+    matches!(enqueue_for_client(ch, payload), EnqueueOutcome::Sent)
+}
+
+/// `TYPE_RAW_ACK` frame を 1 client にだけ送る (DR-0021)。
+///
+/// daemon が `TYPE_RAW_DATA` を受け取って master PTY drain を完了 (= 成功 or 失敗) した時に
+/// 当該 client に「次の raw_data を送って良い / 送れない」を通知する。
+///
+/// 戻り値: enqueue 成功なら `true`、overflow / writer dead なら `false`
+/// (= caller は当該 client を drop すべき)。
+pub(super) fn send_raw_ack(ch: &ClientHandle, ack: &RawAck) -> bool {
+    let body = match ack.encode_to_vec() {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let mut frame_bytes = Vec::new();
+    if Frame::raw_ack(body).encode_to(&mut frame_bytes).is_err() {
         return false;
     }
     let payload: SharedBytes = Arc::new(frame_bytes);

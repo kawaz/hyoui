@@ -4876,6 +4876,341 @@ mod tests {
         let _ = daemon_handle.join();
     }
 
+    /// DR-0021 PTY drain ack の race regression test。
+    ///
+    /// 子に `/bin/cat` を起動 (= stdin → stdout echo の line-oriented 系)。
+    /// `text:長文` + `key:Enter` を 1 connection で順次送り、cat が echo した結果
+    /// (= screen state に反映される primary buffer の visible bytes) で「text bytes
+    /// の末尾に Enter (= 改行) が来ている」を確認する。
+    ///
+    /// 旧実装 (= socket flush で完了扱い) では、長文 text の master fd write が
+    /// chunked になっている途中で次の frame (= Enter) が pipeline で届くと、
+    /// daemon の serve_loop は同一 frame の完了後に次 frame を処理するため通常は
+    /// 順序が保たれるが、子の TUI が ICRNL を切ったり line discipline buffer の
+    /// flush タイミングによって取りこぼされる race が報告されていた (= issue
+    /// `2026-06-16-bug-input-text-key-enter-not-sent`)。新実装は ack 待ちで client
+    /// 側が確実に同期するため、本 test は「ack 機構が確実に動作する」regression
+    /// guard として 30 回繰り返して全 pass を要求する。
+    #[test]
+    fn send_raw_bytes_text_then_enter_arrives_in_order() {
+        use hyoui::daemon::{DaemonConfig, Session};
+        use hyoui::protocol::messages::{
+            ScreenDumpFormat as ProtoDumpFormat, ScreenDumpLayer as ProtoDumpLayer,
+            ScreenDumpRequest,
+        };
+        use std::time::Duration;
+
+        // 反復回数: race を 100% で踏むなら 1 回でも十分だが、ack 機構の安定性
+        // (= timeout / pending_frames buffer / 順序保証) を 30 回連続で確認する。
+        const ITERATIONS: usize = 30;
+
+        let sock_dir = make_0700_dir();
+        let sock_path = sock_dir.path().join("ack-race.sock");
+        let sock_for_daemon = sock_path.clone();
+
+        let daemon_handle = std::thread::spawn(move || {
+            // 子: cat は stdin の行 (= \n 区切り) を echo する。30 秒 sleep を後段に
+            // 入れずに cat だけだと EOF まで生きるので、cat を直起動。
+            let cfg = DaemonConfig::new("ack-race-test", sock_for_daemon, vec!["/bin/cat".into()]);
+            let session = Session::start(cfg).expect("daemon start");
+            session.serve()
+        });
+
+        // listener bind + cat 起動完了を待つ。
+        std::thread::sleep(Duration::from_millis(200));
+
+        let opts = AttachOptions {
+            mode: Mode::Rw,
+            caps: hyoui::protocol::MVP_CAPS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            ..AttachOptions::default()
+        };
+        let mut conn = connect_with_retry(&sock_path, opts).expect("attach Rw");
+
+        // 各反復で text + Enter を送り、screen に "MARK<i>\n" が反映されるのを
+        // 確認する。各反復のラベルを変えることで「前の反復の echo を見ている」
+        // 誤判定を避ける。
+        for i in 0..ITERATIONS {
+            // 識別子付き label。echo されると "MARK<i>\r\n" が screen に乗る。
+            let label = format!("MARK{i}");
+            conn.send_raw_bytes(label.as_bytes())
+                .expect("send_raw_bytes text");
+            // key:Enter (= "\r"、`input_handlers::handle_key("Enter")` と同じ)。
+            conn.send_raw_bytes(b"\r").expect("send_raw_bytes enter");
+
+            // cat の echo が screen state に反映されるまで polling。
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut seen = false;
+            while std::time::Instant::now() < deadline {
+                let req = ScreenDumpRequest {
+                    format: ProtoDumpFormat::Ansi,
+                    layer: ProtoDumpLayer::Visible,
+                    rect: None,
+                    serial: Some(i as u64 + 1),
+                };
+                conn.send_control(&ControlMessage::ScreenDumpRequest(req))
+                    .expect("send screen.dump request");
+                // ModeChange/LeaderNotify/RawAck 等を skip しつつ
+                // ScreenDumpResponse を取り出す。
+                let payload_opt = loop {
+                    match conn.recv_control(None) {
+                        Ok(ControlMessage::ScreenDumpResponse(r)) => break Some(r.payload),
+                        Ok(_) => continue,
+                        Err(_) => break None,
+                    }
+                };
+                let Some(payload) = payload_opt else { break };
+                let s = String::from_utf8_lossy(&payload);
+                if s.contains(&label) {
+                    seen = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                seen,
+                "iteration {i}: label {label} should appear in cat echo (= Enter must \
+                 fire after text, screen.dump never observed the label). PTY drain ack \
+                 should have synchronized text→Enter ordering."
+            );
+        }
+
+        // cleanup。
+        let kill = hyoui::protocol::messages::Kill {
+            signal: None,
+            wait: true,
+        };
+        let _ = conn.send_control(&ControlMessage::Kill(kill));
+        drop(conn);
+        let _ = daemon_handle.join();
+    }
+
+    /// DR-0021 改訂: `recv_raw_ack_inner` の partial-byte discard race regression test。
+    ///
+    /// 旧実装は `set_read_timeout(Some(RAW_ACK_TIMEOUT))` で `read(2)` 自体に timeout を
+    /// 入れていたため、`Frame::decode_from` が body 読み出し途中で `TimedOut` を踏むと
+    /// `read_exact` の partial-bytes 破棄仕様で socket に body 残骸が居残り、次 iteration で
+    /// 残骸の先頭 4 B を size として誤解読し `frame decode failed while waiting raw_ack`
+    /// (= Error::Invalid) が発生した。実機検証では `python -i` に 1038 B 以上の text + Enter
+    /// で再現 (= line discipline buffer ≤ 1024 の echo タイミングと一致)。
+    ///
+    /// 本 test は子に `/bin/cat` を起動し、毎反復で 2000 B 級の text + Enter を送って ack を
+    /// 待つ。新実装 (= poll-based readiness + blocking decode) では partial-byte race が
+    /// 構造的に起きない (= frame 境界でのみ deadline 判定が発火する)。20 反復で全 pass を
+    /// 要求する。
+    #[test]
+    fn send_raw_bytes_partial_byte_race_regression() {
+        use hyoui::daemon::{DaemonConfig, Session};
+        use std::time::Duration;
+
+        const ITERATIONS: usize = 20;
+        const TEXT_LEN: usize = 2000;
+
+        let sock_dir = make_0700_dir();
+        let sock_path = sock_dir.path().join("ack-partial.sock");
+        let sock_for_daemon = sock_path.clone();
+
+        let daemon_handle = std::thread::spawn(move || {
+            let cfg =
+                DaemonConfig::new("ack-partial-test", sock_for_daemon, vec!["/bin/cat".into()]);
+            let session = Session::start(cfg).expect("daemon start");
+            session.serve()
+        });
+
+        std::thread::sleep(Duration::from_millis(200));
+
+        let opts = AttachOptions {
+            mode: Mode::Rw,
+            caps: hyoui::protocol::MVP_CAPS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            ..AttachOptions::default()
+        };
+        let mut conn = connect_with_retry(&sock_path, opts).expect("attach Rw");
+
+        // 各反復: ascii 2000 B + Enter。ack が来れば Ok(()), race を踏むと
+        // Err(Error::Invalid("frame decode failed while waiting raw_ack")) が出る。
+        for i in 0..ITERATIONS {
+            let big = vec![b'A'; TEXT_LEN];
+            conn.send_raw_bytes(&big).unwrap_or_else(|e| {
+                panic!(
+                    "iteration {i}: send_raw_bytes text (2000 B) failed: {e:?} \
+                       (= partial-byte race regression)"
+                );
+            });
+            conn.send_raw_bytes(b"\r").unwrap_or_else(|e| {
+                panic!("iteration {i}: send_raw_bytes Enter failed: {e:?}");
+            });
+        }
+
+        let kill = hyoui::protocol::messages::Kill {
+            signal: None,
+            wait: true,
+        };
+        let _ = conn.send_control(&ControlMessage::Kill(kill));
+        drop(conn);
+        let _ = daemon_handle.join();
+    }
+
+    /// DR-0021 改訂: Ro client から bytes 送ると Error ack (`client.ro-rejected`)。
+    ///
+    /// 旧実装は silent-drop 互換のため `Ok` ack を返していたが、ack の意味論を
+    /// 「子の input stream に確実に到達した」に統一するため Error ack に変更。
+    /// client 側は `Err(Error::Remote(msg))` で受け取る。
+    #[test]
+    fn send_raw_bytes_ro_client_receives_error_ack() {
+        use hyoui::daemon::{DaemonConfig, Session};
+        use std::time::Duration;
+
+        let sock_dir = make_0700_dir();
+        let sock_path = sock_dir.path().join("ack-ro.sock");
+        let sock_for_daemon = sock_path.clone();
+
+        let daemon_handle = std::thread::spawn(move || {
+            let cfg = DaemonConfig::new(
+                "ack-ro-test",
+                sock_for_daemon,
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf 'READY'; sleep 30".into(),
+                ],
+            );
+            let session = Session::start(cfg).expect("daemon start");
+            session.serve()
+        });
+
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Ro client として attach。
+        let opts = AttachOptions {
+            mode: Mode::Ro,
+            caps: hyoui::protocol::MVP_CAPS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            ..AttachOptions::default()
+        };
+        let mut conn = connect_with_retry(&sock_path, opts).expect("attach Ro");
+
+        let result = conn.send_raw_bytes(b"hello");
+        match result {
+            Err(hyoui::Error::Remote(msg)) => {
+                assert!(
+                    msg.contains("read-only") || msg.contains("ro-rejected"),
+                    "Error::Remote message should mention Ro reject: got {msg:?}"
+                );
+            }
+            other => {
+                panic!("Ro client send_raw_bytes must return Err(Error::Remote(..)), got {other:?}")
+            }
+        }
+
+        let kill = hyoui::protocol::messages::Kill {
+            signal: None,
+            wait: true,
+        };
+        let _ = conn.send_control(&ControlMessage::Kill(kill));
+        drop(conn);
+        let _ = daemon_handle.join();
+    }
+
+    /// DR-0021 改訂: lock holder と異なる client から bytes 送ると Error ack
+    /// (`client.lock-not-held`)。
+    ///
+    /// 2 つの Rw client A / B が同 daemon に接続。A が lock 取得 → B が input 送信
+    /// → daemon が Error ack を返し、B は `Err(Error::Remote)`。
+    #[test]
+    fn send_raw_bytes_lock_not_held_receives_error_ack() {
+        use hyoui::daemon::{DaemonConfig, Session};
+        use hyoui::protocol::messages::{LockAcquire, LockResponse, LockResult};
+        use std::time::Duration;
+
+        let sock_dir = make_0700_dir();
+        let sock_path = sock_dir.path().join("ack-lock.sock");
+        let sock_for_daemon = sock_path.clone();
+
+        let daemon_handle = std::thread::spawn(move || {
+            let cfg = DaemonConfig::new(
+                "ack-lock-test",
+                sock_for_daemon,
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf 'READY'; sleep 30".into(),
+                ],
+            );
+            let session = Session::start(cfg).expect("daemon start");
+            session.serve()
+        });
+
+        std::thread::sleep(Duration::from_millis(200));
+
+        let make_opts = || AttachOptions {
+            mode: Mode::Rw,
+            caps: hyoui::protocol::MVP_CAPS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            ..AttachOptions::default()
+        };
+
+        let mut conn_a = connect_with_retry(&sock_path, make_opts()).expect("attach A");
+        let mut conn_b = connect_with_retry(&sock_path, make_opts()).expect("attach B");
+
+        // A が lock 取得 (daemon 側 schema: wait/timeout のみ、token は response で返る)。
+        conn_a
+            .send_control(&ControlMessage::LockAcquire(LockAcquire {
+                wait: false,
+                timeout_abs_ms: None,
+                timeout_idle_ms: None,
+                process_bound: false,
+            }))
+            .expect("A lock acquire send");
+        // LockResponse が来るまで control を読む (= ModeChange/LeaderNotify を skip)。
+        let mut acquired = false;
+        for _ in 0..20 {
+            match conn_a.recv_control(None) {
+                Ok(ControlMessage::LockResponse(LockResponse {
+                    result: LockResult::Acquired,
+                    ..
+                })) => {
+                    acquired = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("A: failed to receive lock response: {e:?}"),
+            }
+        }
+        assert!(acquired, "A must acquire the lock");
+
+        // B が lock holder でない状態で bytes 送信 → Error ack。
+        let result = conn_b.send_raw_bytes(b"hello from B");
+        match result {
+            Err(hyoui::Error::Remote(msg)) => {
+                assert!(
+                    msg.contains("lock") || msg.contains("lock-not-held"),
+                    "Error::Remote message should mention lock: got {msg:?}"
+                );
+            }
+            other => panic!(
+                "non-lock-holder send_raw_bytes must return Err(Error::Remote(..)), got {other:?}"
+            ),
+        }
+
+        let kill = hyoui::protocol::messages::Kill {
+            signal: None,
+            wait: true,
+        };
+        let _ = conn_a.send_control(&ControlMessage::Kill(kill));
+        drop(conn_a);
+        drop(conn_b);
+        let _ = daemon_handle.join();
+    }
+
     /// state-based wait の integration test (DR-0006 §9)。
     ///
     /// 子が "READY" を画面出力するまで `wait_command` が block し、出現後に

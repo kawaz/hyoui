@@ -37,6 +37,7 @@ mod error;
 mod handshake;
 mod lifecycle;
 mod lock;
+mod raw_ack;
 mod record;
 mod screen;
 mod session_lifecycle;
@@ -52,6 +53,10 @@ pub use handshake::{
 pub use lifecycle::{Detach, DetachAck, DetachTarget, Kill, KillAck};
 pub use lock::{
     LeaderNotify, LockAcquire, LockRelease, LockResponse, LockResult, ModeChange, SessionMode,
+};
+pub use raw_ack::{
+    CODE_CLIENT_LOCK_NOT_HELD, CODE_CLIENT_RO_REJECTED, CODE_MASTER_WRITE_ERROR,
+    CODE_MASTER_WRITE_PARTIAL, CODE_MASTER_WRITE_TIMEOUT, RawAck, RawAckError, RawAckResult,
 };
 pub use record::{
     InputSecrecy, RecordDirection, RecordFormat, RecordInfo, RecordListRequest, RecordListResponse,

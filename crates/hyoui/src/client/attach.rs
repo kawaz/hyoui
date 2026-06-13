@@ -11,10 +11,11 @@ use std::path::Path;
 use nix::poll::{PollFd, PollTimeout};
 
 use crate::Error;
-use crate::protocol::messages::{Detach, DetachTarget};
+use crate::protocol::messages::{Detach, DetachTarget, RawAck, RawAckResult};
 use crate::protocol::{
     ControlMessage, ErrorCode, Frame, FrameError, HandshakeRequest, HandshakeResponse, MVP_CAPS,
-    Mode, ProtocolError, TYPE_CBOR_CONTROL, TYPE_RAW_DATA, Transport, UnixStreamTransport,
+    Mode, ProtocolError, TYPE_CBOR_CONTROL, TYPE_RAW_ACK, TYPE_RAW_DATA, Transport,
+    UnixStreamTransport,
 };
 
 /// stdin read chunk の処理結果 (= `process_detach_prefix` の戻り値)。
@@ -165,6 +166,18 @@ fn stdin_revents_is_eof(revents: PollFlags) -> bool {
 pub const DETACH_PREFIX_BYTE: u8 = 0x01;
 /// detach prefix の後に来ると detach を起動する byte (= `'d'`, 0x64)。
 pub const DETACH_TRIGGER_BYTE: u8 = b'd';
+
+/// `send_raw_bytes` が `TYPE_RAW_ACK` を待つ上限 (DR-0021)。
+///
+/// 値の根拠: daemon 側 `MASTER_WRITE_IDLE_TIMEOUT_MS` は per-chunk 500 ms。client → daemon
+/// の write が成功した瞬間に daemon は master fd への `write_all_with_idle_timeout` を
+/// 開始するので、最悪 1 chunk 分 + 通信オーバーヘッドで ack が返る。chunk が
+/// 連続するケース (= 大きな bytes 列 / slow reader) でも 5 秒は十分余裕。
+///
+/// この値を超えても ack が来ない場合 (= daemon 自体が壊れた / dead-locked) は
+/// `Error::Invalid("raw_ack timeout")` を返して CLI exit 1 で abort する (= 永遠に
+/// hang するより明示エラーで上に伝える)。
+pub const RAW_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// suspend (= 子 self-stop に follow して client 自身が SIGSTOP する) 直前に外側端末へ
 /// 吐く「安全側固定 reset シーケンス」(= issue 2026-06-11)。
@@ -337,6 +350,35 @@ pub struct ClientConnection {
     /// 1 byte 書いた) を観測したら `size_fn()` で外側端末サイズを取得し、leader なら
     /// `Resize` message を daemon に送る。`None` なら従来挙動 (= resize 送らない)。
     winch_source: Option<WinchSource>,
+    /// `send_raw_bytes` が ack 待ち中に到着した non-ack frame の buffer (DR-0021)。
+    ///
+    /// `send_raw_bytes` は daemon の RAW_ACK frame を同期で待つが、attach の
+    /// subscription=Raw 経由で同時に届く daemon→client の raw_data frame、もしくは
+    /// 並行で起きる ModeChange/LeaderNotify 等の CBOR control frame を
+    /// 捨てずに保持するための FIFO buffer。`recv_frame` は ここから優先的に
+    /// 返すことで「ack 後に積まれていた frame が後の recv で取り出せる」semantics を
+    /// 保つ (= input 1-shot 接続では使われないが、library として attach 経由でも
+    /// 安全に動かすため)。
+    pending_frames: std::collections::VecDeque<Frame>,
+    /// `send_raw_bytes` の ack 待ちが timeout で打ち切られた / I/O error で失敗した後、
+    /// 同一 connection への新規送信を禁止するためのフラグ (DR-0021 M2)。
+    ///
+    /// ack には seq id が無いため、timeout 後に同 connection で次の `send_raw_bytes`
+    /// を呼ぶと**遅れて届いた前回 ack** を次回 ack として誤って受理する race が
+    /// 成立しうる (= stale ack の silent wrong behavior)。
+    ///
+    /// 対策: timeout / ack 受信中の I/O error が起きた時点で本フラグを立て、
+    /// reader/writer の socket を `shutdown(Both)` し、以降の `send_raw_bytes` は
+    /// `Error::Invalid("connection poisoned after raw_ack failure")` を即返す
+    /// (= connection 再利用を物理的に禁止)。`send_control` 等の non-ack 経路は
+    /// shutdown 済 socket で write が EPIPE を返すので caller には I/O error として
+    /// 伝わる (= explicit な poison check は send_raw_bytes だけで十分)。CLI 一発
+    /// 呼びでは ack 失敗時に exit するため影響なし。library で attach 経路から
+    /// send_raw_bytes を使う場合にこの保護が効く。
+    ///
+    /// daemon が ack:Error (= `RawAckResult::Error`) を返してきた場合は **poison しない**
+    /// (= ack 自体は正常受信できているので、caller が semantic レベルで継続判断する)。
+    poisoned: bool,
 }
 
 /// SIGWINCH → Resize の中継元 (DR-0019 §6)。signal thread が WINCH を受けて
@@ -445,6 +487,8 @@ impl ClientConnection {
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: None,
+            pending_frames: std::collections::VecDeque::new(),
+            poisoned: false,
         })
     }
 
@@ -867,10 +911,17 @@ impl ClientConnection {
     /// 呼ぶ前提の attach は内部 poll loop で frame を消費するので本 method は
     /// 不要。
     ///
+    /// DR-0021: `send_raw_bytes` の ack 待ち中に到着した non-ack frame が
+    /// `pending_frames` に積まれている場合は、socket から読む前にそちらを
+    /// 優先して返す (= FIFO order を保つ)。
+    ///
     /// # Errors
     ///
     /// frame decode 失敗 (= protocol violation or socket EOF) は [`Error::Invalid`]。
     pub fn recv_frame(&mut self) -> Result<Frame, Error> {
+        if let Some(frame) = self.pending_frames.pop_front() {
+            return Ok(frame);
+        }
         Frame::decode_from(&mut self.reader).map_err(|e| match e {
             FrameError::Io(io) => Error::Io(io),
             FrameError::Protocol(_) => Error::Invalid("frame decode failed"),
@@ -918,16 +969,34 @@ impl ClientConnection {
                 }
                 continue;
             }
+            if frame.ty == TYPE_RAW_ACK {
+                // DR-0021 m1: ack 待ちでない時に届く RAW_ACK は silent skip。
+                // 想定経路:
+                // - timeout 後の stale ack (= M2 poison で塞ぐが、防御的に skip)
+                // - 将来 pipeline (= seq id 導入後) の余剰 ack
+                // 旧実装は `unexpected frame type` で hard error にしていたが、
+                // ack の意味的所有者は `send_raw_bytes` のみで、他経路では
+                // ignore するのが安全 (= consumer 経路として broadcast の RAW_DATA を
+                // skip するのと同じ扱い)。
+                continue;
+            }
             return Err(Error::Invalid("unexpected frame type"));
         }
     }
 
-    /// 任意の bytes 列を **raw_data frame** として daemon に送る (= `hyoui input`
-    /// 系の text/hex/file/paste/key の bytes 経路で使う)。
+    /// 任意の bytes 列を **raw_data frame** として daemon に送り、PTY drain 完了の
+    /// ack (= `TYPE_RAW_ACK` frame) を同期で待つ (DR-0021)。
     ///
-    /// daemon は受け取った raw_data frame の body を master PTY にそのまま書き込む
-    /// (= `daemon::control::handle_client_frame` の `TYPE_RAW_DATA` 分岐)。
-    /// したがって本 method は子 PTY に入力を流し込む primitive として機能する。
+    /// daemon は受け取った raw_data frame の body を master PTY にそのまま書き込み
+    /// (= `daemon::control::handle_client_frame` の `TYPE_RAW_DATA` 分岐)、
+    /// `write_all_with_idle_timeout` が return した時点で `RawAck` を返す。本 method は
+    /// その ack 受信まで block する。これにより複数 bytes 系 spec (text → key:Enter 等)
+    /// を順次送る際の race (= text 完了前に Enter が master fd に届いて Enter 取りこぼし)
+    /// が排除される (= `socket flush` ではなく `PTY write 完了` を完了点にする)。
+    ///
+    /// ack 待ち中に到着する **non-ack frame** (= broadcast の `TYPE_RAW_DATA`、
+    /// `TYPE_CBOR_CONTROL` の各種 control message) は `pending_frames` に push し、
+    /// 後続の [`recv_frame`] / [`recv_control`] が FIFO で取り出せるよう保存する。
     ///
     /// 1 frame の上限は protocol 層の `MAX_FRAME_SIZE` (= 16 MiB - 1)。本 method は
     /// 渡された bytes 全体を 1 frame で送る (= size 制御は caller 側の責務、
@@ -935,20 +1004,152 @@ impl ClientConnection {
     ///
     /// # Errors
     ///
-    /// I/O / frame size 超過は [`Error`] で返す。mode が `Ro` の client から呼んでも
-    /// daemon 側で silently drop される (= 本 method では検出できない)。
+    /// * I/O / frame size 超過 → [`Error`]
+    /// * ack の `result == Error` (= daemon 側で master write が timeout / I/O error / partial)
+    ///   → [`Error::Remote`] に daemon 側 error message を載せて返す
+    /// * `RAW_ACK_TIMEOUT` 内に ack が来ない → [`Error::Invalid`]
+    ///
+    /// mode が `Ro` / lock 不一致の client から呼んだ場合、daemon は bytes を master に
+    /// 書かず、`code` = `client.ro-rejected` / `client.lock-not-held` の Error ack を返す。
+    /// client は `Err(Error::Remote(_))` で受け取り、CLI 層は exit 1 で abort する
+    /// (= ack:Ok = 「子の input stream に確実に到達した」semantics に統一、DR-0021 改訂)。
     pub fn send_raw_bytes(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.poisoned {
+            return Err(Error::Invalid(
+                "connection poisoned after raw_ack failure; reconnect required",
+            ));
+        }
         if bytes.is_empty() {
             return Ok(());
         }
         Frame::raw_data(bytes.to_vec())
             .encode_to(&mut self.writer)
             .map_err(|e| match e {
-                FrameError::Io(io) => Error::Io(io),
-                FrameError::Protocol(_) => Error::Invalid("raw_data frame protocol error"),
+                FrameError::Io(io) => {
+                    self.poison();
+                    Error::Io(io)
+                }
+                FrameError::Protocol(_) => {
+                    self.poison();
+                    Error::Invalid("raw_data frame protocol error")
+                }
             })?;
-        self.writer.flush().map_err(Error::Io)?;
-        Ok(())
+        if let Err(io) = self.writer.flush() {
+            self.poison();
+            return Err(Error::Io(io));
+        }
+
+        // DR-0021: ack 待ち。socket-level の `read_timeout` を**変更しない**
+        // (= 次 frame 開始までの readiness は `poll(2)` で判定し、frame body の
+        // 読み出しは blocking `decode_from` で完走させる)。
+        //
+        // 旧実装は `set_read_timeout(Some(RAW_ACK_TIMEOUT))` で `read(2)` 自体に
+        // timeout を入れていたが、`Frame::decode_from` は内部で size 4B / type 1B /
+        // body N B の 3 連続 `read_exact` を行う。`read_exact` は `TimedOut` を
+        // 観測すると既に読んだ partial bytes を破棄する仕様のため、body 読み出し
+        // 途中で timeout が発火すると socket には body の残り bytes が居残り、
+        // 次 iteration で「body 残骸の最初 4 B を size として誤解読」する
+        // partial-byte race が成立した (= 1024 B 境界で再現、Error::Invalid
+        // "frame decode failed while waiting raw_ack")。
+        //
+        // 修正後の不変条件: deadline 判定は frame **境界**でのみ発火する
+        // (= 部分読み出し済みの socket 残骸は生まれない)。
+        let result = self.recv_raw_ack_inner();
+        // DR-0021 M2: timeout / I/O error / protocol error は connection を poison
+        // して以降の `send_raw_bytes` / `send_control` を弾く (= 遅れて届いた前回 ack を
+        // 次回 ack として誤受理する stale-ack race を物理的に塞ぐ)。`Err(Remote(_))`
+        // (= daemon が ack:Error を返した) は ack 自体は正常受信できているので poison
+        // しない (= caller が semantic レベルでの失敗を意識して継続判断する)。
+        if let Err(ref e) = result {
+            match e {
+                Error::Remote(_) => {} // ack:Error は protocol 上正常受信、poison しない
+                _ => self.poison(),
+            }
+        }
+        result
+    }
+
+    /// connection を poison 状態にし、以降の bytes 送信を物理的に禁止する
+    /// (DR-0021 M2)。reader/writer の socket を `shutdown(Both)` し、`poisoned`
+    /// フラグを立てる。idempotent (= 複数回呼んでも安全)。
+    fn poison(&mut self) {
+        if self.poisoned {
+            return;
+        }
+        self.poisoned = true;
+        let _ = self.reader.shutdown(std::net::Shutdown::Both);
+        let _ = self.writer.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// `send_raw_bytes` から呼ばれる ack 受信本体。
+    ///
+    /// 各 iteration:
+    /// 1. 残 deadline 内で `poll(POLLIN)` を呼び readiness を取る
+    /// 2. ready なら `Frame::decode_from` を **blocking** で呼び 1 frame を完走読了
+    ///    (= partial-byte race を frame 単位で原子化)
+    /// 3. ack なら処理 / non-ack なら `pending_frames` に積んで継続
+    ///
+    /// ack 以外の frame は `pending_frames` に積み、後続の `recv_frame` /
+    /// `recv_control` が FIFO で取り出す。
+    fn recv_raw_ack_inner(&mut self) -> Result<(), Error> {
+        let deadline = std::time::Instant::now() + RAW_ACK_TIMEOUT;
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(Error::Invalid(
+                    "raw_ack timeout: daemon did not ack within RAW_ACK_TIMEOUT",
+                ));
+            }
+            let remaining = deadline - now;
+            // poll(reader fd, POLLIN, remaining) で次 frame の readiness を待つ。
+            // EINTR は再 loop (= self-pipe drain は本 path に無いが、interrupt は
+            // 単に再試行する)。
+            let fd = self.reader.as_fd();
+            let mut fds = [PollFd::new(fd, PollFlags::POLLIN)];
+            let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as u16;
+            let timeout = PollTimeout::from(timeout_ms);
+            match poll(&mut fds, timeout)
+                .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?
+            {
+                PollOutcome::Timeout => {
+                    return Err(Error::Invalid(
+                        "raw_ack timeout: daemon did not ack within RAW_ACK_TIMEOUT",
+                    ));
+                }
+                PollOutcome::Interrupted => continue,
+                PollOutcome::Ready(_) => {}
+            }
+            // readiness 観測後は blocking decode で 1 frame を必ず完走させる
+            // (= partial-byte discard を踏まない)。socket の `read_timeout` は
+            // None (= default) のままなので read(2) は EOF / 完了まで block する。
+            let frame = match Frame::decode_from(&mut self.reader) {
+                Ok(f) => f,
+                Err(FrameError::Io(io)) => return Err(Error::Io(io)),
+                Err(FrameError::Protocol(_)) => {
+                    return Err(Error::Invalid("frame decode failed while waiting raw_ack"));
+                }
+            };
+            match frame.ty {
+                TYPE_RAW_ACK => {
+                    let ack = RawAck::decode_from(frame.body.as_slice())
+                        .map_err(|_| Error::Invalid("raw_ack CBOR decode failed"))?;
+                    return match ack.result {
+                        RawAckResult::Ok => Ok(()),
+                        RawAckResult::Error => {
+                            let msg = ack.message.unwrap_or_else(|| {
+                                ack.code
+                                    .clone()
+                                    .unwrap_or_else(|| "master write failed".to_string())
+                            });
+                            Err(Error::Remote(msg))
+                        }
+                    };
+                }
+                // ack 待ち中に届いた non-ack frame は捨てずに保留 (= FIFO 順を保つ)。
+                // 後の recv_frame / recv_control がここから先に取り出す。
+                _ => self.pending_frames.push_back(frame),
+            }
+        }
     }
 
     /// reader 側 socket の borrowed fd を返す (= `poll(2)` で readiness を取る用途)。
@@ -1059,6 +1260,8 @@ mod tests {
             eof_action: StdinEofAction::SendEof,
             suspend_hooks: None,
             winch_source: None,
+            pending_frames: std::collections::VecDeque::new(),
+            poisoned: false,
         };
 
         // 既に EOF な stdin: pipe の write 端を即 close。
@@ -1111,6 +1314,8 @@ mod tests {
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: Some(WinchSource::new(rd, size_fn)),
+            pending_frames: std::collections::VecDeque::new(),
+            poisoned: false,
         };
         // leader=false なので Ok(()) で何も送らない (panic しなければ成功)。
         conn.send_initial_resize().expect("send_initial_resize");
@@ -1139,6 +1344,8 @@ mod tests {
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: Some(WinchSource::new(rd, size_fn)),
+            pending_frames: std::collections::VecDeque::new(),
+            poisoned: false,
         };
         conn.send_initial_resize().expect("send_initial_resize");
 
@@ -1189,6 +1396,8 @@ mod tests {
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: Some(WinchSource::new(notify_rd, size_fn)),
+            pending_frames: std::collections::VecDeque::new(),
+            poisoned: false,
         };
 
         // stdin は即 EOF させない (= run が stdin EOF で抜けないよう) ため、書き込み端を
@@ -1256,6 +1465,8 @@ mod tests {
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: Some(WinchSource::new(notify_rd, size_fn)),
+            pending_frames: std::collections::VecDeque::new(),
+            poisoned: false,
         };
 
         // stdin は EOF させない (= 書き込み端を保持)。
@@ -1327,6 +1538,8 @@ mod tests {
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: Some(WinchSource::new(notify_rd, size_fn)),
+            pending_frames: std::collections::VecDeque::new(),
+            poisoned: false,
         };
 
         let (stdin_rd, stdin_wr_keep) = nix::unistd::pipe().expect("stdin pipe");
@@ -1784,6 +1997,8 @@ mod tests {
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: None,
+            pending_frames: std::collections::VecDeque::new(),
+            poisoned: false,
         };
 
         // stdin に prefix(0x01) + 'd' を流す pipe。
@@ -1840,6 +2055,8 @@ mod tests {
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: None,
+            pending_frames: std::collections::VecDeque::new(),
+            poisoned: false,
         };
 
         // stdin は EOF させない (= 書き込み端を保持)。
@@ -1890,6 +2107,8 @@ mod tests {
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: None,
+            pending_frames: std::collections::VecDeque::new(),
+            poisoned: false,
         };
 
         // 即 EOF な stdin。
@@ -1930,6 +2149,8 @@ mod tests {
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: None,
+            pending_frames: std::collections::VecDeque::new(),
+            poisoned: false,
         };
 
         let (stdin_rd, stdin_wr_keep) = nix::unistd::pipe().expect("stdin pipe");
@@ -1997,6 +2218,8 @@ mod tests {
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: None,
+            pending_frames: std::collections::VecDeque::new(),
+            poisoned: false,
         };
 
         let (stdin_rd, stdin_wr_keep) = nix::unistd::pipe().expect("stdin pipe");
@@ -2017,5 +2240,201 @@ mod tests {
             matches!(res, Ok(RunOutcome::StdoutWriteFailed)),
             "stdout write 失敗は StdoutWriteFailed を返すはず: {res:?}"
         );
+    }
+
+    // ===== DR-0021 改訂: partial-byte race / stale-ack / m1 ack-skip の unit test =====
+
+    /// テスト用に socketpair で直結された ClientConnection を作る helper。
+    /// 戻り値: (client connection, daemon 側 socket = テストから書く / 読む側)。
+    fn make_pair_connection() -> (ClientConnection, UnixStream) {
+        let (client_sock, daemon_sock) = UnixStream::pair().expect("socketpair");
+        let transport = UnixStreamTransport::new(client_sock);
+        let (reader, writer) = transport.split().expect("split");
+        let conn = ClientConnection {
+            reader,
+            writer,
+            response: HandshakeResponse {
+                caps: vec![],
+                session_id: "t".into(),
+                client_id: 1,
+                leader: false,
+                mode: Mode::Rw,
+            },
+            eof_action: StdinEofAction::Detach,
+            suspend_hooks: None,
+            winch_source: None,
+            pending_frames: std::collections::VecDeque::new(),
+            poisoned: false,
+        };
+        (conn, daemon_sock)
+    }
+
+    /// DR-0021 改訂 M2: `send_raw_bytes` の ack 待ちが timeout で打ち切られた後、
+    /// 同 connection への次の `send_raw_bytes` は **stale ack を誤受理せず**
+    /// `Error::Invalid("connection poisoned...")` で即時 fail する。
+    ///
+    /// scenario:
+    /// 1. client が send_raw_bytes を呼ぶ → raw_data が daemon socket に流れる
+    /// 2. daemon は ack を返さない (= test では何も書かない)
+    /// 3. `RAW_ACK_TIMEOUT` 経過で client は `Err(Error::Invalid("raw_ack timeout..."))`
+    /// 4. ここで daemon が **遅れて** ack を書く (= stale ack)
+    /// 5. client が **再度** send_raw_bytes を呼ぶ → poison check で即 fail、
+    ///    stale ack を誤受理しない
+    ///
+    /// 旧実装 (= poison なし) では (5) で stale ack を「自分宛 ack」として受理して
+    /// silent wrong behavior が起きていた。
+    #[test]
+    fn send_raw_bytes_after_timeout_is_poisoned_and_rejects_stale_ack() {
+        let (mut conn, daemon_sock) = make_pair_connection();
+
+        // RAW_ACK_TIMEOUT を待つと test が遅いので、connection に短い timeout を仕掛ける
+        // ことはできない (= RAW_ACK_TIMEOUT は const)。代わりに、daemon socket を完全に
+        // 閉じることで poll が POLLIN を返し、続く decode_from が EOF → I/O error で
+        // 即 poison 経路を踏ませる (= timeout 等価の poison path、両経路とも
+        // `result.is_err()` で `poison()` が呼ばれる)。
+        drop(daemon_sock);
+
+        // この呼び出しは I/O error で fail し poison される (= EPIPE on write、
+        // または ack 待ちの decode で EOF)。
+        let r1 = conn.send_raw_bytes(b"x");
+        assert!(r1.is_err(), "daemon closed: first call must fail: {r1:?}");
+        assert!(
+            conn.poisoned,
+            "connection must be poisoned after I/O failure"
+        );
+
+        // 2 回目の呼び出しは poison check で即 fail (= stale ack 受理経路に進まない)。
+        let r2 = conn.send_raw_bytes(b"y");
+        match r2 {
+            Err(Error::Invalid(msg)) => {
+                assert!(
+                    msg.contains("poisoned"),
+                    "second call must return poison error, got {msg:?}"
+                );
+            }
+            other => panic!("expected poison error on second call, got {other:?}"),
+        }
+    }
+
+    /// DR-0021 改訂: daemon が ack:Error を返した場合は poison しない
+    /// (= ack 自体は正常受信、caller が semantic で継続判断する)。
+    #[test]
+    fn send_raw_bytes_remote_error_does_not_poison() {
+        let (mut conn, mut daemon_sock) = make_pair_connection();
+
+        // 別 thread で daemon 側: client の raw_data を読み、ack:Error を返す。
+        let daemon_thread = std::thread::spawn(move || {
+            let frame = Frame::decode_from(&mut daemon_sock).expect("decode raw_data");
+            assert_eq!(frame.ty, TYPE_RAW_DATA);
+            let ack = RawAck::err("test.rejected", "denied");
+            let body = ack.encode_to_vec().expect("encode ack");
+            Frame::raw_ack(body)
+                .encode_to(&mut daemon_sock)
+                .expect("send ack");
+            // socket は close せず保持 (= 次の呼び出しのため)
+            daemon_sock
+        });
+
+        let r = conn.send_raw_bytes(b"hello");
+        match r {
+            Err(Error::Remote(msg)) => assert!(msg.contains("denied")),
+            other => panic!("expected Err(Remote(..)), got {other:?}"),
+        }
+        assert!(
+            !conn.poisoned,
+            "Remote ack:Error must NOT poison (semantic-level failure, not I/O)"
+        );
+        let _daemon_sock = daemon_thread.join().expect("daemon join");
+    }
+
+    /// DR-0021 改訂 m1: `recv_control` は不要な `TYPE_RAW_ACK` を silent skip
+    /// (= 旧実装は `unexpected frame type` で hard error)。
+    #[test]
+    fn recv_control_silently_skips_unsolicited_raw_ack() {
+        use crate::protocol::messages::LeaderNotify;
+
+        let (mut conn, mut daemon_sock) = make_pair_connection();
+
+        // daemon 側: stale ack を 1 枚 + 本物の control message を送る。
+        std::thread::spawn(move || {
+            // (1) unsolicited RAW_ACK (= stale)
+            let ack = RawAck::ok();
+            let body = ack.encode_to_vec().expect("encode ack");
+            Frame::raw_ack(body)
+                .encode_to(&mut daemon_sock)
+                .expect("send raw_ack");
+            // (2) 本物の control message
+            let msg = ControlMessage::LeaderNotify(LeaderNotify { client_id: Some(7) });
+            let cbor = msg.encode_to_vec().expect("encode ctrl");
+            Frame::cbor_control(cbor)
+                .encode_to(&mut daemon_sock)
+                .expect("send ctrl");
+        });
+
+        // recv_control は RAW_ACK を skip して LeaderNotify を返す。
+        let got = conn
+            .recv_control(None)
+            .expect("recv_control should succeed");
+        match got {
+            ControlMessage::LeaderNotify(n) => {
+                assert_eq!(n.client_id, Some(7));
+            }
+            other => panic!("expected LeaderNotify, got {other:?}"),
+        }
+    }
+
+    /// DR-0021 改訂 (1) partial-byte race の **mock daemon** 再現 unit test。
+    ///
+    /// scenario: daemon が `RAW_ACK` を返す前に、**ack 待ち中の client にとって
+    /// non-ack の大きな frame** (= broadcast 由来の RAW_DATA frame) を 1 枚送る。
+    /// 続けて RAW_ACK frame を送る。client は両 frame を順次 decode し、
+    /// non-ack は pending_frames に積み、ack を return しなければならない。
+    ///
+    /// 旧実装は read_timeout が中途半端な短さで設定された場合に大きな non-ack frame の
+    /// 途中で TimedOut を踏み partial-byte discard で frame protocol が壊れる事故が
+    /// 起きた (= 実機 python 1038 B 再現)。新実装 (poll-based + blocking decode) では
+    /// frame 境界で deadline 判定のみが効くため、frame body の途中で stream が
+    /// 切られない (= partial-byte race が構造的に消える)。
+    #[test]
+    fn send_raw_bytes_handles_large_non_ack_frame_then_ack() {
+        let (mut conn, mut daemon_sock) = make_pair_connection();
+
+        // daemon thread: client の raw_data 受信 → 大きな non-ack frame (= 4 KiB の
+        // RAW_DATA broadcast) → ack frame、を順に流す。
+        let daemon_thread = std::thread::spawn(move || {
+            let req = Frame::decode_from(&mut daemon_sock).expect("decode raw_data req");
+            assert_eq!(req.ty, TYPE_RAW_DATA);
+            // 4 KiB の non-ack frame (= broadcast の RAW_DATA を装う)
+            let big_body = vec![b'B'; 4096];
+            Frame::raw_data(big_body)
+                .encode_to(&mut daemon_sock)
+                .expect("send big raw_data");
+            // ack
+            let ack = RawAck::ok();
+            let body = ack.encode_to_vec().expect("encode ack");
+            Frame::raw_ack(body)
+                .encode_to(&mut daemon_sock)
+                .expect("send ack");
+            daemon_sock
+        });
+
+        // client: send_raw_bytes は大きな non-ack frame をスキップ (= pending_frames に
+        // 積む) して ack を待ち、Ok を返す。
+        let r = conn.send_raw_bytes(b"req");
+        assert!(
+            r.is_ok(),
+            "send_raw_bytes should succeed even with large non-ack frame before ack: {r:?}"
+        );
+        // pending_frames に積まれているはず (= 後続 recv_frame で取り出せる)。
+        assert_eq!(
+            conn.pending_frames.len(),
+            1,
+            "non-ack frame must be buffered"
+        );
+        let buffered = &conn.pending_frames[0];
+        assert_eq!(buffered.ty, TYPE_RAW_DATA);
+        assert_eq!(buffered.body.len(), 4096);
+
+        let _ = daemon_thread.join().expect("daemon join");
     }
 }

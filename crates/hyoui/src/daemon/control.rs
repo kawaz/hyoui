@@ -39,18 +39,20 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
 use crate::protocol::messages::{
-    ClientInfo, ErrorCode, ErrorMessage, LockResponse, LockResult, ModeChange, RecordInfo,
-    RecordListResponse, RecordStartRequest, RecordStartResponse, RecordStopRequest,
-    RecordStopResponse, ScreenBufferKind, ScreenCursorSnap, ScreenDumpRequest, ScreenDumpResponse,
-    ScreenModeSnap, ScreenWindowSize, SessionMode, SnapshotComponent, StateSnapshotRequest,
-    StateSnapshotResponse, StatusResponse, TailRequest,
+    CODE_CLIENT_LOCK_NOT_HELD, CODE_CLIENT_RO_REJECTED, CODE_MASTER_WRITE_ERROR,
+    CODE_MASTER_WRITE_PARTIAL, CODE_MASTER_WRITE_TIMEOUT, ClientInfo, ErrorCode, ErrorMessage,
+    LockResponse, LockResult, ModeChange, RawAck, RecordInfo, RecordListResponse,
+    RecordStartRequest, RecordStartResponse, RecordStopRequest, RecordStopResponse,
+    ScreenBufferKind, ScreenCursorSnap, ScreenDumpRequest, ScreenDumpResponse, ScreenModeSnap,
+    ScreenWindowSize, SessionMode, SnapshotComponent, StateSnapshotRequest, StateSnapshotResponse,
+    StatusResponse, TailRequest,
 };
 use crate::protocol::{ControlMessage, Frame, Mode, TYPE_CBOR_CONTROL, TYPE_RAW_DATA};
 use crate::scrollback::Scrollback;
 use crate::sys::clock::now_unix_ms;
 use crate::sys::{FdExt, Pty, WriteError};
 
-use super::broadcast::{ClientHandle, broadcast_control, send_control};
+use super::broadcast::{ClientHandle, broadcast_control, send_control, send_raw_ack};
 use super::lock::{SessionState, generate_lock_token};
 use super::record::{
     InRejectedReason, LifecycleEvent, RecordStartError, RecordStopError, SessionInfo,
@@ -134,9 +136,15 @@ pub(super) fn handle_client_frame(
             let ch_id = clients[idx].id;
             let ch_mode = clients[idx].mode;
             // 書き込み authorization:
-            // - Ro mode は書けない (silently drop)
-            // - lock 中は lock holder のみ書ける (= 他 rw も silently drop)
+            // - Ro mode は書けない (= reject)
+            // - lock 中は lock holder のみ書ける (= 他 rw も reject)
             // DR-0016 §3: reject 経路は `in-rejected` lifecycle event として記録する。
+            //
+            // DR-0021 改訂: ack の意味論を「bytes が子の input stream に確実に到達した」に
+            // 統一する。Ro / lock 不一致は master fd に書かれていないので Error ack
+            // (`client.ro-rejected` / `client.lock-not-held`) を返し、client は CLI exit 1
+            // で abort する。旧実装は silent-drop 互換のため `Ok` を返していたが、
+            // ack:Ok = 嘘応答になっていたため改訂 (= v1.0 前の breaking、許容方針)。
             if matches!(ch_mode, Mode::Ro) {
                 state.record_registry.push_in_rejected(
                     ch_id,
@@ -145,6 +153,13 @@ pub(super) fn handle_client_frame(
                     InRejectedReason::RoClient,
                     &frame.body,
                 );
+                let ack = RawAck::err(
+                    CODE_CLIENT_RO_REJECTED,
+                    "client is read-only; input rejected by daemon",
+                );
+                if !send_raw_ack(&clients[idx], &ack) {
+                    return ClientFrameOutcome::DropClient;
+                }
                 return ClientFrameOutcome::Continue;
             }
             if let Some(holder) = state.lock_holder
@@ -157,6 +172,13 @@ pub(super) fn handle_client_frame(
                     InRejectedReason::LockNotHeld,
                     &frame.body,
                 );
+                let ack = RawAck::err(
+                    CODE_CLIENT_LOCK_NOT_HELD,
+                    "lock is held by another client; input rejected",
+                );
+                if !send_raw_ack(&clients[idx], &ack) {
+                    return ClientFrameOutcome::DropClient;
+                }
                 return ClientFrameOutcome::Continue;
             }
             // R5-C3: master fd は NONBLOCK なので `write_all` だと EAGAIN
@@ -198,27 +220,61 @@ pub(super) fn handle_client_frame(
                         );
                     }
                     if outcome.is_complete() {
+                        // DR-0021: bytes 系 spec の完了点として ack を返す。
+                        // ack enqueue 失敗 (= overflow / writer dead) は当該 client の
+                        // 終端なので drop する (既存 backpressure cascade に合流)。
+                        if !send_raw_ack(&clients[idx], &RawAck::ok()) {
+                            return ClientFrameOutcome::DropClient;
+                        }
                         ClientFrameOutcome::Continue
                     } else {
                         // partial / failure (= written_len < requested_len、または error)。
-                        match outcome.error {
-                            Some(WriteError::IdleTimeout) => {
-                                let _ = send_control(
-                                    &clients[idx],
-                                    ControlMessage::Error(ErrorMessage {
-                                        code: ErrorCode::MasterWriteTimeout,
-                                        message: format!(
-                                            "master PTY write made no forward progress for {MASTER_WRITE_IDLE_TIMEOUT_MS} ms \
-                                            (child is a slow reader); disconnecting client (written={}/{})",
-                                            outcome.written_len, outcome.requested_len
-                                        ),
-                                        details: None,
-                                    }),
-                                );
-                                ClientFrameOutcome::DropClient
-                            }
-                            Some(WriteError::Io(_)) | None => ClientFrameOutcome::DropClient,
+                        // DR-0021: client が ack 待ちで hang しないよう、disconnect する前に
+                        // 失敗 ack を必ず送る (= client は CLI exit 1 で abort できる)。
+                        let (ack_code, ack_msg) = match outcome.error.as_ref() {
+                            Some(WriteError::IdleTimeout) => (
+                                CODE_MASTER_WRITE_TIMEOUT,
+                                format!(
+                                    "master PTY write made no forward progress for {MASTER_WRITE_IDLE_TIMEOUT_MS} ms \
+                                    (child is a slow reader); disconnecting client (written={}/{})",
+                                    outcome.written_len, outcome.requested_len
+                                ),
+                            ),
+                            Some(WriteError::Io(errno)) => (
+                                CODE_MASTER_WRITE_ERROR,
+                                format!(
+                                    "master PTY write failed with I/O error {errno} \
+                                     (written={}/{})",
+                                    outcome.written_len, outcome.requested_len
+                                ),
+                            ),
+                            None => (
+                                CODE_MASTER_WRITE_PARTIAL,
+                                format!(
+                                    "master PTY write returned partial without error (written={}/{})",
+                                    outcome.written_len, outcome.requested_len
+                                ),
+                            ),
+                        };
+                        let _ = send_raw_ack(&clients[idx], &RawAck::err(ack_code, ack_msg));
+                        // 既存の CBOR Error message も IdleTimeout 経路では送る (= 旧 client
+                        // / 観測者にも理由が伝わるよう retain)。新 client は RAW_ACK で
+                        // 検出済なので無視される (= 後続 frame の skip 経路で吸収)。
+                        if matches!(outcome.error, Some(WriteError::IdleTimeout)) {
+                            let _ = send_control(
+                                &clients[idx],
+                                ControlMessage::Error(ErrorMessage {
+                                    code: ErrorCode::MasterWriteTimeout,
+                                    message: format!(
+                                        "master PTY write made no forward progress for {MASTER_WRITE_IDLE_TIMEOUT_MS} ms \
+                                        (child is a slow reader); disconnecting client (written={}/{})",
+                                        outcome.written_len, outcome.requested_len
+                                    ),
+                                    details: None,
+                                }),
+                            );
                         }
+                        ClientFrameOutcome::DropClient
                     }
                 }
                 Err(_) => ClientFrameOutcome::DropClient,
