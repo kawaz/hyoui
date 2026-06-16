@@ -147,11 +147,10 @@ hyoui wait "$SESS" "^\\$" --timeout=10s
 hyoui screen dump "$SESS"
 hyoui screen dump "$SESS" --layer=both --rect=0,0,80,5
 
-# 構造化 snapshot (= wire 上は CBOR encoded StateSnapshotResponse)
-# 注: --format=json は forward-compat で未配線 (= 現状の出力は CBOR)。
-#     jq に流す前に CBOR デコーダを通すこと。
-hyoui screen snapshot "$SESS" --include=Cursor
+# 構造化 snapshot (= daemon は CBOR encoded StateSnapshotResponse、`--format=json` で CLI 段が JSON 変換)
+hyoui screen snapshot "$SESS" --include=Cursor                            # CBOR (default、機械処理)
 hyoui screen snapshot "$SESS" --include=Cells,Cursor,Mode
+hyoui screen snapshot "$SESS" --include=Cursor,Mode --format=json | jq .  # JSON (jq に直接 pipe 可)
 
 # 排他取得 (= 他 client が強制 ro、自分は leader 強制昇格)
 hyoui lock acquire "$SESS" --timeout=30s

@@ -2811,7 +2811,8 @@ fn parse_screen_dump_rect(s: &str) -> Result<ScreenDumpCliRect, String> {
 /// 受理する options:
 /// - `--socket=<path>` — session_id の代替 (= shared helper)
 /// - `--include=<set>` — comma-separated component 集合 (= default 全部)
-/// - `--format=cbor|json` (= default cbor、json は MVP scope 外で wire 上は cbor)
+/// - `--format=cbor|json` (= default cbor。json は CLI 段で `serde_json` 変換、
+///   wire 不変)
 /// - `--output=<path>` — stdout の代わりに file へ書き出し
 /// - `--timeout=<ms>` — response 受信 timeout (= default 5000ms)
 #[allow(clippy::result_large_err)]
@@ -2844,8 +2845,8 @@ fn parse_screen_snapshot(args: &[String]) -> Command {
                         Ok(true)
                     }
                     "json" => {
-                        // MVP scope 外。CLI 段では受理するが daemon は cbor で返すため
-                        // 実質 cbor と同じ wire 動作。後段 task で json encoder を入れる。
+                        // CLI 段で `StateSnapshotResponse` を `serde_json::to_string_pretty`
+                        // で human-readable JSON に変換する (= daemon は CBOR が正本、wire 不変)。
                         format = ScreenSnapshotCliFormat::Json;
                         Ok(true)
                     }
@@ -4166,8 +4167,8 @@ fn usage_screen_snapshot() -> String {
                 Cells, Cursor, Mode, Style, Scrollback, WindowSize, Buffer, SequenceNo\n                        \
                 (Scrollback は daemon 側で未実装 → 明示指定すると error)\n    \
             --format FMT        Output format (default: cbor)\n                        \
-                cbor — CBOR encoded StateSnapshotResponse\n                        \
-                json — forward-compat (= 現状 daemon 未実装、wire 上は cbor)\n    \
+                cbor — CBOR encoded StateSnapshotResponse (= 機械処理、default)\n                        \
+                json — JSON encoded StateSnapshotResponse (= CLI 段で serde_json 変換、jq 等で直接処理可)\n    \
             --output PATH       書き出し先 (= 未指定なら stdout)\n    \
             --timeout DUR       response 受信 timeout (= default 5s。DUR 形式: 5s/500ms/...)\n    \
             -h, --help          Show this help and exit\n\

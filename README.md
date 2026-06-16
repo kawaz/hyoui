@@ -156,11 +156,10 @@ hyoui wait "$SESS" "^\\$" --timeout=10s
 hyoui screen dump "$SESS"
 hyoui screen dump "$SESS" --layer=both --rect=0,0,80,5
 
-# structured snapshot (CBOR-encoded StateSnapshotResponse on the wire)
-# NOTE: --format=json is forward-compat and NOT wired yet; output is CBOR today,
-#       so decode with a CBOR tool before piping to jq.
-hyoui screen snapshot "$SESS" --include=Cursor
+# structured snapshot (daemon speaks CBOR-encoded StateSnapshotResponse; `--format=json` converts in the CLI)
+hyoui screen snapshot "$SESS" --include=Cursor                            # CBOR (default, machine processing)
 hyoui screen snapshot "$SESS" --include=Cells,Cursor,Mode
+hyoui screen snapshot "$SESS" --include=Cursor,Mode --format=json | jq .  # JSON (pipe straight into jq)
 
 # exclusive acquire (other clients become forced-ro; you become leader)
 hyoui lock acquire "$SESS" --timeout=30s
