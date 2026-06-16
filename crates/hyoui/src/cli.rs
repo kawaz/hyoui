@@ -4675,6 +4675,16 @@ pub struct InputCommand {
     /// memory 枯渇リスクは user 責任)。`file:` 以外の spec は size 制約なし
     /// (= argv 上限が implicit な上限) なので本値は無視される。
     pub max_file_bytes: u64,
+    /// `--auto-lock-timeout-acquire DUR` で指定する auto-lock acquire の timeout
+    /// (DR-0022)。
+    ///
+    /// `hyoui input` invocation 起動時に internal lock を 1 本 auto-acquire するが、
+    /// 他 client が lock を保持中なら本 timeout までは polling で待つ。timeout 超過で
+    /// CLI exit 1。default 30s (= [`crate::cli::DEFAULT_INPUT_AUTO_LOCK_TIMEOUT`])。
+    ///
+    /// 外側 `--lock-token` flag / `HYOUI_LOCK_TOKEN` env が与えられている場合は
+    /// auto-acquire 自体を skip するため本値は使われない。
+    pub auto_lock_timeout_acquire: Duration,
 }
 
 /// [`InputSpec`] のパース結果 (= prefix で type 判別、payload validate)。
@@ -4804,6 +4814,8 @@ fn parse_input(args: &[String]) -> Command {
     // 優先順: --max-file-bytes flag > HYOUI_MAX_FILE_BYTES env > default。
     // env は flag 未指定時のみ参照する (= flag 優先で env を上書きできる)。
     let mut max_file_bytes: Option<u64> = None;
+    // DR-0022: auto-lock acquire timeout (default 30s)。
+    let mut auto_lock_timeout_ms: Option<u64> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut i = 0usize;
     while i < args.len() {
@@ -4899,6 +4911,22 @@ fn parse_input(args: &[String]) -> Command {
                 }
                 None => {
                     return Command::Error("input: --max-file-bytes requires a value".into());
+                }
+            },
+            // DR-0022: auto-lock acquire timeout。default 30s、外側 lock token 継承時
+            // (= --lock-token か HYOUI_LOCK_TOKEN) は auto-acquire skip するので
+            // 本値は無視される。
+            "--auto-lock-timeout-acquire" => match value {
+                Some(v) => match parse_duration_ms(&v) {
+                    Ok(ms) => auto_lock_timeout_ms = Some(ms),
+                    Err(e) => {
+                        return Command::Error(format!("input: --auto-lock-timeout-acquire: {e}"));
+                    }
+                },
+                None => {
+                    return Command::Error(
+                        "input: --auto-lock-timeout-acquire requires a value".into(),
+                    );
                 }
             },
             other if other.starts_with("--") => {
@@ -5013,6 +5041,10 @@ fn parse_input(args: &[String]) -> Command {
         },
     };
 
+    let auto_lock_timeout_acquire = auto_lock_timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_INPUT_AUTO_LOCK_TIMEOUT);
+
     Command::Input(InputCommand {
         socket,
         session_id,
@@ -5022,6 +5054,7 @@ fn parse_input(args: &[String]) -> Command {
         timeout: Duration::from_millis(timeout_ms),
         lock_token,
         max_file_bytes,
+        auto_lock_timeout_acquire,
     })
 }
 
@@ -5049,7 +5082,11 @@ fn usage_input() -> String {
             --index N          Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
             --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --timeout DUR      Per-spec timeout (default: 5s; DUR 形式は下記参照)\n    \
-            --lock-token T     明示 lock token (= env HYOUI_LOCK_TOKEN より優先、DR-0006 §8.5)\n    \
+            --lock-token T     外側 lock tx の token を継承用 (DR-0022 = 継承時は\n                       \
+                               auto-acquire skip、env HYOUI_LOCK_TOKEN より優先、DR-0006 §8.5)\n    \
+            --auto-lock-timeout-acquire DUR\n                       \
+                               auto-lock acquire の timeout (default 30s、DR-0022)。\n                       \
+                               --lock-token / HYOUI_LOCK_TOKEN 指定時は auto-acquire skip\n    \
             --max-file-bytes N file: spec の 1 file あたり最大 bytes (default 16777216 = 16 MiB、\n                       \
                                0 で無制限、env HYOUI_MAX_FILE_BYTES より優先、DR-0006 §8.6)\n    \
             -h, --help         Show this help and exit\n\
@@ -5085,7 +5122,11 @@ fn usage_input() -> String {
             sequencing 保証 (= DR-0021)。1 invocation で並べた spec は順序が崩れず、\n    \
             各 spec の bytes が子の input stream に到達してから次に進む。失敗時は\n    \
             明示 ack:Error code (master.write-timeout / client.ro-rejected 等) で\n    \
-            CLI exit 1。\n\
+            CLI exit 1。\n\n    \
+            DR-0022: invocation 全体で auto-lock を取得 (= 他 client の input と排他)。\n    \
+            wait: / wait-idle: 中も lock 保持。外側 --lock-token / HYOUI_LOCK_TOKEN が\n    \
+            ある場合は token を継承するだけで auto-acquire は skip。並列 hyoui input は\n    \
+            先着が完了するまで後着が待つ (= bytes 混線 race 消失)。\n\
         \n\
         RELATED:\n    \
             hyoui screen snapshot <id>   入力後の state を確認\n    \
@@ -5166,6 +5207,13 @@ pub const MAX_SESSION_ID_LEN: usize = 64;
 /// 同じ値の `DEFAULT_MAX_FILE_BYTES` がある (= handler 内 test 用)。両者は
 /// 同期しているが parser 段ではこちらを使う。
 pub const DEFAULT_INPUT_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// `hyoui input` auto-lock acquire の default timeout (= DR-0022)。
+///
+/// 30s: 他 client が長時間 lock を保持するケース (= 巨大 paste、長い wait 等)を
+/// 視野に入れた中庸値。短すぎると瞬間的な競合で flaky、長すぎると hang に気付け
+/// ない。`--auto-lock-timeout-acquire DUR` で上書き可能。
+pub const DEFAULT_INPUT_AUTO_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `session_id` を path traversal / 制御文字 / 過長から守る whitelist validator。
 ///
@@ -8618,6 +8666,66 @@ mod tests {
             Command::Error(msg) => {
                 assert!(msg.contains("--lock-token"), "got: {msg}");
                 assert!(msg.contains("non-empty"), "got: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    // DR-0022: auto-lock timeout flag のパーステスト群
+    #[test]
+    fn parse_input_auto_lock_timeout_default() {
+        match parse_args(&args(&["input", "demo", "text:x"])) {
+            Command::Input(cmd) => {
+                assert_eq!(
+                    cmd.auto_lock_timeout_acquire,
+                    DEFAULT_INPUT_AUTO_LOCK_TIMEOUT
+                );
+            }
+            other => panic!("expected Input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_auto_lock_timeout_explicit() {
+        match parse_args(&args(&[
+            "input",
+            "demo",
+            "--auto-lock-timeout-acquire=10s",
+            "text:x",
+        ])) {
+            Command::Input(cmd) => {
+                assert_eq!(cmd.auto_lock_timeout_acquire, Duration::from_secs(10));
+            }
+            other => panic!("expected Input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_auto_lock_timeout_invalid_errors() {
+        match parse_args(&args(&[
+            "input",
+            "demo",
+            "--auto-lock-timeout-acquire=bogus",
+            "text:x",
+        ])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("--auto-lock-timeout-acquire"), "got: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_input_auto_lock_timeout_missing_value_errors() {
+        match parse_args(&args(&[
+            "input",
+            "demo",
+            "text:x",
+            "--auto-lock-timeout-acquire",
+        ])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("--auto-lock-timeout-acquire"), "got: {msg}");
+                assert!(msg.contains("requires a value"), "got: {msg}");
             }
             other => panic!("expected Error, got {other:?}"),
         }

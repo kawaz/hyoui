@@ -81,6 +81,15 @@ client 側は `code` を見て semantic 判断する: `master.*` は daemon disc
 伴うため abort、`client.*` は権限不足通知として CLI exit 1 (= 既存の `Err(Error::Remote)`
 経路で wrap される)。
 
+**[[DR-0022]] (= `hyoui input` invocation auto-lock) との相互作用**: DR-0022 で
+`hyoui input` は自接続で auto-acquire するため、通常運用では `client.lock-not-held` ack
+は発生しない (= 自分が holder)。発生し得るのは (a) DR-0022 の auto-acquire が timeout
+で失敗した直後 (= acquire 不成立で input を進めない経路に乗るので raw_data 自体送らない)、
+または (b) 万一 daemon 側の `lock_holder` 状態が想定外に変化 (= バグ等) した場合のみ。
+auto-lock 経路は `LockAcquire` / `LockRelease` (control message、ack 不要) を使うため、
+本 §4 の raw_data ack 経路と独立して send/recv され、`pending_frames` の FIFO 順序を
+壊さない。
+
 ### 5. client 側の挙動 (改訂 2026-06-16)
 
 `send_raw_bytes(bytes)`:

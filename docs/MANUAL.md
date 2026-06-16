@@ -134,6 +134,41 @@ fine.
 > input stream*, not that the child has finished processing them. Use a `wait:`
 > spec when you need to know the command has completed.
 
+#### 4.3 Invocation auto-lock (DR-0022)
+
+`hyoui input` **automatically acquires one lock for the entire invocation**.
+Parallel `hyoui input` calls against the same session no longer interleave their
+bytes — the second call waits until the first completes (= serialization).
+
+```sh
+# Parallel inputs against the same session are serialized
+hyoui input "$SESS" "text:hello\n" &
+hyoui input "$SESS" "text:world\n" &
+wait
+# → the screen echoes "hello" completely before "world"
+```
+
+- **The lock is held even during `wait:` / `wait-idle:`** so other clients are
+  blocked through the entire wait. This makes the invocation atomic from other
+  clients' viewpoint.
+- **Outer token inheritance skips auto-acquire**: if `--lock-token=<T>` or
+  `HYOUI_LOCK_TOKEN` env is present, the inner `input` only inherits the token
+  and does not acquire/release (= it won't break the outer lock).
+- **Acquire timeout**: default 30 s. Adjust with `--auto-lock-timeout-acquire DUR`
+  if another client is expected to hold the lock for longer.
+- **No opt-out flag**: auto-lock is always on. To skip, set
+  `HYOUI_LOCK_TOKEN` in the env.
+
+```sh
+# Outer holds the lock; inner inherits the token and skips auto-acquire
+TOKEN=$(hyoui lock acquire "$SESS" --timeout=10s &)
+hyoui input --lock-token="$TOKEN" "$SESS" "text:..."
+hyoui lock release "$SESS" --token="$TOKEN"
+
+# Extend the timeout when long waits are expected
+hyoui input --auto-lock-timeout-acquire=2m "$SESS" "text:..."
+```
+
 ### 5. Wait for the screen to reach a state
 
 `wait` matches a regex against the **current visible screen state**, so past

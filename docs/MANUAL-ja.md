@@ -128,6 +128,39 @@ alt screen TUI (vim / claude 等) は ICANON が無効なので大量 byte で�
 > 子の input stream に届いたこと」であり、「子がその bytes を処理し終えたこと」ではない。
 > コマンド実行完了を待ちたい場合は `wait:` spec を別途使う。
 
+#### 4.3 invocation auto-lock (DR-0022)
+
+`hyoui input` は invocation 全体で 1 本の lock を **自動取得** する。これにより
+並列に動く別の `hyoui input` (= 他 client) と bytes が混線せず、先着が完了するまで
+後着が待つ (= 直列化)。
+
+```sh
+# 並列に同じ session へ input を送ると、両者は直列化される
+hyoui input "$SESS" "text:hello\n" &
+hyoui input "$SESS" "text:world\n" &
+wait
+# → screen には hello が完全に echo されてから world が echo される
+```
+
+- **`wait:` / `wait-idle:` 中も lock は保持される** (= 他 client の input は wait 中も
+  block される)。これは invocation を atomic な一連の操作として扱うため
+- **外側 token 継承時は auto-acquire を skip**: `--lock-token=<T>` flag か
+  `HYOUI_LOCK_TOKEN` env が与えられている場合、外側 lock の token を継承するだけで
+  自分は acquire しない (= 外側の lock を壊さない)
+- **acquire timeout**: default 30 秒。他 client が長時間 lock を保持している場合は
+  exit 1。`--auto-lock-timeout-acquire DUR` で調整可能
+- **opt-out なし**: `--no-lock` 等の flag は無い。常に auto-lock 有効
+
+```sh
+# 外側で lock を取り、内側 input は token を継承する (= inner は auto-acquire skip)
+TOKEN=$(hyoui lock acquire "$SESS" --timeout=10s &)
+hyoui input --lock-token="$TOKEN" "$SESS" "text:..."  # inner は skip
+hyoui lock release "$SESS" --token="$TOKEN"
+
+# 長時間 wait が予想される場合は timeout を伸ばす
+hyoui input --auto-lock-timeout-acquire=2m "$SESS" "text:..."
+```
+
 ### 5. 画面が特定 state になるまで待つ
 
 `wait` は **現在 visible な画面 state** に対して regex を match させるので、過去の

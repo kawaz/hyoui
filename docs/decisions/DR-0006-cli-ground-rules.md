@@ -111,6 +111,26 @@ Lock semantics:
 - `unlock --force` で他 owner の lock も剥がせる (救済用、stderr warn)
 - 他 client の扱いは **強制 ro** (バッファ・ブロックは将来 opt-in)
 
+**実装上の holder 制約 (= 現実装と整合)**: lock の release は **「acquire 元と同一の
+`ClientConnection`」 + 「同一 token」の両方一致**を daemon が検証する
+(`crates/hyoui/src/daemon/control.rs::handle_lock_release`)。別接続が token 文字列だけを
+持って release を試みると `LockNotHeld` error が返る。これは「token 漏洩でも他接続が
+解除できない」セキュリティ性質を提供する反面、外側で acquire した token を内側 process
+に渡しても内側からは release できないことを意味する。
+
+acquire 元接続が消滅 (= process exit / socket close) した場合は daemon の
+**process-bound GC** (`crates/hyoui/src/daemon/session.rs::client disconnect handler`)
+が `lock_holder == ch.id` を検知して自動で `lock_holder` / `lock_token` を None に
+戻し、`mode.change(Rw)` を broadcast する。これにより:
+
+- lock holder 接続の異常終了で lock が永久に取られっぱなしになることはない
+- DR-0006 上の `--process-bound` flag は「明示的に process bound にする」用途のため
+  残しているが、**実態としては全接続が常に process-bound** (= disconnect で auto-release)
+
+[[DR-0022]] (= `hyoui input` invocation auto-lock) はこの「同一接続 holder 制約」を
+活用し、`hyoui input` の `ClientConnection` 内部で `LockAcquire` / `LockRelease` を
+発行することで新 protocol message なしで invocation 全体の auto-lock を実現する。
+
 ### 8. input family — 自動操作 API の唯一の入口
 
 [[DR-0010]] §1 で「v0.2.0 subcommand を 11 → 7 に統合、`input` family を採用」が確定した。本 §8 で **input family の spec syntax を確定**する (= spec prefix カタログ正本)。
@@ -201,6 +221,11 @@ input family 内で lock 動作を inline に書く案 (= `lock:<scope>` / `tx:b
 - lock は **session 全体への排他制御** であり、input spec の sequence の 1 要素として扱うと semantics が混乱する (= spec sequence の途中で `tx:begin` した場合、その後の error で `tx:end` が呼ばれない可能性がある)
 - 排他境界は **subcommand 境界に揃える** のが筋 (= `hyoui lock tx <session> -- hyoui input <session> ...` で外側に lock、内側に input)
 - `--lock-token T` (env `HYOUI_LOCK_TOKEN` 自動使用) で input が自動継承するので、spec prefix に lock を入れる必要がない
+
+**spec prefix 内 lock 不採用は維持**するが、invocation 全体の auto-lock は [[DR-0022]] で
+別途実装した (= subcommand 境界に排他境界を揃える本 §8.5 方針の自然な延長)。
+`hyoui input` は invocation 起動時に自動で lock を acquire / exit 時に release する
+(外側 token 継承時は skip)。spec prefix 内に lock を書く必要は引き続きない。
 
 #### 8.6 入力源と spool / size 制御
 

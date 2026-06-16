@@ -13,7 +13,7 @@ name = "hyoui"
 path = "src/main.rs"
 
 [dependencies]
-hyoui = { path = "../hyoui", version = "0.7" }
+hyoui = { path = "../hyoui", version = "0.8" }
 nix = { workspace = true }
 # `screen snapshot` subcommand が `StateSnapshotResponse` を独立した CBOR root
 # として出力するため、CBOR serialize の primitive を直接利用する (= DR-0013 §9)。
