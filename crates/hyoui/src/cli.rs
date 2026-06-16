@@ -604,8 +604,8 @@ pub struct ScreenSnapshotConfig {
     /// `--include=Cells,Cursor,...` (= comma-separated)、default は全 component。
     /// Vec はそのまま wire の `include: Vec<SnapshotComponent>` に流す。
     pub include: Vec<SnapshotCliComponent>,
-    /// `--format=cbor|json` (= default cbor)。`json` は MVP scope 外で daemon は
-    /// 無視するが、CLI は wire に格別の追加情報を送らずそのまま cbor を返す。
+    /// `--format=cbor|json` (= default cbor)。`json` は CLI 段で `serde_json` で
+    /// human-readable JSON に変換 (= daemon は CBOR が正本、wire 変更なし)。
     pub format: ScreenSnapshotCliFormat,
     /// `--output=<path>` (= 未指定なら stdout)。
     pub output: Option<String>,
@@ -615,15 +615,17 @@ pub struct ScreenSnapshotConfig {
 
 /// `screen snapshot` の format 選択肢 (= DR-0006 §10.3)。
 ///
-/// 現状 MVP では `cbor` のみ実装。`json` は forward-compat 用 (= daemon 側
-/// 未実装、CLI 段では受理するが wire 上は cbor として送る)。
+/// daemon は CBOR が正本。`json` は CLI 段で `serde_json` で human-readable に
+/// 変換した出力 (= wire 変更なし、`cells` / `scrollback` の bytes は serde
+/// default で number array に展開される、量が多い場合は `--include` で skip 推奨)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ScreenSnapshotCliFormat {
     /// CBOR encoded `StateSnapshotResponse` (= 機械処理、default)。
     #[default]
     Cbor,
-    /// JSON encoded (= forward-compat、現状 daemon 未実装で wire には cbor を送る)。
+    /// JSON encoded `StateSnapshotResponse` (= CLI 段で `serde_json` 変換、
+    /// jq 等の標準 JSON ツールに渡しやすい)。
     Json,
 }
 

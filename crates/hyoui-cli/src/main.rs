@@ -2916,9 +2916,10 @@ fn write_screen_dump_payload(payload: &[u8], output: Option<&str>) -> ExitCode {
 /// を送ると daemon が `error` (= `unsupported-capability`) を返す。これは
 /// `ControlMessage::Error` 経路で受け取り、stderr に表示して exit 1。
 ///
-/// `--format=json` は MVP scope 外 (= daemon 未実装)。CLI 段では cli.rs で
-/// 受理するが、wire 上は cbor で送って payload をそのまま流す
-/// (= json encoder は後段 task で実装)。
+/// `--format=json` は CLI 段で `StateSnapshotResponse` を `serde_json` で
+/// human-readable JSON に変換して出力する (= daemon は CBOR が正本、JSON は
+/// CLI 段変換)。`cells` / `scrollback` の bytes は serde default で number
+/// array に展開される (= 量が増えるので `--include` で skip 推奨)。
 fn screen_snapshot_command(cfg: ScreenSnapshotConfig) -> ExitCode {
     let sock = match resolve_target_socket(
         "screen snapshot",
@@ -2999,10 +3000,6 @@ fn screen_snapshot_command(cfg: ScreenSnapshotConfig) -> ExitCode {
     // を受けたら即同期で `screen.snapshot.response` を返すため実害はほぼ無い。
     // timeout 配線は別 task で `ClientConnection::set_read_timeout` を生やす。
     let _ = cfg.timeout_ms;
-    // `--format=json` は受理するが現状 daemon は CBOR しか返さないため、CLI は
-    // 受信した response を CBOR で再 encode して書き出す (= forward-compat、別 task
-    // で json encoder を入れたらここで分岐する)。
-    let _ = cfg.format;
     loop {
         let msg = match conn.recv_control(None) {
             Ok(m) => m,
@@ -3013,16 +3010,42 @@ fn screen_snapshot_command(cfg: ScreenSnapshotConfig) -> ExitCode {
         };
         match msg {
             ControlMessage::StateSnapshotResponse(resp) => {
-                // response 全体を CBOR で再 encode して payload として書き出す
-                // (= 各 component の値が partial で入っているので、構造ごと
-                // 別 tool に渡せる形が便利、ControlMessage 全体ではなく中身の
-                // `StateSnapshotResponse` を独立した CBOR root として出力)。
-                let mut buf = Vec::new();
-                if let Err(e) = ciborium::ser::into_writer(&resp, &mut buf) {
-                    eprintln!("hyoui: screen snapshot: response の再 encode 失敗: {e}");
-                    return ExitCode::from(1);
-                }
-                return write_screen_snapshot_payload(&buf, cfg.output.as_deref());
+                // ControlMessage 全体ではなく中身の `StateSnapshotResponse` を独立 root と
+                // して出力 (= 各 component の値が partial で入っているので、構造ごと別 tool
+                // に渡せる形が便利)。format 分岐は CLI 段で行う (= daemon は CBOR が正本)。
+                let payload = match cfg.format {
+                    hyoui::cli::ScreenSnapshotCliFormat::Cbor => {
+                        let mut buf = Vec::new();
+                        if let Err(e) = ciborium::ser::into_writer(&resp, &mut buf) {
+                            eprintln!(
+                                "hyoui: screen snapshot: response の CBOR 再 encode 失敗: {e}"
+                            );
+                            return ExitCode::from(1);
+                        }
+                        buf
+                    }
+                    hyoui::cli::ScreenSnapshotCliFormat::Json => {
+                        match serde_json::to_string_pretty(&resp) {
+                            Ok(mut s) => {
+                                s.push('\n');
+                                s.into_bytes()
+                            }
+                            Err(e) => {
+                                eprintln!("hyoui: screen snapshot: response の JSON 変換失敗: {e}");
+                                return ExitCode::from(1);
+                            }
+                        }
+                    }
+                    // `ScreenSnapshotCliFormat` is `#[non_exhaustive]`; future variants surface
+                    // as a binary/library version skew rather than silent fallback.
+                    _ => {
+                        eprintln!(
+                            "hyoui: screen snapshot: unsupported --format variant (binary/library version skew)"
+                        );
+                        return ExitCode::from(2);
+                    }
+                };
+                return write_screen_snapshot_payload(&payload, cfg.output.as_deref());
             }
             ControlMessage::Error(e) => {
                 eprintln!(
@@ -4750,6 +4773,88 @@ mod tests {
         assert!(decoded.cells.is_none(), "cells must not be included");
 
         // cleanup: kill 送って thread を終わらせる
+        let kill_opts = AttachOptions {
+            mode: Mode::Ro,
+            ..AttachOptions::default()
+        };
+        if let Ok(mut conn) = connect_with_retry(&sock_path, kill_opts) {
+            let kill = hyoui::protocol::messages::Kill {
+                signal: None,
+                wait: true,
+            };
+            let _ = conn.send_control(&ControlMessage::Kill(kill));
+            drop(conn);
+        }
+        let _ = daemon_handle.join();
+    }
+
+    /// `screen snapshot --format=json` 経路の検証。daemon が CBOR で返した
+    /// `StateSnapshotResponse` を CLI 段で `serde_json::to_string_pretty` に変換し、
+    /// file に書かれた payload が valid JSON で要求 component を持つことを確認する。
+    #[test]
+    fn screen_snapshot_command_writes_json_response_payload_to_file() {
+        use hyoui::daemon::{DaemonConfig, Session};
+
+        let sock_dir = make_0700_dir();
+        let sock_path = sock_dir.path().join("snap-json-test.sock");
+        let out_path = sock_dir.path().join("snap.json");
+
+        let sock_for_daemon = sock_path.clone();
+        let daemon_handle = std::thread::spawn(move || {
+            let cfg = DaemonConfig::new(
+                "screen-snapshot-json-test",
+                sock_for_daemon,
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf 'SMOKE'; sleep 30".into(),
+                ],
+            );
+            let session = Session::start(cfg).expect("daemon start");
+            session.serve()
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let cfg = ScreenSnapshotConfig {
+            socket: Some(sock_path.to_string_lossy().into_owned()),
+            session_id: None,
+            index: None,
+            namespace: None,
+            include: vec![
+                SnapshotCliComponent::Cursor,
+                SnapshotCliComponent::Mode,
+                SnapshotCliComponent::WindowSize,
+                SnapshotCliComponent::Buffer,
+                SnapshotCliComponent::SequenceNo,
+            ],
+            format: hyoui::cli::ScreenSnapshotCliFormat::Json,
+            output: Some(out_path.to_string_lossy().into_owned()),
+            timeout_ms: 5_000,
+        };
+        let _exit = screen_snapshot_command(cfg);
+
+        let got = std::fs::read_to_string(&out_path).expect("read output");
+        assert!(!got.is_empty(), "json payload must not be empty");
+        assert!(got.ends_with('\n'), "json payload must end with newline");
+        let v: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
+        let obj = v.as_object().expect("top-level must be object");
+        assert!(obj.contains_key("cursor"), "cursor key must be present");
+        assert!(obj.contains_key("mode"), "mode key must be present");
+        assert!(
+            obj.contains_key("window-size"),
+            "window-size key must be present (kebab-case from rename_all)"
+        );
+        assert!(obj.contains_key("buffer"), "buffer key must be present");
+        assert!(
+            obj.contains_key("sequence-no"),
+            "sequence-no key must be present"
+        );
+        assert!(
+            !obj.contains_key("cells"),
+            "cells must be omitted (skip_serializing_if = None)"
+        );
+
         let kill_opts = AttachOptions {
             mode: Mode::Ro,
             ..AttachOptions::default()

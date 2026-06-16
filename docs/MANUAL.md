@@ -155,9 +155,11 @@ hyoui input "$SESS" "wait:^Continue\\?" "key:Enter"
 hyoui screen dump "$SESS"
 hyoui screen dump "$SESS" --layer=both --rect=0,0,80,5
 
-# structured snapshot (CBOR on the wire; --format=json is forward-compat / not wired)
-# decode the CBOR with a tool before piping to jq
-hyoui screen snapshot "$SESS" --include=Cells,Cursor,Mode
+# structured snapshot (daemon speaks CBOR on the wire; `--format=json` converts in the CLI)
+hyoui screen snapshot "$SESS" --include=Cells,Cursor,Mode               # CBOR (default, machine processing)
+hyoui screen snapshot "$SESS" --include=Cursor,Mode --format=json | jq .  # JSON (pipe straight into jq)
+# Note: with `--format=json`, `cells` / `scrollback` bytes expand to number arrays and become
+# bulky. Exclude them via `--include` when you only need to inspect via jq.
 ```
 
 ### 7. Exclusive automation (`lock`)

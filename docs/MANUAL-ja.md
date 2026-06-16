@@ -149,9 +149,11 @@ hyoui input "$SESS" "wait:^Continue\\?" "key:Enter"
 hyoui screen dump "$SESS"
 hyoui screen dump "$SESS" --layer=both --rect=0,0,80,5
 
-# 構造化 snapshot (= wire 上は CBOR、--format=json は forward-compat で未配線)
-# jq に流す前に CBOR デコーダを通すこと
-hyoui screen snapshot "$SESS" --include=Cells,Cursor,Mode
+# 構造化 snapshot (= daemon は CBOR が正本、`--format=json` で CLI 段が JSON 変換)
+hyoui screen snapshot "$SESS" --include=Cells,Cursor,Mode               # CBOR (default、機械処理)
+hyoui screen snapshot "$SESS" --include=Cursor,Mode --format=json | jq .  # JSON (jq に直接流せる)
+# 注: `--format=json` 時、`cells` / `scrollback` の bytes は number array に展開されるため
+# 量が増える。jq で見るだけなら `--include` から外しておくのが軽い。
 ```
 
 ### 7. 排他自動操作 (`lock`)
