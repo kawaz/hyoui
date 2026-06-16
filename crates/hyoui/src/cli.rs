@@ -6,8 +6,8 @@
 //!
 //! `input` subcommand の spec parser (= DR-0006 §8) は本ファイル末尾の
 //! "Input spec" section にまとめてある (= [`InputSpec`] / [`parse_input_spec`]
-//! / [`InputCommand`])。本タスクでは parser + dispatcher 骨格のみで、
-//! 各 spec prefix の handler は別 task (#16/#17) で実装する。
+//! / [`InputCommand`])。bytes 系 spec は DR-0021 で daemon PTY drain ack に
+//! よる sequencing 保証付きで送信される。
 //!
 //! # Subcommand layout
 //!
@@ -889,10 +889,9 @@ pub enum Command {
     Screen(ScreenCommand),
     /// `input` subcommand (= DR-0006 §8、spec sequence の順序保証送信)。
     ///
-    /// 本タスク (= #15) で parser + dispatcher 骨格のみ追加。各 spec prefix の
-    /// handler は task #16 (text/hex/file/paste/key) / #17 (wait/wait-idle) で
-    /// 実装するため、CLI parse は成功するが [`InputSpec`] dispatcher は
-    /// `bail!("... not yet implemented")` を返す。
+    /// bytes 系 spec (text/hex/file/paste/key) は DR-0021 で daemon PTY drain
+    /// ack による sequencing 保証付き、state-based 系 (wait/wait-idle) は
+    /// visible state / idle 経過の polling で達成まで block。
     Input(InputCommand),
     /// `lock` 親 subcommand (= DR-0006 §7、自動操作排他の低レベル primitive)。
     ///
@@ -4589,12 +4588,12 @@ fn usage_completion() -> String {
 }
 
 // =============================================================================
-// Input spec (DR-0006 §8) — 本タスク #15 で追加した parser + dispatcher 骨格
+// Input spec (DR-0006 §8) — parser + dispatcher
 // =============================================================================
 //
 // `hyoui input <session> <spec>...` の spec 単位の表現。各 spec は出現順で
-// daemon に送信される (= 順序保証)。本タスクでは **parser のみ実装**、
-// 各 prefix の実際の送信処理は別 task で配線する。
+// daemon に送信される (= 順序保証)。bytes 系 spec は DR-0021 ack 同期で
+// 完了点が「子の input stream 到達」まで持ち上げられている。
 
 /// `hyoui input <session>` に渡される 1 spec の表現 (= DR-0006 §8.2 カタログ)。
 ///
@@ -5082,10 +5081,11 @@ fn usage_input() -> String {
             hyoui input demo key:C-c\n\
         \n\
         NOTE:\n    \
-            本 subcommand は task #15 で parser + dispatcher 骨格のみ実装。\n    \
-            各 spec prefix の実際の送信処理は task #16 (text/hex/file/paste/key) /\n    \
-            #17 (wait/wait-idle) で配線される。本 binary では spec を 1 つでも\n    \
-            含めると `not yet implemented` で exit 1 する。\n\
+            bytes 系 spec (text/hex/file/paste/key) は daemon の PTY drain ack で\n    \
+            sequencing 保証 (= DR-0021)。1 invocation で並べた spec は順序が崩れず、\n    \
+            各 spec の bytes が子の input stream に到達してから次に進む。失敗時は\n    \
+            明示 ack:Error code (master.write-timeout / client.ro-rejected 等) で\n    \
+            CLI exit 1。\n\
         \n\
         RELATED:\n    \
             hyoui screen snapshot <id>   入力後の state を確認\n    \
