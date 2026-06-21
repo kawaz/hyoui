@@ -57,18 +57,20 @@ pub fn infer_target(command: &[String]) -> Option<String> {
     Some(basename.to_string())
 }
 
-/// 親側で組み込み defaults + add + keep を合成して最終 glob patterns を解決する。
+/// 親側で組み込み defaults + add を合成して kill_glob patterns を解決し、
+/// keep globs はそのまま [`ScrubPlan`] に積んで daemon child に渡す。
 ///
 /// 返り値が `None` の場合 = scrub 完全無効 (= `--no-scrub-env`)。
-/// 返り値が `Some(vec)` の場合 (空 vec を含む) = daemon に渡して `apply` させる
-/// (= 空 list なら `apply` は何もしない、target builtin なし & add なしの素通し target)。
-pub fn resolve_globs(
+/// `keep` patterns は `apply` 時に **env 名と glob match** して削除を skip させる
+/// (= `--scrub-env-keep=CLAUDE_*` のように builtin に exact 一致しない glob でも
+/// 機能する。pattern 列の exact 除外ではない)。
+pub fn resolve_plan(
     no_scrub_env: bool,
     explicit_target: Option<&str>,
     command: &[String],
     add: &[String],
     keep: &[String],
-) -> Option<Vec<String>> {
+) -> Option<ScrubPlan> {
     if no_scrub_env {
         return None;
     }
@@ -88,9 +90,23 @@ pub fn resolve_globs(
             patterns.push(a.clone());
         }
     }
-    let keep_set: std::collections::HashSet<&str> = keep.iter().map(|s| s.as_str()).collect();
-    patterns.retain(|p| !keep_set.contains(p.as_str()));
-    Some(patterns)
+    Some(ScrubPlan {
+        patterns,
+        keep: keep.to_vec(),
+    })
+}
+
+/// 親で解決した scrub 計画 (= daemon child に渡す wire 形式)。
+///
+/// `DaemonizeInit` に乗せて env JSON で運ぶ。`patterns` は env 名と glob match
+/// したら削除候補、`keep` は env 名と glob match したら削除を skip。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScrubPlan {
+    /// 削除候補 kill_glob patterns (= 組み込み default + `--scrub-env-add`)。
+    pub patterns: Vec<String>,
+    /// 削除を skip する keep_glob patterns (= `--scrub-env-keep`)。
+    #[serde(default)]
+    pub keep: Vec<String>,
 }
 
 /// glob match: `*` (= 0 文字以上の任意マッチ) と `?` (= 1 文字マッチ) のみ。
@@ -132,35 +148,47 @@ pub fn is_protected(name: &str) -> bool {
     name.starts_with(PROTECTED_PREFIX)
 }
 
-/// scrub 結果 = 削除した env 名一覧 + protected で skip した env 名一覧。
+/// scrub 結果 = 削除した env 名一覧 + skip 種別ごとの env 名一覧。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ScrubResult {
-    /// 実際に environ から削除した env 名 (= match かつ非 protected)。
+    /// 実際に environ から削除した env 名 (= patterns match かつ keep/protected 非該当)。
     pub removed: Vec<String>,
-    /// match したが `HYOUI_*` protected で削除を skip した env 名。
+    /// patterns に match したが `--scrub-env-keep` で削除を skip した env 名。
+    pub keep_skips: Vec<String>,
+    /// patterns に match したが `HYOUI_*` protected で削除を skip した env 名。
     pub protected_hits: Vec<String>,
 }
 
-/// daemon 子 process の environ に対して patterns を適用、削除する。
+/// daemon 子 process の environ に対して [`ScrubPlan`] を適用する。
 ///
-/// 戻り値 [`ScrubResult`] には「削除した env 名」と「protected (`HYOUI_*`) で
-/// match したが削除を skip した env 名」を分けて積む。log 出力 (= stderr) は
+/// 判定順:
+/// 1. env 名が `plan.patterns` (kill_glob) に 1 つも match しない → 維持
+/// 2. env 名が `plan.keep` (keep_glob) に 1 つでも match する → 維持 (= `keep_skips` に積む)
+/// 3. env 名が `HYOUI_*` で始まる → 維持 (= `protected_hits` に積む)
+/// 4. 上記 1-3 いずれにも該当しなければ削除 (= `removed` に積む)
+///
+/// 戻り値 [`ScrubResult`] には「削除した env 名」「keep glob で skip した env 名」
+/// 「protected (`HYOUI_*`) で skip した env 名」を分けて積む。log 出力 (= stderr) は
 /// caller 責務 (= default 無音、必要なら `--verbose` 等で出す。DR-0023 §log 規定)。
 ///
 /// # Safety (caller 契約)
 /// **process 起動初期 + single-threaded** でのみ呼ぶこと。`Session::start` 前の
 /// daemon child から呼ぶ想定 (= [`remove_var_at_startup`] と同じ前提)。
-pub fn apply(patterns: &[String]) -> ScrubResult {
+pub fn apply(plan: &ScrubPlan) -> ScrubResult {
     let mut result = ScrubResult::default();
-    if patterns.is_empty() {
+    if plan.patterns.is_empty() {
         return result;
     }
     let env_names: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| k.into_string().ok())
         .collect();
     for name in env_names {
-        let hit = patterns.iter().any(|p| glob_match(p, &name));
+        let hit = plan.patterns.iter().any(|p| glob_match(p, &name));
         if !hit {
+            continue;
+        }
+        if plan.keep.iter().any(|p| glob_match(p, &name)) {
+            result.keep_skips.push(name);
             continue;
         }
         if is_protected(&name) {
@@ -171,6 +199,7 @@ pub fn apply(patterns: &[String]) -> ScrubResult {
         result.removed.push(name);
     }
     result.removed.sort();
+    result.keep_skips.sort();
     result.protected_hits.sort();
     result
 }
@@ -243,34 +272,36 @@ mod tests {
     }
 
     #[test]
-    fn resolve_globs_no_scrub() {
-        let r = resolve_globs(true, None, &["claude".into()], &[], &[]);
+    fn resolve_plan_no_scrub() {
+        let r = resolve_plan(true, None, &["claude".into()], &[], &[]);
         assert_eq!(r, None);
     }
 
     #[test]
-    fn resolve_globs_claude_default() {
-        let r = resolve_globs(false, None, &["claude".into()], &[], &[]).unwrap();
-        assert!(r.contains(&"CLAUDECODE".into()));
-        assert!(r.contains(&"AI_AGENT".into()));
-        assert_eq!(r.len(), 9);
+    fn resolve_plan_claude_default() {
+        let r = resolve_plan(false, None, &["claude".into()], &[], &[]).unwrap();
+        assert!(r.patterns.contains(&"CLAUDECODE".into()));
+        assert!(r.patterns.contains(&"AI_AGENT".into()));
+        assert_eq!(r.patterns.len(), 9);
+        assert!(r.keep.is_empty());
     }
 
     #[test]
-    fn resolve_globs_explicit_target_overrides_argv() {
-        let r = resolve_globs(false, Some("claude"), &["env".into()], &[], &[]).unwrap();
-        assert!(r.contains(&"CLAUDE_CODE_SESSION_ID".into()));
+    fn resolve_plan_explicit_target_overrides_argv() {
+        let r = resolve_plan(false, Some("claude"), &["env".into()], &[], &[]).unwrap();
+        assert!(r.patterns.contains(&"CLAUDE_CODE_SESSION_ID".into()));
     }
 
     #[test]
-    fn resolve_globs_unknown_target_empty() {
-        let r = resolve_globs(false, None, &["vim".into()], &[], &[]).unwrap();
-        assert!(r.is_empty());
+    fn resolve_plan_unknown_target_empty() {
+        let r = resolve_plan(false, None, &["vim".into()], &[], &[]).unwrap();
+        assert!(r.patterns.is_empty());
+        assert!(r.keep.is_empty());
     }
 
     #[test]
-    fn resolve_globs_add_dedupes() {
-        let r = resolve_globs(
+    fn resolve_plan_add_dedupes() {
+        let r = resolve_plan(
             false,
             None,
             &["claude".into()],
@@ -279,15 +310,33 @@ mod tests {
         )
         .unwrap();
         // AI_AGENT は builtin に既にあるので重複しない
-        assert_eq!(r.iter().filter(|p| *p == "AI_AGENT").count(), 1);
-        assert!(r.contains(&"CMUXMSG_*".into()));
+        assert_eq!(r.patterns.iter().filter(|p| *p == "AI_AGENT").count(), 1);
+        assert!(r.patterns.contains(&"CMUXMSG_*".into()));
     }
 
     #[test]
-    fn resolve_globs_keep_excludes() {
-        let r = resolve_globs(false, None, &["claude".into()], &[], &["AI_AGENT".into()]).unwrap();
-        assert!(!r.contains(&"AI_AGENT".into()));
-        assert!(r.contains(&"CLAUDECODE".into()));
+    fn resolve_plan_keep_is_separate_from_patterns() {
+        // keep は patterns から exact 除外しない (= patterns はそのまま、keep は別 list で保持)。
+        // apply 時に env 名と keep glob を match して削除を skip する semantics。
+        let r =
+            resolve_plan(false, None, &["claude".into()], &[], &["AI_AGENT".into()]).unwrap();
+        assert!(r.patterns.contains(&"AI_AGENT".into())); // patterns には残る
+        assert!(r.keep.contains(&"AI_AGENT".into())); // keep にも積まれる
+    }
+
+    #[test]
+    fn apply_keep_glob_skips_matching_env() {
+        // keep glob `CLAUDE_*` は CLAUDE_ で始まる env 全部の削除を skip する。
+        // patterns は AI_AGENT も含むが、AI_AGENT は keep glob `CLAUDE_*` に
+        // match しないので削除される。
+        let plan = ScrubPlan {
+            patterns: vec!["CLAUDECODE".into(), "CLAUDE_CODE_SESSION_ID".into(), "AI_AGENT".into()],
+            keep: vec!["CLAUDE_*".into()],
+        };
+        // glob_match の単体検証 (= apply は process env を弄るので unit test 不可)。
+        assert!(glob_match(&plan.keep[0], "CLAUDE_CODE_SESSION_ID"));
+        assert!(!glob_match(&plan.keep[0], "AI_AGENT"));
+        assert!(!glob_match(&plan.keep[0], "CLAUDECODE")); // CLAUDE_ プレフィックスなし
     }
 
     #[test]

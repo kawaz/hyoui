@@ -449,10 +449,10 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     // 解決済 namespace は (1) socket 配置 dir の決定、(2) 子プロセスへの常時 env 注入、
     // (3) 非 detached 経路で exec する `hyoui attach` への明示伝搬、に使う。
     let namespace = socket_path::resolve_namespace(cfg.namespace.as_deref());
-    // DR-0023: 子 PTY env scrub。target 推定 + builtin + add + keep を CLI 側で
-    // 合成して flat な glob list を解決。`None` で完全 disable (= --no-scrub-env)、
-    // `Some(vec)` で daemon child の `env_scrub::apply` に渡す。
-    let scrub_env_globs = hyoui::sys::env_scrub::resolve_globs(
+    // DR-0023: 子 PTY env scrub。target 推定 + builtin + add で kill_glob patterns を
+    // 解決、keep glob は別 list として ScrubPlan に積む。`None` で完全 disable (=
+    // --no-scrub-env)、`Some(plan)` で daemon child の `env_scrub::apply` に渡す。
+    let scrub_env_plan = hyoui::sys::env_scrub::resolve_plan(
         cfg.no_scrub_env,
         cfg.scrub_env_target.as_deref(),
         &cfg.command,
@@ -513,7 +513,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
             cfg.on_child_suspend,
             cfg.timeout_ms,
             cfg.idle_timeout_ms,
-            scrub_env_globs,
+            scrub_env_plan,
             cfg.command,
         );
     }
@@ -537,7 +537,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
         cfg.on_child_suspend,
         cfg.timeout_ms,
         cfg.idle_timeout_ms,
-        scrub_env_globs,
+        scrub_env_plan,
         cfg.command,
     ) {
         Ok(pair) => pair,

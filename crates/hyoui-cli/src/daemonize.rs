@@ -34,7 +34,7 @@ pub fn run_detached_parent(
     on_child_suspend: hyoui::cli::OnChildSuspend,
     timeout_ms: Option<u64>,
     idle_timeout_ms: Option<u64>,
-    scrub_env: Option<Vec<String>>,
+    scrub_env: Option<hyoui::sys::env_scrub::ScrubPlan>,
     cmd: Vec<String>,
 ) -> ExitCode {
     match spawn_detached_daemon_and_wait_ready(
@@ -82,7 +82,7 @@ pub fn spawn_detached_daemon_and_wait_ready(
     on_child_suspend: hyoui::cli::OnChildSuspend,
     timeout_ms: Option<u64>,
     idle_timeout_ms: Option<u64>,
-    scrub_env: Option<Vec<String>>,
+    scrub_env: Option<hyoui::sys::env_scrub::ScrubPlan>,
     cmd: Vec<String>,
 ) -> Result<(String, PathBuf), ExitCode> {
     let session_id = session_id_override.unwrap_or_else(socket_path::auto_session_id);
@@ -350,12 +350,12 @@ struct DaemonizeInit {
     )]
     idle_timeout_ms: Option<u64>,
 
-    /// DR-0023: 子 PTY env scrub の解決済 glob patterns。
+    /// DR-0023: 子 PTY env scrub の解決済 plan (= patterns + keep)。
     /// - `None` = scrub 完全 disable (= `--no-scrub-env` または旧 init JSON 互換)
-    /// - `Some(vec)` = daemon child が `env_scrub::apply` でこれを適用
-    ///   (= 空 vec は target builtin なし & add なしの no-op を表現)
+    /// - `Some(plan)` = daemon child が `env_scrub::apply` でこれを適用
+    ///   (= 空 patterns は target builtin なし & add なしの no-op を表現)
     #[serde(rename = "scrub_env", skip_serializing_if = "Option::is_none", default)]
-    scrub_env: Option<Vec<String>>,
+    scrub_env: Option<hyoui::sys::env_scrub::ScrubPlan>,
 }
 
 /// `DaemonizeInit.namespace` の serde default (= 旧 init JSON 互換)。
@@ -433,8 +433,8 @@ pub fn run_daemon_child() -> ExitCode {
     // 注入対象を巻き添えにしてしまうのを protected guard で防ぐが、それでも順序として
     // 「漏れ削除 → 意図的注入」が読みやすいため。daemon は single-threaded (=
     // Session::start 前) なので `apply` の async-signal-unsafe 制約に抵触しない。
-    if let Some(globs) = init.scrub_env.as_deref() {
-        let _result = hyoui::sys::env_scrub::apply(globs);
+    if let Some(plan) = init.scrub_env.as_ref() {
+        let _result = hyoui::sys::env_scrub::apply(plan);
         // log は default 無音 (DR-0023 §log)。観測したい場合は将来 HYOUI_VERBOSE 等で
         // opt-in する (Future work)。_result は捨てるが apply は環境を実際に書き換え済。
     }
