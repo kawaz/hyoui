@@ -318,8 +318,7 @@ mod tests {
     fn resolve_plan_keep_is_separate_from_patterns() {
         // keep は patterns から exact 除外しない (= patterns はそのまま、keep は別 list で保持)。
         // apply 時に env 名と keep glob を match して削除を skip する semantics。
-        let r =
-            resolve_plan(false, None, &["claude".into()], &[], &["AI_AGENT".into()]).unwrap();
+        let r = resolve_plan(false, None, &["claude".into()], &[], &["AI_AGENT".into()]).unwrap();
         assert!(r.patterns.contains(&"AI_AGENT".into())); // patterns には残る
         assert!(r.keep.contains(&"AI_AGENT".into())); // keep にも積まれる
     }
@@ -330,7 +329,11 @@ mod tests {
         // patterns は AI_AGENT も含むが、AI_AGENT は keep glob `CLAUDE_*` に
         // match しないので削除される。
         let plan = ScrubPlan {
-            patterns: vec!["CLAUDECODE".into(), "CLAUDE_CODE_SESSION_ID".into(), "AI_AGENT".into()],
+            patterns: vec![
+                "CLAUDECODE".into(),
+                "CLAUDE_CODE_SESSION_ID".into(),
+                "AI_AGENT".into(),
+            ],
             keep: vec!["CLAUDE_*".into()],
         };
         // glob_match の単体検証 (= apply は process env を弄るので unit test 不可)。
