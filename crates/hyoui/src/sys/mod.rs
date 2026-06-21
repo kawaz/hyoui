@@ -6,6 +6,7 @@
 
 pub mod clock;
 pub mod env;
+pub mod env_scrub;
 pub mod error;
 pub mod fd;
 pub mod poll;

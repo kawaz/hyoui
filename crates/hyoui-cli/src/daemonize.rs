@@ -34,6 +34,7 @@ pub fn run_detached_parent(
     on_child_suspend: hyoui::cli::OnChildSuspend,
     timeout_ms: Option<u64>,
     idle_timeout_ms: Option<u64>,
+    scrub_env: Option<Vec<String>>,
     cmd: Vec<String>,
 ) -> ExitCode {
     match spawn_detached_daemon_and_wait_ready(
@@ -47,6 +48,7 @@ pub fn run_detached_parent(
         on_child_suspend,
         timeout_ms,
         idle_timeout_ms,
+        scrub_env,
         cmd,
     ) {
         Ok((session_id, _sock)) => {
@@ -80,6 +82,7 @@ pub fn spawn_detached_daemon_and_wait_ready(
     on_child_suspend: hyoui::cli::OnChildSuspend,
     timeout_ms: Option<u64>,
     idle_timeout_ms: Option<u64>,
+    scrub_env: Option<Vec<String>>,
     cmd: Vec<String>,
 ) -> Result<(String, PathBuf), ExitCode> {
     let session_id = session_id_override.unwrap_or_else(socket_path::auto_session_id);
@@ -140,6 +143,8 @@ pub fn spawn_detached_daemon_and_wait_ready(
         // DR-0019 §4: overall / idle timeout を daemon に伝える (= --until と同経路)。
         timeout_ms,
         idle_timeout_ms,
+        // DR-0023: 親で解決した env scrub patterns を daemon child に渡す。
+        scrub_env,
     };
     let init_json = match serde_json::to_string(&init) {
         Ok(s) => s,
@@ -344,6 +349,13 @@ struct DaemonizeInit {
         default
     )]
     idle_timeout_ms: Option<u64>,
+
+    /// DR-0023: 子 PTY env scrub の解決済 glob patterns。
+    /// - `None` = scrub 完全 disable (= `--no-scrub-env` または旧 init JSON 互換)
+    /// - `Some(vec)` = daemon child が `env_scrub::apply` でこれを適用
+    ///   (= 空 vec は target builtin なし & add なしの no-op を表現)
+    #[serde(rename = "scrub_env", skip_serializing_if = "Option::is_none", default)]
+    scrub_env: Option<Vec<String>>,
 }
 
 /// `DaemonizeInit.namespace` の serde default (= 旧 init JSON 互換)。
@@ -414,6 +426,18 @@ pub fn run_daemon_child() -> ExitCode {
     let on_child_suspend = parse_child_suspend(init.on_child_suspend.as_deref());
     let timeout_ms = init.timeout_ms;
     let idle_timeout_ms = init.idle_timeout_ms;
+
+    // DR-0023: 子 PTY 継承用 environ から親 Internal Context env (例: 親 Claude Code
+    // の `CLAUDE_CODE_SESSION_ID` 等) を scrub する。`HYOUI_NAMESPACE`/`HYOUI_SESSION_ID`
+    // 注入の **前** に実施するのは、ユーザ pattern (= `--scrub-env-add=HYOUI_*`) で
+    // 注入対象を巻き添えにしてしまうのを protected guard で防ぐが、それでも順序として
+    // 「漏れ削除 → 意図的注入」が読みやすいため。daemon は single-threaded (=
+    // Session::start 前) なので `apply` の async-signal-unsafe 制約に抵触しない。
+    if let Some(globs) = init.scrub_env.as_deref() {
+        let _result = hyoui::sys::env_scrub::apply(globs);
+        // log は default 無音 (DR-0023 §log)。観測したい場合は将来 HYOUI_VERBOSE 等で
+        // opt-in する (Future work)。_result は捨てるが apply は環境を実際に書き換え済。
+    }
 
     // DR-0018: 子 PTY に `HYOUI_NAMESPACE` を **常時注入** (= default でも注入)。
     // daemon child 自身の env に set しておくと、`Session::start` が fork+execvp する

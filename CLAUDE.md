@@ -20,6 +20,7 @@ Terminal multiplexer ではない (= tmux/screen の代替ではない)。
 | **[DR-0015](docs/decisions/DR-0015-run-as-fork-plus-attach.md)** | **`hyoui run` 構造変更** — fork daemon + attach client 合成、client/server 同居廃止 |
 | [DR-0006](docs/decisions/DR-0006-cli-ground-rules.md) | CLI 設計 — input family / wait / screen / tail / lock |
 | [DR-0008](docs/decisions/DR-0008-protocol-design.md) | protocol — CBOR framing / cap flags |
+| [DR-0023](docs/decisions/DR-0023-child-env-scrub.md) | 子 PTY env scrub — 親 Internal Context env の漏洩防止 (= 透過原則の例外、削除のみ最小介入) |
 
 ## 介入判断 self-check (= DR-0014 §self-check)
 
