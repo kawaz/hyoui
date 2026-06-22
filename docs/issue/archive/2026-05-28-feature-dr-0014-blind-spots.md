@@ -1,6 +1,6 @@
 ---
 title: "feature: DR-0014 で防ぎきれなかった盲点の補強"
-status: wip
+status: resolved
 category: task
 created: 2026-05-28T00:00:00+09:00
 last_read: 2026-06-22T20:46:00+09:00
@@ -9,10 +9,10 @@ wip_entered: 2026-05-30T00:00:00+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-06-22T19:40:45+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0014","implemented","done:盲点 1-3 を self-check 8 項目目 / Anti-pattern 6 件目 / §状態観測 / §検証主義 補強として DR-0014 改訂 (commit mqkrkxqnplqw、CLAUDE.md 連動更新) で反映済。残 3 task は本 issue スコープ外、独立 task として別途 issue 化"]
 blocked_by:
 origin: 自リポ TODO
 ---
