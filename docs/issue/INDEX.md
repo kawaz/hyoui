@@ -26,4 +26,3 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 | 2026-05-26 | request | wip | [feature-recording-and-dump](./2026-05-26-feature-recording-and-dump.md) | tty I/O の dump / record / play subcommand |
 | 2026-05-30 | request | pending-sublimation | [feature-list-format-improvement](./2026-05-30-feature-list-format-improvement.md) | `hyoui list` の表示形式改善 (= 固定長 + cwd / argv 表示 + `--format=jsonl`) |
 | 2026-05-30 | request | pending-sublimation | [feature-attach-index-shortcut](./2026-05-30-feature-attach-index-shortcut.md) | `hyoui attach` で session を index で指定したい (= ID コピペ省略) |
-| 2026-05-26 | bug | pending-sublimation | [bug-flaky-agent-tests](./2026-05-26-bug-flaky-agent-tests.md) | BUG: agent.rs tests がフレーキー (agent.rs 削除済、pending sublimation) |

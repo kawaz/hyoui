@@ -1,6 +1,6 @@
 ---
 title: "BUG: agent.rs tests がフレーキー (`agent_run_echo_output_visible_via_observer`, `agent_socket_input_reaches_child`)"
-status: pending-sublimation
+status: discarded
 category: bug
 created: 2026-05-26T00:00:00+09:00
 last_read: 2026-06-22T09:47:29+00:00
@@ -8,11 +8,11 @@ open_entered: 2026-05-26T00:00:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
-discarded_entered:
+discarded_entered: 2026-06-22T18:55:40+09:00
 resolved_entered:
-discard_reason:
+discard_reason: ["done:agent.rs ごと削除済で症状消滅 (commit numkmlolnkkl, 2026-05-26)、根本の race condition は v0.1.0 daemon 再実装計画で対処済"]
 pending_reason: ["agent.rs ごと削除済、症状消滅。historical reference として保存"]
-close_reason:
+close_reason: ["discarded"]
 blocked_by:
 origin: PoC 完了後の push (pkf run push) で test 失敗、CI でも別の test で fail
 ---
