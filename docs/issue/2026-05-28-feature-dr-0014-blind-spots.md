@@ -3,7 +3,7 @@ title: "feature: DR-0014 で防ぎきれなかった盲点の補強"
 status: wip
 category: task
 created: 2026-05-28T00:00:00+09:00
-last_read:
+last_read: 2026-06-22T20:46:00+09:00
 open_entered: 2026-05-28T00:00:00+09:00
 wip_entered: 2026-05-30T00:00:00+09:00
 blocked_entered:
