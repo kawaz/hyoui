@@ -24,4 +24,3 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 | 2026-05-28 | task | wip | [feature-dr-0014-blind-spots](./2026-05-28-feature-dr-0014-blind-spots.md) | DR-0014 で防ぎきれなかった盲点の補強 |
 | 2026-05-27 | task | wip | [tx-lock-unlock-cli-subcommands](./2026-05-27-tx-lock-unlock-cli-subcommands.md) | tx / lock / unlock CLI subcommand 実装 (DR-0006 §7) |
 | 2026-05-26 | request | wip | [feature-recording-and-dump](./2026-05-26-feature-recording-and-dump.md) | tty I/O の dump / record / play subcommand |
-| 2026-05-30 | request | pending-sublimation | [feature-attach-index-shortcut](./2026-05-30-feature-attach-index-shortcut.md) | `hyoui attach` で session を index で指定したい (= ID コピペ省略) |
