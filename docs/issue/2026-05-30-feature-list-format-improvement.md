@@ -3,7 +3,7 @@ title: "feature: `hyoui list` の表示形式改善 (= 固定長 + cwd / argv �
 status: pending-sublimation
 category: request
 created: 2026-05-30T00:00:00+09:00
-last_read:
+last_read: 2026-06-22T18:49:58+09:00
 open_entered: 2026-05-30T00:00:00+09:00
 wip_entered:
 blocked_entered:
