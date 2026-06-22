@@ -1,7 +1,24 @@
+---
+title: "Bug: wait の全角文字 padding でマッチが崩れる (screen→text 変換)"
+status: open
+category: bug
+created: 2026-06-10T00:00:00+09:00
+last_read:
+open_entered: 2026-06-10T00:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin: 自リポ TODO
+---
+
 # Bug: wait の全角文字 padding でマッチが崩れる (screen→text 変換)
 
-- Status: Open
-- Date: 2026-06-10
 - Priority: Mid (= 日本語混じり pattern で `wait` が意図せず外れる。英数 pattern には影響しないが、claude TUI など日本語 UI を相手にすると顕在化する)
 - 関連 DR: [DR-0006](../decisions/DR-0006-cli-ground-rules.md) §9.1 (= wait の screen→text 変換仕様)、[DR-0013](../decisions/DR-0013-screen-emulator-and-attach-stability.md) (= screen state 正本)
 - 関連実装: `crates/hyoui-cli/src/wait_core.rs` の `SnapshotCells::to_text()` (line 116-167)

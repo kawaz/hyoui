@@ -1,7 +1,24 @@
+---
+title: "Refactor: 巨大ファイル解体 (session.rs serve_loop / main.rs / cli.rs)"
+status: open
+category: task
+created: 2026-06-10T00:00:00+09:00
+last_read:
+open_entered: 2026-06-10T00:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin: 自リポ TODO
+---
+
 # Refactor: 巨大ファイル解体 (session.rs serve_loop / main.rs / cli.rs)
 
-- Status: Open
-- Date: 2026-06-10
 - Priority: Mid (= 動作には影響しないが、3 ファイルが 4000-8000 行に肥大化し、変更時の認知負荷・コピペ起因のバグ混入リスクが高い)
 - 関連 DR: [DR-0009](../decisions/DR-0009-session-module-split.md) (= daemon/session.rs 責務分割の継続)、[DR-0006](../decisions/DR-0006-cli-ground-rules.md) (= CLI 設計地盤)
 
@@ -57,8 +74,7 @@ executor (`record_start_command` / `lock_acquire_command` / 等) を
 ## 単一定義導出構想 (= 別検討、本 issue で議論のみ)
 
 usage text / completion script / argument parse は同じ「subcommand × option」情報を
-3 重に手書きしている。整合性ズレが起きやすい (= help と実装の乖離は
-`cli-design-preferences` でも要警戒)。subcommand 仕様を 1 つの宣言から
+3 重に手書きしている。整合性ズレが起きやすい。subcommand 仕様を 1 つの宣言から
 help / completion / parse を導出する仕組み (= declarative spec table) を将来検討する。
 本 issue では「将来構想」として記録のみ、実装は別 issue に切り出す。
 

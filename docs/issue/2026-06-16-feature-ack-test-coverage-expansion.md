@@ -1,9 +1,25 @@
+---
+title: "feature: DR-0021 ack 機構の test cover 拡張"
+status: open
+category: task
+created: 2026-06-16T00:00:00+09:00
+last_read:
+open_entered: 2026-06-16T00:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin: DR-0021 codex adversarial review minor finding 由来
+---
+
 # feature: DR-0021 ack 機構の test cover 拡張
 
-- Date: 2026-06-16
-- Status: open
 - Severity: 低 (= 主要経路は cover 済、防御的観点で追加が望ましい)
-- Reporter: Claude (DR-0021 codex adversarial review minor finding 由来)
 - Related: DR-0021, `docs/issue/2026-06-16-bug-input-text-key-enter-not-sent.md`
 
 ## 背景

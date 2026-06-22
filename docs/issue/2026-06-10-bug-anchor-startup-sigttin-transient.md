@@ -1,7 +1,24 @@
+---
+title: "bug: anchor 起動直後に子が一過性の T+ (SIGTTIN) になる瞬間がある"
+status: open
+category: bug
+created: 2026-06-10T00:00:00+09:00
+last_read:
+open_entered: 2026-06-10T00:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin: 自リポ TODO
+---
+
 # bug: anchor 起動直後に子が一過性の T+ (SIGTTIN) になる瞬間がある
 
-- Date: 2026-06-10
-- Status: open
 - Priority: 低 (= 実害なし。即 S+ に落ち着き、daemon も stopped と誤認しない)
 
 ## 現象

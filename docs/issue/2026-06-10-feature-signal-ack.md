@@ -1,7 +1,24 @@
+---
+title: "feature: ControlMessage::Signal に成功 ack を追加する"
+status: open
+category: request
+created: 2026-06-10T00:00:00+09:00
+last_read:
+open_entered: 2026-06-10T00:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin: 自リポ TODO
+---
+
 # feature: ControlMessage::Signal に成功 ack を追加する
 
-- Date: 2026-06-10
-- Status: idea
 - Priority: 低
 
 ## 背景

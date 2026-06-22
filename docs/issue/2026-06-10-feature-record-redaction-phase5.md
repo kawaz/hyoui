@@ -1,7 +1,24 @@
+---
+title: "Feature: record secret redaction Phase 5 本実装 (DR-0016 §6)"
+status: open
+category: task
+created: 2026-06-10T00:00:00+09:00
+last_read: 2026-06-22T10:55:18+09:00
+open_entered: 2026-06-10T00:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin: 自リポ TODO
+---
+
 # Feature: record secret redaction Phase 5 本実装 (DR-0016 §6)
 
-- Status: Open
-- Date: 2026-06-10
 - Priority: High (= record は出荷済みだが stdin 素通し記録のため、secret 入力を録画すると passphrase / token がファイルに平文で残る安全性問題)
 - 関連 DR: [DR-0016](../decisions/DR-0016-tty-io-record.md) §6 (redact-after-prompt 仕様正本)
 - 関連実装: `crates/hyoui/src/daemon/record.rs` (冒頭 `⚠ redaction は未実装` 注記)

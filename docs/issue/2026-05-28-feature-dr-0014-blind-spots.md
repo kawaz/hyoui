@@ -1,13 +1,31 @@
+---
+title: "feature: DR-0014 で防ぎきれなかった盲点の補強"
+status: wip
+category: task
+created: 2026-05-28T00:00:00+09:00
+last_read:
+open_entered: 2026-05-28T00:00:00+09:00
+wip_entered: 2026-05-30T00:00:00+09:00
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin: 自リポ TODO
+---
+
 # feature: DR-0014 で防ぎきれなかった盲点の補強
 
-- Date: 2026-05-28
 - Priority: 中 (= process 改善、本格 fix で再発防止)
-- Status: **部分完了 (2026-05-30 整理)** — 盲点 1〜3 は DR-0014 改訂 (commit `mqkrkxqnplqw`) で反映済 (= self-check 拡張、Anti-pattern 追加、§状態観測 / §検証主義 補強、CLAUDE.md 連動更新)。**残り作業**: harness 自動 test (`matrix_test.rs`) への `stty -a` 観測組み込み + real-world TUI 3 category 検証の CI 化 + 盲点 4 (DR Implementation Auditor persona) 実装。
+
+盲点 1〜3 は DR-0014 改訂 (commit `mqkrkxqnplqw`) で反映済 (= self-check 拡張、Anti-pattern 追加、§状態観測 / §検証主義 補強、CLAUDE.md 連動更新)。**残り作業**: harness 自動 test (`matrix_test.rs`) への `stty -a` 観測組み込み + real-world TUI 3 category 検証の CI 化 + 盲点 4 (DR Implementation Auditor persona) 実装。
 
 ## 背景
 
-DR-0014 制定 (= 透過原則 + 検証主義 + 双方向整合性 + Anti-patterns 5 件 + self-check 7 項目) 後にも
-Claude (= 私) が **4 連続で anti-pattern を踏んだ**:
+DR-0014 制定後にも Claude が **4 連続で anti-pattern を踏んだ**:
 
 1. POSIX orphan group 誤読 (= 「TTY system 経由限定」を「全 SIGTSTP」と一般化)
 2. CI 6h hang を「matrix test 由来」と推測 (= 真因は backpressure test)
@@ -43,7 +61,6 @@ Claude (= 私) が **4 連続で anti-pattern を踏んだ**:
 
 - findings/2026-05-27-dr-0001-implementation-gap-analysis.md §6.2 で提案済
 - 「DR を読んで実装エビデンスを grep / test で照合する専任 reviewer」
-- 本 session で別 task 化されたまま、実装されていない
 - **DR-0014 §双方向整合性 の実装手段として組み込み候補**
 
 ## DR-0014 への追加候補 (= 提案)
@@ -82,15 +99,15 @@ Claude (= 私) が **4 連続で anti-pattern を踏んだ**:
   漏れが出ることが本 session で実証された。
 ```
 
-## 実装作業
+## TODO
 
-1. DR-0014 改訂 PR 起票 (= self-check 7 → 8 項目、Anti-pattern 5 → 6 件、§状態観測 / §検証主義 補強)
-2. harness test (= matrix_test.rs) に `stty -a` 観測を組み込み (= Issue 1 検証の前提)
-3. real-world TUI 3 category の test runner 設計 (= 別 issue 化候補)
+- [x] DR-0014 改訂 (= self-check 7 → 8 項目、Anti-pattern 5 → 6 件、§状態観測 / §検証主義 補強)
+- [ ] harness test (= matrix_test.rs) に `stty -a` 観測を組み込み (= Issue 1 検証の前提)
+- [ ] real-world TUI 3 category の test runner 設計 + CI 化
+- [ ] DR Implementation Auditor persona 実装 (盲点 4)
 
 ## 関連
 
 - DR-0014 (= 改訂対象)
 - findings/2026-05-27-self-audit-after-dr-0014.md (= 自監査結果、本 session 後)
 - findings/2026-05-27-dr-0001-implementation-gap-analysis.md §6.2 (= DR Implementation Auditor 案)
-- Issue 1 (= termios) / Issue 2 (= SIGCONT) — 本盲点で検出漏れした実例

@@ -1,16 +1,27 @@
+---
+title: "Feature idea: tty I/O の dump / record / play subcommand"
+status: wip
+category: request
+created: 2026-05-26T00:00:00+09:00
+last_read:
+open_entered: 2026-05-26T00:00:00+09:00
+wip_entered: 2026-06-01T00:00:00+09:00
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin: hyoui paste API 設計議論で --spool-append のユースケースを検討した際に派生
+---
+
 # Feature idea: tty I/O の dump / record / play subcommand
 
-- Status: **Partially adopted (2026-06-01)** — 継続録画部分のみ [DR-0016](../decisions/DR-0016-tty-io-record.md) で MVP scope 切り出し、ctrl-z 系 bug 解析の観測道具として優先実装 (= `hyoui record` 命名、`hyoui screen dump` 静止画と分離)。`hyoui play` (= I/O 注入再生) / `hyoui sink` 抽象化 / `--rotate` / asciinema cast format は **本 issue に残置**、v0.3.0 以降検討
-- Date: 2026-05-26
 - Priority: Low (v0.3.0 以降検討)
-- 発見元: hyoui paste API 設計議論で `--spool-append` (継続的に file に追記) のユースケースを検討した際、
-  「tty dump 用途は paste の責務ではなく、独立 subcommand が筋」と判明したため派生
 
-## ファイル分類
-
-本ファイルは **未採用の feature idea** を集積する `docs/issue/` の `feature-` prefix 慣習の初回ファイル。
-規約上 `docs/issue/` は「自リポ TODO + 外部から受けた依頼」だが、未確定 idea も TODO の上流として
-ここに置き、具体化したら DR/research に昇格、却下時に削除という運用にする (DR/journal だけだと埋もれる)。
+継続録画部分のみ [DR-0016](../decisions/DR-0016-tty-io-record.md) で MVP scope 切り出し、ctrl-z 系 bug 解析の観測道具として優先実装済 (= `hyoui record` 命名、`hyoui screen dump` 静止画と分離)。`hyoui play` (= I/O 注入再生) / `hyoui sink` 抽象化 / `--rotate` / asciinema cast format は **本 issue に残置**、v0.3.0 以降検討。
 
 ## 関連する 3 つの feature
 
@@ -65,7 +76,7 @@ hyoui play <name> --file PATH [--speed 1.0] [--input-only] [--output-only]
 
 両者共存して別 subcommand の方が UX 明快。
 
-## 統合設計: sink 概念 (2026-05-26 追記)
+## 統合設計: sink 概念
 
 dump/record/play は本質的に近い (= daemon の I/O を file に書く/file から戻す)。
 更に tail (ad-hoc bytes stream client) とも「出力先の違いだけ」に見える。整理:
@@ -116,11 +127,6 @@ tail との関係:
 - `record` の cast format は asciinema 互換が筋 (= 既存 viewer/converter 資産を活用)
 - `play` の入力再生は lock + tx 機構と統合 (= play 中は他 client の rw を一時降格)
 - `play --speed` で時間軸を変更する場合、output だけは無視できるが input は子の応答待ちと整合させる必要 (= input only モードは無条件タイミング、output 反映モードは prompt 待ちと連動)
-
-## 段階
-
-優先度低、v0.3.0 以降で本格検討。MVP (v0.1.0) には入れない。
-v0.2.0 (`hyoui serve` + HTTP gateway) と並行して record/play は CI 自動化観点で先行する可能性あり。
 
 ## 関連
 

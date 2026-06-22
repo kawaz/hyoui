@@ -1,9 +1,25 @@
+---
+title: "TtyGuard suspend/resume/Drop の TCSAFLUSH による入力破棄の検討"
+status: open
+category: task
+created: 2026-06-12T00:00:00+09:00
+last_read:
+open_entered: 2026-06-12T00:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin: Fable review M4 の root cause 調査 (= enter_raw の TCSAFLUSH 入力破棄)
+---
+
 # TtyGuard suspend/resume/Drop の TCSAFLUSH による入力破棄の検討
 
-- Date: 2026-06-12
-- Status: open
 - Priority: 低 (= 実害の観測例なし、構造的に同種の問題があることの記録)
-- Origin: Fable review M4 の root cause 調査 (= `enter_raw` の TCSAFLUSH 入力破棄)
 
 ## 内容
 

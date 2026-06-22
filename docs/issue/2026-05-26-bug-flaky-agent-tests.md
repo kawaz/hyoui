@@ -1,9 +1,27 @@
+---
+title: "BUG: agent.rs tests がフレーキー (`agent_run_echo_output_visible_via_observer`, `agent_socket_input_reaches_child`)"
+status: pending-sublimation
+category: bug
+created: 2026-05-26T00:00:00+09:00
+last_read:
+open_entered: 2026-05-26T00:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason: ["agent.rs ごと削除済、症状消滅。historical reference として保存"]
+close_reason:
+blocked_by:
+origin: PoC 完了後の push (pkf run push) で test 失敗、CI でも別の test で fail
+---
+
 # BUG: agent.rs tests がフレーキー (`agent_run_echo_output_visible_via_observer`, `agent_socket_input_reaches_child`)
 
-- Status: **廃止 (2026-05-30 整理)** — 該当 test 2 件は agent.rs ごと削除済 (commit `numkmlolnkkl`、2026-05-26)、症状消滅。根本 race condition は v0.1.0 daemon 再実装計画 (= 当時の根本対処方針) とともに撤回されたため、本 issue としては closed。historical reference として保存。
-- Date: 2026-05-26
 - Priority: Middle (CI を fail させるが、v0.1.0 daemon 再実装で根本対処予定)
-- 発見元: PoC 完了後の push (`pkf run push`) で test 失敗、CI でも別の test (agent_socket_input_reaches_child) で fail
+
+該当 test 2 件は agent.rs ごと削除済 (commit `numkmlolnkkl`、2026-05-26)、症状消滅。根本 race condition は v0.1.0 daemon 再実装計画とともに撤回されたため、本 issue としては closed。
 
 ## 症状
 
@@ -35,9 +53,9 @@ test agent_run_echo_output_visible_via_observer ... FAILED  (並列の偶発失�
 両 test に `#[ignore = "..."]` を付けて disable。`cargo test -- --ignored` で個別検証可。
 push (CI 経由) は通るようになる。
 
-## 根本対処方針 (v0.1.0 daemon 再実装で吸収)
+## 根本対処方針
 
-v0.1.0 で daemon module を 再実装する際:
+v0.1.0 で daemon module を再実装する際:
 - socket bind 完了を pipe で親通知してから client connect する (= PoC 01b で確認した pattern)
 - agent.rs の test 自体を v0.1.0 の daemon 用 integration test に書き直す
 - 古い `tests/agent.rs` は廃止 or 大幅書き換え
@@ -50,4 +68,3 @@ v0.1.0 で daemon module を 再実装する際:
 - `crates/hyoui/src/agent.rs` — 元実装 (v0.1.0 で daemon module に置き換え予定)
 - `docs/findings/2026-05-26-daemon-fork.md` — daemon socket 起動の正しい sync pattern
 - `docs/findings/2026-05-26-multi-attach.md` — multi-client + socket の動作モデル
-- v0.1.0 implementation で根本対処

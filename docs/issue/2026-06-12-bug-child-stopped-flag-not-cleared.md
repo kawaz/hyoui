@@ -1,9 +1,25 @@
+---
+title: "BUG: auto-resume / 外部 SIGCONT 後も `child-state: stopped` が恒久的に下りない"
+status: open
+category: bug
+created: 2026-06-12T00:00:00+09:00
+last_read:
+open_entered: 2026-06-12T00:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin: DR-0019 Update (set/可視化) 実装の push 前 Fable レビュー (2026-06-12)。本 diff 起因ではなく v0.6.3 に既存
+---
+
 # BUG: auto-resume / 外部 SIGCONT 後も `child-state: stopped` が恒久的に下りない
 
-- Status: Open
-- Date: 2026-06-12
 - Priority: Middle (実プロセスは正常走行、表示だけが矛盾。SUSPEND 可視化 (DR-0019 Update) と組み合わさるとユーザを混乱させる)
-- 発見元: DR-0019 Update (set/可視化) 実装の push 前 Fable レビュー (2026-06-12)。本 diff 起因ではなく v0.6.3 に既存
 
 ## 症状
 

@@ -1,9 +1,27 @@
+---
+title: "bug: `serve_propagates_child_exit_code` が full workspace 並列実行時に flaky fail"
+status: open
+category: bug
+created: 2026-06-02T00:00:00+09:00
+last_read:
+open_entered: 2026-06-02T00:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin: DR-0016 record stop hang fix の pkf run push 時に test deps で 1 件 fail
+---
+
 # bug: `serve_propagates_child_exit_code` が full workspace 並列実行時に flaky fail
 
-- Date: 2026-06-02
 - Priority: 低 (= 再実行で通る、機能影響なし、ただし push / CI の不安定要因)
-- Status: Open (= 未調査、観測のみ)
-- 発見元: DR-0016 record stop hang fix の `pkf run push` 時に test deps で 1 件 fail
+
+未調査、観測のみ。
 
 ## 症状
 

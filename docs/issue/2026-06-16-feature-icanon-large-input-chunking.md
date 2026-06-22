@@ -1,10 +1,26 @@
+---
+title: "feature: ICANON apps への大量 byte 送信時の chunk 化 helper / timeout 調整"
+status: open
+category: request
+created: 2026-06-16T00:00:00+09:00
+last_read:
+open_entered: 2026-06-16T00:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin: DR-0021 PTY drain ack 実装中に露出
+---
+
 # feature: ICANON apps への大量 byte 送信時の chunk 化 helper / timeout 調整
 
-- Date: 2026-06-16
-- Status: open
 - Severity: 低 (= 既存挙動を悪化させていない、ack 機構で明示エラー化したことで露出した既知制約)
-- Reporter: kawaz / Claude (DR-0021 PTY drain ack 実装中に露出)
-- Related: DR-0021, DR-0016 (MASTER_WRITE_IDLE_TIMEOUT_MS), `docs/issue/2026-06-16-bug-input-text-key-enter-not-sent.md` (= DR-0021 起因 issue、本 issue 起票元)
+- Related: DR-0021, DR-0016 (MASTER_WRITE_IDLE_TIMEOUT_MS), `docs/issue/2026-06-16-bug-input-text-key-enter-not-sent.md`
 
 ## 背景
 
@@ -65,7 +81,7 @@ hyoui input "$SESS" "chunk-text:$(cat large.txt)" "key:Enter"
 
 ### 案 D: MANUAL に制約明記のみ、code 変更なし
 
-「ICANON apps に 1 KB 超を送るな、改行で分けて複数 spec にせよ」と仕様化する (= 既に DR-0021 完了時 MANUAL 更新で対応済の想定)。
+「ICANON apps に 1 KB 超を送るな、改行で分けて複数 spec にせよ」と仕様化する。
 
 最小コスト、原則的に正しいが、ユーザビリティは現状維持。
 

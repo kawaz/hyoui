@@ -1,9 +1,25 @@
+---
+title: "daemon 子プロセスが fork〜exec 間で停止する race (SIGTTOU/SIGTTIN 系)"
+status: open
+category: bug
+created: 2026-06-12T00:00:00+09:00
+last_read:
+open_entered: 2026-06-12T00:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin: Fable review 対応中の workspace test 実機観測 (2026-06-12)
+---
+
 # daemon 子プロセスが fork〜exec 間で停止する race (SIGTTOU/SIGTTIN 系)
 
-- Date: 2026-06-12
-- Status: open
 - Priority: 中 (= 発生すると daemon が「子が起動しない」状態で永久待ち、attach がハング)
-- Origin: Fable review 対応中の workspace test 実機観測 (2026-06-12)
 
 ## 観測した現象
 

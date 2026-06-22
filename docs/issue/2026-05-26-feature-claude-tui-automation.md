@@ -1,9 +1,25 @@
+---
+title: "Feature idea: claude code TUI 自動操作 (A/B/C 判定 + L1/L2 必須要件)"
+status: open
+category: request
+created: 2026-05-26T00:00:00+09:00
+last_read:
+open_entered: 2026-05-26T00:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin: 2026-05-26 CLI 設計議論 (Phase 11 wait L0 詳細)
+---
+
 # Feature idea: claude code TUI 自動操作 (A/B/C 判定 + L1/L2 必須要件)
 
-- Status: Open (Idea, L1/L2 実装待ち)
-- Date: 2026-05-26
 - Priority: High (hyoui の本命ユースケース、ただし実現は v0.2.0/v0.3.0)
-- 発見元: 2026-05-26 CLI 設計議論 (Phase 11 wait L0 詳細) で「claude のような TUI app の自動操作が本格 use case」と判明
 
 ## 背景
 

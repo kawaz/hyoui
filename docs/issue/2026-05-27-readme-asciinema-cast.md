@@ -1,11 +1,25 @@
+---
+title: "README に asciinema cast を録画・配置する"
+status: open
+category: task
+created: 2026-05-27T00:00:00+09:00
+last_read:
+open_entered: 2026-05-27T00:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin: R5 marketing review (Sales ペルソナ) で「README に動いてる感がゼロ」と指摘
+---
+
 # README に asciinema cast を録画・配置する
 
-- Status: Open
-- Date: 2026-05-27
 - Priority: High (営業面、R5-SAL-C1 / R5-H15)
-- 発見元: R5 marketing review (Sales ペルソナ) で「README に動いてる感がゼロ」と
-  指摘 (= 競合 tmux / zellij / ttyd / asciinema は必ず screenshot / GIF /
-  asciinema cast を README 冒頭に出している)
 
 ## 背景
 

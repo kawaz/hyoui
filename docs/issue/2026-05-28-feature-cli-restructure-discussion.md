@@ -1,13 +1,27 @@
+---
+title: "feature: CLI 設計大改修議論 (screen view 改名 / dump top-level 化 / screen write overlay / format 整理)"
+status: idea
+category: design
+created: 2026-05-28T00:00:00+09:00
+last_read:
+open_entered:
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin: 自リポ TODO
+---
+
 # feature: CLI 設計大改修議論 (screen view 改名 / dump top-level 化 / screen write overlay / format 整理)
 
-- Date: 2026-05-28
 - Priority: 中 (= 結論未確定、別 session で本格議論 → DR 起票)
-- Status: 議論段階 (= 採用方針未確定)
 
-## 背景
-
-kawaz と本 session 末で議論した CLI 設計大改修案。範囲が広く設計判断が多いので、別 session で
-腰を据えて議論 → DR 起票 → 段階実装の流れ。
+採用方針未確定。範囲が広く設計判断が多いので、別 session で腰を据えて議論 → DR 起票 → 段階実装の流れ。
 
 ## 議論トピック一覧
 

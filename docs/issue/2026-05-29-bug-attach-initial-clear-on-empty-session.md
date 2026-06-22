@@ -1,9 +1,25 @@
+---
+title: "bug: hyoui run / attach の初期 redraw で画面が clear される"
+status: open
+category: bug
+created: 2026-05-29T00:00:00+09:00
+last_read:
+open_entered: 2026-05-29T00:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin: kawaz 実機検証 2026-05-29
+---
+
 # bug: hyoui run / attach の初期 redraw で画面が clear される
 
-- Date: 2026-05-29
 - Priority: 中 (= UX 悪化、動作には影響なし)
-- Status: 未着手
-- 報告者: kawaz 実機検証 2026-05-29
 
 ## 現象
 

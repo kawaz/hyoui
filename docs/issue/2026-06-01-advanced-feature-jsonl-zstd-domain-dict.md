@@ -1,9 +1,27 @@
+---
+title: "Advanced feature idea: hyoui dump jsonl の自分ドメイン辞書付き zstd 圧縮 (`jsonl.zst`)"
+status: open
+category: tech-memo
+created: 2026-06-01T00:00:00+09:00
+last_read: 2026-06-22T10:50:08+09:00
+open_entered: 2026-06-01T00:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin: kawaz 発言「自分ドメイン辞書付き zstd 内蔵で jsonl.zst とかを出力するみたいな発想もありかなとも思うがどうだろう」
+---
+
 # Advanced feature idea: hyoui dump jsonl の自分ドメイン辞書付き zstd 圧縮 (`jsonl.zst`)
 
-- Date: 2026-06-01
 - Priority: Low (= v0.3.0 以降検討、advanced future task)
-- Status: Open (= idea 段階、DR-0016 (= `hyoui dump` MVP) で plain jsonl が安定したあと検討)
-- 発見元: 2026-06-01 kawaz 発言「自分ドメイン辞書付き zstd 内蔵で jsonl.zst とかを出力するみたいな発想もありかなとも思うがどうだろう」
+
+idea 段階。DR-0016 (= `hyoui dump` MVP) で plain jsonl が安定したあと検討。
 
 ## 背景
 
@@ -50,7 +68,7 @@ crates/hyoui/assets/zstd-dict-hyoui-tty.dict (= binary, ~16-64KB)
 {"ts":..., "dir":"out", "bytes":"..."}
 ```
 
-注: header 行自体は **non-compressed** で書き、本文行から zstd ストリームにすると外側 tool (= `zcat` 不要、jq で header 取れる) と相性悪い。代わりに **全部 zstd ストリーム化** + magic header で外側 tool が判別する設計が筋。
+全部 zstd ストリーム化 + magic header で外側 tool が判別する設計が筋。
 
 ### 4. 復号 / 読み出し API
 
@@ -66,7 +84,7 @@ crates/hyoui/assets/zstd-dict-hyoui-tty.dict (= binary, ~16-64KB)
 | 高 frame rate TUI (= top / btop) | 1GB | ? | ? |
 | line-oriented session (= bash + 短 cmd) | 10MB | ? | ? |
 
-実測は別 task。**期待値**: 辞書あり zstd で 5x-10x 圧縮、辞書なしでも 3x-5x 程度は出る (= terminal I/O は repeat heavy なので圧縮効率は元々高い)。
+実測は別 task。**期待値**: 辞書あり zstd で 5x-10x 圧縮、辞書なしでも 3x-5x 程度は出る。
 
 ## 実装上の検討点
 

@@ -1,7 +1,24 @@
+---
+title: "bug: PTY サイズ 0 のとき vt100 grid が subtract overflow で panic する"
+status: open
+category: bug
+created: 2026-06-11T00:00:00+09:00
+last_read:
+open_entered: 2026-06-11T00:00:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+origin: jobcontrol_follow ハング調査 (2026-06-11) 中に script(1) 経由の再現を試みた際に副産物として観測
+---
+
 # bug: PTY サイズ 0 のとき vt100 grid が subtract overflow で panic する
 
-- Date: 2026-06-11
-- Status: open
 - Priority: 低 (= 通常の端末経由では発生しない、特殊な起動形態のみ)
 
 ## 現象
@@ -14,9 +31,6 @@
 thread 'main' panicked at .../vt100-0.16.2/src/grid.rs:26:28:
 attempt to subtract with overflow
 ```
-
-jobcontrol_follow ハング調査 (2026-06-11) 中に `script(1)` 経由の再現を試みた際に
-副産物として観測。
 
 ## 再現
 
