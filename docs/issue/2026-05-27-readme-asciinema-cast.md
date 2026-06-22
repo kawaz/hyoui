@@ -3,7 +3,7 @@ title: "README に asciinema cast を録画・配置する"
 status: open
 category: task
 created: 2026-05-27T00:00:00+09:00
-last_read:
+last_read: 2026-06-22T21:38:37+09:00
 open_entered: 2026-05-27T00:00:00+09:00
 wip_entered:
 blocked_entered:
