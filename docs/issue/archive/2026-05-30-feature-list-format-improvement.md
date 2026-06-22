@@ -1,6 +1,6 @@
 ---
 title: "feature: `hyoui list` の表示形式改善 (= 固定長 + cwd / argv 表示 + `--format=jsonl`)"
-status: pending-sublimation
+status: resolved
 category: request
 created: 2026-05-30T00:00:00+09:00
 last_read: 2026-06-22T18:49:58+09:00
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered: 2026-05-31T00:00:00+09:00
+resolved_entered: 2026-06-22T19:00:00+09:00
 discard_reason:
 pending_reason: ["実装完了済み、journal/DR への昇華待ち"]
-close_reason: ["implemented","cwd/argv/clients 表示 + jsonl format 完成"]
+close_reason: ["implemented","done:cwd/argv/clients 表示 + plain 6 列固定長 + --format=jsonl + stale 格下げ警告 + cwd 短縮表記。DaemonConfig.cwd 追加 + StatusResponse 拡張 + list 並列 status.query で完成"]
 blocked_by:
 origin: kawaz 発言 (2026-05-30)
 ---
