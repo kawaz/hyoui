@@ -195,15 +195,10 @@ pub struct RunConfig {
     /// 側の tty 判定で解決 (= 非 tty で `SendEof`、tty で従来挙動)。`Some` のときは
     /// 値をそのまま exec attach に伝搬する。
     pub stdin_eof: Option<StdinEofArg>,
-    /// `--no-scrub-env` (DR-0023): env scrub を完全 disable (= debug / 互換目的)。
+    /// `--no-scrub-env` (DR-0024): env scrub を完全 disable (= debug / 互換目的)。
+    /// config の `scrub_env_enabled = false` と等価。kill/keep の細かい制御は
+    /// `~/.config/hyoui/config.toml` で行う (= CLI flag は最小化)。
     pub no_scrub_env: bool,
-    /// `--scrub-env-target=<name>` (DR-0023): 明示 target 指定。`None` で自動推定
-    /// (= `command[0]` の basename)。
-    pub scrub_env_target: Option<String>,
-    /// `--scrub-env-add=<glob>` (DR-0023): 組み込み default に追加する glob patterns。
-    pub scrub_env_add: Vec<String>,
-    /// `--scrub-env-keep=<glob>` (DR-0023): 組み込み + add から除外する glob patterns。
-    pub scrub_env_keep: Vec<String>,
     /// argv of the child command.
     pub command: Vec<String>,
 }
@@ -2421,11 +2416,8 @@ fn parse_run(args: &[String]) -> Command {
     let mut scrollback_rows: Option<usize> = None;
     let mut debug_dump_server: Option<String> = None;
     let mut debug_dump_client: Option<String> = None;
-    // DR-0023: child env scrub flags
+    // DR-0024: child env scrub flag (kill/keep glob は config で管理)
     let mut no_scrub_env = false;
-    let mut scrub_env_target: Option<String> = None;
-    let mut scrub_env_add: Vec<String> = Vec::new();
-    let mut scrub_env_keep: Vec<String> = Vec::new();
 
     let mut i = 0usize;
     let mut in_command = false;
@@ -2602,28 +2594,11 @@ fn parse_run(args: &[String]) -> Command {
                 Some(_) => return Command::Error("--debug-dump-client: path が空です".into()),
                 None => return Command::Error("--debug-dump-client requires a value".into()),
             },
-            // DR-0023: 子 PTY env scrub。
+            // DR-0024: 子 PTY env scrub の disable escape hatch。
             "--no-scrub-env" => {
                 no_scrub_env = true;
                 consumed_extra = false; // bool flag は次 arg を食わない
             }
-            "--scrub-env-target" => match value {
-                Some(v) if !v.is_empty() => scrub_env_target = Some(v),
-                Some(_) => {
-                    return Command::Error("--scrub-env-target: target 名が空です".into());
-                }
-                None => return Command::Error("--scrub-env-target requires a value".into()),
-            },
-            "--scrub-env-add" => match value {
-                Some(v) if !v.is_empty() => scrub_env_add.push(v),
-                Some(_) => return Command::Error("--scrub-env-add: glob が空です".into()),
-                None => return Command::Error("--scrub-env-add requires a value".into()),
-            },
-            "--scrub-env-keep" => match value {
-                Some(v) if !v.is_empty() => scrub_env_keep.push(v),
-                Some(_) => return Command::Error("--scrub-env-keep: glob が空です".into()),
-                None => return Command::Error("--scrub-env-keep requires a value".into()),
-            },
             other => return Command::Error(format!("unknown option: {other}")),
         }
 
@@ -2660,9 +2635,6 @@ fn parse_run(args: &[String]) -> Command {
         namespace,
         stdin_eof,
         no_scrub_env,
-        scrub_env_target,
-        scrub_env_add,
-        scrub_env_keep,
         command,
     })
 }
@@ -3668,12 +3640,9 @@ fn usage_run() -> String {
                 send-eof (= EOT を子に送り `echo ... | hyoui run -- bc` で\n                                  \
                 子が自然 exit)、tty なら detach。detach は EOF で切断のみ\n    \
             --no-scrub-env                親 Internal Context env の子への漏洩防止を\n                                  \
-                無効化 (= debug / 互換目的 escape hatch、DR-0023)\n    \
-            --scrub-env-target NAME       明示 target 指定 (= default は cmd basename)。\n                                  \
-                `env` wrapper 等で auto 推定が外れる場合に使う\n    \
-            --scrub-env-add GLOB          scrub kill_glob 追加 (繰り返し可)。`*`/`?` 対応\n    \
-            --scrub-env-keep GLOB         scrub kill_glob 除外 (繰り返し可)。組み込み default\n                                  \
-                を残したい時に使う\n    \
+                無効化 (= debug / 互換目的 escape hatch、DR-0024)。\n                                  \
+                kill/keep glob の細かい制御は\n                                  \
+                ~/.config/hyoui/config.toml で設定する\n    \
             -h, --help                    Show this help and exit\n\
         \n\
         ENVIRONMENT:\n    \
@@ -5857,15 +5826,13 @@ mod tests {
         }
     }
 
-    // DR-0023: 子 PTY env scrub flags の parse 検証。
+    // DR-0024: 子 PTY env scrub flag の parse 検証 (= flag は --no-scrub-env のみ、
+    // kill/keep glob は config で管理)。
     #[test]
     fn run_scrub_env_default_is_enabled() {
         match parse_args(&args(&["run", "--", "claude"])) {
             Command::Run(cfg) => {
                 assert!(!cfg.no_scrub_env);
-                assert_eq!(cfg.scrub_env_target, None);
-                assert!(cfg.scrub_env_add.is_empty());
-                assert!(cfg.scrub_env_keep.is_empty());
             }
             other => panic!("expected Run, got {other:?}"),
         }
@@ -5880,49 +5847,19 @@ mod tests {
     }
 
     #[test]
-    fn run_scrub_env_target_explicit() {
-        match parse_args(&args(&[
-            "run",
+    fn run_removed_scrub_flags_are_unknown_option() {
+        // DR-0024: 旧 flag は削除済 = unknown option エラーになるべき。
+        for stale in &[
             "--scrub-env-target=claude",
-            "--",
-            "env",
-            "FOO=bar",
-            "claude",
-        ])) {
-            Command::Run(cfg) => {
-                assert_eq!(cfg.scrub_env_target.as_deref(), Some("claude"));
-            }
-            other => panic!("expected Run, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn run_scrub_env_add_and_keep_repeat() {
-        match parse_args(&args(&[
-            "run",
-            "--scrub-env-add=CMUXMSG_*",
             "--scrub-env-add=FOO",
             "--scrub-env-keep=AI_AGENT",
-            "--",
-            "claude",
-        ])) {
-            Command::Run(cfg) => {
-                assert_eq!(cfg.scrub_env_add, vec!["CMUXMSG_*", "FOO"]);
-                assert_eq!(cfg.scrub_env_keep, vec!["AI_AGENT"]);
+        ] {
+            match parse_args(&args(&["run", stale, "--", "claude"])) {
+                Command::Error(msg) => {
+                    assert!(msg.contains("unknown option"), "{stale}: {msg}");
+                }
+                other => panic!("expected Error for {stale}, got {other:?}"),
             }
-            other => panic!("expected Run, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn run_scrub_env_empty_value_is_error() {
-        match parse_args(&args(&["run", "--scrub-env-add=", "--", "claude"])) {
-            Command::Error(msg) => assert!(msg.contains("scrub-env-add"), "msg: {msg}"),
-            other => panic!("expected Error, got {other:?}"),
-        }
-        match parse_args(&args(&["run", "--scrub-env-target=", "--", "claude"])) {
-            Command::Error(msg) => assert!(msg.contains("scrub-env-target"), "msg: {msg}"),
-            other => panic!("expected Error, got {other:?}"),
         }
     }
 

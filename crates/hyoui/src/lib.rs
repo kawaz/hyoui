@@ -22,6 +22,8 @@ pub mod sys;
 
 pub mod cli;
 
+pub mod config;
+
 // v0.1.0 modules (PoC 07/08 から正規実装に取り込み済み):
 //
 //   * `scrollback` — daemon が子 pty 出力を timestamped chunks の ring buffer に蓄積

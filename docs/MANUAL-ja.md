@@ -24,6 +24,7 @@
   - [7. 排他自動操作 (`lock`)](#7-排他自動操作-lock)
   - [8. tty I/O timeline を録画する (`record`)](#8-tty-io-timeline-を録画する-record)
   - [9. session を namespace でグループ分けする](#9-session-を-namespace-でグループ分けする)
+  - [10. 子プロセスへの env 漏洩を防ぐ (env scrub)](#10-子プロセスへの-env-漏洩を防ぐ-env-scrub)
 - [トラブルシューティング](#トラブルシューティング)
 - [関連リンク](#関連リンク)
 
@@ -262,6 +263,52 @@ hyoui は指定なしで同じ namespace に入る。別 namespace で起動し�
 namespace 名は session id と同じ文字集合 (`[A-Za-z0-9._-]`、最大 64 bytes)。
 `/` は現状 reject される (= 将来の階層 namespace 用に予約)。`default` は
 base socket dir 直下にマップされる予約名。
+
+### 10. 子プロセスへの env 漏洩を防ぐ (env scrub)
+
+親 hyoui を `claude` 等の AI agent CLI から呼んだ時、親が export している
+**Internal Context env** (例: `CLAUDE_CODE_SESSION_ID` / `CLAUDECODE` / `AI_AGENT`)
+が子プロセスに POSIX fork→exec で素通しで漏れて、子 session が「親の延長」と
+誤認される問題を防ぐための機構
+([DR-0024](./decisions/DR-0024-env-scrub-config-file.md))。
+
+**`claude` を子に取る場合は default で透過的に動く** (= builtin で公式 docs に出典
+のある 9 env を削除)。設定不要。
+
+| flag | 用途 |
+|---|---|
+| `--no-scrub-env` | scrub を完全 disable (= debug / 互換目的 escape hatch) |
+
+builtin が未登録の target (= `claude` 以外の AI agent / 独自 tool) で削除したい
+env を増やす、あるいは builtin で削除されている env を残したい場合は
+`~/.config/hyoui/config.toml` で設定する:
+
+```toml
+[scrub_env]
+enabled = true                    # 全体 on/off (default: true)
+
+# claude の builtin に独自 env を追加
+[scrub_env.targets.claude]
+inherit_builtin = true            # default: true、builtin と user 設定を concat
+kill_glob = ["CMUXMSG_*"]         # 追加で削除する env
+keep_glob = ["AI_AGENT"]          # builtin から除外したい env
+
+# 別 target を新規登録 (= builtin 未登録の独自 CLI)
+[scrub_env.targets.my-tool]
+inherit_builtin = false           # builtin 無視、user 設定のみ
+kill_glob = ["MYTOOL_SECRET"]
+```
+
+target は `hyoui run -- <cmd>` の `<cmd>` を basename した値で lookup。
+`env` 等の wrapper コマンドは展開せず、user は素直に `hyoui run -- claude` と
+書く ([DR-0024 §2](./decisions/DR-0024-env-scrub-config-file.md))。
+
+`HYOUI_*` で始まる env は user の `kill_glob` が当たっても削除されない (= hyoui
+自身が `HYOUI_NAMESPACE` / `HYOUI_SESSION_ID` 等を意図的に子へ伝えるため)。
+
+config パースエラー (= 不正 TOML / 型不一致) のときは hyoui の起動を拒否する
+(= 意図しない設定での起動は親 Internal Context 漏洩リスクがあるため)。一時的に
+迂回したい場合は `--no-scrub-env` を使う。
 
 ## トラブルシューティング
 

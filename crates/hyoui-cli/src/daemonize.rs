@@ -350,10 +350,11 @@ struct DaemonizeInit {
     )]
     idle_timeout_ms: Option<u64>,
 
-    /// DR-0023: 子 PTY env scrub の解決済 plan (= patterns + keep)。
-    /// - `None` = scrub 完全 disable (= `--no-scrub-env` または旧 init JSON 互換)
+    /// DR-0024: 子 PTY env scrub の解決済 plan (= patterns + keep)。
+    /// - `None` = scrub 完全 disable (= `--no-scrub-env` または config の
+    ///   `scrub_env_enabled = false`、または旧 init JSON 互換)
     /// - `Some(plan)` = daemon child が `env_scrub::apply` でこれを適用
-    ///   (= 空 patterns は target builtin なし & add なしの no-op を表現)
+    ///   (= 空 patterns は target builtin なし & user 設定なしの no-op を表現)
     #[serde(rename = "scrub_env", skip_serializing_if = "Option::is_none", default)]
     scrub_env: Option<hyoui::sys::env_scrub::ScrubPlan>,
 }
@@ -427,15 +428,15 @@ pub fn run_daemon_child() -> ExitCode {
     let timeout_ms = init.timeout_ms;
     let idle_timeout_ms = init.idle_timeout_ms;
 
-    // DR-0023: 子 PTY 継承用 environ から親 Internal Context env (例: 親 Claude Code
+    // DR-0024: 子 PTY 継承用 environ から親 Internal Context env (例: 親 Claude Code
     // の `CLAUDE_CODE_SESSION_ID` 等) を scrub する。`HYOUI_NAMESPACE`/`HYOUI_SESSION_ID`
-    // 注入の **前** に実施するのは、ユーザ pattern (= `--scrub-env-add=HYOUI_*`) で
-    // 注入対象を巻き添えにしてしまうのを protected guard で防ぐが、それでも順序として
-    // 「漏れ削除 → 意図的注入」が読みやすいため。daemon は single-threaded (=
-    // Session::start 前) なので `apply` の async-signal-unsafe 制約に抵触しない。
+    // 注入の **前** に実施するのは、user config の kill_glob が `HYOUI_*` を巻き添えに
+    // してしまうのを protected guard で防ぐが、それでも順序として「漏れ削除 → 意図的注入」
+    // が読みやすいため。daemon は single-threaded (= Session::start 前) なので `apply` の
+    // async-signal-unsafe 制約に抵触しない。
     if let Some(plan) = init.scrub_env.as_ref() {
         let _result = hyoui::sys::env_scrub::apply(plan);
-        // log は default 無音 (DR-0023 §log)。観測したい場合は将来 HYOUI_VERBOSE 等で
+        // log は default 無音 (DR-0024 §10)。観測したい場合は将来 HYOUI_VERBOSE 等で
         // opt-in する (Future work)。_result は捨てるが apply は環境を実際に書き換え済。
     }
 

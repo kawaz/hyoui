@@ -1,8 +1,8 @@
 # DR-0023: 子 PTY env scrub — 親 Internal Context env の漏洩防止
 
-- Status: Active
+- Status: **Superseded by DR-0024** (= CLI flag 過剰、config ファイル機構の方が筋という kawaz feedback で redesign)
 - Date: 2026-06-21
-- Related: DR-0005 (透明性最優先), DR-0014 (介入判断 self-check / マトリクス検証), DR-0015 (`hyoui run` = fork daemon + attach client), DR-0018 (`HYOUI_NAMESPACE` 注入 = 透過例外の先例), DR-0020 (`HYOUI_SESSION_ID` 注入 = 同上)
+- Related: DR-0005 (透明性最優先), DR-0014 (介入判断 self-check / マトリクス検証), DR-0015 (`hyoui run` = fork daemon + attach client), DR-0018 (`HYOUI_NAMESPACE` 注入 = 透過例外の先例), DR-0020 (`HYOUI_SESSION_ID` 注入 = 同上), [DR-0024](./DR-0024-env-scrub-config-file.md) (= Supersede 先)
 - Origin: GitHub issue #1 (kawaz/hyoui)
 
 ## Context

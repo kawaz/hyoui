@@ -1,0 +1,392 @@
+//! User config file (`~/.config/hyoui/config.toml`) loader (DR-0024).
+//!
+//! hyoui 初の persistent setting 機構。現状は env scrub 設定のみを扱う。
+//! 他の persistent setting への流用は別 DR で扱う方針 (DR-0024 §Future work)。
+//!
+//! ## Path resolution
+//!
+//! 1. `$XDG_CONFIG_HOME/hyoui/config.toml` (環境変数指定時)
+//! 2. `$HOME/.config/hyoui/config.toml` (XDG 不在時)
+//! 3. どちらも resolve できなければ unloadable (= [`Config::default`] を使う)
+//!
+//! ## 不在 / エラー時 (DR-0024 §7)
+//!
+//! - ファイル不在 = [`Config::default`] (= builtin-only 動作)
+//! - パースエラー = `Err(ConfigError::Parse(_))` 。caller が exit non-zero
+//!   で起動を拒否する (= 意図しない設定での起動は害)
+//! - unknown field は warn なしで無視 (= 前方互換性、`deny_unknown_fields` を
+//!   付けない)
+
+use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+/// hyoui 全体設定 (現状は env scrub のみ、将来 log / notify 等を追加する余地)。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct Config {
+    /// 子 PTY env scrub 設定 (= TOML の `[scrub_env]` セクション)。
+    #[serde(default)]
+    pub scrub_env: ScrubEnvConfig,
+}
+
+/// env scrub 設定 (= TOML の `[scrub_env]` 配下、DR-0024 §3)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct ScrubEnvConfig {
+    /// env scrub 全体の on/off (= CLI `--no-scrub-env` と同等)。
+    ///
+    /// default: `true`。`false` にすると target 設定に関わらず scrub を
+    /// 全停止する。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// target 別 scrub 設定。key は `hyoui run -- <cmd>` の argv basename。
+    ///
+    /// 未指定 target は [`TargetConfig::default`] (= `inherit_builtin = true`、
+    /// kill/keep 空) 相当として扱う。
+    #[serde(default)]
+    pub targets: BTreeMap<String, TargetConfig>,
+}
+
+/// target 別 scrub 設定 (= TOML の `[scrub_env.targets.<name>]`、DR-0024 §3)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct TargetConfig {
+    /// `true` で builtin kill_glob / keep_glob を user 設定と concat する。
+    ///
+    /// default: `true`。`false` にすると builtin を完全無視して user 設定のみ
+    /// 適用 (= builtin が未登録の target では true/false 同義)。
+    #[serde(default = "default_true")]
+    pub inherit_builtin: bool,
+
+    /// 削除対象 glob patterns (= builtin kill_glob に追加)。`inherit_builtin =
+    /// false` のときは builtin を無視して user 設定のみ。
+    #[serde(default)]
+    pub kill_glob: Vec<String>,
+
+    /// 削除を skip する glob patterns。`inherit_builtin = true` のときは builtin
+    /// keep_glob (= 現状空) に user 設定を concat。`inherit_builtin = false` の
+    /// ときは builtin を無視して user 設定のみ。
+    #[serde(default)]
+    pub keep_glob: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for ScrubEnvConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            targets: BTreeMap::new(),
+        }
+    }
+}
+
+impl Default for TargetConfig {
+    fn default() -> Self {
+        Self {
+            inherit_builtin: true,
+            kill_glob: Vec::new(),
+            keep_glob: Vec::new(),
+        }
+    }
+}
+
+/// config 読み込み時のエラー (DR-0024 §7)。
+#[derive(Debug)]
+pub enum ConfigError {
+    /// config ファイルの read syscall が失敗 (NotFound 以外、= permission denied 等)。
+    Read {
+        /// 読み込み試行したパス。
+        path: PathBuf,
+        /// underlying I/O error。
+        source: std::io::Error,
+    },
+    /// TOML パースエラー (= syntax error / 型不一致)。
+    Parse {
+        /// 読み込んだパス。
+        path: PathBuf,
+        /// underlying TOML deserialize error。
+        source: toml::de::Error,
+    },
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read { path, source } => {
+                write!(f, "config file read failed ({}): {source}", path.display())
+            }
+            Self::Parse { path, source } => {
+                write!(f, "config file parse failed ({}): {source}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read { source, .. } => Some(source),
+            Self::Parse { source, .. } => Some(source),
+        }
+    }
+}
+
+/// config ファイルの解決パスを返す。
+///
+/// `$XDG_CONFIG_HOME` 指定があればそちら、無ければ `$HOME/.config/hyoui/config.toml`。
+/// どちらの env も無ければ `None` (= config 読み込み不能、`Config::default` で動く)。
+pub fn resolve_path() -> Option<PathBuf> {
+    resolve_path_from(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// [`resolve_path`] の pure 関数化版 (= test で env mutation 不要にするため切り出し)。
+///
+/// 引数 (xdg, home) は両方 `Option<&OsStr>` で受ける。`Some("")` は未設定扱い
+/// (= `var_os` が空文字を返す異常ケースに合わせる)。
+fn resolve_path_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    if let Some(x) = xdg
+        && !x.is_empty()
+    {
+        return Some(PathBuf::from(x).join("hyoui").join("config.toml"));
+    }
+    let h = home?;
+    if h.is_empty() {
+        return None;
+    }
+    Some(
+        PathBuf::from(h)
+            .join(".config")
+            .join("hyoui")
+            .join("config.toml"),
+    )
+}
+
+/// config を読み込む。
+///
+/// - パス解決不能 / ファイル不在 → `Ok(Config::default())`
+/// - read 失敗 (= permission denied 等) → `Err(ConfigError::Read)`
+/// - パース失敗 → `Err(ConfigError::Parse)`
+///
+/// caller (= `hyoui-cli` の `run` 解決経路) はエラー時 exit non-zero で起動を
+/// 拒否する責務がある (DR-0024 §7)。
+pub fn load() -> Result<Config, ConfigError> {
+    let Some(path) = resolve_path() else {
+        return Ok(Config::default());
+    };
+    load_from(&path)
+}
+
+/// 明示パスから config を読み込む (= unit test / 内部実装用)。
+pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => parse_str(s.as_str(), path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+        Err(e) => Err(ConfigError::Read {
+            path: path.to_path_buf(),
+            source: e,
+        }),
+    }
+}
+
+/// TOML 文字列から Config を直接 deserialize する (= test 用、エラー時の path 付帯のため `path` を取る)。
+pub fn parse_str(s: &str, path: &Path) -> Result<Config, ConfigError> {
+    toml::from_str(s).map_err(|e| ConfigError::Parse {
+        path: path.to_path_buf(),
+        source: e,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn dummy_path() -> PathBuf {
+        PathBuf::from("/tmp/test-config.toml")
+    }
+
+    #[test]
+    fn default_config_has_scrub_enabled_and_empty_targets() {
+        let c = Config::default();
+        assert!(c.scrub_env.enabled);
+        assert!(c.scrub_env.targets.is_empty());
+    }
+
+    #[test]
+    fn default_target_inherits_builtin() {
+        let t = TargetConfig::default();
+        assert!(t.inherit_builtin);
+        assert!(t.kill_glob.is_empty());
+        assert!(t.keep_glob.is_empty());
+    }
+
+    #[test]
+    fn parse_empty_toml_gives_defaults() {
+        let c = parse_str("", &dummy_path()).unwrap();
+        assert!(c.scrub_env.enabled);
+        assert!(c.scrub_env.targets.is_empty());
+    }
+
+    #[test]
+    fn parse_disable_only() {
+        let s = r#"
+[scrub_env]
+enabled = false
+"#;
+        let c = parse_str(s, &dummy_path()).unwrap();
+        assert!(!c.scrub_env.enabled);
+    }
+
+    #[test]
+    fn parse_target_full() {
+        let s = r#"
+[scrub_env.targets.claude]
+inherit_builtin = true
+kill_glob = ["CMUXMSG_*"]
+keep_glob = ["AI_AGENT"]
+"#;
+        let c = parse_str(s, &dummy_path()).unwrap();
+        let t = c.scrub_env.targets.get("claude").unwrap();
+        assert!(t.inherit_builtin);
+        assert_eq!(t.kill_glob, vec!["CMUXMSG_*"]);
+        assert_eq!(t.keep_glob, vec!["AI_AGENT"]);
+    }
+
+    #[test]
+    fn parse_target_inherit_false() {
+        let s = r#"
+[scrub_env.targets.claude]
+inherit_builtin = false
+kill_glob = ["MYTOOL_SECRET"]
+"#;
+        let c = parse_str(s, &dummy_path()).unwrap();
+        let t = c.scrub_env.targets.get("claude").unwrap();
+        assert!(!t.inherit_builtin);
+        assert_eq!(t.kill_glob, vec!["MYTOOL_SECRET"]);
+        assert!(t.keep_glob.is_empty());
+    }
+
+    #[test]
+    fn parse_unknown_field_is_ignored() {
+        // DR-0024 §7: unknown field は warn 出さずに無視する (= 前方互換)。
+        let s = r#"
+some_future_section_key = "ignored"
+
+[scrub_env]
+enabled = true
+some_future_field = "ignored"
+
+[scrub_env.targets.claude]
+inherit_builtin = true
+new_field_in_future = 42
+kill_glob = ["FOO"]
+"#;
+        let c = parse_str(s, &dummy_path()).unwrap();
+        assert!(c.scrub_env.enabled);
+        let t = c.scrub_env.targets.get("claude").unwrap();
+        assert_eq!(t.kill_glob, vec!["FOO"]);
+    }
+
+    #[test]
+    fn parse_syntax_error_returns_err() {
+        let s = "this is not valid toml ===";
+        let r = parse_str(s, &dummy_path());
+        assert!(matches!(r, Err(ConfigError::Parse { .. })));
+    }
+
+    #[test]
+    fn parse_type_mismatch_returns_err() {
+        let s = r#"
+[scrub_env]
+enabled = "yes"
+"#; // bool が文字列
+        let r = parse_str(s, &dummy_path());
+        assert!(matches!(r, Err(ConfigError::Parse { .. })));
+    }
+
+    #[test]
+    fn parse_full_example_from_dr() {
+        // DR-0024 §3 の TOML 例がそのまま deserialize できる。
+        let s = r#"
+[scrub_env]
+enabled = true
+
+[scrub_env.targets.claude]
+inherit_builtin = true
+kill_glob = ["CMUXMSG_*"]
+keep_glob = ["AI_AGENT"]
+
+[scrub_env.targets.my-tool]
+inherit_builtin = false
+kill_glob = ["MYTOOL_SECRET"]
+"#;
+        let c = parse_str(s, &dummy_path()).unwrap();
+        assert!(c.scrub_env.enabled);
+        let claude = c.scrub_env.targets.get("claude").unwrap();
+        assert!(claude.inherit_builtin);
+        assert_eq!(claude.kill_glob, vec!["CMUXMSG_*"]);
+        assert_eq!(claude.keep_glob, vec!["AI_AGENT"]);
+        let my_tool = c.scrub_env.targets.get("my-tool").unwrap();
+        assert!(!my_tool.inherit_builtin);
+        assert_eq!(my_tool.kill_glob, vec!["MYTOOL_SECRET"]);
+    }
+
+    #[test]
+    fn load_from_nonexistent_path_gives_default() {
+        let path = PathBuf::from("/tmp/definitely-does-not-exist-hyoui-test.toml");
+        let c = load_from(&path).unwrap();
+        assert_eq!(c, Config::default());
+    }
+
+    #[test]
+    fn load_from_tempfile_with_valid_toml() {
+        use std::io::Write;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "[scrub_env]").unwrap();
+        writeln!(f, "enabled = false").unwrap();
+        drop(f);
+        let c = load_from(&path).unwrap();
+        assert!(!c.scrub_env.enabled);
+    }
+
+    // path 解決ロジックは pure 関数 `resolve_path_from(xdg, home)` に切り出して
+    // env mutation なしで test する (= process global env を弄ると他 test と衝突 +
+    // sys/* 外で unsafe を使うことになる)。
+    #[test]
+    fn resolve_path_from_uses_xdg_when_present() {
+        let p = resolve_path_from(Some(OsStr::new("/custom/xdg")), None).unwrap();
+        assert_eq!(p, PathBuf::from("/custom/xdg/hyoui/config.toml"));
+    }
+
+    #[test]
+    fn resolve_path_from_falls_back_to_home_when_xdg_unset() {
+        let p = resolve_path_from(None, Some(OsStr::new("/custom/home"))).unwrap();
+        assert_eq!(p, PathBuf::from("/custom/home/.config/hyoui/config.toml"));
+    }
+
+    #[test]
+    fn resolve_path_from_falls_back_to_home_when_xdg_empty() {
+        // 異常ケース: XDG=空文字は未設定扱い。
+        let p = resolve_path_from(Some(OsStr::new("")), Some(OsStr::new("/h"))).unwrap();
+        assert_eq!(p, PathBuf::from("/h/.config/hyoui/config.toml"));
+    }
+
+    #[test]
+    fn resolve_path_from_returns_none_when_both_missing() {
+        assert!(resolve_path_from(None, None).is_none());
+        assert!(resolve_path_from(Some(OsStr::new("")), None).is_none());
+        assert!(resolve_path_from(None, Some(OsStr::new(""))).is_none());
+    }
+}

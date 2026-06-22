@@ -449,16 +449,30 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     // 解決済 namespace は (1) socket 配置 dir の決定、(2) 子プロセスへの常時 env 注入、
     // (3) 非 detached 経路で exec する `hyoui attach` への明示伝搬、に使う。
     let namespace = socket_path::resolve_namespace(cfg.namespace.as_deref());
-    // DR-0023: 子 PTY env scrub。target 推定 + builtin + add で kill_glob patterns を
-    // 解決、keep glob は別 list として ScrubPlan に積む。`None` で完全 disable (=
-    // --no-scrub-env)、`Some(plan)` で daemon child の `env_scrub::apply` に渡す。
-    let scrub_env_plan = hyoui::sys::env_scrub::resolve_plan(
-        cfg.no_scrub_env,
-        cfg.scrub_env_target.as_deref(),
-        &cfg.command,
-        &cfg.scrub_env_add,
-        &cfg.scrub_env_keep,
-    );
+    // DR-0024: 子 PTY env scrub。config (= ~/.config/hyoui/config.toml) を load し、
+    // target = argv basename で builtin + user 設定を merge して ScrubPlan を解決する。
+    // `None` で完全 disable (= --no-scrub-env or config の scrub_env_enabled=false)、
+    // `Some(plan)` で daemon child の `env_scrub::apply` に渡す。
+    //
+    // `--no-scrub-env` 指定時は config load 自体を skip する (= 完全 escape hatch、
+    // config 不在/不正の影響を受けず起動できる)。config パースエラーは exit non-zero
+    // で起動を拒否 (= 意図しない設定での起動は親 host Internal Context 漏洩リスク)。
+    let scrub_env_plan = if cfg.no_scrub_env {
+        None
+    } else {
+        let config = match hyoui::config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("hyoui: {e}");
+                eprintln!(
+                    "hyoui: config ファイルを修正してから再実行してください。または \
+                     `--no-scrub-env` で起動して config の読み込みをスキップできます"
+                );
+                return ExitCode::from(2);
+            }
+        };
+        hyoui::sys::env_scrub::resolve_plan(false, &config, &cfg.command)
+    };
     // size 解決 (= ユーザ指示 2026-05-29、stdin pipe 経由):
     // - 明示指定 (= --cols/--rows/--size) があればそれを使う
     // - 非 detached + 明示なし → 外側 TTY size (= stdin) を継承

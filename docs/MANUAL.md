@@ -26,6 +26,7 @@ CLI).
   - [7. Exclusive automation (`lock`)](#7-exclusive-automation-lock)
   - [8. Record the tty I/O timeline (`record`)](#8-record-the-tty-io-timeline-record)
   - [9. Group sessions with namespaces](#9-group-sessions-with-namespaces)
+  - [10. Stop leaking parent env into the child (env scrub)](#10-stop-leaking-parent-env-into-the-child-env-scrub)
 - [Troubleshooting](#troubleshooting)
 - [See also](#see-also)
 
@@ -270,6 +271,54 @@ lets a process detect "am I running under hyoui, and in which namespace?".
 Namespace names share the session-id character set (`[A-Za-z0-9._-]`, max 64
 bytes); `/` is rejected today and reserved for possible future hierarchical
 namespaces. `default` is a reserved name that maps to the base socket dir.
+
+### 10. Stop leaking parent env into the child (env scrub)
+
+When you call hyoui from inside an AI agent CLI like `claude`, the parent's
+**Internal Context env** (e.g. `CLAUDE_CODE_SESSION_ID` / `CLAUDECODE` /
+`AI_AGENT`) leaks into the child via plain POSIX fork→exec, and the child
+session ends up misidentifying itself as a continuation of the parent. hyoui
+strips those out before spawning the child
+([DR-0024](./decisions/DR-0024-env-scrub-config-file.md)).
+
+**For `claude` it just works** — the 9 env vars documented in the Claude Code
+official env-vars docs are removed by the builtin defaults. No setup required.
+
+| flag | purpose |
+|---|---|
+| `--no-scrub-env` | Disable scrub entirely (= debug / compatibility escape hatch) |
+
+To strip env vars for an unregistered target (= AI agents other than `claude`,
+or your own tools), or to keep some of the builtin-removed vars, edit
+`~/.config/hyoui/config.toml`:
+
+```toml
+[scrub_env]
+enabled = true                    # global on/off (default: true)
+
+# Extend the builtin claude list
+[scrub_env.targets.claude]
+inherit_builtin = true            # default: true — concat builtin + user
+kill_glob = ["CMUXMSG_*"]         # extra env names to remove
+keep_glob = ["AI_AGENT"]          # env names to keep that builtin would remove
+
+# Register a brand-new target (= a CLI hyoui doesn't know about)
+[scrub_env.targets.my-tool]
+inherit_builtin = false           # ignore builtin, user list only
+kill_glob = ["MYTOOL_SECRET"]
+```
+
+The target key is the basename of `<cmd>` in `hyoui run -- <cmd>`. Wrappers
+like `env` are not unwrapped — just write `hyoui run -- claude` directly
+([DR-0024 §2](./decisions/DR-0024-env-scrub-config-file.md)).
+
+Env vars whose names start with `HYOUI_` are never removed even if a user
+`kill_glob` matches them (= hyoui itself injects `HYOUI_NAMESPACE` /
+`HYOUI_SESSION_ID` etc. on purpose).
+
+If the config has a parse error (= invalid TOML / type mismatch) hyoui refuses
+to start (= booting with an unintended config risks leaking the parent's
+Internal Context). Use `--no-scrub-env` if you need to bypass it temporarily.
 
 ## Troubleshooting
 

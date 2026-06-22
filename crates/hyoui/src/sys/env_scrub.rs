@@ -1,24 +1,31 @@
-//! Child PTY env scrub (DR-0023).
+//! Child PTY env scrub (DR-0024、DR-0023 を Superseded).
 //!
 //! 親 hyoui ホスト process (例: Claude Code session) が export している
 //! Internal Context env が、`hyoui run -- <cmd>` 経由で子 process に POSIX
 //! fork→exec で素通しで漏れる現象を解消するための target-aware env scrub。
 //!
-//! 親 (= `hyoui-cli` main) で [`resolve_globs`] により kill_glob patterns を
+//! DR-0024 redesign で:
+//!
+//! - CLI flag は `--no-scrub-env` 1 個のみ
+//! - kill/keep glob の user 設定は `~/.config/hyoui/config.toml` 経由
+//! - target 推定は `command[0]` の basename のみ (env wrapper unwrap なし)
+//!
+//! 親 (= `hyoui-cli` main) で [`resolve_plan`] により kill/keep glob patterns を
 //! 解決して `DaemonizeInit` に詰め、daemon child (= `run_daemon_child`) が
 //! [`apply`] を呼んで自 process の environ から match する env を削除する。
 //! environ 削除した状態で `Session::start` が fork+execvp するので、子 PTY が
 //! 継承する environ から該当 env が除外される。
 //!
-//! 詳細は `docs/decisions/DR-0023-child-env-scrub.md` を参照。
+//! 詳細は `docs/decisions/DR-0024-env-scrub-config-file.md` を参照。
 
+use crate::config::{Config, TargetConfig};
 use crate::sys::env::remove_var_at_startup;
 
 /// 削除対象から強制的に除外する env 名 prefix (= hyoui 自身が DR-0018 / DR-0020
 /// 等で意図的に子へ注入する env を保護する)。
 pub const PROTECTED_PREFIX: &str = "HYOUI_";
 
-/// target ごとの組み込み default kill_glob patterns (DR-0023 §3)。
+/// target ごとの組み込み default kill_glob patterns (DR-0024 §4)。
 ///
 /// 出典:
 /// - `CLAUDECODE` / `CLAUDE_CODE_*` / `CLAUDE_JOB_DIR` / `CLAUDE_PLUGIN_DATA`:
@@ -26,7 +33,7 @@ pub const PROTECTED_PREFIX: &str = "HYOUI_";
 ///   (= 子プロセスへ auto-export と明記)
 /// - `AI_AGENT`: Vercel `@vercel/detect-agent` convention (Claude Code バイナリ内
 ///   で `claude-code_<version>_agent` を hardcoded export)
-pub fn builtin_defaults(target: &str) -> &'static [&'static str] {
+pub fn builtin_kill_defaults(target: &str) -> &'static [&'static str] {
     match target {
         "claude" => &[
             "CLAUDECODE",
@@ -43,11 +50,19 @@ pub fn builtin_defaults(target: &str) -> &'static [&'static str] {
     }
 }
 
+/// target ごとの組み込み default keep_glob patterns (DR-0024 §4 = 現状空)。
+///
+/// 将来 builtin で保護したい pattern が出てきたらここに追加する。
+pub fn builtin_keep_defaults(_target: &str) -> &'static [&'static str] {
+    &[]
+}
+
 /// `command[0]` から target 名を推定する (= basename 抽出)。
 ///
 /// 推定に失敗した (= 空 / 非 UTF-8) 場合は `None` を返す。env wrapper
-/// (例: `hyoui run -- env FOO=bar claude`) では誤推定するため、user は
-/// `--scrub-env-target=claude` で明示 override できる (DR-0023 §2)。
+/// (= `hyoui run -- env FOO=bar claude`) では `env` が target になる
+/// = builtin 未登録なので scrub なし。env wrapper サポートは DR-0024 で対象外
+/// が確定 (user は wrapper を使わず素直に target を書く)。
 pub fn infer_target(command: &[String]) -> Option<String> {
     let first = command.first()?;
     let basename = std::path::Path::new(first).file_name()?.to_str()?;
@@ -57,43 +72,56 @@ pub fn infer_target(command: &[String]) -> Option<String> {
     Some(basename.to_string())
 }
 
-/// 親側で組み込み defaults + add を合成して kill_glob patterns を解決し、
-/// keep globs はそのまま [`ScrubPlan`] に積んで daemon child に渡す。
+/// 親側で config + builtin defaults を合成して `ScrubPlan` を解決する。
 ///
-/// 返り値が `None` の場合 = scrub 完全無効 (= `--no-scrub-env`)。
-/// `keep` patterns は `apply` 時に **env 名と glob match** して削除を skip させる
-/// (= `--scrub-env-keep=CLAUDE_*` のように builtin に exact 一致しない glob でも
-/// 機能する。pattern 列の exact 除外ではない)。
-pub fn resolve_plan(
-    no_scrub_env: bool,
-    explicit_target: Option<&str>,
-    command: &[String],
-    add: &[String],
-    keep: &[String],
-) -> Option<ScrubPlan> {
-    if no_scrub_env {
+/// 返り値が `None` の場合 = scrub 完全無効 (= `--no-scrub-env` または config の
+/// `scrub_env_enabled = false`)。
+///
+/// 解決規則 (DR-0024 §3):
+///
+/// 1. `no_scrub_env || !config.scrub_env_enabled` → `None`
+/// 2. target = [`infer_target`] で argv basename を推定。失敗 (= 空 / 非 UTF-8) →
+///    no-op の空 `ScrubPlan` を返す (= scrub は機能するが削除候補なし)
+/// 3. config から target lookup (= 未指定なら `TargetConfig::default`)
+/// 4. `inherit_builtin = true` → builtin kill/keep + user kill/keep を concat
+/// 5. `inherit_builtin = false` → user kill/keep のみ
+/// 6. dedup したうえで `ScrubPlan` に詰める
+pub fn resolve_plan(no_scrub_env: bool, config: &Config, command: &[String]) -> Option<ScrubPlan> {
+    if no_scrub_env || !config.scrub_env.enabled {
         return None;
     }
-    let target = explicit_target
-        .map(|s| s.to_string())
-        .or_else(|| infer_target(command));
-    let builtin: Vec<String> = target
+    let target = infer_target(command);
+    let target_cfg = target
         .as_deref()
-        .map(builtin_defaults)
-        .unwrap_or(&[])
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
-    let mut patterns: Vec<String> = builtin;
-    for a in add {
-        if !patterns.iter().any(|p| p == a) {
-            patterns.push(a.clone());
+        .and_then(|t| config.scrub_env.targets.get(t));
+    let default_cfg = TargetConfig::default();
+    let cfg = target_cfg.unwrap_or(&default_cfg);
+
+    let mut patterns: Vec<String> = Vec::new();
+    let mut keep: Vec<String> = Vec::new();
+
+    if cfg.inherit_builtin
+        && let Some(t) = target.as_deref()
+    {
+        for p in builtin_kill_defaults(t) {
+            patterns.push((*p).to_string());
+        }
+        for p in builtin_keep_defaults(t) {
+            keep.push((*p).to_string());
         }
     }
-    Some(ScrubPlan {
-        patterns,
-        keep: keep.to_vec(),
-    })
+    for p in &cfg.kill_glob {
+        if !patterns.iter().any(|x| x == p) {
+            patterns.push(p.clone());
+        }
+    }
+    for p in &cfg.keep_glob {
+        if !keep.iter().any(|x| x == p) {
+            keep.push(p.clone());
+        }
+    }
+
+    Some(ScrubPlan { patterns, keep })
 }
 
 /// 親で解決した scrub 計画 (= daemon child に渡す wire 形式)。
@@ -102,9 +130,9 @@ pub fn resolve_plan(
 /// したら削除候補、`keep` は env 名と glob match したら削除を skip。
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ScrubPlan {
-    /// 削除候補 kill_glob patterns (= 組み込み default + `--scrub-env-add`)。
+    /// 削除候補 kill_glob patterns (= builtin + config user kill_glob)。
     pub patterns: Vec<String>,
-    /// 削除を skip する keep_glob patterns (= `--scrub-env-keep`)。
+    /// 削除を skip する keep_glob patterns (= builtin + config user keep_glob)。
     #[serde(default)]
     pub keep: Vec<String>,
 }
@@ -153,7 +181,7 @@ pub fn is_protected(name: &str) -> bool {
 pub struct ScrubResult {
     /// 実際に environ から削除した env 名 (= patterns match かつ keep/protected 非該当)。
     pub removed: Vec<String>,
-    /// patterns に match したが `--scrub-env-keep` で削除を skip した env 名。
+    /// patterns に match したが keep_glob で削除を skip した env 名。
     pub keep_skips: Vec<String>,
     /// patterns に match したが `HYOUI_*` protected で削除を skip した env 名。
     pub protected_hits: Vec<String>,
@@ -169,7 +197,7 @@ pub struct ScrubResult {
 ///
 /// 戻り値 [`ScrubResult`] には「削除した env 名」「keep glob で skip した env 名」
 /// 「protected (`HYOUI_*`) で skip した env 名」を分けて積む。log 出力 (= stderr) は
-/// caller 責務 (= default 無音、必要なら `--verbose` 等で出す。DR-0023 §log 規定)。
+/// caller 責務 (= default 無音、必要なら将来 opt-in で出す。DR-0024 §10)。
 ///
 /// # Safety (caller 契約)
 /// **process 起動初期 + single-threaded** でのみ呼ぶこと。`Session::start` 前の
@@ -207,6 +235,12 @@ pub fn apply(plan: &ScrubPlan) -> ScrubResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg_with(target: &str, t: TargetConfig) -> Config {
+        let mut c = Config::default();
+        c.scrub_env.targets.insert(target.to_string(), t);
+        c
+    }
 
     #[test]
     fn glob_match_literal() {
@@ -256,8 +290,8 @@ mod tests {
     }
 
     #[test]
-    fn builtin_defaults_claude() {
-        let d = builtin_defaults("claude");
+    fn builtin_kill_defaults_claude() {
+        let d = builtin_kill_defaults("claude");
         assert!(d.contains(&"CLAUDECODE"));
         assert!(d.contains(&"CLAUDE_CODE_SESSION_ID"));
         assert!(d.contains(&"AI_AGENT"));
@@ -265,62 +299,135 @@ mod tests {
     }
 
     #[test]
-    fn builtin_defaults_unknown_target() {
-        assert_eq!(builtin_defaults("vim").len(), 0);
-        assert_eq!(builtin_defaults("cat").len(), 0);
-        assert_eq!(builtin_defaults("").len(), 0);
+    fn builtin_defaults_unknown_target_is_empty() {
+        assert_eq!(builtin_kill_defaults("vim").len(), 0);
+        assert_eq!(builtin_kill_defaults("cat").len(), 0);
+        assert_eq!(builtin_kill_defaults("").len(), 0);
+        assert_eq!(builtin_keep_defaults("claude").len(), 0);
     }
 
     #[test]
-    fn resolve_plan_no_scrub() {
-        let r = resolve_plan(true, None, &["claude".into()], &[], &[]);
+    fn resolve_plan_no_scrub_flag_disables() {
+        let cfg = Config::default();
+        let r = resolve_plan(true, &cfg, &["claude".into()]);
         assert_eq!(r, None);
     }
 
     #[test]
-    fn resolve_plan_claude_default() {
-        let r = resolve_plan(false, None, &["claude".into()], &[], &[]).unwrap();
+    fn resolve_plan_config_disabled_overrides_builtin() {
+        let mut cfg = Config::default();
+        cfg.scrub_env.enabled = false;
+        let r = resolve_plan(false, &cfg, &["claude".into()]);
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn resolve_plan_claude_default_uses_builtin() {
+        let cfg = Config::default();
+        let r = resolve_plan(false, &cfg, &["claude".into()]).unwrap();
+        assert_eq!(r.patterns.len(), 9);
         assert!(r.patterns.contains(&"CLAUDECODE".into()));
         assert!(r.patterns.contains(&"AI_AGENT".into()));
-        assert_eq!(r.patterns.len(), 9);
         assert!(r.keep.is_empty());
     }
 
     #[test]
-    fn resolve_plan_explicit_target_overrides_argv() {
-        let r = resolve_plan(false, Some("claude"), &["env".into()], &[], &[]).unwrap();
-        assert!(r.patterns.contains(&"CLAUDE_CODE_SESSION_ID".into()));
-    }
-
-    #[test]
-    fn resolve_plan_unknown_target_empty() {
-        let r = resolve_plan(false, None, &["vim".into()], &[], &[]).unwrap();
+    fn resolve_plan_unknown_target_no_builtin_no_user() {
+        let cfg = Config::default();
+        let r = resolve_plan(false, &cfg, &["vim".into()]).unwrap();
         assert!(r.patterns.is_empty());
         assert!(r.keep.is_empty());
     }
 
     #[test]
-    fn resolve_plan_add_dedupes() {
-        let r = resolve_plan(
-            false,
-            None,
-            &["claude".into()],
-            &["AI_AGENT".into(), "CMUXMSG_*".into()],
-            &[],
-        )
-        .unwrap();
-        // AI_AGENT は builtin に既にあるので重複しない
+    fn resolve_plan_inherit_true_concats_user_kill() {
+        let cfg = cfg_with(
+            "claude",
+            TargetConfig {
+                inherit_builtin: true,
+                kill_glob: vec!["CMUXMSG_*".into()],
+                keep_glob: vec![],
+            },
+        );
+        let r = resolve_plan(false, &cfg, &["claude".into()]).unwrap();
+        assert!(r.patterns.contains(&"CLAUDECODE".into()));
+        assert!(r.patterns.contains(&"CMUXMSG_*".into()));
+        assert_eq!(r.patterns.len(), 10);
+    }
+
+    #[test]
+    fn resolve_plan_inherit_true_concats_user_keep() {
+        let cfg = cfg_with(
+            "claude",
+            TargetConfig {
+                inherit_builtin: true,
+                kill_glob: vec![],
+                keep_glob: vec!["AI_AGENT".into()],
+            },
+        );
+        let r = resolve_plan(false, &cfg, &["claude".into()]).unwrap();
+        assert_eq!(r.patterns.len(), 9); // builtin 9 個
+        assert_eq!(r.keep, vec!["AI_AGENT"]);
+    }
+
+    #[test]
+    fn resolve_plan_inherit_false_drops_builtin() {
+        let cfg = cfg_with(
+            "claude",
+            TargetConfig {
+                inherit_builtin: false,
+                kill_glob: vec!["MYTOOL_SECRET".into()],
+                keep_glob: vec![],
+            },
+        );
+        let r = resolve_plan(false, &cfg, &["claude".into()]).unwrap();
+        assert!(!r.patterns.contains(&"CLAUDECODE".into()));
+        assert_eq!(r.patterns, vec!["MYTOOL_SECRET"]);
+    }
+
+    #[test]
+    fn resolve_plan_dedupes_user_against_builtin() {
+        let cfg = cfg_with(
+            "claude",
+            TargetConfig {
+                inherit_builtin: true,
+                kill_glob: vec!["AI_AGENT".into(), "CMUXMSG_*".into()],
+                keep_glob: vec![],
+            },
+        );
+        let r = resolve_plan(false, &cfg, &["claude".into()]).unwrap();
+        // AI_AGENT は builtin に既に存在 → 重複しない
         assert_eq!(r.patterns.iter().filter(|p| *p == "AI_AGENT").count(), 1);
         assert!(r.patterns.contains(&"CMUXMSG_*".into()));
     }
 
     #[test]
-    fn resolve_plan_keep_is_separate_from_patterns() {
-        // keep は patterns から exact 除外しない (= patterns はそのまま、keep は別 list で保持)。
-        // apply 時に env 名と keep glob を match して削除を skip する semantics。
-        let r = resolve_plan(false, None, &["claude".into()], &[], &["AI_AGENT".into()]).unwrap();
-        assert!(r.patterns.contains(&"AI_AGENT".into())); // patterns には残る
-        assert!(r.keep.contains(&"AI_AGENT".into())); // keep にも積まれる
+    fn resolve_plan_user_only_target_with_no_builtin() {
+        // builtin 未登録の target でも config から user 設定を生かせる。
+        let cfg = cfg_with(
+            "my-tool",
+            TargetConfig {
+                inherit_builtin: true,
+                kill_glob: vec!["MYTOOL_SECRET".into()],
+                keep_glob: vec![],
+            },
+        );
+        let r = resolve_plan(false, &cfg, &["my-tool".into()]).unwrap();
+        assert_eq!(r.patterns, vec!["MYTOOL_SECRET"]);
+    }
+
+    #[test]
+    fn resolve_plan_env_wrapper_does_not_unwrap() {
+        // DR-0024 §2: env wrapper サポートなし。argv[0] が "env" の場合、target = "env"
+        // になり builtin 未登録なので scrub は no-op。user は wrapper を使わず素直に書く。
+        let cfg = Config::default();
+        let r = resolve_plan(
+            false,
+            &cfg,
+            &["env".into(), "FOO=bar".into(), "claude".into()],
+        )
+        .unwrap();
+        assert!(r.patterns.is_empty());
     }
 
     #[test]
