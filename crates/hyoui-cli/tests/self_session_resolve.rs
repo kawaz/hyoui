@@ -296,8 +296,17 @@ fn wait_explicit_session_wins_over_env() {
     let me = "c1-wait-me";
     let target = "c1-wait-target";
     spawn_detached(runtime.path(), me);
-    // target の画面に "hello" を出しておく (= wait の match 対象)。
-    spawn_detached_cmd(runtime.path(), target, "echo hello; sleep 30");
+    // target の画面に "hello" を **継続出力** しておく (= wait の match 対象)。
+    // 単発 `echo hello; sleep 30` だと CI 環境で daemon child の出力が viewport から
+    // 流れてしまい、`hyoui wait` の StateSnapshotRequest が visible rows のみを
+    // 配信する都合で pattern を観測できず timeout fail する (= scrollback 未対応の
+    // race)。継続出力にして wait が必ず live で観測できるようにする。
+    // 根本の wait scrollback 対応は別 issue で追跡。
+    spawn_detached_cmd(
+        runtime.path(),
+        target,
+        "while sleep 0.2; do echo hello; done",
+    );
 
     let out = Command::new(hyoui_bin())
         .args(["wait", target, "hello", "--timeout=5s"])
@@ -323,7 +332,13 @@ fn wait_explicit_session_wins_over_env() {
 fn wait_single_positional_resolves_self_with_env() {
     let runtime = runtime_dir();
     let me = "c1-wait-self";
-    spawn_detached_cmd(runtime.path(), me, "echo selfhello; sleep 30");
+    // 継続出力にする理由は wait_explicit_session_wins_over_env と同じ
+    // (= wait の scrollback 未対応で初回 echo が viewport から流れる CI race を回避)。
+    spawn_detached_cmd(
+        runtime.path(),
+        me,
+        "while sleep 0.2; do echo selfhello; done",
+    );
 
     let out = Command::new(hyoui_bin())
         .args(["wait", "selfhello", "--timeout=5s"])

@@ -3610,7 +3610,10 @@ mod tests {
         k.flush().expect("flush");
         // 無限ハング防止 (= issue 2026-06-11): まさに本 test が CI で 6h hang した
         // join 箇所。deadline 超過は fail で落とす (= ハングさせない)。
-        let _ = join_with_deadline(handle, Duration::from_secs(30), "backpressure daemon serve");
+        // deadline 60s: CI runner の負荷で writer_pump → serve_loop drop sequence が
+        // 遅くなり 30s では fail することがある (= 2026-06-22 ubuntu CI で観測)。
+        // writer_pump と serve_loop drop sequence の同期化による根治は別 issue。
+        let _ = join_with_deadline(handle, Duration::from_secs(60), "backpressure daemon serve");
     }
 
     // ---- Round1 fixes: authorization / token / signal / silent skip ----
