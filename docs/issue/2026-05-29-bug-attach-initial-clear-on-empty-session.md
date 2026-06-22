@@ -3,7 +3,7 @@ title: "bug: hyoui run / attach の初期 redraw で画面が clear される"
 status: open
 category: bug
 created: 2026-05-29T00:00:00+09:00
-last_read:
+last_read: 2026-06-22T21:40:45+09:00
 open_entered: 2026-05-29T00:00:00+09:00
 wip_entered:
 blocked_entered:
