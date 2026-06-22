@@ -1,6 +1,6 @@
 ---
 title: "Feature idea: tty I/O の dump / record / play subcommand"
-status: wip
+status: resolved
 category: request
 created: 2026-05-26T00:00:00+09:00
 last_read: 2026-06-22T19:38:42+09:00
@@ -9,10 +9,10 @@ wip_entered: 2026-06-01T00:00:00+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-06-22T19:43:26+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0016","implemented","done:dump/record/play 3 機能のうち record MVP を DR-0016 で切り出し完了、record core は v0.2.x で出荷済 (Phase 4 hot path 配線完了)。Phase 5 (redaction state machine) は別 issue feature-record-redaction-phase5 で進行中。dump / play は v0.3.0+ scope で本 issue から独立、現時点では未起票"]
 blocked_by:
 origin: hyoui paste API 設計議論で --spool-append のユースケースを検討した際に派生
 ---
