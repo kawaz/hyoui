@@ -1,18 +1,18 @@
 ---
 title: "bug: hyoui run / attach の初期 redraw で画面が clear される"
-status: open
+status: resolved
 category: bug
 created: 2026-05-29T00:00:00+09:00
-last_read: 2026-06-22T21:40:45+09:00
+last_read: 2026-06-23T11:14:00+09:00
 open_entered: 2026-05-29T00:00:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-06-23T11:14:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented","done:build_attach_redraw が pristine state (cursor 0,0 + 全 cell empty + alt screen OFF) で空 Vec を返すよう実装済 (crates/hyoui/src/daemon/screen/redraw.rs:30)。test redraw_is_empty_for_pristine_state でカバー、accept.rs:603-608 で empty payload frame として送信される。新規 attach で外側 shell の画面 history が clear されない"]
 blocked_by:
 origin: kawaz 実機検証 2026-05-29
 ---
