@@ -3622,6 +3622,12 @@ fn usage_run() -> String {
             --idle-timeout DUR            Output idle timeout (= 子 PTY 出力が止まったら exit)\n    \
             --until PATTERN               Terminate when PATTERN appears in output\n    \
             --socket PATH                 Unix socket path for input injection\n    \
+            --detached                    daemon を別 process で起動して親はすぐ exit\n                                  \
+                (DR-0015)。socket path を stdout に 1 行 print してから\n                                  \
+                親が終わる。attach は別 process から行う\n    \
+            --session ID                  自動採番 (= run-<pid>-<rand4hex>) ではなく\n                                  \
+                明示 session id を使う。socket path 自動解決にも\n                                  \
+                この値が入る (DR-0015)\n    \
             --namespace NS                Session namespace (default: \"default\";\n                                  \
                 env HYOUI_NAMESPACE で継承可、子に常時注入される)\n    \
             --on-child-suspend=notify|auto-resume\n                                  \
