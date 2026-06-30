@@ -1073,3 +1073,17 @@ DR-0014 だけ読む後続セッションが本 DR の項目を踏むため)。
 - **`Matcher::Wasm` 採用是非**: 本 DR から外し別 DR で起票 (= 実機で Literal/Regex で
   困った事例の集積が条件)
 - **EventFlow operator 拡張** (= Sample / Buffer / Window 等): 必要性が出てから enum 追加
+- **WebUI / 非 unix socket transport 接続**: 本 DR の Client domain Transport sub-state が
+  「transport が何か knowing しない reducer」を実現することで、WebSocket / SSE / HTTP
+  long-poll 等の追加 transport は **新規 Transport variant 追加 + encoder layer (= CBOR /
+  JSON / MessagePack) のみで実現可能** (= reducer 本体は無変更)。考慮点:
+  - HTTP REST API として薄く被せる場合は「register → poll」モデルが必要、WebSocket / SSE
+    なら不要
+  - binary frame vs JSON frame の encoder を Transport sub-state に持たせる
+  - cell 単位差分配信は `ScreenWriteEvent + ScreenLayer` の組み合わせで素直
+  - auth (= Origin 認証 / Bearer token / OAuth) は Client domain の Auth sub-state を
+    拡張するだけ、他 domain は無影響
+  - multi-client (= WebUI + CLI 同時接続) は ClientRegistry が leader/follower / cap
+    negotiation を持つので reducer 責務範囲内
+  - 別 DR で起票時、本 DR の 6 domain reducer 構造の上に WebUI 専用 transport adapter +
+    auth 拡張を被せる形になる予定 (= 本 DR を前提整備として位置付け)
