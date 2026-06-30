@@ -1,8 +1,9 @@
 # DR-0025: Daemon Reducer 化と全ドメイン event の形式化
 
-- Status: Draft
+- Status: Draft (= codex + ultracode 多視点 review 1 巡反映済、Phase 1a 着手前に Active 化)
 - Date: 2026-06-30
-- Related: DR-0014 (透過原則 + 検証主義、本 DR で実装レベル強化), DR-0008 (外部 protocol、本 DR は daemon 内部設計で別軸), DR-0013 (screen state 正本、本 DR の Screen reducer に該当), DR-0022 (input invocation auto-lock、本 DR の Lock reducer で構造的に再整理), DR-0016 (TTY IO record、本 DR の全 event を統一的に record する自然延長), DR-0001 (jobcontrol 2 軸、本 DR の Child state reducer に該当)
+- Review: codex / ultracode 8 観点 (= 設計哲学 / domain 境界 / watch 3 軸 / TTY enum / migration plan / testability / 既存 DR 整合 / Open Questions) review 完了、must-address 6 件 + should-address 6 件を本 revise で本文反映。残置 nice-to-have は実装段階で追加対応
+- Related: DR-0014 (透過原則 + 検証主義、本 DR で実装レベル強化), DR-0008 (外部 protocol、本 DR は daemon 内部設計で別軸、kind 写像規約あり), DR-0013 (screen state 正本、本 DR の Screen reducer に継承、byte-base tail/history と rows-base virtual screen の分離も継承), DR-0022 (input invocation auto-lock、本 DR の Lock reducer で構造的に再整理、効果境界明文化), DR-0016 (TTY IO record、本 DR の event sourcing と二重 record しない設計責任を本 DR 側が持つ), DR-0001 (jobcontrol = axis 1 のみ、axis 2 は DR-0015 で廃止済、本 DR の Child reducer に継承), DR-0015 (run = fork + attach、Client/Serve lifecycle と Child reducer に継承), DR-0017 (session anchor 構造、Child reducer の事前条件), DR-0019 (OnChildSuspend policy、Child reducer 内部 state)
 - Origin: `parallel_input_serialized_by_auto_lock` 試験 (2026-06-29 セッション) で発見された race 構造の根本原因調査。lock 状態管理と raw_data 配信が「論理軸として分離されてない」点が、kawaz との設計議論で「単一 machine 化 + 全 IO を message に統一」に収束。さらに「TTY 操作だけでなく子プロセス / serve / client / screen / lock 含む全ドメインを形式化すべき」「region / matcher / event flow は直交軸」「polling は仮想 screen 自前管理なら不要、event-driven で十分」と発展
 
 ## Context
@@ -34,6 +35,20 @@ lock の効果範囲と test の検証範囲がミスマッチ**しているこ�
 
 これらは個別 PR で fix できる類ではなく、**daemon 内部の責務分離設計** の問題。
 
+### 元 flaky の真因と本 DR の効果範囲の注意
+
+`parallel_input_serialized_by_auto_lock` の flaky の **直接の真因は子プロセス `/bin/cat` の
+`read(2) → write(2)` が kernel scheduler 依存で atomic でない**こと。本 DR の reducer 化は
+**daemon 内部 race** (= 上記 7 項目に列挙した責務散在 / borrow 偶然依存) の構造的解消であり、
+**子プロセス側 race は対象外**。元 flaky の根治には:
+
+1. 本 DR の Lock reducer で lock の効果境界 (= input 直列化までで output は別軌道) を仕様
+   レベルで明文化
+2. 別作業として test 側 expectation を「PTY 上の echo 順序」から「daemon 入力の直列化 fact」
+   (= daemon record event の `bytes-in` order assert) に変更
+
+の 2 段で対処する。本 DR が単独で flaky を解消するわけではない。
+
 ## 問題の本質
 
 - **single-writer principle の欠如**: TTY fd / child pid / lock state / client registry /
@@ -59,10 +74,240 @@ lock の効果範囲と test の検証範囲がミスマッチ**しているこ�
    client registry / screen state を**直接触らない** (例外は DR で justify)
 4. **layered reducer**: 1 個の super-reducer ではなく、domain 別 sub-reducer を並べて
    合成する (= elm / redux pattern)。各 sub-reducer は自 domain の state と event だけ扱う
-5. **event sourcing**: 全 message を順番に record すれば state を replay 可能。debug / test /
-   bug report で再現性を担保
+5. **event sourcing (= reducer 内部 state に限定)**: 全 message を順番に record すれば
+   **reducer 内部 state は** replay 可能。debug / test / bug report で reducer の
+   deterministic check が容易。**外部 IO 状態 (= PTY fd / client socket / child pid) は
+   再現不可** = full session replay はできない、適用範囲を意識する
 6. **3 軸直交設計**: 例えば watch なら region (= どこ) / matcher (= 何) / flow (= いつ /
    どう流すか) の 3 軸を独立に組み合わせ可能にする (= ad-hoc な trigger 列挙を排除)
+
+## IO boundary と reducer boundary の関係 (= concurrency Decision)
+
+reducer が pure であるためには、OS resource (PTY fd / child pid / signalfd / SIGCHLD /
+unix socket) は reducer の外側 (= IO layer) に追い出す必要がある。本 DR は **単一 thread
+での `poll → translate → reduce → effect` loop** を採用する。
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ main thread (= serve loop、単一)                              │
+│                                                                │
+│  1. poll(PTY master fd, signalfd, listener, client sockets)    │
+│     ↓                                                          │
+│  2. translate (= IO event → DaemonMsg variant)                 │
+│     - PTY read bytes → DaemonMsg::Tty(TtyLayer1Bytes { bytes })│
+│     - SIGCHLD → DaemonMsg::Child(SigchldReceived { pid })      │
+│     - client socket read → DaemonMsg::Client(FrameReceived..) │
+│     ↓                                                          │
+│  3. reduce (= super-reducer dispatch、pure)                    │
+│     fn handle(state, msg) -> (state, Vec<Effect>)              │
+│     ↓                                                          │
+│  4. execute effects (= 実 IO に変換)                           │
+│     - Effect::TtyWrite(bytes) → PTY master write               │
+│     - Effect::Kill(pid, sig) → libc::kill                      │
+│     - Effect::ClientReply(id, frame) → socket write            │
+│     ↓                                                          │
+│  5. effect 結果を次の DaemonMsg::EffectResult として feed-back │
+│     → loop の頭に戻る                                          │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 単一 thread 採用理由
+
+- ordering が決定論的 (= channel ordering 依存を排除、Alternative D 棄却理由と整合)
+- borrow 戦略単純化 (= `&mut DaemonState` を 1 thread が独占、`Send + Sync` 制約を回避)
+- hyoui の現状 (= `nix::poll` ベース、async runtime なし) と整合
+- daemon 1 process = 1 session で並列性需要が高くない (= terminal multiplexer ではない)
+
+### 例外: Parser Layer 1 (= byte 読み出し IO) のみ別 thread 許容
+
+PTY master の `read(2)` を main thread に置くと、heavy byte stream (= 巨大 paste / sixel
+graphics) で他 IO event の処理が遅延する懸念がある。Parser Layer 1 (= bytes 読み出し)
+のみは別 thread で読み、`mpsc::Sender<DaemonMsg::Tty(TtyLayer1Bytes)>` で main thread に
+送出する選択肢を残す (= Phase 6a 着手時に必要性を測定して決定)。Layer 2/3 以降は main
+thread の reducer 内で実行 (= ordering 保証維持)。
+
+## Effect layer (= reducer 出力 → 実 IO)
+
+reducer が pure であるため、reducer 出力 `Vec<Effect>` を実 IO に変換する layer が必要
+(= elm `Cmd` / redux middleware 相当)。
+
+### Effect 型
+
+```rust
+enum Effect {
+  /// PTY master fd への write
+  TtyWrite { bytes: Vec<u8> },
+
+  /// 子プロセスへの signal
+  Kill { pid: Pid, signal: Signal },
+
+  /// client socket への frame 送信
+  ClientReply { client_id: ClientId, frame: Frame },
+
+  /// 全 (subscribe 中の) client への broadcast
+  ClientBroadcast { frame: Frame, filter: BroadcastFilter },
+
+  /// record sink への append
+  Record { entry: RecordEntry },
+
+  /// 子プロセス spawn (= run の起動時のみ)
+  SpawnChild { argv: Vec<String>, env: Vec<(String, String)>, pty: PtySetup },
+
+  /// 内部 timer 設定
+  SetTimer { id: TimerId, delay_ms: u64 },
+  CancelTimer { id: TimerId },
+}
+```
+
+### Effect 失敗の feedback
+
+effect 実行結果は次の input message として reducer に戻る:
+
+```rust
+enum DaemonMsg {
+  // ... (各 domain msg)
+  EffectResult {
+    effect_id: EffectId,
+    outcome: EffectOutcome,
+  },
+}
+
+enum EffectOutcome {
+  Ok,
+  Failed { kind: EffectErrorKind, retry_advice: RetryAdvice },
+}
+
+enum EffectErrorKind {
+  WriteEagain,       // 子の slow read で master fd POLLOUT 待ち
+  WriteBroken,       // EPIPE / ECONNRESET
+  KillEsrch,         // 子が既に死亡
+  SpawnFailed { errno },
+  // ...
+}
+```
+
+### state rollback / pending state 戦略
+
+effect 失敗時の state ロールバックは **「pending state パターン」を採用**:
+
+- reducer が effect を出すと同時に、関連 state を `Pending` 状態に遷移 (= 楽観 update せず)
+- `EffectResult::Ok` 受信で `Confirmed` に遷移
+- `EffectResult::Failed` 受信で `Rolled-back` に遷移し、関連 event を発行 (= client への
+  error reply 等)
+
+例 (Lock):
+
+```
+Client: LockAcquire request
+  → Lock reducer: state = Acquiring (pending、holder 確定せず)
+  → Effect: ClientReply(LockResponse::Acquired { token })
+  → EffectResult::Ok → Lock reducer: state = Held { holder, token }
+  → EffectResult::Failed → Lock reducer: state = Free (rollback)
+```
+
+これにより「lock holder を更新したが client への ack が失敗、client は acquire 失敗と
+解釈、daemon は holder 確定」のような **state 食い違い** を防ぐ。
+
+## cross-domain event 伝播 protocol
+
+super-reducer が 1 入力 message を受けて複数 domain reducer を巡る場合の規約を確定する。
+
+### 1 transaction = 1 入力 message + 派生 event chain
+
+1 入力 message から派生する全 event は **1 transaction** として処理する。途中で他の入力
+message を割り込ませない (= ordering 保証)。
+
+### 連鎖停止条件
+
+- domain reducer は cross-domain dispatch が必要なら `CrossDomainMsg` を返す
+- super-reducer は queue (= FIFO) に積み、queue が空になるまで順次 dispatch
+- 同 domain への self-dispatch は禁止 (= 無限 loop 防止、self transition は同 reducer 内で
+  完結させる)
+- queue 深度上限 (= 例: 64) を超えたら panic (= 設計違反として検出)
+
+### 許可された cross-domain 方向 (= 有向グラフ)
+
+```
+Tty   ──→ Screen     (= TTY parse 結果が screen state を更新)
+Child ──→ Serve      (= 子 exit が serve shutdown を trigger)
+Child ──→ Client     (= 子 state 変化を leader client に notify)
+Client ──→ Lock      (= client disconnect で lock auto-release)
+Client ──→ Screen    (= client raw_data write が screen に反映)
+Lock  ──→ Client     (= lock state 変化を全 client に broadcast)
+Screen ──→ Client    (= watch matched / screen write event を subscribe client に配信)
+Serve ──→ Client     (= shutdown 開始を全 client に notify)
+```
+
+**禁止**: 循環 (= Tty ↔ Screen 等)、Client から Tty への直接 dispatch (= Client raw_data
+は Effect::TtyWrite 経由)、Lock から Screen への直接 dispatch (= Lock は holder の
+identity のみ持ち screen を知らない)
+
+### borrow 戦略
+
+`&mut DaemonState` の split borrow が必要なので、`DaemonState` を「各 domain state は
+独立 field、super-reducer は match で 1 field のみ `&mut` 取得」の形にする:
+
+```rust
+struct DaemonState {
+  tty: TtyState,
+  child: ChildState,
+  serve: ServeState,
+  clients: ClientRegistry,
+  screen: ScreenState,
+  lock: LockState,
+}
+
+fn handle(state: &mut DaemonState, msg: DaemonMsg) -> Vec<Effect> {
+  let mut effects = Vec::new();
+  let mut cross_domain_queue = VecDeque::from([msg]);
+
+  while let Some(msg) = cross_domain_queue.pop_front() {
+    let (domain_effects, cross) = match msg {
+      DaemonMsg::Tty(e)    => tty::reduce(&mut state.tty, e),
+      DaemonMsg::Child(e)  => child::reduce(&mut state.child, e),
+      DaemonMsg::Serve(e)  => serve::reduce(&mut state.serve, e),
+      DaemonMsg::Client(e) => client::reduce(&mut state.clients, e),
+      DaemonMsg::Screen(e) => screen::reduce(&mut state.screen, e),
+      DaemonMsg::Lock(e)   => lock::reduce(&mut state.lock, e),
+      // ...
+    };
+    effects.extend(domain_effects);
+    cross_domain_queue.extend(cross);
+    if cross_domain_queue.len() > MAX_CROSS_DOMAIN_DEPTH {
+      panic!("cross-domain queue overflow");
+    }
+  }
+
+  effects
+}
+```
+
+各 domain reducer は **`&mut DaemonState` を受け取らず**、自 domain の state field のみ
+受け取る = borrow checker と整合。
+
+## DR-0008 protocol との接続: ClientRequest 写像規約
+
+外部 protocol (DR-0008、kind 19 種安定済) と内部 ClientEvent の対応規約:
+
+- **default: 1 protocol kind = 1 ClientEvent variant** (= 1:1 mapping)
+- aggregation が必要な場合は **その理由を本 DR (または後続 DR) で明示**
+
+例 (主要 kind 抜粋):
+
+| protocol kind | ClientEvent variant | 備考 |
+|---|---|---|
+| `attach.request` | `Connected { client_id, ... }` | handshake 開始 |
+| `attach.response` | (= Effect::ClientReply) | reducer 出力 |
+| `lock.acquire.request` | `LockAcquireRequested { ... }` | → Lock reducer dispatch |
+| `lock.release.request` | `LockReleaseRequested { ... }` | → Lock reducer dispatch |
+| `raw_data` | (= 即 Effect::TtyWrite via Client reducer) | bytes 書き込み |
+| `signal.request` | `SignalRequested { signum }` | → Child reducer dispatch |
+| `resize.request` | `ResizeRequested { cols, rows }` | → Tty reducer (ioctl) |
+| `kill.request` | `KillRequested { signum, scope }` | → Child reducer |
+| `status.request` | (= 即 Effect::ClientReply with status snapshot) | read-only |
+| ... (DR-0008 §kind 表参照) | ... | ... |
+
+新 protocol kind 追加時は **本表に行を追加** (= DR-0008 と本 DR の両方更新する規約)。
 
 ## ドメイン分割
 
@@ -70,12 +315,33 @@ daemon 内部を 6 domain に分け、各 domain reducer を持つ:
 
 | reducer | 責務 | 既存対応 |
 |---|---|---|
-| **TtyParserPipeline** | byte stream → parsed event → semantic event の 3 layer | DR-0013 screen state を内蔵 |
-| **ChildStateReducer** | 子プロセス state machine + lifecycle event | DR-0001 jobcontrol 2 軸 |
-| **ServeStateReducer** | serve 自身の lifecycle + 内部 metric | (新規、現状散在) |
-| **ClientRegistry** | client 集合 / lifecycle / leader-follower | (新規、現状 `clients: Vec<_>` 直接操作) |
-| **ScreenReducer** | 仮想 screen state + watch (= region / matcher / flow) | DR-0013 を中核に拡張 |
-| **LockReducer** | lock state / token / process-bound GC | DR-0022 (input auto-lock) |
+| **TtyParserPipeline** | byte stream → parsed event → semantic event の 3 layer | byte 読み出しは IO layer、parse 以降は本 reducer |
+| **ChildStateReducer** | 子プロセス state machine + lifecycle event | DR-0001 axis 1 (axis 2 は DR-0015 で廃止済) + DR-0017 anchor + DR-0019 OnChildSuspend policy |
+| **ServeStateReducer** | serve 自身の lifecycle + 内部 metric + shutdown 調停 | (新規、現状散在) |
+| **ClientRegistry** | client 集合 / lifecycle / leader-follower / **Transport (= socket / framing) / Auth (= handshake / cap nego) / Backpressure (= write idle / stale 判定)** | DR-0008 cap negotiation / DR-0015 cap-aware broadcast |
+| **ScreenReducer** | 仮想 screen state (rows-base) + **byte-base tail/history** (DR-0013 §scrollback) + watch (= region / matcher / flow) | DR-0013 を中核に拡張、rows-base と byte-base の分離も継承 |
+| **LockReducer** | lock state / token / process-bound GC (= ClientId は opaque な holder identifier、client lifecycle 監視は本 reducer の責務外) | DR-0022 (input auto-lock) |
+
+### Transport / Auth / Backpressure の扱い (= critical 指摘への対応)
+
+protocol message の framing (= CBOR encode/decode、cap flag negotiation、handshake)、認証
+(= 同 UID 信頼境界 + lock token 検証)、backpressure (= writer pump の idle timeout、queue
+overflow) は **Client domain reducer 内の sub-state** として扱う (= 独立 reducer にすると
+小さすぎ、Client 状態と密結合):
+
+- **Transport sub-state**: `TransportState { socket_fd, framer_state, recv_buffer, send_buffer }`
+- **Auth sub-state**: `AuthState { handshake_phase, negotiated_caps, mode, lock_token_inherited }`
+- **Backpressure sub-state**: `BackpressureState { write_idle_at, send_queue_depth, stale_kind }`
+
+Client domain reducer は上記 sub-state を保持し、それぞれ独立の reducer function
+(`transport::reduce` / `auth::reduce` / `backpressure::reduce`) に dispatch する内部構造。
+**「Client が単一 domain」というのは外向きの reducer 入口の話**で、内部実装は sub-reducer
+で modular に分割する。
+
+これにより:
+- protocol invariant (DR-0008 cap negotiation) が Client domain の Auth sub-state に閉じる
+- backpressure 判定が Client domain の Backpressure sub-state に閉じる
+- cross-domain 漏出が起きない (= 観点 codex Critical #1 への構造的対応)
 
 super-reducer は **単純なルータ**:
 
@@ -137,7 +403,13 @@ TTY 由来の byte stream を 1 個の message にせず、**3 layer に分け�
 SomeVariant { ... },
 ```
 
-**必須**: 略称 + フル名 + 規格名 + section + 実装状態 marker
+**必須 (= 緩和規約)**:
+- **`supported` / `partial`**: 略称 + フル名 + 規格名 + section + 実装状態 marker
+  + `# Verified: YYYY-MM-DD by <reviewer>` marker (= AI 推測の人間レビュー済 marker、未検証
+  variant を grep で検出可能化)
+- **`stub` / `planned`**: 略称 + 規格名 + 1 行説明 のみ (= ドキュメント負債を最小化、
+  振る舞いが入る段階で必須情報に格上げ)
+
 **任意**: URL / 引数仕様詳細 / 参考実装 / DR 参照
 
 #### 実装状態 marker
@@ -241,6 +513,11 @@ ScreenWriteEvent {
 ```
 
 「screen が変化した事実」を知りたいだけならこれを subscribe で十分。watch register の
+責務ではない。配信先は **明示 subscribe した client のみ** (= broadcast せず、購読 client
+のみ受け取る、Q12 の default 方針)。
+```
+
+「screen が変化した事実」を知りたいだけならこれを subscribe で十分。watch register の
 責務ではない。
 
 ### WatchRegistration (= 意味解釈付きの監視)
@@ -256,54 +533,97 @@ WatchRegistration {
   flow: EventFlow,           // どう event を matcher に流すか
 }
 
-WatchRegion {
-  /// 監視範囲。指定なし (= None) なら「全体」
-  rows: Option<Range<u32>>,
-  cols: Option<Range<u32>>,
-  layer: ScreenLayer,
+enum WatchRegion {
+  /// 仮想 screen の可視領域全体 (= alt screen 中なら alt の表示範囲、normal なら現在
+  /// viewport)
+  Visible,
+
+  /// 矩形範囲 (= cells 単位)
+  Rect {
+    rows: Range<u16>,
+    cols: Range<u16>,
+    layer: ScreenLayer,
+  },
+
+  /// scrollback の末尾 N 行
+  ScrollbackTail { rows: u16 },
+
+  /// byte stream 全体 (= DR-0013 §scrollback の byte-base history、巨大 paste / sixel
+  /// 検出等の流量判定で使う、cell に reflow されてない生 byte 系列)
+  EntireByteStream,
 }
+```
+
+`x: u16, y: u16` の `Range<u16>` で `ScreenWriteEvent` の `x, y` と型整合。
 ```
 
 ### Matcher (= 段階的拡張可能)
 
 ```rust
 enum Matcher {
+  /// region 内に write event があった事実だけを通知 (= matcher 必須規約の最小実装)
+  /// raw write event のような低レベル通知が欲しい場合は ScreenWriteEvent を subscribe
+  /// するのが筋、本 variant は「region を絞った write 通知」が欲しい場合の便宜
+  AnyWrite,
+
   /// Phase 1: literal substring
-  Literal { needle: String, case_sensitive: bool },
+  Literal { needle: NonEmptyString, case_sensitive: bool },
 
   /// Phase 1: regex (RE2 互換)
-  Regex { pattern: String },
-
-  /// Phase 2 (planned): user-defined WASM closure
-  /// matcher 内部で region 内の更に部分領域に対する判定 (= 「region 内の [x1,y1,x2,y2]
-  /// に赤色 cell があるか」等) を user が TS で書いて自前 build して WASM 化して使う
-  Wasm { module: WasmModule, entry_point: String, args: WasmArgs },
+  Regex { pattern: NonEmptyString },
 }
 ```
 
-### EventFlow (= 既知の reactive operator)
+**`Matcher::Wasm` は本 DR から外し、別 DR で起票** (= 採用是非自体を docs/issue で discuss):
 
-`ScreenWriteEvent` を matcher にどう流すか。汎用 operator として:
+- DR-0014 透過原則 / 最小介入との整合性が未検証
+- wasmtime 等の依存追加判断 + sandbox / CPU / メモリ制限が pure reducer 原則 + event
+  sourcing replay と衝突
+- 実機で Literal/Regex で困った事例がない段階で planned 化は時期尚早
+- 必要になった時に追加 (= 拡張は enum variant 追加のみで dispatch trivial)
+
+**`NonEmptyString` で型レベル弾き**: 空 needle や `.*` で骨抜き register を防ぐ。空入力は
+parser 段階で reject、誠実な API に。
+
+### EventFlow (= operator chain、reactive stream 同型)
+
+`ScreenWriteEvent` を matcher にどう流すか。**operator chain** として複合:
 
 ```rust
-enum EventFlow {
-  /// write event のたび matcher を実行 (= 無加工)
-  Immediate,
+struct EventFlow {
+  /// 上流の write event → matcher 実行までの operator chain
+  /// Vec の順に適用 (= 例: [Throttle(100), Queue(capacity=16)] で「100ms throttle 後に
+  /// 16 件 queue に積み別 worker で処理」)
+  operators: Vec<FlowOperator>,
+}
 
-  /// 連続する write を一定間隔に間引く (= 高頻度 write 時の matcher 実行を抑制)
-  /// throttle(N ms): N ms に最大 1 回 matcher 実行、超過分は drop
+enum FlowOperator {
+  /// 連続する write を一定間隔に間引く (= throttle(N ms): N ms に最大 1 回、超過分 drop)
   Throttle { interval_ms: u64 },
 
-  /// write が一定時間止まるまで matcher 実行を遅延 (= 描画安定後に判定)
-  /// debounce(N ms): 最後の write から N ms 後に matcher 実行、その間の write は捨てて
-  /// 1 回だけ
+  /// write が一定時間止まるまで遅延 (= debounce(N ms): 最後の write から N ms 後、
+  /// その間の write は捨てて 1 回だけ)
   Debounce { idle_ms: u64 },
 
-  /// write event を queue に積み、matcher 実行は別 worker (= matcher の重さを screen
-  /// 側に影響させない)
+  /// queue に積み別 worker で処理 (= matcher の重さを screen reducer 側に影響させない)
   Queue { capacity: usize, overflow: OverflowPolicy },
 }
+
+enum OverflowPolicy {
+  DropOldest,
+  DropNewest,
+  Disconnect,    // overflow で watch register を解除し client に notify
+  // Block は production daemon では非推奨で除外
+}
 ```
+
+`Vec::new()` (= 空 operator chain) は **無加工 = Immediate 相当**。`Immediate` variant は
+不要。
+
+operator chain の利点:
+- RxJS / Rx.NET の operator chain と同型、開発者の前提知識を活用
+- `Throttle` + `Queue` のような複合が natural (= 4 排他 variant では表現不能だった)
+- 新規 operator (= Sample / Buffer / Window 等) も Vec への variant 追加で済む
 
 **polling (= interval poll) は不採用**: 仮想 screen を自前管理しているので、write 時に
 event 発火で済む。polling は「観測機構を持たない外部 system」を相手にする時の代替であり、
@@ -329,11 +649,15 @@ WatchMatched {
 }
 
 enum MatchData {
+  /// Matcher::AnyWrite で発火 (= region 内に write があった事実通知のみ)
+  Raw,
   Literal { location: (u16, u16), text: String },
   Regex { location: (u16, u16), full_match: String, captures: Vec<String> },
-  Wasm { payload: Vec<u8> },  // WASM 側が返した opaque payload
 }
 ```
+
+watch 配信先 (= Q12 default 方針): **register した client にのみ配信** (= 各 client が
+自分の matcher を register、broadcast せず、明示 subscribe 経路で実装 cost 最小)。
 
 ## Child domain: state machine + lifecycle event
 
@@ -359,7 +683,14 @@ enum ChildEvent {
 }
 ```
 
-DR-0001 jobcontrol 2 軸の現行実装をこの state machine に整理し直す。
+**継承する既存 invariant**:
+- DR-0001 axis 1 (= 子 self-stop に対する `OnChildSuspend` policy) を ChildState::Stopped
+  の reason + ChildState 自身の policy field として formal 化
+- DR-0017 anchor 構造 (= openpty + 手動 fork + TIOCSCTTY) を ChildState::Spawning →
+  ExecCompleted の前提条件として記述
+- DR-0019 OnChildSuspend policy (= Notify / AutoResume) を ChildState 内部 field
+- DR-0001 axis 2 (= parent suspend、`transparent` / `decouple`) は **DR-0015 で廃止済、
+  本 DR で再建しない** (= ChildEvent / ChildState 共に該当 variant を持たない)
 
 ## Serve domain: lifecycle + metric
 
@@ -449,55 +780,115 @@ enum ReleaseReason {
 }
 ```
 
+**弱結合維持**:
+- Lock reducer は `ClientId` を **opaque な holder identifier** として持つだけ
+- client lifecycle 監視 (= disconnect 検出) は **Client reducer の責務**、Client →
+  super-reducer → Lock の `ClientDisconnected → LockReleaseAutoGc` dispatch 経路で
+  実装 (= Lock は client state を知らない)
+- DR-0022 で問題視された「lock の効果範囲と test 検証範囲のミスマッチ」を構造的に解消:
+  Lock の効果境界 = client → master fd write の直列化まで (= input 直列化)、Screen
+  reducer は Lock state を一切参照しない (= output 直列化は別軌道、本 DR では保証
+  対象外)
+
 ## 段階的 migration plan
 
-domain ごとに段階分け:
+各 Phase に **「その Phase 固有の gate」** を持たせる。**test 整備は各 Phase 内で並走** で
+行う (= Phase 8 まで遅延しない、TDD と整合)。
 
-| Phase | 内容 | domain |
-|---|---|---|
-| **Phase 1** | super-reducer 骨格 + 6 domain reducer のシグネチャ定義 (= 中身は既存 handler を wrap) | 全 domain |
-| **Phase 2** | Lock domain reducer 化 + Lock event を pure 化 | Lock |
-| **Phase 3** | Client registry reducer 化 + ClientEvent 整理 | Client |
-| **Phase 4** | Child state machine 化 + ChildEvent 整理 | Child |
-| **Phase 5** | Serve lifecycle 整理 | Serve |
-| **Phase 6** | TTY parser pipeline + enum カタログ (= Layer 1-3 独立 pipeline 構築) | Tty |
-| **Phase 7** | Screen reducer + watch (region/matcher/flow) 実装 | Screen |
-| **Phase 8** | 既存 integration test を「reducer message 列の record assert」に書き換え | test |
+| Phase | 内容 | domain | Phase 固有 gate |
+|---|---|---|---|
+| **Phase 1a** | **Lock domain 単独 pure reducer 化 (= 最小スパイク)** で race 解消 + reducer pattern の Rust 実装妥当性を 1 domain で実証 | Lock | 1a-1: Lock state mutation が Lock reducer 外に存在しないことを grep で確認 / 1a-2: Lock 単独 unit test (PTY 不要、message 列 record/assert) が integration test と等価カバレッジ達成 / 1a-3: 既存 integration test 全 pass + 実機マトリクス (= TUI/line/REPL 3 category) 再検証 |
+| **Phase 1b** | super-reducer 骨格 + 残 5 domain reducer のシグネチャ定義 (= 中身は既存 handler を wrap、passthrough characterization test 付き) | 全 domain | 1b-1: 新 reducer 経路で全 test pass / 1b-2: 旧 handler が dead code として残らない / 1b-3: wrap が単純 passthrough である characterization test 整備 |
+| **Phase 2** | Client domain reducer 化 (= Transport/Auth/Backpressure sub-state 込み) + ClientEvent 整理 + protocol kind 1:1 mapping 実装 | Client | 各 protocol kind の reducer test (PTY 不要) + cap negotiation 単独 test |
+| **Phase 3** | Child state machine 化 + ChildEvent 整理 + DR-0001 axis 1 / DR-0017 anchor / DR-0019 OnChildSuspend を ChildState 内部に formal 化 | Child | 状態遷移網羅 unit test (= 全 ChildState × 全 trigger) + 既存 jobcontrol integration test pass |
+| **Phase 4** | Serve lifecycle 整理 + ShutdownReason 集約 + cross-domain dispatch 経路の検証 | Serve | shutdown 全 reason の unit test + Child→Serve dispatch 経路 test |
+| **Phase 5** | Screen reducer 骨格 (= 仮想 screen state + ScreenWriteEvent broadcast、watch は除く) + DR-0013 byte-base tail/history と rows-base virtual screen の分離継承 | Screen | DR-0013 既存機能の regression なし + ScreenWriteEvent 配信 test |
+| **Phase 6a** | TTY parser 3 layer pipeline 骨格 + **Screen reducer (Phase 5) が必要とする最小限の semantic event のみ supported** + Layer 2/3 境界判断基準を本文に追記 | Tty | Layer 1/2/3 各層単独 unit test (= byte 列 → event 列の入出力 test) + Screen 経由の e2e test pass |
+| **Phase 6b** | enum カタログの漸増 (= scoreboard 運用、Phase 7 以降と並列実行可能な恒久タスク、新規 terminal 機能の追加都度) | Tty | 追加 variant 単位で unit test + `# Verified:` marker + scoreboard 増分 |
+| **Phase 7** | Screen reducer に watch (region/matcher/flow) 実装追加 + matcher cache / operator chain 実装 | Screen | matcher 単独 unit test (= Literal/Regex の境界 / NonEmptyString 型レベル弾き) + operator chain 単独 test (= Throttle/Debounce/Queue + 複合) + watch e2e test |
+| **Phase 8** | 残置 integration test の **追加 + 一部置換** (= 全面書き換えではない、reducer 単独 test で代替できる範囲のみ置換、PTY/signal/子プロセス挙動を検証する integration test は残す) | test | 置換対象と残置対象を明示列挙、置換後の test カバレッジが旧 test と等価 or 上回る |
 
-Phase 2-5 は比較的 scope 小、Phase 6-7 は規模大 (= enum カタログ 150-200 variant)。
-各 Phase 完了後に既存 integration test が全 pass することを gate に進める。
+### coexistence 期間と feature flag
+
+Phase 1b で「旧 handler を wrap する新 reducer 経路」を導入する瞬間、coexistence 期間が
+発生する。Phase 2 以降の各 domain 移行時:
+
+- **旧経路は即削除を default** (= dead code を残さない、Q7 の default 方針)
+- 大規模 regression 懸念がある場合のみ **feature flag 経由で runtime 切替可能化** を許容
+  (= 例: `--internal-use-legacy-handler` 隠し flag、Phase 完了まで 1 release 限定)
+
+### Phase 順序の判断軸
+
+Lock → Client → Child → Serve → Screen → Tty → Screen(watch) の順は **「動機解消順 +
+依存順」の混合**:
+
+- Phase 1a (Lock 単独): 元 race の構造的解消を最速で実証
+- Phase 2 (Client): Transport/Auth/Backpressure を整備しないと他 reducer の effect 配信
+  経路が固まらない
+- Phase 3-4 (Child/Serve): 子 lifecycle と serve lifecycle は密結合 (Child→Serve dispatch)
+- Phase 5 (Screen 骨格) → Phase 6a (Tty parser) → Phase 7 (Screen watch): Screen の
+  byte-base 経路は Tty parser に依存しないが、watch (= matcher 実行 trigger) は
+  ScreenWriteEvent と semantic event 両方に依存
+
+各 Phase は前 Phase の reducer signature を前提に書くため、戻り作業を避けるべく順序固定。
 
 ## 既存 DR との関係
 
-- **DR-0014 (透過原則 + 検証主義)**: 本 DR は実装レベルでの強化。「machine 以外は fd /
-  signal を直接触らない」原則を self-check に追加
+- **DR-0014 (透過原則 + 検証主義)**: 本 DR は実装レベルでの強化。§Anti-patterns 防止
+  self-check を Phase 完了時に段階的に DR-0014 §self-check へ反映する運用
 - **DR-0008 (protocol)**: 外部 protocol (= client ↔ daemon の CBOR framing)。本 DR は
-  **daemon 内部の reducer 構造**で別軸。`ClientRequest` enum は protocol message と 1:1
-  対応させるか複数集約するかは Phase 1 で詳細詰める
-- **DR-0013 (screen state 正本)**: 本 DR の Screen reducer / TTY parser Layer 3 の正本化層
+  **daemon 内部の reducer 構造**で別軸。**`ClientEvent` と protocol kind の対応は default
+  1:1 mapping** で本文 §DR-0008 protocol との接続 に表で記載済
+- **DR-0013 (screen state 正本)**: 本 DR の Screen reducer / TTY parser Layer 3 の正本化層。
+  **byte-base tail/history (= DR-0013 §scrollback) と rows-base virtual screen の分離を
+  Screen reducer に継承**、timestamp semantic は byte-base 側で保持し tail コマンドの
+  動作を維持
 - **DR-0022 (input invocation auto-lock)**: 本 DR の Lock reducer で構造的に再整理。
-  auto-lock の効果境界 (= input 直列化までで output は別軌道) を仕様レベルで明文化する
-  根拠を提供
-- **DR-0016 (TTY IO record)**: 本 DR の event sourcing の自然延長。全 reducer の event を
-  1 箇所で record できる
-- **DR-0001 (jobcontrol 2 軸)**: Child reducer の state machine で formal 化、invariant が
-  state 遷移図として直接読める形に
+  **auto-lock の効果境界 (= input 直列化までで output は別軌道) を仕様レベルで明文化**
+  する根拠を提供。Lock + Screen 境界の典型シナリオ (= lock 取得後に screen に何か書く)
+  では Lock の効果境界 = client → master fd write の直列化まで、Screen reducer は Lock
+  state を一切参照しない (= 弱結合)
+- **DR-0016 (TTY IO record)**: bytes-level record (= 人間が読む用) と event sourcing
+  (= debug/replay 用) は軸が異なるので**並存**。**二重 record しない設計責任を本 DR 側が
+  持つ** (= super-reducer 入口で 1 tap、bytes-level record と event sourcing は別 sink、
+  両者の構造的役割を明示)
+- **DR-0001 (jobcontrol = axis 1 のみ)**: axis 1 (= 子の self-stop に対する `notify` /
+  `auto-resume`) のみが Child reducer の internal state machine に該当。**axis 2 (=
+  parent suspend、`transparent` / `decouple`) は DR-0015 で廃止済**、本 DR で再建しない
+- **DR-0015 (run = fork + attach)**: Client/Serve lifecycle と Child reducer の事前条件
+  (= daemon は setsid 済、attach は別 process) を継承
+- **DR-0017 (session anchor 構造)**: Child reducer の事前条件 (= openpty + 手動 fork +
+  TIOCSCTTY) を継承
+- **DR-0019 (OnChildSuspend policy)**: Child reducer 内部 state (=
+  ChildState::Stopped { reason } 時の policy) として継承
 
 ## Consequences
 
 ### 良い影響
 
-- **race の構造的不可能性**: 各 reducer が単一の receive loop で 1 件ずつ処理 → atomic が
-  設計として保証 (= 「borrow checker 偶然依存」から脱却)
+- **daemon 内部 race の構造的不可能性**: 各 reducer が単一の receive loop で 1 件ずつ
+  処理 → daemon 内部 state (= lock state / client registry / screen state) の writer 散在
+  に起因する race を解消 (= 「borrow checker 偶然依存」から脱却)。**子プロセス起因 race**
+  (= 子の read/write atomicity、§Context 元 flaky の真因) **は本 DR では解消対象外**、
+  別作業で対処
 - **testability の劇的向上**: 各 reducer 単独 unit test で PTY 不要、message 列で全 race /
-  lock / edge case を厚く検証可能
-- **観測性**: 全 message が 1 箇所を通る → record / trace / replay が自然
-- **責務分離**: 6 domain の境界が明確、cross-domain 依存は super-reducer 層で表現
+  lock / edge case を厚く検証可能。**ただし PTY/signal/子プロセスの実 IO 検証は引き続き
+  integration test として残る** (= reducer 化は test の万能薬ではない、適用範囲を限定)
+- **観測性 + 部分的 replay**: 全 message が 1 箇所を通る → record / trace は自然。
+  **replay は reducer 内部 state の deterministic check に限定** (= 外部 IO 状態 = PTY fd
+  番号 / client socket / child pid は再現不可、full session replay はできない、bug report
+  での reducer 状態だけ再現が現実的価値)
+- **責務分離**: 6 domain の境界が明確、cross-domain 依存は super-reducer 層で表現 +
+  許可方向グラフ + queue 深度上限で明示
 - **state machine の可読性**: 各 domain の state 遷移が enum + reducer 関数で直接読める
-- **TTY 機能の網羅追跡**: enum カタログ + scoreboard で実装漏れ・規格対応状況が一覧化
-- **AI 推測列挙との区別**: 一次情報リンク義務化により規格出典の追跡可能性が担保
-- **watch 機構の API 単純化**: region / matcher / flow の 3 軸直交、ad-hoc な trigger 列挙
-  を排除、reactive operator として確立されたパターンを採用
+- **TTY 機能の網羅追跡**: enum カタログ + scoreboard で実装漏れ・規格対応状況が一覧化、
+  doc comment 規約は supported/partial のみ厳格化、stub/planned は緩和でドキュメント負債
+  最小化
+- **AI 推測列挙との区別**: 規格名 + 略称義務化 + `# Verified:` marker により規格出典の
+  追跡可能性が担保
+- **watch 機構の API 単純化**: region / matcher / flow の 3 軸 (= 概念的直交、合成時の
+  semantic 衝突は明示)、ad-hoc な trigger 列挙を排除、reactive operator として確立された
+  パターンを採用
 
 ### コスト・リスク
 
@@ -516,10 +907,27 @@ Phase 2-5 は比較的 scope 小、Phase 6-7 は規模大 (= enum カタログ 1
 不採用理由: lock 1 軸の強化では他 domain (= child / serve / client / screen / tty) の散在
 問題が残る。設計哲学レベルの統一性が得られない。
 
-### B. tokio actor framework
+### B1. tokio actor framework
 
 不採用理由: hyoui は async runtime に依存しない設計 (= `nix::poll` ベース)。actor framework
-導入は依存関係増 + 既存 sync I/O 路と二重化。**手動 reducer + channel で十分**。
+導入は依存関係増 + 既存 sync I/O 路と二重化。
+
+### B2. crossbeam-channel ベースの軽量 actor (= minimalist actor)
+
+検討対象として B1 と分離。`crossbeam-channel` + 1 thread 1 receive loop の minimalist
+actor は依存追加なしで Rust idiom と整合。layered reducer との比較:
+
+| 軸 | layered reducer | minimalist actor |
+|---|---|---|
+| ordering 制御 | super-reducer 内 cross-domain queue で明示 | actor 間 channel ordering 依存 |
+| borrow 戦略 | `&mut DaemonState` の split borrow (= 各 domain field 独立) | actor 間 owned state、channel で値 move |
+| alloc cost | `Vec<Effect>` 返却頻度高、SmallVec / arena / output param `&mut Vec<_>` で抑制可 | message 毎 alloc + send overhead |
+| test 容易性 | reducer 関数を直接呼び unit test | actor を thread spawn せず channel mock で test 可 |
+| 実装複雑度 | super-reducer routing + queue 1 個 | actor 数だけ thread + channel + lifecycle 管理 |
+
+不採用理由: hyoui は 1 daemon = 1 session で並列性需要が高くない、ordering 決定論性の
+方が価値が高い。`Vec<Effect>` alloc は SmallVec/arena/output param で抑制 (= 実装段階で
+benchmark 計測)。
 
 ### C. 単一 super-reducer (= domain 分割なし)
 
@@ -533,47 +941,135 @@ Phase 2-5 は比較的 scope 小、Phase 6-7 は規模大 (= enum カタログ 1
 ### E. 他 terminal multiplexer (tmux / screen / wezterm) の構造踏襲
 
 不採用理由: hyoui の責務は terminal multiplexer ではなく「外部自動操作主軸の透過 PTY ラップ」
-(DR-0005)。tmux 的な構造は overkill。**reducer + 6 domain** という最小構成が hyoui の責務
-範囲に最適。
+(DR-0005)。tmux 的な構造は overkill。ただし tmux の `cmd_queue` (= cross-domain queue
+相当) と wezterm の internal protocol (= effect feedback 相当) から構造的教訓を取り込み
+(= 本 DR の cross-domain dispatch protocol + Effect layer に反映済)。
+
+### F. vt100 crate 維持 (= TTY parser は自作せず)
+
+DR-0013 で採用済の vt100 crate をそのまま使い続け、本 DR の TTY parser pipeline は薄い
+adapter のみ書く案。
+
+不採用理由 (= 暫定): vt100 は **cell hook を提供しない** (= write event 発火が困難)、
+Layer 2/3 の semantic 化が adapter 側で 2 度手間。ただし **完全自作は scope 大** なので
+**Phase 6a 着手前に prototype で fork/diff 抽出の feasibility 検証** が必要 (= Open
+Questions に追加)。
+
+### G. vt100 crate を Layer 2 として wrap + 独自 Layer 3
+
+最有力候補。vt100 を Layer 2 (= parsed event) として使い、本 DR の Layer 3 (= semantic
+event) と watch / cell hook 機構は独自実装で被せる案。
+
+採用方向 (= 暫定、Phase 6a で確定): 既存 DR-0013 の vt100 採用と整合、独自実装範囲を最小化
+しつつ拡張性を確保。enum カタログ 150-200 variant の内訳:
+
+- vt100 が提供: ~80 variant (= ECMA-48 主要 + 主要 OSC)
+- 自前で増やす: ~70-120 variant (= xterm 拡張 / DEC private / iTerm2 / kitty / 業界提案)
+- 規格 ref 付け直しのみ: ~80 variant (= vt100 提供分に doc comment を付与)
+
+### H. Serve domain を super-reducer のトップレベル lifecycle 制御に吸収
+
+Serve は 4 状態 + ShutdownReason 4 種のみで他 domain event の集約 dispatcher 的責務しか
+持たない。独立 reducer に切り出すと cross-domain 翻訳が冗長。
+
+不採用理由 (= 暫定): Serve も「shutdown 調停」「全 client への shutdown notify」等の状態
+遷移ロジックを持つので独立 domain として残すのが筋。ただし将来 Serve が ChildEvent や
+ClientEvent の単純な再 dispatch しかしないと判明したら統合検討。
 
 ## Anti-patterns 防止 self-check
 
-DR-0014 §self-check に追加すべき項目 (= 後続 DR で正式化):
+DR-0014 §self-check に **段階的に取り込み** すべき項目。各項目は **対応 Phase 完了時に
+DR-0014 §self-check に反映** する (= design-impl-bidirectional-check 規律、CLAUDE.md →
+DR-0014 だけ読む後続セッションが本 DR の項目を踏むため)。
+
+### Phase 非依存 (= 本 DR Active 化と同時に DR-0014 反映)
+
+- [ ] polling / interval check を導入する際、event-driven で代替できないか確認したか?
+- [ ] 新 protocol kind を追加する際、本 DR の写像規約表に行を追加したか?
+- [ ] 新規 TTY 由来 event を扱う際、対応する enum variant が catalog に存在するか? (= 段階
+      整備の scoreboard 漸進、Phase 6b の恒久タスク)
+- [ ] supported / partial 変更時に doc comment の規格名 + 略称 + `# Verified:` marker が
+      完備されているか?
+- [ ] reducer 内で非決定要素 (`SystemTime::now` / `rand` / `HashMap` iteration 順 /
+      fd readiness 順) を使っていないか?
+
+### Phase 2 (Client) 完了後
+
+- [ ] machine 外から client registry を直接操作していないか?
+- [ ] 新規 client req を追加する際、対応する `ClientEvent` variant 追加経由か?
+- [ ] Transport / Auth / Backpressure の sub-state が Client domain 外に漏出していないか?
+
+### Phase 1a / 2 (Lock) 完了後
+
+- [ ] machine 外から `LockState` の holder / token を mutate していないか?
+- [ ] Lock reducer が ClientId 以上の client state を参照していないか? (= 弱結合維持)
+
+### Phase 3 (Child) 完了後
+
+- [ ] machine 外から child pid に kill / signal していないか?
+- [ ] signal handler が self-pipe 以外の経路で state を変更していないか?
+- [ ] DR-0001 axis 1 / DR-0017 anchor / DR-0019 OnChildSuspend invariant が ChildState
+      内部に formal 化されているか?
+
+### Phase 5-7 (Screen / Tty / Watch) 完了後
 
 - [ ] machine 外から PTY master fd を read / write していないか?
-- [ ] machine 外から child pid に kill / signal していないか?
-- [ ] machine 外から `LockState` の holder / token を mutate していないか?
-- [ ] machine 外から client registry を直接操作していないか?
 - [ ] machine 外から screen state を mutate していないか?
-- [ ] signal handler が self-pipe 以外の経路で state を変更していないか?
-- [ ] 新規 client req を追加する際、対応する `ClientRequest` enum variant 追加経由か?
-- [ ] 新規 TTY 由来 event を扱う際、対応する `TtyEvent` variant が enum カタログに存在するか?
-- [ ] 新規 variant に「規格名 + 機能名 + 略称」doc comment が完備されているか?
 - [ ] watch 関連の機能追加で region / matcher / flow の 3 軸のどれかに属するか明確か?
-- [ ] polling / interval check を導入する際、event-driven で代替できないか確認したか?
+- [ ] DR-0013 byte-base tail と rows-base screen の分離が保たれているか?
+- [ ] DR-0016 record と event sourcing の二重 record が発生していないか?
 
 ## Open Questions
 
-DR draft 段階で未決、後続議論で詰める:
+各 question に **Phase 依存タグ** を付与。`[本文に解決済]` は本 revise で本文 Decision に
+昇格したもの (= 残置 question から外す)。
 
-1. **Layer 3 (semantic) と Layer 2 (parsed) の境界**: どの event を意味化するか、どこから
-   raw parsed のまま reducer に渡すかの判断基準
-2. **`ClientRequest` と `ControlMessage` (protocol) の対応**: 1:1 か、複数集約か
-3. **InternalTimer の実装方式**: poll timeout で代替するか、専用 timer wheel を持つか
-4. **reducer の concurrency**: 単一 thread reducer で十分か、parser pipeline を別 thread に
-   分けるか
-5. **既存 record sink (DR-0016) との統合**: 全 message を record すれば既存 record sink は
-   reducer internal に吸収されるか、別軸で残すか
-6. **error handling**: reducer が `Result` を返すか、`Vec<DomainEvent>` に error variant を
-   含めるか
-7. **migration 期間中の coexistence**: Phase 1 で既存 handler を wrap した API を出すとき、
-   旧 handler は deprecate するのか並列維持するのか
-8. **cross-domain event の伝播**: child reducer が出した `ChildEvent::Exited` を screen
-   reducer / client reducer が受け取る経路の詳細
-9. **watch matcher の重い処理対策**: `Matcher::Regex` の compile / `Matcher::Wasm` の
-   instantiate を register 時に 1 回だけやって cache するか、event 発火毎にやるか
-10. **WASM matcher の sandbox**: CPU / メモリ / 実行時間制限の規定
-11. **複数 watch register の重複処理**: 同一 region + 同一 matcher を 2 回 register したら
-    2 event 発火か、daemon 側で dedup か
-12. **watch event の配信先**: register した client にのみ配信か、全 client broadcast か、
-    explicit subscribe か
+### `[本文に解決済]` (= 本 revise で Decision 昇格)
+
+- ~~Q2 (ClientRequest と protocol の対応)~~: §DR-0008 protocol との接続規約 を新設、default
+  1:1 mapping + 例表
+- ~~Q4 (reducer concurrency)~~: §IO boundary と reducer boundary の関係 を新設、単一 thread
+  採用 + Parser Layer 1 例外
+- ~~Q5 (record sink との関係)~~: super-reducer 入口で tap する方針を本文に明記
+  (Consequences §観測性)、二重 record しない設計責任を本 DR 側が持つ
+- ~~Q6 (error handling)~~: §Effect layer の pending state パターン、effect 失敗が
+  `DaemonMsg::EffectResult` で reducer に feed-back される設計に集約
+- ~~Q7 (coexistence 期間)~~: §migration plan の coexistence 期間と feature flag、即削除 default
+- ~~Q8 (cross-domain event 伝播)~~: §cross-domain event 伝播 protocol を新設、queue +
+  有向グラフ + borrow 戦略
+- ~~Q10 (WASM matcher sandbox)~~: `Matcher::Wasm` 自体を別 DR に外したため本 DR では不要
+- ~~Q11 (watch dedup)~~: default 方針「別 WatchId = 別 register = 別 event、dedup は client
+  責務」を本文 §Screen domain に明記
+- ~~Q12 (watch 配信先)~~: default「register した client にのみ配信」を本文 §Screen domain
+  event に明記
+
+### `[Phase 6a 着手前 blocker]`
+
+- **Q1 (Layer 3 semantic と Layer 2 parsed の境界)**: どの event を意味化するか、どこから
+  raw parsed のまま reducer に渡すかの判断基準。Phase 6a の prototype で測定して確定
+- **Q-NEW1 (vt100 crate Alternative G の feasibility)**: vt100 fork / diff 抽出 /
+  per-call coarse-grained のどれで cell hook を実現するか prototype 検証
+
+### `[Phase 7 着手前 blocker]`
+
+- **Q9 (watch matcher の重い処理対策)**: `Matcher::Regex` の compile を register 時に 1 回
+  だけ cache する (= default)、event 発火毎は再 compile しない (= 既定)
+
+### `[Phase 内詳細、Phase 着手時に詰める]`
+
+- **Q3 (InternalTimer の実装方式) [Phase 2-3]**: poll timeout 経由で代替するか、専用 timer
+  wheel を持つか。時間も message として reducer に注入する方針 (= TimerTick / Clock 値を
+  caller が message で渡す) を採用、test の決定論性を担保
+- **Q-NEW2 (super-reducer 入口の message channel capacity / overflow policy) [Phase 1b]**:
+  Phase 1b 骨格定義で channel capacity と overflow policy を決める (= 後で backward
+  compatible に直せない)
+- **Q-NEW3 (reducer panic 時の隔離方針) [Phase 1a/1b]**: catch_unwind 有無 / 影響範囲 /
+  state rebuild 方法、CLAUDE.md の partial state 規律と直接ぶつかる可能性
+- **Q-NEW4 (DR-0013 Phase C との依存関係) [Phase 5-7]**: DR-0013 Phase C (observe mode /
+  multi-client resize / reflow / zstd) と本 DR Phase 7 の依存関係を明確化
+
+### `[後続 DR で再起票可]`
+
+- **`Matcher::Wasm` 採用是非**: 本 DR から外し別 DR で起票 (= 実機で Literal/Regex で
+  困った事例の集積が条件)
+- **EventFlow operator 拡張** (= Sample / Buffer / Window 等): 必要性が出てから enum 追加
