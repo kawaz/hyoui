@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-06-30 | bug | open | [bug-bc-macos-ci-compatibility](./2026-06-30-bug-bc-macos-ci-compatibility.md) | pipe_send_eof_default_terminates_bc が macos-latest CI で bc 互換性問題により失敗 |
 | 2026-06-28 | request | open | [release-yml-latest-release-check](./2026-06-28-release-yml-latest-release-check.md) | release.yml semver gate に latest-release 並列 check 追加 (DR-0039 canonical 同期) |
 | 2026-06-22 | bug | open | [backpressure-writer-pump-drop-sequence-deadlock](./2026-06-22-backpressure-writer-pump-drop-sequence-deadlock.md) | serve_backpressure_disconnects_slow_client が CI で 30s deadline hang する (真因未観測・調査継続) |
 | 2026-06-22 | bug | open | [wait-scrollback-snapshot-coverage](./2026-06-22-wait-scrollback-snapshot-coverage.md) | hyoui wait の StateSnapshotRequest が scrollback を含まず viewport 外の出力を見逃す (DR-0013 Phase B 未完) |
