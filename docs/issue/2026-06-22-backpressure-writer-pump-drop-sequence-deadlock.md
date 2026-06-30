@@ -72,3 +72,15 @@ short-term fix として deadline を 30s → 60s に延長済み (`session.rs:3
 - `ClientHandle::drop` で writer_thread join を timeout 5s 付きに (無限 join をやめる)
 - serve_loop polling 改善 (= pending write がある client の revents を即 detect)
 - DR-0011 observability: writer_pump の lifecycle を可視化 (stuck 検出が test deadline まで分からない現状の解消)
+
+## 2026-06-30 観測
+
+main commit `ab46b529` (= DR-0025 Draft land) で CI が再度 failure。CI run id 28413666305 (= 本 commit と無関係、docs 変更のみ)。
+
+- ubuntu-latest `--ignored` で再現 (30s deadline hang)
+- macos-latest `--ignored` では本 test は pass、別 test (`pipe_send_eof_default_terminates_bc`) が bc 互換性問題で failure
+- failure 率: 連続観測。本 session で land した 4 commit (= docs/CI 修正のみ) のうち 3 commit 分の CI で 100% 再現
+
+→ 仮説強化: writer_pump deadlock は **特定環境 (ubuntu-latest GitHub Actions runner) で deterministic に発生**、flaky でない可能性が高い。ローカル macOS では再現せず。
+
+→ **DR-0025 (Daemon Reducer 化、Lock domain Phase 1a で構造的解消見込み)** との関係: DR-0025 reducer 化で writer_pump lifecycle が Effect layer の rollback 経路に formal 化されるため、本 issue は DR-0025 進捗で吸収可能性が高い。並行で個別 fix を進めるか、DR-0025 Phase 1a 完了待ちか、判断待ち。
