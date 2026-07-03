@@ -47,6 +47,7 @@ use super::lock::{LockEvent, LockMsg, SessionState, elevate_next_leader};
 use super::pty::{
     ALIVE_RETRY_INTERVAL, ChildLifecycle, ChildState, ChildTransition, STOPPED_POLL_INTERVAL,
 };
+use super::reducer::{self, DaemonState, translate};
 use super::screen::{ScreenState, StalledOutcome, check_stalled};
 use super::{ChildSuspendPolicy, DaemonConfig};
 
@@ -1158,6 +1159,13 @@ fn serve_loop(
     // `serve_start` と同じにする。
     let serve_start = Instant::now();
     let mut last_output = serve_start;
+    // DR-0025 Phase 1b 後半 (translate 併走): serve_loop の各 IO event を DaemonMsg に
+    // 写して super-reducer を実走させる。現段階では全 domain reducer が stub のため
+    // effect は出ず (= 各挿入点の debug_assert で担保)、既存 handler が従来通り挙動を
+    // 担う (= 挙動不変)。lock の実 state は SessionState (`state.lock`、Phase 1a) 側に
+    // あり、`daemon_state.lock` は未使用の空 stub のまま置く (= 二重管理して食い違わせ
+    // ない、Phase 2 で SessionState.lock を DaemonState へ移設する)。
+    let mut daemon_state = DaemonState::default();
     loop {
         // DR-0019 §4: 終了条件の発火判定 (= ループ冒頭で毎回チェック)。発火したら
         // `--until` match と同じ手順 (= killpg(SIGTERM) → finalize escalation) に乗せ、
@@ -1394,6 +1402,13 @@ fn serve_loop(
         // SIGCHLD については従来通り lifecycle.poll で transition を取り出し、
         // 軸 1 policy (= Stopped transition 観測時の Follow/AutoResume) を発火。
         if sigchld_ready {
+            // DR-0025 Phase 1b (translate 併走): SIGCHLD self-pipe 発火を写す。waitpid
+            // 経由の state 遷移解釈は Phase 3 の Child reducer が担う。
+            let effects = reducer::handle(&mut daemon_state, translate::sigchld_received(child));
+            debug_assert!(
+                effects.is_empty(),
+                "Phase 1b stub 段階では sigchld_received から effect は出ない"
+            );
             if let Some(sp) = sigchld_pipe {
                 let drained = sp.drain().unwrap_or_default();
                 if let Some(outcome) =
@@ -1464,7 +1479,20 @@ fn serve_loop(
                         _ => {}
                     }
                     match child_state {
-                        ChildState::Exited(code) => return RelayOutcome::ChildExited(code),
+                        ChildState::Exited(code) => {
+                            // DR-0025 Phase 1b (translate 併走): 子 exit を Reaped に写す。
+                            // PTY master EOF は子終了の canonical な検出点。他 exit 検出
+                            // 経路 (sigchld / EIO / EINTR / timeout) の集約は Phase 3 の
+                            // Child reducer 化で waitpid transition を child::reduce へ
+                            // 寄せる際に行う。
+                            let effects =
+                                reducer::handle(&mut daemon_state, translate::child_reaped(code));
+                            debug_assert!(
+                                effects.is_empty(),
+                                "Phase 1b stub 段階では child_reaped から effect は出ない"
+                            );
+                            return RelayOutcome::ChildExited(code);
+                        }
                         ChildState::Stopped => {
                             // R4-H14: SIGTSTP'd 子で master EOF/POLLHUP が連続する間の
                             // busy-wait 回避。SIGCONT が来るまで 500ms 単位で待機。
@@ -1476,6 +1504,15 @@ fn serve_loop(
                     }
                 }
                 Ok(n) => {
+                    // DR-0025 Phase 1b (translate 併走): 子 PTY 生 bytes を Layer 1 event
+                    // に写して super-reducer を実走 (stub なので effect 空)。screen_state /
+                    // scrollback / broadcast の既存処理は下でそのまま続ける (= 挙動不変)。
+                    let effects =
+                        reducer::handle(&mut daemon_state, translate::tty_master_read(&buf[..n]));
+                    debug_assert!(
+                        effects.is_empty(),
+                        "Phase 1b stub 段階では tty_master_read から effect は出ない"
+                    );
                     // Issue #1 + user request: `--debug-dump` の raw bytes 書き出し。
                     // 子 PTY からの bytes は scrollback / vt100 へ渡る **前** の生
                     // chunk なので、ここで append すれば「daemon が観測した最初の
@@ -1567,7 +1604,21 @@ fn serve_loop(
             }
             let ch = &mut clients[idx];
             match Frame::decode_from(&mut ch.reader) {
-                Ok(frame) => frames_to_process.push((idx, FrameOrError::Frame(frame))),
+                Ok(frame) => {
+                    // DR-0025 Phase 1b (translate 併走): frame 受信を写す (client id のみ、
+                    // frame 実体は運ばない placeholder 主義)。kind 別の認可 / 処理は下の
+                    // handle_client_frame が従来通り担う (= 挙動不変)。
+                    let client_id = ch.id;
+                    let effects = reducer::handle(
+                        &mut daemon_state,
+                        translate::client_frame_received(client_id),
+                    );
+                    debug_assert!(
+                        effects.is_empty(),
+                        "Phase 1b stub 段階では client_frame_received から effect は出ない"
+                    );
+                    frames_to_process.push((idx, FrameOrError::Frame(frame)));
+                }
                 Err(_) => frames_to_process.push((idx, FrameOrError::Error)),
             }
         }
@@ -1636,6 +1687,15 @@ fn serve_loop(
             if ch.leader {
                 dropped_any_leader = true;
             }
+            // DR-0025 Phase 1b (translate 併走): client detach を写す。lock auto-release /
+            // leader cascade の 1 本化は Phase 2 の Client reducer が担い、現段階では下の
+            // 既存処理 (lock::reduce + elevate_next_leader) が挙動を担う (= 挙動不変)。
+            let effects =
+                reducer::handle(&mut daemon_state, translate::client_detached(detached_id));
+            debug_assert!(
+                effects.is_empty(),
+                "Phase 1b stub 段階では client_detached から effect は出ない"
+            );
             // DR-0025 Phase 1a: holder client の切断による process-bound GC は lock
             // reducer に委譲する。Released (= ProcessBoundGc) が返ったら mode.change
             // broadcast の契機 (dropped_held_lock) にする。非 holder の切断は空 event。

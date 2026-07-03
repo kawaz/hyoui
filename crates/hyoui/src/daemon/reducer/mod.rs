@@ -20,8 +20,13 @@
 //! Lock domain は Phase 1a で pure reducer 化済のため [`super::lock`] の
 //! [`LockState`] / [`LockMsg`] を参照する。
 
-// Phase 1b 後半 (serve_loop の translate 層) で配線されるまでの一時 allow。
-// 配線が完了して各 reducer / Effect が実経路から使われ始めた時点で外す。
+// reducer 骨格の大半は各 domain reducer に振る舞い (= Effect 発行) が入るまで未使用の
+// stub。translate 併走 (DR-0025 Phase 1b 後半) で実経路に配線されるのは handle /
+// DaemonState / translate 経路と一部 domain event variant (Tty::Layer1Bytes /
+// Child::{SigchldReceived,Reaped} / Client::{FrameReceived,Detached}) のみ。Effect 発行系
+// (EffectKind / EffectId / 失敗 feedback) と placeholder 型、未 translate の domain event /
+// EffectResult 経路は reducer が Effect を出し始める後続 Phase まで未使用のため、module
+// 全体で allow する (= 個別 item 化は該当 25 箇所超で可読性を損なうため不採用)。
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
@@ -36,6 +41,9 @@ mod client;
 mod screen;
 mod serve;
 mod tty;
+// serve_loop (= `daemon::session`) から呼ぶため crate::daemon 全体に公開する。
+// 他 domain module は reducer 内 private のまま (= translate 経由でのみ配線)。
+pub(in crate::daemon) mod translate;
 
 /// cross-domain queue の深度上限 (DR-0025 §連鎖停止条件)。
 ///

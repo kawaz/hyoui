@@ -907,6 +907,25 @@ enum ReleaseReason {
   31 件) が置換検討の主対象。lock の reducer 単独 unit test は現状 0 件 (= Phase 1a gate
   1a-2 の出発点)
 
+### Phase 1b 後半の実装形 (= translate 併走方式)
+
+serve_loop への配線は **translate 併走** で行う: poll revents → `DaemonMsg` への
+translate 層を導入し、super-reducer `handle()` を実走させた上で (= stub domain は
+no-op)、既存 handler を従来通り呼ぶ (= 挙動不変)。reducer 関数の中身に既存 handler を
+埋め込む形 (= reducer が IO を持つ) は採らない — 旧 handler は pty / clients / state を
+横断 borrow するため pure signature に収まらず、Phase 2+ の pure 化で丸ごと置換する方が
+二度手間にならない。
+
+- **Q-NEW2 の解**: 単一 thread poll 直結を維持し、super-reducer 入口に channel は導入
+  しない (= capacity / overflow policy 自体が不要)。channel が必要になるのは Phase 6a の
+  Parser Layer 1 別 thread 化のみで、mpsc capacity はその時点で決める
+- **gate 1b-2 の解釈**: 併走中の旧 handler は実経路として生きているので dead code では
+  ない。各 Phase で reducer 実装に置換された handler は**その Phase 内で即削除**する
+  (= §coexistence 期間の即削除 default と整合)
+- **gate 1b-3 の characterization test**: translate が生成する `DaemonMsg` 列が poll IO
+  event と 1:1 対応することを固定する test (= 後続 Phase で reducer 実装を挿しても
+  translate 層の意味論が変わらないことの回帰基準)
+
 ### coexistence 期間と feature flag
 
 Phase 1b で「旧 handler を wrap する新 reducer 経路」を導入する瞬間、coexistence 期間が
@@ -1147,6 +1166,9 @@ DR-0014 だけ読む後続セッションが本 DR の項目を踏むため)。
   責務」を本文 §Screen domain に明記
 - ~~Q12 (watch 配信先)~~: default「register した client にのみ配信」を本文 §Screen domain
   event に明記
+- ~~Q-NEW2 (super-reducer 入口の channel capacity / overflow policy)~~: §Phase 1b 後半の
+  実装形 に解決を記載 — 単一 thread poll 直結を維持し channel 自体を導入しない。必要に
+  なるのは Phase 6a の Parser Layer 1 別 thread 化のみ
 
 ### `[Phase 5 着手前 blocker]`
 
@@ -1171,9 +1193,6 @@ DR-0014 だけ読む後続セッションが本 DR の項目を踏むため)。
 - **Q3 (InternalTimer の実装方式) [Phase 2-3]**: poll timeout 経由で代替するか、専用 timer
   wheel を持つか。時間も message として reducer に注入する方針 (= TimerTick / Clock 値を
   caller が message で渡す) を採用、test の決定論性を担保
-- **Q-NEW2 (super-reducer 入口の message channel capacity / overflow policy) [Phase 1b]**:
-  Phase 1b 骨格定義で channel capacity と overflow policy を決める (= 後で backward
-  compatible に直せない)
 - **Q-NEW3 (reducer panic 時の隔離方針) [Phase 1a/1b]**: catch_unwind 有無 / 影響範囲 /
   state rebuild 方法、CLAUDE.md の partial state 規律と直接ぶつかる可能性
 - **Q-NEW4 (DR-0013 Phase C との依存関係) [Phase 5-7]**: DR-0013 Phase C (observe mode /
