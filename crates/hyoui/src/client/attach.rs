@@ -794,6 +794,14 @@ impl ClientConnection {
                                 }
                             }
                         }
+                        TYPE_RAW_ACK => {
+                            // DR-0021: daemon は raw_data write 完了ごとに RawAck を返す。
+                            // attach の stdin forward は fire-and-forget (= 完了点同期を
+                            // 必要としない) ので読み捨てる。`recv_control` の silent skip
+                            // (DR-0021 改訂 m1) と同じ扱い。ここで捨てないと最初の打鍵 /
+                            // pipe 入力 / SendEof の EOT 送信直後に unknown frame 扱いで
+                            // client が異常終了する (= interactive 打鍵の全滅 bug)。
+                        }
                         _ => return Err(Error::Invalid("unknown frame type from daemon")),
                     },
                     Err(FrameError::Protocol(ProtocolError::UnexpectedEof(_))) => {
