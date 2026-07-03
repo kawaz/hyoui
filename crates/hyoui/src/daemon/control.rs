@@ -41,23 +41,23 @@ use nix::unistd::Pid;
 use crate::protocol::messages::{
     CODE_CLIENT_LOCK_NOT_HELD, CODE_CLIENT_RO_REJECTED, CODE_MASTER_WRITE_ERROR,
     CODE_MASTER_WRITE_PARTIAL, CODE_MASTER_WRITE_TIMEOUT, ClientInfo, ErrorCode, ErrorMessage,
-    LockResponse, LockResult, ModeChange, RawAck, RecordInfo, RecordListResponse,
-    RecordStartRequest, RecordStartResponse, RecordStopRequest, RecordStopResponse,
-    ScreenBufferKind, ScreenCursorSnap, ScreenDumpRequest, ScreenDumpResponse, ScreenModeSnap,
-    ScreenWindowSize, SessionMode, SnapshotComponent, StateSnapshotRequest, StateSnapshotResponse,
-    StatusResponse, TailRequest,
+    LockResponse, LockResult, RawAck, RecordInfo, RecordListResponse, RecordStartRequest,
+    RecordStartResponse, RecordStopRequest, RecordStopResponse, ScreenBufferKind, ScreenCursorSnap,
+    ScreenDumpRequest, ScreenDumpResponse, ScreenModeSnap, ScreenWindowSize, SnapshotComponent,
+    StateSnapshotRequest, StateSnapshotResponse, StatusResponse, TailRequest,
 };
 use crate::protocol::{ControlMessage, Frame, Mode, TYPE_CBOR_CONTROL, TYPE_RAW_DATA};
 use crate::scrollback::Scrollback;
 use crate::sys::clock::now_unix_ms;
 use crate::sys::{FdExt, Pty, WriteError};
 
-use super::broadcast::{ClientHandle, broadcast_control, send_control, send_raw_ack};
+use super::broadcast::{ClientHandle, send_control, send_raw_ack};
 use super::lock::{LockEvent, LockMsg, SessionState, generate_lock_token};
 use super::record::{
     InRejectedReason, LifecycleEvent, RecordStartError, RecordStopError, SessionInfo,
     WriteErrorKind,
 };
+use super::reducer::{DaemonState, execute_with_feedback};
 use super::screen::{
     ScreenDumpFormat as InternalDumpFormat, ScreenDumpLayer as InternalDumpLayer, ScreenState,
     build_screen_dump, build_screen_snapshot,
@@ -127,6 +127,7 @@ pub(super) fn handle_client_frame(
     frame: Frame,
     clients: &mut [ClientHandle],
     state: &mut SessionState,
+    daemon_state: &mut DaemonState,
     scrollback: &Scrollback,
     screen_state: &mut ScreenState,
     config: &DaemonConfig,
@@ -149,7 +150,7 @@ pub(super) fn handle_client_frame(
                 state.record_registry.push_in_rejected(
                     ch_id,
                     ch_mode,
-                    state.lock.holder(),
+                    daemon_state.lock.holder(),
                     InRejectedReason::RoClient,
                     &frame.body,
                 );
@@ -162,7 +163,7 @@ pub(super) fn handle_client_frame(
                 }
                 return ClientFrameOutcome::Continue;
             }
-            if let Some(holder) = state.lock.holder()
+            if let Some(holder) = daemon_state.lock.holder()
                 && holder != ch_id
             {
                 state.record_registry.push_in_rejected(
@@ -292,6 +293,7 @@ pub(super) fn handle_client_frame(
                 msg,
                 clients,
                 state,
+                daemon_state,
                 scrollback,
                 screen_state,
                 config,
@@ -320,6 +322,7 @@ pub(super) fn handle_control_message(
     msg: ControlMessage,
     clients: &mut [ClientHandle],
     state: &mut SessionState,
+    daemon_state: &mut DaemonState,
     scrollback: &Scrollback,
     screen_state: &mut ScreenState,
     config: &DaemonConfig,
@@ -329,13 +332,17 @@ pub(super) fn handle_control_message(
         ControlMessage::Kill(k) => handle_kill(child, idx, k, clients),
         ControlMessage::Signal(s) => handle_signal(child, idx, s, clients),
         ControlMessage::Resize(r) => handle_resize(pty, idx, r, clients, screen_state),
-        ControlMessage::LockAcquire(req) => handle_lock_acquire(idx, req, clients, state),
-        ControlMessage::LockRelease(rel) => handle_lock_release(idx, rel, clients, state),
+        ControlMessage::LockAcquire(req) => {
+            handle_lock_acquire(idx, req, clients, state, daemon_state)
+        }
+        ControlMessage::LockRelease(rel) => {
+            handle_lock_release(idx, rel, clients, state, daemon_state)
+        }
         ControlMessage::TailRequest(req) => {
             handle_tail_request_dispatch(idx, req, clients, scrollback)
         }
         ControlMessage::StatusQuery(_) => {
-            handle_status_query(child, idx, clients, state, scrollback, config)
+            handle_status_query(child, idx, clients, state, daemon_state, scrollback, config)
         }
         ControlMessage::ScreenDumpRequest(req) => {
             handle_screen_dump_request(idx, req, clients, screen_state)
@@ -793,6 +800,7 @@ fn handle_lock_acquire(
     req: crate::protocol::messages::LockAcquire,
     clients: &mut [ClientHandle],
     state: &mut SessionState,
+    daemon_state: &mut DaemonState,
 ) -> ClientFrameOutcome {
     let ch_id = clients[idx].id;
     // D7: lock cap が無いと LockAcquire 受理しない
@@ -817,130 +825,90 @@ fn handle_lock_acquire(
     }
     let _ = req; // wait / timeout / process_bound は wait queue 実装まで未使用 (DR-0008)
 
-    // DR-0025 Phase 1a: lock 判定と state 遷移は lock reducer に集約する。token 生成
-    // (urandom IO) は reducer の外なので、まず token なしで peek し、grant 確定
-    // (= TokenRequired) のときだけ生成して再 reduce する (= 既存の「grant 経路だけ
+    // DR-0025 Phase 2-α2: lock 判定 + state 遷移 + 応答組み立てを lock reducer
+    // (reduce_msg) に、実 IO を execute layer に集約する。token 生成 (urandom IO)
+    // だけは reducer の外の 2-phase: まず token なしで投げ、TokenRequired (= grant
+    // 確定の合図) のときだけ生成して再投入する (= 「grant 経路だけ
     // generate_lock_token を呼ぶ」挙動 = urandom 失敗の影響範囲を保存する)。
-    let peek = super::lock::reduce(
-        &mut state.lock,
+    let (out, events) = super::lock::reduce_msg(
+        &mut daemon_state.lock,
         LockMsg::Acquire {
             client_id: ch_id,
             token: None,
         },
     );
-    match peek.into_iter().next() {
-        // R4-C9 idempotency: 既に holder の client の再取得。発行済 token をそのまま
-        // 返し、mode.change / lifecycle は発火しない (= state 変化なし、newly_acquired
-        // false)。旧実装で自分の lock に自分が弾かれる footgun を防ぐ標準挙動。
-        Some(LockEvent::Acquired {
-            token,
-            newly_acquired: false,
-            ..
-        }) => {
-            let _ = send_control(
-                &clients[idx],
-                ControlMessage::LockResponse(LockResponse {
-                    result: LockResult::Acquired,
-                    token,
-                    queue_position: None,
-                }),
-            );
-            ClientFrameOutcome::Continue
-        }
-        // 他 client 保持中: 「1 request → 1 response」契約を守るため wait=true /
-        // wait=false どちらも LockResponse(Denied) 1 frame のみで応答する (Round2 #3、
-        // MVP は wait queue 未実装で Queued を返せない、DR-0008)。
-        Some(LockEvent::Denied { .. }) => {
-            let _ = send_control(
-                &clients[idx],
-                ControlMessage::LockResponse(LockResponse {
-                    result: LockResult::Denied,
-                    token: None,
-                    queue_position: None,
-                }),
-            );
-            ClientFrameOutcome::Continue
-        }
-        // free → grant 確定。token を生成して再 reduce で holder を確定させる。
-        Some(LockEvent::TokenRequired { .. }) => {
-            // R5-H11: 旧実装は `generate_lock_token()` 内で urandom 失敗時 `.expect()`
-            // panic していたため、`panic = "abort"` 設定下では daemon 全体が abort して
-            // 全 client が巻き添え切断される (= 同 UID の攻撃者が EMFILE/ENFILE を
-            // 作り出せれば session DoS が成立)。Result 化して I/O 失敗時は
-            // `LockResponse(Denied)` + `ErrorCode::InternalError` notify で当該 client
-            // にだけ返し、session 自体は継続する。
-            let token = match generate_lock_token() {
-                Ok(t) => t,
-                Err(e) => {
-                    let _ = send_control(
-                        &clients[idx],
-                        ControlMessage::LockResponse(LockResponse {
-                            result: LockResult::Denied,
-                            token: None,
-                            queue_position: None,
-                        }),
-                    );
-                    let _ = send_control(
-                        &clients[idx],
-                        ControlMessage::Error(ErrorMessage {
-                            code: ErrorCode::InternalError,
-                            message: format!(
-                                "lock token generation failed (urandom unavailable): {e}; retry later"
-                            ),
-                            details: None,
-                        }),
-                    );
-                    return ClientFrameOutcome::Continue;
-                }
-            };
-            let granted = super::lock::reduce(
-                &mut state.lock,
-                LockMsg::Acquire {
-                    client_id: ch_id,
-                    token: Some(token),
-                },
-            );
-            match granted.into_iter().next() {
-                Some(LockEvent::Acquired {
-                    token,
+    debug_assert!(
+        out.cross.is_empty(),
+        "Lock reducer は cross-domain msg を出さない前提の直呼び経路"
+    );
+    if events
+        .iter()
+        .any(|e| matches!(e, LockEvent::TokenRequired { .. }))
+    {
+        // R5-H11: urandom 失敗は当該 client への Denied + InternalError で返し
+        // session は継続する (= `panic = "abort"` 下で daemon abort → 全 client
+        // 巻き添え切断、を避ける。同 UID 攻撃者の EMFILE/ENFILE 起因 DoS 対策)。
+        let token = match generate_lock_token() {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = send_control(
+                    &clients[idx],
+                    ControlMessage::LockResponse(LockResponse {
+                        result: LockResult::Denied,
+                        token: None,
+                        queue_position: None,
+                    }),
+                );
+                let _ = send_control(
+                    &clients[idx],
+                    ControlMessage::Error(ErrorMessage {
+                        code: ErrorCode::InternalError,
+                        message: format!(
+                            "lock token generation failed (urandom unavailable): {e}; retry later"
+                        ),
+                        details: None,
+                    }),
+                );
+                return ClientFrameOutcome::Continue;
+            }
+        };
+        // 単一 thread なので 1 投目と再投入の間に他 client の割り込みは起きない。
+        let (out, events) = super::lock::reduce_msg(
+            &mut daemon_state.lock,
+            LockMsg::Acquire {
+                client_id: ch_id,
+                token: Some(token),
+            },
+        );
+        debug_assert!(out.cross.is_empty());
+        // DR-0016 §3: lock-acquired lifecycle event。state 遷移 (grant) の直後・
+        // 応答 IO (execute) より前で push する (= 観測順序を state 変化と一致させる)。
+        if events.iter().any(|e| {
+            matches!(
+                e,
+                LockEvent::Acquired {
                     newly_acquired: true,
                     ..
-                }) => {
-                    // DR-0016 §3: lock-acquired lifecycle event。state 遷移 (grant) の
-                    // 直後で push する (= 観測順序を state 変化と一致させるため)。
-                    state
-                        .record_registry
-                        .push_lifecycle(LifecycleEvent::LockAcquired {
-                            client_id: ch_id,
-                            ts_unix_ms: now_unix_ms(),
-                        });
-                    let _ = send_control(
-                        &clients[idx],
-                        ControlMessage::LockResponse(LockResponse {
-                            result: LockResult::Acquired,
-                            token,
-                            queue_position: None,
-                        }),
-                    );
-                    broadcast_control(
-                        clients,
-                        &ControlMessage::ModeChange(ModeChange {
-                            session_mode: SessionMode::Locked,
-                            lock_holder: Some(ch_id),
-                            client_mode: None,
-                        }),
-                    );
-                    ClientFrameOutcome::Continue
                 }
-                // 単一 thread なので peek と grant の間に他 client の割り込みは起きない
-                // (= 到達不能)。防御的に state 非確定として Continue で抜ける。
-                _ => ClientFrameOutcome::Continue,
-            }
+            )
+        }) {
+            state
+                .record_registry
+                .push_lifecycle(LifecycleEvent::LockAcquired {
+                    client_id: ch_id,
+                    ts_unix_ms: now_unix_ms(),
+                });
         }
-        // peek は token:None なので grant (Acquired newly_acquired:true) / Released を
-        // 返さない (= 到達不能)。防御的に Continue。
-        _ => ClientFrameOutcome::Continue,
+        // reply (LockResponse) → broadcast (ModeChange) の順は reduce_msg の effect
+        // 列が保証する (= 既存応答順の保存)。broadcast 失敗 id は旧実装同様この経路
+        // では捨てる (= drop 予約の統一は Phase 2-γ の Backpressure sub-state)。
+        execute_with_feedback(daemon_state, out.effects, clients, &mut Vec::new());
+        return ClientFrameOutcome::Continue;
     }
+    // idempotent Acquired (R4-C9) / Denied (wait queue 未実装、DR-0008 Round2 #3 の
+    // 1 request → 1 response 契約): 応答 Effect は reduce_msg が組み立て済み。
+    execute_with_feedback(daemon_state, out.effects, clients, &mut Vec::new());
+    ClientFrameOutcome::Continue
 }
 
 /// `ControlMessage::LockRelease` を処理する。
@@ -951,48 +919,40 @@ fn handle_lock_release(
     rel: crate::protocol::messages::LockRelease,
     clients: &mut [ClientHandle],
     state: &mut SessionState,
+    daemon_state: &mut DaemonState,
 ) -> ClientFrameOutcome {
     let ch_id = clients[idx].id;
-    // DR-0025 Phase 1a: token + holder 照合と state クリアは lock reducer に集約する。
-    let events = super::lock::reduce(
-        &mut state.lock,
+    // DR-0025 Phase 2-α2: token + holder 照合 + state クリア + 応答組み立てを lock
+    // reducer (reduce_msg) に、実 IO を execute layer に集約する。Released →
+    // ClientBroadcast(ModeChange Rw)、Denied → ClientReply(Error LockNotHeld) は
+    // reduce_msg が組み立て済み。
+    let (out, events) = super::lock::reduce_msg(
+        &mut daemon_state.lock,
         LockMsg::Release {
             client_id: ch_id,
             token: rel.token,
         },
     );
-    match events.into_iter().next() {
-        Some(LockEvent::Released { .. }) => {
-            // DR-0016 §3: lock-released lifecycle event。
-            state
-                .record_registry
-                .push_lifecycle(LifecycleEvent::LockReleased {
-                    client_id: ch_id,
-                    ts_unix_ms: now_unix_ms(),
-                });
-            broadcast_control(
-                clients,
-                &ControlMessage::ModeChange(ModeChange {
-                    session_mode: state.session_mode(),
-                    lock_holder: None,
-                    client_mode: None,
-                }),
-            );
-            ClientFrameOutcome::Continue
-        }
-        // Denied (holder でない or token 不一致): 現状どおり Error(LockNotHeld) を返す。
-        _ => {
-            let _ = send_control(
-                &clients[idx],
-                ControlMessage::Error(ErrorMessage {
-                    code: ErrorCode::LockNotHeld,
-                    message: "lock token mismatch or not the lock holder".into(),
-                    details: None,
-                }),
-            );
-            ClientFrameOutcome::Continue
-        }
+    debug_assert!(
+        out.cross.is_empty(),
+        "Lock reducer は cross-domain msg を出さない前提の直呼び経路"
+    );
+    // DR-0016 §3: lock-released lifecycle event。state 遷移直後・broadcast (execute)
+    // より前で push する (= 観測順序を state 変化と一致させる)。
+    if events
+        .iter()
+        .any(|e| matches!(e, LockEvent::Released { .. }))
+    {
+        state
+            .record_registry
+            .push_lifecycle(LifecycleEvent::LockReleased {
+                client_id: ch_id,
+                ts_unix_ms: now_unix_ms(),
+            });
     }
+    // broadcast 失敗 id は旧実装同様この経路では捨てる (= Phase 2-γ で統一)。
+    execute_with_feedback(daemon_state, out.effects, clients, &mut Vec::new());
+    ClientFrameOutcome::Continue
 }
 
 // === DR-0016 record handler (Phase 4 配線) ===
@@ -1208,6 +1168,7 @@ fn handle_status_query(
     idx: usize,
     clients: &mut [ClientHandle],
     state: &SessionState,
+    daemon_state: &DaemonState,
     scrollback: &Scrollback,
     config: &DaemonConfig,
 ) -> ClientFrameOutcome {
@@ -1251,7 +1212,7 @@ fn handle_status_query(
         child_state,
         clients: clients_info,
         scrollback_bytes: scrollback.total_bytes() as u64,
-        lock_holder: state.lock.holder(),
+        lock_holder: daemon_state.lock.holder(),
         cwd: config
             .cwd
             .as_ref()

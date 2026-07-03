@@ -30,6 +30,7 @@ use super::{DaemonMsg, Effect, EffectErrorKind, EffectKind, EffectOutcome, Retry
 pub(in crate::daemon) fn execute(
     effects: Vec<Effect>,
     clients: &mut [ClientHandle],
+    overflow_ids: &mut Vec<u64>,
 ) -> Vec<DaemonMsg> {
     let mut results = Vec::with_capacity(effects.len());
     for Effect { id, kind } in effects {
@@ -49,7 +50,12 @@ pub(in crate::daemon) fn execute(
                 // subscribe filter を `ClientHandle.sub` から内部参照するため、ここでは
                 // filter を渡さず subscribe 中の client へ配る。
                 let _ = filter;
+                // 送信失敗 (= backpressure overflow / writer dead) の client id は
+                // caller の drop 予約 (`overflow_ids`) に積む (= serve_loop が次周回で
+                // drop する既存規律の保存)。EffectResult::Failed 経由の Client domain
+                // lifecycle 統合は Phase 2-γ の Backpressure sub-state で行う。
                 let failed = broadcast_control(clients, &message);
+                overflow_ids.extend(failed.iter().copied());
                 broadcast_outcome(&failed)
             }
             // client 送信系以外の effect はこの片の execute では未配線。各 domain reducer が
@@ -144,12 +150,14 @@ mod tests {
     #[should_panic(expected = "未配線の EffectKind")]
     fn execute_panics_on_unwired_effect_in_debug() {
         let mut clients: Vec<ClientHandle> = Vec::new();
+        let mut overflow_ids = Vec::new();
         let _ = execute(
             vec![Effect {
                 id: EffectId(Domain::Tty, 0),
                 kind: EffectKind::TtyWrite { bytes: vec![b'x'] },
             }],
             &mut clients,
+            &mut overflow_ids,
         );
     }
 }

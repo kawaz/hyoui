@@ -27,7 +27,7 @@ use crate::Error;
 // (= client 側で policy 発動、daemon は新 message を中継するのみ)。
 #[cfg_attr(not(test), allow(unused_imports))]
 use crate::protocol::Mode;
-use crate::protocol::messages::{LeaderNotify, ModeChange};
+use crate::protocol::messages::LeaderNotify;
 use crate::protocol::{ControlMessage, Frame};
 use crate::scrollback::Scrollback;
 use crate::sys::clock::now_unix_ms;
@@ -43,7 +43,7 @@ use super::broadcast::{
     ClientHandle, MAX_CLIENTS_PER_DAEMON, broadcast_control, broadcast_master_bytes, send_control,
 };
 use super::control::{ClientFrameOutcome, FrameOrError, handle_client_frame};
-use super::lock::{LockEvent, LockMsg, SessionState, elevate_next_leader};
+use super::lock::{SessionState, elevate_next_leader};
 use super::pty::{
     ALIVE_RETRY_INTERVAL, ChildLifecycle, ChildState, ChildTransition, STOPPED_POLL_INTERVAL,
 };
@@ -572,6 +572,10 @@ fn linger_for_late_attach(
     let mut next_client_id: u64 = 0;
     let mut clients: Vec<ClientHandle> = Vec::new();
     let mut state = SessionState::default();
+    // DR-0025 Phase 2-α2: linger 中の attach 経路用。linger は既存 client が
+    // 全て消えた後の受付なので lock は常に空 (= 旧 SessionState::default() の
+    // lock 空と同じ)。linger の Serve lifecycle 統合は Phase 4。
+    let mut linger_daemon_state = super::reducer::DaemonState::default();
     let mut overflow_ids: Vec<u64> = Vec::new();
     let mut pending_redraws: Vec<u64> = Vec::new();
 
@@ -605,6 +609,7 @@ fn linger_for_late_attach(
             &mut next_client_id,
             &mut clients,
             &mut state,
+            &mut linger_daemon_state,
             &mut overflow_ids,
             screen_state,
             &mut pending_redraws,
@@ -1329,6 +1334,7 @@ fn serve_loop(
                     next_client_id,
                     clients,
                     state,
+                    &mut daemon_state,
                     &mut overflow_ids,
                     screen_state,
                     pending_redraws,
@@ -1382,6 +1388,7 @@ fn serve_loop(
             next_client_id,
             clients,
             state,
+            &mut daemon_state,
             &mut overflow_ids,
             screen_state,
             pending_redraws,
@@ -1404,10 +1411,11 @@ fn serve_loop(
         if sigchld_ready {
             // DR-0025 Phase 1b (translate 併走): SIGCHLD self-pipe 発火を写す。waitpid
             // 経由の state 遷移解釈は Phase 3 の Child reducer が担う。
-            let effects = reducer::handle(&mut daemon_state, translate::sigchld_received(child));
-            debug_assert!(
-                effects.is_empty(),
-                "Phase 1b stub 段階では sigchld_received から effect は出ない"
+            reducer::handle_and_execute(
+                &mut daemon_state,
+                translate::sigchld_received(child),
+                clients,
+                &mut overflow_ids,
             );
             if let Some(sp) = sigchld_pipe {
                 let drained = sp.drain().unwrap_or_default();
@@ -1485,11 +1493,11 @@ fn serve_loop(
                             // 経路 (sigchld / EIO / EINTR / timeout) の集約は Phase 3 の
                             // Child reducer 化で waitpid transition を child::reduce へ
                             // 寄せる際に行う。
-                            let effects =
-                                reducer::handle(&mut daemon_state, translate::child_reaped(code));
-                            debug_assert!(
-                                effects.is_empty(),
-                                "Phase 1b stub 段階では child_reaped から effect は出ない"
+                            reducer::handle_and_execute(
+                                &mut daemon_state,
+                                translate::child_reaped(code),
+                                clients,
+                                &mut overflow_ids,
                             );
                             return RelayOutcome::ChildExited(code);
                         }
@@ -1507,11 +1515,11 @@ fn serve_loop(
                     // DR-0025 Phase 1b (translate 併走): 子 PTY 生 bytes を Layer 1 event
                     // に写して super-reducer を実走 (stub なので effect 空)。screen_state /
                     // scrollback / broadcast の既存処理は下でそのまま続ける (= 挙動不変)。
-                    let effects =
-                        reducer::handle(&mut daemon_state, translate::tty_master_read(&buf[..n]));
-                    debug_assert!(
-                        effects.is_empty(),
-                        "Phase 1b stub 段階では tty_master_read から effect は出ない"
+                    reducer::handle_and_execute(
+                        &mut daemon_state,
+                        translate::tty_master_read(&buf[..n]),
+                        clients,
+                        &mut overflow_ids,
                     );
                     // Issue #1 + user request: `--debug-dump` の raw bytes 書き出し。
                     // 子 PTY からの bytes は scrollback / vt100 へ渡る **前** の生
@@ -1609,13 +1617,11 @@ fn serve_loop(
                     // frame 実体は運ばない placeholder 主義)。kind 別の認可 / 処理は下の
                     // handle_client_frame が従来通り担う (= 挙動不変)。
                     let client_id = ch.id;
-                    let effects = reducer::handle(
+                    reducer::handle_and_execute(
                         &mut daemon_state,
                         translate::client_frame_received(client_id),
-                    );
-                    debug_assert!(
-                        effects.is_empty(),
-                        "Phase 1b stub 段階では client_frame_received から effect は出ない"
+                        clients,
+                        &mut overflow_ids,
                     );
                     frames_to_process.push((idx, FrameOrError::Frame(frame)));
                 }
@@ -1644,6 +1650,7 @@ fn serve_loop(
                         frame,
                         clients,
                         state,
+                        &mut daemon_state,
                         scrollback,
                         screen_state,
                         config,
@@ -1679,37 +1686,27 @@ fn serve_loop(
         // 重複 index も発生しうるので dedup する
         indices_to_drop.sort_unstable();
         indices_to_drop.dedup();
-        let mut dropped_held_lock = false;
         let mut dropped_any_leader = false;
+        // DR-0025 Phase 2-α2: detach 由来の effect (= holder 切断時の
+        // ClientBroadcast(ModeChange)) はループ内で蓄積し、LeaderNotify の後に
+        // execute する (= 既存の broadcast 順序「drop 群 → LeaderNotify →
+        // ModeChange」の保存)。
+        let mut detach_effects: Vec<reducer::Effect> = Vec::new();
         for idx in indices_to_drop.into_iter().rev() {
             let ch = clients.remove(idx);
             let detached_id = ch.id;
             if ch.leader {
                 dropped_any_leader = true;
             }
-            // DR-0025 Phase 1b (translate 併走): client detach を写す。lock auto-release /
-            // leader cascade の 1 本化は Phase 2 の Client reducer が担い、現段階では下の
-            // 既存処理 (lock::reduce + elevate_next_leader) が挙動を担う (= 挙動不変)。
-            let effects =
-                reducer::handle(&mut daemon_state, translate::client_detached(detached_id));
-            debug_assert!(
-                effects.is_empty(),
-                "daemon_state.lock が空 stub の間は client_detached から effect は出ない \
-                 (= 実 lock state は SessionState 側)。Phase 2-α2 の lock 移設で holder が\
-                 立つようになった時点で、この assert は execute 呼び出しに置換必須"
-            );
-            // DR-0025 Phase 1a: holder client の切断による process-bound GC は lock
-            // reducer に委譲する。Released (= ProcessBoundGc) が返ったら mode.change
-            // broadcast の契機 (dropped_held_lock) にする。非 holder の切断は空 event。
-            if super::lock::reduce(
-                &mut state.lock,
-                LockMsg::ClientDisconnected { client_id: ch.id },
-            )
-            .iter()
-            .any(|e| matches!(e, LockEvent::Released { .. }))
-            {
-                dropped_held_lock = true;
-            }
+            // DR-0025 Phase 2-α2: client detach は「Client reducer → Lock への
+            // ClientDisconnected dispatch → (holder なら) ClientBroadcast(ModeChange)
+            // Effect」の reducer 経路が lock auto-release を担う。leader cascade の
+            // reducer 化は Phase 2-γ (ClientRegistry pure 化) で行い、現段階では下の
+            // 既存処理 (elevate_next_leader) が担う。
+            detach_effects.extend(reducer::handle(
+                &mut daemon_state,
+                translate::client_detached(detached_id),
+            ));
             // ClientHandle::Drop が writer_tx close + reader shutdown +
             // writer_thread join を一括実行 (R5-H18)。backpressure 超過時の
             // writer_pump が write_all で block 中でも shutdown で即 error 化される。
@@ -1717,8 +1714,8 @@ fn serve_loop(
             // DR-0016 §3: client-detached lifecycle event。lock auto-release が
             // 起きた場合は lock-released は別途 push しない (= explicit な
             // LockRelease 経路でないため、observer は client-detached + lock_holder
-            // 変化で推定する想定。dropped_held_lock を見て lock-released を発火する
-            // のは将来 task)。
+            // 変化で推定する想定。GC の Released event から lock-released lifecycle を
+            // 発火するのは将来 task = record の Effect 化 (Phase 2-γ) で扱う)。
             state
                 .record_registry
                 .push_lifecycle(super::record::LifecycleEvent::ClientDetached {
@@ -1738,17 +1735,15 @@ fn serve_loop(
             );
         }
 
-        // lock 自動解放: lock holder が抜けた場合、session mode を Rw に戻す
-        if dropped_held_lock {
-            broadcast_control(
-                clients,
-                &ControlMessage::ModeChange(ModeChange {
-                    session_mode: state.session_mode(),
-                    lock_holder: None,
-                    client_mode: None,
-                }),
-            );
-        }
+        // lock 自動解放: lock holder が抜けた場合の ModeChange(Rw) broadcast は
+        // 蓄積した detach effect の execute が担う (= 実行位置は旧手書き broadcast と
+        // 同一 = LeaderNotify の後)。非 holder の detach では effect が無く no-op。
+        reducer::execute_with_feedback(
+            &mut daemon_state,
+            detach_effects,
+            clients,
+            &mut overflow_ids,
+        );
 
         if let Some(o) = should_return {
             return o;
@@ -1873,7 +1868,7 @@ fn reap_blocking(child: Pid, outcome: &RelayOutcome) -> Result<i32, Error> {
 mod tests {
     use super::super::accept::constant_time_eq;
     use super::super::control::signal_name_to_nix_signal;
-    use super::super::lock::{LockMsg, generate_lock_token, should_assign_leader};
+    use super::super::lock::{generate_lock_token, should_assign_leader};
     use super::*;
     use crate::protocol::messages::{
         Detach, DetachTarget, ErrorCode, Kill, LockResult, SessionMode, TailEndReason,
@@ -2754,23 +2749,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn session_mode_reflects_lock_holder() {
-        let mut s = SessionState::default();
-        assert_eq!(s.session_mode(), SessionMode::Rw);
-        // DR-0025 Phase 1a: lock state は reducer 経由でのみ mutate する。grant すると
-        // holder が Some になり session_mode が Locked に切り替わる。検証意図 (= lock
-        // holder の有無で session_mode が導出される) は元 test と同一で、state 構築のみ
-        // 直接 field 代入から reduce 経由に追従させた。
-        super::super::lock::reduce(
-            &mut s.lock,
-            LockMsg::Acquire {
-                client_id: 7,
-                token: Some("abcd".into()),
-            },
-        );
-        assert_eq!(s.session_mode(), SessionMode::Locked);
-    }
+    // (session_mode の導出 test は lock state の DaemonState 移設 (DR-0025 Phase 2-α2)
+    // に伴い LockState 側へ一本化: lock.rs::session_mode_reflects_holder が同じ検証意図
+    // (= holder の有無で session_mode が導出される) をカバーする)
 
     // ---- Phase 10 e2e tests (= serve_loop 経由) ----
 

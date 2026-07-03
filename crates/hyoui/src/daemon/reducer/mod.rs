@@ -36,6 +36,7 @@ use nix::unistd::Pid;
 
 use crate::protocol::messages::ControlMessage;
 
+use super::broadcast::ClientHandle;
 use super::lock::{LockMsg, LockState};
 
 mod child;
@@ -54,6 +55,14 @@ pub(in crate::daemon) mod translate;
 /// (= 循環 dispatch / 想定外の連鎖爆発)」とみなす。超過時の挙動は build 種別で分岐する
 /// ([`drive`] 参照)。
 const MAX_CROSS_DOMAIN_DEPTH: usize = 64;
+
+/// EffectResult feedback の round 上限 (DR-0025 §Effect 失敗の feedback)。
+///
+/// 「Effect 実行 → EffectResult を reducer に再投入 → さらに Effect」の連鎖は通常
+/// 1-2 round で収束する。超過は「EffectResult が無限に Effect を生む循環」= 設計違反
+/// とみなし、[`MAX_CROSS_DOMAIN_DEPTH`] と同じ build 種別分岐で扱う
+/// ([`execute_with_feedback`] 参照)。
+const MAX_FEEDBACK_ROUNDS: usize = 8;
 
 /// effect 発行元 domain。EffectResult routing の key を兼ねる (DR-0025 §Effect layer)。
 ///
@@ -340,10 +349,12 @@ fn dispatch(state: &mut DaemonState, msg: DaemonMsg) -> DomainOutput {
         }
         DaemonMsg::Screen(e) => screen::reduce(&mut state.screen, e),
         // Lock domain: `super::lock::reduce_msg` が Phase 1a の pure `reduce` を内部で
-        // 呼び、`LockEvent::Released` を `ClientBroadcast(ModeChange)` Effect に翻訳する
-        // (= DR-0025 §Lock domain の `Lock ──→ Client` broadcast)。acquire/release の
-        // reply (LockResponse) 経路は control.rs 配線と不可分で未翻訳 (= 次片以降)。
-        DaemonMsg::Lock(e) => super::lock::reduce_msg(&mut state.lock, e),
+        // 呼び、`LockEvent` を Effect (ClientReply / ClientBroadcast) に翻訳する
+        // (= DR-0025 §Lock domain の `Lock ──→ Client`)。tuple 第 2 要素の LockEvent は
+        // caller 直呼び (= control.rs の TokenRequired 2-phase / lifecycle record) 専用の
+        // 副情報で、cross-domain 経由 (= ClientDisconnected) では捨てる (= GC 経路に
+        // lifecycle record は無い、既存挙動)。
+        DaemonMsg::Lock(e) => super::lock::reduce_msg(&mut state.lock, e).0,
         DaemonMsg::EffectResult { effect_id, outcome } => {
             dispatch_effect_result(state, effect_id, outcome)
         }
@@ -430,6 +441,60 @@ where
 /// 返す。実 IO への変換 (execute layer) は Phase 1b 後半で被せる。
 pub(in crate::daemon) fn handle(state: &mut DaemonState, msg: DaemonMsg) -> Vec<Effect> {
     drive(msg, |m| dispatch(state, m))
+}
+
+/// effect 列を実 IO に変換し、EffectResult feedback が収束するまで回す
+/// (DR-0025 §Effect 失敗の feedback)。
+///
+/// [`execute::execute`] が返す `DaemonMsg::EffectResult` を [`handle`] に再投入し、
+/// そこからさらに Effect が出たら再度 execute する。stub 段階では EffectResult 受口が
+/// 空を返すため 1 round で収束する。[`MAX_FEEDBACK_ROUNDS`] 超過は設計違反として
+/// debug は panic / release は error log + 打ち切りで継続 (= §連鎖停止条件と同方針)。
+pub(in crate::daemon) fn execute_with_feedback(
+    state: &mut DaemonState,
+    effects: Vec<Effect>,
+    clients: &mut [ClientHandle],
+    overflow_ids: &mut Vec<u64>,
+) {
+    let mut effects = effects;
+    let mut rounds = 0usize;
+    while !effects.is_empty() {
+        rounds += 1;
+        if rounds > MAX_FEEDBACK_ROUNDS {
+            #[cfg(debug_assertions)]
+            panic!("effect feedback loop exceeded {MAX_FEEDBACK_ROUNDS} rounds");
+            #[cfg(not(debug_assertions))]
+            {
+                report_feedback_overflow(rounds);
+                break;
+            }
+        }
+        let feedback = execute::execute(effects, clients, overflow_ids);
+        effects = Vec::new();
+        for m in feedback {
+            effects.extend(handle(state, m));
+        }
+    }
+}
+
+/// [`handle`] + [`execute_with_feedback`] の一括形 (= serve_loop の translate 挿入点用)。
+pub(in crate::daemon) fn handle_and_execute(
+    state: &mut DaemonState,
+    msg: DaemonMsg,
+    clients: &mut [ClientHandle],
+    overflow_ids: &mut Vec<u64>,
+) {
+    let effects = handle(state, msg);
+    execute_with_feedback(state, effects, clients, overflow_ids);
+}
+
+/// release build で EffectResult feedback が round 上限を超えた時の fail-safe 通知。
+#[cfg(not(debug_assertions))]
+fn report_feedback_overflow(rounds: usize) {
+    eprintln!(
+        "[hyoui] effect feedback loop exceeded {rounds} rounds (max {MAX_FEEDBACK_ROUNDS}); \
+         dropping remaining effects and continuing"
+    );
 }
 
 /// release build で cross-domain queue が深度上限を超えた時の fail-safe 通知

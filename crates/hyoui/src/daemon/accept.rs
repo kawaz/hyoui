@@ -45,7 +45,8 @@ use super::broadcast::{
     ClientHandle, SharedBytes, Subscription, broadcast_control, enqueue_for_client, send_control,
     writer_pump,
 };
-use super::lock::{LockEvent, LockMsg, SessionState, elevate_next_leader, should_assign_leader};
+use super::lock::{SessionState, elevate_next_leader, should_assign_leader};
+use super::reducer::{self, DaemonState, translate};
 use super::screen::{ScreenState, build_attach_redraw};
 
 /// R4-C3: handshake (= 1 client の HandshakeRequest 受信 + token 検証) を完了
@@ -426,6 +427,7 @@ pub(super) fn process_pending_handshakes(
     next_client_id: &mut u64,
     clients: &mut Vec<ClientHandle>,
     state: &mut SessionState,
+    daemon_state: &mut DaemonState,
     overflow_ids: &mut Vec<u64>,
     screen_state: &ScreenState,
     pending_redraws: &mut Vec<u64>,
@@ -454,11 +456,12 @@ pub(super) fn process_pending_handshakes(
                         let became_leader = accepted.became_leader;
                         // DR-0020 §4: `--detach-others` (= push 後に自分以外を奪取)。
                         let want_detach_others = accepted.detach_others;
-                        let mode_change_for_locked = state.lock.holder().map(|holder| ModeChange {
-                            session_mode: SessionMode::Locked,
-                            lock_holder: Some(holder),
-                            client_mode: None,
-                        });
+                        let mode_change_for_locked =
+                            daemon_state.lock.holder().map(|holder| ModeChange {
+                                session_mode: SessionMode::Locked,
+                                lock_holder: Some(holder),
+                                client_mode: None,
+                            });
                         if let Some(mc) = mode_change_for_locked.as_ref() {
                             // accept した client に「現在 lock 中」を通知
                             let _ = send_control(&accepted.handle, ControlMessage::ModeChange(*mc));
@@ -511,8 +514,14 @@ pub(super) fn process_pending_handshakes(
                             // 強制 drop と同じ経路 (= entry drop に一本化) が素直で、
                             // worker が socket を所有している構造とも整合する。
                             pending_handshakes.clear();
-                            let mut dropped_held_lock = false;
                             let mut dropped_any_leader = false;
+                            // DR-0025 Phase 2-α2: 奪取された client の detach を reducer
+                            // 経路 (Client → Lock の ClientDisconnected dispatch → holder
+                            // なら ClientBroadcast(ModeChange)) に流す。effect はループ後
+                            // (= LeaderNotify の後) に execute し、既存の broadcast 順序
+                            // 「drop 群 → LeaderNotify → ModeChange」を保存する
+                            // (= serve_loop の drop cascade と同一規律)。
+                            let mut detach_effects: Vec<reducer::Effect> = Vec::new();
                             let mut k = clients.len();
                             while k > 0 {
                                 k -= 1;
@@ -524,17 +533,10 @@ pub(super) fn process_pending_handshakes(
                                 if ch.leader {
                                     dropped_any_leader = true;
                                 }
-                                // DR-0025 Phase 1a: 奪取された holder client の
-                                // process-bound GC も lock reducer に委譲する。
-                                if super::lock::reduce(
-                                    &mut state.lock,
-                                    LockMsg::ClientDisconnected { client_id: ch.id },
-                                )
-                                .iter()
-                                .any(|e| matches!(e, LockEvent::Released { .. }))
-                                {
-                                    dropped_held_lock = true;
-                                }
+                                detach_effects.extend(reducer::handle(
+                                    daemon_state,
+                                    translate::client_detached(detached_id),
+                                ));
                                 drop(ch);
                                 state.record_registry.push_lifecycle(
                                     super::record::LifecycleEvent::ClientDetached {
@@ -552,16 +554,15 @@ pub(super) fn process_pending_handshakes(
                                     }),
                                 ));
                             }
-                            if dropped_held_lock {
-                                overflow_ids.extend(broadcast_control(
-                                    clients,
-                                    &ControlMessage::ModeChange(ModeChange {
-                                        session_mode: state.session_mode(),
-                                        lock_holder: None,
-                                        client_mode: None,
-                                    }),
-                                ));
-                            }
+                            // holder が奪取された場合の ModeChange(Rw) broadcast は蓄積
+                            // effect の execute が担う (= 実行位置は LeaderNotify の後、
+                            // serve_loop の drop cascade と同一規律)。
+                            reducer::execute_with_feedback(
+                                daemon_state,
+                                detach_effects,
+                                clients,
+                                overflow_ids,
+                            );
                         }
                     }
                     Err(_) => {
@@ -750,6 +751,7 @@ mod tests {
         );
         let mut next_client_id = 1u64;
         let mut state = SessionState::default();
+        let mut daemon_state = DaemonState::default();
         let mut overflow_ids = Vec::new();
         let screen_state = ScreenState::new(24, 80, 100);
         let mut pending_redraws = Vec::new();
@@ -759,6 +761,7 @@ mod tests {
             &mut next_client_id,
             clients,
             &mut state,
+            &mut daemon_state,
             &mut overflow_ids,
             &screen_state,
             &mut pending_redraws,

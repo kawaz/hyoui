@@ -8,14 +8,14 @@
 //!   の read-only accessor 経由でのみ行う。
 //! - [`reduce`]: [`LockMsg`] を受けて [`LockState`] を遷移させ [`LockEvent`] を
 //!   返す pure function (= socket / PTY / broadcast / record を一切持たない、
-//!   100% unit test 可能)。caller が [`LockEvent`] を見て既存の reply / broadcast /
-//!   lifecycle record を実行する旧経路 (= Phase 2-α2 で `reduce_msg` に一本化して削除予定)。
-//! - [`reduce_msg`]: DR-0025 Phase 2 — super-reducer ([`DomainOutput`]) 形式の入口。
-//!   内部で [`reduce`] を呼び、`Released` を `ClientBroadcast(ModeChange)` Effect に翻訳
-//!   する (Acquired / Denied / TokenRequired の Effect 化は control.rs 配線と同時)。
-//! - [`SessionState`]: lock domain (`lock`) + record registry + 子 stopped 観測 /
-//!   suspend policy を束ねる session-scope state。record / child 系の domain 分離は
-//!   DR-0025 後続 Phase (Child / Serve reducer 化)。
+//!   100% unit test 可能)。[`reduce_msg`] の内部実装。
+//! - [`reduce_msg`]: super-reducer ([`DomainOutput`]) 形式の入口 (DR-0025 Phase 2)。
+//!   内部で [`reduce`] を呼び、[`LockEvent`] を Effect (ClientReply / ClientBroadcast)
+//!   に翻訳する。tuple 第 2 要素の event 列は caller の TokenRequired 2-phase /
+//!   lifecycle record 判定用の副情報。
+//! - [`SessionState`]: record registry + 子 stopped 観測 / suspend policy を束ねる
+//!   session-scope state (lock は DR-0025 Phase 2-α2 で `DaemonState` へ移設済み)。
+//!   record / child 系の domain 分離は DR-0025 後続 Phase (Child / Serve reducer 化)。
 //! - [`generate_lock_token`]: 128-bit hex token を /dev/urandom から生成 (= IO
 //!   境界、reducer の外で呼び grant 確定時のみ token を [`LockMsg::Acquire`] に渡す)。
 //! - [`should_assign_leader`] / [`elevate_next_leader`]: 新規 rw client / 既存
@@ -255,45 +255,120 @@ pub(super) fn reduce(state: &mut LockState, msg: LockMsg) -> Vec<LockEvent> {
 /// DR-0025 Phase 2: [`LockMsg`] を受けて super-reducer 直結の [`DomainOutput`] を返す
 /// Effect 形式の reducer。
 ///
-/// 内部で既存の pure [`reduce`] を呼び、返る [`LockEvent`] を [`Effect`](super::reducer::Effect)
-/// に翻訳する。翻訳規約:
+/// 内部で pure [`reduce`] を呼び、返る [`LockEvent`] を [`Effect`](super::reducer::Effect)
+/// に翻訳する。翻訳規約 (= 既存 `handle_lock_acquire` / `handle_lock_release` の応答形
+/// を保存):
 ///
-/// - [`LockEvent::Released`] → `ClientBroadcast(ModeChange)` Effect。lock 解放を全 subscribe
-///   client に通知する (= DR-0025 §Lock domain の `Lock ──→ Client` broadcast)。Released 後は
-///   holder が無いので `session_mode = Rw` / `lock_holder = None`。`client_mode = None` は
-///   「session 全体の変化で個別 client の mode 変化ではない」を表す (`ModeChange` の
-///   `client_mode` 意味論)。
-/// - [`LockEvent::Acquired`] / [`LockEvent::TokenRequired`] / [`LockEvent::Denied`] は
-///   この片では **翻訳しない** (= 空)。acquire/release の `LockResponse` reply 経路は
-///   `control.rs` の request 配線 (= client_id 対応・token 生成の 2-phase) と不可分で、
-///   Effect 化は次片以降で行う。
+/// - `Acquired { newly_acquired: false }` (= idempotent 再取得) →
+///   `ClientReply(LockResponse::Acquired + 発行済 token)` のみ (broadcast なし、DR-0008 R4-C9)
+/// - `Acquired { newly_acquired: true }` (= 新規 grant) →
+///   `ClientReply(LockResponse::Acquired)` → `ClientBroadcast(ModeChange { Locked, holder })`
+///   の順 (= reply が broadcast より先、既存応答順)
+/// - `Denied { HeldByOther }` (= acquire 拒否) → `ClientReply(LockResponse::Denied)`
+///   (wait queue は MVP 未実装なので wait=true でも Denied 1 frame、DR-0008 Round2 #3)
+/// - `Denied { NotHolderOrTokenMismatch }` (= release 拒否) →
+///   `ClientReply(Error::LockNotHeld)` (= release の拒否応答は LockResponse でなく error frame)
+/// - `Released` (= explicit release / process-bound GC 共通) →
+///   `ClientBroadcast(ModeChange { Rw, holder: None })` (release に成功 reply は無い =
+///   broadcast が事実上の通知、既存挙動)
+/// - `TokenRequired` → **Effect なし**。token 生成 (= urandom IO) は reducer の外で行う
+///   2-phase の合図で、caller が [`generate_lock_token`] → `Acquire { token: Some }` を
+///   再投入する (= 完全 message-driven 化 (GenerateLockToken Effect) は lifecycle record
+///   の Effect 化と併せて Phase 2-γ)
 ///
-/// 既存 [`reduce`] は旧経路 (= Phase 1a で caller が `LockEvent` を直接 IO 実行する経路) の
-/// ために残す。旧経路は control.rs の配線を Effect 経由に移す次片で削除する。
-pub(super) fn reduce_msg(state: &mut LockState, msg: LockMsg) -> DomainOutput {
-    use super::reducer::{BroadcastFilter, Domain, Effect, EffectId, EffectKind};
-    use crate::protocol::messages::{ControlMessage, ModeChange};
+/// 返り値の `Vec<LockEvent>` は caller 専用の副情報: TokenRequired の 2-phase 制御と
+/// lifecycle record (= `newly_acquired` / `Released` の判定、record が Effect 化される
+/// Phase 2-γ まで caller 側 IO) に使う。super-reducer 経由の dispatch (= cross-domain の
+/// `ClientDisconnected`) は `DomainOutput` のみ消費し、event 側は捨ててよい (= GC 経路の
+/// lifecycle record は既存挙動でも発火しない)。
+pub(super) fn reduce_msg(state: &mut LockState, msg: LockMsg) -> (DomainOutput, Vec<LockEvent>) {
+    use super::reducer::{BroadcastFilter, ClientId, Domain, Effect, EffectId, EffectKind};
+    use crate::protocol::messages::{
+        ControlMessage, ErrorCode, ErrorMessage, LockResponse, LockResult, ModeChange,
+    };
+
+    let next_id = |state: &mut LockState| {
+        let seq = state.next_effect_seq;
+        state.next_effect_seq += 1;
+        EffectId(Domain::Lock, seq)
+    };
 
     let events = reduce(state, msg);
     let mut out = DomainOutput::empty();
-    for ev in events {
-        if let LockEvent::Released { .. } = ev {
-            let seq = state.next_effect_seq;
-            state.next_effect_seq += 1;
-            out.effects.push(Effect {
-                id: EffectId(Domain::Lock, seq),
-                kind: EffectKind::ClientBroadcast {
-                    message: ControlMessage::ModeChange(ModeChange {
-                        session_mode: SessionMode::Rw,
-                        lock_holder: None,
-                        client_mode: None,
+    for ev in &events {
+        match ev {
+            LockEvent::Acquired {
+                client_id,
+                token,
+                newly_acquired,
+            } => {
+                out.effects.push(Effect {
+                    id: next_id(state),
+                    kind: EffectKind::ClientReply {
+                        client_id: ClientId(*client_id),
+                        message: ControlMessage::LockResponse(LockResponse {
+                            result: LockResult::Acquired,
+                            token: token.clone(),
+                            queue_position: None,
+                        }),
+                    },
+                });
+                if *newly_acquired {
+                    out.effects.push(Effect {
+                        id: next_id(state),
+                        kind: EffectKind::ClientBroadcast {
+                            message: ControlMessage::ModeChange(ModeChange {
+                                // grant 済み state から導出 (= Locked)。導出規則の正本は
+                                // LockState::session_mode に一元化する。
+                                session_mode: state.session_mode(),
+                                lock_holder: Some(*client_id),
+                                client_mode: None,
+                            }),
+                            filter: BroadcastFilter::SubscribersOnly,
+                        },
+                    });
+                }
+            }
+            LockEvent::TokenRequired { .. } => {}
+            LockEvent::Released { .. } => {
+                out.effects.push(Effect {
+                    id: next_id(state),
+                    kind: EffectKind::ClientBroadcast {
+                        message: ControlMessage::ModeChange(ModeChange {
+                            // release 済み state から導出 (= Rw)。導出規則の正本は
+                            // LockState::session_mode に一元化する。
+                            session_mode: state.session_mode(),
+                            lock_holder: None,
+                            client_mode: None,
+                        }),
+                        filter: BroadcastFilter::SubscribersOnly,
+                    },
+                });
+            }
+            LockEvent::Denied { client_id, reason } => {
+                let message = match reason {
+                    DenyReason::HeldByOther => ControlMessage::LockResponse(LockResponse {
+                        result: LockResult::Denied,
+                        token: None,
+                        queue_position: None,
                     }),
-                    filter: BroadcastFilter::SubscribersOnly,
-                },
-            });
+                    DenyReason::NotHolderOrTokenMismatch => ControlMessage::Error(ErrorMessage {
+                        code: ErrorCode::LockNotHeld,
+                        message: "lock token mismatch or not the lock holder".into(),
+                        details: None,
+                    }),
+                };
+                out.effects.push(Effect {
+                    id: next_id(state),
+                    kind: EffectKind::ClientReply {
+                        client_id: ClientId(*client_id),
+                        message,
+                    },
+                });
+            }
         }
     }
-    out
+    (out, events)
 }
 
 /// session 全体の状態 (Phase 10)。lock domain + record registry + 子観測 state。
@@ -308,8 +383,6 @@ pub(super) fn reduce_msg(state: &mut LockState, msg: LockMsg) -> DomainOutput {
 /// - `record_registry`: DR-0016 record sink 集合 (= Phase 4 で hot path 配線)
 #[derive(Debug, Default)]
 pub(super) struct SessionState {
-    /// DR-0025 Phase 1a: lock domain state。mutation は [`reduce`] 経由のみ。
-    pub(super) lock: LockState,
     /// DR-0016 §8 — session-scope の record sink 集合。`Arc` で複数 hook 点から
     /// clone して持つ (= push 時に lock 不要、registry 内部で同期)。
     pub(super) record_registry: Arc<RecordRegistry>,
@@ -348,13 +421,6 @@ fn policy_from_u8(v: u8) -> ChildSuspendPolicy {
 }
 
 impl SessionState {
-    /// session 全体の SessionMode (= mode.change の `session_mode` 用)。
-    ///
-    /// lock domain に委譲する (DR-0025 Phase 1a)。
-    pub(super) fn session_mode(&self) -> SessionMode {
-        self.lock.session_mode()
-    }
-
     /// DR-0017 §柱2: 子の stopped 観測状態を更新する。
     pub(super) fn set_child_stopped(&self, stopped: bool) {
         self.child_stopped.store(stopped, Ordering::Relaxed);
