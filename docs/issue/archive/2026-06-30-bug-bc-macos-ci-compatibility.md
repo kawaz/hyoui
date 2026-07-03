@@ -1,6 +1,6 @@
 ---
 title: pipe_send_eof_default_terminates_bc が macos-latest CI で bc 互換性問題により失敗
-status: open
+status: resolved
 category: bug
 created: 2026-06-30T11:00:51+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-03T18:58:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: "誤診断だった。真因は bc 互換性ではなく attach run loop の RawAck 未処理 (archive/2026-07-03-bug-attach-run-loop-drops-rawack.md) で、client が入力 forward 直後に死んで stdout が空になっていた。RawAck fix + test の bc 非依存化 (sh read-loop、pipe_send_eof_default_terminates_child に rename) で解消、pipe e2e 3 件 green"
 blocked_by:
 origin: 自リポ TODO
 ---
@@ -60,3 +60,16 @@ deterministic 失敗。
 - DR-0019 §5 (`stdin-eof=detach|send-eof` policy)
 - 旧実装の C-1 再現テスト (= pipe stdin で client が CPU spin せず、SendEof default で子が
   自然 exit する) の検証目的
+
+## Close 時の訂正 (2026-07-03)
+
+本 issue の「bc 互換性問題」という診断は誤りだった。実測での真因:
+
+- client (attach run loop) が daemon の RawAck (DR-0021) を unknown frame 扱いして
+  入力 forward 直後に exit 1 → 子の出力を中継する前に死ぬ → stdout 空 → assert fail
+- bc の種別 (GNU / Howard / BSD) は無関係。sh read-loop 置換後も修正前 binary では
+  同一 failure を再現、RawAck fix 後に green
+- 「macos のみ」に見えたのは ubuntu ignored job が backpressure deadlock で先に
+  fail し当該 test まで到達していなかったため
+
+詳細: archive/2026-07-03-bug-attach-run-loop-drops-rawack.md
