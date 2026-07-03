@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-07-04 | bug | open | [bug-flaky-outer-token-e2e-deadline](./2026-07-04-bug-flaky-outer-token-e2e-deadline.md) | outer_token_inheritance_skips_auto_acquire が単独実行でも稀に 30s deadline fail (macOS CI flaky と同一 test) |
 | 2026-07-03 | bug | open | [bug-flaky-serve-tail-follow-tail-end](./2026-07-03-bug-flaky-serve-tail-follow-tail-end.md) | serve_tail_follow_receives_tail_end_on_child_exit が ubuntu CI で flaky fail (並走 CI では pass) |
 | 2026-07-03 | bug | open | [bug-macos-ci-flaky-pty-tests](./2026-07-03-bug-macos-ci-flaky-pty-tests.md) | macos CI で PTY 系 e2e が flaky fail (outer_token_inheritance / child_inherits_session_id_env、main red の実原因) |
 | 2026-07-03 | bug | open | [bug-main-unittest-hang-ubuntu-ci](./2026-07-03-bug-main-unittest-hang-ubuntu-ci.md) | hyoui-cli main.rs unit tests が ubuntu CI で hang (send_raw_bytes_partial_byte_race_regression / list_marks_stale_socket、flaky) |
