@@ -1,6 +1,6 @@
 ---
 title: "Advanced feature idea: hyoui dump jsonl の自分ドメイン辞書付き zstd 圧縮 (`jsonl.zst`)"
-status: open
+status: idea
 category: tech-memo
 created: 2026-06-01T00:00:00+09:00
 last_read: 2026-06-22T10:50:08+09:00
@@ -134,3 +134,8 @@ crates/hyoui/assets/zstd-dict-hyoui-tty.dict (= binary, ~16-64KB)
 - [DR-0008](../decisions/DR-0008-protocol-design.md) — protocol cap flag 規約
 - [DR-0013](../decisions/DR-0013-screen-emulator-and-attach-stability.md) — Phase C で zstd 言及 (= scrollback 圧縮、本 issue とは独立の zstd 用途)
 - `zstd` crate (= Rust binding for libzstd)
+
+## Triage (2026-07-03)
+
+必要性の実例 (= dump jsonl のサイズが実運用で問題になった事例) が出るまで idea に落とす。
+DR-0013 Phase C の zstd 検討と統合先を再評価するのはその時点で。

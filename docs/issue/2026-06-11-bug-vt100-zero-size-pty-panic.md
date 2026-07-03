@@ -54,3 +54,17 @@ script -q /tmp/typescript.out target/debug/hyoui run --socket=/tmp/x.sock -- /bi
 ## 関連
 
 - docs/issue/2026-06-11-bug-jobcontrol-follow-test-hangs.md (調査中の副産物として発見)
+
+## 再現手順の発見 (2026-07-03)
+
+`script -q /dev/null <cmd>` が 0x0 winsize の PTY を割り当てるため、これで確実に再現できる:
+
+```bash
+(printf 'hi\n'; sleep 2) | script -q /dev/null ./target/debug/hyoui run --session dbg -- cat
+# => thread 'main' panicked at vt100-0.16.2/src/grid.rs:26:28:
+#    attempt to subtract with overflow
+```
+
+CI harness / script(1) / cron 等の「サイズ未設定 PTY」で実運用でも踏み得る。
+fix 候補: PTY サイズ確定時に cols/rows を min 1 に clamp (daemon 側の resize /
+初期化経路)。

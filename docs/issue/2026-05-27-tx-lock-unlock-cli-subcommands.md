@@ -102,3 +102,11 @@ hyoui unlock <name> [--token T | --force]
 - protocol Lock message 定義: `crates/hyoui/src/protocol/messages/lock.rs`
 - daemon Lock handler: `crates/hyoui/src/daemon/control.rs` の `handle_lock_acquire` /
   `handle_lock_release`
+
+## Triage (2026-07-03)
+
+DR-0025 Phase 1a (Lock domain pure reducer 化、feat commit 93102075) が land し、daemon 側
+lock の構造基盤が整った。ただし daemon 側 wait queue / `timeout_abs_ms` / `timeout_idle_ms`
+は依然未実装 (CLI 側 polling で擬似実現のまま)。timer を message として注入する仕組みは
+DR-0025 Q3 (Phase 2-3) で入る予定のため、**残タスクの `hyoui tx` 実装と daemon 側 timeout
+semantics の完全化は Phase 2-3 の timer 導入後が適期**。それまで本 issue は wip のまま保持。
