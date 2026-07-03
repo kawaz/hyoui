@@ -194,10 +194,12 @@ fn attach_other_session_from_inside_is_allowed() {
     spawn_detached(runtime.path(), other);
 
     // 中から ($HYOUI_SESSION_ID=me) 別セッション (other) への attach は self ではない。
-    // attach は raw mode に入って block するため、stdin を即 EOF にして detach させ、
-    // 「self 拒否で即エラー終了しない」ことだけを確認する (= exit が拒否の 2 でない)。
+    // attach は接続後 block するため、stdin 即 EOF (= /dev/null) で終了させる。
+    // `--stdin-eof=detach` の明示が必須: 非 tty stdin の default は send-eof で、
+    // EOF 後も attach を継続する (= ro 観戦の正規挙動) ため test が返ってこない。
+    // 検証したいのは「self 拒否で即エラー終了しない」ことだけ。
     let out = Command::new(hyoui_bin())
-        .args(["attach", other, "--mode=ro"])
+        .args(["attach", other, "--mode=ro", "--stdin-eof=detach"])
         .env("XDG_RUNTIME_DIR", runtime.path())
         .env("HYOUI_SESSION_ID", me)
         .env_remove("HYOUI_LOCK_TOKEN")
@@ -260,11 +262,14 @@ fn attach_other_socket_from_inside_is_allowed() {
     spawn_detached(runtime.path(), other);
 
     let other_sock = runtime.path().join("hyoui").join(format!("{other}.sock"));
+    // `--stdin-eof=detach` の明示が必須 (attach_other_session_from_inside_is_allowed
+    // と同じ理由: 非 tty stdin の default send-eof は EOF 後も attach を継続する)。
     let out = Command::new(hyoui_bin())
         .args([
             "attach",
             &format!("--socket={}", other_sock.display()),
             "--mode=ro",
+            "--stdin-eof=detach",
         ])
         .env("XDG_RUNTIME_DIR", runtime.path())
         .env("HYOUI_SESSION_ID", me)

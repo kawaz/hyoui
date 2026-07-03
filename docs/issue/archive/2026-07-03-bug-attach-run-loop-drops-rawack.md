@@ -58,3 +58,15 @@ daemon")` に落ちて client が exit 1 する。
 daemon が「ack を要求していない client」にも無条件で ack を返す現仕様は、
 interactive 打鍵のたびに frame を 1 往復増やす。protocol kind 写像の整理
 (DR-0025 Phase 2) で ack 要求の opt-in 化を検討する価値がある。
+
+## 追記: fix で顕在化した「crash-exit 依存」の test 2 件
+
+self_session_resolve.rs の `attach_other_session_from_inside_is_allowed` /
+`attach_other_socket_from_inside_is_allowed` は「非 tty stdin の EOF 後、
+ro attach 越しの EOT 送信が daemon に reject され、err ack を unknown frame と
+誤処理した client が異常終了する」ことに**偶然依存して**終了していた。fix 後は
+仕様通り attach が継続する (= ro 観戦の正規挙動) ため永久待ちになる。
+`--stdin-eof=detach` を明示して意図した終了経路に修正済み。
+
+= 「エラーで偶然止まっていた」ものは fix で止まらなくなる。挙動 fix 時は
+「その誤挙動に依存して終了/成立していた test」の存在を疑うこと。
