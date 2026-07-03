@@ -45,7 +45,7 @@ use super::broadcast::{
     ClientHandle, SharedBytes, Subscription, broadcast_control, enqueue_for_client, send_control,
     writer_pump,
 };
-use super::lock::{SessionState, elevate_next_leader, should_assign_leader};
+use super::lock::{LockEvent, LockMsg, SessionState, elevate_next_leader, should_assign_leader};
 use super::screen::{ScreenState, build_attach_redraw};
 
 /// R4-C3: handshake (= 1 client の HandshakeRequest 受信 + token 検証) を完了
@@ -454,7 +454,7 @@ pub(super) fn process_pending_handshakes(
                         let became_leader = accepted.became_leader;
                         // DR-0020 §4: `--detach-others` (= push 後に自分以外を奪取)。
                         let want_detach_others = accepted.detach_others;
-                        let mode_change_for_locked = state.lock_holder.map(|holder| ModeChange {
+                        let mode_change_for_locked = state.lock.holder().map(|holder| ModeChange {
                             session_mode: SessionMode::Locked,
                             lock_holder: Some(holder),
                             client_mode: None,
@@ -524,10 +524,16 @@ pub(super) fn process_pending_handshakes(
                                 if ch.leader {
                                     dropped_any_leader = true;
                                 }
-                                if state.lock_holder == Some(ch.id) {
+                                // DR-0025 Phase 1a: 奪取された holder client の
+                                // process-bound GC も lock reducer に委譲する。
+                                if super::lock::reduce(
+                                    &mut state.lock,
+                                    LockMsg::ClientDisconnected { client_id: ch.id },
+                                )
+                                .iter()
+                                .any(|e| matches!(e, LockEvent::Released { .. }))
+                                {
                                     dropped_held_lock = true;
-                                    state.lock_holder = None;
-                                    state.lock_token = None;
                                 }
                                 drop(ch);
                                 state.record_registry.push_lifecycle(

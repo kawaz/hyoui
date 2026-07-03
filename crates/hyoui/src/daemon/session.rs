@@ -43,7 +43,7 @@ use super::broadcast::{
     ClientHandle, MAX_CLIENTS_PER_DAEMON, broadcast_control, broadcast_master_bytes, send_control,
 };
 use super::control::{ClientFrameOutcome, FrameOrError, handle_client_frame};
-use super::lock::{SessionState, elevate_next_leader};
+use super::lock::{LockEvent, LockMsg, SessionState, elevate_next_leader};
 use super::pty::{
     ALIVE_RETRY_INTERVAL, ChildLifecycle, ChildState, ChildTransition, STOPPED_POLL_INTERVAL,
 };
@@ -1636,10 +1636,17 @@ fn serve_loop(
             if ch.leader {
                 dropped_any_leader = true;
             }
-            if state.lock_holder == Some(ch.id) {
+            // DR-0025 Phase 1a: holder client の切断による process-bound GC は lock
+            // reducer に委譲する。Released (= ProcessBoundGc) が返ったら mode.change
+            // broadcast の契機 (dropped_held_lock) にする。非 holder の切断は空 event。
+            if super::lock::reduce(
+                &mut state.lock,
+                LockMsg::ClientDisconnected { client_id: ch.id },
+            )
+            .iter()
+            .any(|e| matches!(e, LockEvent::Released { .. }))
+            {
                 dropped_held_lock = true;
-                state.lock_holder = None;
-                state.lock_token = None;
             }
             // ClientHandle::Drop が writer_tx close + reader shutdown +
             // writer_thread join を一括実行 (R5-H18)。backpressure 超過時の
@@ -1804,7 +1811,7 @@ fn reap_blocking(child: Pid, outcome: &RelayOutcome) -> Result<i32, Error> {
 mod tests {
     use super::super::accept::constant_time_eq;
     use super::super::control::signal_name_to_nix_signal;
-    use super::super::lock::{generate_lock_token, should_assign_leader};
+    use super::super::lock::{LockMsg, generate_lock_token, should_assign_leader};
     use super::*;
     use crate::protocol::messages::{
         Detach, DetachTarget, ErrorCode, Kill, LockResult, SessionMode, TailEndReason,
@@ -2689,8 +2696,17 @@ mod tests {
     fn session_mode_reflects_lock_holder() {
         let mut s = SessionState::default();
         assert_eq!(s.session_mode(), SessionMode::Rw);
-        s.lock_holder = Some(7);
-        s.lock_token = Some("abcd".into());
+        // DR-0025 Phase 1a: lock state は reducer 経由でのみ mutate する。grant すると
+        // holder が Some になり session_mode が Locked に切り替わる。検証意図 (= lock
+        // holder の有無で session_mode が導出される) は元 test と同一で、state 構築のみ
+        // 直接 field 代入から reduce 経由に追従させた。
+        super::super::lock::reduce(
+            &mut s.lock,
+            LockMsg::Acquire {
+                client_id: 7,
+                token: Some("abcd".into()),
+            },
+        );
         assert_eq!(s.session_mode(), SessionMode::Locked);
     }
 
