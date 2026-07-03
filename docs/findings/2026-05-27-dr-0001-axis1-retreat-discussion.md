@@ -87,7 +87,7 @@ agent (= Claude) の補足:
 
 ## 関連する claude TUI 動作の解釈
 
-cast 解析 (= `claude2.cast` t=10.86) で claude TUI が
+cast 解析 (= `testdata/claude2.cast` t=10.86) で claude TUI が
 「Claude Code has been suspended. Run \`fg\` to bring Claude Code back.」
 を出力していた件:
 
@@ -96,7 +96,7 @@ cast 解析 (= `claude2.cast` t=10.86) で claude TUI が
 - 内部で `raise(SIGTSTP)` を呼んでいるが、kernel が discard、表面上は「suspended message を
   print して shell に戻ったつもり」になっているが実際は子も hyoui client も走り続け
 - これが cast で「^Z 連打しても無反応」だった現象の説明
-- 直接 claude 起動 (= claude1.cast) では shell の中の子なので orphan ではなく、
+- 直接 claude 起動 (= testdata/claude1.cast) では shell の中の子なので orphan ではなく、
   SIGTSTP が正常 fire、shell が suspended job として認識する
 
 → claude TUI の suspended message 出力は「user 期待 vs OS 仕様」の乖離を product 側が
