@@ -3,12 +3,16 @@
 - Status: Active — 🟡 record core 実装済 (v0.2.x 出荷、Phase 4 daemon hot path 配線完了)
 - Date: 2026-06-01
 
-> **⚠ 実装状況の注意 (2026-06-10 時点)**: 本 DR の record 本体 (start/stop/list、jsonl/raw sink、
-> bounded queue + writer task、lifecycle event) は実装・出荷済みだが、**§6 の secret redaction
-> (`redact-after-prompt`) は未実装**。state machine の配線が Phase 5 に積み残されており
-> (`crates/hyoui/src/daemon/record.rs` 冒頭 `⚠ redaction は未実装` 参照)、`--input-secrecy` の値に
-> 関わらず **stdin は素通しで記録される**。passphrase / token を録画したくない場合は録画対象を
-> `--stdout` のみに限定すること。本実装は
+> **⚠ 実装状況の注意 (2026-07-03 更新)**: 本 DR の record 本体 (start/stop/list、jsonl/raw sink、
+> bounded queue + writer task、lifecycle event) は実装・出荷済み。**§6 の secret redaction
+> state machine (`redact-after-prompt`) は Phase 5 未配線**のため、記録ファイルが「redact 済」と
+> 虚偽申告するのを防ぐ interim 正直化を入れた (= §6a):
+>
+> - **default を `record-all`** に変更 (= stdin を verbatim 記録、`record start` の loud warning で明示)。
+> - **`redact-after-prompt` は reject** (= parse 段 `Command::Error` + daemon `RecordStartError::RedactionUnimplemented` の双方)。未実装の policy で「redact 済」file を作らせない。
+> - **`never-record-stdin` は実装済** (= stdin 由来 event を sink に配信せず、header 申告が正直)。
+>
+> Phase 5 で redaction state machine を配線したら `redact-after-prompt` を default 復帰させる。本実装は
 > [docs/issue/2026-06-10-feature-record-redaction-phase5.md](../issue/2026-06-10-feature-record-redaction-phase5.md) で追跡。
 - Related: DR-0005 (= 外側自動操作主軸、本 DR の思想根拠), DR-0008 (= protocol cap flag), DR-0013 (= daemon = screen state 正本、本 DR は I/O stream 正本化), DR-0014 (= 透過原則 + 検証主義、本 DR は観測道具の整備), DR-0015 (= jobcontrol notify / resume protocol、本 DR の lifecycle event 経路)
 - Supersedes / Superseded by: なし
@@ -202,6 +206,30 @@ pub enum WriteError {
 - bug 解析で stdin 内容が見えない代わりに secret 完全保護
 
 custom prompt regex は `--prompt-pattern <regex>` で override 可。
+
+#### 6a. interim 正直化 (2026-07-03、redaction state machine 実装まで)
+
+§6 の redaction state machine (`redact-after-prompt`) は Phase 5 に積み残されている。
+未配線のまま `--input-secrecy` の値だけを header に書くと、記録ファイルが「redact 済」と
+**虚偽申告**する (= 実際は stdin が平文で残る)。これを防ぐため、Phase 5 まで以下の interim
+挙動を取る:
+
+- **default を `record-all` に変更** (= 旧 default `redact-after-prompt` から)。stdin は verbatim
+  記録され、`record start` の loud warning で「secrets typed WILL be stored」を明示する。
+- **`redact-after-prompt` は reject**: CLI parse 段 (= `Command::Error` + 代替 policy への
+  migration hint) と daemon の `RecordRegistry::start` 段 (= `RecordStartError::RedactionUnimplemented`
+  → `ErrorCode::RecordRedactionUnimplemented` / wire `record.redaction-unimplemented`) の双方で塞ぐ。
+  後者は旧 client / 別実装 client の直接 protocol 経由も防ぐ。
+- **`never-record-stdin` は実装**: `NeverRecordStdin` の sink には stdin 由来 event
+  (`BytesIn` / `InRejected` / `InWriteError` = いずれも生 bytes を含む) を配信しない (= `push_*`
+  段で skip)。stdin は一切 file に残らず、header の `input_secrecy` 申告が正直になる。§6 本来の
+  「`in-redacted` event で byte_count を残す」形は Phase 5 で実装する (= interim は byte_count も
+  残さず完全 drop、より安全側)。
+
+protocol の `InputSecrecy` enum は 3 variant を維持する (= wire 互換、reject は handler / start 層で行う)。
+
+**Phase 5 完了時の復帰条件**: redaction state machine を配線し、`redact-after-prompt` の reject を
+解除して default に復帰させる。`ErrorCode::RecordRedactionUnimplemented` は同時に削除する。
 
 #### 7. protocol message + cap flag
 

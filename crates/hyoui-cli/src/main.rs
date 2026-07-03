@@ -3843,10 +3843,12 @@ fn map_record_format(f: RecordFormatArg) -> RecordFormat {
 /// CLI 表現の input secrecy を protocol 表現に写像。
 fn map_record_input_secrecy(s: RecordInputSecrecyArg) -> InputSecrecy {
     match s {
+        // redact-after-prompt は parse 段で reject 済 (= ここには到達しない) が、
+        // protocol enum との 1:1 写像として arm を残す (DR-0016 §6 interim)。
         RecordInputSecrecyArg::RedactAfterPrompt => InputSecrecy::RedactAfterPrompt,
         RecordInputSecrecyArg::RecordAll => InputSecrecy::RecordAll,
         RecordInputSecrecyArg::NeverRecordStdin => InputSecrecy::NeverRecordStdin,
-        _ => InputSecrecy::RedactAfterPrompt,
+        _ => InputSecrecy::RecordAll,
     }
 }
 
@@ -3866,27 +3868,27 @@ fn print_record_cap_hint(err_msg: &str) {
 /// `--input-secrecy` の値と出力 path を埋め込み、record file が機密情報を含む
 /// 可能性を毎回明示する (= ユーザが「うっかり共有」を防ぐ最終防壁)。
 fn print_record_start_warning(output_path: &std::path::Path, secrecy: RecordInputSecrecyArg) {
-    let secrecy_str = match secrecy {
-        RecordInputSecrecyArg::RedactAfterPrompt => "redact-after-prompt",
-        RecordInputSecrecyArg::RecordAll => "record-all",
-        RecordInputSecrecyArg::NeverRecordStdin => "never-record-stdin",
-        _ => "redact-after-prompt",
-    };
     eprintln!("WARNING: record file contains ALL bytes including potential secrets");
     eprintln!("  (passwords typed at prompts, OTP, API tokens).");
     eprintln!(
         "  Output: {} (mode 0600, only readable by your user).",
         output_path.display()
     );
-    eprintln!("  Selected input secrecy: --input-secrecy={secrecy_str}.");
-    // redact-after-prompt は未実装 (= redaction 機構が無く stdin は素通しで記録
-    // される)。値を選んでも実際の redaction は行われないことを明示し、ユーザが
-    // 「redact されている」と誤認するのを防ぐ。
-    if matches!(secrecy, RecordInputSecrecyArg::RedactAfterPrompt) {
-        eprintln!(
-            "  NOTE: redact-after-prompt is NOT yet implemented; stdin is recorded\n        \
-             verbatim (no redaction). Secrets typed during recording WILL be stored."
-        );
+    match secrecy {
+        RecordInputSecrecyArg::NeverRecordStdin => {
+            eprintln!("  Input secrecy: --input-secrecy=never-record-stdin.");
+            eprintln!("  stdin is NOT recorded (dropped entirely); only stdout/lifecycle stored.");
+        }
+        // record-all (= interim default)。redact-after-prompt は parse 段で reject 済
+        // のため到達しないが、non_exhaustive の受け皿として record-all 扱い (= 安全側:
+        // 「stdin が残る」警告を出す、DR-0016 §6 interim)。
+        _ => {
+            eprintln!("  Input secrecy: --input-secrecy=record-all (default).");
+            eprintln!(
+                "  stdin is recorded VERBATIM (no redaction); secrets typed during\n  \
+                 recording WILL be stored in the record file."
+            );
+        }
     }
     eprintln!("  Do NOT share record files outside your authentication boundary.");
 }

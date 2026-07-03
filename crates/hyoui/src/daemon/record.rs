@@ -20,14 +20,19 @@
 //! - `RecordRegistry`: session-scope の sink 集合 (= start/stop/list/broadcast)
 //! - `RecordEvent`: in/out bytes / reject / write error / redaction / lifecycle
 //!
-//! ## ⚠ redaction は未実装 (= stdin は素通し記録)
+//! ## input secrecy の現状 (= redaction state machine は Phase 5)
 //!
-//! `InputSecrecy::RedactAfterPrompt` / `prompt_pattern` を request で渡せるが、
-//! **secret redaction の state machine は Phase 5 で配線予定で、現状は未実装**。
-//! `record-all` と同様に **stdin bytes をそのまま file に記録する** (= header の
-//! `input_secrecy` 値に関わらず redaction は効かない)。`InSecretRedacted` event /
-//! `push_in_secret_redacted` も Phase 5 まで dead code。passphrase / token 等を
-//! stdin で打つ session を `direction: stdin|both` で録ると平文で残る点に注意。
+//! `InputSecrecy` のうち **`RecordAll` / `NeverRecordStdin` が有効**:
+//! - `RecordAll` (= default): stdin bytes をそのまま file に記録する。passphrase /
+//!   token 等を `direction: stdin|both` で録ると平文で残る点に注意。
+//! - `NeverRecordStdin`: stdin 由来の event (`BytesIn` / `InRejected` /
+//!   `InWriteError` = いずれも生 bytes を含む) を当該 sink へ配信しない (= `push_*`
+//!   段で skip)。stdin は一切 file に残らず、header の `input_secrecy` 申告が正直になる。
+//!
+//! `RedactAfterPrompt` は `RecordRegistry::start` で **reject** する
+//! (= `RecordStartError::RedactionUnimplemented`)。prompt 検出 + redaction state
+//! machine が Phase 5 未配線のため、「redact 済」と偽る file を作らせない。
+//! `InSecretRedacted` event / `push_in_secret_redacted` も Phase 5 まで dead code。
 //!
 //! ## 設計判断メモ
 //!
@@ -283,6 +288,13 @@ pub enum RecordStartError {
     UnsupportedDirectionForFormat,
     #[error("invalid prompt pattern: {0}")]
     InvalidPromptPattern(String),
+    /// `input_secrecy = redact-after-prompt` だが redaction state machine が Phase 5
+    /// 未配線 (DR-0016 §6)。「redact 済」と偽る record file を作らせないための reject。
+    #[error(
+        "input-secrecy=redact-after-prompt is not yet implemented (Phase 5); \
+         use record-all or never-record-stdin"
+    )]
+    RedactionUnimplemented,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -304,6 +316,11 @@ pub struct RecordSink {
     pub output_path: PathBuf,
     pub started_by_client_id: u64,
     pub started_unix_ms: u64,
+    /// stdin redaction policy (DR-0016 §6 interim)。`NeverRecordStdin` なら stdin
+    /// 由来 event (`BytesIn` / `InRejected` / `InWriteError`) を配信しない。
+    /// `RedactAfterPrompt` は `start` 段で reject 済のため、実際に入るのは
+    /// `RecordAll` / `NeverRecordStdin` のみ。
+    input_secrecy: InputSecrecy,
     seq: AtomicU32,
     /// `Mutex<Option<_>>` で持つ理由: stop 時に **Sender を明示 drop** しないと
     /// writer thread の `rx.recv()` が永遠に待ち続ける (= Arc<RecordSink> 経由で
@@ -425,6 +442,14 @@ impl RecordRegistry {
             return Err(RecordStartError::UnsupportedDirectionForFormat);
         }
 
+        // 2b. redact-after-prompt は redaction state machine が Phase 5 未配線のため
+        // reject する (= 「redact 済」と偽る record file を作らせない、DR-0016 §6
+        // interim)。正規 CLI は parse 段で弾くが、旧 client / 別実装 client の直接
+        // protocol 経由もここで塞ぐ。
+        if matches!(request.input_secrecy, InputSecrecy::RedactAfterPrompt) {
+            return Err(RecordStartError::RedactionUnimplemented);
+        }
+
         // (3 の前に) prompt pattern compile 検証は Phase 5 で。Phase 2 では Option を
         // 受け取るが触らない (= None なら default、Some なら storage のみ、redaction の
         // state machine 配線は Phase 5 で行う)。
@@ -472,6 +497,7 @@ impl RecordRegistry {
             output_path: path,
             started_by_client_id,
             started_unix_ms,
+            input_secrecy: request.input_secrecy,
             seq: AtomicU32::new(1),
             tx: Mutex::new(Some(tx)),
             stats,
@@ -536,6 +562,11 @@ impl RecordRegistry {
         self.broadcast_for(
             |d| matches!(d, RecordDirection::Stdin | RecordDirection::Both),
             |sink| {
+                // never-record-stdin: stdin 由来 bytes を一切 file に残さない
+                // (DR-0016 §6 interim)。BytesIn を配信せず header の申告を正直にする。
+                if matches!(sink.input_secrecy, InputSecrecy::NeverRecordStdin) {
+                    return Ok(());
+                }
                 sink.try_push(RecordEvent::BytesIn {
                     client_id,
                     bytes: bytes.to_vec(),
@@ -573,6 +604,11 @@ impl RecordRegistry {
         self.broadcast_for(
             |d| matches!(d, RecordDirection::Stdin | RecordDirection::Both),
             |sink| {
+                // never-record-stdin: 却下 input も生 bytes を含むので配信しない
+                // (DR-0016 §6 interim)。
+                if matches!(sink.input_secrecy, InputSecrecy::NeverRecordStdin) {
+                    return Ok(());
+                }
                 sink.try_push(RecordEvent::InRejected {
                     client_id,
                     client_mode,
@@ -597,6 +633,11 @@ impl RecordRegistry {
         self.broadcast_for(
             |d| matches!(d, RecordDirection::Stdin | RecordDirection::Both),
             |sink| {
+                // never-record-stdin: unwritten_bytes に生 stdin を含むので配信しない
+                // (DR-0016 §6 interim)。
+                if matches!(sink.input_secrecy, InputSecrecy::NeverRecordStdin) {
+                    return Ok(());
+                }
                 sink.try_push(RecordEvent::InWriteError {
                     client_id,
                     requested_len,
@@ -1249,7 +1290,10 @@ mod tests {
             output_path: path.to_string_lossy().into_owned(),
             max_bytes: None,
             max_duration_ms: None,
-            input_secrecy: InputSecrecy::RedactAfterPrompt,
+            // interim default (= record-all)。redact-after-prompt は start で reject
+            // されるため、共通ヘルパーは record-all を使う (= 個別 test は必要に応じて
+            // req.input_secrecy を上書きする)。
+            input_secrecy: InputSecrecy::RecordAll,
             prompt_pattern: None,
         }
     }
@@ -1261,7 +1305,8 @@ mod tests {
             output_path: path.to_string_lossy().into_owned(),
             max_bytes: None,
             max_duration_ms: None,
-            input_secrecy: InputSecrecy::RedactAfterPrompt,
+            // interim default (= record-all)。理由は jsonl_request 参照。
+            input_secrecy: InputSecrecy::RecordAll,
             prompt_pattern: None,
         }
     }
@@ -1316,7 +1361,8 @@ mod tests {
         assert!(v["argv"].as_array().is_some());
         assert_eq!(v["cwd"], "/tmp");
         assert_eq!(v["direction"], "both");
-        assert_eq!(v["input_secrecy"], "redact-after-prompt");
+        // interim default は record-all (= ヘルパー jsonl_request が渡す値)。
+        assert_eq!(v["input_secrecy"], "record-all");
     }
 
     #[test]
@@ -1809,5 +1855,114 @@ mod tests {
             (1..=2).contains(&body_lines),
             "expected 1 or 2 body lines, got {body_lines}"
         );
+    }
+
+    /// never-record-stdin: stdin 由来 event (BytesIn) を当該 sink に配信しない。
+    /// BytesOut は stdin 由来でないので通常通り記録される。これで header の
+    /// `input_secrecy=never-record-stdin` 申告が「実際に stdin を残さない」という
+    /// 意味で正直になる (= DR-0016 §6 interim、Phase 5 の in-redacted 化に先立つ最小防護)。
+    #[test]
+    fn never_record_stdin_drops_bytes_in_keeps_bytes_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nrs.jsonl");
+        let registry = RecordRegistry::new();
+        let mut req = jsonl_request(&path, RecordDirection::Both);
+        req.input_secrecy = InputSecrecy::NeverRecordStdin;
+        let id = registry.start(&req, 1, sample_session()).unwrap();
+        registry.push_bytes_in(99, b"secret-passphrase");
+        registry.push_bytes_out(b"prompt> ");
+        registry.stop(id).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        // header + BytesOut のみ (= BytesIn は drop されるので body 1 行)。
+        assert_eq!(lines.len(), 2, "header + out only, stdin dropped");
+        let hdr: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(hdr["input_secrecy"], "never-record-stdin");
+        let out: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(out["dir"], "out");
+        // stdin secret の hex が file に一切現れないことを直接確認 (= 平文残留の回帰防止)。
+        assert!(
+            !content.contains(&hex::encode("secret-passphrase")),
+            "stdin secret must not appear in never-record-stdin file"
+        );
+    }
+
+    /// never-record-stdin: 却下 input (InRejected) / partial write (InWriteError) も
+    /// 生 bytes を含むため配信しない。stdin 由来の全 in 系 event が drop され、header
+    /// のみが残る (= DR-0016 §6 interim、生 bytes を含む event の網羅 gate 確認)。
+    #[test]
+    fn never_record_stdin_drops_rejected_and_write_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nrs2.jsonl");
+        let registry = RecordRegistry::new();
+        let mut req = jsonl_request(&path, RecordDirection::Stdin);
+        req.input_secrecy = InputSecrecy::NeverRecordStdin;
+        let id = registry.start(&req, 1, sample_session()).unwrap();
+        registry.push_in_rejected(
+            7,
+            Mode::Ro,
+            None,
+            InRejectedReason::RoClient,
+            b"rejected-secret",
+        );
+        registry.push_in_write_error(5, 20, 10, WriteErrorKind::IdleTimeout, b"unwritten-secret");
+        registry.stop(id).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        // header のみ (= stdin 由来 event はすべて drop)。
+        assert_eq!(
+            lines.len(),
+            1,
+            "header only, all stdin-derived events dropped"
+        );
+        assert!(!content.contains(&hex::encode("rejected-secret")));
+        assert!(!content.contains(&hex::encode("unwritten-secret")));
+    }
+
+    /// record-all sink には stdin (BytesIn) が verbatim で記録される (= interim default)。
+    /// never-record-stdin との対比: record-all は「全 stdin を残す」という header 申告
+    /// 通りに動く。ヘルパー jsonl_request は record-all を渡す。
+    #[test]
+    fn record_all_keeps_bytes_in_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ra.jsonl");
+        let registry = RecordRegistry::new();
+        let id = registry
+            .start(
+                &jsonl_request(&path, RecordDirection::Both),
+                1,
+                sample_session(),
+            )
+            .unwrap();
+        registry.push_bytes_in(3, b"typed-input");
+        registry.stop(id).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains(&hex::encode("typed-input")),
+            "record-all must keep stdin verbatim"
+        );
+        let hdr: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(hdr["input_secrecy"], "record-all");
+    }
+
+    /// redact-after-prompt は redaction state machine が Phase 5 未配線のため start で
+    /// reject される (= 「redact 済」と偽る file を作らせない、DR-0016 §6 interim)。
+    /// 正規 CLI は parse 段でも弾くが、protocol を直叩きする旧 / 別実装 client への
+    /// 防御を daemon 側でも固定する。
+    #[test]
+    fn redact_after_prompt_rejected_at_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rap.jsonl");
+        let registry = RecordRegistry::new();
+        let mut req = jsonl_request(&path, RecordDirection::Both);
+        req.input_secrecy = InputSecrecy::RedactAfterPrompt;
+        let err = registry
+            .start(&req, 1, sample_session())
+            .expect_err("redact-after-prompt must be rejected");
+        assert!(matches!(err, RecordStartError::RedactionUnimplemented));
+        // reject は file open 前 (= 空 file すら残さない)。
+        assert!(!path.exists());
     }
 }

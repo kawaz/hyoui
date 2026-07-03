@@ -252,10 +252,11 @@ tty I/O timeline の永続録画
   format) と `raw` (単一方向の生 byte stream、timestamp なし。export 専用、
   `--both` 不可)
 - cap: `record-v1` optional capability で gate し、旧 client も動作継続する
-- **⚠ secret redaction は未実装。** `--input-secrecy`（default `redact-after-prompt`）は
-  受理・保存されるが、redaction の state machine は Phase 5 に積み残しで、policy に
-  関わらず stdin は素通し記録される。`InSecretRedacted` / `push_in_secret_redacted` は
-  それまで dead code。
+- **secret redaction の state machine (`redact-after-prompt`) は Phase 5 に積み残し。**
+  interim は正直化済 (DR-0016 §6a): default は `record-all`（stdin を素通し記録、
+  loud warning つき）、`never-record-stdin` は stdin 由来 event を sink に配信しない
+  実実装、`redact-after-prompt` は parse 段 / daemon 段の双方で reject される。
+  `InSecretRedacted` / `push_in_secret_redacted` は Phase 5 まで dead code。
 
 ## 3. データフロー
 

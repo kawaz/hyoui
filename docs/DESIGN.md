@@ -299,11 +299,13 @@ separate from the client broadcast path.
   timestamps — export only, `--both` not allowed)
 - Caps: gated behind the `record-v1` optional capability so older clients keep
   working
-- **⚠ Secret redaction is not yet implemented.** `--input-secrecy`
-  (`redact-after-prompt` default) is accepted and stored, but the redaction
-  state machine is parked in Phase 5 — stdin is recorded verbatim regardless of
-  the policy. `InSecretRedacted` / `push_in_secret_redacted` are dead code until
-  then.
+- **The secret-redaction state machine (`redact-after-prompt`) is parked in
+  Phase 5.** The interim behavior is honest (DR-0016 §6a): the default is
+  `record-all` (stdin recorded verbatim, with a loud warning),
+  `never-record-stdin` is fully implemented (stdin-derived events are never
+  delivered to the sink), and `redact-after-prompt` is rejected at both the
+  parse layer and the daemon. `InSecretRedacted` /
+  `push_in_secret_redacted` remain dead code until Phase 5.
 
 ## 3. Data flow
 

@@ -1165,6 +1165,12 @@ fn record_start_error_to_protocol(e: &RecordStartError) -> (ErrorCode, String) {
             ErrorCode::RecordInvalidPromptPattern,
             format!("invalid prompt pattern regex: {msg}"),
         ),
+        RecordStartError::RedactionUnimplemented => (
+            ErrorCode::RecordRedactionUnimplemented,
+            "record input-secrecy=redact-after-prompt is not yet implemented (Phase 5); \
+             use record-all or never-record-stdin"
+                .to_string(),
+        ),
         RecordStartError::Io(e) => (ErrorCode::InternalError, format!("record io error: {e}")),
     }
 }
@@ -1632,6 +1638,11 @@ mod tests {
                 RecordStartError::InvalidPromptPattern("x".into()),
                 ErrorCode::RecordInvalidPromptPattern,
             ),
+            // interim: redact-after-prompt reject → 専用 code (DR-0016 §6 Phase 5)。
+            (
+                RecordStartError::RedactionUnimplemented,
+                ErrorCode::RecordRedactionUnimplemented,
+            ),
         ];
         for (input, expected_code) in cases {
             let (code, _msg) = record_start_error_to_protocol(&input);
@@ -1657,7 +1668,7 @@ mod tests {
             output_path: path.to_string_lossy().into_owned(),
             max_bytes: None,
             max_duration_ms: None,
-            input_secrecy: InputSecrecy::RedactAfterPrompt,
+            input_secrecy: InputSecrecy::RecordAll,
             prompt_pattern: None,
         };
         let session = super::super::record::SessionInfo {
@@ -1702,7 +1713,7 @@ mod tests {
             output_path: path.to_string_lossy().into_owned(),
             max_bytes: None,
             max_duration_ms: None,
-            input_secrecy: InputSecrecy::RedactAfterPrompt,
+            input_secrecy: InputSecrecy::RecordAll,
             prompt_pattern: None,
         };
         let session = super::super::record::SessionInfo {
@@ -1750,7 +1761,7 @@ mod tests {
             output_path: path.to_string_lossy().into_owned(),
             max_bytes: None,
             max_duration_ms: None,
-            input_secrecy: InputSecrecy::RedactAfterPrompt,
+            input_secrecy: InputSecrecy::RecordAll,
             prompt_pattern: None,
         };
         let session = super::super::record::SessionInfo {
@@ -1943,7 +1954,7 @@ mod tests {
             output_path: path.to_string_lossy().into_owned(),
             max_bytes: None,
             max_duration_ms: None,
-            input_secrecy: InputSecrecy::RedactAfterPrompt,
+            input_secrecy: InputSecrecy::RecordAll,
             prompt_pattern: None,
         };
         let session = super::super::record::SessionInfo {

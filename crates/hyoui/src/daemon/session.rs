@@ -4778,7 +4778,9 @@ mod tests {
             output_path: path.to_string_lossy().into_owned(),
             max_bytes: None,
             max_duration_ms: None,
-            input_secrecy: InputSecrecy::RedactAfterPrompt,
+            // record-all (= start が redact-after-prompt を reject するため、lifecycle
+            // 記録の意図を保ったまま受理される policy を使う、DR-0016 §6 interim)。
+            input_secrecy: InputSecrecy::RecordAll,
             prompt_pattern: None,
         };
         let session = crate::daemon::record::SessionInfo {

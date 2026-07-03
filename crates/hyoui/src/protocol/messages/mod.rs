@@ -680,7 +680,8 @@ mod tests {
 
     #[test]
     fn record_start_request_roundtrip_minimal() {
-        // 最小: option field 全部 None、direction=Both / format=Jsonl / 既定 redaction。
+        // 最小: option field 全部 None、direction=Both / format=Jsonl。redact-after-prompt
+        // は protocol wire 上の正当 variant (= reject は daemon の start 段、protocol 層は透過)。
         let msg = ControlMessage::RecordStartRequest(RecordStartRequest {
             direction: RecordDirection::Both,
             format: RecordFormat::Jsonl,

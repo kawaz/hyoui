@@ -97,6 +97,12 @@ pub enum ErrorCode {
     /// `record.not-found` — `record.stop.request.record_id` に該当する active
     /// record が存在しない (DR-0016 §7)。
     RecordNotFound,
+    /// `record.redaction-unimplemented` — `record.start.request.input_secrecy` が
+    /// `redact-after-prompt` だが、redaction state machine が未配線 (= DR-0016 §6
+    /// Phase 5)。「redact 済」と偽る record file を作らせないため daemon が reject する。
+    /// 代替は `record-all` (= stdin を verbatim 記録) / `never-record-stdin` (= stdin を
+    /// 一切残さない)。
+    RecordRedactionUnimplemented,
     /// `set.invalid-key` — `set.request.key` が未知 (= daemon が解釈できない設定 key、
     /// DR-0019 Update)。
     SetInvalidKey,
@@ -137,6 +143,7 @@ impl ErrorCode {
             ErrorCode::RecordInvalidPromptPattern => "record.invalid-prompt-pattern",
             ErrorCode::RecordLimitExceeded => "record.limit-exceeded",
             ErrorCode::RecordNotFound => "record.not-found",
+            ErrorCode::RecordRedactionUnimplemented => "record.redaction-unimplemented",
             ErrorCode::SetInvalidKey => "set.invalid-key",
             ErrorCode::SetInvalidValue => "set.invalid-value",
             ErrorCode::Unknown(s) => s.as_str(),
@@ -169,6 +176,7 @@ impl ErrorCode {
             "record.invalid-prompt-pattern" => ErrorCode::RecordInvalidPromptPattern,
             "record.limit-exceeded" => ErrorCode::RecordLimitExceeded,
             "record.not-found" => ErrorCode::RecordNotFound,
+            "record.redaction-unimplemented" => ErrorCode::RecordRedactionUnimplemented,
             "set.invalid-key" => ErrorCode::SetInvalidKey,
             "set.invalid-value" => ErrorCode::SetInvalidValue,
             other => ErrorCode::Unknown(other.to_string()),
@@ -256,6 +264,10 @@ mod tests {
             ),
             (ErrorCode::RecordLimitExceeded, "record.limit-exceeded"),
             (ErrorCode::RecordNotFound, "record.not-found"),
+            (
+                ErrorCode::RecordRedactionUnimplemented,
+                "record.redaction-unimplemented",
+            ),
             (ErrorCode::SetInvalidKey, "set.invalid-key"),
             (ErrorCode::SetInvalidValue, "set.invalid-value"),
         ];

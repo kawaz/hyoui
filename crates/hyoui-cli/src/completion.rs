@@ -154,7 +154,7 @@ _hyoui() {
                 case "$prev" in
                     --socket|--output) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
                     --format) COMPREPLY=( $(compgen -W "jsonl raw" -- "$cur") ); return 0 ;;
-                    --input-secrecy) COMPREPLY=( $(compgen -W "redact-after-prompt record-all never-record-stdin" -- "$cur") ); return 0 ;;
+                    --input-secrecy) COMPREPLY=( $(compgen -W "record-all never-record-stdin" -- "$cur") ); return 0 ;;
                     --namespace|--index|--max-bytes|--max-duration|--prompt-pattern) return 0 ;;
                 esac
                 COMPREPLY=( $(compgen -W "--socket --namespace --index --output --stdin --stdout --both --format --max-bytes --max-duration --input-secrecy --prompt-pattern --help -h" -- "$cur") )
@@ -581,7 +581,7 @@ _hyoui_record() {
                         '--format=[Output format]:format:(jsonl raw)' \
                         '--max-bytes=[Recording byte cap (0 disables)]:bytes:' \
                         '--max-duration=[Recording duration cap (0 disables)]:duration:' \
-                        '--input-secrecy=[stdin redaction policy (NOTE: unimplemented, Phase 5)]:policy:(redact-after-prompt record-all never-record-stdin)' \
+                        '--input-secrecy=[stdin redaction policy (default record-all; redact-after-prompt reserved for Phase 5)]:policy:(record-all never-record-stdin)' \
                         '--prompt-pattern=[Custom prompt detection regex]:regex:' \
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:session id:'
@@ -969,7 +969,7 @@ complete -c hyoui -n '__hyoui_record_using_sub start' -l both                  -
 complete -c hyoui -n '__hyoui_record_using_sub start' -l format -x -a 'jsonl raw' -d 'Output format'
 complete -c hyoui -n '__hyoui_record_using_sub start' -l max-bytes    -x       -d 'Recording byte cap (0 disables)'
 complete -c hyoui -n '__hyoui_record_using_sub start' -l max-duration -x       -d 'Recording duration cap (0 disables)'
-complete -c hyoui -n '__hyoui_record_using_sub start' -l input-secrecy -x -a 'redact-after-prompt record-all never-record-stdin' -d 'stdin redaction policy (NOTE: unimplemented, Phase 5)'
+complete -c hyoui -n '__hyoui_record_using_sub start' -l input-secrecy -x -a 'record-all never-record-stdin' -d 'stdin redaction policy (default record-all; redact-after-prompt reserved for Phase 5)'
 complete -c hyoui -n '__hyoui_record_using_sub start' -l prompt-pattern -x     -d 'Custom prompt detection regex'
 complete -c hyoui -n '__hyoui_record_using_sub start' -s h -l help             -d 'Show help and exit'
 

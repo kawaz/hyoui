@@ -157,8 +157,8 @@ hyoui lock acquire "$SESS" --timeout=30s
 hyoui lock release "$SESS"
 
 # tty I/O timeline をファイルに録画 (= jsonl)
-# ⚠ stdin の redaction はまだ未配線 — --input-secrecy の値に関わらず stdin は
-#   素通しで記録される。secret を打つ可能性があるなら --stdout のみに限定する。
+# default (--input-secrecy=record-all) は stdin を素通しで記録する。secret を
+#   打つ可能性があるなら --input-secrecy=never-record-stdin で stdin を丸ごと落とす。
 hyoui record start "$SESS" --output session.jsonl --both
 hyoui record list "$SESS"
 hyoui record stop "$SESS" --all
@@ -290,7 +290,8 @@ v0.1.x = **外側 API 確立期**。
 - input family (= `text:` / `hex:` / `file:` / `paste:` / `key:` / `wait:` /
   `wait-idle:` spec) と `lock` / `unlock` の本実装も完了済（`tx` は未実装）
 - `hyoui record start/stop/list` (= tty I/O timeline、jsonl/raw) は v0.2.2 で出荷。
-  ただし **stdin redaction (`--input-secrecy`) はまだ未配線**
+  `--input-secrecy` は `record-all` (default) / `never-record-stdin` が有効。
+  **`redact-after-prompt` は未実装で指定するとエラーになる** (Phase 5 予定)
 
 **production readiness**:
 

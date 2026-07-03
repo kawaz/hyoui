@@ -754,12 +754,14 @@ pub enum RecordFormatArg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum RecordInputSecrecyArg {
-    /// `redact-after-prompt` (= default、prompt pattern 後の stdin を redact)。
-    #[default]
+    /// `redact-after-prompt` (= Phase 5 予定)。redaction state machine が未配線の
+    /// ため parse 段 / daemon 段の双方で reject される。protocol `InputSecrecy` との
+    /// 1:1 対応を保つため variant 自体は残す (DR-0016 §6 interim)。
     RedactAfterPrompt,
-    /// `record-all` (= opt-in、redaction なし、全 stdin を hex 記録、loud warning 必須)。
+    /// `record-all` (= interim default、redaction なし、全 stdin を hex 記録、loud warning)。
+    #[default]
     RecordAll,
-    /// `never-record-stdin` (= opt-in、全 stdin を `in-redacted` 化、内容捨て)。
+    /// `never-record-stdin` (= stdin 由来 event を一切記録しない、secret 完全保護)。
     NeverRecordStdin,
 }
 
@@ -3342,15 +3344,25 @@ fn parse_record_start(args: &[String]) -> Command {
                     Command::Error("record start: --input-secrecy requires a value".into())
                 })?;
                 match v.as_str() {
-                    "redact-after-prompt" => {
-                        input_secrecy = RecordInputSecrecyArg::RedactAfterPrompt
-                    }
                     "record-all" => input_secrecy = RecordInputSecrecyArg::RecordAll,
                     "never-record-stdin" => input_secrecy = RecordInputSecrecyArg::NeverRecordStdin,
+                    // redact-after-prompt は redaction state machine が未実装 (Phase 5)。
+                    // 「redact 済」と偽る record file を作らせないため reserved but not yet
+                    // implemented として reject し、代替 policy へ誘導する (DR-0016 §6 interim)。
+                    "redact-after-prompt" => {
+                        return Err(Command::Error(
+                            "record start: --input-secrecy=redact-after-prompt is reserved but \
+                             not yet implemented (Phase 5); use --input-secrecy=record-all \
+                             (records stdin verbatim) or --input-secrecy=never-record-stdin \
+                             (drops stdin entirely) instead"
+                                .into(),
+                        ));
+                    }
                     other => {
                         return Err(Command::Error(format!(
                             "record start: --input-secrecy must be one of \
-                             `redact-after-prompt` / `record-all` / `never-record-stdin`, got {other:?}"
+                             `record-all` / `never-record-stdin`, got {other:?} \
+                             (`redact-after-prompt` is reserved but not yet implemented, Phase 5)"
                         )));
                     }
                 }
@@ -4445,9 +4457,9 @@ fn usage_record() -> String {
             record file は子 PTY の全 I/O bytes を含むため、機密情報 (password / OTP /\n    \
             API token 等) が永続化される可能性があります。出力 file (mode 0600) は\n    \
             認証境界外に共有しないでください。\n    \
-            ⚠ WARNING: `--input-secrecy` の redaction は **未実装** (= Phase 5 予定)。\n    \
-            現状どの policy を指定しても stdin は素通しで記録されます\n    \
-            (= password / OTP も平文で残る)。\n",
+            `--input-secrecy` の default は record-all (= stdin を verbatim 記録)。\n    \
+            secret を録りたくない場合は --input-secrecy=never-record-stdin を使ってください。\n    \
+            redact-after-prompt は Phase 5 予定で、現状は指定すると error になります。\n",
     )
 }
 
@@ -4475,12 +4487,10 @@ fn usage_record_start() -> String {
                 suffix 受理: k/K/kb/KiB (1024), m/MB/MiB (1024²), g/GB/GiB (1024³)\n    \
             --max-duration DUR          録画 duration 上限 (default 1h、`0` で disable + 警告)\n                                \
                 DUR 形式: `30m` / `1h` / `1d12h` 等 (`hyoui run` の --timeout と同形式)\n    \
-            --input-secrecy POLICY      stdin redaction policy (default redact-after-prompt)\n                                \
-                ⚠ redaction は **未実装** (Phase 5 予定)。現状どの policy でも\n                                \
-                stdin は素通しで記録される (= password / OTP も平文で残る)。\n                                \
-                redact-after-prompt — (予定) password/OTP prompt 後の stdin を redact\n                                \
-                record-all          — (予定) redaction なし、全 stdin を hex 記録\n                                \
-                never-record-stdin  — (予定) 全 stdin を redaction (内容捨て、byte_count のみ)\n    \
+            --input-secrecy POLICY      stdin redaction policy (default record-all)\n                                \
+                record-all          — redaction なし、全 stdin を verbatim hex 記録 (= default)\n                                \
+                never-record-stdin  — stdin 由来 event を一切記録しない (= secret 完全保護)\n                                \
+                redact-after-prompt — reserved (Phase 5 予定)。指定すると error になる\n    \
             --prompt-pattern REGEX      custom prompt 検出 regex (default は daemon 適用)\n    \
             -h, --help                  Show this help and exit\n\
         \n\
@@ -5499,8 +5509,10 @@ pub const RECORD_LIST_FORMAT_VALUES: &[&str] = &["table", "jsonl"];
 pub const RECORD_START_FORMAT_VALUES: &[&str] = &["jsonl", "raw"];
 
 /// `hyoui record start --input-secrecy` が受理する policy 値一覧。
-pub const RECORD_INPUT_SECRECY_VALUES: &[&str] =
-    &["redact-after-prompt", "record-all", "never-record-stdin"];
+///
+/// `redact-after-prompt` は Phase 5 予定で parse / daemon の双方で reject されるため
+/// completion 候補には含めない (= 選んでも error になる値を補完しない、DR-0016 §6 interim)。
+pub const RECORD_INPUT_SECRECY_VALUES: &[&str] = &["record-all", "never-record-stdin"];
 
 /// `正規化済 component 名 → SnapshotCliComponent` を 1:1 で解決する。
 ///
@@ -9242,7 +9254,8 @@ mod tests {
                 assert_eq!(cfg.session_id.as_deref(), Some("demo"));
                 assert_eq!(cfg.direction, RecordDirectionArg::Both);
                 assert_eq!(cfg.format, RecordFormatArg::Jsonl);
-                assert_eq!(cfg.input_secrecy, RecordInputSecrecyArg::RedactAfterPrompt);
+                // interim default は record-all (= redact-after-prompt は未実装で reject)。
+                assert_eq!(cfg.input_secrecy, RecordInputSecrecyArg::RecordAll);
                 assert_eq!(cfg.output_path, PathBuf::from("/tmp/rec.jsonl"));
                 // default 100 MiB / 1h が wire 値に適用される
                 assert_eq!(cfg.max_bytes, Some(100 * 1024 * 1024));
@@ -9363,14 +9376,12 @@ mod tests {
         assert!(matches!(cmd, Command::Error(ref m) if m.contains("--output")));
     }
 
-    /// `--input-secrecy` の 3 variant がそれぞれ parse 可能。
+    /// interim で受理可能な 2 variant (record-all / never-record-stdin) が parse される。
+    /// redact-after-prompt は Phase 5 予定で reject されるため、ここには含めない
+    /// (= reject は下の record_start_input_secrecy_redact_after_prompt_rejected で確認)。
     #[test]
     fn record_start_input_secrecy_variants() {
         for (val, expected) in [
-            (
-                "redact-after-prompt",
-                RecordInputSecrecyArg::RedactAfterPrompt,
-            ),
             ("record-all", RecordInputSecrecyArg::RecordAll),
             (
                 "never-record-stdin",
@@ -9392,6 +9403,40 @@ mod tests {
                 }
                 other => panic!("{val}: expected Start, got {other:?}"),
             }
+        }
+    }
+
+    /// interim: redact-after-prompt は redaction state machine が Phase 5 未実装のため
+    /// parse 段で reject される (= 「redact 済」と偽る record file を作らせない正直化、
+    /// DR-0016 §6)。error 文言に「not yet implemented」+ 代替 policy (record-all /
+    /// never-record-stdin) の migration hint を必ず含める。
+    #[test]
+    fn record_start_input_secrecy_redact_after_prompt_rejected() {
+        let cmd = parse_args(&args(&[
+            "record",
+            "start",
+            "demo",
+            "--output",
+            "/tmp/x.jsonl",
+            "--input-secrecy",
+            "redact-after-prompt",
+        ]));
+        match cmd {
+            Command::Error(msg) => {
+                assert!(
+                    msg.contains("not yet implemented"),
+                    "expected unimplemented notice, got {msg}"
+                );
+                assert!(
+                    msg.contains("record-all"),
+                    "expected record-all migration hint, got {msg}"
+                );
+                assert!(
+                    msg.contains("never-record-stdin"),
+                    "expected never-record-stdin migration hint, got {msg}"
+                );
+            }
+            other => panic!("expected Command::Error for redact-after-prompt, got {other:?}"),
         }
     }
 

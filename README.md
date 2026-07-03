@@ -166,8 +166,8 @@ hyoui lock acquire "$SESS" --timeout=30s
 hyoui lock release "$SESS"
 
 # record the tty I/O timeline to a file (jsonl)
-# ⚠ stdin redaction is NOT wired yet — stdin is recorded verbatim regardless of
-#   --input-secrecy. Limit to --stdout if you may type secrets.
+# the default (--input-secrecy=record-all) records stdin verbatim. If you may
+#   type secrets, use --input-secrecy=never-record-stdin to drop stdin entirely.
 hyoui record start "$SESS" --output session.jsonl --both
 hyoui record list "$SESS"
 hyoui record stop "$SESS" --all
@@ -308,7 +308,9 @@ v0.1.x = **external API stabilization phase**.
 - The input family (`text:` / `hex:` / `file:` / `paste:` / `key:` / `wait:`
   / `wait-idle:` specs) and `lock` / `unlock` are implemented (`tx` is not yet)
 - `hyoui record start/stop/list` (tty I/O timeline, jsonl/raw) ships since
-  v0.2.2; **stdin redaction (`--input-secrecy`) is not yet wired**
+  v0.2.2; `--input-secrecy` supports `record-all` (default) and
+  `never-record-stdin`. **`redact-after-prompt` is unimplemented and errors
+  out** (planned for Phase 5)
 
 **Production readiness:**
 

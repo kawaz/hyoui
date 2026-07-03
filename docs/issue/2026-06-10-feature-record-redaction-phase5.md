@@ -29,7 +29,7 @@ origin: 自リポ TODO
 lifecycle event) は実装・出荷済み (v0.2.2)。だが **§6 の secret redaction state machine が
 未配線** (Phase 5 積み残し)。
 
-現状の挙動:
+当初の挙動 (2026-07-03 interim 対応前):
 
 - `--input-secrecy`（default `redact-after-prompt`）は CLI で受理され request に乗るが、
   `RecordRegistry::start` は `prompt_pattern` を storage に置くだけで触らない
@@ -41,6 +41,28 @@ lifecycle event) は実装・出荷済み (v0.2.2)。だが **§6 の secret red
 → password / OTP / token を打つ可能性のあるセッションを録画すると、それらが
 jsonl / raw にそのまま残る。README / MANUAL / DESIGN / DR-0016 に loud warning は
 出してあるが、本実装で塞ぐべき。
+
+## interim 対応済み (2026-07-03、本 issue = redaction state machine 本実装は継続)
+
+「policy 値に関わらず stdin 素通し記録」= 記録ファイルの虚偽申告問題は、redaction state
+machine 本実装を待たずに interim で正直化した (DR-0016 §6a)。これで「secret が虚偽申告される」
+安全性問題自体は解消済み:
+
+- **default を `record-all` に変更** (= 旧 `redact-after-prompt` から)。stdin verbatim 記録 +
+  loud warning で「secrets WILL be stored」を明示。
+- **`redact-after-prompt` は reject**: CLI parse 段 (`Command::Error` + 代替 policy hint) と
+  daemon `RecordRegistry::start` 段 (`RecordStartError::RedactionUnimplemented` →
+  `ErrorCode::RecordRedactionUnimplemented`) の双方。未実装 policy で「redact 済」file を作らせない。
+- **`never-record-stdin` は実装**: `NeverRecordStdin` sink には stdin 由来 event (`BytesIn` /
+  `InRejected` / `InWriteError` = 生 bytes を含む) を配信せず、stdin を一切残さない (= header 申告が
+  正直)。§6 本来の `in-redacted` + byte_count 形は Phase 5 で実装 (= interim は完全 drop)。
+
+interim 実装ファイル: `crates/hyoui/src/{cli.rs, daemon/record.rs, daemon/control.rs,
+protocol/messages/error.rs}` + `crates/hyoui-cli/src/{main.rs, completion.rs}`。
+
+**本 issue に残るのは redaction state machine 本実装** (= `redact-after-prompt` の prompt 検出 +
+redaction mode)。完了時に `redact-after-prompt` の reject を解除 + default 復帰させ、
+`ErrorCode::RecordRedactionUnimplemented` を削除する。
 
 ## 求められる仕様 (= DR-0016 §6 から)
 

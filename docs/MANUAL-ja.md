@@ -213,11 +213,11 @@ hyoui record list "$SESS"
 hyoui record stop "$SESS" --all
 ```
 
-> **⚠ stdin の redaction はまだ未配線。** `--input-secrecy`（default は
-> `redact-after-prompt`）の値に関わらず stdin は素通しで記録される — redaction の
-> state machine は Phase 5 に積み残し
-> ([DR-0016](./decisions/DR-0016-tty-io-record.md))。passphrase / token を打つ
-> 可能性があるなら `--stdout` のみ録画するか、secret 入力中は録画を避けること。
+> **stdin の扱い**: default (`--input-secrecy=record-all`) は stdin を素通しで
+> 記録する。passphrase / token を打つ可能性があるなら
+> `--input-secrecy=never-record-stdin` を使うと stdin 由来の event は一切
+> 記録されない。`redact-after-prompt` (prompt 検出後のみ redact) は Phase 5 予定で
+> 現状は指定するとエラーになる ([DR-0016](./decisions/DR-0016-tty-io-record.md) §6a)。
 
 ### 9. session を namespace でグループ分けする
 

@@ -221,11 +221,12 @@ hyoui record list "$SESS"
 hyoui record stop "$SESS" --all
 ```
 
-> **⚠ stdin redaction is NOT wired yet.** Regardless of `--input-secrecy`
-> (`redact-after-prompt` is the default), stdin is recorded verbatim — the
-> redaction state machine is parked in Phase 5
-> ([DR-0016](./decisions/DR-0016-tty-io-record.md)). If you may type passphrases
-> or tokens, record only `--stdout`, or avoid recording stdin during secret entry.
+> **stdin handling**: the default (`--input-secrecy=record-all`) records stdin
+> verbatim. If you may type passphrases or tokens, use
+> `--input-secrecy=never-record-stdin` — stdin-derived events are then never
+> recorded at all. `redact-after-prompt` (redact only after a prompt is
+> detected) is planned for Phase 5 and currently errors out
+> ([DR-0016](./decisions/DR-0016-tty-io-record.md) §6a).
 
 ### 9. Group sessions with namespaces
 
