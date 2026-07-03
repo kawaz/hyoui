@@ -30,6 +30,7 @@ mod control;
 mod lock;
 mod pty;
 mod record;
+mod reducer;
 mod screen;
 mod session;
 mod tail;
