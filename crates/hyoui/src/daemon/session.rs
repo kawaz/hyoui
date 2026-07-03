@@ -1694,7 +1694,9 @@ fn serve_loop(
                 reducer::handle(&mut daemon_state, translate::client_detached(detached_id));
             debug_assert!(
                 effects.is_empty(),
-                "Phase 1b stub 段階では client_detached から effect は出ない"
+                "daemon_state.lock が空 stub の間は client_detached から effect は出ない \
+                 (= 実 lock state は SessionState 側)。Phase 2-α2 の lock 移設で holder が\
+                 立つようになった時点で、この assert は execute 呼び出しに置換必須"
             );
             // DR-0025 Phase 1a: holder client の切断による process-bound GC は lock
             // reducer に委譲する。Released (= ProcessBoundGc) が返ったら mode.change

@@ -8,9 +8,11 @@
 //!   の read-only accessor 経由でのみ行う。
 //! - [`reduce`]: [`LockMsg`] を受けて [`LockState`] を遷移させ [`LockEvent`] を
 //!   返す pure function (= socket / PTY / broadcast / record を一切持たない、
-//!   100% unit test 可能)。Effect 型 / super-reducer は DR-0025 Phase 1b で導入
-//!   予定で、Phase 1a では caller が [`LockEvent`] を見て既存の reply / broadcast /
-//!   lifecycle record を実行する。
+//!   100% unit test 可能)。caller が [`LockEvent`] を見て既存の reply / broadcast /
+//!   lifecycle record を実行する旧経路 (= Phase 2-α2 で `reduce_msg` に一本化して削除予定)。
+//! - [`reduce_msg`]: DR-0025 Phase 2 — super-reducer ([`DomainOutput`]) 形式の入口。
+//!   内部で [`reduce`] を呼び、`Released` を `ClientBroadcast(ModeChange)` Effect に翻訳
+//!   する (Acquired / Denied / TokenRequired の Effect 化は control.rs 配線と同時)。
 //! - [`SessionState`]: lock domain (`lock`) + record registry + 子 stopped 観測 /
 //!   suspend policy を束ねる session-scope state。record / child 系の domain 分離は
 //!   DR-0025 後続 Phase (Child / Serve reducer 化)。
@@ -32,6 +34,7 @@ use crate::protocol::messages::SessionMode;
 use super::broadcast::ClientHandle;
 use super::config::ChildSuspendPolicy;
 use super::record::RecordRegistry;
+use super::reducer::DomainOutput;
 
 /// DR-0025 Phase 1a: lock domain の pure reducer state。
 ///
@@ -58,6 +61,13 @@ pub(super) struct LockState {
     /// disconnect では解放しない) の余地を型で保持する (DR-0025 §Lock domain の
     /// `process_bound` field)。
     process_bound: bool,
+    /// DR-0025 Phase 2: Effect 発行時の domain 内連番採番 counter。
+    ///
+    /// [`reduce_msg`] が Effect を出すたびに [`EffectId`](super::reducer::EffectId) の
+    /// 連番として消費して +1 する (= `SystemTime` / `rand` に依存しない決定論採番、
+    /// EffectResult routing の相関キー、DR-0025 §Effect layer の「各 domain state が
+    /// 保持する counter から決定論的に採番」)。
+    next_effect_seq: u64,
 }
 
 impl LockState {
@@ -240,6 +250,50 @@ pub(super) fn reduce(state: &mut LockState, msg: LockMsg) -> Vec<LockEvent> {
             }
         }
     }
+}
+
+/// DR-0025 Phase 2: [`LockMsg`] を受けて super-reducer 直結の [`DomainOutput`] を返す
+/// Effect 形式の reducer。
+///
+/// 内部で既存の pure [`reduce`] を呼び、返る [`LockEvent`] を [`Effect`](super::reducer::Effect)
+/// に翻訳する。翻訳規約:
+///
+/// - [`LockEvent::Released`] → `ClientBroadcast(ModeChange)` Effect。lock 解放を全 subscribe
+///   client に通知する (= DR-0025 §Lock domain の `Lock ──→ Client` broadcast)。Released 後は
+///   holder が無いので `session_mode = Rw` / `lock_holder = None`。`client_mode = None` は
+///   「session 全体の変化で個別 client の mode 変化ではない」を表す (`ModeChange` の
+///   `client_mode` 意味論)。
+/// - [`LockEvent::Acquired`] / [`LockEvent::TokenRequired`] / [`LockEvent::Denied`] は
+///   この片では **翻訳しない** (= 空)。acquire/release の `LockResponse` reply 経路は
+///   `control.rs` の request 配線 (= client_id 対応・token 生成の 2-phase) と不可分で、
+///   Effect 化は次片以降で行う。
+///
+/// 既存 [`reduce`] は旧経路 (= Phase 1a で caller が `LockEvent` を直接 IO 実行する経路) の
+/// ために残す。旧経路は control.rs の配線を Effect 経由に移す次片で削除する。
+pub(super) fn reduce_msg(state: &mut LockState, msg: LockMsg) -> DomainOutput {
+    use super::reducer::{BroadcastFilter, Domain, Effect, EffectId, EffectKind};
+    use crate::protocol::messages::{ControlMessage, ModeChange};
+
+    let events = reduce(state, msg);
+    let mut out = DomainOutput::empty();
+    for ev in events {
+        if let LockEvent::Released { .. } = ev {
+            let seq = state.next_effect_seq;
+            state.next_effect_seq += 1;
+            out.effects.push(Effect {
+                id: EffectId(Domain::Lock, seq),
+                kind: EffectKind::ClientBroadcast {
+                    message: ControlMessage::ModeChange(ModeChange {
+                        session_mode: SessionMode::Rw,
+                        lock_holder: None,
+                        client_mode: None,
+                    }),
+                    filter: BroadcastFilter::SubscribersOnly,
+                },
+            });
+        }
+    }
+    out
 }
 
 /// session 全体の状態 (Phase 10)。lock domain + record registry + 子観測 state。

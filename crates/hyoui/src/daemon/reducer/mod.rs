@@ -34,6 +34,8 @@ use std::collections::VecDeque;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 
+use crate::protocol::messages::ControlMessage;
+
 use super::lock::{LockMsg, LockState};
 
 mod child;
@@ -43,6 +45,7 @@ mod serve;
 mod tty;
 // serve_loop (= `daemon::session`) から呼ぶため crate::daemon 全体に公開する。
 // 他 domain module は reducer 内 private のまま (= translate 経由でのみ配線)。
+pub(in crate::daemon) mod execute;
 pub(in crate::daemon) mod translate;
 
 /// cross-domain queue の深度上限 (DR-0025 §連鎖停止条件)。
@@ -106,10 +109,12 @@ pub(in crate::daemon) struct Effect {
 
 /// effect の種別 (DR-0025 §Effect 型)。
 ///
-/// 具体 payload のうち既存の重い型 (protocol frame / record entry / pty spawn setup) は
-/// Phase 1b 前半では [`FramePayload`] / [`RecordEntry`] / [`PtySetup`] の placeholder で
-/// 表現し、既存コードへの結合を避ける (= 各型の doc に置換予定 Phase を記す)。OS
-/// プリミティブ ([`Pid`] / [`Signal`]) と std 型はそのまま用いる。
+/// client 送信系 (`ClientReply` / `ClientBroadcast`) の payload は pure な
+/// [`ControlMessage`] を直接持つ (= reducer が state から組み立て、CBOR encode + socket
+/// write は execute layer が担う)。残る重い型 (record entry / pty spawn setup) は
+/// [`RecordEntry`] / [`PtySetup`] の placeholder で表現し、既存コードへの結合を避ける
+/// (= 各型の doc に置換予定 Phase を記す)。OS プリミティブ ([`Pid`] / [`Signal`]) と
+/// std 型はそのまま用いる。
 #[derive(Debug)]
 pub(in crate::daemon) enum EffectKind {
     /// PTY master fd への write。
@@ -121,15 +126,17 @@ pub(in crate::daemon) enum EffectKind {
     /// 子プロセスへの signal 送出。
     Kill { pid: Pid, signal: Signal },
 
-    /// 特定 client socket への frame 送信。
+    /// 特定 client socket への reply 送信。reducer が組んだ pure な [`ControlMessage`] を
+    /// 持ち、encode + socket write は execute layer ([`execute::execute`]) が行う。
     ClientReply {
         client_id: ClientId,
-        frame: FramePayload,
+        message: ControlMessage,
     },
 
-    /// subscribe 中の client への broadcast。
+    /// subscribe 中の client への broadcast。payload は pure な [`ControlMessage`]、
+    /// 配信は execute layer ([`execute::execute`])。
     ClientBroadcast {
-        frame: FramePayload,
+        message: ControlMessage,
         filter: BroadcastFilter,
     },
 
@@ -204,13 +211,6 @@ pub(in crate::daemon) struct ClientId(pub(in crate::daemon) u64);
 /// 内部 timer の識別子 (placeholder)。Phase 2-3 の timer 実装 (DR-0025 Q3) で実体化予定。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(in crate::daemon) struct TimerId(pub(in crate::daemon) u64);
-
-/// client へ返す frame の payload placeholder。
-///
-/// Phase 2 (Client reducer + protocol kind 1:1 mapping) で `crate::protocol::Frame` に
-/// 置換予定。現状は「reducer が pure に組み立てた client 宛 bytes」を opaque に保持するだけ。
-#[derive(Debug)]
-pub(in crate::daemon) struct FramePayload(pub(in crate::daemon) Vec<u8>);
 
 /// broadcast の配信対象フィルタ placeholder。
 ///
@@ -339,11 +339,11 @@ fn dispatch(state: &mut DaemonState, msg: DaemonMsg) -> DomainOutput {
             client::reduce(&mut state.clients, DomainViews { lock: &state.lock }, e)
         }
         DaemonMsg::Screen(e) => screen::reduce(&mut state.screen, e),
-        // [stub] Lock domain: Phase 1a の pure reducer (`super::lock::reduce`) は
-        // `LockEvent` を返し Effect を出さない。Effect 経路への配線 (= LockEvent →
-        // ClientReply / ClientBroadcast Effect への翻訳) は Phase 1b 後半 / Phase 2。
-        // 前半では routing だけ通し、空 DomainOutput を返す。
-        DaemonMsg::Lock(_e) => DomainOutput::empty(),
+        // Lock domain: `super::lock::reduce_msg` が Phase 1a の pure `reduce` を内部で
+        // 呼び、`LockEvent::Released` を `ClientBroadcast(ModeChange)` Effect に翻訳する
+        // (= DR-0025 §Lock domain の `Lock ──→ Client` broadcast)。acquire/release の
+        // reply (LockResponse) 経路は control.rs 配線と不可分で未翻訳 (= 次片以降)。
+        DaemonMsg::Lock(e) => super::lock::reduce_msg(&mut state.lock, e),
         DaemonMsg::EffectResult { effect_id, outcome } => {
             dispatch_effect_result(state, effect_id, outcome)
         }
