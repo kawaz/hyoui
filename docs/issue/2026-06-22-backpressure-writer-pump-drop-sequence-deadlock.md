@@ -1,19 +1,19 @@
 ---
 title: serve_backpressure_disconnects_slow_client が CI で 30s deadline hang する (真因未観測・調査継続)
-status: open
+status: blocked
 category: bug
 created: 2026-06-22T23:16:49+09:00
 last_read: 2026-06-30T00:31:42+09:00
 open_entered: 2026-06-22T23:16:49+09:00
 wip_entered:
-blocked_entered:
+blocked_entered: 2026-07-03T16:01:05+09:00
 pending_entered:
 discarded_entered:
 resolved_entered:
 discard_reason:
 pending_reason:
 close_reason:
-blocked_by:
+blocked_by: DR-0025 Phase 2
 origin: 自リポ TODO
 ---
 
@@ -84,3 +84,9 @@ main commit `ab46b529` (= DR-0025 Draft land) で CI が再度 failure。CI run 
 → 仮説強化: writer_pump deadlock は **特定環境 (ubuntu-latest GitHub Actions runner) で deterministic に発生**、flaky でない可能性が高い。ローカル macOS では再現せず。
 
 → **DR-0025 (Daemon Reducer 化、Lock domain Phase 1a で構造的解消見込み)** との関係: DR-0025 reducer 化で writer_pump lifecycle が Effect layer の rollback 経路に formal 化されるため、本 issue は DR-0025 進捗で吸収可能性が高い。並行で個別 fix を進めるか、DR-0025 Phase 1a 完了待ちか、判断待ち。
+
+## Triage (2026-07-03)
+
+DR-0025 Phase 2 (Client domain reducer 化、Transport/Auth/Backpressure sub-state を含む) で
+writer pump / drop sequence の状態管理が reducer 化される見込み。上記 6/30 追記の吸収可能性を
+Phase 2 として確定し、Phase 2 完了待ちとして blocked に遷移する。

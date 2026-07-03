@@ -1,19 +1,19 @@
 ---
 title: "Refactor: 巨大ファイル解体 (session.rs serve_loop / main.rs / cli.rs)"
-status: open
+status: blocked
 category: task
 created: 2026-06-10T00:00:00+09:00
 last_read:
 open_entered: 2026-06-10T00:00:00+09:00
 wip_entered:
-blocked_entered:
+blocked_entered: 2026-07-03T16:01:05+09:00
 pending_entered:
 discarded_entered:
 resolved_entered:
 discard_reason:
 pending_reason:
 close_reason:
-blocked_by:
+blocked_by: DR-0025 Phase 1b/3/4
 origin: 自リポ TODO
 ---
 
@@ -85,3 +85,11 @@ help / completion / parse を導出する仕組み (= declarative spec table) �
 - 1 ステップ = 1 commit で小さく。session / main / cli を別 commit に
 - ServeContext 化 (1) → poll_fds 統合 (2) は session.rs 内で連続して行うと整合確認しやすい
 - 単一定義導出 (将来構想) は本 issue では着手しない
+
+## Triage (2026-07-03)
+
+`serve_loop` 12 引数問題 (= 本 issue の 1/2) は DR-0025 Phase 1b (super-reducer 骨格) /
+Phase 3 (Child) / Phase 4 (Serve lifecycle) の reducer 化で根本解消される見込み。ただし
+main.rs / cli.rs の CLI 層分割 (= 本 issue の 3/4) は DR-0025 のスコープ外 (daemon 内部
+設計であり CLI dispatch 層は対象としない) のため、その部分は本 issue に残す。session.rs 分は
+DR-0025 進捗待ちとして blocked に遷移するが、CLI 分割自体は DR-0025 完了を待たず着手可能。

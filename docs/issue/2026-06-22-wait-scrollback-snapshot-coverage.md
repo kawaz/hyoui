@@ -1,19 +1,19 @@
 ---
 title: hyoui wait の StateSnapshotRequest が scrollback を含まず viewport 外の出力を見逃す
-status: open
+status: blocked
 category: bug
 created: 2026-06-22T23:15:49+09:00
 last_read:
 open_entered: 2026-06-22T23:15:49+09:00
 wip_entered:
-blocked_entered:
+blocked_entered: 2026-07-03T16:01:05+09:00
 pending_entered:
 discarded_entered:
 resolved_entered:
 discard_reason:
 pending_reason:
 close_reason:
-blocked_by:
+blocked_by: DR-0025 Phase 5
 origin: 自リポ TODO
 ---
 
@@ -61,3 +61,10 @@ DR-0013 Phase B (scrollback) の実装漏れとして位置づける (= CLAUDE.m
 - [ ] DR-0013 Phase B の実装要件を確認して根治案 A/B/C の採否を決定
 - [ ] 採用案を DR-0013 または新 DR に記録
 - [ ] 実装 + テスト (継続出力 workaround を除去して安定を確認)
+
+## Triage (2026-07-03)
+
+DR-0025 Phase 5 (Screen reducer 骨格、DR-0013 byte-base tail/history と rows-base virtual
+screen の分離を継承) のスコープで `StateSnapshotRequest` への scrollback 統合が扱われる見込み。
+根治案 A (StateSnapshotRequest に scrollback last N rows を含める) は Phase 5 の実装対象と
+整合するため、Phase 5 完了待ちとして blocked に遷移する。

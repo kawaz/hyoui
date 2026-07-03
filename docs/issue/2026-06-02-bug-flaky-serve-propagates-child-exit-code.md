@@ -1,19 +1,19 @@
 ---
 title: "bug: `serve_propagates_child_exit_code` が full workspace 並列実行時に flaky fail"
-status: open
+status: blocked
 category: bug
 created: 2026-06-02T00:00:00+09:00
 last_read:
 open_entered: 2026-06-02T00:00:00+09:00
 wip_entered:
-blocked_entered:
+blocked_entered: 2026-07-03T16:01:05+09:00
 pending_entered:
 discarded_entered:
 resolved_entered:
 discard_reason:
 pending_reason:
 close_reason:
-blocked_by:
+blocked_by: DR-0025 Phase 3
 origin: DR-0016 record stop hang fix の pkf run push 時に test deps で 1 件 fail
 ---
 
@@ -62,3 +62,10 @@ CLAUDE.md §検証主義の「signal は process group / session 単位の broad
 
 - `serve_propagates_child_exit_code` が他のどの test と並列で走ると fail するか特定 (= `cargo test -- --test-threads=1` で pass するか確認 → race 確定)
 - signal serialize Mutex を適用するか、test 設計を見直す
+
+## Triage (2026-07-03)
+
+DR-0025 Phase 3 (Child state machine 化) で child exit code 伝播の状態管理が Child reducer に
+集約される見込み。signal handler の global state 共有 / waitpid race といった推定原因は
+Phase 3 の single-writer 化で構造的に解消される対象のため、Phase 3 完了待ちとして blocked に
+遷移する。

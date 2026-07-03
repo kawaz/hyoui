@@ -1,19 +1,19 @@
 ---
 title: "BUG: auto-resume / 外部 SIGCONT 後も `child-state: stopped` が恒久的に下りない"
-status: open
+status: blocked
 category: bug
 created: 2026-06-12T00:00:00+09:00
 last_read:
 open_entered: 2026-06-12T00:00:00+09:00
 wip_entered:
-blocked_entered:
+blocked_entered: 2026-07-03T16:01:05+09:00
 pending_entered:
 discarded_entered:
 resolved_entered:
 discard_reason:
 pending_reason:
 close_reason:
-blocked_by:
+blocked_by: DR-0025 Phase 3
 origin: DR-0019 Update (set/可視化) 実装の push 前 Fable レビュー (2026-06-12)。本 diff 起因ではなく v0.6.3 に既存
 ---
 
@@ -76,3 +76,10 @@ WCONTINUED poll。
 - [ ] `record_child_continued` 発火の実機確認 (lifecycle event `child-continued-observed`
   が jsonl に出るか)
 - [ ] 修正 + マトリクス再検証 (attached / detached × auto-resume / notify × STOP/CONT)
+
+## Triage (2026-07-03)
+
+DR-0025 Phase 3 (Child state machine 化、ChildEvent 整理、DR-0001 axis 1 / DR-0017 anchor /
+DR-0019 OnChildSuspend を ChildState 内部に formal 化) で child_stopped フラグ管理が
+一元化され、detached 状況での WCONTINUED/Continued transition 取りこぼしが構造的に解消される
+見込み。Phase 3 完了待ちとして blocked に遷移する。

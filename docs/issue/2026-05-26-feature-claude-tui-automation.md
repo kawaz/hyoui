@@ -1,19 +1,19 @@
 ---
 title: "Feature idea: claude code TUI 自動操作 (A/B/C 判定 + L1/L2 必須要件)"
-status: open
+status: blocked
 category: request
 created: 2026-05-26T00:00:00+09:00
 last_read: 2026-06-22T21:37:19+09:00
 open_entered: 2026-05-26T00:00:00+09:00
 wip_entered:
-blocked_entered:
+blocked_entered: 2026-07-03T16:01:05+09:00
 pending_entered:
 discarded_entered:
 resolved_entered:
 discard_reason:
 pending_reason:
 close_reason:
-blocked_by:
+blocked_by: DR-0025 Phase 7
 origin: 2026-05-26 CLI 設計議論 (Phase 11 wait L0 詳細)
 ---
 
@@ -143,3 +143,10 @@ hyoui wait <name> --area input-line --predicate-file ./claude-prompt-idle.json -
 - [[DR-0007]] — v0.2.0 で L1 emulator、v0.3.0 で L2 述語の段階
 - `docs/issue/2026-05-26-feature-recording-and-dump.md` — record/play で自動化シーケンスを記録
 - `docs/journal/2026-05-26-cli-design-discussion.md` — Phase 11 で本要件の発見経緯
+
+## Triage (2026-07-03)
+
+DR-0025 Phase 7 (Screen reducer に watch (region/matcher/flow) 実装追加 + matcher cache /
+operator chain 実装) が本 issue の A/B/C 判定 + L1/L2 要件の実装基盤になる見込み。region
+指定 wait / matcher 述語 / flow 制御の 3 軸機構は Phase 7 のスコープと直接対応する。Phase 5
+(Screen reducer 骨格) が前提のため、Phase 5-7 完了待ちとして blocked に遷移する。
