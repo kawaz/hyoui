@@ -5,11 +5,16 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # release.yml が CI 一式を release gate として再利用するための呼び出し口
+  workflow_call:
 
 jobs:
   test:
     name: Test (${{ matrix.os }} / ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
+    # test hang 時に既定 6h まで runner を空焼きしない上限。通常 run は ~5-8 分
+    # (rust-cache 有効時)。hang しても suite は fail として顕在化する。
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

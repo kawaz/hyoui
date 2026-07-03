@@ -1,6 +1,6 @@
 ---
 title: release.yml semver gate に latest-release 並列 check 追加 (DR-0039 canonical 同期)
-status: open
+status: resolved
 category: request
 created: 2026-06-28T20:04:49+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-03T19:00:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: "DR-0039 canonical の latest-release / latest-tag 並列 check を移植 (trigger が paths [Cargo.toml] のため eq=良性 skip / lt=error の適応あり、workflow 内に Design rationale 記載)。あわせて ci.yml workflow_call 化 + release build-release の CI gate 化、test job timeout-minutes: 30 も同時実装。actionlint clean"
 blocked_by:
 origin: bump-semver dogfood報告
 ---
@@ -49,3 +49,14 @@ bump-semver canonical (DR-0039) で release.yml の semver gate pattern が更�
 
 - [ ] release.yml の semver gate が DR-0039 canonical pattern と一致する
 - [ ] `latest-release` 並列 check が追加されている
+
+## Close 時の記録 (2026-07-03)
+
+- latest-release / latest-tag 並列 check を release.yml `check-version` step に実装
+  (canonical: kawaz/bump-semver release.yml / DR-0039)
+- 本リポ固有の適応: trigger が `paths: [Cargo.toml]` で非 bump 変更でも発火するため、
+  「現 version == 最新」は良性 skip (changed=false, exit 0)、「現 version < 最新」のみ
+  error (exit 1)。canonical の一律 error は不採用 (理由は workflow 内コメント)
+- スコープ拡張分 (同一 commit): CI red のまま release が出る穴を塞ぐため
+  ci.yml に `workflow_call` を追加し、release.yml の `build-release` が
+  `needs: [check-version, ci]` で CI 一式 green を必須 gate 化

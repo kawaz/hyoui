@@ -9,6 +9,15 @@ on:
   workflow_dispatch:
 
 jobs:
+  # CI 一式 (lint + test + msrv + audit + deny) を release の必須 gate にする。
+  # build-release が needs で待つため、CI が green でない commit からは
+  # release artifact が一切作られない。
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      checks: write # audit job (rustsec/audit-check) が check-run 作成に必要
+
   check-version:
     runs-on: ubuntu-latest
     outputs:
@@ -17,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0 # bump-semver の `vcs tag latest` で全 tag が必要
+          fetch-depth: 0 # bump-semver の `vcs get latest-tag` で全 tag が必要
 
       # bump-semver を install (release flow が bump-semver に依存)。
       # 最新 release のバイナリを curl で取得 (linux-amd64)。
@@ -46,15 +55,57 @@ jobs:
           CURRENT_VERSION=$(bump-semver get Cargo.toml --no-hint)
           echo "current=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
 
-          # 既存 tag より大きいか検証 (二重リリース防止) — compare の一発形。
-          # 比較失敗 (= 以下) も予期せぬエラーも release skip に倒す (= 安全側)。
-          if ! bump-semver vcs get latest-tag >/dev/null 2>&1; then
-            echo "SemVer tag がまだ無い; first release とみなす"
-          elif bump-semver compare gt Cargo.toml 'vcs:latest-tag()'; then
-            : # CURRENT > latest tag: release 続行
+          # ---- semver gate (= bump-semver DR-0039 canonical pattern) ----
+          #
+          # CURRENT_VERSION が「過去の release / tag いずれよりも大」を並列 check
+          # する。両 source を短絡せず評価し、どちらかの gate を越えなかったら
+          # release を作らない:
+          #   - latest-release: GH の release 一覧 (= 過去リリース済 versions)
+          #   - latest-tag    : git tag (= origin の git ref)
+          #
+          # なぜ両方必要か (= latest-tag 単独では不足):
+          #   `gh release create` は GH 内部に release + tag object を作るが
+          #   origin の git ref には tag を push しない (cli/cli#4357)。よって
+          #   checkout 後の `vcs get latest-tag` が GH の最新 release より古い
+          #   tag を返すケースがあり、そのギャップを latest-release が埋める。
+          #
+          # Design rationale (canonical との差分): 本リポの trigger は
+          # paths [Cargo.toml] で、version bump を伴わない変更 (依存追加等)
+          # でも発火する。そのため「現 version == 最新」は良性 skip
+          # (changed=false, exit 0)、「現 version < 最新」のみ設定 error
+          # (exit 1) に分ける。VERSION file trigger の canonical は常に
+          # bump 意図なので gate 不通過 = 一律 error だが、ここでは過剰。
+          FAIL=0
+          SKIP=0
+          check_axis() {
+            local label="$1" latest="$2"
+            echo "${label}: ${latest}"
+            if bump-semver compare gt "$CURRENT_VERSION" "$latest" -qq; then
+              : # CURRENT > latest: この軸は通過
+            elif bump-semver compare eq "$CURRENT_VERSION" "$latest" -qq; then
+              SKIP=1
+            else
+              echo "::error::v${CURRENT_VERSION} is less than ${label} v${latest}"
+              FAIL=1
+            fi
+          }
+          if LATEST_REL=$(bump-semver vcs get latest-release --repository "$REPO" 2>/dev/null); then
+            check_axis "latest-release" "$LATEST_REL"
           else
+            echo "latest-release: (none yet); bootstrap"
+          fi
+          if LATEST_TAG=$(bump-semver vcs get latest-tag --include-prerelease --vcs git 2>/dev/null); then
+            check_axis "latest-tag" "$LATEST_TAG"
+          else
+            echo "latest-tag: (none yet, or transient migration); bootstrap"
+          fi
+          if [ "$FAIL" = "1" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Version v${CURRENT_VERSION} は latest tag 以下; release skip"
+            exit 1
+          fi
+          if [ "$SKIP" = "1" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Version v${CURRENT_VERSION} is already the latest; release skip"
             exit 0
           fi
 
@@ -68,7 +119,7 @@ jobs:
           fi
 
   build-release:
-    needs: check-version
+    needs: [check-version, ci]
     if: needs.check-version.outputs.changed == 'true'
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -140,7 +191,7 @@ jobs:
       - name: Generate SHA256SUMS
         run: |
           set -euo pipefail
-          sha256sum *.tar.gz > SHA256SUMS
+          sha256sum ./*.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
       - name: Generate SLSA build provenance attestation
@@ -158,7 +209,7 @@ jobs:
           COMMIT_SHA: ${{ github.sha }}
         run: |
           gh release create "v${VERSION}" \
-            *.tar.gz SHA256SUMS \
+            ./*.tar.gz SHA256SUMS \
             --repo "$REPO" \
             --title "v${VERSION}" \
             --target "$COMMIT_SHA" \
