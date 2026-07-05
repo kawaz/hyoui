@@ -34,7 +34,8 @@ use std::collections::VecDeque;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 
-use crate::protocol::messages::ControlMessage;
+use crate::protocol::Mode;
+use crate::protocol::messages::{ControlMessage, RawAck};
 
 use super::broadcast::ClientHandle;
 use super::lock::{LockMsg, LockState};
@@ -149,7 +150,18 @@ pub(in crate::daemon) enum EffectKind {
         filter: BroadcastFilter,
     },
 
-    /// record sink への append。
+    /// 特定 client への raw ack (= `TYPE_RAW_ACK` frame、DR-0021)。CBOR control とは
+    /// frame type が異なるため [`EffectKind::ClientReply`] と分離する (DR-0025 §Phase 2-β
+    /// の実体化点)。
+    ClientRawAck { client_id: ClientId, ack: RawAck },
+
+    /// client の切断予約 (= 旧 `ClientFrameOutcome::DropClient` 相当)。execute は
+    /// `overflow_ids` に積むだけで実 IO を持たない (= 実際の drop は caller の既存
+    /// cascade 経路が担う)。EffectResult は返さない。
+    ClientDisconnect { client_id: ClientId },
+
+    /// record sink への append。fire-and-forget (= EffectResult は返さない、既存の
+    /// push 系呼び出しも返り値を持たない)。
     Record { entry: RecordEntry },
 
     /// 子プロセス spawn (= run 起動時のみ)。
@@ -172,11 +184,32 @@ pub(in crate::daemon) enum EffectOutcome {
     /// daemon 側での effect 実行成功 (= socket write 成功等。client 受信保証ではない、
     /// DR-0025 §state rollback / pending state 戦略の適用範囲注意)。
     Ok,
+    /// [`EffectKind::TtyWrite`] の実行詳細 (DR-0025 §Phase 2-β の実体化点)。
+    ///
+    /// `write_all_with_idle_timeout` の `WriteOutcome` を pure data に写したもの。
+    /// 発行元 reducer は pending state に保持した bytes とこの詳細から record
+    /// (in / in-write-error) と RawAck (ok / err) を組み立てる (= DR-0021 の完了点
+    /// 「master fd write の return」を保存)。complete = `error.is_none() &&
+    /// written_len == requested_len`。
+    TtyWrite {
+        written_len: usize,
+        requested_len: usize,
+        error: Option<TtyWriteErrorKind>,
+    },
     /// effect 実行失敗。`kind` で失敗種別、`retry_advice` で再試行方針を返す。
     Failed {
         kind: EffectErrorKind,
         retry_advice: RetryAdvice,
     },
+}
+
+/// [`EffectOutcome::TtyWrite`] の error 種別 (= `sys::WriteError` の pure data 写像)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::daemon) enum TtyWriteErrorKind {
+    /// forward progress が `MASTER_WRITE_IDLE_TIMEOUT_MS` 続けて無い (= 子が slow reader)。
+    IdleTimeout,
+    /// IO 失敗 (= EIO / EBADF 等)。errno 由来の表示文字列を保持。
+    Io(String),
 }
 
 /// effect 失敗の種別 (DR-0025 §Effect 失敗の feedback)。
@@ -233,12 +266,38 @@ pub(in crate::daemon) enum BroadcastFilter {
     SubscribersOnly,
 }
 
-/// record sink へ append する entry の placeholder。
+/// record sink へ append する entry (DR-0025 §Phase 2-β の実体化点)。
 ///
-/// Phase 4 (Serve / record domain) で `daemon::record` の event 型に置換予定。現状は
-/// serialize 済 bytes を opaque に保持するだけ。
+/// `daemon::record::RecordRegistry` の push 系呼び出しと 1:1 対応する pure data。
+/// execute layer が対応する push を実行する。raw_data 経路が使う 3 種のみ実体化し、
+/// lifecycle 系 (LockAcquired / ClientDetached 等) の Effect 化は Phase 2-γ。
 #[derive(Debug)]
-pub(in crate::daemon) struct RecordEntry(pub(in crate::daemon) Vec<u8>);
+pub(in crate::daemon) enum RecordEntry {
+    /// 子の input stream へ書き込み成功した bytes (= `push_bytes_in`、DR-0016 §4)。
+    BytesIn { client_id: u64, bytes: Vec<u8> },
+    /// master write の partial / 失敗 (= `push_in_write_error`、DR-0016 §4)。
+    InWriteError {
+        client_id: u64,
+        requested_len: usize,
+        written_len: usize,
+        error: RecordWriteErrorKind,
+        unwritten_bytes: Vec<u8>,
+    },
+    /// 認可 reject された input (= `push_in_rejected`、DR-0016 §3)。
+    InRejected {
+        client_id: u64,
+        client_mode: Mode,
+        lock_holder_client_id: Option<u64>,
+        reason: RecordInRejectedReason,
+        bytes: Vec<u8>,
+    },
+}
+
+/// [`RecordEntry::InWriteError`] の error 種別 (= `record::WriteErrorKind` に写す)。
+pub(in crate::daemon) type RecordWriteErrorKind = super::record::WriteErrorKind;
+
+/// [`RecordEntry::InRejected`] の理由 (= `record::InRejectedReason` に写す)。
+pub(in crate::daemon) type RecordInRejectedReason = super::record::InRejectedReason;
 
 /// 子 PTY spawn 設定の placeholder。
 ///
@@ -450,11 +509,10 @@ pub(in crate::daemon) fn handle(state: &mut DaemonState, msg: DaemonMsg) -> Vec<
 /// そこからさらに Effect が出たら再度 execute する。stub 段階では EffectResult 受口が
 /// 空を返すため 1 round で収束する。[`MAX_FEEDBACK_ROUNDS`] 超過は設計違反として
 /// debug は panic / release は error log + 打ち切りで継続 (= §連鎖停止条件と同方針)。
-pub(in crate::daemon) fn execute_with_feedback(
+pub(in crate::daemon) fn execute_with_feedback_ctx(
     state: &mut DaemonState,
     effects: Vec<Effect>,
-    clients: &mut [ClientHandle],
-    overflow_ids: &mut Vec<u64>,
+    ctx: &mut execute::ExecuteCtx<'_>,
 ) {
     let mut effects = effects;
     let mut rounds = 0usize;
@@ -469,12 +527,30 @@ pub(in crate::daemon) fn execute_with_feedback(
                 break;
             }
         }
-        let feedback = execute::execute(effects, clients, overflow_ids);
+        let feedback = execute::execute(effects, ctx);
         effects = Vec::new();
         for m in feedback {
             effects.extend(handle(state, m));
         }
     }
+}
+
+/// [`execute_with_feedback_ctx`] の後方互換 wrapper (= pty / record_registry を持たない
+/// 呼び出し元用。TtyWrite / Record effect が来ない経路でのみ使える)。Phase 2-γ で
+/// 全呼び出し元を ctx 版に一本化して削除する。
+pub(in crate::daemon) fn execute_with_feedback(
+    state: &mut DaemonState,
+    effects: Vec<Effect>,
+    clients: &mut [ClientHandle],
+    overflow_ids: &mut Vec<u64>,
+) {
+    let mut ctx = execute::ExecuteCtx {
+        clients,
+        overflow_ids,
+        pty: None,
+        record_registry: None,
+    };
+    execute_with_feedback_ctx(state, effects, &mut ctx);
 }
 
 /// [`handle`] + [`execute_with_feedback`] の一括形 (= serve_loop の translate 挿入点用)。

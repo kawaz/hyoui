@@ -5,38 +5,58 @@
 //! feed-back する契約、DR-0025 §Effect 失敗の feedback)。reducer が pure を保つための IO
 //! 境界層で、本 module だけが `send_control` / `broadcast_control` の実 socket write を触る。
 //!
-//! この片で配線する effect は client 送信系 ([`EffectKind::ClientReply`] /
-//! [`EffectKind::ClientBroadcast`]) のみ。他 domain の effect (TtyWrite / Kill / Record /
-//! SpawnChild / Timer 系) は各 domain reducer が当該 effect を発行し始める後続 Phase で
-//! 本 module に配線する。未配線 effect の到達は設計違反として debug_assert で検出する。
+//! 配線済み effect: client 送信系 ([`EffectKind::ClientReply`] / [`ClientBroadcast`] /
+//! [`ClientRawAck`]([`EffectKind::ClientRawAck`]))、raw_data hot path の
+//! [`EffectKind::TtyWrite`] (DR-0025 §Phase 2-β)、[`EffectKind::Record`] (raw_data 系
+//! 3 種)、[`EffectKind::ClientDisconnect`] (切断予約)。未配線 (Kill / SpawnChild /
+//! Timer 系 / TtyResize) は各 domain reducer が発行し始める Phase で配線し、それまでの
+//! 到達は設計違反として debug_assert で検出する。
 
-// serve_loop (= `daemon::session`) への配線は次片で行うため、この片では execute の
-// 呼び出し元がまだ無い。unit test だけが execute / outcome ヘルパを使う。配線までの間、
-// pub fn を dead_code として許容する (= reducer/mod.rs の module allow と同じ扱い)。
-#![allow(dead_code)]
+use super::super::broadcast::{ClientHandle, broadcast_control, send_control, send_raw_ack};
+use super::super::record::RecordRegistry;
+use super::{
+    DaemonMsg, Effect, EffectErrorKind, EffectKind, EffectOutcome, RecordEntry, RetryAdvice,
+    TtyWriteErrorKind,
+};
+use crate::sys::{FdExt, Pty, WriteError};
 
-use super::super::broadcast::{ClientHandle, broadcast_control, send_control};
-use super::{DaemonMsg, Effect, EffectErrorKind, EffectKind, EffectOutcome, RetryAdvice};
+/// execute の実行資源 (DR-0025 §Phase 2-β の実体化点)。
+///
+/// - `clients`: [`EffectKind::ClientReply`] / [`ClientRawAck`] の宛先探索、
+///   [`ClientBroadcast`] の配信先
+/// - `overflow_ids`: 送信失敗 / [`EffectKind::ClientDisconnect`] の切断予約先
+/// - `pty`: [`EffectKind::TtyWrite`] の書き込み先。持たない呼び出し元 (= linger 等) は
+///   `None` (= TtyWrite が来たら設計違反として debug_assert)
+/// - `record_registry`: [`EffectKind::Record`] の push 先。`None` なら同上
+pub(in crate::daemon) struct ExecuteCtx<'a> {
+    pub(in crate::daemon) clients: &'a mut [ClientHandle],
+    pub(in crate::daemon) overflow_ids: &'a mut Vec<u64>,
+    pub(in crate::daemon) pty: Option<&'a Pty>,
+    pub(in crate::daemon) record_registry: Option<&'a RecordRegistry>,
+}
+
+/// [`EffectKind::TtyWrite`] の idle timeout (ms)。
+///
+/// 値の正本は raw_data 経路の既存挙動 (= `control.rs` が使っていた
+/// `MASTER_WRITE_IDLE_TIMEOUT_MS = 500`、DR-0016 §4 / R5-C3)。execute layer への移設に
+/// 伴い本 module で保持する。
+pub(in crate::daemon) const MASTER_WRITE_IDLE_TIMEOUT_MS: u32 = 500;
 
 /// [`Effect`] 列を実 IO に変換し、各 effect の [`DaemonMsg::EffectResult`] を返す。
 ///
-/// `clients` は送信対象の client handle 群 (= [`EffectKind::ClientReply`] の宛先探索 /
-/// [`EffectKind::ClientBroadcast`] の配信先)。返す `Vec<DaemonMsg>` は caller が
-/// super-reducer [`super::handle`] に feed-back する (DR-0025 §Effect 失敗の feedback)。
+/// 返す `Vec<DaemonMsg>` は caller が super-reducer [`super::handle`] に feed-back する
+/// (DR-0025 §Effect 失敗の feedback)。fire-and-forget の effect ([`EffectKind::Record`] /
+/// [`ClientDisconnect`]) は EffectResult を返さない。
 ///
-/// send の実 IO (`send_control` / `broadcast_control`) は本関数が担い、その結果からの
-/// [`EffectOutcome`] 生成は [`reply_outcome`] / [`broadcast_outcome`] の pure ヘルパに
-/// 分離する (= clients 無しで outcome 生成ロジックを unit test 可能にする)。
-pub(in crate::daemon) fn execute(
-    effects: Vec<Effect>,
-    clients: &mut [ClientHandle],
-    overflow_ids: &mut Vec<u64>,
-) -> Vec<DaemonMsg> {
+/// send の実 IO は本関数が担い、その結果からの [`EffectOutcome`] 生成は
+/// [`reply_outcome`] / [`broadcast_outcome`] / [`tty_write_outcome`] の pure ヘルパに
+/// 分離する (= 実 IO 無しで outcome 生成ロジックを unit test 可能にする)。
+pub(in crate::daemon) fn execute(effects: Vec<Effect>, ctx: &mut ExecuteCtx<'_>) -> Vec<DaemonMsg> {
     let mut results = Vec::with_capacity(effects.len());
     for Effect { id, kind } in effects {
         let outcome = match kind {
             EffectKind::ClientReply { client_id, message } => {
-                let sent_ok = match clients.iter().find(|c| c.id == client_id.0) {
+                let sent_ok = match ctx.clients.iter().find(|c| c.id == client_id.0) {
                     Some(ch) => send_control(ch, message),
                     // 宛先 client が既に集合から消えている = 送信不能。broken 扱いで
                     // feedback し、発行元 reducer が pending state を rollback できるようにする。
@@ -54,9 +74,96 @@ pub(in crate::daemon) fn execute(
                 // caller の drop 予約 (`overflow_ids`) に積む (= serve_loop が次周回で
                 // drop する既存規律の保存)。EffectResult::Failed 経由の Client domain
                 // lifecycle 統合は Phase 2-γ の Backpressure sub-state で行う。
-                let failed = broadcast_control(clients, &message);
-                overflow_ids.extend(failed.iter().copied());
+                let failed = broadcast_control(ctx.clients, &message);
+                ctx.overflow_ids.extend(failed.iter().copied());
                 broadcast_outcome(&failed)
+            }
+            EffectKind::TtyWrite { bytes } => {
+                let Some(pty) = ctx.pty else {
+                    debug_assert!(false, "execute: TtyWrite が来たが ctx.pty が None");
+                    continue;
+                };
+                // DR-0016 §4 / R5-C3: master fd は NONBLOCK。EAGAIN (= 子の line
+                // discipline buffer 満杯) は poll(POLLOUT) で待ち、forward progress が
+                // idle timeout 続けて無いときだけ IdleTimeout を返す。結果の解釈
+                // (record / ack / disconnect) は EffectOutcome::TtyWrite を受けた
+                // 発行元 reducer が行う。
+                match pty
+                    .master_fd()
+                    .write_all_with_idle_timeout(&bytes, MASTER_WRITE_IDLE_TIMEOUT_MS)
+                {
+                    Ok(outcome) => tty_write_outcome(
+                        outcome.written_len,
+                        outcome.requested_len,
+                        outcome.error.as_ref(),
+                    ),
+                    // write の dispatch 自体の失敗 (= 既存挙動では ack 無しの即
+                    // DropClient)。詳細を持たない Failed で返し、発行元 reducer が
+                    // 「ack 無しで disconnect」に写す。
+                    Err(_) => EffectOutcome::Failed {
+                        kind: EffectErrorKind::WriteBroken,
+                        retry_advice: RetryAdvice::DoNotRetry,
+                    },
+                }
+            }
+            EffectKind::ClientRawAck { client_id, ack } => {
+                let sent_ok = match ctx.clients.iter().find(|c| c.id == client_id.0) {
+                    Some(ch) => send_raw_ack(ch, &ack),
+                    None => false,
+                };
+                reply_outcome(sent_ok)
+            }
+            EffectKind::ClientDisconnect { client_id } => {
+                // 切断予約のみ (= 実 IO なし、実 drop は caller の既存 cascade)。
+                // fire-and-forget で EffectResult は返さない。
+                ctx.overflow_ids.push(client_id.0);
+                continue;
+            }
+            EffectKind::Record { entry } => {
+                let Some(registry) = ctx.record_registry else {
+                    debug_assert!(
+                        false,
+                        "execute: Record が来たが ctx.record_registry が None"
+                    );
+                    continue;
+                };
+                match entry {
+                    RecordEntry::BytesIn { client_id, bytes } => {
+                        registry.push_bytes_in(client_id, &bytes);
+                    }
+                    RecordEntry::InWriteError {
+                        client_id,
+                        requested_len,
+                        written_len,
+                        error,
+                        unwritten_bytes,
+                    } => {
+                        registry.push_in_write_error(
+                            client_id,
+                            requested_len,
+                            written_len,
+                            error,
+                            &unwritten_bytes,
+                        );
+                    }
+                    RecordEntry::InRejected {
+                        client_id,
+                        client_mode,
+                        lock_holder_client_id,
+                        reason,
+                        bytes,
+                    } => {
+                        registry.push_in_rejected(
+                            client_id,
+                            client_mode,
+                            lock_holder_client_id,
+                            reason,
+                            &bytes,
+                        );
+                    }
+                }
+                // fire-and-forget (= 既存の push 系も返り値なし)。
+                continue;
             }
             // client 送信系以外の effect はこの片の execute では未配線。各 domain reducer が
             // 当該 effect を発行し始める Phase で配線する。未配線 effect の到達は「未実装
@@ -104,6 +211,25 @@ fn broadcast_outcome(_failed_client_ids: &[u64]) -> EffectOutcome {
     EffectOutcome::Ok
 }
 
+/// [`EffectKind::TtyWrite`] の `WriteOutcome` から [`EffectOutcome::TtyWrite`] を導く。
+///
+/// `sys::WriteError` を pure data の [`TtyWriteErrorKind`] に写す (= reducer が sys 型に
+/// 依存しないための境界変換)。実 IO を触らない pure ヘルパなので unit test 可能。
+fn tty_write_outcome(
+    written_len: usize,
+    requested_len: usize,
+    error: Option<&WriteError>,
+) -> EffectOutcome {
+    EffectOutcome::TtyWrite {
+        written_len,
+        requested_len,
+        error: error.map(|e| match e {
+            WriteError::IdleTimeout => TtyWriteErrorKind::IdleTimeout,
+            WriteError::Io(errno) => TtyWriteErrorKind::Io(format!("{errno}")),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{Domain, EffectId};
@@ -122,7 +248,7 @@ mod tests {
                 assert!(matches!(kind, EffectErrorKind::WriteBroken));
                 assert!(matches!(retry_advice, RetryAdvice::DoNotRetry));
             }
-            EffectOutcome::Ok => panic!("送信失敗は Failed になるべき"),
+            other => panic!("送信失敗は Failed になるべき: {other:?}"),
         }
     }
 
@@ -137,27 +263,60 @@ mod tests {
         assert!(matches!(broadcast_outcome(&[1, 2, 3]), EffectOutcome::Ok));
     }
 
-    /// 未配線の [`EffectKind`] (= TtyWrite 等) が [`execute`] に到達したら debug build で
-    /// panic する (= 設計違反の即検出)。
+    /// 未配線の [`EffectKind`] (= Kill / SpawnChild / Timer 系 / TtyResize) が
+    /// [`execute`] に到達したら debug build で panic する (= 設計違反の即検出)。
     ///
-    /// なぜこの test か: この片の execute は client 送信系のみ配線する。未実装 domain が
-    /// client effect 以外を出したら、それは「未配線 domain が effect を発行した」設計違反。
-    /// debug build で fail-fast して検出する。`cargo test` は既定で `debug_assertions` on
-    /// なのでこの panic 経路を通る (release 側の黙って skip は別 build profile を要するため
-    /// 本 test では検証しない)。clients は空で良い (TtyWrite は client を触らない = 実 IO
-    /// 無しで panic 経路のみを弁別できる)。
+    /// なぜこの test か: これらの effect はまだどの reducer も発行しない。到達したら
+    /// 「未実装 domain が effect を発行した」設計違反なので debug build で fail-fast
+    /// する。`cargo test` は既定で `debug_assertions` on なのでこの panic 経路を通る
+    /// (release 側の黙って skip は別 build profile を要するため本 test では検証しない)。
+    /// Kill は実 IO 前に match arm で弾かれるため pid/signal はダミー値でよい。
     #[test]
     #[should_panic(expected = "未配線の EffectKind")]
     fn execute_panics_on_unwired_effect_in_debug() {
         let mut clients: Vec<ClientHandle> = Vec::new();
         let mut overflow_ids = Vec::new();
+        let mut ctx = ExecuteCtx {
+            clients: &mut clients,
+            overflow_ids: &mut overflow_ids,
+            pty: None,
+            record_registry: None,
+        };
+        let _ = execute(
+            vec![Effect {
+                id: EffectId(super::super::Domain::Child, 0),
+                kind: EffectKind::Kill {
+                    pid: nix::unistd::Pid::from_raw(1),
+                    signal: nix::sys::signal::Signal::SIGTERM,
+                },
+            }],
+            &mut ctx,
+        );
+    }
+
+    /// 配線済みの [`EffectKind::TtyWrite`] が pty 無しの ctx (= 後方互換 wrapper 経路等)
+    /// に到達したら debug build で panic する (= 実行資源の欠落を設計違反として検出)。
+    ///
+    /// なぜこの test か: TtyWrite を発行しうる reducer 経路 (= raw_data) は必ず pty 付き
+    /// ctx (= control.rs の raw arm) から execute される契約 (DR-0025 §Phase 2-β)。
+    /// pty: None の ctx に来るのは配線ミスなので fail-fast する。
+    #[test]
+    #[should_panic(expected = "ctx.pty が None")]
+    fn execute_panics_on_tty_write_without_pty_in_debug() {
+        let mut clients: Vec<ClientHandle> = Vec::new();
+        let mut overflow_ids = Vec::new();
+        let mut ctx = ExecuteCtx {
+            clients: &mut clients,
+            overflow_ids: &mut overflow_ids,
+            pty: None,
+            record_registry: None,
+        };
         let _ = execute(
             vec![Effect {
                 id: EffectId(Domain::Tty, 0),
                 kind: EffectKind::TtyWrite { bytes: vec![b'x'] },
             }],
-            &mut clients,
-            &mut overflow_ids,
+            &mut ctx,
         );
     }
 }

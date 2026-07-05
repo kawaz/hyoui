@@ -177,6 +177,29 @@ enum EffectKind {
 }
 ```
 
+### Phase 2-β の実体化点 (= raw_data hot path)
+
+raw_data 経路の reducer 化で以下を確定する:
+
+- **EffectOutcome は effect 種別の詳細 payload を持てる**: `TtyWrite { written_len,
+  requested_len, error: Option<TtyWriteErrorKind> }` variant を追加。発行元 reducer は
+  pending state に保持した bytes とこの詳細から record (in / in-write-error) と
+  RawAck (ok / err) を組み立てる (= DR-0021 の完了点「master fd write の return」を保存)
+- **EffectKind の 2-β 実体化**: `ClientRawAck { client_id, ack }` (= RawAck は
+  TYPE_RAW_ACK frame で CBOR control と別型のため ClientReply と分離) /
+  `ClientDisconnect { client_id }` (= 旧 ClientFrameOutcome::DropClient 相当の切断予約) /
+  `Record { entry }` の entry を record_registry の push 系呼び出しを表す enum に実体化
+  (bytes-in / in-write-error / in-rejected。lifecycle 系 record の Effect 化は Phase 2-γ)
+- **ExecuteCtx**: execute の実行資源 (clients / overflow_ids / pty / record_registry) を
+  struct に集約。pty は `Option` (= TtyWrite が来たのに無ければ設計違反として
+  debug_assert。linger 等 pty を持たない呼び出し元が存在するため)
+- **認可判定の入力**: client の mode は translate 時に payload へスナップショットする
+  (= ClientRegistry pure ミラーの導入は Phase 2-γ、それまでの中間形)。raw_data に
+  cap 判定は無い (= cap は CBOR control 系のみ) ので mode + lock view で認可が閉じる
+- **DropClient の昇格**: raw arm の reducer 経路は control.rs 内で execute をローカル
+  overflow で回し、自 client id が積まれたら `ClientFrameOutcome::DropClient` を返す
+  (= serve_loop の frame dispatch / indices_to_drop 構造は不変、既存の切断タイミングを保存)
+
 ### Effect 失敗の feedback
 
 effect 実行結果は次の input message として reducer に戻る:

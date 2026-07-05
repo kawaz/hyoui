@@ -62,6 +62,24 @@ pub(in crate::daemon) fn client_frame_received(client_id: u64) -> DaemonMsg {
     })
 }
 
+/// raw_data frame (= `TYPE_RAW_DATA`) → Client RawDataReceived event
+/// (DR-0025 §Phase 2-β の実体化点)。
+///
+/// `mode` は認可判定 (Ro reject) 用の client mode スナップショット (= ClientRegistry
+/// pure ミラー導入までの中間形)。bytes は frame body の所有権をそのまま受け取る
+/// (= copy しない)。
+pub(in crate::daemon) fn client_raw_data(
+    client_id: u64,
+    mode: crate::protocol::Mode,
+    bytes: Vec<u8>,
+) -> DaemonMsg {
+    DaemonMsg::Client(ClientMsg::RawDataReceived {
+        client_id,
+        mode,
+        bytes,
+    })
+}
+
 /// client drop (detach cascade) → Client Detached event (DR-0025 §cross-domain
 /// `Client ──→ Serve` / `Client ──→ Lock` の起点)。
 ///
