@@ -5177,11 +5177,8 @@ fn parse_int(s: &str) -> Option<i32> {
     }
     let mut value: i32 = 0;
     for ch in s.chars() {
-        if let Some(d) = ch.to_digit(10) {
-            value = value.checked_mul(10)?.checked_add(d as i32)?;
-        } else {
-            return None;
-        }
+        let d = ch.to_digit(10)?;
+        value = value.checked_mul(10)?.checked_add(d as i32)?;
     }
     Some(value)
 }
