@@ -1472,10 +1472,22 @@ fn shorten_cwd(cwd: &str) -> String {
 fn fmt_argv(argv: &[String]) -> String {
     argv.iter()
         .map(|a| {
-            if a.is_empty() || a.contains(' ') || a.contains('\t') || a.contains('"') {
-                format!("\"{}\"", a.replace('"', "\\\""))
+            let needs_quote = a.is_empty()
+                || a.contains(' ')
+                || a.contains('\t')
+                || a.contains('\n')
+                || a.contains('\r')
+                || a.contains('"');
+            let escaped = a
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            if needs_quote {
+                format!("\"{escaped}\"")
             } else {
-                a.clone()
+                escaped
             }
         })
         .collect::<Vec<_>>()
@@ -4404,6 +4416,26 @@ mod tests {
     fn fmt_argv_plain_args_no_quote() {
         let argv = vec!["bash".to_string(), "-l".to_string()];
         assert_eq!(fmt_argv(&argv), "bash -l");
+    }
+
+    /// `fmt_argv`: 改行 / CR / TAB を含む arg は quote + `\n` `\r` `\t` escape
+    /// (= plain list 出力が縦に崩れないため。JSONL 側は serde_json が escape 済)。
+    #[test]
+    fn fmt_argv_escapes_control_chars() {
+        let argv = vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            "echo foo\nbar\tbaz\r".to_string(),
+        ];
+        assert_eq!(fmt_argv(&argv), "bash -c \"echo foo\\nbar\\tbaz\\r\"");
+    }
+
+    /// `fmt_argv`: 既存の `\` はそのままの literal として escape される
+    /// (= 復元可能性のため。表示専用なので厳密な shell 互換 quoting は不要)。
+    #[test]
+    fn fmt_argv_escapes_backslash() {
+        let argv = vec!["a\\b".to_string()];
+        assert_eq!(fmt_argv(&argv), "a\\\\b");
     }
 
     /// R5-H3: live socket (= listener が bind されている) は `probe_socket_liveness`
