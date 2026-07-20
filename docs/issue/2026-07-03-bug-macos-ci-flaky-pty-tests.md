@@ -46,6 +46,14 @@ fail した。同一 code の後続 run では pass しており flaky。
 3. DR-0025 Phase 2 (Client domain) / Phase 3 (Child domain) の reducer 化で
    吸収されるか evaluate (吸収されるなら blocked 遷移)
 
+## 再観測 (2026-07-19, v0.9.10)
+
+- Release run: https://github.com/kawaz/hyoui/actions/runs/29694355729 (commit 9180fd8e)
+- job: `ci / Test (macos-latest / stable)`
+- 失敗テスト: `single_input_succeeds_with_auto_lock` (crates/hyoui-cli/tests/common/pty.rs:96)
+- panic: `single-input daemon: thread did not finish within 30s (= 無限ハング防止のため deadline fail)`
+- 同一 pty.rs:96 の deadline hang 様式。本 issue が既に扱う `outer_token_inheritance_skips_auto_acquire` / `child_inherits_hyoui_session_id_env` に加え、同ファイル内の 3 件目のテストで同型 flaky が発生
+
 ## 受け入れ条件
 
 - [ ] 不安定さの軸が観測データで特定されている
