@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-07-21 | bug | open | [bug-screen-dump-empty-while-tail-has-output](./2026-07-21-bug-screen-dump-empty-while-tail-has-output.md) | screen dump/snapshot が空 (seqno=0) を返す — idle 15s の stalled auto-reset が false-positive で cells 全消し |
 | 2026-07-20 | bug | open | [socket-dir-tmp-fallback-macos-cleanup](./2026-07-20-socket-dir-tmp-fallback-macos-cleanup.md) | socket dir が /tmp 固定 fallback のため macOS 定期掃除で daemon 生存中に socket file が消える |
 | 2026-07-20 | bug | open | [detach-key-not-firing-keyboard-protocol](./2026-07-20-detach-key-not-firing-keyboard-protocol.md) | detach key (Ctrl-A d) が実端末で発火しない疑い — 端末 keyboard protocol (kitty CSI-u 等) 起因の可能性 |
 | 2026-07-04 | bug | open | [bug-flaky-outer-token-e2e-deadline](./2026-07-04-bug-flaky-outer-token-e2e-deadline.md) | outer_token_inheritance_skips_auto_acquire が単独実行でも稀に 30s deadline fail (macOS CI flaky と同一 test) |
