@@ -60,6 +60,10 @@
   const sendStatus = document.getElementById('sendStatus');
   const stoppedBanner = document.getElementById('stoppedBanner');
   const resumeBtn = document.getElementById('resumeBtn');
+  // HTML の `hidden` 属性に加え script 側でも明示的に hide しておく (belt-and-suspenders)。
+  // 初回 fetch が成功して child_stopped=true と判明するまでは絶対に表示させない
+  // (= false-positive で banner が一瞬映る過渡を潰す。CSS 側の override も別途施した)。
+  stoppedBanner.hidden = true;
 
   let timer = null;
   let lastPayload = '';

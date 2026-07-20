@@ -168,6 +168,15 @@ body.embed #inputForm { flex: 0 0 auto; }
   border-radius: 3px;
   font-size: 0.9rem;
 }
+/* `hidden` 属性を確実に効かせるための override。`.stopped-banner { display: flex }`
+   の author CSS は UA `[hidden] { display: none }` (attribute selector 単体) より
+   cascade origin で勝つため、HTML の `hidden` 属性が初期描画で無視され banner が
+   一瞬映る過渡が発生していた (kawaz playwright 観測 2026-07-21)。同じ author 側で
+   `.stopped-banner[hidden]` = (0,2,0) を用意して `.stopped-banner` = (0,1,0) より
+   確実に勝たせる。 */
+.stopped-banner[hidden] {
+  display: none;
+}
 .stopped-banner button {
   margin-left: auto;
   border-color: #b8860b;
