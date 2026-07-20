@@ -69,3 +69,11 @@ DR-0025 Phase 3 (Child state machine 化) で child exit code 伝播の状態管
 集約される見込み。signal handler の global state 共有 / waitpid race といった推定原因は
 Phase 3 の single-writer 化で構造的に解消される対象のため、Phase 3 完了待ちとして blocked に
 遷移する。
+
+## 再観測 (2026-07-19, v0.9.10)
+
+- Release run: https://github.com/kawaz/hyoui/actions/runs/29694355729 (commit 9180fd8e)
+- job: `ci / Test (macos-latest / stable)`
+- 失敗テスト: `child_exit_propagates_code` (crates/hyoui-cli/tests/daemon_death_exit.rs:92)
+- panic: `assertion \`left == right\` failed: 子の exit 7 が client に伝搬するはず (= ChildExited)`, `left: None`, `right: Some(7)`
+- 注: 本 issue の対象 test は `daemon::session::tests::serve_propagates_child_exit_code` (lib test) だが、今回の失敗は CLI e2e `child_exit_propagates_code` (daemon_death_exit.rs) — 同一の「child exit code 伝搬」flaky family として本 issue に記録。DR-0025 Phase 3 待ちの blocked 状況は変わらず
