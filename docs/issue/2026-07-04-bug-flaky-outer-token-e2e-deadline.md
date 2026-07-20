@@ -3,7 +3,7 @@ title: outer_token_inheritance_skips_auto_acquire が単独実行でも稀に 30
 status: open
 category: bug
 created: 2026-07-04T01:07:04+09:00
-last_read:
+last_read: 2026-07-20T10:22:16+09:00
 open_entered: 2026-07-04T01:07:04+09:00
 wip_entered:
 blocked_entered:
