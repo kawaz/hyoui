@@ -54,6 +54,21 @@ fail した。同一 code の後続 run では pass しており flaky。
 - panic: `single-input daemon: thread did not finish within 30s (= 無限ハング防止のため deadline fail)`
 - 同一 pty.rs:96 の deadline hang 様式。本 issue が既に扱う `outer_token_inheritance_skips_auto_acquire` / `child_inherits_hyoui_session_id_env` に加え、同ファイル内の 3 件目のテストで同型 flaky が発生
 
+## 再観測 (2026-07-21, commit a9e123c1 後)
+
+- 本日 commit a9e123c1 直後の workspace test を 3 回連続実行し全て green
+  (input_auto_lock_cli 含む)
+- diff (auto_lock helper を `crates/hyoui-cli/src/main.rs` から
+  `crates/hyoui/src/client/auto_lock.rs` へ切り出し) を精読。
+  `LOCK_RECV_TIMEOUT=5s` / `POLL_INTERVAL=100ms` / control-flow
+  (LockAcquire→poll→recv→match result) / release 経路すべて意味論同一。
+  error 型が `String` → `AutoLockError` enum 化されただけで CLI 側は
+  Display 経由で同じ eprintln 文字列を出す
+- ローカルでは a9e123c1 起因の regression と判定できず、macOS CI 側で
+  観測されていた既存 flaky (30s deadline hang @ pty.rs:96) と同族と推定。
+  並列 workspace test の CPU 資源競合による露出頻度上昇の可能性は残るが、
+  実装側の意味論変更に起因する反証は得られていない
+
 ## 受け入れ条件
 
 - [ ] 不安定さの軸が観測データで特定されている
