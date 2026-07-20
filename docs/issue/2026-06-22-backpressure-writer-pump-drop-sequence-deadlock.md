@@ -3,7 +3,7 @@ title: serve_backpressure_disconnects_slow_client が CI で 30s deadline hang �
 status: blocked
 category: bug
 created: 2026-06-22T23:16:49+09:00
-last_read: 2026-06-30T00:31:42+09:00
+last_read: 2026-07-20T10:23:08+09:00
 open_entered: 2026-06-22T23:16:49+09:00
 wip_entered:
 blocked_entered: 2026-07-03T16:01:05+09:00
