@@ -291,7 +291,16 @@ fn e2e_input_returns_409_while_external_client_holds_lock() {
         .env_remove("HYOUI_SESSION_ID")
         .env_remove("HYOUI_LOCK_TOKEN")
         .env_remove("HYOUI_NAMESPACE")
-        .stdin(Stdio::null())
+        // stdin は `Stdio::null()` にしない: `hyoui lock acquire` は token 出力後の
+        // block phase で **stdin EOF を release trigger にする** ため (= main.rs
+        // `wait_until_release_signal` の POLLHUP / read=0 path)。/dev/null からの
+        // 読み取りは即 EOF になるので、token を stdout に出した直後に CLI が exit → daemon が
+        // process-bound GC で lock を release してしまい、web POST が来た時には lock が
+        // 既に消えていて 409 でなく 200 が返る race を起こす (= CI Linux で観測、run
+        // 29762474605)。piped で child が保持する ChildStdin を **drop せず生かし続ける**
+        // ことで stdin を open のまま維持 = block phase から抜けない = lock 保持継続。
+        // Child が drop (= ChildGuard::drop の kill + wait) された時点でまとめて閉じる。
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
