@@ -39,6 +39,15 @@ origin: Release run 28655240907 の ci gate fail 観測 (session a7761122)
    共通か比較し、共通なら統合して DR-0025 Phase 2/4 (Serve/Client reducer 化) への
    blocked 遷移を検討する
 
+## 再観測 (2026-07-19, v0.9.10)
+
+- Release run: https://github.com/kawaz/hyoui/actions/runs/29694355729 (commit 9180fd8e)
+- job: `ci / Test (ubuntu-latest / stable)`
+- 失敗テスト: `daemon::session::tests::serve_tail_follow_receives_tail_end_on_child_exit`
+- panic 箇所: crates/hyoui/src/daemon/session.rs:3310 (前回観測時は :3267、その後のコード変更で行がずれている)
+- panic 内容: `frame: Protocol(UnexpectedEof("size header"))`
+- suite: 806 passed; 1 failed; finished in 32.03s
+
 ## 受け入れ条件
 
 - [ ] 不安定さの軸が観測データで特定されている
