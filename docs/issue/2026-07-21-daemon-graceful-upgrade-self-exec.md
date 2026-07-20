@@ -3,7 +3,7 @@ title: daemon の graceful upgrade (self-exec による fd/pid 引き継ぎ)
 status: open
 category: request
 created: 2026-07-21T02:46:19+09:00
-last_read:
+last_read: 2026-07-21T02:50:53+09:00
 open_entered: 2026-07-21T02:46:19+09:00
 wip_entered:
 blocked_entered:
