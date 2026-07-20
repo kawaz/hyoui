@@ -166,28 +166,27 @@ partial escape sequence は parser 内部 buffer (`interm_buf`, `param_buf`, dyn
 
 handoff sketch §6 で挙げていた「flush 課題」は emulator 採用で**消滅する**。
 
-ただし health check として:
+#### Status: Retracted (2026-07-21)
 
-- **5 秒 timeout で stalled sequence を reset** (= tmux `input.c` 標準、broken byte
-  stream で parser が永久に partial 状態に閉じ込められるのを防ぐ)
-- timeout 発火時は warn ログ + parser internal buffer clear (= 過去 byte は捨てる)
+本節で提案していた「5 秒 timeout の stalled sequence 自動 reset」は撤回した。
+判断根拠は archived issue `docs/issue/archive/2026-07-21-bug-screen-dump-empty-while-tail-has-output.md`。
 
-#### Update (2026-05-27, post-DR-0014 audit): partial state 自動破棄の保守化
+要点:
 
-Phase B 実装で「stalled 5s × 3 連続 → 自動 reset」とした (= partial sequence を
-vt100 state ごと捨てる強い介入)。DR-0014 制定後の self-audit
-(= `docs/findings/2026-05-27-self-audit-after-dr-0014.md` Item 4) で
-「partial state を裁量で破棄する介入」として識別、以下に補強:
+- vt100 crate は「parser 内部 partial buffer だけを reset」する public API を持たない。
+  そのため hyoui 実装は `vt100::Parser::new(...)` で **parser 全体を作り直す** ショート
+  カットを取り、cells / cursor / mode / seqno 全てを破棄していた。tmux `input.c` の
+  意図する介入範囲 (= partial escape sequence buffer だけ) より遥かに広い破壊。
+- default で自動発火するため、静止した TUI (= claude / vim / bash prompt 待ち等) が
+  15 秒沈黙するだけで screen state が全消しされる false-positive を確認 (再現手順は
+  archived issue 参照、100% 再現)。
+- CLAUDE.md §「partial state を扱う実装の規律」の「default は warn のみ + 手動操作」
+  規律に真っ向反する挙動だったため、self-audit findings で挙がっていた「default OFF
+  化」を待たず全撤去 (= 定数・counter・health.rs・reset() まで dead code として整理)。
 
-- **判定基準の明示**: 3 連続検知は「typical SGR/CSI sequence は 1-30 bytes、5 秒で
-  完結しないのは真に異常」という仮定に基づく。OSC52 (clipboard) の base64 巨大 paste
-  / DCS sixel 部分送信 / ネスト sync update 等、子は正常だが時間がかかるケースで
-  false-positive リスクあり
-- **false-positive 対策**: `HYOUI_STALLED_AUTO_RESET=0` で default OFF 化を将来検討
-  (= 別 task)、または warn のみ + 手動 reset CLI 提供
-- **マトリクス検証要否**: 巨大 OSC52 paste / DCS sixel / ネスト sync update での
-  false-positive 検証を DR-0014 マトリクス verification に登録 (= cell 候補リスト
-  あり、audit findings 参照)
+将来 partial-parser-only reset が必要になった場合は、vt100 crate に partial-state
+判定 API を追加するか手動 reset CLI で対処する (= 別 issue で再設計、本 DR には
+先取りしない)。
 
 ### 6. alternate screen hook
 
@@ -551,7 +550,6 @@ transitive 3 個程度**で済む (= alacritty_terminal の direct 11 / wezterm-
 - alt screen hook (= `Screen::alternate_screen()` で判別、attach 復元時に補完)
 - 既存 broadcast の attach 時動作変更 (= 生 byte broadcast → state 経由)
 - DEC sync update (`?2026h`) 抑制 hook (= vt100 parser の同期 hook を考慮)
-- 5 秒 stalled sequence reset (= §5 health check)
 
 ### Phase B (優先)
 

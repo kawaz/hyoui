@@ -48,7 +48,7 @@ use super::pty::{
     ALIVE_RETRY_INTERVAL, ChildLifecycle, ChildState, ChildTransition, STOPPED_POLL_INTERVAL,
 };
 use super::reducer::{self, DaemonState, translate};
-use super::screen::{ScreenState, StalledOutcome, check_stalled};
+use super::screen::ScreenState;
 use super::{ChildSuspendPolicy, DaemonConfig};
 
 /// R5-H7: send `sig` to the child's whole process group instead of only the
@@ -769,44 +769,6 @@ fn flush_pending_redraws_if_sync_over(
     }
 }
 
-/// DR-0013 §5 Phase B: stalled sequence の 5s 検出と自動 reset 判定。
-///
-/// 動作 (DR-0013 task A-8 解消):
-/// - `check_stalled` で Detected/Healthy を取得
-/// - `ScreenState::note_stalled_outcome` で連続 detect counter を進める
-/// - 連続 3 回 (= 15s) detect されると `StalledAction::ResetRequested` が返るので
-///   `ScreenState::reset` を呼び、警告 log を出す
-/// - 既存 `warned` flag は「同じ detect cycle で warn を 1 度だけ出す」用途、
-///   feed 復帰 (= note が Healthy 受信で counter リセット) で再 warn 可能になる
-fn detect_and_warn_stalled(screen_state: &mut ScreenState, warned: &mut bool) {
-    let outcome = check_stalled(screen_state, Instant::now());
-    let detected = matches!(outcome, StalledOutcome::Detected);
-    let action = screen_state.note_stalled_outcome(detected);
-    if detected && !*warned {
-        // Hotfix (透過原則違反 bug): daemon の stderr は非 detached 起動時に
-        // child PTY と同じ TTY に向いている (= 親 process 内で daemon thread が走る)
-        // ため、`eprintln!` で warning を出すと attach 中 client の画面に混入する。
-        // MVP では完全 silent 化して画面汚染を止める。stalled detect counter / 自動
-        // reset 機構自体は維持 (= 機能は失わない)。
-        // TODO: 別 channel (= XDG_STATE_HOME/hyoui/<session>.log 等の log file) に
-        // warning を出す経路を整備する。
-        *warned = true;
-    }
-    if action.is_some() {
-        // DR-0013 §5 Phase B: 連続 detect 上限到達 → 自動 reset。state を捨てる
-        // (= cells / cursor / mode 全消し) が、broken stream からの復旧を優先する。
-        // warning 表示は同上の理由で silent (TODO: log file 経路)。
-        screen_state.reset();
-        // reset 後は note の counter も 0 になっている (reset 内で初期化済)。
-        // warn flag も解除して、次サイクル以降の detect で新 warn を許可する。
-        *warned = false;
-    }
-    if !detected {
-        // feed 復帰時に warn flag をリセット (= 次回 stalled で改めて warn できる)
-        *warned = false;
-    }
-}
-
 /// DR-0001 軸 2 + invariant 回復: self-pipe から drain した signal byte 列を
 /// 走査し、SIGTSTP / SIGCONT に対応する policy を発火する。
 ///
@@ -1141,10 +1103,6 @@ fn serve_loop(
 ) -> RelayOutcome {
     // debug_dump は loop 内で再借用するため局所変数に move する。
     let mut debug_dump = debug_dump;
-    // DR-0013 §5: stalled sequence の 5s timeout 検出は per-loop で行う。
-    // 連続して warn を撒かないよう、検出後は flag を立てて feed が来るまで
-    // 黙る (= 1 度 detect したら次の feed まで再 detect しない方針)。
-    let mut stalled_warned = false;
     // R4-C3: 別 thread で進行中の handshake worker 群。worker が `do_handshake_stage`
     // を完了すると `rx` に Ok/Err が流れる。本 vector は serve_loop が所有し、各
     // iteration で try_recv で完了したものを引き取って `clients` に integrate する。
@@ -1339,16 +1297,13 @@ fn serve_loop(
                     screen_state,
                     pending_redraws,
                 );
-                // DR-0013 §5 + §6 Phase A:
-                // - sync 終了で pending redraw を flush
-                // - 5s stalled detect (Phase A は warn のみ)
+                // DR-0013 §6 Phase A: sync 終了で pending redraw を flush。
                 flush_pending_redraws_if_sync_over(
                     clients,
                     screen_state,
                     pending_redraws,
                     &mut overflow_ids,
                 );
-                detect_and_warn_stalled(screen_state, &mut stalled_warned);
                 // 後段の drop 処理 (overflow / dead) を共通化するため
                 let mut indices_to_drop: Vec<usize> = Vec::new();
                 for id in overflow_ids.drain(..) {
@@ -1393,15 +1348,13 @@ fn serve_loop(
             screen_state,
             pending_redraws,
         );
-        // DR-0013 §5 + §6 Phase A: sync 終了で pending redraw を flush、
-        // stalled detect は per-iteration で 1 回行う。
+        // DR-0013 §6 Phase A: sync 終了で pending redraw を flush。
         flush_pending_redraws_if_sync_over(
             clients,
             screen_state,
             pending_redraws,
             &mut overflow_ids,
         );
-        detect_and_warn_stalled(screen_state, &mut stalled_warned);
 
         // R5-H6 + DR-0001 軸 1/2: SIGCHLD / SIGTSTP / SIGCONT wake-up handling.
         // Drain the self-pipe + dispatch each signal byte. SIGTSTP / SIGCONT が
@@ -1548,8 +1501,6 @@ fn serve_loop(
                     // 生 bytes も従来通り流す (= breaking 回避、§10)。
                     // Phase B で生 byte broadcast を state-driven に置換する。
                     screen_state.process(&buf[..n]);
-                    // feed 後に stalled-warn flag を解除 (= 次回 5s 経過時に再警告可)
-                    stalled_warned = false;
                     overflow_ids.extend(broadcast_master_bytes(clients, &buf[..n], now));
                     // R5-FB1: `--until PATTERN` match 検査。一致した瞬間に
                     // 子 process group へ SIGTERM を投げて session 終了させる。

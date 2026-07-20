@@ -51,6 +51,7 @@ impl InputLog {
     }
 
     /// 現在 capacity (= byte 単位)。
+    #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }

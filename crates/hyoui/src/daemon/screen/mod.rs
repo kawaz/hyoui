@@ -7,17 +7,15 @@
 //! ## 構成
 //!
 //! - [`state`] — vt100 `Parser` を内包する [`ScreenState`]、process / 各 getter /
-//!   DEC sync flag / stalled timer を提供
+//!   DEC sync flag を提供
 //! - [`redraw`] — attach 復元用 bytes を組み立てる [`build_attach_redraw`]
 //!   (= alt mode prepend + `state_formatted()`)
-//! - [`health`] — stalled sequence 検出 [`check_stalled`] (Phase A: detect only)
 //!
 //! ## Phase A の責務
 //!
 //! 1. PTY read loop が `ScreenState::process` を呼んで bytes を反映する経路 (§3)
 //! 2. attach handshake 直後に `build_attach_redraw` を送って画面を復元する (§4)
 //! 3. DEC sync update (`?2026h`) 同期中は redraw を blocking する (§6)
-//! 4. 5 秒 stalled sequence 検出 (`check_stalled`、Phase A は warn のみ) (§5)
 //!
 //! ## Phase B 以降に持ち越す項目
 //!
@@ -27,13 +25,11 @@
 //! - per-line SequenceNo + pull 型 protocol (= §4 Phase B)
 //! - debug / inspection protocol (= §9) + DR-0008 cap flag negotiation (§10)
 
-pub(crate) mod health;
 pub(crate) mod input_log;
 pub(crate) mod redraw;
 pub(crate) mod snapshot;
 pub(crate) mod state;
 
-pub(crate) use health::{StalledOutcome, check_stalled};
 pub(crate) use redraw::build_attach_redraw;
 pub(crate) use snapshot::{
     ScreenDumpFormat, ScreenDumpLayer, build_screen_dump, build_screen_snapshot,

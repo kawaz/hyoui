@@ -3,27 +3,20 @@
 //! DR-0013 §3 で確定した wrapper module の中核。`Parser::process` で子 PTY bytes を
 //! state に流し込み、`Screen` 経由で cell / cursor / mode 等を expose する。
 //!
-//! Phase A の責務:
+//! 責務:
 //!
 //! 1. 子 PTY bytes を 1 度だけ feed する経路を提供する (= `process`)
 //! 2. attach 復元用の sequence を組み立てるための primitive を expose (= `state_formatted`,
 //!    `alternate_screen`, `cursor_position`, `cursor_visible`, `size`)
 //! 3. DEC sync update (`?2026h` / `?2026l`) の同期中フラグを保持し、redraw の deferred
 //!    判定に使う (= `sync_in_progress`)
-//! 4. stalled sequence 検出用に `last_feed_at: Instant` を保持し、5 秒経過判定 (`is_stalled`)
-//!    と内部 buffer reset (`reset_stalled`) を提供する
-//!
-//! Phase B 追加分:
-//!
-//! - **input bytes log の統合** (= [`super::input_log::InputLog`]、resize 救済策、§7):
-//!   `process` 内で primary buffer 中のみ push、alt mode 切替で hook、`resize` で
-//!   新 Parser を組み立てて replay
-//! - **DEC sync chunk 跨ぎ対応**: `process` 間の境界で `\x1b[?2026` の partial を
-//!   carry する (= chunk 末尾 8 bytes を `sync_scan_carry` に保持して次 chunk と連結
-//!   して走査)
-//! - **stalled reset 判定**: connector が `note_stalled_outcome` で 3 回連続 detect を
-//!   観測したら `reset` を呼ぶ判断ができるよう、connector に counter API を提供する
-//! - **`current_seqno`** (= byte feed 毎 increment、Phase B incremental sync の土台、§4)
+//! 4. **input bytes log の統合** (= [`super::input_log::InputLog`]、resize 救済策、§7):
+//!    `process` 内で primary buffer 中のみ push、alt mode 切替で hook、`resize` で
+//!    新 Parser を組み立てて replay
+//! 5. **DEC sync chunk 跨ぎ対応**: `process` 間の境界で `\x1b[?2026` の partial を
+//!    carry する (= chunk 末尾 8 bytes を `sync_scan_carry` に保持して次 chunk と連結
+//!    して走査)
+//! 6. **`current_seqno`** (= byte feed 毎 increment、incremental sync の土台、§4)
 //!
 //! 持ち越し (Phase C 以降):
 //!
@@ -32,24 +25,7 @@
 //! - per-line SequenceNo の真の活用は incremental sync 本体 (DirtyLinesNotify /
 //!   GetLines) と一緒に実装、ここでは counter フィールドのみ用意
 
-use std::time::{Duration, Instant};
-
 use super::input_log::InputLog;
-
-/// stalled sequence reset の閾値。tmux `input.c` 標準と揃える (= 5 秒)。
-///
-/// `last_feed_at` から本値経過しても新規 bytes が来なければ、parser 内部 buffer に
-/// 取り残された partial escape sequence を捨てて整合を取る。broken byte stream で
-/// parser が永久に partial 状態に閉じ込められるのを防ぐ (DR-0013 §5)。
-pub(crate) const STALLED_RESET_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// stalled detect が **連続** で何回観測されたら自動 reset するかの閾値。
-///
-/// `STALLED_RESET_TIMEOUT * STALLED_RESET_CONSECUTIVE_DETECTS` 経過しても新 byte が
-/// 来ない broken stream 状態でだけ reset するため、誤発火耐性が高い。
-///
-/// 3 回 (= 15 秒) を採用: Phase A は warn のみ、本値で初めて自動 reset まで進む。
-pub(crate) const STALLED_RESET_CONSECUTIVE_DETECTS: u32 = 3;
 
 /// DEC sync update の chunk 跨ぎ検出用 carry の最大長 (= 検索 needle `\x1b[?2026h` /
 /// `\x1b[?2026l` は 8 byte なので、`needle.len() - 1 = 7` byte 残せば次 chunk で
@@ -59,18 +35,16 @@ const SYNC_SCAN_CARRY_LEN: usize = 7;
 /// daemon が保持する screen state の正本 wrapper。
 ///
 /// vt100 `Parser` (= `Screen` を内包) をそのまま正本にし、hyoui 側の責務 (= sync
-/// flag / stalled timer / 補完 hook / input bytes log / SequenceNo) を追加 layer
-/// として持つ。`process` は 1 度だけ呼び、子 PTY bytes は本 wrapper を経由してから
-/// broadcast / wait / tail に流れる (= DR-0013 §1「raw byte の直接 broadcast はしない」)。
+/// flag / input bytes log / SequenceNo) を追加 layer として持つ。`process` は
+/// 1 度だけ呼び、子 PTY bytes は本 wrapper を経由してから broadcast / wait / tail
+/// に流れる (= DR-0013 §1「raw byte の直接 broadcast はしない」)。
 pub(crate) struct ScreenState {
     parser: vt100::Parser,
     /// `Parser::new` 時に渡した scrollback ring の行数上限 (= rows-base 層、DR-0013 §8)。
     /// vt100 0.16 では `Parser` から `scrollback_len` を引き出す public API が無いため、
-    /// `reset` / `resize` で新 Parser を組み直す際に同値を渡し直すために覚えておく。
+    /// `resize` で新 Parser を組み直す際に同値を渡し直すために覚えておく。
     /// 0 を渡せば scrollback 無効 (= 過去 row は保存されない)。
     scrollback_len: usize,
-    /// 最後に `process` で bytes を feed した時刻。stalled 判定に使う。
-    last_feed_at: Instant,
     /// DEC sync update (`\x1b[?2026h` ... `\x1b[?2026l`) の同期中フラグ。
     ///
     /// vt100 は本 mode を内部処理しないため (vt100 0.16 時点)、hyoui wrapper で
@@ -88,9 +62,6 @@ pub(crate) struct ScreenState {
     /// の土台、§10 PDU serial と同期しない別 layer の SequenceNo)。本 phase ではフィー
     /// ルドの導入のみで、DirtyLinesNotify / GetLines の本体は Phase C 以降。
     current_seqno: u64,
-    /// 連続 stalled detect 回数 (= caller が `note_stalled_outcome` で更新)。
-    /// `STALLED_RESET_CONSECUTIVE_DETECTS` 到達で自動 reset を実行する判断材料。
-    consecutive_stalled_detects: u32,
 }
 
 impl ScreenState {
@@ -98,10 +69,9 @@ impl ScreenState {
     /// の new state を作る。
     ///
     /// input_log capacity を指定したい場合は [`Self::with_input_log_capacity`] を使う。
-    /// `vt100::Parser::new` をそのまま呼ぶ薄い factory。`last_feed_at` は now で
-    /// 初期化し、初期状態では sync flag は off。
+    /// `vt100::Parser::new` をそのまま呼ぶ薄い factory。初期状態では sync flag は off。
     ///
-    /// 本 factory は test と health.rs 専用 (= production code は input_log capacity を
+    /// 本 factory は test 専用 (= production code は input_log capacity を
     /// 指定する `with_input_log_capacity` を使う)。
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(rows: u16, cols: u16, scrollback_len: usize) -> Self {
@@ -119,32 +89,26 @@ impl ScreenState {
         Self {
             parser: vt100::Parser::new(rows, cols, scrollback_len),
             scrollback_len,
-            last_feed_at: Instant::now(),
             sync_in_progress: false,
             sync_scan_carry: Vec::with_capacity(SYNC_SCAN_CARRY_LEN),
             input_log: InputLog::new(input_log_capacity),
             current_seqno: 0,
-            consecutive_stalled_detects: 0,
         }
     }
 
     /// 子 PTY 出力 bytes を vt100 parser に流し込む。
     ///
     /// 1. vt100 Parser に feed
-    /// 2. `last_feed_at` を now に更新
-    /// 3. DEC sync update (`?2026h` / `?2026l`) を carry + 新 bytes で走査して
+    /// 2. DEC sync update (`?2026h` / `?2026l`) を carry + 新 bytes で走査して
     ///    `sync_in_progress` を更新 (= chunk 跨ぎでも取りこぼさない)
-    /// 4. alt screen flag の値変化を input log に伝播
-    /// 5. primary buffer 中なら input log に push (= resize 救済策、§7)
-    /// 6. `current_seqno` を increment (= Phase B incremental sync の SequenceNo 土台)
-    /// 7. 連続 stalled detect counter を 0 にリセット (= 新 byte が来た = 健全)
+    /// 3. alt screen flag の値変化を input log に伝播
+    /// 4. primary buffer 中なら input log に push (= resize 救済策、§7)
+    /// 5. `current_seqno` を increment (= Phase B incremental sync の SequenceNo 土台)
     pub(crate) fn process(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
         self.parser.process(bytes);
-        self.last_feed_at = Instant::now();
-        self.consecutive_stalled_detects = 0;
         // DEC sync update の状態更新。carry を新 bytes の前に連結してから走査し、
         // 次回 chunk のため末尾 SYNC_SCAN_CARRY_LEN bytes を保持する。
         update_sync_flag_with_carry(&mut self.sync_in_progress, &mut self.sync_scan_carry, bytes);
@@ -181,7 +145,7 @@ impl ScreenState {
 
     /// viewport size `(rows, cols)`。
     ///
-    /// Phase A では `reset` で内部利用、Phase B の snapshot でも expose 予定。
+    /// structured snapshot (DR-0013 §11) で expose される。
     pub(crate) fn size(&self) -> (u16, u16) {
         self.parser.screen().size()
     }
@@ -234,11 +198,6 @@ impl ScreenState {
         true
     }
 
-    /// `last_feed_at` から `STALLED_RESET_TIMEOUT` 経過していれば true。
-    pub(crate) fn is_stalled(&self, now: Instant) -> bool {
-        now.duration_since(self.last_feed_at) >= STALLED_RESET_TIMEOUT
-    }
-
     /// 現在 SequenceNo (DR-0013 §4 Phase B incremental sync 土台)。
     ///
     /// `process` の各 chunk 終了時にチェックして「自分が持つ since_seqno との差」
@@ -260,59 +219,6 @@ impl ScreenState {
         self.input_log.capacity()
     }
 
-    /// connector が stalled detect 結果を本 state に通知する。
-    ///
-    /// `Detected` を **連続で** `STALLED_RESET_CONSECUTIVE_DETECTS` 回受け取ったら
-    /// `Some(StalledAction::ResetRequested)` を返す。`Healthy` を 1 度でも受けたら
-    /// counter をリセットする。caller は `ResetRequested` を受けたら `reset()` を
-    /// 呼ぶ判断ができる (DR-0013 §5 Phase B の自動 reset 判定)。
-    pub(crate) fn note_stalled_outcome(&mut self, is_detected: bool) -> Option<StalledAction> {
-        if is_detected {
-            self.consecutive_stalled_detects = self.consecutive_stalled_detects.saturating_add(1);
-            if self.consecutive_stalled_detects >= STALLED_RESET_CONSECUTIVE_DETECTS {
-                Some(StalledAction::ResetRequested)
-            } else {
-                None
-            }
-        } else {
-            self.consecutive_stalled_detects = 0;
-            None
-        }
-    }
-
-    /// 現在の連続 stalled detect 回数 (= test / metrics 用)。
-    #[cfg(test)]
-    pub(crate) fn consecutive_stalled_detects(&self) -> u32 {
-        self.consecutive_stalled_detects
-    }
-
-    /// 内部 parser を新規構築して partial sequence buffer を捨てる。
-    ///
-    /// `scrollback_len` は **元の Parser と同じ値** を保持し続ける (= `Self` の
-    /// `scrollback_len` フィールドに記録済の値を新 Parser に渡し直す)。これにより
-    /// reset 後も `screen.dump --layer=scrollback` は config 通りの容量で動作する
-    /// (= ただし reset で過去 cell は捨てられるので scrollback は 0 行から再蓄積)。
-    ///
-    /// reset 後の `last_feed_at` は now、`sync_in_progress` / `sync_scan_carry` /
-    /// `consecutive_stalled_detects` も 0 / 空に戻る。`current_seqno` も 0 から
-    /// やり直す (= incremental sync は次の since_seqno=0 から再開)。input_log は
-    /// 一緒に clear する (= replay 用 byte も無効と扱う)。
-    pub(crate) fn reset(&mut self) {
-        let (rows, cols) = self.size();
-        self.parser = vt100::Parser::new(rows, cols, self.scrollback_len);
-        self.last_feed_at = Instant::now();
-        self.sync_in_progress = false;
-        self.sync_scan_carry.clear();
-        self.consecutive_stalled_detects = 0;
-        self.current_seqno = 0;
-        // input_log は capacity を維持しつつ中身だけ捨てる。
-        // (alt mode flag も primary 開始に戻す = reset 直後は primary 前提)
-        self.input_log.set_alt_mode(false);
-        // VecDeque を drain で空にする (= public clear が test only なので直接操作)
-        let cap = self.input_log.capacity();
-        self.input_log = InputLog::new(cap);
-    }
-
     /// viewport を `(rows, cols)` に変更し、input log を新 Parser に replay する。
     ///
     /// vt100 `Parser::set_size` は **truncate のみで真の reflow なし** のため、
@@ -328,13 +234,12 @@ impl ScreenState {
     ///   capacity 内の最新 bytes 列が cell grid + cursor + mode に再構築される。
     /// - `sync_in_progress` / `sync_scan_carry` は新 Parser に合わせて clear。
     ///   replay 中に `?2026h` を踏めば再度 detect される。
-    /// - `last_feed_at` は now (= resize 時刻)、stalled counter は 0。
     /// - `current_seqno` は **保持** (= incremental sync の連続性、resize で乱さない)。
     pub(crate) fn resize(&mut self, rows: u16, cols: u16) {
         let was_alt = self.parser.screen().alternate_screen();
-        // 新 Parser にも同じ scrollback_len を渡す (= reset と同じ方針、
-        // resize 後も scrollback 機能を保つ。過去 cell は input_log 経由で
-        // primary 中なら replay されるため、scrollback への蓄積もそこから再構築される)
+        // 新 Parser にも同じ scrollback_len を渡す (= resize 後も scrollback 機能を
+        // 保つ。過去 cell は input_log 経由で primary 中なら replay されるため、
+        // scrollback への蓄積もそこから再構築される)
         let mut new_parser = vt100::Parser::new(rows, cols, self.scrollback_len);
 
         if was_alt {
@@ -348,10 +253,8 @@ impl ScreenState {
         }
 
         self.parser = new_parser;
-        self.last_feed_at = Instant::now();
         self.sync_in_progress = false;
         self.sync_scan_carry.clear();
-        self.consecutive_stalled_detects = 0;
     }
 
     /// 過去 row へのアクセス用に scrollback offset 付き行を iter する (DR-0013 §8)。
@@ -465,14 +368,6 @@ impl ScreenState {
     pub(crate) fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
     }
-}
-
-/// `note_stalled_outcome` の戻り値 (= caller が判断材料にする action 種別)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StalledAction {
-    /// 連続 detect 数が閾値に達したので reset が推奨される。caller (= session)
-    /// が `reset()` を呼ぶか、追加の log だけに留めるか判断する。
-    ResetRequested,
 }
 
 /// 1 cell 分の snapshot data (= debug / snapshot protocol 用)。Phase B では
@@ -714,31 +609,19 @@ mod tests {
         assert!(!s.sync_in_progress(), "last is OFF");
     }
 
-    /// stalled 判定: 5 秒経過判定の境界を Instant 操作なしで確認するため、
-    /// `STALLED_RESET_TIMEOUT` を直接超過させた `Instant` を渡す。
+    /// DR-0013 §5 (Retracted): stalled auto-reset を廃止した後、`process` を呼ばない
+    /// まま任意時間経過しても cells が保持されることを担保する。撤回理由は
+    /// `docs/issue/2026-07-21-bug-screen-dump-empty-while-tail-has-output.md`。
     #[test]
-    fn is_stalled_after_timeout() {
-        let s = ScreenState::new(5, 40, 100);
-        // 直後は stalled でない
-        assert!(!s.is_stalled(Instant::now()));
-        // 6 秒先の Instant を渡せば stalled
-        let future = Instant::now() + STALLED_RESET_TIMEOUT + Duration::from_secs(1);
-        assert!(s.is_stalled(future));
-    }
-
-    /// reset で parser が新規構築され、過去の cell 内容が消える。
-    #[test]
-    fn reset_clears_screen() {
+    fn cells_persist_without_further_process_calls() {
         let mut s = ScreenState::new(5, 40, 100);
         s.process(b"hello");
         assert_eq!(s.screen().cell(0, 0).unwrap().contents(), "h");
-        s.reset();
-        // 新 Parser は cell が空
-        let c = s.screen().cell(0, 0).unwrap();
-        assert_eq!(c.contents(), "");
-        assert!(!s.sync_in_progress());
-        assert_eq!(s.consecutive_stalled_detects(), 0);
-        assert_eq!(s.current_seqno(), 0);
+        // 追加 feed をしないまま時間が経った状況を模擬する。旧実装は 15 秒経過で
+        // reset() が発火して cells を全消ししていた。現在は state を触る経路が
+        // process 以外に無いため、`process` を呼ばない = 何も変わらない、が正解。
+        assert_eq!(s.screen().cell(0, 0).unwrap().contents(), "h");
+        assert_eq!(s.current_seqno(), 1);
     }
 
     /// DEC sync update が **chunk 境界に跨る** 場合でも carry 経由で検出できる。
@@ -760,25 +643,6 @@ mod tests {
         assert!(s.sync_in_progress());
         s.process(b"l"); // 残り 1 byte
         assert!(!s.sync_in_progress(), "OFF reconstructed across chunks");
-    }
-
-    /// 連続 stalled detect が閾値に達したら `ResetRequested` を返す。
-    /// Healthy を 1 度受けると counter は reset される。
-    #[test]
-    fn note_stalled_outcome_counts_consecutive_detects() {
-        let mut s = ScreenState::new(5, 40, 100);
-        assert_eq!(s.note_stalled_outcome(true), None);
-        assert_eq!(s.note_stalled_outcome(true), None);
-        // 3 回目で閾値到達
-        assert_eq!(
-            s.note_stalled_outcome(true),
-            Some(StalledAction::ResetRequested)
-        );
-        // Healthy で counter リセット
-        assert_eq!(s.note_stalled_outcome(false), None);
-        assert_eq!(s.consecutive_stalled_detects(), 0);
-        // 再度 detect 1 回では requested にならない
-        assert_eq!(s.note_stalled_outcome(true), None);
     }
 
     /// `process` の度に `current_seqno` が increment される。
@@ -982,59 +846,6 @@ mod tests {
         assert_eq!(
             row0_first_char, "L",
             "visible row0 should still start with 'L' (got {row0_first_char:?})"
-        );
-    }
-
-    /// `reset` 後も `scrollback_len` が保持され、新たな出力で scrollback が再構築される。
-    #[test]
-    fn reset_preserves_scrollback_len() {
-        let mut s = ScreenState::new(3, 10, 5);
-        for i in 0..10 {
-            s.process(format!("L{i}\r\n").as_bytes());
-        }
-        assert!(
-            !s.snapshot_scrollback_rows().is_empty(),
-            "reset 前は scrollback あり"
-        );
-        s.reset();
-        // reset 直後は scrollback は空 (= 過去 cell は捨てられる)
-        assert!(
-            s.snapshot_scrollback_rows().is_empty(),
-            "reset 直後の scrollback は空"
-        );
-        // 再度大量出力すれば scrollback に再蓄積される (= scrollback_len は保持されている)
-        for i in 0..10 {
-            s.process(format!("R{i}\r\n").as_bytes());
-        }
-        assert!(
-            !s.snapshot_scrollback_rows().is_empty(),
-            "reset 後も scrollback_len が保持されて再蓄積される"
-        );
-    }
-
-    /// QA edge: stalled detect の counter が `note_stalled_outcome(false)` で
-    /// 確実に 0 に reset され、その後再度 3 連続検知でも閾値判定が成立すること
-    /// (= state を持ち越して誤動作しない保護)。既存 test は 1 サイクルのみで
-    /// 「再利用」を確認していなかったため補強。
-    #[test]
-    fn stalled_counter_resets_and_retriggers_after_healthy() {
-        let mut s = ScreenState::new(5, 40, 100);
-        // 1 サイクル目: 3 連続で閾値達成
-        assert_eq!(s.note_stalled_outcome(true), None);
-        assert_eq!(s.note_stalled_outcome(true), None);
-        assert_eq!(
-            s.note_stalled_outcome(true),
-            Some(StalledAction::ResetRequested)
-        );
-        // healthy で reset
-        assert_eq!(s.note_stalled_outcome(false), None);
-        assert_eq!(s.consecutive_stalled_detects(), 0);
-        // 2 サイクル目: 再度 3 連続で閾値判定が成立する
-        assert_eq!(s.note_stalled_outcome(true), None);
-        assert_eq!(s.note_stalled_outcome(true), None);
-        assert_eq!(
-            s.note_stalled_outcome(true),
-            Some(StalledAction::ResetRequested)
         );
     }
 }
