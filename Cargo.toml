@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/hyoui", "crates/hyoui-cli", "crates/hyoui-web"]
 
 [workspace.package]
-version = "0.9.13"
+version = "0.9.14"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
