@@ -1,6 +1,6 @@
 # DR-0028: daemon graceful upgrade — self-exec による fd/PID 引き継ぎ
 
-- Status: Active (Draft 起草 2026-07-21、kawaz 方式裁定済み・詳細裁定は Open Questions)
+- Status: Active (2026-07-21 全裁定確定、実装は Phase 1 から未着手)
 - Date: 2026-07-21
 - Related: DR-0025 (message 駆動原則 — upgrade も protocol message として形式化、state の message 形式化が進むほど handoff は単純化), DR-0008 (protocol — 新 kind 追加規約 / cap flag), DR-0013 (screen state 正本 — scrollback bytes 再 feed による再構築の根拠), DR-0017 (session anchor — daemon = session leader + controlling tty、PID 温存の必然の根拠), DR-0016 (record — scrollback/record bytes が再構築の材料), DR-0014 (検証主義 — マトリクス検証要件)
 - Origin: kawaz 要望 2026-07-20「再起動したくない。fd も pid も引き継いで新バイナリに exec する感じ」、docs/issue/2026-07-21-daemon-graceful-upgrade-self-exec.md
@@ -182,16 +182,12 @@ reducer 化が進んだ時点で upgrade 処理は Serve domain reducer + Effect
 point of no return なので Effect 化の例外扱いになる見込み、その整理は DR-0025 側の
 Phase に委ねる)。
 
-## Open Questions
+## 詳細裁定 (kawaz 2026-07-21、旧 Open Questions)
 
-- **UPG-Q1: 一時ファイルの format**: (a) CBOR (protocol と共通の語彙、既存依存のみ) /
-  (b) JSON (人間可読、デバッグ容易)。**推し: (a)** — 依存追加なし + protocol と同じ
-  encode 基盤。破損調査は record 側の lifecycle event で足りる
-- **UPG-Q2: upgrade 中の新規 client 接続**: listener fd は生きたままなので exec の
-  数十 ms 間に accept 待ち client が来うる。(a) 気にしない (backlog が吸収、新プロセス
-  が accept) / (b) exec 前に一時的に accept 停止。**推し: (a)** — backlog で足り、
-  介入最小
-- **UPG-Q3: ack 前 pending input の扱い** (検証マトリクス「入力 race」の結果次第):
-  (a) upgrade.request 受理後は新規 raw_data を reject して drain 完了を待ってから exec /
-  (b) 気にしない (lock (DR-0022) を upgrade が取得する運用で回避)。**推し: (a)** —
-  DR-0021 の「完了点 = master fd write の return」意味論を upgrade 跨ぎでも保存できる
+- **一時ファイルの format = CBOR** (外部と交換するものでもない、protocol と同じ
+  encode 基盤で依存追加なし)
+- **upgrade 中の新規 client 接続 = listener backlog に任せる** (exec の空白数十 ms は
+  backlog が吸収、新プロセスが accept。介入最小)
+- **ack 前 pending input = upgrade.request 受理後は新規 raw_data を reject し、
+  drain 完了を待ってから exec** (DR-0021 の「完了点 = master fd write の return」
+  意味論を upgrade 跨ぎでも保存)
