@@ -18,6 +18,10 @@
   https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0.8.0/lib/addon-unicode11.js).
   MIT License. Unicode 11 の絵文字幅を xterm.js に反映するアドオン (= daemon 側
   vt100 emulator の width 2 判定と一致させる)。
+- `addon-fit.js` — @xterm/addon-fit v0.10.0 UMD build (obtained 2026-07-21
+  from https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js).
+  MIT License. コンテナサイズから cols/rows を計算して xterm.js の grid を
+  fit させるアドオン (= viewport 変化 / iframe 幅 に追従、DR-0027 UI 側)。
 
 Do not fetch from CDN at runtime (DR-0027 §4: bundler なし、vendored copy を
 crate に埋め込み)。バージョン更新時は上記 URL から取り直して同 file 名で上書き。

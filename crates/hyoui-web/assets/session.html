@@ -25,6 +25,9 @@
     <button id="reload" class="reload-btn" type="button" title="reload page (PWA 用)" aria-label="reload page">↻</button>
     <button id="refresh" type="button">refresh</button>
     <label><input type="checkbox" id="auto" checked> auto refresh</label>
+    <label title="viewport 変化に追従して daemon 側 PTY の cols/rows も resize する (実 TUI が再レイアウトされる)"><input type="checkbox" id="autoResize"> auto-resize (PTY)</label>
+    <span class="sep">·</span>
+    <span id="size" class="meta">80x24</span>
     <span class="sep">·</span>
     <span id="status" class="status-text">loading…</span>
   </p>
@@ -41,6 +44,20 @@
     <button type="button" id="sendRaw">Send (no Enter)</button>
     <button type="button" id="sendKey" title="送信するキーを prompt で入力 (例: Escape, Tab, Ctrl-C, C-a)">Send Key…</button>
   </form>
+  <!-- 特殊キーパッド (iPad ソフトキーボードで打てない矢印 / Tab / Esc 等を補う)。
+       button の data-spec 属性を POST /input の spec としてそのまま送る。
+       hex:1b5b5a は Shift+Tab (= CSI Z / BackTab、input_bytes に key 名が無いので hex 直指定)。 -->
+  <div id="keypad" class="keypad" aria-label="special key pad">
+    <button type="button" data-spec="key:Up" title="Up (↑)">↑</button>
+    <button type="button" data-spec="key:Down" title="Down (↓)">↓</button>
+    <button type="button" data-spec="key:Left" title="Left (←)">←</button>
+    <button type="button" data-spec="key:Right" title="Right (→)">→</button>
+    <button type="button" data-spec="key:Tab" title="Tab">Tab</button>
+    <button type="button" data-spec="hex:1b5b5a" title="Shift+Tab (CSI Z / BackTab)">⇧Tab</button>
+    <button type="button" data-spec="key:Escape" title="Escape">Esc</button>
+    <button type="button" data-spec="key:Enter" title="Enter">Enter</button>
+    <button type="button" data-spec="key:Ctrl-C" title="Ctrl+C (SIGINT for cooked mode / raw ^C)">^C</button>
+  </div>
   <p id="sendStatus" class="meta"></p>
   <details id="debugPanel">
     <summary>debug log (<span id="debugCount">0</span>)</summary>
@@ -82,6 +99,7 @@
 </script>
 <script src="/assets/vendor/xterm.js"></script>
 <script src="/assets/vendor/addon-unicode11.js"></script>
+<script src="/assets/vendor/addon-fit.js"></script>
 <script src="/assets/session.js"></script>
 </body>
 </html>

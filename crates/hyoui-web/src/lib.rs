@@ -73,6 +73,7 @@ pub fn router(config: hyoui::config::Config, assets_dir: Option<PathBuf>) -> Rou
         .route("/api/sessions/{id}/screen", get(get_screen))
         .route("/api/sessions/{id}/input", post(post_input))
         .route("/api/sessions/{id}/resume", post(post_resume))
+        .route("/api/sessions/{id}/resize", post(post_resize))
         .with_state(state)
 }
 
@@ -459,6 +460,76 @@ fn resume_child_blocking(socket_path: &std::path::Path) -> Result<(), String> {
         .map_err(|e| format!("connect/handshake: {e}"))?;
     conn.send_child_resume()
         .map_err(|e| format!("send resume.request: {e}"))?;
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// POST /api/sessions/:id/resize
+// -----------------------------------------------------------------------------
+
+/// resize request body: `{"cols": 120, "rows": 40}`。
+///
+/// 既存 `ControlMessage::Resize` (DR-0008 §2.3) を再利用する (= 新 protocol
+/// message は追加しない、`CLAUDE.md` self-check「新 protocol message 追加なら
+/// 必然性を DR に書けるか?」の観点)。
+#[derive(Debug, serde::Deserialize)]
+struct ResizeRequest {
+    cols: u16,
+    rows: u16,
+}
+
+/// `POST /api/sessions/:id/resize` — PTY と ScreenState を同期 resize させる。
+///
+/// **Multi-client tradeoff (kawaz 割り切り 2026-07-21)**: 本 endpoint は毎回
+/// 短命 Rw connection を張って `Resize` message を送るだけの実装。daemon 側は
+/// resize を leader 限定で受理する (DR-0008 §2.3) ため、既に別の Rw client
+/// (= `hyoui attach` の対話 leader 等) が居る場合は本 request は **silently
+/// 効かない** (daemon が Error frame を返すがこの ephemeral 接続では recv しない)。
+/// 逆に他 web page からの concurrent resize は daemon 内で serialize されるので
+/// 「後着が勝つ」動作。DR-0013 Phase C の multi-client resize 調停は本 task の
+/// scope 外 (kawaz 明示)。
+async fn post_resize(
+    Path(id): Path<String>,
+    State(_state): State<AppState>,
+    axum::Json(body): axum::Json<ResizeRequest>,
+) -> Response {
+    if body.cols == 0 || body.rows == 0 {
+        return bad_request(format!(
+            "cols/rows must be > 0 (got cols={}, rows={})",
+            body.cols, body.rows
+        ));
+    }
+    let sock = match resolve_socket(&id).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let (cols, rows) = (body.cols, body.rows);
+    let result = tokio::task::spawn_blocking(move || resize_blocking(&sock, cols, rows)).await;
+    match result {
+        Ok(Ok(())) => (StatusCode::NO_CONTENT, "").into_response(),
+        Ok(Err(msg)) => internal_error(format!("resize failed: {msg}")),
+        Err(e) => internal_error(format!("resize join error: {e}")),
+    }
+}
+
+fn resize_blocking(socket_path: &std::path::Path, cols: u16, rows: u16) -> Result<(), String> {
+    use hyoui::client::{AttachOptions, ClientConnection};
+    use hyoui::protocol::{ControlMessage, MVP_CAPS, Mode};
+
+    let opts = AttachOptions {
+        mode: Mode::Rw,
+        caps: MVP_CAPS.iter().map(|s| (*s).to_string()).collect(),
+        token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
+        exclusive: false,
+        detach_others: false,
+    };
+    let mut conn = ClientConnection::connect(socket_path, opts)
+        .map_err(|e| format!("connect/handshake: {e}"))?;
+    conn.send_control(&ControlMessage::Resize(hyoui::protocol::messages::Resize {
+        cols,
+        rows,
+    }))
+    .map_err(|e| format!("send resize: {e}"))?;
     Ok(())
 }
 

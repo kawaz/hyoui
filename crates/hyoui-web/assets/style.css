@@ -148,14 +148,33 @@ body.embed #inputForm { flex: 0 0 auto; }
   padding: 4px;
   background: #111;
   border-radius: 3px;
-  /* Let xterm.js size itself from cols/rows. */
-  width: fit-content;
+  /* fit-addon が viewport 幅から cols/rows を計算するため、コンテナは横幅を
+     広く取る (= fit-content にすると xterm.js の初期サイズに引きずられて縮む)。
+     高さは xterm.js が rows*cell-height に自動追従する。 */
+  width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
 }
 #inputForm {
   display: flex;
   gap: 0.4rem;
   align-items: center;
   flex-wrap: wrap;
+}
+/* 特殊キーパッド (iPad ソフトキーボードで打てない矢印 / Tab / Esc 等)。
+   1 行に収まるよう button は小さく (padding tight + font 少し小さめ)、
+   embed でも同じ 1 行 layout。折り返しは許容。 */
+.keypad {
+  display: flex;
+  gap: 0.25rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.keypad button {
+  padding: 0.15rem 0.5rem;
+  font-size: 0.85rem;
+  min-width: 2.2rem;
+  line-height: 1.2;
 }
 .stopped-banner {
   display: flex;

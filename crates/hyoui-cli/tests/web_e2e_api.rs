@@ -371,6 +371,98 @@ fn e2e_input_returns_409_while_external_client_holds_lock() {
     cleanup(runtime.path(), sid);
 }
 
+/// `POST /api/sessions/:id/resize` の e2e。
+///
+/// - valid body → 204、実際に daemon 側の window_size が反映される
+///   (= `hyoui screen snapshot --include=WindowSize --format=json` で検証)
+/// - cols=0 / rows=0 body → 400
+/// - 不明 session_id → 404
+#[test]
+fn e2e_resize_endpoint() {
+    let runtime = runtime_dir();
+    let sid = "web-e2e-resize";
+
+    spawn_detached(runtime.path(), sid);
+    let (mut web, port) = spawn_web(runtime.path());
+    let panic_guard = ChildGuard(&mut web);
+
+    // 未知 session → 404
+    let body = serde_json::to_vec(&serde_json::json!({"cols": 100u16, "rows": 30u16})).unwrap();
+    let r = http_request(
+        port,
+        "POST",
+        "/api/sessions/no-such-xyz/resize",
+        Some(("application/json", &body)),
+    );
+    assert_eq!(r.status, 404, "unknown session must 404");
+
+    // cols=0 → 400
+    let bad = serde_json::to_vec(&serde_json::json!({"cols": 0u16, "rows": 30u16})).unwrap();
+    let r = http_request(
+        port,
+        "POST",
+        &format!("/api/sessions/{sid}/resize"),
+        Some(("application/json", &bad)),
+    );
+    assert_eq!(r.status, 400, "cols=0 must 400");
+
+    // valid → 204
+    let ok = serde_json::to_vec(&serde_json::json!({"cols": 123u16, "rows": 37u16})).unwrap();
+    let r = http_request(
+        port,
+        "POST",
+        &format!("/api/sessions/{sid}/resize"),
+        Some(("application/json", &ok)),
+    );
+    assert_eq!(
+        r.status,
+        204,
+        "valid resize must 204 (body={})",
+        String::from_utf8_lossy(&r.body)
+    );
+
+    // daemon 側で window_size が反映されるまで待って `screen snapshot` で検証。
+    // snapshot は CBOR 出力なので --format=json + jq 相当の parse は入れず、
+    // 「cols=123 & rows=37 を含む JSON テキスト」を最大 2 秒待って部分マッチする
+    // 軽量検証にとどめる (= 依存 crate を増やしたくない)。
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut matched = false;
+    while Instant::now() < deadline {
+        let out = Command::new(hyoui_bin())
+            .args([
+                "screen",
+                "snapshot",
+                sid,
+                "--include=WindowSize",
+                "--format=json",
+            ])
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env_remove("HYOUI_SESSION_ID")
+            .env_remove("HYOUI_LOCK_TOKEN")
+            .env_remove("HYOUI_NAMESPACE")
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn screen snapshot");
+        let text = String::from_utf8_lossy(&out.stdout);
+        // snapshot --format=json は pretty JSON (`"cols": 123`) を出す。空白許容で
+        // 部分文字列マッチ。
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        if compact.contains("\"cols\":123") && compact.contains("\"rows\":37") {
+            matched = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        matched,
+        "resize 後に snapshot の window_size が cols=123 rows=37 に反映されない"
+    );
+
+    drop(panic_guard);
+    cleanup(runtime.path(), sid);
+}
+
 /// panic 時に web subprocess を確実に kill する RAII guard。
 struct ChildGuard<'a>(&'a mut Child);
 

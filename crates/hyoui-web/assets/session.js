@@ -48,10 +48,25 @@
   } else if (window.__hyouiDebug) {
     window.__hyouiDebug('warn', 'Unicode11Addon global not found');
   }
+  // Fit addon (コンテナサイズ → cols/rows を計算)。
+  let fitAddon = null;
+  if (window.FitAddon) {
+    try {
+      fitAddon = new window.FitAddon.FitAddon();
+      term.loadAddon(fitAddon);
+      if (window.__hyouiDebug) window.__hyouiDebug('info', 'fit addon loaded');
+    } catch (e) {
+      if (window.__hyouiDebug) window.__hyouiDebug('warn', 'fit addon load failed: ' + e.message);
+    }
+  } else if (window.__hyouiDebug) {
+    window.__hyouiDebug('warn', 'FitAddon global not found');
+  }
   term.open(document.getElementById('term'));
 
   const statusEl = document.getElementById('status');
+  const sizeEl = document.getElementById('size');
   const autoEl = document.getElementById('auto');
+  const autoResizeEl = document.getElementById('autoResize');
   const refreshBtn = document.getElementById('refresh');
   const inputForm = document.getElementById('inputForm');
   const inputText = document.getElementById('inputText');
@@ -67,6 +82,85 @@
 
   let timer = null;
   let lastPayload = '';
+  let lastCols = COLS;
+  let lastRows = ROWS;
+
+  // ---- resize logic (kawaz 要望 2026-07-21) ----
+  //
+  // 責務: (a) 表示 fit (= xterm.js の grid を viewport に合わせる) は default on。
+  //       (b) daemon 側 PTY の resize (= 実 TUI 再レイアウト) は明示 opt-in
+  //           (autoResizeEl checkbox、localStorage 保持、default off)。
+  //
+  // なぜ (b) が opt-in か: iframe 埋め込み (ccmsg webui Terminal タブ等) で
+  // 意図せず PTY resize が発火して稼働中の TUI (claude / vim) を勝手に
+  // 再レイアウトさせないため。
+  const LS_AUTO_RESIZE = 'hyoui.session.autoResize';
+  try {
+    autoResizeEl.checked = localStorage.getItem(LS_AUTO_RESIZE) === '1';
+  } catch (_e) { /* private mode 等で失敗しても既定 off */ }
+  autoResizeEl.addEventListener('change', () => {
+    try { localStorage.setItem(LS_AUTO_RESIZE, autoResizeEl.checked ? '1' : '0'); } catch (_e) {}
+    // opt-in した瞬間に現サイズを一度 PTY に反映。
+    if (autoResizeEl.checked) sendResizeIfChanged(true);
+  });
+
+  async function sendResizeIfChanged(force) {
+    const cols = term.cols;
+    const rows = term.rows;
+    if (!force && cols === lastCols && rows === lastRows) return;
+    lastCols = cols;
+    lastRows = rows;
+    if (sizeEl) sizeEl.textContent = `${cols}x${rows}`;
+    if (!autoResizeEl.checked) return;
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/resize`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cols, rows }),
+      });
+      if (!r.ok) {
+        const txt = await r.text();
+        if (window.__hyouiDebug) window.__hyouiDebug('warn', `resize HTTP ${r.status}: ${txt}`);
+        return;
+      }
+      // resize 後は daemon が新サイズで redraw するので screen を取り直す。
+      setTimeout(fetchScreen, 200);
+    } catch (e) {
+      if (window.__hyouiDebug) window.__hyouiDebug('warn', 'resize failed: ' + e.message);
+    }
+  }
+
+  let fitTimer = null;
+  function scheduleFit() {
+    if (!fitAddon) return;
+    if (fitTimer) clearTimeout(fitTimer);
+    fitTimer = setTimeout(() => {
+      fitTimer = null;
+      try {
+        fitAddon.fit();
+        sendResizeIfChanged(false);
+      } catch (e) {
+        if (window.__hyouiDebug) window.__hyouiDebug('warn', 'fit failed: ' + e.message);
+      }
+    }, 150); // debounce (数百 ms オーダで十分、resize drag 中の連射を抑える)
+  }
+
+  // 初回 fit は open() 直後の layout 完了を待って 1 tick 後に。
+  setTimeout(() => {
+    if (fitAddon) {
+      try { fitAddon.fit(); } catch (_e) {}
+    }
+    lastCols = term.cols;
+    lastRows = term.rows;
+    if (sizeEl) sizeEl.textContent = `${term.cols}x${term.rows}`;
+  }, 0);
+
+  window.addEventListener('resize', scheduleFit);
+  if (typeof ResizeObserver !== 'undefined') {
+    try {
+      new ResizeObserver(scheduleFit).observe(document.getElementById('term'));
+    } catch (_e) { /* best-effort */ }
+  }
 
   async function refreshSessionStatus() {
     // /api/sessions を一覧して自分の session_id を探し child_stopped で banner を出す。
@@ -165,6 +259,21 @@
     sendSpecs(['text:' + t]);
     inputText.value = '';
   });
+
+  // 特殊キーパッド (iPad ソフトキーボードで打てない矢印 / Tab / Esc / Ctrl-C 等)。
+  // 各 button の data-spec を POST /input の spec としてそのまま送る。
+  // mousedown で preventDefault することで button に focus を奪われず、送信後も
+  // input の focus はそのまま (= 連打しやすさ)。
+  const keypad = document.getElementById('keypad');
+  if (keypad) {
+    keypad.querySelectorAll('button[data-spec]').forEach((btn) => {
+      btn.addEventListener('mousedown', (e) => e.preventDefault());
+      btn.addEventListener('click', () => {
+        const spec = btn.getAttribute('data-spec');
+        if (spec) sendSpecs([spec]);
+      });
+    });
+  }
 
   sendKeyBtn.addEventListener('click', () => {
     const name = prompt('Key name (e.g. Escape, Tab, Ctrl-C, C-a):');
