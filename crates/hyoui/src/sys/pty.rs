@@ -158,6 +158,15 @@ impl Pty {
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         raw::ioctl_set_winsize(self.master_fd(), cols, rows)
     }
+
+    /// DR-0028 Phase 1: 既存 PTY master fd (= self-exec 前の親から継承した fd) から
+    /// `Pty` を組み立てる。slave は既に子 process が保持しているので `None`。
+    pub fn from_master_fd(master: std::os::fd::OwnedFd) -> Self {
+        Self {
+            master: Some(master),
+            slave: None,
+        }
+    }
 }
 
 impl Drop for Pty {

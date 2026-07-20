@@ -19,7 +19,7 @@ pub mod wait;
 
 pub use clock::clock_monotonic;
 pub use error::{Error, Result};
-pub use fd::{FdExt, WriteError, WriteOutcome};
+pub use fd::{FdExt, WriteError, WriteOutcome, clear_cloexec, set_cloexec};
 pub use poll::{PollOutcome, poll};
 pub use pty::Pty;
 pub use signal::{

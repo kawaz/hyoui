@@ -202,6 +202,26 @@ pub trait FdExt: AsFd {
 
 impl<T: AsFd> FdExt for T {}
 
+/// `FD_CLOEXEC` を明示的に設定する (= execve で子に fd を継承させたくない、既定の
+/// defense-in-depth)。DR-0028 §3 の fallback path (= upgrade exec 失敗時に fd を
+/// 元の CLOEXEC 状態に戻す) で使う。set/clear の両向きが必要になるので薄い pair
+/// として exports する。
+pub fn set_cloexec<F: AsFd>(fd: &F) -> Result<()> {
+    fcntl(
+        fd.as_fd(),
+        FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+    )
+    .map_err(Error::from)?;
+    Ok(())
+}
+
+/// `FD_CLOEXEC` を明示的に clear する (= execve 後の新プロセスに fd を継承させる)。
+/// DR-0028 §3 の self-exec 骨格で PTY master fd / listener fd に対して呼ぶ。
+pub fn clear_cloexec<F: AsFd>(fd: &F) -> Result<()> {
+    fcntl(fd.as_fd(), FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty())).map_err(Error::from)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

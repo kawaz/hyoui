@@ -312,6 +312,13 @@ fn main() -> ExitCode {
         return daemonize::run_daemon_child();
     }
 
+    // DR-0028 Phase 1: self-exec upgrade で継承した fd / init env を検知したら
+    // upgrade-resume child 経路に分岐する (= HYOUI_DAEMONIZE_INIT と同じ pattern)。
+    // 検出 env は `HYOUI_UPGRADE_RESUME=1` のみ、他の値は無視 (= 誤誘導防止)。
+    if std::env::var("HYOUI_UPGRADE_RESUME").as_deref() == Ok("1") {
+        return daemonize::run_upgrade_resume_child();
+    }
+
     let cmd = parse_args(&argv);
 
     match cmd {

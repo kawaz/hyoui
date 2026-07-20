@@ -188,6 +188,11 @@ fn acquire_sigchld_selfpipe() -> Option<SigchldOwner> {
     // child は SIGHUP 巻き添え死 + socket 残骸になる。best-effort install。
     let _ = register_self_pipe(Signal::SIGTERM);
     let _ = register_self_pipe(Signal::SIGINT);
+    // DR-0028 Phase 1: SIGUSR1 = 隠し upgrade trigger。外部から `kill -USR1 <daemon-pid>`
+    // で `handle_suspend_signals` が `RelayOutcome::UpgradeRequested` を返し、
+    // `Session::serve` が self-exec 経路 (`daemon::upgrade::perform_self_exec`) に
+    // 分岐する。best-effort install (= 失敗しても既存 signal 経路は損なわない)。
+    let _ = register_self_pipe(Signal::SIGUSR1);
     Some(SigchldOwner {
         pipe,
         _guard: guard,
@@ -204,6 +209,9 @@ fn release_suspend_signal_handlers() {
     // 優先3: graceful shutdown 用に install した SIGTERM / SIGINT も default に戻す。
     let _ = install_default(Signal::SIGTERM);
     let _ = install_default(Signal::SIGINT);
+    // DR-0028 Phase 1: SIGUSR1 も default 復帰させる (= 通常は register 失敗しても
+    // 副作用なしだが、self-pipe 由来 handler の残留を避けるため揃える)。
+    let _ = install_default(Signal::SIGUSR1);
 }
 use super::tail::{broadcast_tail_end_to_followers, tail_end_reason_from_outcome};
 
@@ -288,6 +296,41 @@ impl Session {
         // block するのを防ぐ。read_some は EAGAIN を返す → serve_loop で continue。
         pty.master_fd().set_nonblocking(true)?;
         let listener = UnixSock::listen(&config.socket_path)?;
+        Ok(Self {
+            config,
+            inner: Some(SessionInner {
+                pty,
+                child,
+                listener,
+            }),
+        })
+    }
+
+    /// DR-0028 Phase 1: upgrade self-exec 後の新プロセスから呼ぶ復帰用コンストラクタ。
+    ///
+    /// `master_fd` / `listener_fd` は前 daemon が CLOEXEC を clear した状態で execve
+    /// 経由に継承した bind 済 fd。`child` は前 daemon が親子関係を保っていた子 PID
+    /// (= exec 前後で PID / PPID は不変、DR-0028 §1)。socket file の unlink 責務は
+    /// 通常の `UnixSock::Drop` が担うので `from_listener_fd` で普通に組み立てる
+    /// (= socket path は既存 file を指したまま bind 済)。
+    ///
+    /// `Pty::master_fd` は fd inheritance で有効だが nonblock 属性は execve でも
+    /// 保存されるので (= `F_SETFL` は fd 属性)、Session::start と同じく nonblock
+    /// のまま扱う。念のため明示的に set_nonblocking を呼ぶ。
+    ///
+    /// # Errors
+    ///
+    /// * `set_nonblocking` 失敗 (= 引き継いだ fd が無効) → [`Error::Errno`]
+    pub fn from_upgrade_inherited(
+        config: DaemonConfig,
+        master_fd: std::os::fd::OwnedFd,
+        listener_fd: std::os::fd::OwnedFd,
+        child: Pid,
+    ) -> Result<Self, Error> {
+        use crate::sys::FdExt as _;
+        let pty = Pty::from_master_fd(master_fd);
+        pty.master_fd().set_nonblocking(true)?;
+        let listener = UnixSock::from_listener_fd(listener_fd, config.socket_path.clone());
         Ok(Self {
             config,
             inner: Some(SessionInner {
@@ -440,6 +483,18 @@ impl Session {
         let had_owner = sigchld_owner.is_some();
         drop(sigchld_owner);
 
+        // DR-0028 Phase 1: UpgradeRequested は通常 shutdown を **迂回** して
+        // self-exec に飛び込む。drain / SessionExitNotify / linger / socket
+        // unlink / finalize_child は全て skip する (= 子は継続、socket は継続、
+        // fd は新プロセスへ継承)。had_owner の signal handler は execve が全て
+        // default にリセットするため、ここでは触らない。
+        if matches!(outcome, RelayOutcome::UpgradeRequested) {
+            let err = super::upgrade::perform_self_exec(pty, listener, child, config);
+            // execve が失敗した場合のみ到達。Phase 1 PoC としては session error で
+            // abort し、子は orphan 化する (= DR-0028 §5 の Phase 2 課題)。
+            return Err(err);
+        }
+
         // tail follow subscriber へ TailEnd を 1 発投げてから cleanup する。
         // 終了理由の導出 (= ChildExited / ClientCancel / Error は送らない) と
         // 一括 best-effort 送信は tail.rs の helper に委譲。
@@ -545,6 +600,9 @@ impl Session {
         match outcome {
             RelayOutcome::ChildExited(_) | RelayOutcome::ClientDetachedOrKilled => Ok(exit_code),
             RelayOutcome::Error(e) => Err(e),
+            // UpgradeRequested は上の分岐で早期 return 済 (= 通常 shutdown を迂回)。
+            // 型上の網羅性のため到達不能 arm を書く。
+            RelayOutcome::UpgradeRequested => unreachable!("UpgradeRequested handled above"),
         }
     }
 }
@@ -863,6 +921,19 @@ fn handle_suspend_signals(
             if lifecycle.is_stopped() || child_is_stopped_via_waitpid(child) {
                 let _ = kill_pgrp(child, Signal::SIGCONT);
             }
+        } else if sig_i32 == Signal::SIGUSR1 as i32 {
+            // DR-0028 Phase 1: SIGUSR1 = 隠し upgrade trigger。record に痕跡を
+            // 残してから `RelayOutcome::UpgradeRequested` を返し、`Session::serve`
+            // 側で self-exec 経路に飛ぶ。**child は殺さない / socket は unlink
+            // しない** (= 新プロセスに fd を継承させる)。Phase 3 で正規
+            // `upgrade.request` protocol kind に置き換わる。
+            state.record_registry.push_lifecycle(
+                super::record::LifecycleEvent::SessionTerminatedByCondition {
+                    reason: "upgrade-request".to_string(),
+                    ts_unix_ms: now_unix_ms(),
+                },
+            );
+            return Some(RelayOutcome::UpgradeRequested);
         } else if sig_i32 == Signal::SIGTERM as i32 || sig_i32 == Signal::SIGINT as i32 {
             // issue 2026-06-11 優先3: graceful shutdown。`--until` match と同じ経路
             // (= killpg(SIGTERM) → finalize escalation → SessionExitNotify → socket
@@ -1713,6 +1784,11 @@ pub(super) enum RelayOutcome {
     ClientDetachedOrKilled,
     /// 回復不能な error (= protocol violation 等)。
     Error(Error),
+    /// DR-0028 Phase 1: 隠し SIGUSR1 経由で self-exec upgrade を要求された。
+    /// `Session::serve` は本 outcome を受けたら `finalize_child` や socket unlink
+    /// を **迂回** し、`daemon::upgrade::perform_self_exec` に fd 所有権を渡す
+    /// (= 子 PID / 子 との親子関係 / listener bind をそのまま新プロセスへ引き継ぐ)。
+    UpgradeRequested,
 }
 
 /// 子 PTY exit を見届けて SIGTERM → SIGKILL に昇格するまでの grace 期間。

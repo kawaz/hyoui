@@ -119,6 +119,10 @@ pub(super) fn tail_end_reason_from_outcome(outcome: &RelayOutcome) -> Option<Tai
         RelayOutcome::ChildExited(_) => Some(TailEndReason::ChildExited),
         RelayOutcome::ClientDetachedOrKilled => Some(TailEndReason::ClientCancel),
         RelayOutcome::Error(_) => None,
+        // DR-0028 Phase 1: upgrade は Session::serve 側で早期 return するため本
+        // helper には到達しないが、型網羅性のため None を返す (= tail-end 送信は
+        // upgrade でも不要、client 側は socket 切断で気づく)。
+        RelayOutcome::UpgradeRequested => None,
     }
 }
 

@@ -548,6 +548,97 @@ pub fn run_daemon_child() -> ExitCode {
     }
 }
 
+/// DR-0028 Phase 1: self-exec upgrade で継承した fd から daemon serve を再開する。
+///
+/// 呼び出し前提: main entry が `HYOUI_UPGRADE_RESUME=1` を検知して本関数に dispatch
+/// している (= single-threaded、`set_var_at_startup` / `remove_var_at_startup`
+/// の契約を満たす)。
+///
+/// 手順:
+/// 1. `daemon::upgrade::read_upgrade_env()` で env から fd 番号 / session_id /
+///    socket path / cols / rows / child_pid を取り出す
+/// 2. 継承 fd を `own_raw_fd` で `OwnedFd` 化 (= execve 前に CLOEXEC 解除済み、
+///    kernel が exec 後も fd を保持している前提)
+/// 3. `Session::from_upgrade_inherited` で Session を組み立て、通常の serve loop
+///    に合流する
+/// 4. upgrade 系 env は unset で孫プロセスに漏らさない
+///
+/// Phase 1 制約: `DaemonConfig` は最小 field のみ復元する (= session_id / socket /
+/// cmd 空 / cols / rows)。until / on_child_suspend / scrollback 上限 / record 継続
+/// 等の高度な引き継ぎは Phase 2 で一時ファイル (CBOR) 経由に拡張する。**exec 元
+/// daemon で有効だった `--until` / `--timeout` は本 PoC では消える** ため、実運用の
+/// upgrade はまだ推奨できない (= DR-0028 §Phase 2 gate 到達まで隠し経路)。
+pub fn run_upgrade_resume_child() -> ExitCode {
+    use hyoui::daemon::upgrade;
+    use nix::unistd::Pid;
+
+    let env = match upgrade::read_upgrade_env() {
+        Ok(e) => e,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // 孫プロセスへの漏れを防ぐため upgrade env は全て unset (= HYOUI_DAEMONIZE_INIT
+    // 経路と同じ流儀)。
+    for k in [
+        upgrade::ENV_UPGRADE_RESUME,
+        upgrade::ENV_UPGRADE_PTY_FD,
+        upgrade::ENV_UPGRADE_LISTENER_FD,
+        upgrade::ENV_UPGRADE_CHILD_PID,
+        upgrade::ENV_UPGRADE_SESSION,
+        upgrade::ENV_UPGRADE_SOCKET,
+        upgrade::ENV_UPGRADE_COLS,
+        upgrade::ENV_UPGRADE_ROWS,
+    ] {
+        hyoui::sys::env::remove_var_at_startup(k);
+    }
+
+    // 継承 fd を OwnedFd 化。前 daemon が CLOEXEC を解いてから execve したので
+    // kernel には有効な fd として残っている。
+    let master_owned = hyoui::sys::raw::own_raw_fd(env.pty_fd);
+    let listener_owned = hyoui::sys::raw::own_raw_fd(env.listener_fd);
+
+    // DaemonConfig 最小復元 (= Phase 1 は cmd を空で置く。cmd は「今から spawn する
+    // 子」を表すため、既に生きている child を継承する upgrade path では意味を持たない。
+    // `DaemonConfig::new` の invariant (= cmd must not be empty) との衝突を避けるため
+    // dummy `["<upgrade-resume>"]` を入れる。Phase 2 で一時ファイル経由の完全復元に
+    // 置き換える予定)。
+    let dummy_cmd = vec!["<upgrade-resume>".to_string()];
+    let mut dcfg =
+        hyoui::daemon::DaemonConfig::new(env.session_id.clone(), env.socket.clone(), dummy_cmd);
+    dcfg.cols = env.cols;
+    dcfg.rows = env.rows;
+
+    let session = match hyoui::daemon::Session::from_upgrade_inherited(
+        dcfg,
+        master_owned,
+        listener_owned,
+        Pid::from_raw(env.child_pid),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("hyoui (upgrade-resume child): Session::from_upgrade_inherited failed: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    eprintln!(
+        "hyoui: upgrade-resume ready (session={}, socket={}, child_pid={}, pty_fd={}, listener_fd={})",
+        env.session_id,
+        env.socket.display(),
+        env.child_pid,
+        env.pty_fd,
+        env.listener_fd,
+    );
+
+    match session.serve() {
+        Ok(_code) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::from(1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

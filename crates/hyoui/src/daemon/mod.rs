@@ -34,6 +34,7 @@ mod reducer;
 mod screen;
 mod session;
 mod tail;
+pub mod upgrade;
 
 pub use config::{ChildSuspendPolicy, DaemonConfig};
 pub use session::Session;
