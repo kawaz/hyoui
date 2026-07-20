@@ -581,7 +581,8 @@ pub fn run_upgrade_resume_child() -> ExitCode {
     };
 
     // 孫プロセスへの漏れを防ぐため upgrade env は全て unset (= HYOUI_DAEMONIZE_INIT
-    // 経路と同じ流儀)。
+    // 経路と同じ流儀)。ENV_UPGRADE_STATE_FILE も含む (= 読み込み後の path 情報が
+    // 孫 process に漏れないように)。
     for k in [
         upgrade::ENV_UPGRADE_RESUME,
         upgrade::ENV_UPGRADE_PTY_FD,
@@ -591,6 +592,7 @@ pub fn run_upgrade_resume_child() -> ExitCode {
         upgrade::ENV_UPGRADE_SOCKET,
         upgrade::ENV_UPGRADE_COLS,
         upgrade::ENV_UPGRADE_ROWS,
+        upgrade::ENV_UPGRADE_STATE_FILE,
     ] {
         hyoui::sys::env::remove_var_at_startup(k);
     }
@@ -600,22 +602,80 @@ pub fn run_upgrade_resume_child() -> ExitCode {
     let master_owned = hyoui::sys::raw::own_raw_fd(env.pty_fd);
     let listener_owned = hyoui::sys::raw::own_raw_fd(env.listener_fd);
 
-    // DaemonConfig 最小復元 (= Phase 1 は cmd を空で置く。cmd は「今から spawn する
-    // 子」を表すため、既に生きている child を継承する upgrade path では意味を持たない。
-    // `DaemonConfig::new` の invariant (= cmd must not be empty) との衝突を避けるため
-    // dummy `["<upgrade-resume>"]` を入れる。Phase 2 で一時ファイル経由の完全復元に
-    // 置き換える予定)。
-    let dummy_cmd = vec!["<upgrade-resume>".to_string()];
-    let mut dcfg =
-        hyoui::daemon::DaemonConfig::new(env.session_id.clone(), env.socket.clone(), dummy_cmd);
-    dcfg.cols = env.cols;
-    dcfg.rows = env.rows;
+    // DR-0028 Phase 2: state file (CBOR versioned) から DaemonConfig / scrollback
+    // bytes / 子 PID を復元する。state file が読めない / decode 失敗 / version
+    // mismatch のいずれかで fallback へ (= env 最小 subset で dummy cmd resume)。
+    let (dcfg, scrollback_bytes, child_pid) = match env
+        .state_file
+        .as_deref()
+        .map(upgrade::read_and_consume_state_file)
+    {
+        Some(Ok(state)) => {
+            let cmd = if state.cmd.is_empty() {
+                vec!["<upgrade-resume>".to_string()]
+            } else {
+                state.cmd.clone()
+            };
+            let mut dcfg = hyoui::daemon::DaemonConfig::new(
+                state.session_id.clone(),
+                state.socket_path.clone(),
+                cmd,
+            );
+            dcfg.cols = state.cols;
+            dcfg.rows = state.rows;
+            dcfg.scrollback_bytes = state.scrollback_bytes;
+            dcfg.screen_input_log_bytes = state.screen_input_log_bytes;
+            dcfg.screen_vt100_scrollback_rows = state.screen_vt100_scrollback_rows;
+            dcfg.client_buffer_bytes = state.client_buffer_bytes;
+            dcfg.expected_token = state.expected_token.clone();
+            dcfg.until = state.until.clone();
+            dcfg.debug_dump_path = state.debug_dump_path.clone();
+            dcfg.cwd = state.cwd.clone();
+            dcfg.on_child_suspend = upgrade::parse_on_child_suspend(&state.on_child_suspend);
+            dcfg.timeout_ms = state.timeout_ms;
+            dcfg.idle_timeout_ms = state.idle_timeout_ms;
+            eprintln!(
+                "hyoui: upgrade-resume state file loaded (session={}, cmd={:?}, scrollback={} bytes, prev_boot_id={})",
+                state.session_id,
+                state.cmd,
+                state.scrollback.len(),
+                state.daemon_boot_id_prev,
+            );
+            (dcfg, state.scrollback, state.child_pid)
+        }
+        Some(Err(msg)) => {
+            eprintln!(
+                "hyoui: upgrade-resume state file unusable ({msg}); env-only minimum path (= scrollback lost, config detail lost)"
+            );
+            let mut dcfg = hyoui::daemon::DaemonConfig::new(
+                env.session_id.clone(),
+                env.socket.clone(),
+                vec!["<upgrade-resume>".to_string()],
+            );
+            dcfg.cols = env.cols;
+            dcfg.rows = env.rows;
+            (dcfg, Vec::new(), env.child_pid)
+        }
+        None => {
+            eprintln!(
+                "hyoui: upgrade-resume no state file env; env-only minimum path (= scrollback lost, config detail lost)"
+            );
+            let mut dcfg = hyoui::daemon::DaemonConfig::new(
+                env.session_id.clone(),
+                env.socket.clone(),
+                vec!["<upgrade-resume>".to_string()],
+            );
+            dcfg.cols = env.cols;
+            dcfg.rows = env.rows;
+            (dcfg, Vec::new(), env.child_pid)
+        }
+    };
 
-    let session = match hyoui::daemon::Session::from_upgrade_inherited(
+    let mut session = match hyoui::daemon::Session::from_upgrade_inherited(
         dcfg,
         master_owned,
         listener_owned,
-        Pid::from_raw(env.child_pid),
+        Pid::from_raw(child_pid),
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -623,12 +683,15 @@ pub fn run_upgrade_resume_child() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if !scrollback_bytes.is_empty() {
+        session.set_upgrade_scrollback(scrollback_bytes);
+    }
 
     eprintln!(
         "hyoui: upgrade-resume ready (session={}, socket={}, child_pid={}, pty_fd={}, listener_fd={})",
         env.session_id,
         env.socket.display(),
-        env.child_pid,
+        child_pid,
         env.pty_fd,
         env.listener_fd,
     );

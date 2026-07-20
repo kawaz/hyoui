@@ -238,6 +238,11 @@ pub struct Session {
     /// `serve` 経由で消費されると `None` になり、その後の Drop は no-op になる。
     /// `start` 直後は常に `Some`。
     inner: Option<SessionInner>,
+    /// DR-0028 Phase 2: upgrade-resume 経路で受け取った scrollback bytes。
+    /// `serve` 開始時に `ScreenState::process` に 1 度だけ feed して vt100 状態を
+    /// 復元し、Scrollback ring にも push で seed する。通常 `Session::start` 経路
+    /// では `None`。
+    resume_scrollback: Option<Vec<u8>>,
 }
 
 /// `Session` の本体リソース。`Option<SessionInner>` で包むことで `serve` が
@@ -303,6 +308,7 @@ impl Session {
                 child,
                 listener,
             }),
+            resume_scrollback: None,
         })
     }
 
@@ -338,7 +344,16 @@ impl Session {
                 child,
                 listener,
             }),
+            resume_scrollback: None,
         })
+    }
+
+    /// DR-0028 Phase 2: upgrade-resume 経路で受け取った scrollback bytes を
+    /// `Session` に注入する。`serve` 開始時に `ScreenState` へ 1 度だけ feed され、
+    /// 同時に byte-base `Scrollback` ring にも push で seed される (= 新プロセスでも
+    /// tail queries が pre-upgrade の履歴を見られる)。
+    pub fn set_upgrade_scrollback(&mut self, bytes: Vec<u8>) {
+        self.resume_scrollback = Some(bytes);
     }
 
     /// `inner` を `Some` 前提で参照する内部ヘルパ。`start` 直後 〜 `serve` の
@@ -430,6 +445,25 @@ impl Session {
         // (DR-0013 §6 + alacritty `event_loop.rs:166` pattern)。
         let mut pending_redraws: Vec<u64> = Vec::new();
 
+        // DR-0028 Phase 2: upgrade-resume で受け取った scrollback bytes を
+        // ScreenState + Scrollback ring に再 feed する。screen dump が exec 跨ぎ
+        // で pre-upgrade 相当を再現できるようにするため (= DR-0028 §3 gate)。
+        // Scrollback ring への seed は 1 chunk (= 現在時刻) にまとめる (= 元の
+        // chunk 単位 timestamp は失われるが tail の since 系は現在時刻起点で動く)。
+        if let Some(bytes) = self.resume_scrollback.take()
+            && !bytes.is_empty()
+        {
+            let n = bytes.len();
+            let t0 = std::time::Instant::now();
+            screen_state.process(&bytes);
+            let feed_us = t0.elapsed().as_micros();
+            eprintln!(
+                "hyoui: upgrade-resume scrollback re-feed: {n} bytes in {feed_us} µs \
+                 (= vt100 parser reconstruction, DR-0028 Phase 2)"
+            );
+            scrollback.push(std::time::Instant::now(), bytes);
+        }
+
         // R5-H6: Try to acquire process-wide SIGCHLD self-pipe ownership.
         // The `Some` branch installs SIGCHLD → self-pipe so `poll(2)` wakes
         // immediately on child STOP/CONT/exit (= 500ms latency → ~ms).
@@ -459,20 +493,66 @@ impl Session {
                 }
             });
 
-        let outcome = serve_loop(
-            &pty,
-            child,
-            &listener,
-            &mut clients,
-            &mut next_client_id,
-            config,
-            &mut state,
-            &mut scrollback,
-            &mut screen_state,
-            &mut pending_redraws,
-            sigchld_owner.as_ref().map(|o| &o.pipe),
-            debug_dump_file.as_mut(),
-        );
+        // DR-0028 Phase 2: `UpgradeRequested` は pre-check 失敗時に旧 serve_loop
+        // に再突入する (= §5.1 の fail-safe)。ループで serve_loop を回し、非
+        // upgrade outcome か pre-check 通過時に抜ける。sigchld_owner は
+        // ループ外で保持し続けるので、continue の後も signal 経路は維持される。
+        let outcome = loop {
+            let o = serve_loop(
+                &pty,
+                child,
+                &listener,
+                &mut clients,
+                &mut next_client_id,
+                config,
+                &mut state,
+                &mut scrollback,
+                &mut screen_state,
+                &mut pending_redraws,
+                sigchld_owner.as_ref().map(|o| &o.pipe),
+                debug_dump_file.as_mut(),
+            );
+            if !matches!(o, RelayOutcome::UpgradeRequested) {
+                break o;
+            }
+            // pre-check (= DR-0028 §5.1): 存在 / 実行 bit / 所有 UID を検査。
+            match super::upgrade::precheck_upgrade_target() {
+                Ok(exe_path) => {
+                    // 通過 → self-exec 経路に進む。sigchld_owner を先に drop し、
+                    // 直後に perform_self_exec (成功時は戻らない、失敗時は Err)。
+                    let had_owner = sigchld_owner.is_some();
+                    drop(sigchld_owner);
+                    // signal handler default 復帰は skip (execve が全て default に
+                    // リセットするため、または pre-check 通過後の execve 失敗時は
+                    // どうせ session abort する)。had_owner は unused だが対称性で残す。
+                    let _ = had_owner;
+                    let scrollback_bytes = scrollback.last_n_bytes(scrollback.total_bytes());
+                    let err = super::upgrade::perform_self_exec(
+                        pty,
+                        listener,
+                        child,
+                        config,
+                        scrollback_bytes,
+                        &config.daemon_boot_id,
+                        &exe_path,
+                    );
+                    return Err(err);
+                }
+                Err(msg) => {
+                    // pre-check 失敗 → 旧続行 (§5.1)。lifecycle record に痕跡を
+                    // 残してから outer loop で serve_loop を再起動。fd も socket
+                    // も clients も scrollback も screen_state もそのまま。
+                    eprintln!("hyoui: upgrade pre-check failed, continuing old serve: {msg}");
+                    state.record_registry.push_lifecycle(
+                        super::record::LifecycleEvent::SessionTerminatedByCondition {
+                            reason: format!("upgrade-precheck-failed: {msg}"),
+                            ts_unix_ms: now_unix_ms(),
+                        },
+                    );
+                    continue;
+                }
+            }
+        };
 
         // Drop the SIGCHLD self-pipe explicitly before any further cleanup so
         // the global `SELFPIPE_WRITE_FD` is cleared and a subsequent serve in
@@ -482,18 +562,6 @@ impl Session {
         // 据え置く (= 下記 `release_suspend_signal_handlers` 参照)。
         let had_owner = sigchld_owner.is_some();
         drop(sigchld_owner);
-
-        // DR-0028 Phase 1: UpgradeRequested は通常 shutdown を **迂回** して
-        // self-exec に飛び込む。drain / SessionExitNotify / linger / socket
-        // unlink / finalize_child は全て skip する (= 子は継続、socket は継続、
-        // fd は新プロセスへ継承)。had_owner の signal handler は execve が全て
-        // default にリセットするため、ここでは触らない。
-        if matches!(outcome, RelayOutcome::UpgradeRequested) {
-            let err = super::upgrade::perform_self_exec(pty, listener, child, config);
-            // execve が失敗した場合のみ到達。Phase 1 PoC としては session error で
-            // abort し、子は orphan 化する (= DR-0028 §5 の Phase 2 課題)。
-            return Err(err);
-        }
 
         // tail follow subscriber へ TailEnd を 1 発投げてから cleanup する。
         // 終了理由の導出 (= ChildExited / ClientCancel / Error は送らない) と
