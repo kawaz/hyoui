@@ -139,8 +139,18 @@ pub enum HelpTopic {
     RecordStop,
     /// Help for the `record list` subcommand (= DR-0016 §2)。
     RecordList,
+    /// Help for the `web` subcommand (= DR-0027 Phase 1、HTTP gateway 起動)。
+    Web,
     /// User invoked an unknown subcommand; render top-level help with note.
     UnknownSubcommand(String),
+}
+
+/// `web` subcommand configuration (DR-0027 Phase 1)。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WebConfig {
+    /// `--listen=<host:port>`。`None` なら config.toml `[web].listen`、それも無ければ
+    /// `127.0.0.1:43690` (= 0xAAAA、DR-0027 §Decision.2)。
+    pub listen: Option<String>,
 }
 
 /// Fully parsed `run` subcommand configuration.
@@ -921,6 +931,8 @@ pub enum Command {
     /// 各 subcommand の executor は本 commit (Phase 7) では protocol message を
     /// 構築・送信できる構造のみ、daemon 側 hook 配線は Phase 4 で行う。
     Record(RecordCommand),
+    /// `web <listen>` — HTTP gateway (= DR-0027 Phase 1)。
+    Web(WebConfig),
     /// Print a completion script for the given shell.
     Completion {
         /// Target shell.
@@ -972,6 +984,7 @@ pub fn parse_args(args: &[String]) -> Command {
         "unlock" => parse_unlock(rest),
         "record" => parse_record(rest),
         "detach" => parse_detach(rest),
+        "web" => parse_web(rest),
         "completion" => parse_completion(rest),
         // Reserved for future stages.
         //
@@ -2379,7 +2392,30 @@ pub fn usage(topic: &HelpTopic) -> String {
         HelpTopic::RecordStop => usage_record_stop(),
         HelpTopic::RecordList => usage_record_list(),
         HelpTopic::Completion => usage_completion(),
+        HelpTopic::Web => usage_web(),
     }
+}
+
+/// `hyoui web` subcommand の usage (DR-0027 Phase 1)。
+fn usage_web() -> String {
+    "\
+hyoui web [--listen=<host:port>]
+
+Start the HTTP gateway that exposes hyoui sessions over REST (DR-0027 Phase 1).
+
+Options:
+  --listen=<host:port>  Override bind address (default: config `[web].listen`
+                        or `127.0.0.1:43690`).
+  --help, -h            Show this help.
+
+Endpoints:
+  GET  /api/sessions               List live sessions as JSON.
+  GET  /api/sessions/:id/screen    ANSI dump of the session's screen
+                                   (text/plain; charset=utf-8).
+  POST /api/sessions/:id/input     Send input specs. Body JSON:
+                                   {\"specs\": [\"text:hello\", \"key:Enter\"]}
+"
+    .to_string()
 }
 
 // =============================================================================
@@ -3541,6 +3577,41 @@ fn parse_record_list(args: &[String]) -> Command {
         namespace: t.namespace,
         format,
     }))
+}
+
+/// `hyoui web [--listen=<host:port>]` (= DR-0027 Phase 1)。
+fn parse_web(args: &[String]) -> Command {
+    let mut listen: Option<String> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "--help" | "-h" => {
+                return Command::Help {
+                    topic: HelpTopic::Web,
+                };
+            }
+            _ if arg.starts_with("--listen=") => {
+                let v = &arg["--listen=".len()..];
+                if v.is_empty() {
+                    return Command::Error("web: --listen requires a value".into());
+                }
+                listen = Some(v.to_string());
+            }
+            "--listen" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) if !v.is_empty() => listen = Some(v.clone()),
+                    _ => return Command::Error("web: --listen requires a value".into()),
+                }
+            }
+            other => {
+                return Command::Error(format!("web: unexpected argument: {other}"));
+            }
+        }
+        i += 1;
+    }
+    Command::Web(WebConfig { listen })
 }
 
 fn parse_completion(args: &[String]) -> Command {

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/hyoui", "crates/hyoui-cli"]
+members = ["crates/hyoui", "crates/hyoui-cli", "crates/hyoui-web"]
 
 [workspace.package]
 version = "0.9.12"

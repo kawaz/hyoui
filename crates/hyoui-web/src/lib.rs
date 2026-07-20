@@ -1,0 +1,414 @@
+//! hyoui web gateway (DR-0027 Phase 1)。
+//!
+//! `crates/hyoui` の blocking `ClientConnection` / `discovery` / `input_bytes` /
+//! `cli::parse_input_spec` を axum ハンドラから `spawn_blocking` 経由で呼び、
+//! HTTP API 3 endpoint を提供する。
+//!
+//! ## Endpoints
+//!
+//! - `GET  /api/sessions` — 全 namespace 横断で live/stale session を JSON list で返す
+//! - `GET  /api/sessions/:id/screen` — `screen.dump.request` の ANSI payload を
+//!   `text/plain; charset=utf-8` で返す
+//! - `POST /api/sessions/:id/input` — body `{"specs": ["text:...", "key:Enter"]}`
+//!   を hyoui input と同じ流儀で送信 (= `parse_input_spec` → `input_bytes` → raw_data frame)
+//!
+//! ## namespace の扱い (Phase 1)
+//!
+//! path param `:id` は **session_id 名のみ**を受け付ける。全 namespace を横断走査して
+//! 同名 session を探す (= `discovery::list_sessions` が返した中から最初の match を採用)。
+//! 名前衝突が起きる運用は現状想定していない (= namespace は運用グループ分離目的、
+//! 同名 session を複数 namespace で並走させる事故は list JSON で発覚する)。将来
+//! `?namespace=X` query の受理は必要になった段階で追加する。
+
+#![warn(missing_docs)]
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use axum::Router;
+use axum::extract::{Path, State};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+
+pub use axum;
+
+/// axum の shared state。
+///
+/// `Config` は `hyoui::config::Config` の owned copy を持ち回る (= Arc は不要な size、
+/// でも handler 内で clone 増やしすぎない用に Arc に包む)。
+#[derive(Clone)]
+struct AppState {
+    #[allow(dead_code)]
+    // 将来 `[web]` セクションから rate limit / auth を読む余地。現時点では未使用。
+    config: Arc<hyoui::config::Config>,
+}
+
+/// axum Router を返す (= test / bin 側で `axum::serve` に渡すか
+/// `tower::ServiceExt::oneshot` で直接叩ける)。
+pub fn router(config: hyoui::config::Config) -> Router {
+    let state = AppState {
+        config: Arc::new(config),
+    };
+    Router::new()
+        .route("/api/sessions", get(get_sessions))
+        .route("/api/sessions/{id}/screen", get(get_screen))
+        .route("/api/sessions/{id}/input", post(post_input))
+        .with_state(state)
+}
+
+/// listen アドレスに bind して axum server を回す。
+///
+/// `hyoui web` subcommand から呼ばれる本体。Ctrl+C で graceful shutdown。
+pub async fn serve(listen: &str, config: hyoui::config::Config) -> std::io::Result<()> {
+    let app = router(config);
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    eprintln!("hyoui web: listening on http://{}", listener.local_addr()?);
+    axum::serve(listener, app.into_make_service())
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+}
+
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+// -----------------------------------------------------------------------------
+// GET /api/sessions
+// -----------------------------------------------------------------------------
+
+/// live/stale session 一覧を JSON で返す (= `hyoui list --format=jsonl` の JSON 配列版)。
+async fn get_sessions() -> Response {
+    let entries = match tokio::task::spawn_blocking(hyoui::discovery::list_sessions).await {
+        Ok(v) => v,
+        Err(e) => return internal_error(format!("session enumeration join error: {e}")),
+    };
+    let json: Vec<serde_json::Value> = entries.iter().map(session_entry_to_json).collect();
+    axum::Json(json).into_response()
+}
+
+fn session_entry_to_json(e: &hyoui::discovery::SessionEntry) -> serde_json::Value {
+    use hyoui::discovery::SessionStatus;
+    match &e.status {
+        SessionStatus::Live(info) => serde_json::json!({
+            "session_id": e.session_id,
+            "namespace": e.namespace,
+            "socket_path": e.socket_path.display().to_string(),
+            "started_unix_ms": e.started_unix_ms,
+            "status": if info.child_stopped { "stopped" } else { "live" },
+            "cwd": info.cwd,
+            "argv": info.argv,
+            "clients": info.clients,
+            "child_pid": info.child_pid,
+            "child_pgid": info.child_pgid,
+            "child_stopped": info.child_stopped,
+            "on_child_suspend": info.on_child_suspend.map(|p| p.as_str()),
+            "daemon_version": if info.daemon_version.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(info.daemon_version.clone())
+            },
+        }),
+        SessionStatus::Stale { reason } => serde_json::json!({
+            "session_id": e.session_id,
+            "namespace": e.namespace,
+            "socket_path": e.socket_path.display().to_string(),
+            "started_unix_ms": e.started_unix_ms,
+            "status": "stale",
+            "reason": reason,
+        }),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// GET /api/sessions/:id/screen
+// -----------------------------------------------------------------------------
+
+/// `screen.dump.request` の ANSI payload を `text/plain; charset=utf-8` で返す。
+async fn get_screen(Path(id): Path<String>, State(_state): State<AppState>) -> Response {
+    let sock = match resolve_socket(&id).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let bytes = match tokio::task::spawn_blocking(move || dump_screen_blocking(&sock)).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(msg)) => return internal_error(format!("screen dump failed: {msg}")),
+        Err(e) => return internal_error(format!("screen dump join error: {e}")),
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        bytes,
+    )
+        .into_response()
+}
+
+fn dump_screen_blocking(socket_path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use hyoui::client::{AttachOptions, ClientConnection};
+    use hyoui::protocol::messages::{ScreenDumpFormat, ScreenDumpLayer, ScreenDumpRequest};
+    use hyoui::protocol::{ControlMessage, MVP_CAPS, Mode};
+
+    let opts = AttachOptions {
+        mode: Mode::Ro,
+        caps: MVP_CAPS.iter().map(|s| (*s).to_string()).collect(),
+        token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
+        exclusive: false,
+        detach_others: false,
+    };
+    let mut conn = ClientConnection::connect(socket_path, opts)
+        .map_err(|e| format!("connect/handshake: {e}"))?;
+    let req = ScreenDumpRequest {
+        format: ScreenDumpFormat::Ansi,
+        layer: ScreenDumpLayer::Visible,
+        rect: None,
+        serial: Some(1),
+    };
+    conn.send_control(&ControlMessage::ScreenDumpRequest(req))
+        .map_err(|e| format!("send screen.dump.request: {e}"))?;
+    loop {
+        match conn.recv_control(None).map_err(|e| format!("recv: {e}"))? {
+            ControlMessage::ScreenDumpResponse(resp) => return Ok(resp.payload),
+            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+            ControlMessage::Error(e) => {
+                return Err(format!("daemon error: {:?} ({})", e.code, e.message));
+            }
+            other => {
+                return Err(format!(
+                    "unexpected response kind: {:?}",
+                    std::mem::discriminant(&other)
+                ));
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// POST /api/sessions/:id/input
+// -----------------------------------------------------------------------------
+
+/// input request body: `{"specs": ["text:hello", "key:Enter"]}`。
+#[derive(Debug, serde::Deserialize)]
+struct InputRequest {
+    specs: Vec<String>,
+}
+
+/// input 送信結果 (= 成功時: 送った bytes 総数、失敗時: どの spec が失敗したか)。
+#[derive(Debug, serde::Serialize)]
+struct InputResponse {
+    sent_bytes: usize,
+    specs: usize,
+}
+
+async fn post_input(
+    Path(id): Path<String>,
+    State(_state): State<AppState>,
+    axum::Json(body): axum::Json<InputRequest>,
+) -> Response {
+    // Phase 1: file: / wait: / wait-idle: は非サポート (network 経由で server 側の file を
+    // 読む経路 = セキュリティ懸念、wait 系は long-poll になり client の HTTP timeout と
+    // 相性が悪い)。text: / hex: / key: / paste: のみ受理。
+    let parsed = match parse_specs(&body.specs) {
+        Ok(v) => v,
+        Err(msg) => return bad_request(msg),
+    };
+    let sock = match resolve_socket(&id).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let result = tokio::task::spawn_blocking(move || send_input_blocking(&sock, &parsed)).await;
+    match result {
+        Ok(Ok(sent_bytes)) => axum::Json(InputResponse {
+            sent_bytes,
+            specs: body.specs.len(),
+        })
+        .into_response(),
+        Ok(Err(msg)) => internal_error(format!("input send failed: {msg}")),
+        Err(e) => internal_error(format!("input join error: {e}")),
+    }
+}
+
+/// spec 文字列列を bytes ペイロード列に変換する (= parse + handler の合成)。
+///
+/// 失敗した spec の index を error message に含める (= どこで止まったかが分かる)。
+fn parse_specs(specs: &[String]) -> Result<Vec<Vec<u8>>, String> {
+    let mut out = Vec::with_capacity(specs.len());
+    for (idx, s) in specs.iter().enumerate() {
+        let parsed = hyoui::cli::parse_input_spec(s)
+            .map_err(|e| format!("specs[{idx}] parse error: {e}"))?;
+        let bytes = spec_to_bytes(&parsed).map_err(|e| format!("specs[{idx}]: {e}"))?;
+        out.push(bytes);
+    }
+    Ok(out)
+}
+
+/// `InputSpec` を bytes に落とす (= file: / wait: / wait-idle: は reject)。
+fn spec_to_bytes(spec: &hyoui::cli::InputSpec) -> Result<Vec<u8>, String> {
+    use hyoui::cli::InputSpec;
+    use hyoui::input_bytes;
+    match spec {
+        InputSpec::Text(s) => Ok(input_bytes::handle_text(s)),
+        InputSpec::Hex(b) => Ok(input_bytes::handle_hex(b)),
+        InputSpec::Paste(s) => input_bytes::handle_paste(s),
+        InputSpec::Key(name) => input_bytes::handle_key(name),
+        InputSpec::File(_) => Err(
+            "file: spec は web gateway では未サポート (= server 側 file 読み込み経路は Phase 1 では受け付けない)".to_string(),
+        ),
+        InputSpec::Wait(_) | InputSpec::WaitIdle(_) => Err(
+            "wait / wait-idle spec は web gateway では未サポート (= long-poll 相当、Phase 1 対象外)".to_string(),
+        ),
+        _ => Err("unsupported InputSpec variant".to_string()),
+    }
+}
+
+fn send_input_blocking(
+    socket_path: &std::path::Path,
+    payloads: &[Vec<u8>],
+) -> Result<usize, String> {
+    use hyoui::client::{AttachOptions, ClientConnection};
+    use hyoui::protocol::Mode;
+
+    let opts = AttachOptions {
+        mode: Mode::Rw,
+        caps: hyoui::protocol::MVP_CAPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
+        exclusive: false,
+        detach_others: false,
+    };
+    let mut conn = ClientConnection::connect(socket_path, opts)
+        .map_err(|e| format!("connect/handshake: {e}"))?;
+    let mut sent = 0usize;
+    for payload in payloads {
+        conn.send_raw_bytes(payload)
+            .map_err(|e| format!("send_raw_bytes: {e}"))?;
+        sent += payload.len();
+    }
+    Ok(sent)
+}
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+/// session_id から live socket path を解決する。live entry のみ受理 (= stale は 404)。
+async fn resolve_socket(id: &str) -> Result<PathBuf, Response> {
+    let id = id.to_string();
+    let entries = match tokio::task::spawn_blocking(hyoui::discovery::list_sessions).await {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(internal_error(format!(
+                "session enumeration join error: {e}"
+            )));
+        }
+    };
+    for e in entries {
+        if e.session_id != id {
+            continue;
+        }
+        match e.status {
+            hyoui::discovery::SessionStatus::Live(_) => return Ok(e.socket_path),
+            hyoui::discovery::SessionStatus::Stale { reason } => {
+                return Err(not_found(format!("session {id:?} is stale: {reason}")));
+            }
+        }
+    }
+    Err(not_found(format!("no session named {id:?}")))
+}
+
+fn bad_request(msg: impl Into<String>) -> Response {
+    (StatusCode::BAD_REQUEST, msg.into()).into_response()
+}
+
+fn not_found(msg: impl Into<String>) -> Response {
+    (StatusCode::NOT_FOUND, msg.into()).into_response()
+}
+
+fn internal_error(msg: impl Into<String>) -> Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, msg.into()).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    //! router 単体の smoke test (= daemon 不要)。
+    //!
+    //! 本物の daemon を巻き込む e2e は `crates/hyoui-cli/tests/web_e2e_api.rs` 側 —
+    //! `CARGO_BIN_EXE_hyoui` は自 crate の bin target を指す env で cargo が
+    //! 用意するため、bin target を持つ hyoui-cli test でしか取れない。
+
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn parse_specs_rejects_file_and_wait() {
+        // web gateway は file: / wait: を **spec_to_bytes** で reject する。
+        // (= parse_input_spec 自体は成功する)。
+        let text = hyoui::cli::parse_input_spec("text:x").unwrap();
+        assert!(spec_to_bytes(&text).is_ok());
+
+        let file = hyoui::cli::parse_input_spec("file:/etc/hosts").unwrap();
+        let err = spec_to_bytes(&file).unwrap_err();
+        assert!(err.contains("file:"), "err={err}");
+
+        let wait = hyoui::cli::parse_input_spec("wait:foo").unwrap();
+        let err = spec_to_bytes(&wait).unwrap_err();
+        assert!(err.contains("wait"), "err={err}");
+    }
+
+    #[tokio::test]
+    async fn missing_session_returns_404() {
+        // daemon が居ない状態でも router は動く。unknown session_id は 404。
+        let app = router(hyoui::config::Config::default());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions/no-such-session-xyz/screen")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn sessions_endpoint_returns_array() {
+        let app = router(hyoui::config::Config::default());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // env に何が居ようと Ok な JSON array であること (要素数は環境依存で assert しない)。
+        assert!(json.is_array(), "expected array, got {json}");
+    }
+
+    #[tokio::test]
+    async fn input_bad_json_returns_400() {
+        let app = router(hyoui::config::Config::default());
+        // 空 body / 不正 JSON は axum::Json extractor が 400 に落とす。
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions/anything/input")
+                    .header("content-type", "application/json")
+                    .body(Body::from(b"not a json".as_slice()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // axum の JSON extractor は 400 を返す。
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+}

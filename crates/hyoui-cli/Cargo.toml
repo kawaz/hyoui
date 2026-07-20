@@ -14,6 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 hyoui = { path = "../hyoui", version = "0.9" }
+# DR-0027 Phase 1: `hyoui web` subcommand が hyoui-web の axum server を起動する
+# ためのハブ。tokio / axum は hyoui-web に閉じるが、cli binary からは path dep で
+# 呼び出す (= 別 binary に切り出す設計コスト回避)。
+hyoui-web = { path = "../hyoui-web", version = "0.9" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
 nix = { workspace = true }
 # `screen snapshot` subcommand が `StateSnapshotResponse` を独立した CBOR root
 # として出力するため、CBOR serialize の primitive を直接利用する (= DR-0013 §9)。

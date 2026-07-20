@@ -31,6 +31,36 @@ pub struct Config {
     /// attach client UX 設定 (= TOML の `[attach]` セクション、DR-0026)。
     #[serde(default)]
     pub attach: AttachConfig,
+
+    /// Web gateway 設定 (= TOML の `[web]` セクション、DR-0027)。
+    #[serde(default)]
+    pub web: WebConfig,
+}
+
+/// Web gateway 設定 (= TOML の `[web]` 配下、DR-0027 §Decision.2)。
+///
+/// `hyoui web` subcommand が listen する host:port を持つ。CLI flag
+/// `--listen` があれば config を上書きする (= DR-0024 の flag 最小化方針)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct WebConfig {
+    /// listen する host:port (= default `127.0.0.1:43690` = 0xAAAA、DR-0027)。
+    ///
+    /// 前段 Caddy reverse proxy 想定 (= HTTPS / auth は前段が担う)。tailnet の外に
+    /// 直接晒す場合は将来 DR で auth を扱う。
+    #[serde(default = "default_web_listen")]
+    pub listen: String,
+}
+
+fn default_web_listen() -> String {
+    "127.0.0.1:43690".to_string()
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            listen: default_web_listen(),
+        }
+    }
 }
 
 /// attach client UX 設定 (= TOML の `[attach]` 配下、DR-0026 §3)。
@@ -283,6 +313,23 @@ mod tests {
         assert_eq!(c.attach.tstp.short_debounce_ms, 300);
         assert_eq!(c.attach.tstp.long_grace_ms, 1500);
         assert!(c.attach.resume.on_reattach);
+        assert_eq!(c.web.listen, "127.0.0.1:43690");
+    }
+
+    #[test]
+    fn parse_web_section_overrides_listen() {
+        let s = r#"
+[web]
+listen = "0.0.0.0:8080"
+"#;
+        let c = parse_str(s, &dummy_path()).unwrap();
+        assert_eq!(c.web.listen, "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn parse_web_missing_uses_default() {
+        let c = parse_str("", &dummy_path()).unwrap();
+        assert_eq!(c.web.listen, "127.0.0.1:43690");
     }
 
     #[test]

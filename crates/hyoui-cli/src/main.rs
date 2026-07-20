@@ -35,7 +35,7 @@ use hyoui::sys::{enter_raw, is_tty};
 
 mod completion;
 mod daemonize;
-mod input_handlers;
+use hyoui::input_bytes as input_handlers;
 mod socket_path;
 mod wait_core;
 
@@ -396,6 +396,8 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+
+        Command::Web(cfg) => web_command(cfg),
 
         Command::Completion { shell } => {
             print!("{}", completion::script(shell));
@@ -2251,6 +2253,40 @@ fn socket_path_is_self(p: &std::path::Path) -> bool {
 /// daemon と子 PTY は影響を受けず継続する (= DR-0015 §2.3.1)。session 省略時は
 /// `$HYOUI_SESSION_ID` で自セッションに解決 (= self default 許容、TUI 脱出用途)。
 /// target 指定は持たない (= `DetachConfig` doc 参照、Fable review M1 2026-06-12)。
+/// `hyoui web` subcommand (= DR-0027 Phase 1)。
+///
+/// tokio multi-thread runtime を新規に起こし、`hyoui_web::serve` を回す。
+/// listen アドレスの解決順は CLI flag `--listen` > config.toml `[web].listen` >
+/// hardcoded default (`127.0.0.1:43690` = 0xAAAA)。
+fn web_command(cfg: hyoui::cli::WebConfig) -> ExitCode {
+    let config = match hyoui::config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hyoui: web: config 読み込み失敗: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let listen = cfg.listen.unwrap_or_else(|| config.web.listen.clone());
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("hyoui: web: tokio runtime 構築失敗: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let result = runtime.block_on(hyoui_web::serve(&listen, config));
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("hyoui: web: serve 失敗 (listen={listen}): {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn detach_command(cfg: hyoui::cli::DetachConfig) -> ExitCode {
     use hyoui::protocol::messages::{Detach, DetachTarget};
 

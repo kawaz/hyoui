@@ -51,6 +51,13 @@ pub mod daemon;
 // daemon と対称構造で stdin/stdout を中継。protocol module を frame レベルで使う。
 pub mod client;
 
+// DR-0027 Phase 1: session discovery for hyoui-web (= socket dir walk + status.query 統合)。
+pub mod discovery;
+
+// DR-0027 Phase 1: input spec bytes 化 helpers (= 旧 `hyoui-cli::input_handlers` を core 側に
+// 引き上げ、hyoui-web からも同じ変換を使う)。
+pub mod input_bytes;
+
 /// Library version (matches `Cargo.toml`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

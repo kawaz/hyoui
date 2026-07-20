@@ -56,14 +56,14 @@ use std::path::Path;
 /// [`handle_file`] に渡すため、本定数は **test 専用**として残してある
 /// (= 両者は同期している、handler 単体テストで実値を書きたくないため)。
 #[cfg(test)]
-pub(crate) const DEFAULT_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// `text:<string>` を bytes 化。
 ///
 /// DR-0006 §8.2 に従い **escape 解釈はしない** (= `\n` などの literal 化は
 /// shell の責務、CLI 側で `--unescape` flag を入れる議論は別 task)。UTF-8
 /// 文字列をそのまま bytes 列にする。
-pub(crate) fn handle_text(value: &str) -> Vec<u8> {
+pub fn handle_text(value: &str) -> Vec<u8> {
     value.as_bytes().to_vec()
 }
 
@@ -71,7 +71,7 @@ pub(crate) fn handle_text(value: &str) -> Vec<u8> {
 ///
 /// parser 段 (= `cli::parse_hex_value`) で既に `Vec<u8>` に decode 済なので、
 /// 本 handler は clone するだけ。一貫性のため handler 経路を通す。
-pub(crate) fn handle_hex(bytes: &[u8]) -> Vec<u8> {
+pub fn handle_hex(bytes: &[u8]) -> Vec<u8> {
     bytes.to_vec()
 }
 
@@ -101,7 +101,7 @@ pub(crate) fn handle_hex(bytes: &[u8]) -> Vec<u8> {
 /// - size 上限超過 → "file: '<path>': size <N> exceeds limit <M> bytes"
 /// - stdin 読み取り失敗 → "file: stdin 読み取り失敗: ..."
 /// - stdin の入力 size 超過 → "file: stdin の入力 size が上限 <M> bytes を超えています"
-pub(crate) fn handle_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
+pub fn handle_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
     if path.as_os_str() == "-" {
         // stdin を完全に読み切る (= EOF まで)。size 上限を超えたら error。
         // max_bytes == 0 は「無制限」扱い (= take せず全部読む)。
@@ -204,7 +204,7 @@ const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 /// # Errors
 ///
 /// 中身に `\x1b[201~` が含まれていれば "paste: 中身に bracketed paste 終端 ..." を返す。
-pub(crate) fn handle_paste(value: &str) -> Result<Vec<u8>, String> {
+pub fn handle_paste(value: &str) -> Result<Vec<u8>, String> {
     if value
         .as_bytes()
         .windows(BRACKETED_PASTE_END.len())
@@ -241,7 +241,7 @@ pub(crate) fn handle_paste(value: &str) -> Result<Vec<u8>, String> {
 ///
 /// - 不明な key 名 → "key: 未知のキー名 ..."
 /// - multi-modifier → "key: 複合 modifier ... は MVP 範囲外"
-pub(crate) fn handle_key(name: &str) -> Result<Vec<u8>, String> {
+pub fn handle_key(name: &str) -> Result<Vec<u8>, String> {
     if name.is_empty() {
         return Err("key: key name が空です".to_string());
     }

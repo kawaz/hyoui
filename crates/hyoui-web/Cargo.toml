@@ -1,0 +1,33 @@
+[package]
+name = "hyoui-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "HTTP gateway for hyoui sessions (DR-0027 Phase 1)"
+
+[lib]
+name = "hyoui_web"
+path = "src/lib.rs"
+
+[dependencies]
+# core (blocking `ClientConnection`, config, discovery, input_bytes, cli spec parser)。
+# tokio 系依存は本 crate に閉じ、`crates/hyoui` の Cargo.toml は変更しない (DR-0027 §2)。
+hyoui = { path = "../hyoui", version = "0.9" }
+
+# HTTP server: axum + tokio + tower。JSON body / query.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal"] }
+tower = { version = "0.5", default-features = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Router 単体の smoke test 用 (実 daemon を巻き込む e2e は hyoui-cli/tests/web_e2e_api.rs
+# 側で `CARGO_BIN_EXE_hyoui` 経由で subprocess として daemon を起動する)。
+tower = { version = "0.5", default-features = false, features = ["util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+serde_json = { workspace = true }
