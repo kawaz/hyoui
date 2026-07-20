@@ -60,6 +60,16 @@ short-term fix として deadline を 30s → 60s に延長済み (`session.rs:3
 2. failure 時の writer_pump thread dump 取得
 3. DR-0011 observability: writer_pump lifecycle の可視化があれば真因特定が早い
 
+## 再観測 (2026-07-19, v0.9.10)
+
+- Release run: https://github.com/kawaz/hyoui/actions/runs/29694355729 (commit 9180fd8e)
+- job: `ci / Ignored tests (ubuntu-latest / PTY+daemon)`
+- 失敗テスト: `daemon::session::tests::serve_backpressure_disconnects_slow_client`
+- panic 箇所: crates/hyoui/src/daemon/session.rs:3569
+- panic 内容: `backpressure daemon serve: thread did not finish within 30s (= 無限ハング防止のため deadline fail)`
+- suite: 3 passed; 1 failed; 807 filtered out; finished in 31.02s
+- 30s deadline hang の再現が継続。DR-0025 Phase 2 完了待ちの blocked 状況は変わらず
+
 ## 受け入れ条件
 
 - [ ] CI 並列実行 (フルワークスペース) で `serve_backpressure_disconnects_slow_client` がフラップしない
