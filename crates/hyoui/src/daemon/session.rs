@@ -519,7 +519,20 @@ impl Session {
                 break o;
             }
             // pre-check (= DR-0028 §5.1): 存在 / 実行 bit / 所有 UID を検査。
-            let exe_path = match super::upgrade::precheck_upgrade_target() {
+            // DR-0028 Phase 3: protocol handler が `upgrade.request.binary_path` を
+            // 指定していれば `state.take_upgrade_target()` から取り出す (= env 経由
+            // ではなく SessionState 経由でデータを渡す、multi-thread 動作中の env
+            // 書き換えを回避)。指定無し / SIGUSR1 経路では従来通り env / current_exe
+            // ベースの precheck を使う。
+            let exe_path_result = if let Some(explicit) = state.take_upgrade_target() {
+                // handler で既に precheck 済のはずだが serve_loop まで来る間に環境が
+                // 変わる (= file 削除 / permission 変更) 可能性への defense-in-depth
+                // として再検査する。
+                super::upgrade::precheck_path(&explicit).map(|_| explicit)
+            } else {
+                super::upgrade::precheck_upgrade_target()
+            };
+            let exe_path = match exe_path_result {
                 Ok(p) => p,
                 Err(msg) => {
                     // pre-check 失敗 → 旧続行 (§5.1)。lifecycle record に痕跡を

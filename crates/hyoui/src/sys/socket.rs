@@ -82,10 +82,17 @@ impl Drop for UmaskGuard {
 }
 
 /// Owned listening Unix-domain socket. Drop unlinks the path.
+///
+/// DR-0028 Phase 3: fields are `Option<>` so [`into_parts_for_exec`] can `take()`
+/// them without needing a raw-pointer destructure (= keeps low-level `unsafe`
+/// blocks confined to `sys/raw.rs` + `sys/signal.rs` + `sys/env.rs`, satisfying
+/// the `lint-unsafe` recipe).
+/// Normal lifetime: both fields are always `Some` between `listen`/`from_listener_fd`
+/// and the terminating `into_parts_for_exec` or `Drop`. Accessors use `expect()`.
 #[derive(Debug)]
 pub struct UnixSock {
-    fd: OwnedFd,
-    path: PathBuf,
+    fd: Option<OwnedFd>,
+    path: Option<PathBuf>,
 }
 
 impl UnixSock {
@@ -152,46 +159,64 @@ impl UnixSock {
 
         socket::listen(&fd, Backlog::new(5).map_err(Error::from)?).map_err(Error::from)?;
 
-        Ok(Self { fd, path })
+        Ok(Self {
+            fd: Some(fd),
+            path: Some(path),
+        })
+    }
+
+    /// Internal helper: unwrap `fd` assuming normal (non-consumed) lifetime.
+    fn fd_ref(&self) -> &OwnedFd {
+        self.fd
+            .as_ref()
+            .expect("UnixSock fd accessed after into_parts_for_exec (bug)")
     }
 
     /// Borrow the listening fd.
     pub fn as_fd(&self) -> BorrowedFd<'_> {
-        self.fd.as_fd()
+        self.fd_ref().as_fd()
     }
 
     /// Bound path.
     pub fn path(&self) -> &Path {
-        &self.path
+        self.path
+            .as_deref()
+            .expect("UnixSock path accessed after into_parts_for_exec (bug)")
     }
 
     /// DR-0028 Phase 1: 既存 listener fd (= self-exec 前の親から継承した bind 済 fd)
     /// と socket path から `UnixSock` を組み立てる。bind / listen は既に済んでいる
     /// 前提。Drop で socket file を unlink するのは通常挙動と同じ。
     pub fn from_listener_fd(fd: OwnedFd, path: PathBuf) -> Self {
-        Self { fd, path }
+        Self {
+            fd: Some(fd),
+            path: Some(path),
+        }
     }
 
-    /// DR-0028 Phase 1: self-exec 直前に fd + path を取り出す。**socket file の
+    /// DR-0028 Phase 1/3: self-exec 直前に fd + path を取り出す。**socket file の
     /// unlink を行わない** (= exec 後の新プロセスが同じ path で listener を継続使用
-    /// するため)。`self` の `Drop` は走らない (= `ManuallyDrop` で bypass)。
+    /// するため)。Phase 3 で `Option::take` 方式に変更し `unsafe` を排除
+    /// (`just lint-unsafe` 遵守)。
     ///
-    /// exec 経路以外で使うと socket file が unlink されず leak するので、DR-0028
-    /// upgrade path 専用。
-    pub fn into_parts_for_exec(self) -> (OwnedFd, PathBuf) {
-        // SAFETY: `ManuallyDrop::new` は `self` の drop を抑止する。fd / path を
-        // 明示的に move out することでリソース所有権は caller に移る。
-        let md = std::mem::ManuallyDrop::new(self);
-        // path を Clone せず move するには unsafe な ptr::read が必要。short-lived
-        // かつ 1 度きりの取り出しなので許容する (= drop 抑止と対で成立)。
-        let fd = unsafe { std::ptr::read(&md.fd) };
-        let path = unsafe { std::ptr::read(&md.path) };
+    /// 取り出し後は `self` の Drop が走っても both fields が `None` なので unlink
+    /// は発生しない。exec 経路以外で使うと socket file が新プロセス側でも継承されず
+    /// leak するので、DR-0028 upgrade path 専用。
+    pub fn into_parts_for_exec(mut self) -> (OwnedFd, PathBuf) {
+        let fd = self
+            .fd
+            .take()
+            .expect("UnixSock::into_parts_for_exec called twice (bug)");
+        let path = self
+            .path
+            .take()
+            .expect("UnixSock::into_parts_for_exec called twice (bug)");
         (fd, path)
     }
 
     /// `accept(2)` + `FD_CLOEXEC` set via fcntl. Returns the client fd.
     pub fn accept(&self) -> Result<OwnedFd> {
-        let raw_fd = socket::accept(self.fd.as_raw_fd()).map_err(Error::from)?;
+        let raw_fd = socket::accept(self.fd_ref().as_raw_fd()).map_err(Error::from)?;
         // L6: brief window between accept and fcntl. hyoui is single-threaded
         // so no realistic race.
         let owned = crate::sys::raw::own_raw_fd(raw_fd);
@@ -202,7 +227,10 @@ impl UnixSock {
 
 impl Drop for UnixSock {
     fn drop(&mut self) {
-        let _ = nix::unistd::unlink(&self.path);
+        // path が `None` (= into_parts_for_exec で取り出し済) なら unlink skip。
+        if let Some(p) = self.path.as_ref() {
+            let _ = nix::unistd::unlink(p);
+        }
     }
 }
 

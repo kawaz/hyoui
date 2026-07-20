@@ -1241,25 +1241,19 @@ fn handle_upgrade_request(
         return ClientFrameOutcome::Continue;
     }
 
-    // binary_path 指定時は precheck target を上書き。unsafe env write を単一 point
-    // に閉じ込めるため handler ローカルで set → precheck → restore する。daemon は
-    // 単スレッド (serve_loop) なのでこの range で他 thread が env を触ることは無い。
-    let saved = std::env::var_os(crate::daemon::upgrade::ENV_UPGRADE_EXE_OVERRIDE);
-    if let Some(bp) = req.binary_path.as_deref() {
-        // SAFETY: daemon は Session::serve loop 内で single-threaded (writer thread は
-        // env を触らない)。upgrade.request handler の範囲でのみ env を触る。
-        unsafe { std::env::set_var(crate::daemon::upgrade::ENV_UPGRADE_EXE_OVERRIDE, bp) };
-    }
-    let precheck_result = crate::daemon::upgrade::precheck_upgrade_target();
-    // saved を復元する (= 呼び出し前状態に戻す。Session::serve 側の precheck も
-    // 通常 unset なので実質的には常に unset に戻すことになる)。
-    match saved {
-        Some(v) => unsafe {
-            std::env::set_var(crate::daemon::upgrade::ENV_UPGRADE_EXE_OVERRIDE, v)
-        },
-        None => unsafe { std::env::remove_var(crate::daemon::upgrade::ENV_UPGRADE_EXE_OVERRIDE) },
-    }
-
+    // DR-0028 Phase 3 (unsafe env write 廃止版): binary_path 指定時は明示 path を
+    // pure `precheck_path` に渡す (env に一切触らない)。通過時は SessionState に
+    // path を格納して serve_loop に伝達する (= handler / serve_loop 間のデータフロー
+    // は SessionState 経由に統一、multi-thread 動作中の env 書き換えを排除)。
+    let target_path: Option<std::path::PathBuf> =
+        req.binary_path.as_deref().map(std::path::PathBuf::from);
+    let precheck_result = match target_path.as_deref() {
+        Some(p) => crate::daemon::upgrade::precheck_path(p),
+        // 指定なし: daemon の current_exe (+ 起動時 env override) を検査。
+        // env は起動時 single-threaded に読まれた値を `precheck_upgrade_target()` が
+        // `std::env::var_os` で 1 度読むだけなので安全 (書き込み無し)。
+        None => crate::daemon::upgrade::precheck_upgrade_target().map(|_| ()),
+    };
     if let Err(msg) = precheck_result {
         let _ = send_control(
             &clients[idx],
@@ -1272,16 +1266,11 @@ fn handle_upgrade_request(
         return ClientFrameOutcome::Continue;
     }
 
-    // 受理 → ack 送信 + upgrade_pending flag セット。
-    // ack は cap 付き client 前提なので単一 client への send_control で足りる
-    // (broadcast は Phase 4 の考察対象、必要なら別途)。
-    // pre-check 通過時 binary_path を保存: serve_loop 側の precheck が同じ path で
-    // 再検査するように env をここで恒久 set する (= 短命 set → 復元 だと serve_loop
-    // での再 precheck 時に落ちる)。session-scope の一時 env なので daemon 消滅で自動的に消える。
-    if let Some(bp) = req.binary_path.as_deref() {
-        // SAFETY: 上と同じく daemon single-threaded。
-        unsafe { std::env::set_var(crate::daemon::upgrade::ENV_UPGRADE_EXE_OVERRIDE, bp) };
-    }
+    // 受理 → ack 送信 + upgrade_pending flag + upgrade_target セット。
+    // ack は cap 付き client 前提なので broadcast_control_with_cap で全 attached
+    // client に配る (= 要求元以外も upgrade 開始を知らせる、DR §4 の基盤)。
+    // upgrade_target は Mutex 経由で serve_loop に渡す (= env 書き換え不要)。
+    state.set_upgrade_target(target_path);
     state.set_upgrade_pending();
     // DR-0028 §4: 全 attached client のうち cap `upgrade-v1` を持つ者に upgrade.ack
     // を broadcast する (= 要求元以外にも「upgrade 開始」を知らせる、client 側で

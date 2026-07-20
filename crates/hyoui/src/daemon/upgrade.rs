@@ -252,15 +252,26 @@ pub fn compute_state_file_path(socket_path: &Path) -> PathBuf {
 /// upgrade は fd に一切触れず** 呼び出し側 (= [`crate::daemon::Session::serve`]) が
 /// 旧 serve_loop に再突入する (= DR-0028 §5.1 の「大半は事前検証で弾く」)。
 pub fn precheck_upgrade_target() -> Result<PathBuf, String> {
-    use std::os::unix::fs::MetadataExt;
-    use std::os::unix::fs::PermissionsExt;
-
     let path = if let Some(p) = std::env::var_os(ENV_UPGRADE_EXE_OVERRIDE) {
         PathBuf::from(p)
     } else {
         std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"))?
     };
-    let meta = std::fs::metadata(&path)
+    precheck_path(&path)?;
+    Ok(path)
+}
+
+/// 指定 path を pre-check する pure fn (= env に依存しない、handler から明示 path
+/// で呼ぶ用)。Phase 3 でランタイム env 書き換えを廃止した結果、handler は
+/// `binary_path` を直接ここに渡す。
+///
+/// 検査項目は [`precheck_upgrade_target`] と同一 (存在 / regular file / 実行 bit /
+/// 同一 UID)。成功時 `Ok(())`、失敗時 `Err(reason)`。
+pub fn precheck_path(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let meta = std::fs::metadata(path)
         .map_err(|e| format!("upgrade target `{}` stat failed: {e}", path.display()))?;
     if !meta.is_file() {
         return Err(format!(
@@ -284,7 +295,7 @@ pub fn precheck_upgrade_target() -> Result<PathBuf, String> {
             euid
         ));
     }
-    Ok(path)
+    Ok(())
 }
 
 /// DR-0028 Phase 3: `perform_self_exec` の結果。**成功時は execve が戻らないので
@@ -671,21 +682,26 @@ mod tests {
     #[test]
     fn precheck_env_branches_serial() {
         let saved = std::env::var_os(ENV_UPGRADE_EXE_OVERRIDE);
-        // 分岐 1: override 無し → current_exe が使われ、必ず存在 + 実行 bit あり
-        // SAFETY: test 内 single test なので同時実行なし、production 経路と分離。
-        unsafe { std::env::remove_var(ENV_UPGRADE_EXE_OVERRIDE) };
+        // 分岐 1: override 無し → current_exe が使われ、必ず存在 + 実行 bit あり。
+        // cfg(test) 用 wrapper (`crate::sys::env::{set_var,remove_var}`) 経由で
+        // unsafe を sys/env.rs に閉じ込める (= just lint-unsafe 遵守)。
+        crate::sys::env::remove_var(ENV_UPGRADE_EXE_OVERRIDE);
         let ok_path = precheck_upgrade_target().expect("current_exe should pass");
         assert!(ok_path.is_file(), "path {ok_path:?} should be file");
 
         // 分岐 2: override に不在 path → stat 失敗で Err
-        unsafe { std::env::set_var(ENV_UPGRADE_EXE_OVERRIDE, "/nonexistent/hyoui-upgrade-test") };
+        crate::sys::env::set_var(ENV_UPGRADE_EXE_OVERRIDE, "/nonexistent/hyoui-upgrade-test");
         let err = precheck_upgrade_target().expect_err("should fail on nonexistent path");
         assert!(err.contains("stat failed"), "err: {err}");
 
+        // 追加: pure `precheck_path` は env に依存せず path 引数だけで判断する。
+        let err2 = precheck_path(std::path::Path::new("/nonexistent/x")).expect_err("should fail");
+        assert!(err2.contains("stat failed"), "err: {err2}");
+
         // restore
         match saved {
-            Some(v) => unsafe { std::env::set_var(ENV_UPGRADE_EXE_OVERRIDE, v) },
-            None => unsafe { std::env::remove_var(ENV_UPGRADE_EXE_OVERRIDE) },
+            Some(v) => crate::sys::env::set_var(ENV_UPGRADE_EXE_OVERRIDE, v.to_str().unwrap_or("")),
+            None => crate::sys::env::remove_var(ENV_UPGRADE_EXE_OVERRIDE),
         }
     }
 

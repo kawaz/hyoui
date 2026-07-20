@@ -25,8 +25,9 @@
 //! token 比較) は本 module には含めない (= `control.rs` の `handle_lock_acquire` /
 //! `handle_lock_release` が reduce の caller として残る)。
 
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::protocol::Mode;
 use crate::protocol::messages::SessionMode;
@@ -407,6 +408,11 @@ pub(super) struct SessionState {
     /// 各 iteration 冒頭で観測して `UpgradeRequested` を返す (= drain trivially
     /// 満たされる、raw_data は本 flag が立った時点で reject される)。
     upgrade_pending: AtomicBool,
+    /// DR-0028 Phase 3 (unsafe env write 廃止版): `upgrade.request.binary_path`
+    /// で明示された exec target を handler → serve_loop に渡すためのチャネル。
+    /// `None` なら「daemon の `current_exe()` を使う (§2 既定)」。protocol
+    /// handler は同時に 1 つの upgrade しか処理しないので Mutex で十分。
+    upgrade_target: Mutex<Option<PathBuf>>,
 }
 
 /// `ChildSuspendPolicy` を `AtomicU8` 格納用の u8 に変換する。
@@ -470,6 +476,31 @@ impl SessionState {
     /// upgrade.request を受け付けられる状態に戻す)。
     pub(super) fn clear_upgrade_pending(&self) {
         self.upgrade_pending.store(false, Ordering::Release);
+        // 併せて upgrade target も clear (= 次の upgrade で古い target を残さない)。
+        // lock poison は最後の書き手が panic した場合のみで、その時は取れる値を
+        // そのまま drop する (= None に戻す)。
+        match self.upgrade_target.lock() {
+            Ok(mut g) => *g = None,
+            Err(p) => *p.into_inner() = None,
+        }
+    }
+
+    /// DR-0028 Phase 3 (unsafe env write 廃止版): handler が `upgrade.request.binary_path`
+    /// を受理した時に呼び、serve_loop が execve target として使う path を格納する。
+    /// `None` は「daemon の `current_exe()` を使う (§2 既定)」。
+    pub(super) fn set_upgrade_target(&self, path: Option<PathBuf>) {
+        match self.upgrade_target.lock() {
+            Ok(mut g) => *g = path,
+            Err(p) => *p.into_inner() = path,
+        }
+    }
+
+    /// serve_loop 側で execve target を取り出す (= 1 度使ったら None に戻る)。
+    pub(super) fn take_upgrade_target(&self) -> Option<PathBuf> {
+        match self.upgrade_target.lock() {
+            Ok(mut g) => g.take(),
+            Err(p) => p.into_inner().take(),
+        }
     }
 }
 
