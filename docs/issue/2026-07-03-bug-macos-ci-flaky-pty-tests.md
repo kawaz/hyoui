@@ -3,7 +3,7 @@ title: macos CI で PTY 系 e2e が flaky fail する (outer_token_inheritance_s
 status: open
 category: bug
 created: 2026-07-03T18:25:00+09:00
-last_read:
+last_read: 2026-07-20T10:18:31+09:00
 open_entered: 2026-07-03T18:25:00+09:00
 wip_entered:
 blocked_entered:
