@@ -79,6 +79,13 @@ pub fn router(config: hyoui::config::Config, assets_dir: Option<PathBuf>) -> Rou
 /// listen アドレスに bind して axum server を回す。
 ///
 /// `hyoui web` subcommand から呼ばれる本体。Ctrl+C で graceful shutdown。
+///
+/// **iframe 埋め込み方針** (= ccmsg webui の Terminal タブ等が `?embed=1` で iframe に
+/// 貼るユースケース): `X-Frame-Options` / `Content-Security-Policy: frame-ancestors`
+/// を意図的に付けない。tailnet 内利用を前提とした DR-0027 の scope で、外部からの
+/// clickjacking / CSRF リスクは network 側 (= tailnet ACL) で担保している。もし
+/// public network で serve する運用が出てきたら、その時点で reverse proxy 側で
+/// header を付けるか、`[web]` config に flag を追加する (= 現時点では yagni)。
 pub async fn serve(
     listen: &str,
     config: hyoui::config::Config,
@@ -736,6 +743,37 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), custom_body);
+    }
+
+    #[tokio::test]
+    async fn session_page_has_no_iframe_blocking_headers() {
+        // iframe 埋め込み (?embed=1) を tailnet 前提で許容する方針の regression guard。
+        // 将来 middleware で X-Frame-Options / frame-ancestors を default で付けたく
+        // なった場合、この test が失敗して意思決定を強制する (= 気付かず制限が入るのを防ぐ)。
+        let app = router(hyoui::config::Config::default(), None);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/anything?embed=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get("x-frame-options").is_none(),
+            "X-Frame-Options should not be set (tailnet 前提)"
+        );
+        let csp = resp
+            .headers()
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            !csp.to_ascii_lowercase().contains("frame-ancestors"),
+            "CSP frame-ancestors should not be set: {csp}"
+        );
     }
 
     #[tokio::test]

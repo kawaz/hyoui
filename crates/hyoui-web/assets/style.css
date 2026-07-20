@@ -97,6 +97,33 @@ a { color: var(--accent); }
 
 /* session page */
 .session-page main { display: flex; flex-direction: column; gap: 0.5rem; }
+
+/* embed=1 view (= ccmsg webui Terminal タブ等の iframe 埋め込み)。
+   header / debug panel / #sendStatus を隠し、terminal + banner + input のみを
+   viewport にフィットさせる。iframe 側で幅 / 高さが決まるので 100% 系で埋める。
+   frame-ancestors 制限は付けない (= tailnet 前提、DR-0027 §serve)。 */
+body.embed { padding: 0; }
+body.embed > header,
+body.embed #debugPanel,
+body.embed #sendStatus { display: none; }
+body.embed main {
+  height: 100vh;
+  padding: 0.4rem;
+  box-sizing: border-box;
+  gap: 0.4rem;
+}
+body.embed #term {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: auto;
+}
+body.embed #term .xterm,
+body.embed #term .xterm-viewport,
+body.embed #term .xterm-screen {
+  width: 100% !important;
+  height: 100% !important;
+}
+body.embed #inputForm { flex: 0 0 auto; }
 #term {
   border: 1px solid var(--border);
   padding: 4px;
@@ -137,6 +164,19 @@ a { color: var(--accent); }
   color: #b8860b;
   border-color: #b8860b;
   background: rgba(184, 134, 11, 0.12);
+}
+.badge-live {
+  color: #2f9e44;
+  border-color: #2f9e44;
+  background: rgba(47, 158, 68, 0.12);
+}
+.muted { color: var(--muted); }
+td.uptime, td.suspend { white-space: nowrap; font-size: 0.82rem; color: var(--muted); }
+td.argv, td.cwd {
+  max-width: 40ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 #inputText {
   font-family: "HackGen Console NF", Menlo, "DejaVu Sans Mono", Consolas, monospace;

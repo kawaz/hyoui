@@ -12,6 +12,14 @@
   document.getElementById('sid').textContent = sid;
   document.title = `hyoui — ${sid}`;
 
+  // Embed mode (= ccmsg webui Terminal タブ等の iframe 埋め込み用の軽量ビュー)。
+  // ?embed=1 で発火し、header / debug panel を消してターミナル + banner + input のみを
+  // viewport にフィットさせる。ページ複製せず同じ session.html を再利用する (DR-0027)。
+  const embed = new URLSearchParams(location.search).get('embed') === '1';
+  if (embed) {
+    document.body.classList.add('embed');
+  }
+
   const term = new Terminal({
     cols: COLS,
     rows: ROWS,

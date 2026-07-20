@@ -22,6 +22,25 @@
     return a.join(' ');
   }
 
+  // 起動からの経過を短く整形 (= "3d 4h", "5h 12m", "42m", "18s")。
+  // 精度は「一覧の目視で状況を掴む」用途、時計としては使わない。
+  function fmtUptime(startedUnixMs) {
+    if (!startedUnixMs || typeof startedUnixMs !== 'number') return '';
+    const sec = Math.max(0, Math.floor((Date.now() - startedUnixMs) / 1000));
+    const d = Math.floor(sec / 86400);
+    const h = Math.floor((sec % 86400) / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    if (d > 0) return `${d}d ${h}h`;
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m`;
+    return `${sec}s`;
+  }
+
+  function fmtStarted(startedUnixMs) {
+    if (!startedUnixMs) return '';
+    try { return new Date(startedUnixMs).toISOString(); } catch { return ''; }
+  }
+
   async function fetchSessions() {
     statusEl.textContent = 'fetching…';
     try {
@@ -52,14 +71,30 @@
         : esc(s.session_id);
       const statusCell = isStopped
         ? `<span class="badge badge-stopped" title="child is stopped (SIGSTOP)">⏸ stopped</span>`
-        : esc(s.status);
+        : (isLive ? `<span class="badge badge-live" title="live">● live</span>` : esc(s.status));
+      const uptime = fmtUptime(s.started_unix_ms);
+      const startedTitle = fmtStarted(s.started_unix_ms);
+      // suspend policy: null (旧 daemon) or "notify" / "auto-resume"。
+      const suspend = s.on_child_suspend
+        ? `<span title="${esc(s.on_child_suspend)}">${esc(s.on_child_suspend)}</span>`
+        : `<span class="muted" title="旧 daemon or 未報告">-</span>`;
+      const version = s.daemon_version
+        ? `<code title="daemon binary version">${esc(s.daemon_version)}</code>`
+        : `<span class="muted" title="旧 daemon or 未報告">-</span>`;
+      const clientsCell = (s.clients ?? '') === '' ? '' :
+        `<span title="attached clients">${esc(s.clients)}</span>`;
+      const argvStr = fmtArgv(s.argv);
+      const cwdStr = s.cwd || '';
       tr.innerHTML = [
         `<td>${link}</td>`,
         `<td>${esc(s.namespace)}</td>`,
         `<td>${statusCell}</td>`,
-        `<td>${esc(s.clients ?? '')}</td>`,
-        `<td class="argv"><code>${esc(fmtArgv(s.argv))}</code></td>`,
-        `<td class="cwd">${esc(s.cwd || '')}</td>`,
+        `<td class="uptime" title="started ${esc(startedTitle)}">${esc(uptime)}</td>`,
+        `<td>${clientsCell}</td>`,
+        `<td class="suspend">${suspend}</td>`,
+        `<td>${version}</td>`,
+        `<td class="argv" title="${esc(argvStr)}"><code>${esc(argvStr)}</code></td>`,
+        `<td class="cwd" title="${esc(cwdStr)}">${esc(cwdStr)}</td>`,
       ].join('');
       tbody.appendChild(tr);
     }
