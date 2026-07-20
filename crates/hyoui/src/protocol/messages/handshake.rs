@@ -103,4 +103,7 @@ pub struct HandshakeResponse {
     pub leader: bool,
     /// daemon が認証した実 mode (request の mode から変更されうる)。
     pub mode: Mode,
+    /// handshake 完了時点で子 process group が stopped か。
+    #[serde(default)]
+    pub child_stopped: bool,
 }

@@ -1,7 +1,6 @@
 //! User config file (`~/.config/hyoui/config.toml`) loader (DR-0024).
 //!
-//! hyoui 初の persistent setting 機構。現状は env scrub 設定のみを扱う。
-//! 他の persistent setting への流用は別 DR で扱う方針 (DR-0024 §Future work)。
+//! hyoui の persistent setting 機構。env scrub と attach UX 設定を扱う。
 //!
 //! ## Path resolution
 //!
@@ -22,12 +21,52 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// hyoui 全体設定 (現状は env scrub のみ、将来 log / notify 等を追加する余地)。
+/// hyoui 全体設定。
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct Config {
     /// 子 PTY env scrub 設定 (= TOML の `[scrub_env]` セクション)。
     #[serde(default)]
     pub scrub_env: ScrubEnvConfig,
+
+    /// attach client UX 設定 (= TOML の `[attach]` セクション、DR-0026)。
+    #[serde(default)]
+    pub attach: AttachConfig,
+}
+
+/// attach client UX 設定 (= TOML の `[attach]` 配下、DR-0026 §3)。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct AttachConfig {
+    /// Ctrl+Z intercept 設定。
+    #[serde(default)]
+    pub tstp: AttachTstpConfig,
+
+    /// stopped child の再 attach 時 resume 設定。
+    #[serde(default)]
+    pub resume: AttachResumeConfig,
+}
+
+/// Ctrl+Z intercept 設定 (= TOML の `[attach.tstp]`)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct AttachTstpConfig {
+    /// Ctrl+Z state machine を有効にする。false なら完全 bypass。
+    #[serde(default = "default_true")]
+    pub intercept: bool,
+
+    /// 最初の Ctrl+Z を保留して 2 打目を待つ時間。
+    #[serde(default = "default_short_debounce_ms")]
+    pub short_debounce_ms: u64,
+
+    /// Ctrl+Z を子へ通した後、連投を素通しする時間。
+    #[serde(default = "default_long_grace_ms")]
+    pub long_grace_ms: u64,
+}
+
+/// stopped child の再 attach 時 resume 設定 (= TOML の `[attach.resume]`)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct AttachResumeConfig {
+    /// rw attach を復帰意思とみなし stopped child を resume する。
+    #[serde(default = "default_true")]
+    pub on_reattach: bool,
 }
 
 /// env scrub 設定 (= TOML の `[scrub_env]` 配下、DR-0024 §3)。
@@ -72,6 +111,30 @@ pub struct TargetConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_short_debounce_ms() -> u64 {
+    300
+}
+
+fn default_long_grace_ms() -> u64 {
+    1500
+}
+
+impl Default for AttachTstpConfig {
+    fn default() -> Self {
+        Self {
+            intercept: true,
+            short_debounce_ms: default_short_debounce_ms(),
+            long_grace_ms: default_long_grace_ms(),
+        }
+    }
+}
+
+impl Default for AttachResumeConfig {
+    fn default() -> Self {
+        Self { on_reattach: true }
+    }
 }
 
 impl Default for ScrubEnvConfig {
@@ -212,10 +275,14 @@ mod tests {
     }
 
     #[test]
-    fn default_config_has_scrub_enabled_and_empty_targets() {
+    fn default_config_has_scrub_and_attach_defaults() {
         let c = Config::default();
         assert!(c.scrub_env.enabled);
         assert!(c.scrub_env.targets.is_empty());
+        assert!(c.attach.tstp.intercept);
+        assert_eq!(c.attach.tstp.short_debounce_ms, 300);
+        assert_eq!(c.attach.tstp.long_grace_ms, 1500);
+        assert!(c.attach.resume.on_reattach);
     }
 
     #[test]
@@ -231,6 +298,41 @@ mod tests {
         let c = parse_str("", &dummy_path()).unwrap();
         assert!(c.scrub_env.enabled);
         assert!(c.scrub_env.targets.is_empty());
+    }
+
+    #[test]
+    fn parse_partial_attach_config_keeps_missing_field_defaults() {
+        let s = r#"
+[attach.tstp]
+short_debounce_ms = 125
+
+[attach.resume]
+on_reattach = false
+"#;
+        let c = parse_str(s, &dummy_path()).unwrap();
+        assert!(c.attach.tstp.intercept);
+        assert_eq!(c.attach.tstp.short_debounce_ms, 125);
+        assert_eq!(c.attach.tstp.long_grace_ms, 1500);
+        assert!(!c.attach.resume.on_reattach);
+        assert!(c.scrub_env.enabled);
+    }
+
+    #[test]
+    fn parse_full_attach_config() {
+        let s = r#"
+[attach.tstp]
+intercept = false
+short_debounce_ms = 10
+long_grace_ms = 20
+
+[attach.resume]
+on_reattach = false
+"#;
+        let c = parse_str(s, &dummy_path()).unwrap();
+        assert!(!c.attach.tstp.intercept);
+        assert_eq!(c.attach.tstp.short_debounce_ms, 10);
+        assert_eq!(c.attach.tstp.long_grace_ms, 20);
+        assert!(!c.attach.resume.on_reattach);
     }
 
     #[test]

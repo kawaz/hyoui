@@ -290,6 +290,7 @@ fn finalize_accepted_client(
     client_id: u64,
     clients: &[ClientHandle],
     other_pending: usize,
+    child_stopped: bool,
 ) -> Result<AcceptedClient, Error> {
     let (reader, mut writer_main, req, intersect) = stage;
 
@@ -368,6 +369,7 @@ fn finalize_accepted_client(
         client_id,
         leader: became_leader,
         mode: req.mode,
+        child_stopped,
     };
 
     let body = ControlMessage::HandshakeResponse(response)
@@ -449,6 +451,7 @@ pub(super) fn process_pending_handshakes(
                     *next_client_id,
                     clients,
                     other_pending,
+                    state.child_stopped(),
                 ) {
                     Ok(accepted) => {
                         *next_client_id += 1;
@@ -767,6 +770,37 @@ mod tests {
             &mut pending_redraws,
         );
         state
+    }
+
+    #[test]
+    fn handshake_response_reports_session_child_stopped_snapshot() {
+        // attach client が追加 round-trip 無しで再 attach resume を判断できるよう、daemon の
+        // SessionState と同じ stopped snapshot を handshake response に載せる。
+        let request = HandshakeRequest {
+            caps: Vec::new(),
+            mode: Mode::Rw,
+            exclusive: false,
+            detach_others: false,
+            token: None,
+        };
+        let (pending, _peer_w, mut peer_r) = make_completed_pending(request);
+        let stage = pending.rx.recv().expect("stage result").expect("stage");
+        let config = DaemonConfig::new(
+            "t",
+            std::path::PathBuf::from("/tmp/t.sock"),
+            vec!["cmd".into()],
+        );
+        let accepted = finalize_accepted_client(stage, &config, 1, &[], 0, true)
+            .expect("finalize stopped handshake");
+
+        let frame = Frame::decode_from(&mut peer_r).expect("decode handshake response frame");
+        let response =
+            ControlMessage::decode_from(frame.body.as_slice()).expect("decode handshake response");
+        match response {
+            ControlMessage::HandshakeResponse(response) => assert!(response.child_stopped),
+            other => panic!("expected handshake.response, got {other:?}"),
+        }
+        drop(accepted);
     }
 
     /// codex review #1 regression: `--exclusive` の占有判定は確立済 `clients` だけで

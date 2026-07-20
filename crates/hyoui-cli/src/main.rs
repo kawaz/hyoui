@@ -678,6 +678,16 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // DR-0026: attach UX 設定は既存 config.toml 読み込み経路を共有する。
+    // 不正 config は raw mode / handshake より前に拒否し、意図しない介入設定で続行しない。
+    let app_config = match hyoui::config::load() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("hyoui: attach: {e}");
+            eprintln!("hyoui: config ファイルを修正してから再実行してください");
+            return ExitCode::from(2);
+        }
+    };
 
     // DR-0018: namespace を解決 (= --namespace flag > HYOUI_NAMESPACE env > default)。
     let namespace = socket_path::resolve_namespace(cfg.namespace.as_deref());
@@ -773,13 +783,25 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
 
     // R5-FB4: socket 不存在系 errno は短時間 retry (= 別 process の daemon が
     // listen するまでの window 対策)。詳細は `connect_with_retry` doc を参照。
-    let conn = match connect_with_retry(&sock, opts) {
+    let mut conn = match connect_with_retry(&sock, opts) {
         Ok(c) => c,
         Err(e) => {
             print_connect_failure("attach", &sock, &e);
             return ExitCode::from(1);
         }
     };
+
+    // DR-0026 §2: rw attach は stopped child を操作する意思表明とみなし、handshake
+    // snapshot が stopped の場合だけ既存 resume.request を即送る。ro / rw-no-leader は
+    // 観察または非 leader 接続なので、設定値に関係なく子を起こさない。
+    if conn.response.child_stopped
+        && conn.response.mode == Mode::Rw
+        && app_config.attach.resume.on_reattach
+        && let Err(e) = conn.send_child_resume()
+    {
+        eprintln!("hyoui: attach: stopped child の resume 要求送信失敗: {e}");
+        return ExitCode::from(1);
+    }
 
     // DR-0020 §5: attach 成立時に detach / peek の発見性ヒントを stderr へ 1 行出す。
     // 子の出力経路 (PTY/stdout) ではなく client の stderr なので透過性を壊さない
@@ -950,7 +972,9 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         None if !stdin_is_tty => hyoui::client::StdinEofAction::SendEof,
         None => hyoui::client::StdinEofAction::Detach,
     };
-    let conn = conn.with_stdin_eof_action(eof_action);
+    let conn = conn
+        .with_stdin_eof_action(eof_action)
+        .with_tstp_config(app_config.attach.tstp.clone());
 
     // DR-0019 §6: SIGWINCH → Resize 配線。winch_source を注入し、attach 成立直後に
     // 初回 Resize を送る (= 別端末から attach した時のサイズ不一致を解消、leader 限定)。

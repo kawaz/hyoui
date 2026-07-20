@@ -23,9 +23,90 @@ use crate::protocol::{
 enum DetachAction {
     /// 通常通り bytes を forward。Vec が空なら no-op。
     Forward(Vec<u8>),
-    /// detach が起動された (= prefix + 'd' 検知)。`Vec` は detach 起動より前の
-    /// forward 分 (= 同 chunk 内で prefix 前にあった bytes)。
+    /// detach が起動された。`Vec` は detach 起動より前の forward 分。
     TriggerDetach(Vec<u8>),
+}
+
+const TSTP_BYTE: u8 = 0x1a;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TstpState {
+    Idle,
+    Armed { deadline: std::time::Instant },
+    Grace { deadline: std::time::Instant },
+}
+
+/// Ctrl+Z 折衷 intercept state machine (DR-0026 §1)。
+///
+/// `now` を caller から受け取ることで wall-clock 依存を局所化し、chunk 境界と時定数を
+/// deterministic に test できる。空 chunk は timer 満了処理だけを行う。
+fn process_tstp(
+    chunk: &[u8],
+    state: &mut TstpState,
+    now: std::time::Instant,
+    config: &crate::config::AttachTstpConfig,
+) -> DetachAction {
+    if !config.intercept {
+        *state = TstpState::Idle;
+        return DetachAction::Forward(chunk.to_vec());
+    }
+
+    let short = std::time::Duration::from_millis(config.short_debounce_ms);
+    let long = std::time::Duration::from_millis(config.long_grace_ms);
+    let mut forward = Vec::with_capacity(chunk.len() + 1);
+
+    if let TstpState::Armed { deadline } = *state
+        && now >= deadline
+    {
+        forward.push(TSTP_BYTE);
+        *state = TstpState::Grace {
+            deadline: now + long,
+        };
+    } else if let TstpState::Grace { deadline } = *state
+        && now >= deadline
+    {
+        *state = TstpState::Idle;
+    }
+
+    for &byte in chunk {
+        match *state {
+            TstpState::Idle if byte == TSTP_BYTE => {
+                *state = TstpState::Armed {
+                    deadline: now + short,
+                };
+            }
+            TstpState::Idle => forward.push(byte),
+            TstpState::Armed { .. } if byte == TSTP_BYTE => {
+                *state = TstpState::Idle;
+                return DetachAction::TriggerDetach(forward);
+            }
+            TstpState::Armed { .. } => {
+                forward.push(TSTP_BYTE);
+                forward.push(byte);
+                *state = TstpState::Grace {
+                    deadline: now + long,
+                };
+            }
+            TstpState::Grace { .. } if byte == TSTP_BYTE => {
+                forward.push(byte);
+                *state = TstpState::Grace {
+                    deadline: now + long,
+                };
+            }
+            TstpState::Grace { .. } => forward.push(byte),
+        }
+    }
+    DetachAction::Forward(forward)
+}
+
+fn tstp_poll_timeout(state: TstpState, now: std::time::Instant) -> PollTimeout {
+    let deadline = match state {
+        TstpState::Armed { deadline } | TstpState::Grace { deadline } => deadline,
+        TstpState::Idle => return PollTimeout::NONE,
+    };
+    let remaining = deadline.saturating_duration_since(now);
+    let millis = remaining.as_millis().max(1).min(u16::MAX as u128) as u16;
+    PollTimeout::from(millis)
 }
 
 /// chunk 内の bytes を走査し、prefix state machine を更新しつつ forward bytes を
@@ -360,6 +441,8 @@ pub struct ClientConnection {
     /// 保つ (= input 1-shot 接続では使われないが、library として attach 経由でも
     /// 安全に動かすため)。
     pending_frames: std::collections::VecDeque<Frame>,
+    /// Ctrl+Z 折衷 intercept 設定 (DR-0026)。
+    tstp_config: crate::config::AttachTstpConfig,
     /// `send_raw_bytes` の ack 待ちが timeout で打ち切られた / I/O error で失敗した後、
     /// 同一 connection への新規送信を禁止するためのフラグ (DR-0021 M2)。
     ///
@@ -488,6 +571,7 @@ impl ClientConnection {
             suspend_hooks: None,
             winch_source: None,
             pending_frames: std::collections::VecDeque::new(),
+            tstp_config: crate::config::AttachTstpConfig::default(),
             poisoned: false,
         })
     }
@@ -525,6 +609,13 @@ impl ClientConnection {
         self
     }
 
+    /// Ctrl+Z 折衷 intercept 設定を適用する (DR-0026)。
+    #[must_use]
+    pub fn with_tstp_config(mut self, config: crate::config::AttachTstpConfig) -> Self {
+        self.tstp_config = config;
+        self
+    }
+
     /// SIGWINCH → Resize の中継元を設定する (DR-0019 §6)。設定すると `run` の poll
     /// loop が notify pipe を監視し、WINCH 観測時に外側端末サイズを取得して leader
     /// なら `Resize` message を daemon に送る。CLI 層が raw mode guard 保持時 (= tty
@@ -555,6 +646,15 @@ impl ClientConnection {
         };
         let msg = ControlMessage::Resize(crate::protocol::messages::Resize { cols, rows });
         self.send_control(&msg)
+    }
+
+    /// stopped child の resume と attach redraw を既存 protocol で要求する。
+    ///
+    /// caller が handshake の `child_stopped`、attach mode、config を確認してから呼ぶ。
+    pub fn send_child_resume(&mut self) -> Result<(), Error> {
+        self.send_control(&ControlMessage::SessionChildResumeRequest(
+            crate::protocol::messages::SessionChildResumeRequest::default(),
+        ))
     }
 
     /// stdin / stdout を daemon と中継する。
@@ -589,6 +689,7 @@ impl ClientConnection {
         let detach_prefix = resolve_detach_prefix_from_env()
             .map_err(|_| Error::Invalid("invalid HYOUI_DETACH_PREFIX env"))?;
         let mut detach_prefix_armed: bool = false;
+        let mut tstp_state = TstpState::Idle;
         // DR-0019 §5: SendEof で stdin EOF 観測後、stdin はもう読まない (= EOT 送出
         // 済) が、子の出力 (= bc の計算結果) と SessionExitNotify を拾い切るため
         // loop は継続する。
@@ -633,11 +734,39 @@ impl ClientConnection {
                 idx
             });
 
-            match poll(&mut fds, PollTimeout::NONE) {
-                Ok(PollOutcome::Ready(_)) => {}
+            let now = std::time::Instant::now();
+            let poll_timeout = tstp_poll_timeout(tstp_state, now);
+            let poll_timed_out = match poll(&mut fds, poll_timeout) {
+                Ok(PollOutcome::Ready(_)) => false,
                 Ok(PollOutcome::Interrupted) => continue,
-                Ok(PollOutcome::Timeout) => continue,
+                Ok(PollOutcome::Timeout) => true,
                 Err(e) => return Err(e),
+            };
+
+            // timer deadline と同時に socket output 等が ready でも、保留 Ctrl+Z の満了を
+            // 飢餓させない。poll outcome に関係なく deadline を評価してから ready fd を処理する。
+            if let DetachAction::Forward(bytes) = process_tstp(
+                &[],
+                &mut tstp_state,
+                std::time::Instant::now(),
+                &self.tstp_config,
+            ) && !bytes.is_empty()
+            {
+                let bytes = if let Some(prefix) = detach_prefix {
+                    match process_detach_prefix(&bytes, &mut detach_prefix_armed, prefix) {
+                        DetachAction::Forward(bytes) => bytes,
+                        DetachAction::TriggerDetach(_) => Vec::new(),
+                    }
+                } else {
+                    bytes
+                };
+                if !bytes.is_empty() && Frame::raw_data(bytes).encode_to(&mut self.writer).is_err()
+                {
+                    return Ok(RunOutcome::ConnectionLost);
+                }
+            }
+            if poll_timed_out {
+                continue;
             }
 
             let sock_revents = fds[0].revents().unwrap_or(PollFlags::empty());
@@ -864,41 +993,58 @@ impl ClientConnection {
                         return Ok(RunOutcome::Detached);
                     }
                     Ok(n) => {
-                        // detach prefix が disabled (= env HYOUI_DETACH_PREFIX=none) なら
-                        // state machine を通さず raw forward
-                        if let Some(prefix) = detach_prefix {
-                            let action =
-                                process_detach_prefix(&buf[..n], &mut detach_prefix_armed, prefix);
-                            if let DetachAction::TriggerDetach(forward_before) = &action {
-                                if !forward_before.is_empty() {
-                                    let frame = Frame::raw_data(forward_before.clone());
-                                    let _ = frame.encode_to(&mut self.writer);
-                                    let _ = self.writer.flush();
-                                }
-                                let detach = ControlMessage::Detach(Detach {
-                                    target: DetachTarget::Myself,
-                                });
-                                if let Ok(body) = detach.encode_to_vec() {
-                                    let _ = Frame::cbor_control(body).encode_to(&mut self.writer);
-                                    let _ = self.writer.flush();
-                                }
-                                // detach key (`Ctrl-A d`) 由来の自発 detach。
-                                return Ok(RunOutcome::Detached);
+                        // Ctrl+Z state machine と detach prefix state machine は独立した state
+                        // を持ち、Ctrl+Z 処理後の forward bytes を既存 prefix 処理へ渡す。
+                        let tstp_action = process_tstp(
+                            &buf[..n],
+                            &mut tstp_state,
+                            std::time::Instant::now(),
+                            &self.tstp_config,
+                        );
+                        let action = match tstp_action {
+                            DetachAction::TriggerDetach(bytes) => {
+                                let bytes = if let Some(prefix) = detach_prefix {
+                                    match process_detach_prefix(
+                                        &bytes,
+                                        &mut detach_prefix_armed,
+                                        prefix,
+                                    ) {
+                                        DetachAction::Forward(bytes)
+                                        | DetachAction::TriggerDetach(bytes) => bytes,
+                                    }
+                                } else {
+                                    bytes
+                                };
+                                DetachAction::TriggerDetach(bytes)
                             }
-                            if let DetachAction::Forward(forward_bytes) = action
-                                && !forward_bytes.is_empty()
-                            {
-                                let frame = Frame::raw_data(forward_bytes);
-                                if frame.encode_to(&mut self.writer).is_err() {
-                                    // socket への書き込み失敗 = daemon 消滅の疑い。
-                                    return Ok(RunOutcome::ConnectionLost);
+                            DetachAction::Forward(bytes) => {
+                                if let Some(prefix) = detach_prefix {
+                                    process_detach_prefix(&bytes, &mut detach_prefix_armed, prefix)
+                                } else {
+                                    DetachAction::Forward(bytes)
                                 }
                             }
-                        } else {
-                            // detach key 無効 → 全 bytes をそのまま forward
-                            let frame = Frame::raw_data(buf[..n].to_vec());
+                        };
+                        if let DetachAction::TriggerDetach(forward_before) = &action {
+                            if !forward_before.is_empty() {
+                                let frame = Frame::raw_data(forward_before.clone());
+                                let _ = frame.encode_to(&mut self.writer);
+                                let _ = self.writer.flush();
+                            }
+                            let detach = ControlMessage::Detach(Detach {
+                                target: DetachTarget::Myself,
+                            });
+                            if let Ok(body) = detach.encode_to_vec() {
+                                let _ = Frame::cbor_control(body).encode_to(&mut self.writer);
+                                let _ = self.writer.flush();
+                            }
+                            return Ok(RunOutcome::Detached);
+                        }
+                        if let DetachAction::Forward(forward_bytes) = action
+                            && !forward_bytes.is_empty()
+                        {
+                            let frame = Frame::raw_data(forward_bytes);
                             if frame.encode_to(&mut self.writer).is_err() {
-                                // socket への書き込み失敗 = daemon 消滅の疑い。
                                 return Ok(RunOutcome::ConnectionLost);
                             }
                         }
@@ -1264,11 +1410,13 @@ mod tests {
                 client_id: 1,
                 leader: false,
                 mode: Mode::Rw,
+                child_stopped: false,
             },
             eof_action: StdinEofAction::SendEof,
             suspend_hooks: None,
             winch_source: None,
             pending_frames: std::collections::VecDeque::new(),
+            tstp_config: crate::config::AttachTstpConfig::default(),
             poisoned: false,
         };
 
@@ -1318,11 +1466,13 @@ mod tests {
                 client_id: 1,
                 leader: false,
                 mode: Mode::Ro,
+                child_stopped: false,
             },
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: Some(WinchSource::new(rd, size_fn)),
             pending_frames: std::collections::VecDeque::new(),
+            tstp_config: crate::config::AttachTstpConfig::default(),
             poisoned: false,
         };
         // leader=false なので Ok(()) で何も送らない (panic しなければ成功)。
@@ -1348,11 +1498,13 @@ mod tests {
                 client_id: 1,
                 leader: true,
                 mode: Mode::Rw,
+                child_stopped: false,
             },
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: Some(WinchSource::new(rd, size_fn)),
             pending_frames: std::collections::VecDeque::new(),
+            tstp_config: crate::config::AttachTstpConfig::default(),
             poisoned: false,
         };
         conn.send_initial_resize().expect("send_initial_resize");
@@ -1400,11 +1552,13 @@ mod tests {
                 client_id: 1,
                 leader: true,
                 mode: Mode::Rw,
+                child_stopped: false,
             },
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: Some(WinchSource::new(notify_rd, size_fn)),
             pending_frames: std::collections::VecDeque::new(),
+            tstp_config: crate::config::AttachTstpConfig::default(),
             poisoned: false,
         };
 
@@ -1469,11 +1623,13 @@ mod tests {
                 // 初期は非 leader (= 他 client が leader)。
                 leader: false,
                 mode: Mode::Rw,
+                child_stopped: false,
             },
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: Some(WinchSource::new(notify_rd, size_fn)),
             pending_frames: std::collections::VecDeque::new(),
+            tstp_config: crate::config::AttachTstpConfig::default(),
             poisoned: false,
         };
 
@@ -1542,11 +1698,13 @@ mod tests {
                 // 初期 leader だが、他 client への leader 移動通知で降格する。
                 leader: true,
                 mode: Mode::Rw,
+                child_stopped: false,
             },
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: Some(WinchSource::new(notify_rd, size_fn)),
             pending_frames: std::collections::VecDeque::new(),
+            tstp_config: crate::config::AttachTstpConfig::default(),
             poisoned: false,
         };
 
@@ -1640,6 +1798,133 @@ mod tests {
         let a = process_detach_prefix(b"\x01d", &mut armed, 0x02);
         assert_eq!(a, DetachAction::Forward(b"\x01d".to_vec()));
         assert!(!armed);
+    }
+
+    // ---- DR-0026 Ctrl+Z 折衷 intercept state machine ----
+
+    fn tstp_config() -> crate::config::AttachTstpConfig {
+        crate::config::AttachTstpConfig {
+            intercept: true,
+            short_debounce_ms: 300,
+            long_grace_ms: 1500,
+        }
+    }
+
+    #[test]
+    fn tstp_first_press_is_held_and_second_press_detaches_across_chunks() {
+        // 反射的な 2 連打は chunk 境界に依存せず detach として認識し、保留 byte は子へ送らない。
+        let t0 = std::time::Instant::now();
+        let mut state = TstpState::Idle;
+        assert_eq!(
+            process_tstp(&[TSTP_BYTE], &mut state, t0, &tstp_config()),
+            DetachAction::Forward(Vec::new())
+        );
+        assert!(matches!(state, TstpState::Armed { .. }));
+        assert_eq!(
+            process_tstp(
+                &[TSTP_BYTE],
+                &mut state,
+                t0 + Duration::from_millis(299),
+                &tstp_config(),
+            ),
+            DetachAction::TriggerDetach(Vec::new())
+        );
+        assert_eq!(state, TstpState::Idle);
+    }
+
+    #[test]
+    fn tstp_armed_other_byte_forwards_held_tstp_before_that_byte() {
+        // Ctrl+Z に続く通常入力は意図的な子操作とみなし、保留 Ctrl+Z → 当該 byte の順を守る。
+        let t0 = std::time::Instant::now();
+        let mut state = TstpState::Idle;
+        let _ = process_tstp(&[TSTP_BYTE], &mut state, t0, &tstp_config());
+        assert_eq!(
+            process_tstp(
+                b"x",
+                &mut state,
+                t0 + Duration::from_millis(100),
+                &tstp_config(),
+            ),
+            DetachAction::Forward(vec![TSTP_BYTE, b'x'])
+        );
+        assert!(matches!(state, TstpState::Grace { .. }));
+    }
+
+    #[test]
+    fn tstp_short_debounce_expiry_forwards_held_byte_and_enters_grace() {
+        // 300ms の境界で単発 Ctrl+Z を子へ届け、通常の SIGTSTP path を保存する。
+        let t0 = std::time::Instant::now();
+        let mut state = TstpState::Idle;
+        let _ = process_tstp(&[TSTP_BYTE], &mut state, t0, &tstp_config());
+        assert_eq!(
+            process_tstp(
+                &[],
+                &mut state,
+                t0 + Duration::from_millis(300),
+                &tstp_config(),
+            ),
+            DetachAction::Forward(vec![TSTP_BYTE])
+        );
+        assert!(matches!(state, TstpState::Grace { .. }));
+    }
+
+    #[test]
+    fn tstp_grace_passes_repeated_tstp_and_extends_deadline() {
+        // 一度子へ通した後の連投はすべて即 forward し、最後の Ctrl+Z から grace を延長する。
+        let t0 = std::time::Instant::now();
+        let mut state = TstpState::Grace {
+            deadline: t0 + Duration::from_millis(10),
+        };
+        assert_eq!(
+            process_tstp(
+                &[TSTP_BYTE, TSTP_BYTE],
+                &mut state,
+                t0 + Duration::from_millis(5),
+                &tstp_config(),
+            ),
+            DetachAction::Forward(vec![TSTP_BYTE, TSTP_BYTE])
+        );
+        assert_eq!(
+            state,
+            TstpState::Grace {
+                deadline: t0 + Duration::from_millis(1505)
+            }
+        );
+    }
+
+    #[test]
+    fn tstp_grace_expiry_returns_to_idle() {
+        // grace 満了後の Ctrl+Z は新しい detach 候補として再び保留する。
+        let t0 = std::time::Instant::now();
+        let mut state = TstpState::Grace {
+            deadline: t0 + Duration::from_millis(1500),
+        };
+        assert_eq!(
+            process_tstp(
+                &[TSTP_BYTE],
+                &mut state,
+                t0 + Duration::from_millis(1500),
+                &tstp_config(),
+            ),
+            DetachAction::Forward(Vec::new())
+        );
+        assert!(matches!(state, TstpState::Armed { .. }));
+    }
+
+    #[test]
+    fn tstp_intercept_false_is_complete_bypass() {
+        // escape hatch は timer/state を残さず、全 byte を入力通りに素通しする。
+        let mut config = tstp_config();
+        config.intercept = false;
+        let now = std::time::Instant::now();
+        let mut state = TstpState::Armed {
+            deadline: now + Duration::from_millis(300),
+        };
+        assert_eq!(
+            process_tstp(&[TSTP_BYTE, TSTP_BYTE, b'x'], &mut state, now, &config,),
+            DetachAction::Forward(vec![TSTP_BYTE, TSTP_BYTE, b'x'])
+        );
+        assert_eq!(state, TstpState::Idle);
     }
 
     // ---- SUSPEND_OUTER_TTY_RESET (issue 2026-06-11) ----
@@ -2001,11 +2286,13 @@ mod tests {
                 client_id: 1,
                 leader: false,
                 mode: Mode::Rw,
+                child_stopped: false,
             },
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: None,
             pending_frames: std::collections::VecDeque::new(),
+            tstp_config: crate::config::AttachTstpConfig::default(),
             poisoned: false,
         };
 
@@ -2059,11 +2346,13 @@ mod tests {
                 client_id: 1,
                 leader: false,
                 mode: Mode::Rw,
+                child_stopped: false,
             },
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: None,
             pending_frames: std::collections::VecDeque::new(),
+            tstp_config: crate::config::AttachTstpConfig::default(),
             poisoned: false,
         };
 
@@ -2111,11 +2400,13 @@ mod tests {
                 client_id: 1,
                 leader: false,
                 mode: Mode::Rw,
+                child_stopped: false,
             },
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: None,
             pending_frames: std::collections::VecDeque::new(),
+            tstp_config: crate::config::AttachTstpConfig::default(),
             poisoned: false,
         };
 
@@ -2153,11 +2444,13 @@ mod tests {
                 client_id: 1,
                 leader: false,
                 mode: Mode::Rw,
+                child_stopped: false,
             },
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: None,
             pending_frames: std::collections::VecDeque::new(),
+            tstp_config: crate::config::AttachTstpConfig::default(),
             poisoned: false,
         };
 
@@ -2222,11 +2515,13 @@ mod tests {
                 client_id: 1,
                 leader: false,
                 mode: Mode::Rw,
+                child_stopped: false,
             },
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: None,
             pending_frames: std::collections::VecDeque::new(),
+            tstp_config: crate::config::AttachTstpConfig::default(),
             poisoned: false,
         };
 
@@ -2267,11 +2562,13 @@ mod tests {
                 client_id: 1,
                 leader: false,
                 mode: Mode::Rw,
+                child_stopped: false,
             },
             eof_action: StdinEofAction::Detach,
             suspend_hooks: None,
             winch_source: None,
             pending_frames: std::collections::VecDeque::new(),
+            tstp_config: crate::config::AttachTstpConfig::default(),
             poisoned: false,
         };
         (conn, daemon_sock)

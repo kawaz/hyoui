@@ -339,6 +339,7 @@ mod tests {
             client_id: 42,
             leader: true,
             mode: Mode::Rw,
+            child_stopped: true,
         });
         assert_eq!(roundtrip(&msg), msg);
     }
