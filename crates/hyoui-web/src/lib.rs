@@ -221,6 +221,57 @@ struct InputResponse {
     specs: usize,
 }
 
+/// `send_input_blocking` の失敗分類。HTTP status code へのマップに使う。
+///
+/// DR-0021 (raw_ack) / DR-0022 (auto-lock) に沿って原因種別を保持する。
+#[derive(Debug)]
+enum InputError {
+    /// daemon socket 接続 / handshake 失敗。500。
+    Connect(String),
+    /// DR-0022 auto-lock 取得失敗 (= 他 client が保持中で timeout)。409 Conflict。
+    LockContention {
+        /// message: どの timeout で失敗したかを含む。
+        message: String,
+    },
+    /// DR-0022 auto-lock 取得失敗 (= daemon 応答異常 / protocol / I/O)。503。
+    LockUnavailable {
+        /// daemon 状態を含む message。
+        message: String,
+    },
+    /// DR-0021 raw-ack 経路の失敗、または送信 I/O 失敗。500。
+    /// どの spec (0-index) で起きたかを保持する。
+    SpecSend {
+        /// specs[] の 0-index。
+        spec_index: usize,
+        /// エラー文言。raw-ack timeout / daemon error / I/O 混在。
+        message: String,
+    },
+}
+
+impl InputError {
+    fn into_response(self) -> Response {
+        match self {
+            InputError::Connect(msg) => internal_error(format!("input send failed: {msg}")),
+            InputError::LockContention { message } => (
+                StatusCode::CONFLICT,
+                format!("他 client が入力中のため lock を取得できません: {message}"),
+            )
+                .into_response(),
+            InputError::LockUnavailable { message } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("auto-lock 取得に失敗しました: {message}"),
+            )
+                .into_response(),
+            InputError::SpecSend {
+                spec_index,
+                message,
+            } => internal_error(format!(
+                "input send failed at specs[{spec_index}]: {message}"
+            )),
+        }
+    }
+}
+
 async fn post_input(
     Path(id): Path<String>,
     State(_state): State<AppState>,
@@ -244,7 +295,7 @@ async fn post_input(
             specs: body.specs.len(),
         })
         .into_response(),
-        Ok(Err(msg)) => internal_error(format!("input send failed: {msg}")),
+        Ok(Err(e)) => e.into_response(),
         Err(e) => internal_error(format!("input join error: {e}")),
     }
 }
@@ -282,12 +333,22 @@ fn spec_to_bytes(spec: &hyoui::cli::InputSpec) -> Result<Vec<u8>, String> {
     }
 }
 
+/// web gateway の auto-lock 取得 timeout (DR-0022)。CLI の 30s より短く 5s に
+/// 設定して、HTTP client の応答待ちを長引かせない (= 「他 client が入力中」の
+/// 状態を早く 409 で返すほうが web UI として都合が良い)。
+const WEB_INPUT_AUTO_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn send_input_blocking(
     socket_path: &std::path::Path,
     payloads: &[Vec<u8>],
-) -> Result<usize, String> {
+) -> Result<usize, InputError> {
     use hyoui::client::{AttachOptions, ClientConnection};
     use hyoui::protocol::Mode;
+
+    // DR-0022: `HYOUI_LOCK_TOKEN` env で外側 token を継承している場合は auto-acquire を
+    // skip する (= 外側 wrapper が既に holder、内側で acquire/release すると外側の
+    // lock を壊す)。CLI `hyoui input` と同じ挙動。
+    let inherited_token = std::env::var("HYOUI_LOCK_TOKEN").ok();
 
     let opts = AttachOptions {
         mode: Mode::Rw,
@@ -295,19 +356,61 @@ fn send_input_blocking(
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
-        token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
+        token: inherited_token.clone(),
         exclusive: false,
         detach_others: false,
     };
     let mut conn = ClientConnection::connect(socket_path, opts)
-        .map_err(|e| format!("connect/handshake: {e}"))?;
-    let mut sent = 0usize;
-    for payload in payloads {
-        conn.send_raw_bytes(payload)
-            .map_err(|e| format!("send_raw_bytes: {e}"))?;
-        sent += payload.len();
+        .map_err(|e| InputError::Connect(format!("connect/handshake: {e}")))?;
+
+    // DR-0022: invocation 全体で auto-lock を 1 本 acquire (= web POST 1 回 = 1
+    // invocation 相当)。CLI `input_command` と同じ意味論。外側 token を継承していれば
+    // skip。取得失敗は原因種別で 409 / 503 にマップする (= `InputError` variant で
+    // 上位へ)。
+    let owned_lock_token: Option<String> = if inherited_token.is_none() {
+        match hyoui::client::acquire_auto_lock(&mut conn, WEB_INPUT_AUTO_LOCK_TIMEOUT) {
+            Ok(tok) => Some(tok),
+            Err(hyoui::client::AutoLockError::Timeout { .. }) => {
+                return Err(InputError::LockContention {
+                    message: format!("timeout ({} ms)", WEB_INPUT_AUTO_LOCK_TIMEOUT.as_millis()),
+                });
+            }
+            Err(e) => {
+                return Err(InputError::LockUnavailable {
+                    message: e.to_string(),
+                });
+            }
+        }
+    } else {
+        None
+    };
+
+    // 全 spec を順に送信。各 spec の送信は DR-0021 raw_ack で PTY drain 完了まで
+    // 同期 block する (= `send_raw_bytes` 内部の `recv_raw_ack_inner` が待つ)。失敗は
+    // どの spec で起きたかを保持して上位へ返す (= caller が 500 + spec index を
+    // レスポンスに反映)。
+    let send_result: Result<usize, InputError> = (|| {
+        let mut sent = 0usize;
+        for (idx, payload) in payloads.iter().enumerate() {
+            conn.send_raw_bytes(payload)
+                .map_err(|e| InputError::SpecSend {
+                    spec_index: idx,
+                    message: format!("send_raw_bytes: {e}"),
+                })?;
+            sent += payload.len();
+        }
+        Ok(sent)
+    })();
+
+    // DR-0022: 明示 release (= dispatch 成否に関わらず取った lock は必ず返す)。
+    // 失敗しても daemon の process-bound GC が接続切断時に回収する。
+    if let Some(tok) = owned_lock_token.as_ref()
+        && let Err(e) = hyoui::client::release_auto_lock(&mut conn, tok)
+    {
+        eprintln!("hyoui-web: auto-lock release 失敗 (best-effort、daemon GC で回収): {e}");
     }
-    Ok(sent)
+
+    send_result
 }
 
 // -----------------------------------------------------------------------------

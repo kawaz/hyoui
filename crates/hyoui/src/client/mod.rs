@@ -5,8 +5,10 @@
 //! list/status/kill は薄い 1-shot client として後の Phase で追加。
 
 mod attach;
+pub mod auto_lock;
 
 pub use attach::{
     AttachOptions, ClientConnection, RunOutcome, SUSPEND_OUTER_TTY_RESET, StdinEofAction,
     SuspendHooks, WinchSource, resolve_detach_prefix_from_env,
 };
+pub use auto_lock::{AutoLockError, acquire_auto_lock, release_auto_lock};

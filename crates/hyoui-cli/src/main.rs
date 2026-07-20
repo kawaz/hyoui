@@ -3269,10 +3269,10 @@ fn input_command(cmd: InputCommand) -> ExitCode {
     // するかどうかを decide する。途中 error / early return 時の保険は daemon 側
     // process-bound GC (= 接続切断で auto-release) に任せる。
     let owned_lock_token: Option<String> = if inherited_token.is_none() {
-        match acquire_auto_lock(&mut conn, cmd.auto_lock_timeout_acquire) {
+        match hyoui::client::acquire_auto_lock(&mut conn, cmd.auto_lock_timeout_acquire) {
             Ok(tok) => Some(tok),
-            Err(msg) => {
-                eprintln!("hyoui: input: auto-lock acquire 失敗: {msg}");
+            Err(e) => {
+                eprintln!("hyoui: input: auto-lock acquire 失敗: {e}");
                 return ExitCode::from(1);
             }
         }
@@ -3313,7 +3313,7 @@ fn input_command(cmd: InputCommand) -> ExitCode {
     //
     //    release は dispatch 成否に関わらず実行する (= 取った lock は必ず返す)。
     if let Some(tok) = owned_lock_token.as_ref()
-        && let Err(e) = release_auto_lock(&mut conn, tok)
+        && let Err(e) = hyoui::client::release_auto_lock(&mut conn, tok)
     {
         eprintln!("hyoui: input: auto-lock release 失敗 (best-effort、daemon GC で回収): {e}");
     }
@@ -3327,127 +3327,8 @@ fn input_command(cmd: InputCommand) -> ExitCode {
     }
 }
 
-/// DR-0022: `hyoui input` invocation の auto-lock を acquire する。
-///
-/// 戻り値:
-/// - `Ok(token)`: 取得成功。caller は invocation 終了時に `release_auto_lock` を呼ぶ
-/// - `Err(msg)`: timeout / daemon error / I/O error
-///
-/// `timeout` 内に取れなければ error。MVP daemon は wait queue 未実装なので、
-/// 他 holder が居る場合は `Denied` が返るのを polling で再試行する (= 既存
-/// `lock_acquire_command` と同じ戦略)。
-fn acquire_auto_lock(
-    conn: &mut ClientConnection,
-    timeout: std::time::Duration,
-) -> Result<String, String> {
-    use hyoui::protocol::messages::{LockAcquire, LockResponse, LockResult};
-    use std::time::Instant;
-
-    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-    let deadline = Instant::now() + timeout;
-
-    loop {
-        let req = ControlMessage::LockAcquire(LockAcquire {
-            // wait=true は MVP daemon では queue 化されないが、将来 queue 実装時に
-            // 自然と queue に乗せる前向き signal として送る。
-            wait: true,
-            timeout_abs_ms: Some(timeout.as_millis().min(u64::MAX as u128) as u64),
-            timeout_idle_ms: None,
-            process_bound: true,
-        });
-        if let Err(e) = conn.send_control(&req) {
-            return Err(format!("LockAcquire send 失敗: {e}"));
-        }
-
-        // response 1 frame を待つ。期待外 broadcast (mode.change 等) は捨てて再受信。
-        let response: LockResponse = loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(format!(
-                    "timeout (= {} ms 経過、--auto-lock-timeout-acquire で調整可能)",
-                    timeout.as_millis()
-                ));
-            }
-            // poll の上限は LOCK_RECV_TIMEOUT と auto-lock 残時間の min。
-            // half-open 検知は LOCK_RECV_TIMEOUT 経由でも検出可能 (= daemon 無応答)。
-            let poll_to = remaining.min(LOCK_RECV_TIMEOUT);
-            match poll_recv_ready(conn, poll_to) {
-                Ok(true) => {}
-                Ok(false) => {
-                    // POLLHUP / POLLERR / timeout (poll_to = remaining なら deadline 到達)。
-                    if Instant::now() >= deadline {
-                        return Err(format!(
-                            "timeout (= {} ms 経過、--auto-lock-timeout-acquire で調整可能)",
-                            timeout.as_millis()
-                        ));
-                    }
-                    return Err(
-                        "daemon が応答しません (= recv timeout、daemon 消失の可能性)".into(),
-                    );
-                }
-                Err(e) => return Err(format!("poll 失敗: {e}")),
-            }
-            match conn.recv_control(None) {
-                Ok(ControlMessage::LockResponse(lr)) => break lr,
-                Ok(ControlMessage::Error(em)) => {
-                    return Err(format!("daemon error: {} ({:?})", em.message, em.code));
-                }
-                Ok(_) => continue,
-                Err(e) => return Err(format!("recv 失敗: {e}")),
-            }
-        };
-
-        match response.result {
-            LockResult::Acquired => {
-                return response
-                    .token
-                    .ok_or_else(|| "Acquired response に token がありません".into());
-            }
-            LockResult::Denied => {
-                if Instant::now() >= deadline {
-                    return Err(format!(
-                        "他 client が lock 保持中、{} ms 内に取得できませんでした (--auto-lock-timeout-acquire で延長可能)",
-                        timeout.as_millis()
-                    ));
-                }
-                std::thread::sleep(POLL_INTERVAL);
-                continue;
-            }
-            LockResult::Queued => {
-                if Instant::now() >= deadline {
-                    return Err(format!(
-                        "queued のまま {} ms 経過 (= daemon queue 滞留)",
-                        timeout.as_millis()
-                    ));
-                }
-                std::thread::sleep(POLL_INTERVAL);
-                continue;
-            }
-            LockResult::Timeout => {
-                return Err("daemon timeout".into());
-            }
-            // `LockResult` is `#[non_exhaustive]`; treat unknown as failure.
-            _ => return Err("unknown LockResult variant (binary/library skew)".into()),
-        }
-    }
-}
-
-/// DR-0022: auto-lock の明示 release。
-///
-/// 失敗しても daemon の process-bound GC が接続切断時に回収するので、caller は
-/// best-effort で扱う (= warning を出して継続)。
-fn release_auto_lock(conn: &mut ClientConnection, token: &str) -> Result<(), String> {
-    use hyoui::protocol::messages::LockRelease;
-    let msg = ControlMessage::LockRelease(LockRelease {
-        token: token.to_string(),
-    });
-    conn.send_control(&msg)
-        .map_err(|e| format!("LockRelease send 失敗: {e}"))?;
-    // ack は不要 (= control message、daemon は best-effort で broadcast)。
-    // 万一 daemon が Error response (= token mismatch 等) を返してきても、それは
-    // daemon GC で結局 release されるので caller は気にしない。
-    Ok(())
-}
+// DR-0022 の auto-lock helper (`acquire_auto_lock` / `release_auto_lock`) は
+// `hyoui::client::auto_lock` に移動 (= CLI + web gateway で共有)。
 
 // =============================================================================
 // lock subcommand dispatchers (DR-0006 §7、task #20)

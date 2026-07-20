@@ -266,6 +266,102 @@ fn e2e_sessions_screen_input() {
     cleanup(runtime.path(), sid);
 }
 
+/// DR-0022 auto-lock の web 側統合を検証する e2e。
+///
+/// 前提: `hyoui input` invocation の auto-lock を web `POST /input` にも入れたので、
+/// **外部 CLI が lock を保持している間** に web から input を投げると 409 Conflict で
+/// 失敗すること (= web は default 5s で timeout する)。
+///
+/// この振る舞いは DR-0022 の意味論 (= 他 client 入力中は wait する) と、web の HTTP
+/// レスポンス性の要求 (= 応答待ちを長引かせない) の両立点。
+#[test]
+fn e2e_input_returns_409_while_external_client_holds_lock() {
+    let runtime = runtime_dir();
+    let sid = "web-e2e-lock-2";
+
+    spawn_detached(runtime.path(), sid);
+    let (mut web, port) = spawn_web(runtime.path());
+    let panic_guard = ChildGuard(&mut web);
+
+    // 外部 CLI で lock acquire → stdout に token が 1 行 print される。
+    // acquire は blocking で socket が生きている限り保持する (= release まで)。
+    let mut acquire_child = Command::new(hyoui_bin())
+        .args(["lock", "acquire", sid])
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env_remove("HYOUI_SESSION_ID")
+        .env_remove("HYOUI_LOCK_TOKEN")
+        .env_remove("HYOUI_NAMESPACE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lock acquire");
+    let mut stdout = BufReader::new(acquire_child.stdout.take().expect("stdout pipe"));
+    let mut token_line = String::new();
+    let n = stdout.read_line(&mut token_line).expect("read token line");
+    assert!(
+        n > 0,
+        "lock acquire が token を出力する前に stdout を閉じました"
+    );
+    let acquire_guard = ChildGuard(&mut acquire_child);
+
+    // 別 client が lock を保持している状態で web から input を投げる → 409 が返る。
+    let body_json = serde_json::json!({"specs": ["text:BLOCKED", "key:Enter"]});
+    let body = serde_json::to_vec(&body_json).unwrap();
+    let t0 = Instant::now();
+    let r = http_request(
+        port,
+        "POST",
+        &format!("/api/sessions/{sid}/input"),
+        Some(("application/json", &body)),
+    );
+    let elapsed = t0.elapsed();
+    assert_eq!(
+        r.status,
+        409,
+        "外部 lock 保持中の input は 409 になるべき: status={}, body={}",
+        r.status,
+        String::from_utf8_lossy(&r.body)
+    );
+    // web の default timeout は 5s。少なくとも半分は待つはず (= すぐに 409 で返らない)。
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "409 が早すぎます (= 実際に retry しているか怪しい): {elapsed:?}"
+    );
+    // 画面には送っていないはず (= BLOCKED 文字列は入らない)。
+    let r = http_request(port, "GET", &format!("/api/sessions/{sid}/screen"), None);
+    assert_eq!(r.status, 200);
+    assert!(
+        !r.body.windows(7).any(|w| w == b"BLOCKED"),
+        "409 なのに画面に BLOCKED が出ています: 応答が実は成功した?"
+    );
+
+    drop(acquire_guard); // lock を解放 (= release、CLI が exit する)。
+
+    // release 後は input が通ること。
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut succeeded = false;
+    let body_json = serde_json::json!({"specs": ["text:AFTER", "key:Enter"]});
+    let body = serde_json::to_vec(&body_json).unwrap();
+    while Instant::now() < deadline {
+        let r = http_request(
+            port,
+            "POST",
+            &format!("/api/sessions/{sid}/input"),
+            Some(("application/json", &body)),
+        );
+        if r.status == 200 {
+            succeeded = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(succeeded, "外部 lock 解放後の input が 200 にならない");
+
+    drop(panic_guard);
+    cleanup(runtime.path(), sid);
+}
+
 /// panic 時に web subprocess を確実に kill する RAII guard。
 struct ChildGuard<'a>(&'a mut Child);
 
