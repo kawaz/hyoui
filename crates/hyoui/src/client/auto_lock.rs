@@ -58,26 +58,31 @@ impl std::fmt::Display for AutoLockError {
 
 impl std::error::Error for AutoLockError {}
 
+/// [`poll_recv_ready`] の 3 分類結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollRecvOutcome {
+    /// POLLIN。caller は `recv_control` で frame を読める。
+    Ready,
+    /// poll 内 `timeout` に到達 (= daemon 生死不明、frame 未着)。
+    TimedOut,
+    /// POLLHUP / POLLERR (= peer 側 EOF or error、daemon 消失確定的)。
+    HangUp,
+}
+
 /// `conn` の reader fd を poll して recv 可能になるまで最大 `timeout` 待つ。
-///
-/// 戻り値:
-/// - `Ok(true)`: POLLIN、caller は `recv_control` で frame を読める。
-/// - `Ok(false)`: timeout 超過 / POLLHUP / POLLERR (= daemon 無応答 or 消失)。
-///   caller は「daemon 消失」として error 終了すべき。
-/// - `Err`: poll(2) 自体の失敗。
 ///
 /// EINTR は signal 割り込みなので通算 deadline で re-poll する。
 pub fn poll_recv_ready(
     conn: &ClientConnection,
     timeout: Duration,
-) -> Result<bool, crate::sys::Error> {
+) -> Result<PollRecvOutcome, crate::sys::Error> {
     use crate::sys::poll::{PollFlags, PollOutcome, poll};
     use nix::poll::{PollFd, PollTimeout};
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Ok(false);
+            return Ok(PollRecvOutcome::TimedOut);
         }
         let fd = conn.reader_fd();
         let mut fds = [PollFd::new(fd, PollFlags::POLLIN)];
@@ -87,14 +92,14 @@ pub fn poll_recv_ready(
             Ok(PollOutcome::Ready(_)) => {
                 let re = fds[0].revents().unwrap_or(PollFlags::empty());
                 if re.contains(PollFlags::POLLIN) {
-                    return Ok(true);
+                    return Ok(PollRecvOutcome::Ready);
                 }
                 if re.contains(PollFlags::POLLHUP) || re.contains(PollFlags::POLLERR) {
-                    return Ok(false);
+                    return Ok(PollRecvOutcome::HangUp);
                 }
                 // 想定外 revents は re-poll。
             }
-            Ok(PollOutcome::Timeout) => return Ok(false),
+            Ok(PollOutcome::Timeout) => return Ok(PollRecvOutcome::TimedOut),
             Ok(PollOutcome::Interrupted) => continue,
             Err(e) => return Err(e),
         }
@@ -139,16 +144,29 @@ pub fn acquire_auto_lock(
             if remaining.is_zero() {
                 return Err(AutoLockError::Timeout { elapsed: timeout });
             }
+            // poll_to の由来で TimedOut を分類する: liveness cap (= LOCK_RECV_TIMEOUT が
+            // 上限になった) なら「daemon が liveness bound 内に無応答」= Unresponsive。
+            // deadline cap (= remaining が上限になった) なら「caller の timeout に到達」=
+            // Timeout。`Instant::now() >= deadline` で分類すると、`poll_to` を ms に
+            // 切り捨てる誤差で deadline より数 ms 早く poll が戻った場合に Unresponsive
+            // へ誤分類され、CI 高負荷時に 409 期待のテストが 503 になる。POLLHUP/POLLERR
+            // は peer 消失確定なので caller の timeout 内でも Unresponsive で返す。
+            let capped_by_liveness = LOCK_RECV_TIMEOUT < remaining;
             let poll_to = remaining.min(LOCK_RECV_TIMEOUT);
             match poll_recv_ready(conn, poll_to) {
-                Ok(true) => {}
-                Ok(false) => {
-                    if Instant::now() >= deadline {
-                        return Err(AutoLockError::Timeout { elapsed: timeout });
-                    }
+                Ok(PollRecvOutcome::Ready) => {}
+                Ok(PollRecvOutcome::HangUp) => {
                     return Err(AutoLockError::DaemonUnresponsive(
-                        "recv timeout (daemon 消失の可能性)".into(),
+                        "socket HUP/ERR (daemon 消失)".into(),
                     ));
+                }
+                Ok(PollRecvOutcome::TimedOut) => {
+                    if capped_by_liveness {
+                        return Err(AutoLockError::DaemonUnresponsive(
+                            "recv timeout (daemon 消失の可能性)".into(),
+                        ));
+                    }
+                    return Err(AutoLockError::Timeout { elapsed: timeout });
                 }
                 Err(e) => return Err(AutoLockError::Io(format!("poll 失敗: {e}"))),
             }
