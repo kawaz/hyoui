@@ -18,6 +18,10 @@
   </p>
 </header>
 <main>
+  <div id="stoppedBanner" class="stopped-banner" hidden>
+    <span>child is stopped (SIGSTOP). resume で SIGCONT を送信します。</span>
+    <button type="button" id="resumeBtn">▶ resume</button>
+  </div>
   <div id="term"></div>
   <form id="inputForm" autocomplete="off">
     <input type="text" id="inputText" placeholder="input to send..." spellcheck="false">
@@ -65,6 +69,7 @@
 })();
 </script>
 <script src="/assets/vendor/xterm.js"></script>
+<script src="/assets/vendor/addon-unicode11.js"></script>
 <script src="/assets/session.js"></script>
 </body>
 </html>

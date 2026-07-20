@@ -18,10 +18,27 @@
     convertEol: false,
     scrollback: 2000,
     disableStdin: true,
+    // 半角ブロック罫線 (▀▄▉ 等) の上下ズレ対策として lineHeight を 1.0 に固定。
+    // fontFamily は等幅かつメトリクスの安定した候補列 (Menlo/Consolas は canvas
+    // renderer で block element の baseline が揃いやすい)。
+    lineHeight: 1.0,
     fontFamily: 'Menlo, "DejaVu Sans Mono", Consolas, "Courier New", monospace',
     fontSize: 13,
     theme: { background: '#111', foreground: '#e0e0e0' },
   });
+  // Unicode 11 addon (絵文字を width=2 として扱う。daemon 側 vt100 emulator と一致)。
+  if (window.Unicode11Addon) {
+    try {
+      const addon = new window.Unicode11Addon.Unicode11Addon();
+      term.loadAddon(addon);
+      term.unicode.activeVersion = '11';
+      if (window.__hyouiDebug) window.__hyouiDebug('info', 'unicode11 addon loaded, activeVersion=' + term.unicode.activeVersion);
+    } catch (e) {
+      if (window.__hyouiDebug) window.__hyouiDebug('warn', 'unicode11 addon load failed: ' + e.message);
+    }
+  } else if (window.__hyouiDebug) {
+    window.__hyouiDebug('warn', 'Unicode11Addon global not found');
+  }
   term.open(document.getElementById('term'));
 
   const statusEl = document.getElementById('status');
@@ -32,9 +49,47 @@
   const sendRawBtn = document.getElementById('sendRaw');
   const sendKeyBtn = document.getElementById('sendKey');
   const sendStatus = document.getElementById('sendStatus');
+  const stoppedBanner = document.getElementById('stoppedBanner');
+  const resumeBtn = document.getElementById('resumeBtn');
 
   let timer = null;
   let lastPayload = '';
+
+  async function refreshSessionStatus() {
+    // /api/sessions を一覧して自分の session_id を探し child_stopped で banner を出す。
+    // 専用エンドポイントを増やさず既存 API を再利用 (= protocol/API 表面を最小化)。
+    try {
+      const r = await fetch('/api/sessions', { cache: 'no-store' });
+      if (!r.ok) return;
+      const list = await r.json();
+      const me = Array.isArray(list) ? list.find((s) => s.session_id === sid) : null;
+      const stopped = !!(me && me.child_stopped);
+      stoppedBanner.hidden = !stopped;
+    } catch (_e) {
+      // best-effort。失敗しても画面は動かす。
+    }
+  }
+
+  async function sendResume() {
+    resumeBtn.disabled = true;
+    const orig = resumeBtn.textContent;
+    resumeBtn.textContent = 'resuming…';
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/resume`, { method: 'POST' });
+      if (!r.ok) {
+        const txt = await r.text();
+        throw new Error(`HTTP ${r.status}: ${txt}`);
+      }
+      // 復帰後 daemon が redraw を送るので、screen と status の両方を fetch し直す。
+      setTimeout(() => { fetchScreen(); refreshSessionStatus(); }, 300);
+    } catch (e) {
+      alert('resume failed: ' + e.message);
+    } finally {
+      resumeBtn.disabled = false;
+      resumeBtn.textContent = orig;
+    }
+  }
+  resumeBtn.addEventListener('click', sendResume);
 
   async function fetchScreen() {
     statusEl.textContent = 'fetching…';
@@ -112,7 +167,10 @@
   }
 
   autoEl.addEventListener('change', schedule);
-  refreshBtn.addEventListener('click', fetchScreen);
+  refreshBtn.addEventListener('click', () => { fetchScreen(); refreshSessionStatus(); });
   fetchScreen();
+  refreshSessionStatus();
   schedule();
+  // status は screen より遅めに poll (= 一覧 API を頻繁に叩かない)。
+  setInterval(refreshSessionStatus, 5000);
 })();

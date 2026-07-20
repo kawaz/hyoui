@@ -45,14 +45,18 @@
     for (const s of list) {
       const tr = document.createElement('tr');
       const isLive = s.status === 'live';
+      const isStopped = s.status === 'stopped' || !!s.child_stopped;
       tr.className = 'row-' + esc(s.status || 'unknown');
-      const link = isLive || s.status === 'stopped'
+      const link = isLive || isStopped
         ? `<a href="/sessions/${encodeURIComponent(s.session_id)}">${esc(s.session_id)}</a>`
         : esc(s.session_id);
+      const statusCell = isStopped
+        ? `<span class="badge badge-stopped" title="child is stopped (SIGSTOP)">⏸ stopped</span>`
+        : esc(s.status);
       tr.innerHTML = [
         `<td>${link}</td>`,
         `<td>${esc(s.namespace)}</td>`,
-        `<td>${esc(s.status)}</td>`,
+        `<td>${statusCell}</td>`,
         `<td>${esc(s.clients ?? '')}</td>`,
         `<td class="argv"><code>${esc(fmtArgv(s.argv))}</code></td>`,
         `<td class="cwd">${esc(s.cwd || '')}</td>`,

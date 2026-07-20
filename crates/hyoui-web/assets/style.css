@@ -93,6 +93,33 @@ a { color: var(--accent); }
   align-items: center;
   flex-wrap: wrap;
 }
+.stopped-banner {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid #b8860b;
+  background: rgba(184, 134, 11, 0.12);
+  color: var(--fg);
+  border-radius: 3px;
+  font-size: 0.9rem;
+}
+.stopped-banner button {
+  margin-left: auto;
+  border-color: #b8860b;
+}
+.badge {
+  display: inline-block;
+  padding: 0.05rem 0.4rem;
+  border-radius: 3px;
+  font-size: 0.78rem;
+  border: 1px solid var(--border);
+}
+.badge-stopped {
+  color: #b8860b;
+  border-color: #b8860b;
+  background: rgba(184, 134, 11, 0.12);
+}
 #inputText {
   font-family: Menlo, "DejaVu Sans Mono", Consolas, monospace;
   font-size: 0.9rem;

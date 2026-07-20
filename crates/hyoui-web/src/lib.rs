@@ -72,6 +72,7 @@ pub fn router(config: hyoui::config::Config, assets_dir: Option<PathBuf>) -> Rou
         .route("/api/sessions", get(get_sessions))
         .route("/api/sessions/{id}/screen", get(get_screen))
         .route("/api/sessions/{id}/input", post(post_input))
+        .route("/api/sessions/{id}/resume", post(post_resume))
         .with_state(state)
 }
 
@@ -414,6 +415,47 @@ fn send_input_blocking(
 }
 
 // -----------------------------------------------------------------------------
+// POST /api/sessions/:id/resume
+// -----------------------------------------------------------------------------
+
+/// stopped child に SIGCONT を送るための resume request を daemon に投げる
+/// (= 既存 `SessionChildResumeRequest`、新 protocol message は追加しない)。
+///
+/// rw attach で connect し `send_child_resume()` を呼ぶ (= CLI `hyoui attach` の
+/// reattach auto-resume 経路と同じ)。子が既に running でも daemon 側で SIGCONT が
+/// 冪等に飛ぶので害はない (= running プロセスへの SIGCONT は no-op)。
+async fn post_resume(Path(id): Path<String>, State(_state): State<AppState>) -> Response {
+    let sock = match resolve_socket(&id).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let result = tokio::task::spawn_blocking(move || resume_child_blocking(&sock)).await;
+    match result {
+        Ok(Ok(())) => (StatusCode::NO_CONTENT, "").into_response(),
+        Ok(Err(msg)) => internal_error(format!("resume failed: {msg}")),
+        Err(e) => internal_error(format!("resume join error: {e}")),
+    }
+}
+
+fn resume_child_blocking(socket_path: &std::path::Path) -> Result<(), String> {
+    use hyoui::client::{AttachOptions, ClientConnection};
+    use hyoui::protocol::{MVP_CAPS, Mode};
+
+    let opts = AttachOptions {
+        mode: Mode::Rw,
+        caps: MVP_CAPS.iter().map(|s| (*s).to_string()).collect(),
+        token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
+        exclusive: false,
+        detach_others: false,
+    };
+    let mut conn = ClientConnection::connect(socket_path, opts)
+        .map_err(|e| format!("connect/handshake: {e}"))?;
+    conn.send_child_resume()
+        .map_err(|e| format!("send resume.request: {e}"))?;
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
 
@@ -691,6 +733,22 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), custom_body);
+    }
+
+    #[tokio::test]
+    async fn resume_unknown_session_returns_404() {
+        let app = router(hyoui::config::Config::default(), None);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions/no-such-session-xyz/resume")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
