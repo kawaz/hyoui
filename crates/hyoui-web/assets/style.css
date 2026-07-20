@@ -1,3 +1,21 @@
+/* HackGen Console NF (SIL OFL 1.1)。半角:全角=1:2、Nerd Font + 日本語入り。
+   罫線・半ブロック・Powerline のメトリクス安定が狙い (= host font 依存を消す)。
+   詳細は assets/vendor/README.md / assets/vendor/fonts/LICENSE.md。 */
+@font-face {
+  font-family: 'HackGen Console NF';
+  src: url('/assets/vendor/fonts/HackGenConsoleNF-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+@font-face {
+  font-family: 'HackGen Console NF';
+  src: url('/assets/vendor/fonts/HackGenConsoleNF-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: block;
+}
+
 :root {
   color-scheme: light dark;
   --fg: #222;
@@ -66,7 +84,7 @@ th {
 }
 tr.row-stale td { color: var(--muted); }
 td.argv code, td.cwd {
-  font-family: Menlo, "DejaVu Sans Mono", Consolas, monospace;
+  font-family: "HackGen Console NF", Menlo, "DejaVu Sans Mono", Consolas, monospace;
   font-size: 0.82rem;
 }
 td.cwd { color: var(--muted); }
@@ -121,7 +139,7 @@ a { color: var(--accent); }
   background: rgba(184, 134, 11, 0.12);
 }
 #inputText {
-  font-family: Menlo, "DejaVu Sans Mono", Consolas, monospace;
+  font-family: "HackGen Console NF", Menlo, "DejaVu Sans Mono", Consolas, monospace;
   font-size: 0.9rem;
   padding: 0.3rem 0.5rem;
   border: 1px solid var(--border);

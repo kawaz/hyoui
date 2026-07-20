@@ -19,10 +19,11 @@
     scrollback: 2000,
     disableStdin: true,
     // 半角ブロック罫線 (▀▄▉ 等) の上下ズレ対策として lineHeight を 1.0 に固定。
-    // fontFamily は等幅かつメトリクスの安定した候補列 (Menlo/Consolas は canvas
-    // renderer で block element の baseline が揃いやすい)。
+    // fontFamily は同梱の HackGen Console NF (SIL OFL、半角:全角=1:2、Nerd Font +
+    // 日本語 JIS 第 1-2 水準入り) を最優先。host 依存フォントを消してメトリクス
+    // を安定化させる。fallback は既存 monospace 列。
     lineHeight: 1.0,
-    fontFamily: 'Menlo, "DejaVu Sans Mono", Consolas, "Courier New", monospace',
+    fontFamily: '"HackGen Console NF", Menlo, "DejaVu Sans Mono", Consolas, "Courier New", monospace',
     fontSize: 13,
     theme: { background: '#111', foreground: '#e0e0e0' },
   });

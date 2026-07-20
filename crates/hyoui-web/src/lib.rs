@@ -549,6 +549,9 @@ fn content_type_for(path: &str) -> &'static str {
         "svg" => "image/svg+xml",
         "png" => "image/png",
         "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
         _ => "application/octet-stream",
     }
 }
@@ -733,6 +736,36 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), custom_body);
+    }
+
+    #[tokio::test]
+    async fn hackgen_font_served_as_woff2() {
+        // vendored HackGen Console NF が embedded 経路で配信されて font/woff2 で返ること。
+        let app = router(hyoui::config::Config::default(), None);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/vendor/fonts/HackGenConsoleNF-Regular.woff2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(ct, "font/woff2", "ct={ct}");
+        let body = to_bytes(resp.into_body(), 8 * 1024 * 1024).await.unwrap();
+        // woff2 magic: "wOF2".
+        assert!(
+            body.starts_with(b"wOF2"),
+            "not a woff2 (first 4 bytes = {:?})",
+            &body[..4.min(body.len())]
+        );
+        assert!(body.len() > 100_000, "woff2 too small: {} B", body.len());
     }
 
     #[tokio::test]
