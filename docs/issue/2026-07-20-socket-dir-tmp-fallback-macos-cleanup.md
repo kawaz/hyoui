@@ -53,6 +53,14 @@ kawaz 裁定: `/tmp` をやめる。
 - [ ] `socket.rs` のエラーヒント文言が新 fallback パスに追従している
 - [ ] macOS 定期掃除下で daemon 生存中に socket file が消えないことを実機確認
 
+## 追記 (2026-07-20)
+
+kawaz 裁定: fallback は XDG_STATE_HOME (`${XDG_STATE_HOME:-$HOME/.local/state}/hyoui/`) に確定。
+cache 案は「ユーザが気軽に消す」リスクで却下、socket は再生成不能な実行状態なので state が semantic 正。
+XDG_RUNTIME_DIR 優先は維持、list 探索候補からも /tmp を除去 (v1.0 未満 breaking 許容)。
+実装は worker が進行中 (CACHE 版 commit 3047a5ac を STATE 版へ差し替え再作業中)。
+status は open のまま維持 (実装 land + リリース後に close 判断)。
+
 ## TODO
 
 <!-- wip 時のみ -->
