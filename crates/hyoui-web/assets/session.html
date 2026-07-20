@@ -26,7 +26,44 @@
     <button type="button" id="sendKey" title="送信するキーを prompt で入力 (例: Escape, Tab, Ctrl-C, C-a)">Send Key…</button>
   </form>
   <p id="sendStatus" class="meta"></p>
+  <details id="debugPanel">
+    <summary>debug log (<span id="debugCount">0</span>)</summary>
+    <pre id="debugLog"></pre>
+  </details>
 </main>
+<script>
+// devtools の無い環境 (iPad Safari 等) 向けのページ内デバッグ収集。
+// uncaught error / unhandled rejection / console.error / xterm 初期化前の失敗を全部拾う。
+(function () {
+  const MAX = 200;
+  const lines = [];
+  function push(kind, msg) {
+    const t = new Date().toISOString().slice(11, 23);
+    lines.push(`${t} [${kind}] ${msg}`);
+    if (lines.length > MAX) lines.shift();
+    const pre = document.getElementById('debugLog');
+    const cnt = document.getElementById('debugCount');
+    if (pre) pre.textContent = lines.join('\n');
+    if (cnt) cnt.textContent = String(lines.length);
+  }
+  window.__hyouiDebug = push;
+  window.addEventListener('error', (e) => {
+    push('error', `${e.message} @ ${e.filename}:${e.lineno}:${e.colno}`);
+  }, true);
+  window.addEventListener('unhandledrejection', (e) => {
+    push('rejection', String(e.reason && (e.reason.stack || e.reason.message || e.reason)));
+  });
+  const origErr = console.error.bind(console);
+  console.error = (...a) => { push('console', a.map(String).join(' ')); origErr(...a); };
+  const origWarn = console.warn.bind(console);
+  console.warn = (...a) => { push('warn', a.map(String).join(' ')); origWarn(...a); };
+  window.addEventListener('DOMContentLoaded', () => {
+    push('info', `ua=${navigator.userAgent}`);
+    push('info', `viewport=${window.innerWidth}x${window.innerHeight} dpr=${devicePixelRatio}`);
+    push('info', `xterm loaded=${typeof window.Terminal !== 'undefined'}`);
+  });
+})();
+</script>
 <script src="/assets/vendor/xterm.js"></script>
 <script src="/assets/session.js"></script>
 </body>

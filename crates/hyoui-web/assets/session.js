@@ -49,7 +49,12 @@
       if (text !== lastPayload) {
         // Full redraw: reset and write the full ANSI dump.
         term.reset();
-        term.write(text);
+        term.write(text, () => {
+          if (window.__hyouiDebug) {
+            const line = term.buffer.active.getLine(0);
+            window.__hyouiDebug('screen', `wrote ${text.length}B, buffer line0="${line ? line.translateToString().trimEnd().slice(0, 40) : '(null)'}"`);
+          }
+        });
         lastPayload = text;
       }
       statusEl.textContent = `updated ${new Date().toLocaleTimeString()} (${text.length} B)`;
