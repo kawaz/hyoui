@@ -1663,28 +1663,12 @@ fn print_list_jsonl(entries: &[ListEntry]) {
     }
 }
 
-/// hyoui base socket dir 候補 (= namespace を含めない `hyoui-<uid>` まで) を返す。
+/// hyoui base socket dir 候補 (= namespace を含めない `hyoui` まで) を返す。
 ///
-/// `XDG_RUNTIME_DIR/hyoui` (実在時) と **`/tmp/hyoui-<uid>`** の 2 候補を、実在する
-/// 方だけ列挙する (= `socket_path::resolve_with_env` の dir 選択ロジックと同順・同 base)。
-/// base は `$TMPDIR` でなく `/tmp` 固定 (= 2026-06-11 の sun_path bug fix、resolver と
-/// 一致させないと `hyoui list` が新 path の session を見つけられなくなる)。
+/// resolver と同じ優先順位 (`XDG_RUNTIME_DIR` → XDG cache fallback) で実在する
+/// dir だけを列挙する。起動 path と `hyoui list` の探索 path は必ず同期させる。
 fn base_socket_dirs() -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR")
-        && !xdg.is_empty()
-    {
-        let p = std::path::PathBuf::from(xdg).join("hyoui");
-        if p.is_dir() {
-            out.push(p);
-        }
-    }
-    let uid = nix::unistd::geteuid().as_raw();
-    let p = std::path::PathBuf::from(format!("/tmp/hyoui-{uid}"));
-    if p.is_dir() {
-        out.push(p);
-    }
-    out
+    socket_path::existing_base_dirs()
 }
 
 /// `hyoui list` 等で scan する候補 dir を **namespace スコープ**で返す (= DR-0018)。

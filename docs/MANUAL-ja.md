@@ -314,7 +314,7 @@ config パースエラー (= 不正 TOML / 型不一致) のときは hyoui の�
 
 | 症状 | 対処 |
 |---|---|
-| `hyoui list` に session が出ない | `$XDG_RUNTIME_DIR/hyoui` / `/tmp/hyoui-<uid>` の socket dir に stale socket が残っていないか確認 (`docs/runbooks/2026-05-27-stale-socket-detection.md`) |
+| `hyoui list` に session が出ない | `$XDG_RUNTIME_DIR/hyoui` / `${XDG_CACHE_HOME:-$HOME/.cache}/hyoui` の socket dir に stale socket が残っていないか確認 (`docs/runbooks/2026-05-27-stale-socket-detection.md`) |
 | attach 直後に切られる | daemon が cap negotiation で reject した可能性 (`docs/runbooks/2026-05-27-handshake-cap-rejection.md`) |
 | 子プロセスが死んで daemon だけ残る | `docs/runbooks/2026-05-27-child-orphan-detection.md` |
 

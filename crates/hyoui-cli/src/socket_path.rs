@@ -5,23 +5,16 @@
 //!
 //! 1. `$XDG_RUNTIME_DIR` が set されていて、かつ実在 dir なら `$XDG_RUNTIME_DIR/hyoui/`
 //!    (Linux の典型、`/run/user/<uid>` が systemd-logind 等で mode 0700 で provision される)
-//! 2. それ以外 (= macOS や XDG 未設定環境) は **`/tmp/hyoui-<uid>/`** 固定:
-//!    `/tmp/hyoui-<uid>/<session>.sock`
-//!    - tmux の `/tmp/tmux-<uid>` / screen と同じ前例。base を短く固定することで
-//!      unix socket の `sun_path` 上限 (macOS 104 / Linux 108 bytes) に namespace +
-//!      session 名を載せても余裕を残す (= macOS の TMPDIR
-//!      `/var/folders/.../T/` ≈50 文字が ENAMETOOLONG を誘発する問題への対処)。
-//!      macOS では `/tmp` は `/private/tmp` への symlink だが、bind は与えた path を
-//!      そのまま使うため実効長は `/tmp/...` で計算される。
-//!    - 再起動でクリーンされてよい設計 (socket は永続化対象外)
-//!    - `-<uid>` で multi-user 衝突回避
+//! 2. それ以外は `${XDG_CACHE_HOME:-$HOME/.cache}/hyoui/`:
+//!    `${XDG_CACHE_HOME:-$HOME/.cache}/hyoui/<session>.sock`
+//!    - macOS が daemon 生存中の `/tmp` を定期掃除して socket file だけを消し、
+//!      session を外側から到達不能にするため、ユーザ管理下の cache dir を使う。
 //!    - dir は **新規作成時** mode 0700。既存 dir は所有者と mode を verify
+//!    - unix socket の `sun_path` 上限 (macOS 104 / Linux 108 bytes) は、完成 path を
+//!      [`check_sun_path_len`] で bind 前に検査する。
 //!
-//! `$TMPDIR` を base に使わない理由 (= breaking change, v0.x): macOS の per-user
-//! TMPDIR が長すぎて namespace 機能が実環境で使えなかった。`/tmp` 固定で sun_path
-//! 予算を確保する。
-//!
-//! HOME 直下 (`~/.hyoui` 等) は使わない (= ユーザ HOME を汚さない)。
+//! `$TMPDIR` は参照しない。macOS の per-user TMPDIR は長く `sun_path` 予算を
+//! 圧迫するうえ、OS の掃除対象になるため socket の生存期間と合わない。
 //!
 //! # namespace (DR-0018)
 //!
@@ -30,7 +23,7 @@
 //! - `default` namespace (= 既定): 上記の base dir **直下** にそのまま socket を置く
 //!   (= 既存 session と完全互換、dir 移動なし)。
 //! - それ以外の namespace `<ns>`: base dir の下に `<ns>/` サブ dir を 1 段掘り、
-//!   その中に socket を置く (= `<base>/hyoui-<uid>/<ns>/<session>.sock`)。
+//!   その中に socket を置く (= `<base>/hyoui/<ns>/<session>.sock`)。
 //!
 //! namespace の解決順は `--namespace=X` flag > env `HYOUI_NAMESPACE` > `default`
 //! ([`resolve_namespace`])。ns 名は [`hyoui::cli::validate_namespace`] で whitelist
@@ -137,9 +130,9 @@ pub fn resolve_namespace(flag: Option<&str>) -> String {
 /// daemon socket path を **namespace スコープ**で決定する (= DR-0018)。
 ///
 /// `explicit = Some(p)` ならそのまま、`None` なら自動 path:
-/// - `default` namespace → base dir 直下 (= 既存互換):
+/// - `default` namespace → base dir 直下:
 ///   `$XDG_RUNTIME_DIR/hyoui/<sid>.sock` (= dir 実在時) /
-///   `/tmp/hyoui-<uid>/<sid>.sock`
+///   `${XDG_CACHE_HOME:-$HOME/.cache}/hyoui/<sid>.sock`
 /// - それ以外 → `<base>/<namespace>/<sid>.sock`
 ///
 /// parent dir は **新規作成時のみ** mode 0700 で create、既存 dir は所有者/mode 検証。
@@ -156,11 +149,8 @@ pub fn resolve_in_namespace(
 ) -> std::io::Result<PathBuf> {
     let env = EnvSnapshot {
         xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR"),
-        // production では `$TMPDIR` を読まない (= base は `/tmp` 固定)。macOS の
-        // 長い per-user TMPDIR が sun_path 上限を食い潰す問題を避けるため。
-        // `tmpdir` field は test が writable tempdir を base に差し込むための
-        // injection hook としてのみ使う (= 下記 `tmp_base_override`)。
-        tmp_base_override: None,
+        xdg_cache_home: std::env::var_os("XDG_CACHE_HOME"),
+        home_dir: std::env::var_os("HOME"),
         uid: nix::unistd::geteuid().as_raw(),
         namespace: namespace.to_string(),
     };
@@ -172,11 +162,10 @@ pub fn resolve_in_namespace(
 pub struct EnvSnapshot {
     /// `$XDG_RUNTIME_DIR` の値 (= 未設定なら None)。
     pub xdg_runtime_dir: Option<OsString>,
-    /// 非 XDG 経路の base tmp dir を差し替える test 専用 hook (= `None` なら
-    /// `/tmp` 固定)。production では `resolve_in_namespace` が常に `None` を渡す
-    /// (= `$TMPDIR` は読まない)。test が writable tempdir を base にして `/tmp` を
-    /// 汚さずに検証するためだけに使う。
-    pub tmp_base_override: Option<OsString>,
+    /// `$XDG_CACHE_HOME` の値 (= 未設定なら None)。
+    pub xdg_cache_home: Option<OsString>,
+    /// `$HOME` の値 (= 未設定なら None)。XDG cache 未設定時に `.cache` を補う。
+    pub home_dir: Option<OsString>,
     /// 現在の effective UID。
     pub uid: u32,
     /// 解決済 session namespace (= DR-0018)。`default` なら base dir 直下、
@@ -202,7 +191,7 @@ pub fn resolve_with_env(
     // `create_dir_all` は中間 dir の mode を umask に委ねてしまい 0700 を保証しない
     // ため、base → ns の順で `ensure_socket_dir` を 2 段呼びして両階層とも 0700 を
     // 強制する (= 非 default ns でも base dir の所有者/権限検証が効く)。
-    let base = pick_base_dir(env);
+    let base = pick_base_dir(env)?;
     ensure_socket_dir(&base, env.uid)?;
     let dir = if env.namespace == hyoui::cli::DEFAULT_NAMESPACE {
         base
@@ -233,7 +222,7 @@ fn check_sun_path_len(path: &Path, namespace: &str, session_id: &str) -> std::io
                 "socket path が unix domain socket の上限を超えています \
                  (現在 {len} bytes > 上限 {max} bytes): {}\n\
                  \x20      namespace ({namespace:?}) か session 名 ({session_id:?}) を \
-                 短くしてください (= base dir は /tmp/hyoui-<uid> 固定で最短化済み)。",
+                 短くするか、より短い XDG_RUNTIME_DIR / XDG_CACHE_HOME を指定してください。",
                 path.display()
             ),
         ));
@@ -241,28 +230,68 @@ fn check_sun_path_len(path: &Path, namespace: &str, session_id: &str) -> std::io
     Ok(())
 }
 
-/// namespace を含めない base socket dir を選ぶ (= `hyoui-<uid>` まで)。
+/// namespace を含めない base socket dir を選ぶ。
 ///
 /// 1. `XDG_RUNTIME_DIR` が空でなく実在 dir → `$XDG_RUNTIME_DIR/hyoui`
-/// 2. それ以外 → `<tmp_base>/hyoui-<uid>`。`tmp_base` は production では `/tmp`
-///    固定 (= sun_path 予算確保のため `$TMPDIR` を読まない)、test では
-///    `tmp_base_override` で writable tempdir を差し込む。
-fn pick_base_dir(env: &EnvSnapshot) -> PathBuf {
+/// 2. `XDG_CACHE_HOME` が空でない → `$XDG_CACHE_HOME/hyoui`
+/// 3. それ以外 → `$HOME/.cache/hyoui`
+fn pick_base_dir(env: &EnvSnapshot) -> std::io::Result<PathBuf> {
     if let Some(xdg) = env.xdg_runtime_dir.as_ref()
         && !xdg.is_empty()
     {
         let p = PathBuf::from(xdg);
         if p.is_dir() {
-            return p.join("hyoui");
+            return Ok(p.join("hyoui"));
         }
     }
-    let tmp = env
-        .tmp_base_override
+    pick_cache_base_dir(env)
+}
+
+/// `hyoui list` が走査する、現在実在する base socket dir を優先順で返す。
+/// resolver と同じ環境 snapshot / fallback 規則を使い、起動と列挙の path drift を防ぐ。
+pub fn existing_base_dirs() -> Vec<PathBuf> {
+    let env = EnvSnapshot {
+        xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR"),
+        xdg_cache_home: std::env::var_os("XDG_CACHE_HOME"),
+        home_dir: std::env::var_os("HOME"),
+        uid: nix::unistd::geteuid().as_raw(),
+        namespace: hyoui::cli::DEFAULT_NAMESPACE.to_string(),
+    };
+    let mut dirs = Vec::new();
+    if let Some(runtime) = env.xdg_runtime_dir.as_ref()
+        && !runtime.is_empty()
+    {
+        let runtime_dir = PathBuf::from(runtime).join("hyoui");
+        if runtime_dir.is_dir() {
+            dirs.push(runtime_dir);
+        }
+    }
+    if let Ok(cache_dir) = pick_cache_base_dir(&env)
+        && cache_dir.is_dir()
+        && !dirs.contains(&cache_dir)
+    {
+        dirs.push(cache_dir);
+    }
+    dirs
+}
+
+fn pick_cache_base_dir(env: &EnvSnapshot) -> std::io::Result<PathBuf> {
+    if let Some(cache) = env.xdg_cache_home.as_ref()
+        && !cache.is_empty()
+    {
+        return Ok(PathBuf::from(cache).join("hyoui"));
+    }
+    let home = env
+        .home_dir
         .as_ref()
         .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    tmp.join(format!("hyoui-{}", env.uid))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "socket dir を解決できません: XDG_CACHE_HOME または HOME を設定してください",
+            )
+        })?;
+    Ok(PathBuf::from(home).join(".cache").join("hyoui"))
 }
 
 /// `dir` を「mode 0700 + 所有者 = euid」で利用可能にする。
@@ -305,14 +334,15 @@ fn ensure_socket_dir(dir: &Path, expected_uid: u32) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    fn env_with(xdg: Option<&Path>, tmp: Option<&Path>) -> EnvSnapshot {
-        env_with_ns(xdg, tmp, hyoui::cli::DEFAULT_NAMESPACE)
+    fn env_with(xdg: Option<&Path>, cache: Option<&Path>) -> EnvSnapshot {
+        env_with_ns(xdg, cache, hyoui::cli::DEFAULT_NAMESPACE)
     }
 
-    fn env_with_ns(xdg: Option<&Path>, tmp: Option<&Path>, ns: &str) -> EnvSnapshot {
+    fn env_with_ns(xdg: Option<&Path>, cache: Option<&Path>, ns: &str) -> EnvSnapshot {
         EnvSnapshot {
             xdg_runtime_dir: xdg.map(|p| p.as_os_str().to_os_string()),
-            tmp_base_override: tmp.map(|p| p.as_os_str().to_os_string()),
+            xdg_cache_home: cache.map(|p| p.as_os_str().to_os_string()),
+            home_dir: None,
             uid: nix::unistd::geteuid().as_raw(),
             namespace: ns.to_string(),
         }
@@ -400,20 +430,21 @@ mod tests {
             .expect("tempdir");
         let env = EnvSnapshot {
             xdg_runtime_dir: Some(OsString::new()), // 空 string は無視
-            tmp_base_override: Some(tmp.path().as_os_str().to_os_string()),
+            xdg_cache_home: Some(tmp.path().as_os_str().to_os_string()),
+            home_dir: None,
             uid: nix::unistd::geteuid().as_raw(),
             namespace: hyoui::cli::DEFAULT_NAMESPACE.to_string(),
         };
         let got = resolve_with_env(None, "x", &env).expect("resolve");
         assert!(
             got.starts_with(tmp.path()),
-            "should use tmp_base_override, got {got:?}"
+            "should use XDG_CACHE_HOME fallback, got {got:?}"
         );
     }
 
     #[test]
     fn xdg_runtime_dir_ignored_when_not_a_dir() {
-        // 存在しない path → fallback to TMPDIR
+        // 存在しない runtime path → XDG cache fallback
         let tmp = tempfile::Builder::new()
             .prefix("hyoui-tmp-")
             .tempdir()
@@ -421,52 +452,73 @@ mod tests {
         let bogus = PathBuf::from("/this/path/does/not/exist/probably/abc123");
         let env = EnvSnapshot {
             xdg_runtime_dir: Some(bogus.as_os_str().to_os_string()),
-            tmp_base_override: Some(tmp.path().as_os_str().to_os_string()),
+            xdg_cache_home: Some(tmp.path().as_os_str().to_os_string()),
+            home_dir: None,
             uid: nix::unistd::geteuid().as_raw(),
             namespace: hyoui::cli::DEFAULT_NAMESPACE.to_string(),
         };
         let got = resolve_with_env(None, "x", &env).expect("resolve");
         assert!(
             got.starts_with(tmp.path()),
-            "should fall back to /tmp base (test override)"
+            "should fall back to XDG cache base"
         );
     }
 
+    /// XDG runtime が使えない場合、XDG cache を fallback として使い、作成する
+    /// `hyoui` dir は同 UID のみアクセスできる mode 0700 にする。
     #[test]
-    fn tmpdir_used_when_xdg_unset() {
-        let tmp = tempfile::Builder::new()
-            .prefix("hyoui-tmp-")
+    fn xdg_cache_home_used_when_runtime_unset() {
+        let cache = tempfile::Builder::new()
+            .prefix("hyoui-cache-")
             .tempdir()
             .expect("tempdir");
-        let uid = nix::unistd::geteuid().as_raw();
-        let env = env_with(None, Some(tmp.path()));
+        let env = env_with(None, Some(cache.path()));
         let got = resolve_with_env(None, "mysession", &env).expect("resolve");
-        assert_eq!(
-            got,
-            tmp.path()
-                .join(format!("hyoui-{uid}"))
-                .join("mysession.sock")
-        );
+        assert_eq!(got, cache.path().join("hyoui").join("mysession.sock"));
         let parent = got.parent().unwrap();
         let meta = std::fs::metadata(parent).expect("meta");
         assert_eq!(meta.permissions().mode() & 0o777, 0o700);
     }
 
+    /// XDG cache も未設定なら HOME 配下の `.cache/hyoui` を fallback にする。
     #[test]
-    fn tmpdir_defaults_to_slash_tmp() {
-        // /tmp は通常 mode 1777 (sticky)。`hyoui-<uid>` という subdirは存在しない
-        // 想定なので、resolve は新規作成して mode 0700 にする。
-        // ここでは /tmp が書き込み可能か (= CI runner で書ける) を期待。
-        let env = env_with(None, None);
-        let unique_sid = format!("test-default-tmp-{}-{}", std::process::id(), rand_token());
-        let got = resolve_with_env(None, &unique_sid, &env).expect("resolve");
-        let uid = nix::unistd::geteuid().as_raw();
-        assert!(
-            got.starts_with(format!("/tmp/hyoui-{uid}")),
-            "expected /tmp/hyoui-<uid>/..., got {got:?}"
+    fn home_cache_used_when_xdg_dirs_unset() {
+        let home = tempfile::Builder::new()
+            .prefix("hyoui-home-")
+            .tempdir()
+            .expect("tempdir");
+        let env = EnvSnapshot {
+            xdg_runtime_dir: None,
+            xdg_cache_home: None,
+            home_dir: Some(home.path().as_os_str().to_os_string()),
+            uid: nix::unistd::geteuid().as_raw(),
+            namespace: hyoui::cli::DEFAULT_NAMESPACE.to_string(),
+        };
+        let got = resolve_with_env(None, "mysession", &env).expect("resolve");
+        assert_eq!(
+            got,
+            home.path()
+                .join(".cache")
+                .join("hyoui")
+                .join("mysession.sock")
         );
-        // cleanup: 作った dir 配下を消す (子 sock file は無いので dir のみ削除)
-        let _ = std::fs::remove_dir_all(format!("/tmp/hyoui-{uid}"));
+        assert_eq!(
+            std::fs::metadata(got.parent().unwrap())
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    /// fallback の根になる環境変数が両方無ければ、意図しない相対 path を作らず失敗する。
+    #[test]
+    fn missing_cache_and_home_is_an_error() {
+        let env = env_with(None, None);
+        let err = resolve_with_env(None, "mysession", &env).expect_err("must err");
+        assert!(err.to_string().contains("XDG_CACHE_HOME"));
+        assert!(err.to_string().contains("HOME"));
     }
 
     #[test]
@@ -585,16 +637,6 @@ mod tests {
         assert_eq!(got, PathBuf::from("/tmp/explicit.sock"));
     }
 
-    fn rand_token() -> String {
-        // 単純な「test ごとに変わる」値、衝突確率は低い
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-            .to_string()
-    }
-
     // ------------------------------------------------------------------
     // DR-0018: namespace resolution / socket dir 分離
     // ------------------------------------------------------------------
@@ -606,15 +648,9 @@ mod tests {
             .prefix("hyoui-ns-default-")
             .tempdir()
             .expect("tempdir");
-        let uid = nix::unistd::geteuid().as_raw();
         let env = env_with_ns(None, Some(tmp.path()), "default");
         let got = resolve_with_env(None, "mysession", &env).expect("resolve");
-        assert_eq!(
-            got,
-            tmp.path()
-                .join(format!("hyoui-{uid}"))
-                .join("mysession.sock")
-        );
+        assert_eq!(got, tmp.path().join("hyoui").join("mysession.sock"));
     }
 
     /// 非 default namespace は base dir 配下に `<ns>/` サブ dir を掘る。
@@ -624,15 +660,11 @@ mod tests {
             .prefix("hyoui-ns-sub-")
             .tempdir()
             .expect("tempdir");
-        let uid = nix::unistd::geteuid().as_raw();
         let env = env_with_ns(None, Some(tmp.path()), "workers");
         let got = resolve_with_env(None, "w1", &env).expect("resolve");
         assert_eq!(
             got,
-            tmp.path()
-                .join(format!("hyoui-{uid}"))
-                .join("workers")
-                .join("w1.sock")
+            tmp.path().join("hyoui").join("workers").join("w1.sock")
         );
         // ns dir も base dir も mode 0700。
         let ns_dir = got.parent().unwrap();
@@ -693,7 +725,7 @@ mod tests {
     /// friendly error (= 現在長 / 上限 / 短くする方法を含む) を返す。
     #[test]
     fn resolve_rejects_too_long_sun_path() {
-        // base `/tmp/hyoui-<uid>/<ns>/<sid>.sock` を上限超えにするため、ns + sid を
+        // 長い cache base + `<ns>/<sid>.sock` を上限超えにするため、ns + sid を
         // それぞれ MAX 長近くまで伸ばす。各 component は whitelist 長制限内に収め、
         // 合計 path 長で sun_path 上限を超えさせる。
         let max_comp = hyoui::cli::MAX_SESSION_ID_LEN; // ns/sid 共通の上限想定
