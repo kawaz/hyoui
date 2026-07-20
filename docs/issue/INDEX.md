@@ -4,7 +4,6 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
-| 2026-07-21 | bug | open | [bug-screen-dump-empty-while-tail-has-output](./2026-07-21-bug-screen-dump-empty-while-tail-has-output.md) | screen dump/snapshot が空 (seqno=0) を返す — idle 15s の stalled auto-reset が false-positive で cells 全消し |
 | 2026-07-21 | request | idea | [screen-region-watch-api](./2026-07-21-screen-region-watch-api.md) | screen 仮想スクリーンの部分切り出し API + 監視エリアのマッチング検出インターフェース (DR-0025 母体、web ターミナル完了後着手) |
 | 2026-07-21 | design | open | [screen-overlay-general-mechanism](./2026-07-21-screen-overlay-general-mechanism.md) | screen state への動的仮想オーバーレイ一般機構 (DR-0013 延長、DR-0026 detach 案内 / web ターミナル ダイアログ用、web ターミナル完了後着手) |
 | 2026-07-20 | bug | open | [socket-dir-tmp-fallback-macos-cleanup](./2026-07-20-socket-dir-tmp-fallback-macos-cleanup.md) | socket dir が /tmp 固定 fallback のため macOS 定期掃除で daemon 生存中に socket file が消える |
