@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="hyoui">
+  <!-- 極力シンプル: 端末風の角丸ダーク背景 + プロンプト "> hy" 表示。凝らない。 -->
+  <rect width="512" height="512" rx="80" fill="#111"/>
+  <g font-family="ui-monospace, 'JetBrains Mono', 'HackGen Console NF', Menlo, monospace" font-weight="700" fill="#6db4ff">
+    <text x="72" y="320" font-size="180">&gt;</text>
+    <text x="200" y="320" font-size="180" fill="#e0e0e0">hy</text>
+  </g>
+</svg>

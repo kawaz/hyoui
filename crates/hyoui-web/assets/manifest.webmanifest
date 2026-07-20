@@ -1,0 +1,19 @@
+{
+  "name": "hyoui web",
+  "short_name": "hyoui",
+  "description": "hyoui web gateway (session list / terminal viewer).",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#111111",
+  "theme_color": "#111111",
+  "icons": [
+    {
+      "src": "/assets/icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "any",
+      "purpose": "any"
+    }
+  ]
+}

@@ -177,6 +177,9 @@
 
   autoEl.addEventListener('change', schedule);
   refreshBtn.addEventListener('click', () => { fetchScreen(); refreshSessionStatus(); });
+  // PWA (standalone) 用の全ページリロード。詳細は index.js の該当箇所参照。
+  const reloadBtn = document.getElementById('reload');
+  if (reloadBtn) reloadBtn.addEventListener('click', () => location.reload());
   fetchScreen();
   refreshSessionStatus();
   schedule();

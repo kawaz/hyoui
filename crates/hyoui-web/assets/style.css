@@ -52,8 +52,27 @@ header h1 a {
   color: var(--muted);
   font-size: 0.85rem;
   margin: 0.25rem 0 1rem 0;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
 }
-.meta .sep { margin: 0 0.5rem; }
+.meta .sep { margin: 0 0.2rem; }
+/* 幅が変動する status text は行末に置く前提 (index.html/session.html) で、
+   等幅数字 + min-width で更新のたびのちらつきを抑える。 */
+.status-text {
+  font-variant-numeric: tabular-nums;
+  min-width: 22ch;
+  display: inline-block;
+}
+/* 固定位置の丸ボタン (reload)。PWA (standalone) でアドレスバーが無い時の全ページリロード。
+   通常の in-page refresh (screen 更新) と紛らわしくないよう ↻ アイコンを使い、
+   `refresh` button は「screen を再取得」と役割分担。 */
+.reload-btn {
+  padding: 0.15rem 0.5rem;
+  font-size: 1rem;
+  line-height: 1;
+}
 button {
   font: inherit;
   padding: 0.15rem 0.6rem;

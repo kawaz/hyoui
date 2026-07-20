@@ -559,6 +559,7 @@ fn content_type_for(path: &str) -> &'static str {
         "woff2" => "font/woff2",
         "woff" => "font/woff",
         "ttf" => "font/ttf",
+        "webmanifest" => "application/manifest+json; charset=utf-8",
         _ => "application/octet-stream",
     }
 }
@@ -774,6 +775,53 @@ mod tests {
             !csp.to_ascii_lowercase().contains("frame-ancestors"),
             "CSP frame-ancestors should not be set: {csp}"
         );
+    }
+
+    #[tokio::test]
+    async fn manifest_and_icon_served() {
+        // PWA 用の manifest / icon が embedded 経路で正しい content-type で配信されること。
+        let app = router(hyoui::config::Config::default(), None);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/manifest.webmanifest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.starts_with("application/manifest+json"),
+            "manifest ct={ct}"
+        );
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("manifest is JSON");
+        assert_eq!(json["name"], "hyoui web");
+        assert_eq!(json["display"], "standalone");
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/icon.svg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(ct, "image/svg+xml", "icon ct={ct}");
     }
 
     #[tokio::test]

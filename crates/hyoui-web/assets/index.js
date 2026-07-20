@@ -109,6 +109,10 @@
 
   autoEl.addEventListener('change', schedule);
   refreshBtn.addEventListener('click', fetchSessions);
+  // PWA (standalone) 用の全ページリロード。アドレスバーの再読み込みが無い
+  // ホーム画面追加時の retreat 手段。screen refresh (= 一覧再取得) と役割分担。
+  const reloadBtn = document.getElementById('reload');
+  if (reloadBtn) reloadBtn.addEventListener('click', () => location.reload());
   fetchSessions();
   schedule();
 })();

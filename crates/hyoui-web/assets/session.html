@@ -3,6 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="hyoui">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#111111">
+<link rel="manifest" href="/assets/manifest.webmanifest">
+<link rel="icon" type="image/svg+xml" href="/assets/icon.svg">
+<link rel="apple-touch-icon" href="/assets/icon.svg">
 <title>hyoui — session</title>
 <link rel="stylesheet" href="/assets/vendor/xterm.css">
 <link rel="stylesheet" href="/assets/style.css">
@@ -11,10 +19,14 @@
 <header>
   <h1><a href="/">← sessions</a> / <span id="sid"></span></h1>
   <p class="meta">
-    <span id="status">loading…</span>
-    <span class="sep">·</span>
-    <label><input type="checkbox" id="auto" checked> auto refresh</label>
+    <!-- 固定幅要素を先 (端) に配置してレイアウトシフトを防ぐ (task 3):
+         status の text は末尾に置き、幅変動が後続要素を押さないようにする。
+         reload ボタンは PWA (standalone) でアドレスバー無し時の全ページリロード用 (task 4)。 -->
+    <button id="reload" class="reload-btn" type="button" title="reload page (PWA 用)" aria-label="reload page">↻</button>
     <button id="refresh" type="button">refresh</button>
+    <label><input type="checkbox" id="auto" checked> auto refresh</label>
+    <span class="sep">·</span>
+    <span id="status" class="status-text">loading…</span>
   </p>
 </header>
 <main>
