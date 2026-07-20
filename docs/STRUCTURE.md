@@ -90,7 +90,7 @@ crates/
     src/
       main.rs        # entry point、cli.rs の Command を dispatch
       daemonize.rs   # double fork + setsid (--detached)
-      socket_path.rs # socket dir resolver (XDG runtime / cache fallback)
+      socket_path.rs # socket dir resolver (XDG runtime / state fallback)
       input_handlers.rs # input family の subcommand handler
       wait_core.rs   # state-based wait polling (snapshot 発火 + cells → text 構築)
       completion.rs  # shell completion 生成

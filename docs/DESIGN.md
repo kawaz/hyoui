@@ -47,7 +47,7 @@ model is close to abduco / shpool.
 - The daemon exits as soon as the child exits, even while all clients are
   detached
 - Socket placement: `$XDG_RUNTIME_DIR/hyoui/<session>.sock` when available,
-  otherwise `${XDG_CACHE_HOME:-$HOME/.cache}/hyoui/<session>.sock`. `$TMPDIR` is
+  otherwise `${XDG_STATE_HOME:-$HOME/.local/state}/hyoui/<session>.sock`. `$TMPDIR` is
   not consulted; the completed path is checked against the platform `sun_path` limit.
 - Directory mode 0700, socket mode 0600 (same-UID trust boundary)
 
@@ -107,7 +107,7 @@ crates/
     src/
       main.rs       # entry point, dispatches the Command enum from cli.rs
       daemonize.rs  # double fork + setsid (--detached)
-      socket_path.rs # socket directory resolver (XDG runtime / cache fallback)
+      socket_path.rs # socket directory resolver (XDG runtime / state fallback)
       input_handlers.rs # subcommand handlers for the input family
       wait_core.rs  # state-based wait polling (snapshot trigger + cells → text)
       completion.rs # shell completion generation

@@ -1665,7 +1665,7 @@ fn print_list_jsonl(entries: &[ListEntry]) {
 
 /// hyoui base socket dir 候補 (= namespace を含めない `hyoui` まで) を返す。
 ///
-/// resolver と同じ優先順位 (`XDG_RUNTIME_DIR` → XDG cache fallback) で実在する
+/// resolver と同じ優先順位 (`XDG_RUNTIME_DIR` → XDG state fallback) で実在する
 /// dir だけを列挙する。起動 path と `hyoui list` の探索 path は必ず同期させる。
 fn base_socket_dirs() -> Vec<std::path::PathBuf> {
     socket_path::existing_base_dirs()

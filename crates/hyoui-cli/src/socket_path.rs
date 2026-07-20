@@ -5,10 +5,10 @@
 //!
 //! 1. `$XDG_RUNTIME_DIR` が set されていて、かつ実在 dir なら `$XDG_RUNTIME_DIR/hyoui/`
 //!    (Linux の典型、`/run/user/<uid>` が systemd-logind 等で mode 0700 で provision される)
-//! 2. それ以外は `${XDG_CACHE_HOME:-$HOME/.cache}/hyoui/`:
-//!    `${XDG_CACHE_HOME:-$HOME/.cache}/hyoui/<session>.sock`
+//! 2. それ以外は `${XDG_STATE_HOME:-$HOME/.local/state}/hyoui/`:
+//!    `${XDG_STATE_HOME:-$HOME/.local/state}/hyoui/<session>.sock`
 //!    - macOS が daemon 生存中の `/tmp` を定期掃除して socket file だけを消し、
-//!      session を外側から到達不能にするため、ユーザ管理下の cache dir を使う。
+//!      session を外側から到達不能にするため、ユーザ管理下の state dir を使う。
 //!    - dir は **新規作成時** mode 0700。既存 dir は所有者と mode を verify
 //!    - unix socket の `sun_path` 上限 (macOS 104 / Linux 108 bytes) は、完成 path を
 //!      [`check_sun_path_len`] で bind 前に検査する。
@@ -132,7 +132,7 @@ pub fn resolve_namespace(flag: Option<&str>) -> String {
 /// `explicit = Some(p)` ならそのまま、`None` なら自動 path:
 /// - `default` namespace → base dir 直下:
 ///   `$XDG_RUNTIME_DIR/hyoui/<sid>.sock` (= dir 実在時) /
-///   `${XDG_CACHE_HOME:-$HOME/.cache}/hyoui/<sid>.sock`
+///   `${XDG_STATE_HOME:-$HOME/.local/state}/hyoui/<sid>.sock`
 /// - それ以外 → `<base>/<namespace>/<sid>.sock`
 ///
 /// parent dir は **新規作成時のみ** mode 0700 で create、既存 dir は所有者/mode 検証。
@@ -149,7 +149,7 @@ pub fn resolve_in_namespace(
 ) -> std::io::Result<PathBuf> {
     let env = EnvSnapshot {
         xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR"),
-        xdg_cache_home: std::env::var_os("XDG_CACHE_HOME"),
+        xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
         home_dir: std::env::var_os("HOME"),
         uid: nix::unistd::geteuid().as_raw(),
         namespace: namespace.to_string(),
@@ -162,9 +162,9 @@ pub fn resolve_in_namespace(
 pub struct EnvSnapshot {
     /// `$XDG_RUNTIME_DIR` の値 (= 未設定なら None)。
     pub xdg_runtime_dir: Option<OsString>,
-    /// `$XDG_CACHE_HOME` の値 (= 未設定なら None)。
-    pub xdg_cache_home: Option<OsString>,
-    /// `$HOME` の値 (= 未設定なら None)。XDG cache 未設定時に `.cache` を補う。
+    /// `$XDG_STATE_HOME` の値 (= 未設定なら None)。
+    pub xdg_state_home: Option<OsString>,
+    /// `$HOME` の値 (= 未設定なら None)。XDG state 未設定時に `.local/state` を補う。
     pub home_dir: Option<OsString>,
     /// 現在の effective UID。
     pub uid: u32,
@@ -222,7 +222,7 @@ fn check_sun_path_len(path: &Path, namespace: &str, session_id: &str) -> std::io
                 "socket path が unix domain socket の上限を超えています \
                  (現在 {len} bytes > 上限 {max} bytes): {}\n\
                  \x20      namespace ({namespace:?}) か session 名 ({session_id:?}) を \
-                 短くするか、より短い XDG_RUNTIME_DIR / XDG_CACHE_HOME を指定してください。",
+                 短くするか、より短い XDG_RUNTIME_DIR / XDG_STATE_HOME を指定してください。",
                 path.display()
             ),
         ));
@@ -233,8 +233,8 @@ fn check_sun_path_len(path: &Path, namespace: &str, session_id: &str) -> std::io
 /// namespace を含めない base socket dir を選ぶ。
 ///
 /// 1. `XDG_RUNTIME_DIR` が空でなく実在 dir → `$XDG_RUNTIME_DIR/hyoui`
-/// 2. `XDG_CACHE_HOME` が空でない → `$XDG_CACHE_HOME/hyoui`
-/// 3. それ以外 → `$HOME/.cache/hyoui`
+/// 2. `XDG_STATE_HOME` が空でない → `$XDG_STATE_HOME/hyoui`
+/// 3. それ以外 → `$HOME/.local/state/hyoui`
 fn pick_base_dir(env: &EnvSnapshot) -> std::io::Result<PathBuf> {
     if let Some(xdg) = env.xdg_runtime_dir.as_ref()
         && !xdg.is_empty()
@@ -244,7 +244,7 @@ fn pick_base_dir(env: &EnvSnapshot) -> std::io::Result<PathBuf> {
             return Ok(p.join("hyoui"));
         }
     }
-    pick_cache_base_dir(env)
+    pick_state_base_dir(env)
 }
 
 /// `hyoui list` が走査する、現在実在する base socket dir を優先順で返す。
@@ -252,7 +252,7 @@ fn pick_base_dir(env: &EnvSnapshot) -> std::io::Result<PathBuf> {
 pub fn existing_base_dirs() -> Vec<PathBuf> {
     let env = EnvSnapshot {
         xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR"),
-        xdg_cache_home: std::env::var_os("XDG_CACHE_HOME"),
+        xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
         home_dir: std::env::var_os("HOME"),
         uid: nix::unistd::geteuid().as_raw(),
         namespace: hyoui::cli::DEFAULT_NAMESPACE.to_string(),
@@ -266,20 +266,20 @@ pub fn existing_base_dirs() -> Vec<PathBuf> {
             dirs.push(runtime_dir);
         }
     }
-    if let Ok(cache_dir) = pick_cache_base_dir(&env)
-        && cache_dir.is_dir()
-        && !dirs.contains(&cache_dir)
+    if let Ok(state_dir) = pick_state_base_dir(&env)
+        && state_dir.is_dir()
+        && !dirs.contains(&state_dir)
     {
-        dirs.push(cache_dir);
+        dirs.push(state_dir);
     }
     dirs
 }
 
-fn pick_cache_base_dir(env: &EnvSnapshot) -> std::io::Result<PathBuf> {
-    if let Some(cache) = env.xdg_cache_home.as_ref()
-        && !cache.is_empty()
+fn pick_state_base_dir(env: &EnvSnapshot) -> std::io::Result<PathBuf> {
+    if let Some(state) = env.xdg_state_home.as_ref()
+        && !state.is_empty()
     {
-        return Ok(PathBuf::from(cache).join("hyoui"));
+        return Ok(PathBuf::from(state).join("hyoui"));
     }
     let home = env
         .home_dir
@@ -288,10 +288,13 @@ fn pick_cache_base_dir(env: &EnvSnapshot) -> std::io::Result<PathBuf> {
         .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "socket dir を解決できません: XDG_CACHE_HOME または HOME を設定してください",
+                "socket dir を解決できません: XDG_STATE_HOME または HOME を設定してください",
             )
         })?;
-    Ok(PathBuf::from(home).join(".cache").join("hyoui"))
+    Ok(PathBuf::from(home)
+        .join(".local")
+        .join("state")
+        .join("hyoui"))
 }
 
 /// `dir` を「mode 0700 + 所有者 = euid」で利用可能にする。
@@ -334,14 +337,14 @@ fn ensure_socket_dir(dir: &Path, expected_uid: u32) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    fn env_with(xdg: Option<&Path>, cache: Option<&Path>) -> EnvSnapshot {
-        env_with_ns(xdg, cache, hyoui::cli::DEFAULT_NAMESPACE)
+    fn env_with(xdg: Option<&Path>, state: Option<&Path>) -> EnvSnapshot {
+        env_with_ns(xdg, state, hyoui::cli::DEFAULT_NAMESPACE)
     }
 
-    fn env_with_ns(xdg: Option<&Path>, cache: Option<&Path>, ns: &str) -> EnvSnapshot {
+    fn env_with_ns(xdg: Option<&Path>, state: Option<&Path>, ns: &str) -> EnvSnapshot {
         EnvSnapshot {
             xdg_runtime_dir: xdg.map(|p| p.as_os_str().to_os_string()),
-            xdg_cache_home: cache.map(|p| p.as_os_str().to_os_string()),
+            xdg_state_home: state.map(|p| p.as_os_str().to_os_string()),
             home_dir: None,
             uid: nix::unistd::geteuid().as_raw(),
             namespace: ns.to_string(),
@@ -430,7 +433,7 @@ mod tests {
             .expect("tempdir");
         let env = EnvSnapshot {
             xdg_runtime_dir: Some(OsString::new()), // 空 string は無視
-            xdg_cache_home: Some(tmp.path().as_os_str().to_os_string()),
+            xdg_state_home: Some(tmp.path().as_os_str().to_os_string()),
             home_dir: None,
             uid: nix::unistd::geteuid().as_raw(),
             namespace: hyoui::cli::DEFAULT_NAMESPACE.to_string(),
@@ -438,13 +441,13 @@ mod tests {
         let got = resolve_with_env(None, "x", &env).expect("resolve");
         assert!(
             got.starts_with(tmp.path()),
-            "should use XDG_CACHE_HOME fallback, got {got:?}"
+            "should use XDG_STATE_HOME fallback, got {got:?}"
         );
     }
 
     #[test]
     fn xdg_runtime_dir_ignored_when_not_a_dir() {
-        // 存在しない runtime path → XDG cache fallback
+        // 存在しない runtime path → XDG state fallback
         let tmp = tempfile::Builder::new()
             .prefix("hyoui-tmp-")
             .tempdir()
@@ -452,7 +455,7 @@ mod tests {
         let bogus = PathBuf::from("/this/path/does/not/exist/probably/abc123");
         let env = EnvSnapshot {
             xdg_runtime_dir: Some(bogus.as_os_str().to_os_string()),
-            xdg_cache_home: Some(tmp.path().as_os_str().to_os_string()),
+            xdg_state_home: Some(tmp.path().as_os_str().to_os_string()),
             home_dir: None,
             uid: nix::unistd::geteuid().as_raw(),
             namespace: hyoui::cli::DEFAULT_NAMESPACE.to_string(),
@@ -460,36 +463,36 @@ mod tests {
         let got = resolve_with_env(None, "x", &env).expect("resolve");
         assert!(
             got.starts_with(tmp.path()),
-            "should fall back to XDG cache base"
+            "should fall back to XDG state base"
         );
     }
 
-    /// XDG runtime が使えない場合、XDG cache を fallback として使い、作成する
+    /// XDG runtime が使えない場合、XDG state を fallback として使い、作成する
     /// `hyoui` dir は同 UID のみアクセスできる mode 0700 にする。
     #[test]
-    fn xdg_cache_home_used_when_runtime_unset() {
-        let cache = tempfile::Builder::new()
-            .prefix("hyoui-cache-")
+    fn xdg_state_home_used_when_runtime_unset() {
+        let state = tempfile::Builder::new()
+            .prefix("hyoui-state-")
             .tempdir()
             .expect("tempdir");
-        let env = env_with(None, Some(cache.path()));
+        let env = env_with(None, Some(state.path()));
         let got = resolve_with_env(None, "mysession", &env).expect("resolve");
-        assert_eq!(got, cache.path().join("hyoui").join("mysession.sock"));
+        assert_eq!(got, state.path().join("hyoui").join("mysession.sock"));
         let parent = got.parent().unwrap();
         let meta = std::fs::metadata(parent).expect("meta");
         assert_eq!(meta.permissions().mode() & 0o777, 0o700);
     }
 
-    /// XDG cache も未設定なら HOME 配下の `.cache/hyoui` を fallback にする。
+    /// XDG state も未設定なら HOME 配下の `.local/state/hyoui` を fallback にする。
     #[test]
-    fn home_cache_used_when_xdg_dirs_unset() {
+    fn home_state_used_when_xdg_dirs_unset() {
         let home = tempfile::Builder::new()
             .prefix("hyoui-home-")
             .tempdir()
             .expect("tempdir");
         let env = EnvSnapshot {
             xdg_runtime_dir: None,
-            xdg_cache_home: None,
+            xdg_state_home: None,
             home_dir: Some(home.path().as_os_str().to_os_string()),
             uid: nix::unistd::geteuid().as_raw(),
             namespace: hyoui::cli::DEFAULT_NAMESPACE.to_string(),
@@ -498,7 +501,8 @@ mod tests {
         assert_eq!(
             got,
             home.path()
-                .join(".cache")
+                .join(".local")
+                .join("state")
                 .join("hyoui")
                 .join("mysession.sock")
         );
@@ -514,10 +518,10 @@ mod tests {
 
     /// fallback の根になる環境変数が両方無ければ、意図しない相対 path を作らず失敗する。
     #[test]
-    fn missing_cache_and_home_is_an_error() {
+    fn missing_state_and_home_is_an_error() {
         let env = env_with(None, None);
         let err = resolve_with_env(None, "mysession", &env).expect_err("must err");
-        assert!(err.to_string().contains("XDG_CACHE_HOME"));
+        assert!(err.to_string().contains("XDG_STATE_HOME"));
         assert!(err.to_string().contains("HOME"));
     }
 
@@ -725,7 +729,7 @@ mod tests {
     /// friendly error (= 現在長 / 上限 / 短くする方法を含む) を返す。
     #[test]
     fn resolve_rejects_too_long_sun_path() {
-        // 長い cache base + `<ns>/<sid>.sock` を上限超えにするため、ns + sid を
+        // 長い state base + `<ns>/<sid>.sock` を上限超えにするため、ns + sid を
         // それぞれ MAX 長近くまで伸ばす。各 component は whitelist 長制限内に収め、
         // 合計 path 長で sun_path 上限を超えさせる。
         let max_comp = hyoui::cli::MAX_SESSION_ID_LEN; // ns/sid 共通の上限想定

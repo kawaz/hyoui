@@ -107,7 +107,7 @@ impl UnixSock {
         if mode != 0o700 {
             return Err(Error::Precondition(
                 "socket parent directory must be mode 0700 \
-                 (use $XDG_RUNTIME_DIR/hyoui or ${XDG_CACHE_HOME:-$HOME/.cache}/hyoui, or run `chmod 700 <parent>`)",
+                 (use $XDG_RUNTIME_DIR/hyoui or ${XDG_STATE_HOME:-$HOME/.local/state}/hyoui, or run `chmod 700 <parent>`)",
             ));
         }
         let euid = nix::unistd::geteuid();
@@ -115,7 +115,7 @@ impl UnixSock {
             return Err(Error::Precondition(
                 "socket parent directory must be owned by current euid \
                  (= 別 user 所有の dir を --socket で指定した可能性。\
-                 hyoui の自動 path ($XDG_RUNTIME_DIR/hyoui or ${XDG_CACHE_HOME:-$HOME/.cache}/hyoui) を使う)",
+                 hyoui の自動 path ($XDG_RUNTIME_DIR/hyoui or ${XDG_STATE_HOME:-$HOME/.local/state}/hyoui) を使う)",
             ));
         }
         Ok(())
@@ -251,7 +251,7 @@ mod tests {
         );
         // hint: 推奨 dir + 直し方
         assert!(
-            msg.contains("XDG_RUNTIME_DIR") && msg.contains("XDG_CACHE_HOME"),
+            msg.contains("XDG_RUNTIME_DIR") && msg.contains("XDG_STATE_HOME"),
             "error must hint at XDG runtime and cache socket dirs; got: {msg}"
         );
         assert!(

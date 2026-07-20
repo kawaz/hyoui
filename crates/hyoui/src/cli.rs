@@ -3666,8 +3666,8 @@ fn usage_run() -> String {
         ENVIRONMENT:\n    \
             SHELL                  Fallback command when none is given (legacy)\n    \
             XDG_RUNTIME_DIR        Preferred base for the auto-generated socket path\n    \
-            XDG_CACHE_HOME         Fallback base when XDG_RUNTIME_DIR is unavailable\n                                   \
-                (otherwise $HOME/.cache/hyoui is used; TMPDIR is not consulted)\n    \
+            XDG_STATE_HOME         Fallback base when XDG_RUNTIME_DIR is unavailable\n                                   \
+                (otherwise $HOME/.local/state/hyoui is used; TMPDIR is not consulted)\n    \
             HYOUI_NAMESPACE        Session namespace (= --namespace の env 経路、flag 優先)\n    \
             HYOUI_SCROLLBACK_ROWS  --scrollback-rows と同じ値を env で渡す\n                                   \
                 (--scrollback-rows 指定時は flag 優先)\n    \
@@ -4000,7 +4000,7 @@ fn usage_list() -> String {
         SCAN ORDER (= socket_path::resolve_in_namespace と同順、最初に見つかった dir のみ):\n    \
             default namespace: base dir 直下 (= 既存互換):\n    \
             \x20 1. $XDG_RUNTIME_DIR/hyoui/\n    \
-            \x20 2. ${XDG_CACHE_HOME:-$HOME/.cache}/hyoui/  (= $TMPDIR は読まない)\n    \
+            \x20 2. ${XDG_STATE_HOME:-$HOME/.local/state}/hyoui/  (= $TMPDIR は読まない)\n    \
             その他 namespace: <base>/<ns>/。--all-namespaces は base 配下のサブ dir も走査。\n\
         \n\
         EXIT CODE:\n    \

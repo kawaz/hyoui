@@ -38,7 +38,7 @@ escape なし）に振る舞いつつ、**外側から監視・自動操作す�
 - **screen 型** (1 daemon 1 socket 1 子) を採用。tmux 型 (1 server 多 session) は不採用 ([[DR-0006]] §1)
 - session の存在は **filesystem が source of truth** (`hyoui list` は socket dir 走査)
 - daemon は子 exit で即終了、全 client detach 中でも生存
-- socket 配置: `$XDG_RUNTIME_DIR/hyoui/<session>.sock` を優先し、利用できなければ `${XDG_CACHE_HOME:-$HOME/.cache}/hyoui/<session>.sock`。`$TMPDIR` は参照せず、完成 path を platform の `sun_path` 上限に対して検査する
+- socket 配置: `$XDG_RUNTIME_DIR/hyoui/<session>.sock` を優先し、利用できなければ `${XDG_STATE_HOME:-$HOME/.local/state}/hyoui/<session>.sock`。`$TMPDIR` は参照せず、完成 path を platform の `sun_path` 上限に対して検査する
 - dir mode 0700 / sock mode 0600（同 UID 信頼境界）
 
 ## 2. アーキテクチャ
@@ -96,7 +96,7 @@ crates/
     src/
       main.rs       # entry point、cli.rs の Command を dispatch
       daemonize.rs  # double fork + setsid (--detached)
-      socket_path.rs # socket dir resolver (XDG runtime / cache fallback)
+      socket_path.rs # socket dir resolver (XDG runtime / state fallback)
       input_handlers.rs # input family の subcommand handler
       wait_core.rs  # state-based wait polling (= snapshot 発火 + cells → text 構築)
       completion.rs # shell completion 生成
