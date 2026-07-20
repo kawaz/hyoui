@@ -151,6 +151,10 @@ pub struct WebConfig {
     /// `--listen=<host:port>`。`None` なら config.toml `[web].listen`、それも無ければ
     /// `127.0.0.1:43690` (= 0xAAAA、DR-0027 §Decision.2)。
     pub listen: Option<String>,
+    /// `--web-assets-dir=<path>` (= DR-0027 §4 開発モード)。指定時は埋め込み
+    /// assets ではなくローカル dir を都度読む。`None` の時は config
+    /// `[web].assets_dir` にフォールバック、それも `None` なら埋め込みを使う。
+    pub assets_dir: Option<std::path::PathBuf>,
 }
 
 /// Fully parsed `run` subcommand configuration.
@@ -2399,16 +2403,24 @@ pub fn usage(topic: &HelpTopic) -> String {
 /// `hyoui web` subcommand の usage (DR-0027 Phase 1)。
 fn usage_web() -> String {
     "\
-hyoui web [--listen=<host:port>]
+hyoui web [--listen=<host:port>] [--web-assets-dir=<path>]
 
-Start the HTTP gateway that exposes hyoui sessions over REST (DR-0027 Phase 1).
+Start the HTTP gateway that exposes hyoui sessions over REST + HTML UI
+(DR-0027 Phase 1/2).
 
 Options:
-  --listen=<host:port>  Override bind address (default: config `[web].listen`
-                        or `127.0.0.1:43690`).
-  --help, -h            Show this help.
+  --listen=<host:port>       Override bind address (default: config
+                             `[web].listen` or `127.0.0.1:43690`).
+  --web-assets-dir=<path>    Serve static assets from a local directory (dev
+                             mode). Falls back to config `[web].assets_dir`;
+                             when both are unset, the release build's
+                             embedded assets are used.
+  --help, -h                 Show this help.
 
 Endpoints:
+  GET  /                           HTML session list page.
+  GET  /sessions/:id               HTML session view (xterm.js + input form).
+  GET  /assets/*                   Static assets (HTML/JS/CSS + vendored xterm.js).
   GET  /api/sessions               List live sessions as JSON.
   GET  /api/sessions/:id/screen    ANSI dump of the session's screen
                                    (text/plain; charset=utf-8).
@@ -3582,6 +3594,7 @@ fn parse_record_list(args: &[String]) -> Command {
 /// `hyoui web [--listen=<host:port>]` (= DR-0027 Phase 1)。
 fn parse_web(args: &[String]) -> Command {
     let mut listen: Option<String> = None;
+    let mut assets_dir: Option<std::path::PathBuf> = None;
     let mut i = 0usize;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -3605,13 +3618,29 @@ fn parse_web(args: &[String]) -> Command {
                     _ => return Command::Error("web: --listen requires a value".into()),
                 }
             }
+            _ if arg.starts_with("--web-assets-dir=") => {
+                let v = &arg["--web-assets-dir=".len()..];
+                if v.is_empty() {
+                    return Command::Error("web: --web-assets-dir requires a path".into());
+                }
+                assets_dir = Some(std::path::PathBuf::from(v));
+            }
+            "--web-assets-dir" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) if !v.is_empty() => {
+                        assets_dir = Some(std::path::PathBuf::from(v));
+                    }
+                    _ => return Command::Error("web: --web-assets-dir requires a path".into()),
+                }
+            }
             other => {
                 return Command::Error(format!("web: unexpected argument: {other}"));
             }
         }
         i += 1;
     }
-    Command::Web(WebConfig { listen })
+    Command::Web(WebConfig { listen, assets_dir })
 }
 
 fn parse_completion(args: &[String]) -> Command {

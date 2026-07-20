@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hyoui — session</title>
+<link rel="stylesheet" href="/assets/vendor/xterm.css">
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body class="session-page">
+<header>
+  <h1><a href="/">← sessions</a> / <span id="sid"></span></h1>
+  <p class="meta">
+    <span id="status">loading…</span>
+    <span class="sep">·</span>
+    <label><input type="checkbox" id="auto" checked> auto refresh</label>
+    <button id="refresh" type="button">refresh</button>
+  </p>
+</header>
+<main>
+  <div id="term"></div>
+  <form id="inputForm" autocomplete="off">
+    <input type="text" id="inputText" placeholder="input to send..." spellcheck="false">
+    <button type="submit" id="sendEnter">Send + Enter</button>
+    <button type="button" id="sendRaw">Send (no Enter)</button>
+    <button type="button" id="sendKey" title="送信するキーを prompt で入力 (例: Escape, Tab, Ctrl-C, C-a)">Send Key…</button>
+  </form>
+  <p id="sendStatus" class="meta"></p>
+</main>
+<script src="/assets/vendor/xterm.js"></script>
+<script src="/assets/session.js"></script>
+</body>
+</html>

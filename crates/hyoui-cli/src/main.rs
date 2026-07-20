@@ -2267,6 +2267,11 @@ fn web_command(cfg: hyoui::cli::WebConfig) -> ExitCode {
         }
     };
     let listen = cfg.listen.unwrap_or_else(|| config.web.listen.clone());
+    // assets_dir: CLI flag > config `[web].assets_dir` > None (embedded)。
+    let assets_dir = cfg
+        .assets_dir
+        .clone()
+        .or_else(|| config.web.assets_dir.clone());
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -2277,7 +2282,7 @@ fn web_command(cfg: hyoui::cli::WebConfig) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let result = runtime.block_on(hyoui_web::serve(&listen, config));
+    let result = runtime.block_on(hyoui_web::serve(&listen, config, assets_dir));
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

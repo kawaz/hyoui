@@ -30,8 +30,15 @@ use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use include_dir::{Dir, include_dir};
 
 pub use axum;
+
+/// リリースビルドに埋め込む静的アセット (= `crates/hyoui-web/assets/`)。
+///
+/// 開発モードで `--web-assets-dir <path>` (or config `[web].assets_dir`) を
+/// 指定すると、ここではなくローカルディレクトリを都度読む (= DR-0027 §4)。
+static EMBEDDED_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/assets");
 
 /// axum の shared state。
 ///
@@ -42,15 +49,26 @@ struct AppState {
     #[allow(dead_code)]
     // 将来 `[web]` セクションから rate limit / auth を読む余地。現時点では未使用。
     config: Arc<hyoui::config::Config>,
+    /// 開発モードで指定されたローカル assets ディレクトリ (= `--web-assets-dir` /
+    /// config `[web].assets_dir`)。`Some` の時は都度ファイル読み込み、`None` なら
+    /// `EMBEDDED_ASSETS` から返す。
+    assets_dir: Option<Arc<PathBuf>>,
 }
 
 /// axum Router を返す (= test / bin 側で `axum::serve` に渡すか
 /// `tower::ServiceExt::oneshot` で直接叩ける)。
-pub fn router(config: hyoui::config::Config) -> Router {
+///
+/// `assets_dir` が `Some` なら開発モード: `/assets/*` と HTML page 群を
+/// そのディレクトリから都度読む。`None` なら埋め込みアセットを返す。
+pub fn router(config: hyoui::config::Config, assets_dir: Option<PathBuf>) -> Router {
     let state = AppState {
         config: Arc::new(config),
+        assets_dir: assets_dir.map(Arc::new),
     };
     Router::new()
+        .route("/", get(get_index_page))
+        .route("/sessions/{id}", get(get_session_page))
+        .route("/assets/{*path}", get(get_asset))
         .route("/api/sessions", get(get_sessions))
         .route("/api/sessions/{id}/screen", get(get_screen))
         .route("/api/sessions/{id}/input", post(post_input))
@@ -60,8 +78,12 @@ pub fn router(config: hyoui::config::Config) -> Router {
 /// listen アドレスに bind して axum server を回す。
 ///
 /// `hyoui web` subcommand から呼ばれる本体。Ctrl+C で graceful shutdown。
-pub async fn serve(listen: &str, config: hyoui::config::Config) -> std::io::Result<()> {
-    let app = router(config);
+pub async fn serve(
+    listen: &str,
+    config: hyoui::config::Config,
+    assets_dir: Option<PathBuf>,
+) -> std::io::Result<()> {
+    let app = router(config, assets_dir);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!("hyoui web: listening on http://{}", listener.local_addr()?);
     axum::serve(listener, app.into_make_service())
@@ -317,6 +339,75 @@ async fn resolve_socket(id: &str) -> Result<PathBuf, Response> {
     Err(not_found(format!("no session named {id:?}")))
 }
 
+// -----------------------------------------------------------------------------
+// HTML pages + static assets (DR-0027 Phase 2)
+// -----------------------------------------------------------------------------
+
+/// `GET /` — セッション一覧ページ (静的 HTML)。`/api/sessions` は client 側 JS が叩く。
+async fn get_index_page(State(state): State<AppState>) -> Response {
+    serve_asset(&state, "index.html").await
+}
+
+/// `GET /sessions/:id` — セッションページ。`:id` は client 側 JS が URL から抽出する。
+/// server 側では session の存在確認をせず HTML を返す (= 存在チェックは JS が
+/// `/api/sessions/:id/screen` の 404 で扱う。ページ自体は 200 で返す方が
+/// bookmarkable で扱いやすい)。
+async fn get_session_page(Path(_id): Path<String>, State(state): State<AppState>) -> Response {
+    serve_asset(&state, "session.html").await
+}
+
+/// `GET /assets/*path` — 静的アセット配信。
+///
+/// `path` は `..` を含めない (= axum の path parser が normalize するが、
+/// 念のため component 単位で reject する)。埋め込み or ローカル dir から読む。
+async fn get_asset(Path(path): Path<String>, State(state): State<AppState>) -> Response {
+    // Reject any traversal component. `axum::extract::Path` decodes %2E etc.
+    if path.split('/').any(|c| c == ".." || c.is_empty()) {
+        return not_found(format!("invalid asset path: {path:?}"));
+    }
+    serve_asset(&state, &path).await
+}
+
+/// アセットを 1 個返す。開発モード (`assets_dir` set) では tokio::fs、
+/// リリースでは `EMBEDDED_ASSETS` から。存在しない場合は 404。
+async fn serve_asset(state: &AppState, rel: &str) -> Response {
+    let ct = content_type_for(rel);
+    if let Some(dir) = state.assets_dir.as_ref() {
+        let full = dir.join(rel);
+        match tokio::fs::read(&full).await {
+            Ok(bytes) => (StatusCode::OK, [(header::CONTENT_TYPE, ct)], bytes).into_response(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                not_found(format!("asset not found: {rel}"))
+            }
+            Err(e) => internal_error(format!("asset read error: {e}")),
+        }
+    } else {
+        match EMBEDDED_ASSETS.get_file(rel) {
+            Some(f) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, ct)],
+                f.contents().to_vec(),
+            )
+                .into_response(),
+            None => not_found(format!("asset not found: {rel}")),
+        }
+    }
+}
+
+/// 最小限の content-type 判定。UI で使う拡張子のみ扱う。
+fn content_type_for(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" => "application/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "ico" => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+}
+
 fn bad_request(msg: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, msg.into()).into_response()
 }
@@ -361,7 +452,7 @@ mod tests {
     #[tokio::test]
     async fn missing_session_returns_404() {
         // daemon が居ない状態でも router は動く。unknown session_id は 404。
-        let app = router(hyoui::config::Config::default());
+        let app = router(hyoui::config::Config::default(), None);
         let resp = app
             .oneshot(
                 Request::builder()
@@ -376,7 +467,7 @@ mod tests {
 
     #[tokio::test]
     async fn sessions_endpoint_returns_array() {
-        let app = router(hyoui::config::Config::default());
+        let app = router(hyoui::config::Config::default(), None);
         let resp = app
             .oneshot(
                 Request::builder()
@@ -394,8 +485,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn index_page_serves_html_with_xterm_ref() {
+        // 埋め込みモードで / が index.html を返す (= session.html は xterm.js を参照)。
+        let app = router(hyoui::config::Config::default(), None);
+        let resp = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.starts_with("text/html"), "content-type={ct}");
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(s.contains("<title>"), "body missing title: {s}");
+        assert!(s.contains("hyoui sessions"), "body missing h1: {s}");
+    }
+
+    #[tokio::test]
+    async fn session_page_returns_html_and_references_xterm() {
+        let app = router(hyoui::config::Config::default(), None);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/anything")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(
+            s.contains("/assets/vendor/xterm.js"),
+            "body missing xterm.js reference: {s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_asset_xterm_js_served() {
+        let app = router(hyoui::config::Config::default(), None);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/vendor/xterm.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.starts_with("application/javascript"), "ct={ct}");
+        let body = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        assert!(body.len() > 1000, "xterm.js too small: {} B", body.len());
+    }
+
+    #[tokio::test]
+    async fn asset_traversal_is_rejected() {
+        let app = router(hyoui::config::Config::default(), None);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/../Cargo.toml")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // axum の path parser が `..` を含む path を正規化する場合もあるが、
+        // 少なくとも 200 で Cargo.toml が返ってはいけない。404 か 400 のいずれか。
+        assert!(
+            resp.status() == StatusCode::NOT_FOUND || resp.status() == StatusCode::BAD_REQUEST,
+            "unexpected status: {}",
+            resp.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn assets_dir_mode_reads_local_file() {
+        // 開発モード (--web-assets-dir) の動作: 一時 dir に index.html を置いて、
+        // router が埋め込みではなくその dir から読むことを確認。
+        let tmp = tempfile::tempdir().unwrap();
+        let custom_body = "<!doctype html><title>custom-index</title>DEVMODE";
+        std::fs::write(tmp.path().join("index.html"), custom_body).unwrap();
+        let app = router(
+            hyoui::config::Config::default(),
+            Some(tmp.path().to_path_buf()),
+        );
+        let resp = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), custom_body);
+    }
+
+    #[tokio::test]
     async fn input_bad_json_returns_400() {
-        let app = router(hyoui::config::Config::default());
+        let app = router(hyoui::config::Config::default(), None);
         // 空 body / 不正 JSON は axum::Json extractor が 400 に落とす。
         let resp = app
             .oneshot(

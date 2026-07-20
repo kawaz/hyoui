@@ -1,0 +1,106 @@
+:root {
+  color-scheme: light dark;
+  --fg: #222;
+  --bg: #fafafa;
+  --muted: #666;
+  --border: #ddd;
+  --accent: #0057b7;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e0e0e0;
+    --bg: #181818;
+    --muted: #999;
+    --border: #333;
+    --accent: #6db4ff;
+  }
+}
+body {
+  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 1rem;
+}
+header h1 {
+  margin: 0 0 0.25rem 0;
+  font-size: 1.2rem;
+}
+header h1 a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.meta {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin: 0.25rem 0 1rem 0;
+}
+.meta .sep { margin: 0 0.5rem; }
+button {
+  font: inherit;
+  padding: 0.15rem 0.6rem;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+  border-radius: 3px;
+  cursor: pointer;
+}
+button:hover { border-color: var(--accent); }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.9rem;
+}
+th, td {
+  border-bottom: 1px solid var(--border);
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  font-weight: 600;
+  color: var(--muted);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+tr.row-stale td { color: var(--muted); }
+td.argv code, td.cwd {
+  font-family: Menlo, "DejaVu Sans Mono", Consolas, monospace;
+  font-size: 0.82rem;
+}
+td.cwd { color: var(--muted); }
+a { color: var(--accent); }
+.empty {
+  padding: 2rem;
+  text-align: center;
+  color: var(--muted);
+}
+
+/* session page */
+.session-page main { display: flex; flex-direction: column; gap: 0.5rem; }
+#term {
+  border: 1px solid var(--border);
+  padding: 4px;
+  background: #111;
+  border-radius: 3px;
+  /* Let xterm.js size itself from cols/rows. */
+  width: fit-content;
+}
+#inputForm {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+#inputText {
+  font-family: Menlo, "DejaVu Sans Mono", Consolas, monospace;
+  font-size: 0.9rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+  border-radius: 3px;
+  flex: 1;
+  min-width: 20ch;
+}

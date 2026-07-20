@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hyoui web — sessions</title>
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<header>
+  <h1>hyoui sessions</h1>
+  <p class="meta">
+    <span id="status">loading…</span>
+    <span class="sep">·</span>
+    <label><input type="checkbox" id="auto" checked> auto refresh</label>
+    <button id="refresh" type="button">refresh</button>
+  </p>
+</header>
+<main>
+  <table id="sessions">
+    <thead>
+      <tr>
+        <th>session_id</th>
+        <th>namespace</th>
+        <th>status</th>
+        <th>clients</th>
+        <th>argv</th>
+        <th>cwd</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+  <p id="empty" class="empty" hidden>No sessions found. Start one with <code>hyoui run &lt;cmd&gt;</code>.</p>
+</main>
+<script src="/assets/index.js"></script>
+</body>
+</html>

@@ -49,6 +49,11 @@ pub struct WebConfig {
     /// 直接晒す場合は将来 DR で auth を扱う。
     #[serde(default = "default_web_listen")]
     pub listen: String,
+
+    /// 静的アセットの開発モード配信元 (= 指定時はローカル dir を都度読む、
+    /// DR-0027 §4)。`None` (default) ならリリースビルドに埋め込まれた assets を返す。
+    #[serde(default)]
+    pub assets_dir: Option<std::path::PathBuf>,
 }
 
 fn default_web_listen() -> String {
@@ -59,6 +64,7 @@ impl Default for WebConfig {
     fn default() -> Self {
         Self {
             listen: default_web_listen(),
+            assets_dir: None,
         }
     }
 }
