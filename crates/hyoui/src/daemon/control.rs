@@ -115,6 +115,23 @@ pub(super) fn handle_client_frame(
 ) -> ClientFrameOutcome {
     match frame.ty {
         TYPE_RAW_DATA => {
+            // DR-0028 §2 (Phase 3): upgrade.request 受理後は新規 raw_data を全 client で
+            // reject する (= 「drain 完了 → exec」意味論、UPG-Q3=a)。error kind は
+            // `upgrade.rejected`。record にも一件だけ痕跡を残したいが hot path なので
+            // per-frame push は避け、ここでは error notify + Continue のみ (record は
+            // upgrade.request 受理時の lifecycle event が代表)。
+            if state.is_upgrade_pending() {
+                let _ = super::broadcast::send_control(
+                    &clients[idx],
+                    ControlMessage::Error(ErrorMessage {
+                        code: ErrorCode::Unknown("upgrade.rejected".to_string()),
+                        message: "raw_data rejected: upgrade in progress (drain awaiting exec)"
+                            .to_string(),
+                        details: None,
+                    }),
+                );
+                return ClientFrameOutcome::Continue;
+            }
             let ch_id = clients[idx].id;
             let ch_mode = clients[idx].mode;
             // DR-0025 Phase 2-β: 認可判定 (Ro / lock holder) + master write + record +
@@ -227,6 +244,7 @@ pub(super) fn handle_control_message(
         }
         ControlMessage::RecordListRequest(_req) => handle_record_list_request(idx, clients, state),
         ControlMessage::SetRequest(req) => handle_set_request(idx, req, clients, state),
+        ControlMessage::UpgradeRequest(req) => handle_upgrade_request(idx, req, clients, state),
         // daemon → client 方向のはずの message が client → daemon に来た or 未実装 kind。
         // DR-0008 §3.2 「未知 kind は decode error」だが、ここに来るのは serde で既知
         // variant なので decode 段階では catch されない。protocol violation として
@@ -249,7 +267,8 @@ pub(super) fn handle_control_message(
         | ControlMessage::RecordStartResponse(_)
         | ControlMessage::RecordStopResponse(_)
         | ControlMessage::RecordListResponse(_)
-        | ControlMessage::SetAck(_) => reject_unexpected_kind(idx, clients),
+        | ControlMessage::SetAck(_)
+        | ControlMessage::UpgradeAck(_) => reject_unexpected_kind(idx, clients),
     }
 }
 
@@ -1180,6 +1199,107 @@ fn handle_set_request(
             ClientFrameOutcome::Continue
         }
     }
+}
+
+/// DR-0028 §2 (Phase 3): `upgrade.request` を受理する。
+///
+/// - cap `upgrade-v1` 必須。
+/// - Ro 拒否 (= set と同じ「観察者に session 挙動を変えさせない」境界)。
+/// - `binary_path` が指定されていれば daemon 側で pre-check (存在 / 実行 bit /
+///   同一 UID) を実施 (= `HYOUI_UPGRADE_EXE_OVERRIDE` env に一時 set して
+///   [`crate::daemon::upgrade::precheck_upgrade_target`] を呼ぶ)。失敗時は
+///   `error` (`upgrade.precheck-failed`) を返し upgrade を中止 (旧 daemon 続行)。
+/// - 通過時は `upgrade.ack` を送信 + `SessionState::set_upgrade_pending()` を
+///   セット。以降 raw_data は reject され、serve_loop 次回 iteration で
+///   `UpgradeRequested` outcome が返る (= drain trivially 満たす、handler は
+///   同期処理なので upgrade.request を受けた時点で先行 raw_data は master fd 書込
+///   済み、これ以上受け付けない)。
+///
+/// 判断ログ:
+/// - `set_upgrade_pending` はコネクション個別の権限判定ではなく **session
+///   全体** の状態遷移なので `SessionState` に置く (= 全 client の raw_data が
+///   一斉に reject される、DR-0028 §2 の drain semantics)。
+/// - 一度 pending が立ったら **解除できない** (= upgrade 中止経路がまだ無い、
+///   pre-check 通過後の execve 失敗 fallback は Phase 3 積み残し / DR §5.2)。
+fn handle_upgrade_request(
+    idx: usize,
+    req: crate::protocol::messages::UpgradeRequest,
+    clients: &mut [ClientHandle],
+    state: &SessionState,
+) -> ClientFrameOutcome {
+    let ch = &clients[idx];
+    if ensure_cap(
+        ch,
+        "upgrade-v1",
+        "upgrade.request requires `upgrade-v1` cap",
+    )
+    .is_err()
+    {
+        return ClientFrameOutcome::Continue;
+    }
+    if ensure_not_ro(ch, "upgrade requires a writable mode (= rw / rw-no-leader)").is_err() {
+        return ClientFrameOutcome::Continue;
+    }
+
+    // binary_path 指定時は precheck target を上書き。unsafe env write を単一 point
+    // に閉じ込めるため handler ローカルで set → precheck → restore する。daemon は
+    // 単スレッド (serve_loop) なのでこの range で他 thread が env を触ることは無い。
+    let saved = std::env::var_os(crate::daemon::upgrade::ENV_UPGRADE_EXE_OVERRIDE);
+    if let Some(bp) = req.binary_path.as_deref() {
+        // SAFETY: daemon は Session::serve loop 内で single-threaded (writer thread は
+        // env を触らない)。upgrade.request handler の範囲でのみ env を触る。
+        unsafe { std::env::set_var(crate::daemon::upgrade::ENV_UPGRADE_EXE_OVERRIDE, bp) };
+    }
+    let precheck_result = crate::daemon::upgrade::precheck_upgrade_target();
+    // saved を復元する (= 呼び出し前状態に戻す。Session::serve 側の precheck も
+    // 通常 unset なので実質的には常に unset に戻すことになる)。
+    match saved {
+        Some(v) => unsafe {
+            std::env::set_var(crate::daemon::upgrade::ENV_UPGRADE_EXE_OVERRIDE, v)
+        },
+        None => unsafe { std::env::remove_var(crate::daemon::upgrade::ENV_UPGRADE_EXE_OVERRIDE) },
+    }
+
+    if let Err(msg) = precheck_result {
+        let _ = send_control(
+            &clients[idx],
+            ControlMessage::Error(ErrorMessage {
+                code: ErrorCode::Unknown("upgrade.precheck-failed".to_string()),
+                message: msg,
+                details: None,
+            }),
+        );
+        return ClientFrameOutcome::Continue;
+    }
+
+    // 受理 → ack 送信 + upgrade_pending flag セット。
+    // ack は cap 付き client 前提なので単一 client への send_control で足りる
+    // (broadcast は Phase 4 の考察対象、必要なら別途)。
+    // pre-check 通過時 binary_path を保存: serve_loop 側の precheck が同じ path で
+    // 再検査するように env をここで恒久 set する (= 短命 set → 復元 だと serve_loop
+    // での再 precheck 時に落ちる)。session-scope の一時 env なので daemon 消滅で自動的に消える。
+    if let Some(bp) = req.binary_path.as_deref() {
+        // SAFETY: 上と同じく daemon single-threaded。
+        unsafe { std::env::set_var(crate::daemon::upgrade::ENV_UPGRADE_EXE_OVERRIDE, bp) };
+    }
+    state.set_upgrade_pending();
+    // DR-0028 §4: 全 attached client のうち cap `upgrade-v1` を持つ者に upgrade.ack
+    // を broadcast する (= 要求元以外にも「upgrade 開始」を知らせる、client 側で
+    // socket EOF 後の auto-reconnect 判断材料とする。client 側 auto-reconnect の
+    // 具体実装は Phase 4 課題、本 broadcast は先行して準備しておく)。
+    // Phase 3 では要求元 client にも同 broadcast 経由で ack が届くのでシンプル化。
+    let _ = super::broadcast::broadcast_control_with_cap(
+        clients,
+        &ControlMessage::UpgradeAck(crate::protocol::messages::UpgradeAck {}),
+        "upgrade-v1",
+    );
+    state
+        .record_registry
+        .push_lifecycle(LifecycleEvent::SessionTerminatedByCondition {
+            reason: "upgrade-request-accepted".to_string(),
+            ts_unix_ms: now_unix_ms(),
+        });
+    ClientFrameOutcome::Continue
 }
 
 /// daemon → client 方向のはずの message が client → daemon に来た or 未実装 kind を

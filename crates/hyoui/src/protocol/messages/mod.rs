@@ -44,6 +44,7 @@ mod session_lifecycle;
 mod settings;
 mod status;
 mod tail;
+mod upgrade;
 
 pub use control::{Resize, Signal};
 pub use error::{ErrorCode, ErrorMessage};
@@ -75,6 +76,7 @@ pub use session_lifecycle::{
 pub use settings::{SetAck, SetRequest};
 pub use status::{ChildLiveState, ClientInfo, OnChildSuspendPolicy, StatusQuery, StatusResponse};
 pub use tail::{TailData, TailEnd, TailEndReason, TailRequest};
+pub use upgrade::{UpgradeAck, UpgradeRequest};
 
 /// CBOR control message の全 kind を包む tagged enum。
 ///
@@ -242,6 +244,18 @@ pub enum ControlMessage {
     /// (DR-0019 Update、cap `set-v1` 要)。
     #[serde(rename = "set.ack")]
     SetAck(SetAck),
+
+    /// `kind = "upgrade.request"` — client → daemon、graceful upgrade 要求
+    /// (DR-0028 §2、cap `upgrade-v1` 要)。
+    #[serde(rename = "upgrade.request")]
+    UpgradeRequest(UpgradeRequest),
+
+    /// `kind = "upgrade.ack"` — daemon → client、`upgrade.request` の受理応答
+    /// (DR-0028 §2、cap `upgrade-v1` 要)。ack 後 daemon は raw_data を reject
+    /// して drain 完了を待ってから execve に飛ぶ。client は socket EOF で
+    /// 完了を観測。
+    #[serde(rename = "upgrade.ack")]
+    UpgradeAck(UpgradeAck),
 }
 
 /// CBOR control message の encode/decode error。

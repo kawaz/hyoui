@@ -146,9 +146,10 @@ pub struct UpgradeStateV1 {
     pub child_pid: i32,
     /// scrollback ring から export した raw bytes (= 新プロセスで vt100 parser に
     /// 再 feed する材料、DR-0028 §3)。空でも OK (= 初期 fresh state)。
-    /// note: `serde_bytes` を挟まないため CBOR encoding は major type 4 の array で
-    /// 1 byte あたり 1 element (= size 2 倍程度)。Phase 2 の state file は transient
-    /// で 1 MiB 未満想定なので許容する。効率化は Phase 3 課題。
+    /// Phase 3: `serde_bytes` 経由で CBOR major type 2 (byte string) として encode
+    /// する (= Phase 2 の array-of-int から切替、~2x → ~1x size)。1 MiB scrollback
+    /// で state file が 1 MiB 前後になる (= header 数百 byte + bytes 本体)。
+    #[serde(with = "serde_bytes")]
     pub scrollback: Vec<u8>,
 }
 
@@ -286,13 +287,40 @@ pub fn precheck_upgrade_target() -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// DR-0028 Phase 2: self-exec を実行する。**成功時は戻り値を返さない** (= execve
-/// が現プロセス image を新バイナリで置換)。失敗時のみ `Err(Error)` を返す。
+/// DR-0028 Phase 3: `perform_self_exec` の結果。**成功時は execve が戻らないので
+/// 変数体無し** (= 戻ってきた時点で必ずいずれかの失敗)。
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum PerformSelfExecOutcome {
+    /// state file 書き出しなど pre-check 通過後だが fd 移譲前の段階で失敗した
+    /// (= pty / listener は本関数の scope で drop 済、socket unlink 発生)。caller は
+    /// session-fatal error 扱いにする。
+    PrepFailed(Error),
+    /// pre-check + fd 移譲 + CLOEXEC clear は済んだが **execve syscall 自体が
+    /// 失敗** (DR-0028 §5.2 の Phase 3 fallback)。CLOEXEC を復元し、state file を
+    /// 削除し、Pty / UnixSock を **再構築して返す**。caller は
+    /// [`crate::daemon::Session::from_upgrade_inherited_parts`] 相当の経路で
+    /// serve_loop に再突入する (= 旧プロセス継続)。
+    ExecFailed {
+        /// 再構築された PTY (master fd は CLOEXEC 復元済み)。
+        pty: Pty,
+        /// 再構築された listener (socket path は前と同じ、unlink されない)。
+        listener: UnixSock,
+        /// 子 PID (exec しなかったので変わらない)。
+        child: Pid,
+        /// execve が返した errno を含む error 詳細。
+        error: Error,
+    },
+}
+
+/// DR-0028 Phase 2/3: self-exec を実行する。**成功時は戻り値を返さない** (= execve
+/// が現プロセス image を新バイナリで置換)。失敗時のみ [`PerformSelfExecOutcome`] を返す。
 ///
 /// caller (= `Session::serve` の UpgradeRequested 分岐) は先に
 /// [`precheck_upgrade_target`] を呼んで OK なら `exe_path` を渡す (= exec 直前で
 /// 追加の pre-check を重複しない)。`pty` / `listener` の所有権はここで取得し、
-/// CLOEXEC 解除してから execve へ飛ぶ。
+/// CLOEXEC 解除してから execve へ飛ぶ。**execve 失敗時は CLOEXEC を復元 + fd を
+/// 再パッケージして返す** (Phase 3 追加、DR §5.2)。
 ///
 /// state file は先に本関数内で書き出す (= 失敗すると upgrade 中断、DR-0028 §3 の
 /// 「screen 継続」gate 達成のため state 無しで進めない)。
@@ -302,7 +330,7 @@ pub fn precheck_upgrade_target() -> Result<PathBuf, String> {
 /// - `pty` / `listener` / `child`: 引き継ぐ fd + 子 PID
 /// - `config`: DaemonConfig 全体 (= state file にシリアライズする材料)
 /// - `scrollback_bytes`: 新プロセスに渡す scrollback 生 bytes (= 再 feed 材料)
-/// - `daemon_boot_id_prev`: 前 daemon の boot_id (= Phase 3 record 継続で使う)
+/// - `daemon_boot_id_prev`: 前 daemon の boot_id (= record 継続 Phase 4 で使う)
 /// - `exe_path`: `precheck_upgrade_target` が返した実行 target
 #[allow(clippy::too_many_arguments)]
 pub fn perform_self_exec(
@@ -313,7 +341,7 @@ pub fn perform_self_exec(
     scrollback_bytes: Vec<u8>,
     daemon_boot_id_prev: &str,
     exe_path: &Path,
-) -> Error {
+) -> PerformSelfExecOutcome {
     // 0. state file を先に書く (= 書けない環境なら upgrade 中断、fd はまだ手つかず)。
     let state_path = compute_state_file_path(&config.socket_path);
     let state = UpgradeStateV1 {
@@ -344,34 +372,46 @@ pub fn perform_self_exec(
             "hyoui upgrade: state file write failed: {e} (path={}); aborting upgrade",
             state_path.display()
         );
-        // fd はまだ pty / listener が保持 → 通常の Drop で socket unlink 発生。
-        // これは exec しない選択なので旧プロセス継続は Session::serve の責務。
-        // ここでは Err を返す (= UpgradeRequested 分岐が Err を検知して continue)。
-        return e;
+        // pty / listener はまだ本関数 scope が保持 → 関数 return で drop され socket unlink。
+        // これは exec しない選択なので session-fatal error として caller に伝える。
+        return PerformSelfExecOutcome::PrepFailed(e);
     }
 
     // 1. fd を取り出す。UnixSock は Drop で socket file を unlink するので
-    //    `into_parts_for_exec` で Drop を bypass。Pty は Drop で fd を close する
-    //    が、CLOEXEC を解いた後 execve に成功すれば memory wipe で Drop 未実行、
-    //    失敗時は fd を leak しつつ eprintln (Phase 3 で 2 相分離)。
+    //    `into_parts_for_exec` で Drop を bypass。Pty も `into_master()` で master
+    //    OwnedFd を取り出し (残りの Pty 部分は関数 scope 抜けで no-op drop)。
     let master_owned = pty.into_master();
     let (listener_owned, socket_path) = listener.into_parts_for_exec();
 
-    // 2. CLOEXEC 解除 (= execve で新プロセスへ fd を継承させる)。exec 失敗時に
-    //    CLOEXEC 復元は本 Phase では実装しない (Phase 3)。fd は leak する。
+    // 2. CLOEXEC 解除 (= execve で新プロセスへ fd を継承させる)。
     if let Err(e) = clear_cloexec(&master_owned) {
         eprintln!("hyoui upgrade: CLOEXEC clear on master fd failed: {e}");
-        let _ = nix::unistd::unlink(&socket_path);
+        // Phase 3 fallback: fd を Pty / UnixSock として再構築して caller に返す
+        // (= old serve_loop 継続)。ここではまだ execve に到達していないので、
+        // master_owned は close されず新 Pty に譲る。listener 側も同様。
+        let pty = Pty::from_master_fd(master_owned);
+        let listener = UnixSock::from_listener_fd(listener_owned, socket_path);
         let _ = std::fs::remove_file(&state_path);
-        return e;
+        return PerformSelfExecOutcome::ExecFailed {
+            pty,
+            listener,
+            child,
+            error: e,
+        };
     }
     if let Err(e) = clear_cloexec(&listener_owned) {
         eprintln!("hyoui upgrade: CLOEXEC clear on listener fd failed: {e}");
-        // master 側は CLOEXEC を復元して close させる (= 子が SIGHUP を受ける前提)。
+        // master 側 CLOEXEC は復元してから再パッケージ。
         let _ = set_cloexec(&master_owned);
-        let _ = nix::unistd::unlink(&socket_path);
+        let pty = Pty::from_master_fd(master_owned);
+        let listener = UnixSock::from_listener_fd(listener_owned, socket_path);
         let _ = std::fs::remove_file(&state_path);
-        return e;
+        return PerformSelfExecOutcome::ExecFailed {
+            pty,
+            listener,
+            child,
+            error: e,
+        };
     }
 
     let pty_raw = master_owned.as_raw_fd();
@@ -426,27 +466,50 @@ pub fn perform_self_exec(
                 "hyoui upgrade: exe_path contained NUL: {}",
                 exe_path.display()
             );
-            let _ = nix::unistd::unlink(&socket_path);
+            // CLOEXEC 復元 + 再パッケージ (execve に到達していないので fallback path)。
+            let _ = set_cloexec(&master_owned);
+            let _ = set_cloexec(&listener_owned);
+            let pty = Pty::from_master_fd(master_owned);
+            let listener = UnixSock::from_listener_fd(listener_owned, socket_path);
             let _ = std::fs::remove_file(&state_path);
-            return Error::Invalid("exe_path contained NUL");
+            return PerformSelfExecOutcome::ExecFailed {
+                pty,
+                listener,
+                child,
+                error: Error::Invalid("exe_path contained NUL"),
+            };
         }
     };
     let argv: Vec<CString> = vec![exe_c.clone()];
 
-    // 4. execve — 成功時は返らない。失敗時は Err(Errno) を返す。
+    // 4. execve — 成功時は返らない。失敗時は Phase 3 fallback: CLOEXEC 復元 +
+    //    Pty/UnixSock 再構築 + state file 削除 → caller に返却 (= 旧 serve_loop 続行)。
     match nix::unistd::execve(&exe_c, &argv, &envp) {
         Ok(_infallible) => unreachable!("execve returned Ok(Infallible)"),
         Err(e) => {
             eprintln!(
-                "hyoui upgrade: execve failed after pre-check: {e} (exe={}); aborting session",
+                "hyoui upgrade: execve failed after pre-check: {e} (exe={}); restoring CLOEXEC + resuming old daemon",
                 exe_path.display()
             );
-            let _ = nix::unistd::unlink(&socket_path);
+            // CLOEXEC 復元 (= 通常運用の defense-in-depth に戻す。失敗しても
+            // fd は使えるので警告のみ)。
+            if let Err(re) = set_cloexec(&master_owned) {
+                eprintln!("hyoui upgrade: CLOEXEC restore on master fd failed: {re} (continuing)");
+            }
+            if let Err(re) = set_cloexec(&listener_owned) {
+                eprintln!(
+                    "hyoui upgrade: CLOEXEC restore on listener fd failed: {re} (continuing)"
+                );
+            }
+            let pty = Pty::from_master_fd(master_owned);
+            let listener = UnixSock::from_listener_fd(listener_owned, socket_path);
             let _ = std::fs::remove_file(&state_path);
-            // fd は leak; Session::serve の Err path で session が abort。
-            let _ = listener_owned;
-            let _ = master_owned;
-            Error::Errno(e)
+            PerformSelfExecOutcome::ExecFailed {
+                pty,
+                listener,
+                child,
+                error: Error::Errno(e),
+            }
         }
     }
 }

@@ -141,6 +141,8 @@ pub enum HelpTopic {
     RecordList,
     /// Help for the `web` subcommand (= DR-0027 Phase 1、HTTP gateway 起動)。
     Web,
+    /// Help for the `upgrade` subcommand (= DR-0028 §2 Phase 3、graceful self-exec)。
+    Upgrade,
     /// User invoked an unknown subcommand; render top-level help with note.
     UnknownSubcommand(String),
 }
@@ -274,6 +276,31 @@ pub struct DetachConfig {
     pub index: Option<i32>,
     /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
     pub namespace: Option<String>,
+}
+
+/// `upgrade [session]` の設定 (DR-0028 §2 Phase 3)。
+///
+/// session 省略時は `$HYOUI_SESSION_ID` (= 中から実行) で自セッションに解決される
+/// (= `parse_session_targeted` 内の `has_self_session_env` で許容)。DR-0028 §2 の
+/// 「デフォルトで daemon 自身の実行ファイルを再 exec」意味論から、`--binary` 省略時は
+/// daemon 側で `current_exe()` を解決する (= client 側で解決しない、client が別
+/// バイナリを見ている可能性を排除するため)。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpgradeConfig {
+    /// Target socket path (= `--socket` 明示指定用)。`None` なら session_id / index から resolve。
+    pub socket: Option<String>,
+    /// Target session id (= socket path resolver の入力)。
+    pub session_id: Option<String>,
+    /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
+    pub index: Option<i32>,
+    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
+    pub namespace: Option<String>,
+    /// `--binary=<path>` — daemon が exec する新バイナリ。省略時は daemon 側の
+    /// `current_exe()` が使われる (DR-0028 §2)。
+    pub binary_path: Option<String>,
+    /// `--skip-version-check` — 新バイナリの `--version` 実行事前確認を skip する
+    /// (= test / 特殊環境用、DR-0028 §5.3)。default false。
+    pub skip_version_check: bool,
 }
 
 /// `list` subcommand の出力形式 (= `--format=plain|jsonl`)。
@@ -937,6 +964,12 @@ pub enum Command {
     Record(RecordCommand),
     /// `web <listen>` — HTTP gateway (= DR-0027 Phase 1)。
     Web(WebConfig),
+    /// `upgrade [session]` — daemon graceful self-exec upgrade (DR-0028 §2 Phase 3)。
+    ///
+    /// session 省略時は `$HYOUI_SESSION_ID` (= 中から実行) で自セッションに解決される。
+    /// `--binary=<path>` で自身以外のバイナリに切り替え可 (省略時は daemon 自身の
+    /// `current_exe()`)。
+    Upgrade(UpgradeConfig),
     /// Print a completion script for the given shell.
     Completion {
         /// Target shell.
@@ -989,6 +1022,7 @@ pub fn parse_args(args: &[String]) -> Command {
         "record" => parse_record(rest),
         "detach" => parse_detach(rest),
         "web" => parse_web(rest),
+        "upgrade" => parse_upgrade(rest),
         "completion" => parse_completion(rest),
         // Reserved for future stages.
         //
@@ -2397,7 +2431,41 @@ pub fn usage(topic: &HelpTopic) -> String {
         HelpTopic::RecordList => usage_record_list(),
         HelpTopic::Completion => usage_completion(),
         HelpTopic::Web => usage_web(),
+        HelpTopic::Upgrade => usage_upgrade(),
     }
+}
+
+/// `hyoui upgrade` subcommand の usage (DR-0028 §2 Phase 3)。
+fn usage_upgrade() -> String {
+    "\
+hyoui upgrade [session] [--socket=<path>] [--index=<N>] [--namespace=<NS>]
+               [--binary=<path>] [--skip-version-check]
+
+Trigger daemon graceful self-exec upgrade (DR-0028 §2 Phase 3). The daemon
+replaces its own binary via execve while keeping the child PID, PTY master fd,
+and Unix socket listener fd intact.
+
+By default the daemon re-execs `current_exe()`, so the intended workflow is
+\"install new hyoui binary, then run `hyoui upgrade <session>`\".
+
+Options:
+  --socket=<path>           Explicit socket path (alternative to session-id).
+  --index=<N>               Session selector (= mtime 昇順、1=最古 / -1=最新)。
+  --namespace=<NS>          Session namespace (default \"default\").
+  --binary=<path>           Override the daemon's execve target with the given
+                            absolute path (must be regular file, executable, and
+                            owned by the current euid). Client-side
+                            `--version` pre-check runs against this path unless
+                            --skip-version-check is set.
+  --skip-version-check      Skip the `<binary> --version` pre-check on the
+                            client side (= DR-0028 §5.3、for test / edge cases).
+  -h, --help                Show this help.
+
+The client sends `upgrade.request` and waits for `upgrade.ack`, then waits for
+the socket to close (= exec happened) and reconnects with backoff to verify the
+new daemon accepts commands. Cap `upgrade-v1` must be advertised by both sides.
+"
+    .to_string()
 }
 
 /// `hyoui web` subcommand の usage (DR-0027 Phase 1)。
@@ -3191,6 +3259,50 @@ fn parse_detach(args: &[String]) -> Command {
             session_id: t.session_id,
             index: t.index,
             namespace: t.namespace,
+        }),
+        Err(c) => c,
+    }
+}
+
+/// `upgrade [session]` の parser (DR-0028 §2 Phase 3)。
+///
+/// session 解決は `parse_session_targeted` に一任 (= detach と同じ)。追加 flag:
+/// - `--binary=<path>`: daemon 側 exec target を上書き (= `UpgradeRequest.binary_path`
+///   に載せる)。省略時は daemon が `current_exe()` を使う
+/// - `--skip-version-check`: 新バイナリの `--version` 事前確認を skip (テスト用)
+#[allow(clippy::result_large_err)]
+fn parse_upgrade(args: &[String]) -> Command {
+    use std::cell::RefCell;
+    let binary_path = RefCell::new(None::<String>);
+    let skip_version_check = RefCell::new(false);
+    let res = parse_session_targeted("upgrade", args, HelpTopic::Upgrade, |opt, value| {
+        match opt {
+            "--binary" => match value {
+                Some(v) => {
+                    *binary_path.borrow_mut() = Some(v);
+                    Ok(true)
+                }
+                None => Err(Command::Error(
+                    "upgrade: --binary requires a value (= absolute path to new hyoui binary)"
+                        .to_string(),
+                )),
+            },
+            "--skip-version-check" => {
+                *skip_version_check.borrow_mut() = true;
+                // このオプションは値を持たない (= 直後の positional は独立 arg)。
+                Ok(false)
+            }
+            other => Err(Command::Error(format!("upgrade: unknown option: {other}"))),
+        }
+    });
+    match res {
+        Ok(t) => Command::Upgrade(UpgradeConfig {
+            socket: t.socket,
+            session_id: t.session_id,
+            index: t.index,
+            namespace: t.namespace,
+            binary_path: binary_path.into_inner(),
+            skip_version_check: skip_version_check.into_inner(),
         }),
         Err(c) => c,
     }
@@ -5516,6 +5628,7 @@ pub(crate) const TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
     "lock",
     "unlock",
     "record",
+    "upgrade",
 ];
 
 // =============================================================================
@@ -5548,6 +5661,7 @@ pub const IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
     "unlock",
     "detach",
     "record",
+    "upgrade",
     "completion",
 ];
 

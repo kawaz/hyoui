@@ -2063,6 +2063,7 @@ mod tests {
                 "child-state-v1".into(),
                 "record-v1".into(),
                 "set-v1".into(),
+                "upgrade-v1".into(),
             ]
         );
         assert!(conn.response.leader);

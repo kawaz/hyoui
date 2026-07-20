@@ -29,6 +29,10 @@ use std::collections::BTreeSet;
 /// - `"set-v1"`: `set.request` / `set.ack` messages (DR-0019 Update、runtime 設定
 ///   変更。新 client → 旧 daemon は cap intersect でこの cap が落ちるため、CLI は
 ///   「daemon が set 未対応」と判定して明示エラーにする)
+/// - `"upgrade-v1"`: `upgrade.request` / `upgrade.ack` messages (DR-0028 §2、
+///   graceful self-exec upgrade)。旧 daemon (Phase 1/2 の SIGUSR1 隠し経路のみ) には
+///   cap 無し → 新 client は「upgrade protocol 未対応」と判定して SIGUSR1 fallback
+///   もしくは明示 error にする
 pub const MVP_CAPS: &[&str] = &[
     "data",
     "lock",
@@ -39,6 +43,7 @@ pub const MVP_CAPS: &[&str] = &[
     "child-state-v1",
     "record-v1",
     "set-v1",
+    "upgrade-v1",
 ];
 
 /// 2 つの cap 集合の intersect を取って `Vec<String>` で返す。
@@ -92,6 +97,7 @@ mod tests {
         assert!(MVP_CAPS.contains(&"child-state-v1"));
         assert!(MVP_CAPS.contains(&"record-v1"));
         assert!(MVP_CAPS.contains(&"set-v1"));
+        assert!(MVP_CAPS.contains(&"upgrade-v1"));
     }
 
     /// wait-l0 cap は DR-0006 §9 改訂 (state-based wait 移行) に伴い削除済。

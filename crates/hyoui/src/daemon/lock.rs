@@ -402,6 +402,11 @@ pub(super) struct SessionState {
     /// 初期値は `Default` で `Notify` (= u8=0)。daemon 起動時に config の値で
     /// `init_child_suspend_policy` で上書きする。
     child_suspend_policy: AtomicU8,
+    /// DR-0028 Phase 3: `upgrade.request` を受理して以降、raw_data を reject し
+    /// drain 完了を待つべき状態か。handler が `true` にセットし、serve_loop が
+    /// 各 iteration 冒頭で観測して `UpgradeRequested` を返す (= drain trivially
+    /// 満たされる、raw_data は本 flag が立った時点で reject される)。
+    upgrade_pending: AtomicBool,
 }
 
 /// `ChildSuspendPolicy` を `AtomicU8` 格納用の u8 に変換する。
@@ -447,6 +452,24 @@ impl SessionState {
     /// (= `notify_child_stopped` / `status` / `list` 用)。
     pub(super) fn child_suspend_policy(&self) -> ChildSuspendPolicy {
         policy_from_u8(self.child_suspend_policy.load(Ordering::Relaxed))
+    }
+
+    /// DR-0028 Phase 3: upgrade pending flag をセットする。以降 raw_data は
+    /// reject され、serve_loop 次回 iteration で `UpgradeRequested` が返る。
+    pub(super) fn set_upgrade_pending(&self) {
+        self.upgrade_pending.store(true, Ordering::Release);
+    }
+
+    /// DR-0028 Phase 3: upgrade pending flag を読む。
+    pub(super) fn is_upgrade_pending(&self) -> bool {
+        self.upgrade_pending.load(Ordering::Acquire)
+    }
+
+    /// DR-0028 Phase 3 fallback: execve が失敗して旧 serve_loop に再突入する時に
+    /// upgrade pending flag を解除する (= raw_data reject を再開しない、次回の
+    /// upgrade.request を受け付けられる状態に戻す)。
+    pub(super) fn clear_upgrade_pending(&self) {
+        self.upgrade_pending.store(false, Ordering::Release);
     }
 }
 

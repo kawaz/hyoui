@@ -406,6 +406,8 @@ fn main() -> ExitCode {
 
         Command::Web(cfg) => web_command(cfg),
 
+        Command::Upgrade(cfg) => upgrade_command(cfg),
+
         Command::Completion { shell } => {
             print!("{}", completion::script(shell));
             ExitCode::SUCCESS
@@ -2370,6 +2372,246 @@ fn detach_command(cfg: hyoui::cli::DetachConfig) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// `upgrade [session]` subcommand — daemon graceful self-exec (DR-0028 §2 Phase 3)。
+///
+/// 手順:
+/// 1. socket 解決 (= detach と同じ規則、self session env 許容)
+/// 2. `--version` 事前確認 (`cfg.binary_path` が set かつ `skip_version_check == false`
+///    のとき、`<path> --version` を local spawn して exit 0 + `hyoui X.Y.Z` prefix
+///    を確認、DR-0028 §5.3)
+/// 3. connect + handshake (cap `upgrade-v1` 要求)。cap 未対応 daemon (旧版) は
+///    「upgrade-v1 未 negotiate」で error 終了 (= SIGUSR1 隠し経路は fallback として
+///    暗黙推奨しない、明示 error に倒す)
+/// 4. `UpgradeRequest { binary_path }` を送信
+/// 5. `UpgradeAck` を deadline 5s で待つ。`Error` が返ったら失敗として exit
+/// 6. socket EOF (= exec 開始) を deadline 5s で待つ
+/// 7. 同 socket に retry backoff で reconnect + handshake で新 daemon の
+///    生存確認 (= §5.3 の「exec 後の再接続確認まで client 側で行う」)
+///
+/// return:
+/// - 成功 (upgrade 完了 + 再接続 OK): exit 0
+/// - pre-check 失敗 (client-side): exit 2
+/// - daemon reject (Error 受信 / cap 不足): exit 1
+/// - ack timeout / 再接続失敗: exit 1
+fn upgrade_command(cfg: hyoui::cli::UpgradeConfig) -> ExitCode {
+    use hyoui::protocol::messages::{UpgradeAck, UpgradeRequest};
+
+    let namespace = socket_path::resolve_namespace(cfg.namespace.as_deref());
+    let sock = match resolve_target_socket(
+        "upgrade",
+        cfg.socket.as_deref(),
+        cfg.session_id.as_deref(),
+        cfg.index,
+        &namespace,
+    ) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+
+    // Step 2: --version 事前確認 (client-side)。binary_path が明示され、かつ
+    // skip されていなければ実行する。省略時 (= daemon の current_exe に任せる場合)
+    // は client 側では検証しない (= client は新バイナリ path を知らないため意味なし)。
+    if let Some(bin) = cfg.binary_path.as_deref()
+        && !cfg.skip_version_check
+    {
+        match preflight_version_check(bin) {
+            Ok(v) => eprintln!("hyoui: upgrade preflight OK: {bin} --version -> {v}"),
+            Err(msg) => {
+                eprintln!("hyoui: upgrade preflight FAILED: {msg}");
+                eprintln!(
+                    "       aborting without contacting daemon. Use --skip-version-check to bypass."
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    // Step 3: connect + handshake。upgrade は「観察者」ではないので RwNoLeader で
+    // 接続 (= leader 奪取しない、detach と同じ選択)。
+    let opts = AttachOptions {
+        mode: Mode::RwNoLeader,
+        caps: hyoui::protocol::MVP_CAPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
+        exclusive: false,
+        detach_others: false,
+    };
+    let mut conn = match connect_with_retry(&sock, opts.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            print_connect_failure("upgrade", &sock, &e);
+            return ExitCode::from(1);
+        }
+    };
+
+    // cap intersect の確認 (= daemon が upgrade-v1 を持たない旧 daemon なら明示 error)。
+    if !conn.response.caps.iter().any(|c| c == "upgrade-v1") {
+        eprintln!(
+            "hyoui: upgrade: daemon does not advertise cap `upgrade-v1` (= old daemon, negotiated={:?})",
+            conn.response.caps
+        );
+        eprintln!(
+            "       upgrade to a hyoui version that supports the upgrade protocol first, or use `SIGUSR1` directly (hidden Phase 1/2 path)."
+        );
+        return ExitCode::from(1);
+    }
+
+    // Step 4: UpgradeRequest 送信
+    let req = UpgradeRequest {
+        binary_path: cfg.binary_path.clone(),
+    };
+    if let Err(e) = conn.send_control(&ControlMessage::UpgradeRequest(req)) {
+        eprintln!("hyoui: upgrade: send 失敗: {e}");
+        return ExitCode::from(1);
+    }
+
+    // Step 5: UpgradeAck を待つ (= 5s deadline、その間 broadcast は読み飛ばす)。
+    let ack_deadline = std::time::Duration::from_secs(5);
+    // ack を受信したら break。loop 内で break するので flag は不要。
+    loop {
+        match poll_recv_ready(&conn, ack_deadline) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("hyoui: upgrade: timed out waiting for upgrade.ack (5s)");
+                return ExitCode::from(1);
+            }
+            Err(e) => {
+                eprintln!("hyoui: upgrade: poll error: {e}");
+                return ExitCode::from(1);
+            }
+        }
+        match conn.recv_control(None) {
+            Ok(ControlMessage::UpgradeAck(UpgradeAck {})) => {
+                break;
+            }
+            Ok(ControlMessage::Error(e)) => {
+                eprintln!(
+                    "hyoui: upgrade: daemon rejected ({:?}): {}",
+                    e.code, e.message
+                );
+                return ExitCode::from(1);
+            }
+            Ok(_) => continue, // broadcast (LeaderNotify 等) 読み飛ばし
+            Err(e) => {
+                eprintln!("hyoui: upgrade: recv error before ack: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    // Step 6: socket EOF を待つ (= daemon が drain 完了 + execve 開始で socket
+    // close)。deadline 5s 経過しても EOF が来なければ、daemon 側で **execve が失敗
+    // + §5.2 fallback で旧 daemon 継続** の可能性が高い。この判定は後続 reconnect
+    // verify の後で最終メッセージに反映する。
+    let eof_deadline = std::time::Duration::from_secs(5);
+    let mut eof_observed = false;
+    match poll_recv_ready(&conn, eof_deadline) {
+        Ok(true) => match conn.recv_control(None) {
+            Ok(_msg) => {
+                // upgrade 後にまだ frame が届いた = daemon はまだ生きている
+                // (= exec 前 / 遅延)。もう一度だけ EOF poll する猶予は与えず、
+                // 次の reconnect verify に進む (= 実運用で問題があれば log 側で観測)。
+            }
+            Err(_) => {
+                eof_observed = true; // EOF or decode error = socket 切れた
+            }
+        },
+        Ok(false) => {
+            // deadline 到達 = socket 生きたまま。§5.2 fallback の兆候。
+        }
+        Err(e) => {
+            eprintln!("hyoui: upgrade: EOF poll error: {e}");
+        }
+    }
+    drop(conn);
+
+    // Step 7: 再接続 verify (= 新 daemon が accept 開始したことを確認)。socket は
+    // 継承されているため path 自体は変わらない。connect_with_retry は 100ms × 20 =
+    // 2s まで待つが、exec 直後の非常に短い accept 空白を避けるため冒頭で 200ms 猶予。
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let opts2 = AttachOptions {
+        mode: Mode::RwNoLeader,
+        caps: hyoui::protocol::MVP_CAPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
+        exclusive: false,
+        detach_others: false,
+    };
+    let verify = connect_with_retry(&sock, opts2);
+    match verify {
+        Ok(c) => {
+            let post_caps = c.response.caps.clone();
+            drop(c);
+            if !post_caps.iter().any(|s| s == "upgrade-v1") {
+                eprintln!(
+                    "hyoui: upgrade: post-exec daemon connected but no `upgrade-v1` in negotiated caps: {post_caps:?}"
+                );
+            }
+            if eof_observed {
+                // socket EOF を観測 → 新 daemon が accept 再開している。健全な upgrade。
+                println!("upgrade OK: daemon re-execed and accepting connections again");
+                ExitCode::SUCCESS
+            } else {
+                // EOF 未観測かつ reconnect 成功 = old daemon が execve fallback で
+                // 継続している可能性が高い (DR-0028 §5.2)。exit 0 だが明示的に warn。
+                eprintln!(
+                    "hyoui: upgrade: WARNING — no socket EOF observed within 5s; daemon accepting connections but exec may have been aborted (see daemon stderr for `upgrade execve failed` / `upgrade prep failed` line). Old daemon likely continues."
+                );
+                // 「上書き効果なし」を exit code に反映するか迷ったが、daemon から
+                // ack は返っている (= 通信は成立) + session は生きている ので、exit 0
+                // を維持し警告に留める。厳密判定は将来 status.response に
+                // `daemon_boot_id` を含めて before/after 比較する形で改善予定。
+                ExitCode::SUCCESS
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "hyoui: upgrade: post-exec reconnect failed: {e} (socket: {})",
+                sock.display()
+            );
+            eprintln!(
+                "       daemon likely failed to resume (state file corrupt / prep failed / socket unlinked)."
+            );
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `<binary> --version` を spawn して exit 0 かつ output prefix が `hyoui `
+/// で始まることを確認する (DR-0028 §5.3)。
+///
+/// binary の path や env は client の環境をそのまま継承する (= daemon 側と同一
+/// UID の想定なので追加の isolation 不要)。output は最大 4 KiB を取る (= `hyoui
+/// 0.9.14\n` が想定範囲、それより長ければ最初の行だけ判断に使う)。
+fn preflight_version_check(bin: &str) -> Result<String, String> {
+    use std::process::{Command as PCommand, Stdio};
+    let out = PCommand::new(bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to spawn `{bin} --version`: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`{bin} --version` exited with status {:?} (stderr: {})",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim(),
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let first_line = stdout.lines().next().unwrap_or("").trim();
+    if !first_line.starts_with("hyoui ") {
+        return Err(format!(
+            "`{bin} --version` did not start with `hyoui ` (got: {first_line:?})"
+        ));
+    }
+    Ok(first_line.to_string())
 }
 
 /// `status` subcommand: connect → handshake → status.query → print response。

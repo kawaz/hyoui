@@ -493,10 +493,13 @@ impl Session {
                 }
             });
 
-        // DR-0028 Phase 2: `UpgradeRequested` は pre-check 失敗時に旧 serve_loop
-        // に再突入する (= §5.1 の fail-safe)。ループで serve_loop を回し、非
-        // upgrade outcome か pre-check 通過時に抜ける。sigchld_owner は
-        // ループ外で保持し続けるので、continue の後も signal 経路は維持される。
+        // DR-0028 §2/§5 (Phase 3): `UpgradeRequested` は pre-check 失敗 or execve 直接失敗時に
+        // 旧 serve_loop に再突入する (= §5.1 pre-check fallback + §5.2 execve fallback)。
+        // pty / listener / sigchld_owner を mutable にして、execve 失敗時の fd 再パッケージを
+        // ループ内で再バインドできるようにする。
+        let mut pty = pty;
+        let mut listener = listener;
+        let mut sigchld_owner = sigchld_owner;
         let outcome = loop {
             let o = serve_loop(
                 &pty,
@@ -516,32 +519,12 @@ impl Session {
                 break o;
             }
             // pre-check (= DR-0028 §5.1): 存在 / 実行 bit / 所有 UID を検査。
-            match super::upgrade::precheck_upgrade_target() {
-                Ok(exe_path) => {
-                    // 通過 → self-exec 経路に進む。sigchld_owner を先に drop し、
-                    // 直後に perform_self_exec (成功時は戻らない、失敗時は Err)。
-                    let had_owner = sigchld_owner.is_some();
-                    drop(sigchld_owner);
-                    // signal handler default 復帰は skip (execve が全て default に
-                    // リセットするため、または pre-check 通過後の execve 失敗時は
-                    // どうせ session abort する)。had_owner は unused だが対称性で残す。
-                    let _ = had_owner;
-                    let scrollback_bytes = scrollback.last_n_bytes(scrollback.total_bytes());
-                    let err = super::upgrade::perform_self_exec(
-                        pty,
-                        listener,
-                        child,
-                        config,
-                        scrollback_bytes,
-                        &config.daemon_boot_id,
-                        &exe_path,
-                    );
-                    return Err(err);
-                }
+            let exe_path = match super::upgrade::precheck_upgrade_target() {
+                Ok(p) => p,
                 Err(msg) => {
                     // pre-check 失敗 → 旧続行 (§5.1)。lifecycle record に痕跡を
-                    // 残してから outer loop で serve_loop を再起動。fd も socket
-                    // も clients も scrollback も screen_state もそのまま。
+                    // 残し、upgrade_pending を解除してから outer loop で serve_loop 再起動。
+                    // fd も socket も clients も scrollback も screen_state もそのまま。
                     eprintln!("hyoui: upgrade pre-check failed, continuing old serve: {msg}");
                     state.record_registry.push_lifecycle(
                         super::record::LifecycleEvent::SessionTerminatedByCondition {
@@ -549,6 +532,55 @@ impl Session {
                             ts_unix_ms: now_unix_ms(),
                         },
                     );
+                    state.clear_upgrade_pending();
+                    continue;
+                }
+            };
+            // 通過 → self-exec 経路。sigchld_owner を先に drop し (= 新 process init
+            // 前に global SELFPIPE_WRITE_FD を必ずクリアする)、perform_self_exec へ。
+            // 成功時は戻らず (execve)、失敗時は PerformSelfExecOutcome が返る。
+            let taken = sigchld_owner.take();
+            drop(taken);
+            let scrollback_bytes = scrollback.last_n_bytes(scrollback.total_bytes());
+            match super::upgrade::perform_self_exec(
+                pty,
+                listener,
+                child,
+                config,
+                scrollback_bytes,
+                &config.daemon_boot_id,
+                &exe_path,
+            ) {
+                super::upgrade::PerformSelfExecOutcome::PrepFailed(err) => {
+                    // pty / listener は perform_self_exec 内で drop 済 (socket unlink 済)。
+                    // session-fatal error として caller に戻す。
+                    eprintln!(
+                        "hyoui: upgrade prep failed (state file write etc.); session ending: {err}"
+                    );
+                    return Err(err);
+                }
+                super::upgrade::PerformSelfExecOutcome::ExecFailed {
+                    pty: p,
+                    listener: l,
+                    child: c,
+                    error,
+                } => {
+                    // §5.2 fallback: CLOEXEC 復元 + fd 再パッケージ済。旧 serve_loop に
+                    // 再突入して session 継続。sigchld_owner も再取得。
+                    eprintln!(
+                        "hyoui: upgrade execve failed (post-precheck), resuming old serve: {error}"
+                    );
+                    state.record_registry.push_lifecycle(
+                        super::record::LifecycleEvent::SessionTerminatedByCondition {
+                            reason: format!("upgrade-execve-failed: {error}"),
+                            ts_unix_ms: now_unix_ms(),
+                        },
+                    );
+                    state.clear_upgrade_pending();
+                    pty = p;
+                    listener = l;
+                    debug_assert_eq!(c.as_raw(), child.as_raw());
+                    sigchld_owner = acquire_sigchld_selfpipe();
                     continue;
                 }
             }
@@ -1269,6 +1301,14 @@ fn serve_loop(
     // ない、Phase 2 で SessionState.lock を DaemonState へ移設する)。
     let mut daemon_state = DaemonState::default();
     loop {
+        // DR-0028 §2 (Phase 3): upgrade.request 受理後は drain (= 同期 raw_data 経路の
+        // 既完了性) を trivially 満たすので次回 iteration 冒頭で UpgradeRequested を返す。
+        // handler が同一 iteration 内で set_upgrade_pending した直後は poll に戻る前に
+        // ここに来て即 return する (= 「ack 送信 → drain → exec」の順序保証)。
+        if state.is_upgrade_pending() {
+            return RelayOutcome::UpgradeRequested;
+        }
+
         // DR-0019 §4: 終了条件の発火判定 (= ループ冒頭で毎回チェック)。発火したら
         // `--until` match と同じ手順 (= killpg(SIGTERM) → finalize escalation) に乗せ、
         // 発火理由を lifecycle event に残す。

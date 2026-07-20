@@ -58,7 +58,7 @@ _hyoui() {
     if [[ -z "$sub" ]]; then
         # Top-level: implemented subcommands + global flags.
         # (reserved subcommands send/tx are intentionally omitted.)
-        COMPREPLY=( $(compgen -W "run attach list kill status set tail wait screen input lock unlock detach record completion --help -h --version -V" -- "$cur") )
+        COMPREPLY=( $(compgen -W "run attach list kill status set tail wait screen input lock unlock detach record upgrade completion --help -h --version -V" -- "$cur") )
         return 0
     fi
 
@@ -307,6 +307,13 @@ _hyoui() {
             esac
             COMPREPLY=( $(compgen -W "--socket --namespace --index --help -h" -- "$cur") )
             return 0 ;;
+        upgrade)
+            case "$prev" in
+                --socket|--binary) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                --namespace|--index) return 0 ;;
+            esac
+            COMPREPLY=( $(compgen -W "--socket --namespace --index --binary --skip-version-check --help -h" -- "$cur") )
+            return 0 ;;
         *)
             return 0 ;;
     esac
@@ -440,6 +447,16 @@ _hyoui() {
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:session id:'
                     ;;
+                upgrade)
+                    _arguments \
+                        '--socket=[Explicit socket path]:socket:_files' \
+                        '--index=[Session selector (1=oldest, -1=newest)]:index:' \
+                        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
+                        '--binary=[Override the daemon exec target path]:binary:_files' \
+                        '--skip-version-check[Skip <binary> --version pre-check (test only)]' \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '*:session id:'
+                    ;;
                 record)
                     _hyoui_record
                     ;;
@@ -465,6 +482,7 @@ _hyoui_subcommands() {
         'unlock:Release a session lock (= lock release alias)'
         'detach:Detach all attached clients from a session'
         'record:Record tty I/O timeline (start, stop, list)'
+        'upgrade:Trigger daemon graceful self-exec upgrade (DR-0028)'
         'completion:Print a shell completion script'
     )
     _describe -t commands 'hyoui subcommand' subs
@@ -694,7 +712,7 @@ function __hyoui_using_subcommand
     set -e cmd[1]
     for arg in $cmd
         switch $arg
-            case run attach list kill status set tail wait screen input lock unlock detach record completion
+            case run attach list kill status set tail wait screen input lock unlock detach record upgrade completion
                 if test "$arg" = "$argv[1]"
                     return 0
                 end
@@ -709,7 +727,7 @@ function __hyoui_no_subcommand
     set -e cmd[1]
     for arg in $cmd
         switch $arg
-            case run attach list kill status set tail wait screen input lock unlock detach record completion
+            case run attach list kill status set tail wait screen input lock unlock detach record upgrade completion
                 return 1
         end
     end
