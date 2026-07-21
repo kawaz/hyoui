@@ -98,6 +98,12 @@
   try {
     autoResizeEl.checked = localStorage.getItem(LS_AUTO_RESIZE) === '1';
   } catch (_e) { /* private mode 等で失敗しても既定 off */ }
+  // ?resize=1 で auto-resize を強制 ON (embed では header ごとトグルが消える +
+  // iframe の third-party storage 分離で localStorage が親ページと共有されない
+  // 環境があるため、URL で明示 opt-in できる経路を用意する)。
+  if (new URLSearchParams(location.search).get('resize') === '1') {
+    autoResizeEl.checked = true;
+  }
   autoResizeEl.addEventListener('change', () => {
     try { localStorage.setItem(LS_AUTO_RESIZE, autoResizeEl.checked ? '1' : '0'); } catch (_e) {}
     // opt-in した瞬間に現サイズを一度 PTY に反映。
@@ -153,6 +159,8 @@
     lastCols = term.cols;
     lastRows = term.rows;
     if (sizeEl) sizeEl.textContent = `${term.cols}x${term.rows}`;
+    // auto-resize が既に ON (localStorage / ?resize=1) なら初回サイズを即 PTY へ。
+    if (autoResizeEl.checked) sendResizeIfChanged(true);
   }, 0);
 
   window.addEventListener('resize', scheduleFit);
