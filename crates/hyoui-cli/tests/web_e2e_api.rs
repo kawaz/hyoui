@@ -463,6 +463,114 @@ fn e2e_resize_endpoint() {
     cleanup(runtime.path(), sid);
 }
 
+/// DR-0027 Phase 3: `WS /api/sessions/:id/attach` の e2e。
+///
+/// - WS 接続 (upgrade) が確立できる
+/// - client → daemon: WS binary で "HELLOWS\n" を送る → PTY に届き echo される
+/// - daemon → client: echo bytes が WS binary message として返る (= 部分マッチ)
+/// - WS close で bridge が正常終了する
+///
+/// 使う tungstenite は blocking client (= dev-dep のみ、prod は axum 内蔵の
+/// tokio-tungstenite が bridge 実装)。std::net::TcpStream に対して handshake +
+/// read_message / send_message する薄い client。
+#[test]
+fn e2e_ws_attach_bridge_roundtrip() {
+    use std::net::TcpStream;
+    use tungstenite::{Message, client, handshake::client::Request};
+
+    let runtime = runtime_dir();
+    let sid = "web-e2e-wsattach";
+
+    spawn_detached(runtime.path(), sid);
+    let (mut web, port) = spawn_web(runtime.path());
+    let panic_guard = ChildGuard(&mut web);
+
+    // 未知 session の WS upgrade は 404 が返るはず。upgrade 前の HTTP status で
+    // handshake が失敗すること (= tungstenite が Err を返す) だけ確認。
+    {
+        let bad_url = format!("ws://127.0.0.1:{port}/api/sessions/no-such-xyz-ws/attach");
+        let bad_req = Request::builder()
+            .uri(&bad_url)
+            .header("Host", format!("127.0.0.1:{port}"))
+            .header("Upgrade", "websocket")
+            .header("Connection", "Upgrade")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(())
+            .unwrap();
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("tcp");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let res = client(bad_req, stream);
+        assert!(res.is_err(), "unknown session の WS handshake は失敗すべき");
+    }
+
+    // 正常 session の WS attach。
+    let url = format!("ws://127.0.0.1:{port}/api/sessions/{sid}/attach");
+    let req = Request::builder()
+        .uri(&url)
+        .header("Host", format!("127.0.0.1:{port}"))
+        .header("Upgrade", "websocket")
+        .header("Connection", "Upgrade")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(())
+        .unwrap();
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("tcp");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let (mut ws, _resp) = client(req, stream).expect("ws handshake");
+
+    // WS → daemon: "HELLOWS\n" を送る (= line-echo shell が echo back する)。
+    ws.send(Message::Binary(b"HELLOWS\n".to_vec().into()))
+        .expect("ws send");
+
+    // daemon → WS: echo bytes を含む binary message が届くまで最大 5s 待つ。
+    // 中間で他の frame (= 過去 screen redraw 等) が挟まる可能性があるため、
+    // 累積 buffer に「HELLOWS」が現れれば OK とする。
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut cum: Vec<u8> = Vec::new();
+    let mut matched = false;
+    while Instant::now() < deadline {
+        match ws.read() {
+            Ok(Message::Binary(b)) => {
+                cum.extend_from_slice(&b);
+                if cum.windows(7).any(|w| w == b"HELLOWS") {
+                    matched = true;
+                    break;
+                }
+            }
+            Ok(Message::Text(s)) => cum.extend_from_slice(s.as_bytes()),
+            Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
+            Ok(Message::Close(_)) => break,
+            Err(tungstenite::Error::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(e) => panic!("ws read error: {e}"),
+        }
+    }
+    assert!(
+        matched,
+        "WS 経由の echo bytes に 'HELLOWS' が現れない (cum={:?})",
+        String::from_utf8_lossy(&cum)
+    );
+
+    // client → daemon: 明示 Close。daemon 側 attach が cleanup されて daemon の
+    // client 数が減ることは snapshot でも観測可能だが本 test では skip (= 別 test で
+    // sessions API が client 数を出すのを確認済み)。
+    ws.close(None).expect("ws close");
+    // close frame の echo 待ちで少し drain。
+    let _ = ws.read();
+
+    drop(panic_guard);
+    cleanup(runtime.path(), sid);
+}
+
 /// panic 時に web subprocess を確実に kill する RAII guard。
 struct ChildGuard<'a>(&'a mut Child);
 

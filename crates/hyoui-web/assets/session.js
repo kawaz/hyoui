@@ -25,7 +25,11 @@
     rows: ROWS,
     convertEol: false,
     scrollback: 2000,
-    disableStdin: true,
+    // DR-0027 Phase 3: WS attach 接続後は raw stream で xterm.js が直接キー入力を
+    // WS に流すため、stdin を有効化する。WS 未接続時のフォーカス入力は WS が
+    // 復活するまで無害 (= term.onData で input queue に貯まるが送り先が無いので
+    // WS 接続時に flush される。UX 上は input 欄経由が primary な fallback)。
+    disableStdin: false,
     // 半角ブロック罫線 (▀▄▉ 等) の上下ズレ対策として lineHeight を 1.0 に固定。
     // fontFamily は同梱の HackGen Console NF (SIL OFL、半角:全角=1:2、Nerd Font +
     // 日本語 JIS 第 1-2 水準入り) を最優先。host 依存フォントを消してメトリクス
@@ -296,6 +300,147 @@
     }
   }
 
+  // ---- DR-0027 Phase 3: WebSocket attach (フルターミナル bridge) ----
+  //
+  // WS 接続確立中は screen ポーリングを止め、xterm.js の onData / onBinary で
+  // 生成した raw bytes を WS に投げ、daemon から返ってくる raw stream を
+  // term.write でリアルタイム描画する。WS 切断時は fallback として screen
+  // ポーリング + input 欄経路に戻り、指数バックオフで再接続を試みる。
+  let ws = null;
+  let wsReconnectMs = 1000;
+  const WS_RECONNECT_MAX_MS = 30000;
+  let wsExplicitClose = false; // ページ離脱等の意図的 close を示す flag
+  // WS 接続前 (未開通 / 再接続中) に xterm.onData で来た入力は queue して、
+  // 接続復帰時に送る。過剰蓄積を防ぐため上限 8 KiB (= 短時間の間 typing 分は
+  // 拾えるが、切断状態で長時間叩き続けても memory は伸びない)。
+  const wsPendingInput = [];
+  let wsPendingBytes = 0;
+  const WS_PENDING_MAX = 8 * 1024;
+
+  // 接続状態バッジ (existing status 領域の右側に別 element を新設)。
+  const wsStatusEl = document.createElement('span');
+  wsStatusEl.id = 'wsStatus';
+  wsStatusEl.className = 'meta';
+  wsStatusEl.style.marginLeft = '0.5em';
+  wsStatusEl.textContent = 'ws: init';
+  if (statusEl && statusEl.parentNode) {
+    statusEl.parentNode.appendChild(document.createTextNode(' '));
+    statusEl.parentNode.appendChild(wsStatusEl);
+  }
+  function setWsStatus(text) {
+    wsStatusEl.textContent = 'ws: ' + text;
+  }
+
+  function wsIsOpen() { return ws && ws.readyState === WebSocket.OPEN; }
+
+  function flushPendingToWs() {
+    if (!wsIsOpen() || wsPendingInput.length === 0) return;
+    for (const b of wsPendingInput) {
+      try { ws.send(b); } catch (_e) { break; }
+    }
+    wsPendingInput.length = 0;
+    wsPendingBytes = 0;
+  }
+
+  function sendBytesToWs(bytes) {
+    // bytes は Uint8Array or string (xterm.js onData は string、onBinary は Uint8Array)
+    if (wsIsOpen()) {
+      try {
+        ws.send(bytes);
+        return true;
+      } catch (e) {
+        if (window.__hyouiDebug) window.__hyouiDebug('warn', 'ws.send failed: ' + e.message);
+      }
+    }
+    // queue (上限あり)
+    const size = typeof bytes === 'string' ? bytes.length : bytes.byteLength;
+    if (wsPendingBytes + size <= WS_PENDING_MAX) {
+      wsPendingInput.push(bytes);
+      wsPendingBytes += size;
+    }
+    return false;
+  }
+
+  // xterm キー入力 → WS。onData は string (VT sequence 完成済み)、onBinary は
+  // ISO-8859-1 として渡ってくる Uint8Array 相当 (mouse tracking 等)。
+  term.onData((data) => {
+    sendBytesToWs(data);
+  });
+  term.onBinary((data) => {
+    // xterm.js の onBinary は Latin-1 string で bytes を渡してくる仕様。
+    // そのまま send しても WS は text frame として送るので、Uint8Array に変換して
+    // binary frame 化する (= daemon 側は bytes 透過で扱う)。
+    const arr = new Uint8Array(data.length);
+    for (let i = 0; i < data.length; i++) arr[i] = data.charCodeAt(i) & 0xff;
+    sendBytesToWs(arr);
+  });
+
+  function connectWs() {
+    if (wsExplicitClose) return;
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${proto}//${location.host}/api/sessions/${encodeURIComponent(sid)}/attach`;
+    setWsStatus('connecting…');
+    try {
+      ws = new WebSocket(url);
+    } catch (e) {
+      setWsStatus('error: ' + e.message);
+      scheduleWsReconnect();
+      return;
+    }
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => {
+      setWsStatus('connected');
+      wsReconnectMs = 1000;
+      // WS 接続中は screen ポーリング停止 (= 転送コスト削減 + 二重書き込みで
+      // ちらつくのを避ける)。UI checkbox は状態そのまま。
+      if (timer) { clearInterval(timer); timer = null; }
+      flushPendingToWs();
+      // 接続直後は daemon 側が redraw をまだ送っていない可能性がある。
+      // 一度だけ screen dump を fetch して初期状態を xterm に流し込む
+      // (= WS 経由の incremental だけだと画面が空のまま長時間になる懸念を潰す)。
+      fetchScreen();
+    };
+    ws.onmessage = (ev) => {
+      if (ev.data instanceof ArrayBuffer) {
+        // Uint8Array を string 化して term.write。xterm.js は string でも
+        // ArrayBuffer でも受けるが、既存 fetchScreen が string で書いているので
+        // 統一しておく (= 差分が出にくい)。
+        const u8 = new Uint8Array(ev.data);
+        term.write(u8);
+      } else if (typeof ev.data === 'string') {
+        term.write(ev.data);
+      }
+    };
+    ws.onclose = (ev) => {
+      setWsStatus('disconnected (code=' + ev.code + ')');
+      ws = null;
+      if (wsExplicitClose) return;
+      // fallback: ポーリング再開 + 再接続予約
+      schedule();
+      scheduleWsReconnect();
+    };
+    ws.onerror = (_e) => {
+      setWsStatus('error');
+      // onclose も後続で呼ばれる (= reconnect スケジューリングはそちらで)
+    };
+  }
+
+  let wsReconnectTimer = null;
+  function scheduleWsReconnect() {
+    if (wsReconnectTimer) return;
+    setWsStatus('reconnecting in ' + Math.round(wsReconnectMs / 1000) + 's…');
+    wsReconnectTimer = setTimeout(() => {
+      wsReconnectTimer = null;
+      connectWs();
+    }, wsReconnectMs);
+    wsReconnectMs = Math.min(wsReconnectMs * 2, WS_RECONNECT_MAX_MS);
+  }
+
+  window.addEventListener('beforeunload', () => {
+    wsExplicitClose = true;
+    if (ws) try { ws.close(); } catch (_e) {}
+  });
+
   autoEl.addEventListener('change', schedule);
   refreshBtn.addEventListener('click', () => { fetchScreen(); refreshSessionStatus(); });
   // PWA (standalone) 用の全ページリロード。詳細は index.js の該当箇所参照。
@@ -304,6 +449,8 @@
   fetchScreen();
   refreshSessionStatus();
   schedule();
+  // WS attach 開始 (= 成功すればポーリング停止、失敗しても指数バックオフで再試行)。
+  connectWs();
   // status は screen より遅めに poll (= 一覧 API を頻繁に叩かない)。
   setInterval(refreshSessionStatus, 5000);
 })();

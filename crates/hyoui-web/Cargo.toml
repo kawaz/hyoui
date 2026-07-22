@@ -18,12 +18,16 @@ path = "src/lib.rs"
 hyoui = { path = "../hyoui", version = "0.9" }
 
 # HTTP server: axum + tokio + tower。JSON body / query.
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "fs"] }
 include_dir = "0.7"
 tower = { version = "0.5", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# WS bridge: split() で Stream/Sink を Task 分離するために SinkExt / StreamExt が必要 (DR-0027 Phase 3)。
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# 越境 wake pipe と poll 系。core crate と同一 workspace dep を再利用。
+nix = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -32,3 +36,4 @@ tempfile = { workspace = true }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 serde_json = { workspace = true }
+futures-util = { version = "0.3", default-features = false }

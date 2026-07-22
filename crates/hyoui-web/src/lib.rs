@@ -26,13 +26,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use include_dir::{Dir, include_dir};
 
 pub use axum;
+
+mod ws_attach;
 
 /// リリースビルドに埋め込む静的アセット (= `crates/hyoui-web/assets/`)。
 ///
@@ -74,6 +76,7 @@ pub fn router(config: hyoui::config::Config, assets_dir: Option<PathBuf>) -> Rou
         .route("/api/sessions/{id}/input", post(post_input))
         .route("/api/sessions/{id}/resume", post(post_resume))
         .route("/api/sessions/{id}/resize", post(post_resize))
+        .route("/api/sessions/{id}/attach", get(get_ws_attach))
         .with_state(state)
 }
 
@@ -531,6 +534,25 @@ fn resize_blocking(socket_path: &std::path::Path, cols: u16, rows: u16) -> Resul
     }))
     .map_err(|e| format!("send resize: {e}"))?;
     Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// GET /api/sessions/:id/attach (WS)  — DR-0027 Phase 3
+// -----------------------------------------------------------------------------
+
+/// WebSocket attach handler。upgrade 前に session 存在 (= live socket) を確認し、
+/// upgrade 後は `ws_attach::run_bridge` が daemon `ClientConnection` (Rw) と WS を
+/// 1:1 双方向 bridge する。
+async fn get_ws_attach(
+    Path(id): Path<String>,
+    State(_state): State<AppState>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let sock = match resolve_socket(&id).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    ws_attach::on_upgrade(ws, sock)
 }
 
 // -----------------------------------------------------------------------------

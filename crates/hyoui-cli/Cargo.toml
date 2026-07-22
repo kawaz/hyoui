@@ -44,6 +44,9 @@ nix = { workspace = true }
 #   `std::process::Child` をそのまま返す lean な設計)
 insta = "1.47"
 pty-process = "0.5"
+# DR-0027 Phase 3: WS attach e2e で blocking WS client として使う (= workspace 依存の
+# 他 crate と衝突しないよう default features 有効のまま、rustls 系は使わない ws:// 前提)。
+tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 
 [lints.rust]
 unsafe_code = "forbid"
