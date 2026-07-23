@@ -249,8 +249,12 @@ td.argv, td.cwd {
   width: 3.2rem;
   height: 3.2rem;
   border-radius: 50%;
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  background: rgba(30, 30, 30, 0.92);
+  /* JS が bg query param を受けた時のみ --fab-bg / --fab-border / --fab-hover-bg を
+     setProperty する (未指定時は var() の fallback で既定値)。
+     border/hover は bg の派生: border=color-mix(oklch, bg 70%, white) で bg より
+     明度を上げた輪郭、hover=color-mix(oklch, bg 85%, white) で bg の少し明るい色 (r56)。 */
+  border: 1px solid var(--fab-border, rgba(255, 255, 255, 0.2));
+  background: var(--fab-bg, rgba(30, 30, 30, 0.92));
   color: #e0e0e0;
   /* 絵文字グリフを circle にほぼフィットさせる (PC のテキストスタイル描画で
      小さく見える問題への対策。VS16 付き絵文字 + 大きめ font-size)。 */
@@ -266,7 +270,7 @@ td.argv, td.cwd {
   align-items: center;
   justify-content: center;
 }
-#inputFab:hover { background: rgba(50, 50, 50, 0.92); }
+#inputFab:hover { background: var(--fab-hover-bg, rgba(50, 50, 50, 0.92)); }
 #inputFab.dragging { cursor: grabbing; opacity: 0.7; }
 #inputFab[hidden] { display: none; }
 

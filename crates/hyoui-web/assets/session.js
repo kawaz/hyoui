@@ -501,7 +501,16 @@
       el.style.height = design.size + 'px';
       el.style.fontSize = (design.size * FAB_FONT_RATIO) + 'px';
     }
-    if (design.bg !== null) el.style.background = design.bg;
+    if (design.bg !== null) {
+      // bg を CSS custom property 経由でセットし、border / hover 派生色を
+      // color-mix(in oklch, ...) で CSS 側に生成させる (kawaz r56、ccmsg UI 馴染ませ用)。
+      // design.bg は CSS.supports('color', ...) 検証通過済み → color-mix の引数として
+      // 直挿しても injection safe (custom property 値は宣言外へ抜けない)。
+      // 数値 70%/85% は「bg より一段明るい border」「bg のわずかに明るい hover」を意図。
+      el.style.setProperty('--fab-bg', design.bg);
+      el.style.setProperty('--fab-border', `color-mix(in oklch, ${design.bg} 70%, white)`);
+      el.style.setProperty('--fab-hover-bg', `color-mix(in oklch, ${design.bg} 85%, white)`);
+    }
     if (design.fg !== null) el.style.color = design.fg;
   }
 
