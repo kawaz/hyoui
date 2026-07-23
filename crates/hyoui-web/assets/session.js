@@ -66,6 +66,9 @@
     window.__hyouiDebug('warn', 'FitAddon global not found');
   }
   term.open(document.getElementById('term'));
+  // playwright / devtools 用の debug hook。production でも露出しているが
+  // xterm.js の内部 API なので副作用は限定的 (= UI ボタンを増やす代わり)。
+  window.__hyouiTerm = term;
 
   const statusEl = document.getElementById('status');
   const sizeEl = document.getElementById('size');
@@ -210,6 +213,17 @@
   }
   resumeBtn.addEventListener('click', sendResume);
 
+  // fetchScreen は「reset + 全 ANSI 書き直し」を行うため、実行するたびに
+  // scrollback 履歴と現行の選択範囲を破棄する。WS attach 中は raw stream の
+  // incremental append で状態が反映され続けるので、fetchScreen を呼ぶと
+  // scrollback / 選択 / コピー中の状態が壊れる (kawaz 受け入れ条件 2026-07-23)。
+  // よって wsIsOpen() 判定で reset 系呼び出しは全て抑止する:
+  // - refresh ボタン: WS 中は no-op に降格 (`refresh (ws active)` バッジで示す)
+  // - auto refresh checkbox: WS 中は無効化 (schedule() が timer を張らない)
+  // - sendSpecs 後の 300ms 後 fetchScreen: WS 中は skip (WS 側で描画される)
+  // WS onopen 直後の初回 fetchScreen だけは、bridge が接続時点以降の追記しか
+  // 出さない性質上、初期状態を xterm へ流し込む唯一の手段なので許容する
+  // (= 直後に選択操作は無いはず、以降は WS のみ)。
   async function fetchScreen() {
     statusEl.textContent = 'fetching…';
     try {
@@ -248,8 +262,9 @@
       const txt = await r.text();
       if (!r.ok) throw new Error(`HTTP ${r.status}: ${txt}`);
       sendStatus.textContent = `sent (${txt})`;
-      // Refresh screen soon after sending.
-      setTimeout(fetchScreen, 300);
+      // Refresh screen soon after sending — WS 中は bridge が echo を stream で
+      // 返すので fetchScreen を呼ばない (reset で scrollback / 選択が消えるため)。
+      if (!wsIsOpen()) setTimeout(fetchScreen, 300);
     } catch (e) {
       sendStatus.textContent = 'send error: ' + e.message;
     }
@@ -295,7 +310,8 @@
 
   function schedule() {
     if (timer) { clearInterval(timer); timer = null; }
-    if (autoEl.checked) {
+    // WS 中は reset を伴う fetchScreen をタイマーで走らせない (受け入れ条件)。
+    if (autoEl.checked && !wsIsOpen()) {
       timer = setInterval(fetchScreen, REFRESH_MS);
     }
   }
@@ -391,9 +407,12 @@
     ws.onopen = () => {
       setWsStatus('connected');
       wsReconnectMs = 1000;
-      // WS 接続中は screen ポーリング停止 (= 転送コスト削減 + 二重書き込みで
-      // ちらつくのを避ける)。UI checkbox は状態そのまま。
+      // WS 接続中は screen ポーリング停止 (= 転送コスト削減 + reset で scrollback
+      // が消えるのを avoid)。auto refresh checkbox は disable にして UI 上も
+      // 「今は WS が主」であることを示す。
       if (timer) { clearInterval(timer); timer = null; }
+      autoEl.disabled = true;
+      autoEl.title = 'WS 接続中は auto refresh 無効 (scrollback / 選択保護)';
       flushPendingToWs();
       // 接続直後は daemon 側が redraw をまだ送っていない可能性がある。
       // 一度だけ screen dump を fetch して初期状態を xterm に流し込む
@@ -414,8 +433,10 @@
     ws.onclose = (ev) => {
       setWsStatus('disconnected (code=' + ev.code + ')');
       ws = null;
+      // WS 切断後は fallback ポーリング + auto refresh 再有効化。
+      autoEl.disabled = false;
+      autoEl.title = '';
       if (wsExplicitClose) return;
-      // fallback: ポーリング再開 + 再接続予約
       schedule();
       scheduleWsReconnect();
     };
@@ -442,7 +463,16 @@
   });
 
   autoEl.addEventListener('change', schedule);
-  refreshBtn.addEventListener('click', () => { fetchScreen(); refreshSessionStatus(); });
+  // refresh ボタン: WS 中に押すと reset が走って scrollback / 選択が消える。
+  // 「明示押下は WS 中でも状態リセットの意図がある」ケース (= 画面が乱れた等) が
+  // あり得るので nop にせず、確認ダイアログでガードする (誤タップ抑止)。
+  refreshBtn.addEventListener('click', () => {
+    if (wsIsOpen()) {
+      if (!confirm('WS 接続中です。refresh すると scrollback と選択が消えます。実行しますか?')) return;
+    }
+    fetchScreen();
+    refreshSessionStatus();
+  });
   // PWA (standalone) 用の全ページリロード。詳細は index.js の該当箇所参照。
   const reloadBtn = document.getElementById('reload');
   if (reloadBtn) reloadBtn.addEventListener('click', () => location.reload());
