@@ -427,60 +427,94 @@
     savePos(pos);
     return pos;
   }
-  // Query パラメータからの初期位置指定 (kawaz r40m99、ccmsg 側の＋ボタン被り対策)。
-  // 優先順位: sessionStorage > query > default (CSS の右下 1rem)。
+  // Query パラメータからの初期位置 + デザインヒント指定
+  // (kawaz r40m99: ccmsg 側の＋ボタン被り対策 / r56: ccmsg UI と馴染ませる用の size/bg/fg 追加)。
+  // 優先順位: sessionStorage (pos のみ) > query > default (CSS の右下 1rem、CSS の色/サイズ)。
   //
   // 受理形式 (どちらでも / 両方併用時は個別 param が単一 param を上書き):
-  //   1) 単一 param:   ?fab=<edge>:<dist>[,<edge>:<dist>...]
-  //        例: ?fab=right:16,bottom:80
-  //            ?fab=left:24,top:10
-  //   2) 個別 param:   ?fab-right=16&fab-bottom=80  (right/left/top/bottom いずれも)
+  //   1) 単一 param:   ?fab=<key>:<val>[,<key>:<val>...]
+  //        位置キー:  left/right/top/bottom  (値: 非負数、px)
+  //        デザインキー: size (32〜96 に clamp), bg (CSS color), fg (CSS color)
+  //        例: ?fab=right:16,bottom:64,size:48,bg:%233b82f6,fg:white
+  //   2) 個別 param:   ?fab-<key>=<val>
+  //        例: ?fab-right=16&fab-bottom=64&fab-size=48&fab-bg=%233b82f6
   //
   // ルール:
   //   - edge は right/left (水平) と top/bottom (垂直) から片方ずつ選ぶ
-  //   - dist は非負整数 or 小数 (px 単位、単位表記なし)
-  //   - horizontal / vertical のどちらかしか指定されない場合、未指定側は default (右 or 下 16px)
-  //   - 両側 (right & left の両方等) 指定された場合は「後勝ち」= 個別 param → 単一 param 内は右辺後勝ち
-  //   - 不正 (edge 名不正 / dist が NaN) は silent skip → default にフォールバック
-  function parsePosFromQuery() {
+  //   - 位置 dist / size は非負数値、size は 32〜96 に clamp
+  //   - bg/fg は CSS.supports('color', v) で検証、不正は silent skip
+  //   - 未知 key は silent skip (前方互換)
+  //   - 両側指定は「後勝ち」= 個別 param → 単一 param 内は右辺後勝ち
+  //   - 片側 (h/v) 未指定なら default (右 or 下 16px)
+  const FAB_SIZE_MIN = 32, FAB_SIZE_MAX = 96;
+  const FAB_FONT_RATIO = 2.1 / 3.2; // CSS default 51.2px 径 : 33.6px font の比を維持
+  function parseFabFromQuery() {
     const q = new URLSearchParams(location.search);
     let hEdge = null, hDist = null, vEdge = null, vDist = null;
-    // 単一 param 先に処理
+    const design = { size: null, bg: null, fg: null };
+    const assign = (key, raw) => {
+      const k = key.toLowerCase();
+      if (k === 'left' || k === 'right' || k === 'top' || k === 'bottom') {
+        const d = parseFloat(raw);
+        if (!Number.isFinite(d) || d < 0) return;
+        if (k === 'left' || k === 'right') { hEdge = k; hDist = d; }
+        else { vEdge = k; vDist = d; }
+      } else if (k === 'size') {
+        const n = parseFloat(raw);
+        if (!Number.isFinite(n)) return;
+        design.size = Math.max(FAB_SIZE_MIN, Math.min(FAB_SIZE_MAX, n));
+      } else if (k === 'bg' || k === 'fg') {
+        // CSS.supports で検証 (injection 対策: 検証通過値を style プロパティへ直代入のみ)
+        if (typeof CSS !== 'undefined' && CSS.supports && CSS.supports('color', raw)) {
+          design[k] = raw;
+        }
+      }
+      // 未知 key は silent skip
+    };
     const single = q.get('fab');
     if (single) {
       for (const part of single.split(',')) {
-        const m = part.trim().match(/^(left|right|top|bottom)\s*:\s*(-?\d+(?:\.\d+)?)$/i);
-        if (!m) continue;
-        const edge = m[1].toLowerCase();
-        const d = parseFloat(m[2]);
-        if (!Number.isFinite(d) || d < 0) continue;
-        if (edge === 'left' || edge === 'right') { hEdge = edge; hDist = d; }
-        else { vEdge = edge; vDist = d; }
+        const s = part.trim();
+        const idx = s.indexOf(':');
+        if (idx < 0) continue;
+        assign(s.slice(0, idx).trim(), s.slice(idx + 1).trim());
       }
     }
-    // 個別 param が単一を上書き
-    for (const edge of ['left', 'right', 'top', 'bottom']) {
-      const v = q.get('fab-' + edge);
+    for (const key of ['left', 'right', 'top', 'bottom', 'size', 'bg', 'fg']) {
+      const v = q.get('fab-' + key);
       if (v == null) continue;
-      const d = parseFloat(v);
-      if (!Number.isFinite(d) || d < 0) continue;
-      if (edge === 'left' || edge === 'right') { hEdge = edge; hDist = d; }
-      else { vEdge = edge; vDist = d; }
+      assign(key, v);
     }
-    if (hEdge === null && vEdge === null) return null;
-    // 片側未指定なら default (右下 16px)
-    if (hEdge === null) { hEdge = 'right'; hDist = 16; }
-    if (vEdge === null) { vEdge = 'bottom'; vDist = 16; }
-    return { hEdge, hDist, vEdge, vDist };
+    let pos = null;
+    if (hEdge !== null || vEdge !== null) {
+      if (hEdge === null) { hEdge = 'right'; hDist = 16; }
+      if (vEdge === null) { vEdge = 'bottom'; vDist = 16; }
+      pos = { hEdge, hDist, vEdge, vDist };
+    }
+    const hasDesign = design.size !== null || design.bg !== null || design.fg !== null;
+    return { pos, design: hasDesign ? design : null };
+  }
+  function applyFabDesign(el, design) {
+    if (!design) return;
+    if (design.size !== null) {
+      el.style.width = design.size + 'px';
+      el.style.height = design.size + 'px';
+      el.style.fontSize = (design.size * FAB_FONT_RATIO) + 'px';
+    }
+    if (design.bg !== null) el.style.background = design.bg;
+    if (design.fg !== null) el.style.color = design.fg;
   }
 
-  // 初期位置 restore: sessionStorage > query > CSS default (右下 1rem)。
+  // 初期位置 + デザインヒント restore: sessionStorage (pos) > query > CSS default (右下 1rem)。
   floatPos = loadPos();
-  const queryPos = floatPos ? null : parsePosFromQuery();
+  const fromQuery = parseFabFromQuery();
+  const queryPos = floatPos ? null : fromQuery.pos;
+  // デザインヒントは sessionStorage に保存しない (= query 経由専用、reload で再解釈)。
+  // size 反映後に位置計算が正しくなるよう、design → pos の順で適用。
+  applyFabDesign(inputFab, fromQuery.design);
   const initialPos = floatPos ?? queryPos;
   if (initialPos) {
-    // query 経由は sessionStorage に書かない (= reload / タブ再利用で query を再解釈させる)。
-    // sessionStorage 経由は既にそこにあるので書き直し不要。
+    // query 経由 pos は sessionStorage に書かない (= reload / タブ再利用で query を再解釈させる)。
     requestAnimationFrame(() => applyEdgePos(inputFab, initialPos));
     if (queryPos) floatPos = queryPos; // resize/drag の基準として持つ
   }
