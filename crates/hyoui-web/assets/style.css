@@ -123,8 +123,7 @@ a { color: var(--accent); }
    frame-ancestors 制限は付けない (= tailnet 前提、DR-0027 §serve)。 */
 body.embed { padding: 0; }
 body.embed > header,
-body.embed #debugPanel,
-body.embed #sendStatus { display: none; }
+body.embed #debugPanel { display: none; }
 body.embed main {
   height: 100vh;
   padding: 0.4rem;
@@ -142,7 +141,8 @@ body.embed #term .xterm-screen {
   width: 100% !important;
   height: 100% !important;
 }
-body.embed #inputForm { flex: 0 0 auto; }
+/* 旧 #inputForm ルールはフローティング化に伴い廃止。#inputFab / .input-panel は
+   fixed 位置なので main flow に居ない (= embed でも共通に使える)。 */
 #term {
   border: 1px solid var(--border);
   padding: 4px;
@@ -227,12 +227,130 @@ td.argv, td.cwd {
 }
 #inputText {
   font-family: "HackGen Console NF", Menlo, "DejaVu Sans Mono", Consolas, monospace;
-  font-size: 0.9rem;
-  padding: 0.3rem 0.5rem;
+  font-size: 0.95rem;
+  padding: 0.4rem 0.55rem;
   border: 1px solid var(--border);
-  background: transparent;
+  background: rgba(255, 255, 255, 0.03);
   color: var(--fg);
-  border-radius: 3px;
-  flex: 1;
-  min-width: 20ch;
+  border-radius: 4px;
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 3.2em;
+}
+
+/* ---------------- Floating input FAB + panel (DR-0027 Phase3 続) ---------------- */
+/* fab: fixed 位置。default 右下、drag&drop で移動 (JS 側で translate3d)。
+   タッチ 44x44 min、iPad で操作しやすい大きさ。ダーク調で terminal を邪魔しない。 */
+#inputFab {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  width: 3.2rem;
+  height: 3.2rem;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(30, 30, 30, 0.92);
+  color: #e0e0e0;
+  font-size: 1.5rem;
+  line-height: 1;
+  cursor: grab;
+  z-index: 1000;
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.5);
+  touch-action: none; /* pointer 経由の drag を優先 (scroll に取られない) */
+  user-select: none;
+  -webkit-user-select: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#inputFab:hover { background: rgba(50, 50, 50, 0.92); }
+#inputFab.dragging { cursor: grabbing; opacity: 0.7; }
+#inputFab[hidden] { display: none; }
+
+/* panel: fab の近傍に fixed で開く。JS が top/left をセット。
+   最大 min(90vw, 32rem) 幅、モバイルで縦画面時も収まる。 */
+.input-panel {
+  position: fixed;
+  z-index: 1001;
+  background: rgba(24, 24, 24, 0.98);
+  color: #e0e0e0;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.6);
+  padding: 0.6rem;
+  width: min(90vw, 32rem);
+  max-height: min(70vh, 32rem);
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+.input-panel[hidden] { display: none; }
+.input-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  padding-bottom: 0.35rem;
+}
+.input-panel-title { font-size: 0.9rem; font-weight: bold; color: #e0e0e0; }
+.input-panel-close {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: #e0e0e0;
+  border-radius: 4px;
+  width: 2rem;
+  height: 2rem;
+  font-size: 1.2rem;
+  line-height: 1;
+  padding: 0;
+}
+.input-panel-close:hover { background: rgba(255, 255, 255, 0.08); }
+.input-panel .input-panel-buttons {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.input-panel .input-panel-buttons button {
+  color: #e0e0e0;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  padding: 0.4rem 0.8rem;
+  min-height: 2.4rem;
+}
+.input-panel .input-panel-buttons button.send-primary {
+  background: #1e5fb3;
+  border-color: #2a7dd7;
+  font-weight: bold;
+}
+.input-panel .input-panel-buttons button.send-primary:hover { background: #2a7dd7; }
+.input-panel .input-panel-buttons button:hover { background: rgba(255, 255, 255, 0.09); }
+.input-panel .input-panel-buttons kbd {
+  font-family: inherit;
+  font-size: 0.8rem;
+  opacity: 0.75;
+}
+.input-panel .input-panel-buttons .opt {
+  color: #ccc;
+  font-size: 0.85rem;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+.input-panel #keypad { padding-top: 0.3rem; border-top: 1px solid rgba(255, 255, 255, 0.08); }
+.input-panel #keypad[hidden] { display: none; }
+.input-panel #keypad button {
+  color: #e0e0e0;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  padding: 0.35rem 0.6rem;
+  min-height: 2.4rem;
+  min-width: 2.6rem;
+}
+.input-panel #sendStatus {
+  margin: 0;
+  font-size: 0.78rem;
+  color: #999;
+  min-height: 1em;
 }

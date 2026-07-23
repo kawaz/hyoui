@@ -38,27 +38,44 @@
     <button type="button" id="resumeBtn">▶ resume</button>
   </div>
   <div id="term"></div>
-  <form id="inputForm" autocomplete="off">
-    <input type="text" id="inputText" placeholder="input to send..." spellcheck="false">
-    <button type="submit" id="sendEnter">Send + Enter</button>
-    <button type="button" id="sendRaw">Send (no Enter)</button>
-    <button type="button" id="sendKey" title="送信するキーを prompt で入力 (例: Escape, Tab, Ctrl-C, C-a)">Send Key…</button>
-  </form>
-  <!-- 特殊キーパッド (iPad ソフトキーボードで打てない矢印 / Tab / Esc 等を補う)。
-       button の data-spec 属性を POST /input の spec としてそのまま送る。
-       hex:1b5b5a は Shift+Tab (= CSI Z / BackTab、input_bytes に key 名が無いので hex 直指定)。 -->
-  <div id="keypad" class="keypad" aria-label="special key pad">
-    <button type="button" data-spec="key:Up" title="Up (↑)">↑</button>
-    <button type="button" data-spec="key:Down" title="Down (↓)">↓</button>
-    <button type="button" data-spec="key:Left" title="Left (←)">←</button>
-    <button type="button" data-spec="key:Right" title="Right (→)">→</button>
-    <button type="button" data-spec="key:Tab" title="Tab">Tab</button>
-    <button type="button" data-spec="hex:1b5b5a" title="Shift+Tab (CSI Z / BackTab)">⇧Tab</button>
-    <button type="button" data-spec="key:Escape" title="Escape">Esc</button>
-    <button type="button" data-spec="key:Enter" title="Enter">Enter</button>
-    <button type="button" data-spec="key:Ctrl-C" title="Ctrl+C (SIGINT for cooked mode / raw ^C)">^C</button>
+  <!--
+    DR-0027 Phase3 続: 常設 input 欄は廃止し、フローティング呼び出しボタン (#inputFab)
+    + 展開パネル (#inputPanel) に置き換え (kawaz 要望 2026-07-23)。WS attach でキーは
+    xterm に直接打てるので、input パネルは iPad ソフトキーボード / 特殊キー用の
+    補助手段の位置づけ。
+    - #inputFab: fixed 位置、drag & drop で移動可、位置は localStorage
+    - #inputPanel: textarea (マルチライン)、Cmd/Ctrl+Enter 送信、Enter は改行
+    - キーパッドは折り畳み式
+  -->
+  <button id="inputFab" type="button"
+          title="Input パネルを開く (ドラッグで移動)"
+          aria-label="Open input panel">⌨</button>
+  <div id="inputPanel" class="input-panel" hidden role="dialog" aria-label="Input panel">
+    <div class="input-panel-head">
+      <span class="input-panel-title">Input</span>
+      <button type="button" id="inputPanelClose" class="input-panel-close" aria-label="close">×</button>
+    </div>
+    <textarea id="inputText" spellcheck="false" autocomplete="off" autocapitalize="off"
+              rows="4" placeholder="Cmd/Ctrl+Enter で送信 / Enter は改行"></textarea>
+    <div class="input-panel-buttons">
+      <button type="button" id="sendBtn" class="send-primary">Send  <kbd>⌘↩</kbd></button>
+      <label class="opt" title="各行末に Enter (0x0d) を挟む。off だと生 bytes だけ送る"><input type="checkbox" id="sendEnterAfter" checked> Enter/行</label>
+      <button type="button" id="keypadToggle" aria-expanded="false" aria-controls="keypad">Keys ▾</button>
+      <button type="button" id="sendKey" title="任意 key 名 (例: Escape, Tab, Ctrl-C, C-a)">Key…</button>
+    </div>
+    <div id="keypad" class="keypad" aria-label="special key pad" hidden>
+      <button type="button" data-spec="key:Up" title="Up (↑)">↑</button>
+      <button type="button" data-spec="key:Down" title="Down (↓)">↓</button>
+      <button type="button" data-spec="key:Left" title="Left (←)">←</button>
+      <button type="button" data-spec="key:Right" title="Right (→)">→</button>
+      <button type="button" data-spec="key:Tab" title="Tab">Tab</button>
+      <button type="button" data-spec="hex:1b5b5a" title="Shift+Tab (CSI Z / BackTab)">⇧Tab</button>
+      <button type="button" data-spec="key:Escape" title="Escape">Esc</button>
+      <button type="button" data-spec="key:Enter" title="Enter">Enter</button>
+      <button type="button" data-spec="key:Ctrl-C" title="Ctrl+C">^C</button>
+    </div>
+    <p id="sendStatus" class="meta"></p>
   </div>
-  <p id="sendStatus" class="meta"></p>
   <details id="debugPanel">
     <summary>debug log (<span id="debugCount">0</span>)</summary>
     <pre id="debugLog"></pre>

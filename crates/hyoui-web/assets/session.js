@@ -75,11 +75,15 @@
   const autoEl = document.getElementById('auto');
   const autoResizeEl = document.getElementById('autoResize');
   const refreshBtn = document.getElementById('refresh');
-  const inputForm = document.getElementById('inputForm');
   const inputText = document.getElementById('inputText');
-  const sendRawBtn = document.getElementById('sendRaw');
+  const sendBtn = document.getElementById('sendBtn');
   const sendKeyBtn = document.getElementById('sendKey');
   const sendStatus = document.getElementById('sendStatus');
+  const sendEnterAfter = document.getElementById('sendEnterAfter');
+  const inputFab = document.getElementById('inputFab');
+  const inputPanel = document.getElementById('inputPanel');
+  const inputPanelClose = document.getElementById('inputPanelClose');
+  const keypadToggle = document.getElementById('keypadToggle');
   const stoppedBanner = document.getElementById('stoppedBanner');
   const resumeBtn = document.getElementById('resumeBtn');
   // HTML の `hidden` 属性に加え script 側でも明示的に hide しておく (belt-and-suspenders)。
@@ -270,21 +274,43 @@
     }
   }
 
-  inputForm.addEventListener('submit', (ev) => {
-    ev.preventDefault();
-    const t = inputText.value;
+  // multi-line 対応の送信ロジック (kawaz 要望 2026-07-23)。
+  // - textarea の中身を \n で split
+  // - 各行を text:<line> として送信
+  // - sendEnterAfter が checked (default) なら各行末に key:Enter を挟む
+  //   (= shell では 0x0d が Enter、0x0a を text で送っても cooked mode で扱いが
+  //    OS 依存になるため、key:Enter で 0x0d を明示的に送る)
+  // - 送信後は textarea を空にする (再送信リスク回避)
+  function submitFromTextarea() {
+    const raw = inputText.value;
+    if (raw.length === 0 && !sendEnterAfter.checked) return;
+    const lines = raw.split('\n');
     const specs = [];
-    if (t.length > 0) specs.push('text:' + t);
-    specs.push('key:Enter');
+    lines.forEach((line, idx) => {
+      if (line.length > 0) specs.push('text:' + line);
+      if (sendEnterAfter.checked) {
+        specs.push('key:Enter');
+      } else if (idx < lines.length - 1) {
+        // Enter/行 off でも改行区切りは残す (= hex で 0x0a 送信)
+        specs.push('hex:0a');
+      }
+    });
+    if (specs.length === 0) return;
     sendSpecs(specs);
     inputText.value = '';
-  });
+  }
 
-  sendRawBtn.addEventListener('click', () => {
-    const t = inputText.value;
-    if (t.length === 0) return;
-    sendSpecs(['text:' + t]);
-    inputText.value = '';
+  sendBtn.addEventListener('click', submitFromTextarea);
+
+  // textarea key handling: Cmd+Enter / Ctrl+Enter で送信、Enter 単体は改行 (default 動作)。
+  // IME 変換確定の Enter を誤送信しない (= isComposing / keyCode 229 の除外)。
+  inputText.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) {
+      // 変換中の Enter は Cmd/Ctrl 付きでは通常来ないが念のため除外
+      if (ev.isComposing || ev.keyCode === 229) return;
+      ev.preventDefault();
+      submitFromTextarea();
+    }
   });
 
   // 特殊キーパッド (iPad ソフトキーボードで打てない矢印 / Tab / Esc / Ctrl-C 等)。
@@ -306,6 +332,187 @@
     const name = prompt('Key name (e.g. Escape, Tab, Ctrl-C, C-a):');
     if (!name) return;
     sendSpecs(['key:' + name]);
+  });
+
+  // ---- Floating input FAB + panel (kawaz 要望 2026-07-23 r40m93) ----
+  //
+  // - FAB: fixed 位置、drag & drop で移動可 (localStorage 保持)、touch 対応。
+  // - Panel: FAB 近傍に fixed で開く。閉じると textarea 内容を保持
+  //   (= 誤クローズ時の入力消失を避ける)。
+  // - Cmd/Ctrl+Enter で送信、Enter は改行 (上の keydown ハンドラ参照)。
+  // - キーパッドは折り畳み式 (default: 畳んだ状態)。
+  // - WS attach との協調: パネル展開中は textarea にフォーカス、閉じたら
+  //   xterm ヘルパー textarea にフォーカスを戻して直打ちを継続。
+
+  const LS_FAB_POS = 'hyoui.session.fabPos';
+
+  // FAB 位置の restore (localStorage)。存在しなければ default (CSS の bottom-right)。
+  function clampFabPos(x, y) {
+    const r = inputFab.getBoundingClientRect();
+    const w = r.width || 51;
+    const h = r.height || 51;
+    const maxX = window.innerWidth - w;
+    const maxY = window.innerHeight - h;
+    return {
+      x: Math.max(0, Math.min(maxX, x)),
+      y: Math.max(0, Math.min(maxY, y)),
+    };
+  }
+  function applyFabPos(x, y) {
+    inputFab.style.left = x + 'px';
+    inputFab.style.top = y + 'px';
+    inputFab.style.right = 'auto';
+    inputFab.style.bottom = 'auto';
+  }
+  try {
+    const saved = JSON.parse(localStorage.getItem(LS_FAB_POS) || 'null');
+    if (saved && typeof saved.x === 'number' && typeof saved.y === 'number') {
+      // layout 完了後に clamp して適用 (= viewport サイズが小さい環境で画面外に出ないよう)
+      requestAnimationFrame(() => {
+        const p = clampFabPos(saved.x, saved.y);
+        applyFabPos(p.x, p.y);
+      });
+    }
+  } catch (_e) { /* localStorage 不能環境は default 位置 */ }
+
+  // Drag 実装 (pointer events で mouse / touch / pen を統一)。
+  // - pointerdown: 記録開始 (offsetX/offsetY で「掴んだ相対位置」を保存)
+  // - pointermove: translate 追従 (dragThreshold 超えたら dragging class)
+  // - pointerup: 保存 + click 抑止 (drag と click の区別)。
+  let dragState = null;
+  let suppressNextClick = false; // drag 完了直後の click を吸収 (toggle 誤発火防止)
+  const DRAG_THRESHOLD_PX = 5;
+  inputFab.addEventListener('pointerdown', (ev) => {
+    if (ev.button !== undefined && ev.button !== 0) return; // 左クリック only
+    const r = inputFab.getBoundingClientRect();
+    dragState = {
+      startX: ev.clientX,
+      startY: ev.clientY,
+      offsetX: ev.clientX - r.left,
+      offsetY: ev.clientY - r.top,
+      moved: false,
+      pointerId: ev.pointerId,
+    };
+    inputFab.setPointerCapture(ev.pointerId);
+  });
+  inputFab.addEventListener('pointermove', (ev) => {
+    if (!dragState || ev.pointerId !== dragState.pointerId) return;
+    const dx = ev.clientX - dragState.startX;
+    const dy = ev.clientY - dragState.startY;
+    if (!dragState.moved && Math.hypot(dx, dy) > DRAG_THRESHOLD_PX) {
+      dragState.moved = true;
+      inputFab.classList.add('dragging');
+    }
+    if (dragState.moved) {
+      const p = clampFabPos(ev.clientX - dragState.offsetX, ev.clientY - dragState.offsetY);
+      applyFabPos(p.x, p.y);
+    }
+  });
+  inputFab.addEventListener('pointerup', (ev) => {
+    if (!dragState || ev.pointerId !== dragState.pointerId) return;
+    const moved = dragState.moved;
+    inputFab.classList.remove('dragging');
+    try { inputFab.releasePointerCapture(dragState.pointerId); } catch (_e) {}
+    if (moved) {
+      // 位置保存 + 直後の click 吸収 (browser は pointerup 後に click を送るため
+      // toggle が誤発火して drag 完了と同時にパネル開閉してしまうのを avoid)。
+      const r = inputFab.getBoundingClientRect();
+      try { localStorage.setItem(LS_FAB_POS, JSON.stringify({ x: r.left, y: r.top })); } catch (_e) {}
+      suppressNextClick = true;
+    }
+    dragState = null;
+  });
+  inputFab.addEventListener('pointercancel', (ev) => {
+    if (dragState && ev.pointerId === dragState.pointerId) {
+      inputFab.classList.remove('dragging');
+      dragState = null;
+    }
+  });
+  // click (mouse / touch / keyboard 全部から発火) で toggle。drag 完了直後は skip。
+  inputFab.addEventListener('click', (ev) => {
+    if (suppressNextClick) {
+      suppressNextClick = false;
+      ev.stopPropagation();
+      ev.preventDefault();
+      return;
+    }
+    togglePanel();
+  });
+
+  function positionPanelNearFab() {
+    const r = inputFab.getBoundingClientRect();
+    const pw = Math.min(window.innerWidth * 0.9, 512);
+    const ph = Math.min(window.innerHeight * 0.7, 512);
+    // FAB の上に開くか下に開くかは viewport 位置で判定 (下半分に FAB があれば上に開く)
+    let top, left;
+    if (r.top + r.height / 2 > window.innerHeight / 2) {
+      // 上方向に開く: panel の bottom を FAB の top-8 に合わせる
+      top = Math.max(8, r.top - ph - 8);
+    } else {
+      top = Math.min(window.innerHeight - ph - 8, r.bottom + 8);
+    }
+    // 横位置: FAB の左右で近い側に寄せつつ、はみ出さないようクランプ
+    if (r.left + r.width / 2 > window.innerWidth / 2) {
+      // FAB が右寄り → panel を FAB の左端に合わせて左展開
+      left = Math.max(8, r.right - pw);
+    } else {
+      left = Math.min(window.innerWidth - pw - 8, r.left);
+    }
+    inputPanel.style.top = top + 'px';
+    inputPanel.style.left = left + 'px';
+  }
+
+  function openPanel() {
+    positionPanelNearFab();
+    inputPanel.hidden = false;
+    // 展開時に textarea へフォーカス (iPad ソフトキーボードが立ち上がる)
+    requestAnimationFrame(() => {
+      inputText.focus();
+      // 末尾にカーソル (前回の残り content があった場合の UX)
+      const l = inputText.value.length;
+      try { inputText.setSelectionRange(l, l); } catch (_e) {}
+    });
+  }
+  function closePanel() {
+    inputPanel.hidden = true;
+    // WS 直打ちに戻すため xterm ヘルパー textarea にフォーカス
+    try {
+      const helper = document.querySelector('.xterm-helper-textarea');
+      if (helper) helper.focus();
+    } catch (_e) {}
+  }
+  function togglePanel() {
+    if (inputPanel.hidden) openPanel();
+    else closePanel();
+  }
+
+  inputPanelClose.addEventListener('click', closePanel);
+  // Esc で閉じても textarea 内容は残す (誤クローズ時の入力保護)。
+  // ただしパネル外クリックでの誤クローズはさせない (kawaz 明示)。
+  inputPanel.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') {
+      ev.preventDefault();
+      closePanel();
+    }
+  });
+
+  // Keys 折り畳み。default 畳み。
+  const keypadEl = document.getElementById('keypad');
+  keypadToggle.addEventListener('click', () => {
+    const willShow = keypadEl.hidden;
+    keypadEl.hidden = !willShow;
+    keypadToggle.setAttribute('aria-expanded', willShow ? 'true' : 'false');
+    keypadToggle.textContent = willShow ? 'Keys ▴' : 'Keys ▾';
+    // 開閉で高さが変わるので再配置
+    positionPanelNearFab();
+  });
+
+  // viewport resize (回転 / iframe サイズ変化) 時に FAB とパネルをクランプ
+  window.addEventListener('resize', () => {
+    const r = inputFab.getBoundingClientRect();
+    const p = clampFabPos(r.left, r.top);
+    if (p.x !== r.left || p.y !== r.top) applyFabPos(p.x, p.y);
+    if (!inputPanel.hidden) positionPanelNearFab();
   });
 
   function schedule() {
