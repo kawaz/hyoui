@@ -334,148 +334,150 @@
     sendSpecs(['key:' + name]);
   });
 
-  // ---- Floating input FAB + panel (kawaz 要望 2026-07-23 r40m93) ----
+  // ---- Floating input: FAB ⇔ Panel は同一の浮遊物 (kawaz 実機 FB 2026-07-23) ----
   //
-  // - FAB: fixed 位置、drag & drop で移動可 (localStorage 保持)、touch 対応。
-  // - Panel: FAB 近傍に fixed で開く。閉じると textarea 内容を保持
-  //   (= 誤クローズ時の入力消失を避ける)。
-  // - Cmd/Ctrl+Enter で送信、Enter は改行 (上の keydown ハンドラ参照)。
-  // - キーパッドは折り畳み式 (default: 畳んだ状態)。
-  // - WS attach との協調: パネル展開中は textarea にフォーカス、閉じたら
-  //   xterm ヘルパー textarea にフォーカスを戻して直打ちを継続。
+  // メンタルモデル: FAB と Panel は「折り畳み状態 / 展開状態」の 2 モードを持つ
+  // 1 つの浮遊物。Panel は FAB の位置に「置き換え」で出て、閉じると **その時の
+  // Panel 位置** に FAB が戻る (位置は連動、localStorage は 1 つ)。
+  //
+  // - FAB / Panel いずれもドラッグで移動可 (touch 対応)。Panel はヘッダを掴む
+  // - viewport clamp: 表示中の要素の実寸で clamp
+  // - Cmd/Ctrl+Enter で送信、Enter は改行 (上の keydown ハンドラ参照)
+  // - キーパッドは折り畳み式 (default: 畳んだ状態)
+  // - WS attach との協調: パネル展開中は textarea にフォーカス、閉じたら xterm
+  //   ヘルパー textarea にフォーカスを戻して直打ちを継続
 
-  const LS_FAB_POS = 'hyoui.session.fabPos';
+  const LS_POS = 'hyoui.session.floatPos'; // 統合された位置 (旧 LS_FAB_POS は back-compat で吸収)
+  const LS_POS_LEGACY = 'hyoui.session.fabPos';
 
-  // FAB 位置の restore (localStorage)。存在しなければ default (CSS の bottom-right)。
-  function clampFabPos(x, y) {
-    const r = inputFab.getBoundingClientRect();
+  // 位置ステート: null なら default (CSS の右下)。set したら FAB / Panel どちら
+  // にでも共通で適用する。localStorage には常にこの値を書く。
+  let floatPos = null;
+
+  function loadPos() {
+    try {
+      const raw = localStorage.getItem(LS_POS) ?? localStorage.getItem(LS_POS_LEGACY);
+      if (!raw) return null;
+      const p = JSON.parse(raw);
+      if (typeof p?.x === 'number' && typeof p?.y === 'number') return { x: p.x, y: p.y };
+    } catch (_e) { /* private mode 等 */ }
+    return null;
+  }
+  function savePos(p) {
+    floatPos = p;
+    try {
+      localStorage.setItem(LS_POS, JSON.stringify(p));
+      // legacy key は捨てる (1 位置に統合)
+      localStorage.removeItem(LS_POS_LEGACY);
+    } catch (_e) {}
+  }
+  function clampToViewport(x, y, el) {
+    const r = el.getBoundingClientRect();
     const w = r.width || 51;
     const h = r.height || 51;
-    const maxX = window.innerWidth - w;
-    const maxY = window.innerHeight - h;
-    return {
-      x: Math.max(0, Math.min(maxX, x)),
-      y: Math.max(0, Math.min(maxY, y)),
-    };
+    const maxX = Math.max(0, window.innerWidth - w);
+    const maxY = Math.max(0, window.innerHeight - h);
+    return { x: Math.max(0, Math.min(maxX, x)), y: Math.max(0, Math.min(maxY, y)) };
   }
-  function applyFabPos(x, y) {
-    inputFab.style.left = x + 'px';
-    inputFab.style.top = y + 'px';
-    inputFab.style.right = 'auto';
-    inputFab.style.bottom = 'auto';
+  function applyPos(el, x, y) {
+    const p = clampToViewport(x, y, el);
+    el.style.left = p.x + 'px';
+    el.style.top = p.y + 'px';
+    el.style.right = 'auto';
+    el.style.bottom = 'auto';
+    return p;
   }
-  try {
-    const saved = JSON.parse(localStorage.getItem(LS_FAB_POS) || 'null');
-    if (saved && typeof saved.x === 'number' && typeof saved.y === 'number') {
-      // layout 完了後に clamp して適用 (= viewport サイズが小さい環境で画面外に出ないよう)
-      requestAnimationFrame(() => {
-        const p = clampFabPos(saved.x, saved.y);
-        applyFabPos(p.x, p.y);
-      });
-    }
-  } catch (_e) { /* localStorage 不能環境は default 位置 */ }
+  // 初期位置 restore (default は CSS の右下、bottom/right が効いた状態)。
+  floatPos = loadPos();
+  if (floatPos) {
+    requestAnimationFrame(() => { applyPos(inputFab, floatPos.x, floatPos.y); });
+  }
 
-  // Drag 実装 (pointer events で mouse / touch / pen を統一)。
-  // - pointerdown: 記録開始 (offsetX/offsetY で「掴んだ相対位置」を保存)
-  // - pointermove: translate 追従 (dragThreshold 超えたら dragging class)
-  // - pointerup: 保存 + click 抑止 (drag と click の区別)。
-  let dragState = null;
-  let suppressNextClick = false; // drag 完了直後の click を吸収 (toggle 誤発火防止)
+  // 共通の pointer drag。target = 掴む要素 (FAB or panel header)、
+  // move = 実際に位置を変える要素 (FAB or panel)。tap 時に click を発火させる
+  // かどうかは caller (onTap 経由) が決める。
   const DRAG_THRESHOLD_PX = 5;
-  inputFab.addEventListener('pointerdown', (ev) => {
-    if (ev.button !== undefined && ev.button !== 0) return; // 左クリック only
-    const r = inputFab.getBoundingClientRect();
-    dragState = {
-      startX: ev.clientX,
-      startY: ev.clientY,
-      offsetX: ev.clientX - r.left,
-      offsetY: ev.clientY - r.top,
-      moved: false,
-      pointerId: ev.pointerId,
-    };
-    inputFab.setPointerCapture(ev.pointerId);
-  });
-  inputFab.addEventListener('pointermove', (ev) => {
-    if (!dragState || ev.pointerId !== dragState.pointerId) return;
-    const dx = ev.clientX - dragState.startX;
-    const dy = ev.clientY - dragState.startY;
-    if (!dragState.moved && Math.hypot(dx, dy) > DRAG_THRESHOLD_PX) {
-      dragState.moved = true;
-      inputFab.classList.add('dragging');
-    }
-    if (dragState.moved) {
-      const p = clampFabPos(ev.clientX - dragState.offsetX, ev.clientY - dragState.offsetY);
-      applyFabPos(p.x, p.y);
-    }
-  });
-  inputFab.addEventListener('pointerup', (ev) => {
-    if (!dragState || ev.pointerId !== dragState.pointerId) return;
-    const moved = dragState.moved;
-    inputFab.classList.remove('dragging');
-    try { inputFab.releasePointerCapture(dragState.pointerId); } catch (_e) {}
-    if (moved) {
-      // 位置保存 + 直後の click 吸収 (browser は pointerup 後に click を送るため
-      // toggle が誤発火して drag 完了と同時にパネル開閉してしまうのを avoid)。
-      const r = inputFab.getBoundingClientRect();
-      try { localStorage.setItem(LS_FAB_POS, JSON.stringify({ x: r.left, y: r.top })); } catch (_e) {}
-      suppressNextClick = true;
-    }
-    dragState = null;
-  });
-  inputFab.addEventListener('pointercancel', (ev) => {
-    if (dragState && ev.pointerId === dragState.pointerId) {
-      inputFab.classList.remove('dragging');
-      dragState = null;
-    }
-  });
-  // click (mouse / touch / keyboard 全部から発火) で toggle。drag 完了直後は skip。
-  inputFab.addEventListener('click', (ev) => {
-    if (suppressNextClick) {
-      suppressNextClick = false;
-      ev.stopPropagation();
-      ev.preventDefault();
-      return;
-    }
-    togglePanel();
-  });
-
-  function positionPanelNearFab() {
-    const r = inputFab.getBoundingClientRect();
-    const pw = Math.min(window.innerWidth * 0.9, 512);
-    const ph = Math.min(window.innerHeight * 0.7, 512);
-    // FAB の上に開くか下に開くかは viewport 位置で判定 (下半分に FAB があれば上に開く)
-    let top, left;
-    if (r.top + r.height / 2 > window.innerHeight / 2) {
-      // 上方向に開く: panel の bottom を FAB の top-8 に合わせる
-      top = Math.max(8, r.top - ph - 8);
-    } else {
-      top = Math.min(window.innerHeight - ph - 8, r.bottom + 8);
-    }
-    // 横位置: FAB の左右で近い側に寄せつつ、はみ出さないようクランプ
-    if (r.left + r.width / 2 > window.innerWidth / 2) {
-      // FAB が右寄り → panel を FAB の左端に合わせて左展開
-      left = Math.max(8, r.right - pw);
-    } else {
-      left = Math.min(window.innerWidth - pw - 8, r.left);
-    }
-    inputPanel.style.top = top + 'px';
-    inputPanel.style.left = left + 'px';
+  function attachDrag(target, mover, opts) {
+    let state = null;
+    let suppressClick = false;
+    target.addEventListener('pointerdown', (ev) => {
+      if (ev.button !== undefined && ev.button !== 0) return;
+      // 掴む対象外 (close ボタン等) は無視
+      if (opts?.ignoreTarget?.(ev.target)) return;
+      const r = mover.getBoundingClientRect();
+      state = {
+        startX: ev.clientX,
+        startY: ev.clientY,
+        offsetX: ev.clientX - r.left,
+        offsetY: ev.clientY - r.top,
+        moved: false,
+        pointerId: ev.pointerId,
+      };
+      try { target.setPointerCapture(ev.pointerId); } catch (_e) {}
+    });
+    target.addEventListener('pointermove', (ev) => {
+      if (!state || ev.pointerId !== state.pointerId) return;
+      const dx = ev.clientX - state.startX;
+      const dy = ev.clientY - state.startY;
+      if (!state.moved && Math.hypot(dx, dy) > DRAG_THRESHOLD_PX) {
+        state.moved = true;
+        mover.classList.add('dragging');
+      }
+      if (state.moved) {
+        const p = applyPos(mover, ev.clientX - state.offsetX, ev.clientY - state.offsetY);
+        savePos(p);
+      }
+    });
+    target.addEventListener('pointerup', (ev) => {
+      if (!state || ev.pointerId !== state.pointerId) return;
+      const moved = state.moved;
+      mover.classList.remove('dragging');
+      try { target.releasePointerCapture(state.pointerId); } catch (_e) {}
+      if (moved) suppressClick = true;
+      else if (opts?.onTap) opts.onTap();
+      state = null;
+    });
+    target.addEventListener('pointercancel', (ev) => {
+      if (state && ev.pointerId === state.pointerId) {
+        mover.classList.remove('dragging');
+        state = null;
+      }
+    });
+    // drag 直後の native click を吸収 (pointer 経由の tap は onTap で処理済み)
+    target.addEventListener('click', (ev) => {
+      if (suppressClick) {
+        suppressClick = false;
+        ev.stopPropagation();
+        ev.preventDefault();
+        return;
+      }
+      // keyboard 経由の click (detail=0) は FAB の場合のみ toggle 扱い (accessibility)
+      if (ev.detail === 0 && opts?.onTap) opts.onTap();
+    });
   }
 
   function openPanel() {
-    positionPanelNearFab();
+    // FAB の現在位置 (rect) をそのまま Panel の左上に引き継ぎ、FAB を隠す。
+    // savePos は Panel 側でも同じ位置を使うので統一される。
+    const r = inputFab.getBoundingClientRect();
+    inputFab.hidden = true;
     inputPanel.hidden = false;
-    // 展開時に textarea へフォーカス (iPad ソフトキーボードが立ち上がる)
+    // 表示直後は width/height が確定するので、それを見て clamp
+    const p = applyPos(inputPanel, r.left, r.top);
+    savePos(p);
     requestAnimationFrame(() => {
       inputText.focus();
-      // 末尾にカーソル (前回の残り content があった場合の UX)
       const l = inputText.value.length;
       try { inputText.setSelectionRange(l, l); } catch (_e) {}
     });
   }
   function closePanel() {
+    // Panel の現在位置 (rect) を FAB の左上に引き継ぐ (= 「位置引き継ぎ」)。
+    const r = inputPanel.getBoundingClientRect();
     inputPanel.hidden = true;
-    // WS 直打ちに戻すため xterm ヘルパー textarea にフォーカス
+    inputFab.hidden = false;
+    const p = applyPos(inputFab, r.left, r.top);
+    savePos(p);
     try {
       const helper = document.querySelector('.xterm-helper-textarea');
       if (helper) helper.focus();
@@ -485,6 +487,16 @@
     if (inputPanel.hidden) openPanel();
     else closePanel();
   }
+
+  // FAB: 全体で drag、tap で open。
+  attachDrag(inputFab, inputFab, { onTap: togglePanel });
+
+  // Panel: ヘッダ (× ボタン除く) で drag。tap は open/close トグルではない
+  // (= ヘッダを軽くタップしても閉じないほうが安全)。
+  const panelHead = inputPanel.querySelector('.input-panel-head');
+  attachDrag(panelHead, inputPanel, {
+    ignoreTarget: (t) => t.closest('.input-panel-close'),
+  });
 
   inputPanelClose.addEventListener('click', closePanel);
   // Esc で閉じても textarea 内容は残す (誤クローズ時の入力保護)。
@@ -496,23 +508,26 @@
     }
   });
 
-  // Keys 折り畳み。default 畳み。
+  // Keys 折り畳み。default 畳み。開閉で高さが変わるので clamp を掛け直す。
   const keypadEl = document.getElementById('keypad');
   keypadToggle.addEventListener('click', () => {
     const willShow = keypadEl.hidden;
     keypadEl.hidden = !willShow;
     keypadToggle.setAttribute('aria-expanded', willShow ? 'true' : 'false');
     keypadToggle.textContent = willShow ? 'Keys ▴' : 'Keys ▾';
-    // 開閉で高さが変わるので再配置
-    positionPanelNearFab();
+    requestAnimationFrame(() => {
+      const r = inputPanel.getBoundingClientRect();
+      const p = applyPos(inputPanel, r.left, r.top);
+      savePos(p);
+    });
   });
 
-  // viewport resize (回転 / iframe サイズ変化) 時に FAB とパネルをクランプ
+  // viewport resize (回転 / iframe サイズ変化) 時に visible 側を clamp。
   window.addEventListener('resize', () => {
-    const r = inputFab.getBoundingClientRect();
-    const p = clampFabPos(r.left, r.top);
-    if (p.x !== r.left || p.y !== r.top) applyFabPos(p.x, p.y);
-    if (!inputPanel.hidden) positionPanelNearFab();
+    const target = inputPanel.hidden ? inputFab : inputPanel;
+    const r = target.getBoundingClientRect();
+    const p = applyPos(target, r.left, r.top);
+    savePos(p);
   });
 
   function schedule() {

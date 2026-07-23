@@ -294,7 +294,14 @@ td.argv, td.cwd {
   justify-content: space-between;
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   padding-bottom: 0.35rem;
+  /* ヘッダ全体を drag ハンドルにする (× ボタンだけ ignoreTarget で除外)。
+     touch-action:none で scroll に取られず drag が優先される。 */
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
 }
+.input-panel.dragging .input-panel-head { cursor: grabbing; }
 .input-panel-title { font-size: 0.9rem; font-weight: bold; color: #e0e0e0; }
 .input-panel-close {
   background: transparent;
