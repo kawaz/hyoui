@@ -591,13 +591,15 @@
   }
 
   function openPanel() {
-    // FAB の現在位置 (rect) をそのまま Panel の左上に引き継ぎ、FAB を隠す。
-    // edge-relative pos に変換して保存する (= 回転/resize でも Panel が同じ辺
-    // 基準で貼り付いた状態を維持できる)。
-    const r = inputFab.getBoundingClientRect();
+    // FAB と Panel は「同一浮遊物の折りたたみ/展開」なので、位置引き継ぎは
+    // 左上座標でなく edge-relative pos (floatPos) を共有する。左上座標で
+    // 引き継ぐと、幅の違う要素間でアンカー辺の判定 (中心点) が反転し、
+    // 「右端で開いて閉じたら左端に飛ぶ」バグになる (kawaz 実機 2026-07-23)。
+    const pos = floatPos || rectToEdgePos(inputFab.getBoundingClientRect());
     inputFab.hidden = true;
     inputPanel.hidden = false;
-    applyAndSaveFromRect(inputPanel, r.left, r.top);
+    applyEdgePos(inputPanel, pos);
+    savePos(pos);
     requestAnimationFrame(() => {
       inputText.focus();
       const l = inputText.value.length;
@@ -605,11 +607,13 @@
     });
   }
   function closePanel() {
-    // Panel の現在位置 (rect) を FAB の左上に引き継ぐ (= 「位置引き継ぎ」)。
-    const r = inputPanel.getBoundingClientRect();
+    // openPanel と対称: edge-relative pos を共有して FAB に適用する
+    // (Panel を drag した場合は drag handler が floatPos を更新済み)。
+    const pos = floatPos || rectToEdgePos(inputPanel.getBoundingClientRect());
     inputPanel.hidden = true;
     inputFab.hidden = false;
-    applyAndSaveFromRect(inputFab, r.left, r.top);
+    applyEdgePos(inputFab, pos);
+    savePos(pos);
     try {
       const helper = document.querySelector('.xterm-helper-textarea');
       if (helper) helper.focus();
