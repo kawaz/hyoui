@@ -347,50 +347,90 @@
   // - WS attach との協調: パネル展開中は textarea にフォーカス、閉じたら xterm
   //   ヘルパー textarea にフォーカスを戻して直打ちを継続
 
-  const LS_POS = 'hyoui.session.floatPos'; // 統合された位置 (旧 LS_FAB_POS は back-compat で吸収)
-  const LS_POS_LEGACY = 'hyoui.session.fabPos';
+  // 位置保存: sessionStorage にエッジ相対で保存 (kawaz r40m97 / r40m98)。
+  //
+  // - 保存キーは sessionStorage の 1 本に統合。**リロードで default (右下) に戻る**
+  //   のは「見失った時のリカバリ手段」として意図的 (localStorage で永続化しない)。
+  // - 位置は絶対 x,y ではなく **エッジ相対** に保存:
+  //   `{ hEdge: 'left'|'right', hDist, vEdge: 'top'|'bottom', vDist }`。
+  //   基準辺は「要素の中心が viewport 中心のどちら側か」で決める (中央同点は
+  //   右 / 下を優先、default 位置と整合)。回転 / resize でも「基準辺からの距離」
+  //   で再配置されるため、画面中央や画面外に浮いた状態が構造的に発生しない。
+  // - 旧 localStorage キー (Phase B / Phase C の {x,y}) は残っていたら掃除する。
+  const SS_POS = 'hyoui.session.floatPos';
+  const LS_POS_LEGACY_KEYS = ['hyoui.session.floatPos', 'hyoui.session.fabPos'];
 
-  // 位置ステート: null なら default (CSS の右下)。set したら FAB / Panel どちら
-  // にでも共通で適用する。localStorage には常にこの値を書く。
-  let floatPos = null;
+  let floatPos = null; // { hEdge, hDist, vEdge, vDist } or null (= default 右下)
 
   function loadPos() {
     try {
-      const raw = localStorage.getItem(LS_POS) ?? localStorage.getItem(LS_POS_LEGACY);
+      const raw = sessionStorage.getItem(SS_POS);
       if (!raw) return null;
       const p = JSON.parse(raw);
-      if (typeof p?.x === 'number' && typeof p?.y === 'number') return { x: p.x, y: p.y };
+      if (
+        (p?.hEdge === 'left' || p?.hEdge === 'right') &&
+        (p?.vEdge === 'top' || p?.vEdge === 'bottom') &&
+        typeof p.hDist === 'number' &&
+        typeof p.vDist === 'number'
+      ) return p;
     } catch (_e) { /* private mode 等 */ }
     return null;
   }
   function savePos(p) {
     floatPos = p;
-    try {
-      localStorage.setItem(LS_POS, JSON.stringify(p));
-      // legacy key は捨てる (1 位置に統合)
-      localStorage.removeItem(LS_POS_LEGACY);
-    } catch (_e) {}
+    try { sessionStorage.setItem(SS_POS, JSON.stringify(p)); } catch (_e) {}
   }
-  function clampToViewport(x, y, el) {
+  // 旧 localStorage の絶対座標保存は掃除 (1 度だけ)。
+  try { LS_POS_LEGACY_KEYS.forEach((k) => localStorage.removeItem(k)); } catch (_e) {}
+
+  // 要素の rect と viewport から edge-relative pos を導出。
+  // 中心が viewport の右半 (中央同点含む) にあれば hEdge='right'、それ以外は 'left'。
+  // 下半 (同点含む) なら vEdge='bottom'、それ以外は 'top'。
+  function rectToEdgePos(rect) {
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const hEdge = cx >= vw / 2 ? 'right' : 'left';
+    const vEdge = cy >= vh / 2 ? 'bottom' : 'top';
+    const hDist = hEdge === 'right' ? Math.max(0, vw - rect.right) : Math.max(0, rect.left);
+    const vDist = vEdge === 'bottom' ? Math.max(0, vh - rect.bottom) : Math.max(0, rect.top);
+    return { hEdge, hDist, vEdge, vDist };
+  }
+  // pos (edge-relative) を el に適用。el の実寸で viewport clamp してから絶対座標へ変換。
+  function applyEdgePos(el, pos) {
     const r = el.getBoundingClientRect();
     const w = r.width || 51;
     const h = r.height || 51;
-    const maxX = Math.max(0, window.innerWidth - w);
-    const maxY = Math.max(0, window.innerHeight - h);
-    return { x: Math.max(0, Math.min(maxX, x)), y: Math.max(0, Math.min(maxY, y)) };
-  }
-  function applyPos(el, x, y) {
-    const p = clampToViewport(x, y, el);
-    el.style.left = p.x + 'px';
-    el.style.top = p.y + 'px';
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    // 基準辺から目標距離。反対辺までの余白があるかを確認して clamp。
+    // 反対辺までの最小余白は 0 (画面内に必ず収める)。
+    const maxH = Math.max(0, vw - w);
+    const maxV = Math.max(0, vh - h);
+    const hDist = Math.max(0, Math.min(maxH, pos.hDist));
+    const vDist = Math.max(0, Math.min(maxV, pos.vDist));
+    const x = pos.hEdge === 'right' ? vw - w - hDist : hDist;
+    const y = pos.vEdge === 'bottom' ? vh - h - vDist : vDist;
+    el.style.left = x + 'px';
+    el.style.top = y + 'px';
     el.style.right = 'auto';
     el.style.bottom = 'auto';
-    return p;
   }
-  // 初期位置 restore (default は CSS の右下、bottom/right が効いた状態)。
+  // drag / open / close で「今 el がここにある」を新 pos として保存 + 反映する。
+  function applyAndSaveFromRect(el, x, y) {
+    // 一旦仮 rect を作って edge pos を計算 (要素の現在サイズ基準)
+    const r = el.getBoundingClientRect();
+    const fakeRect = { left: x, top: y, right: x + r.width, bottom: y + r.height, width: r.width, height: r.height };
+    const pos = rectToEdgePos(fakeRect);
+    applyEdgePos(el, pos);
+    savePos(pos);
+    return pos;
+  }
+  // 初期位置 restore (default = CSS の右下、bottom/right が効いた状態)。
   floatPos = loadPos();
   if (floatPos) {
-    requestAnimationFrame(() => { applyPos(inputFab, floatPos.x, floatPos.y); });
+    requestAnimationFrame(() => applyEdgePos(inputFab, floatPos));
   }
 
   // 共通の pointer drag。target = 掴む要素 (FAB or panel header)、
@@ -424,8 +464,7 @@
         mover.classList.add('dragging');
       }
       if (state.moved) {
-        const p = applyPos(mover, ev.clientX - state.offsetX, ev.clientY - state.offsetY);
-        savePos(p);
+        applyAndSaveFromRect(mover, ev.clientX - state.offsetX, ev.clientY - state.offsetY);
       }
     });
     target.addEventListener('pointerup', (ev) => {
@@ -458,13 +497,12 @@
 
   function openPanel() {
     // FAB の現在位置 (rect) をそのまま Panel の左上に引き継ぎ、FAB を隠す。
-    // savePos は Panel 側でも同じ位置を使うので統一される。
+    // edge-relative pos に変換して保存する (= 回転/resize でも Panel が同じ辺
+    // 基準で貼り付いた状態を維持できる)。
     const r = inputFab.getBoundingClientRect();
     inputFab.hidden = true;
     inputPanel.hidden = false;
-    // 表示直後は width/height が確定するので、それを見て clamp
-    const p = applyPos(inputPanel, r.left, r.top);
-    savePos(p);
+    applyAndSaveFromRect(inputPanel, r.left, r.top);
     requestAnimationFrame(() => {
       inputText.focus();
       const l = inputText.value.length;
@@ -476,8 +514,7 @@
     const r = inputPanel.getBoundingClientRect();
     inputPanel.hidden = true;
     inputFab.hidden = false;
-    const p = applyPos(inputFab, r.left, r.top);
-    savePos(p);
+    applyAndSaveFromRect(inputFab, r.left, r.top);
     try {
       const helper = document.querySelector('.xterm-helper-textarea');
       if (helper) helper.focus();
@@ -515,19 +552,21 @@
     keypadEl.hidden = !willShow;
     keypadToggle.setAttribute('aria-expanded', willShow ? 'true' : 'false');
     keypadToggle.textContent = willShow ? 'Keys ▴' : 'Keys ▾';
+    // Keys 開閉で height が変わるので、edge-relative 保存位置ベースで再配置。
+    // (絶対座標に落として applyAndSaveFromRect でなく、既に持っている edge pos
+    //  を再適用 = 「開いたら bottom 基準から下辺に貼り付く」動きが自然)。
     requestAnimationFrame(() => {
-      const r = inputPanel.getBoundingClientRect();
-      const p = applyPos(inputPanel, r.left, r.top);
-      savePos(p);
+      if (floatPos) applyEdgePos(inputPanel, floatPos);
     });
   });
 
-  // viewport resize (回転 / iframe サイズ変化) 時に visible 側を clamp。
+  // viewport resize (回転 / iframe サイズ変化) 時に visible 側を edge-relative で
+  // 再配置。edge 基準の距離で貼り付いているので、画面中央や画面外に浮くことなく
+  // 「右下から 16px」等の相対位置が保たれる。
   window.addEventListener('resize', () => {
+    if (!floatPos) return;
     const target = inputPanel.hidden ? inputFab : inputPanel;
-    const r = target.getBoundingClientRect();
-    const p = applyPos(target, r.left, r.top);
-    savePos(p);
+    applyEdgePos(target, floatPos);
   });
 
   function schedule() {
