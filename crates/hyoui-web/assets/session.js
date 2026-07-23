@@ -427,10 +427,62 @@
     savePos(pos);
     return pos;
   }
-  // 初期位置 restore (default = CSS の右下、bottom/right が効いた状態)。
+  // Query パラメータからの初期位置指定 (kawaz r40m99、ccmsg 側の＋ボタン被り対策)。
+  // 優先順位: sessionStorage > query > default (CSS の右下 1rem)。
+  //
+  // 受理形式 (どちらでも / 両方併用時は個別 param が単一 param を上書き):
+  //   1) 単一 param:   ?fab=<edge>:<dist>[,<edge>:<dist>...]
+  //        例: ?fab=right:16,bottom:80
+  //            ?fab=left:24,top:10
+  //   2) 個別 param:   ?fab-right=16&fab-bottom=80  (right/left/top/bottom いずれも)
+  //
+  // ルール:
+  //   - edge は right/left (水平) と top/bottom (垂直) から片方ずつ選ぶ
+  //   - dist は非負整数 or 小数 (px 単位、単位表記なし)
+  //   - horizontal / vertical のどちらかしか指定されない場合、未指定側は default (右 or 下 16px)
+  //   - 両側 (right & left の両方等) 指定された場合は「後勝ち」= 個別 param → 単一 param 内は右辺後勝ち
+  //   - 不正 (edge 名不正 / dist が NaN) は silent skip → default にフォールバック
+  function parsePosFromQuery() {
+    const q = new URLSearchParams(location.search);
+    let hEdge = null, hDist = null, vEdge = null, vDist = null;
+    // 単一 param 先に処理
+    const single = q.get('fab');
+    if (single) {
+      for (const part of single.split(',')) {
+        const m = part.trim().match(/^(left|right|top|bottom)\s*:\s*(-?\d+(?:\.\d+)?)$/i);
+        if (!m) continue;
+        const edge = m[1].toLowerCase();
+        const d = parseFloat(m[2]);
+        if (!Number.isFinite(d) || d < 0) continue;
+        if (edge === 'left' || edge === 'right') { hEdge = edge; hDist = d; }
+        else { vEdge = edge; vDist = d; }
+      }
+    }
+    // 個別 param が単一を上書き
+    for (const edge of ['left', 'right', 'top', 'bottom']) {
+      const v = q.get('fab-' + edge);
+      if (v == null) continue;
+      const d = parseFloat(v);
+      if (!Number.isFinite(d) || d < 0) continue;
+      if (edge === 'left' || edge === 'right') { hEdge = edge; hDist = d; }
+      else { vEdge = edge; vDist = d; }
+    }
+    if (hEdge === null && vEdge === null) return null;
+    // 片側未指定なら default (右下 16px)
+    if (hEdge === null) { hEdge = 'right'; hDist = 16; }
+    if (vEdge === null) { vEdge = 'bottom'; vDist = 16; }
+    return { hEdge, hDist, vEdge, vDist };
+  }
+
+  // 初期位置 restore: sessionStorage > query > CSS default (右下 1rem)。
   floatPos = loadPos();
-  if (floatPos) {
-    requestAnimationFrame(() => applyEdgePos(inputFab, floatPos));
+  const queryPos = floatPos ? null : parsePosFromQuery();
+  const initialPos = floatPos ?? queryPos;
+  if (initialPos) {
+    // query 経由は sessionStorage に書かない (= reload / タブ再利用で query を再解釈させる)。
+    // sessionStorage 経由は既にそこにあるので書き直し不要。
+    requestAnimationFrame(() => applyEdgePos(inputFab, initialPos));
+    if (queryPos) floatPos = queryPos; // resize/drag の基準として持つ
   }
 
   // 共通の pointer drag。target = 掴む要素 (FAB or panel header)、
