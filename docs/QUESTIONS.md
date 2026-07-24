@@ -12,4 +12,15 @@
 
 ---
 
-(現在裁定待ちなし)
+## 👺 TSTP2-Q1: Ctrl+Z 単発時に attach client も一緒に stop する現仕様を維持するか
+
+実測で DR-0026 intercept は仕様通り動作 (単発 = 300ms 保留 → 子 SIGTSTP)。ただし
+DR-0017 §柱1 の follow 仕様により **client も一緒に stop して外側 shell に戻る** ため、
+体感が「Ctrl+Z 押したら即ターミナルに戻る」になる (2026-07-24 kawaz 報告の再現 A は
+これで、bug ではなく仕様)。
+
+- a) **現仕様維持** (AI の推し) — 直接起動した TUI の Ctrl+Z と同じ体感 (子が止まれば
+  手前も shell に戻る = 透過原則)。detach したい時は 2 連打が既に効く
+- b) 単発時は子だけ stop し client は attach 継続 (画面は凍結表示 + resume 手段を案内) —
+  「眺めたまま止めたい」用途向けだが、直接起動との体感差が生まれ、DR-0017 改訂が必要
+- 参照: 調査記録は次 commit の docs/issue/2026-07-24-bug-tstp-intercept-followups.md
