@@ -222,10 +222,25 @@ DR-0019 §3 が却下済み (= 無人時に発動できないので有効な発�
 - **検証要件 (DR-0014 マトリクス)**:
   - 連打 1/2/3/4/5 × (子へ届く Ctrl+Z 数, detach 有無) を state machine unit test で網羅
   - 窓延長 / 他キー割り込み / `delay=0` / `guard=false` / poll timeout も unit test
-  - 実機: `hyoui run -- bash` で単発 detach → `hyoui list` が live のまま、2 連打で
-    子に SIGTSTP が届いて STATUS=stopped、stopped 中も attach が生き残ること
+  - 実機 (macOS / release 0.9.18、pty harness、config 不在 = default 500ms):
+
+    | 操作 | attach client | 子 (`/bin/cat`) |
+    |---|---|---|
+    | Ctrl+Z 単発 | exit 0 (= Detached、`OUTER_TTY_RESET` を送出) | live のまま |
+    | Ctrl+Z 2 連打 | 繋がったまま (= 5s 以上 `0:rw*` を維持)、最下行に停止通知 | stopped |
+    | Ctrl+Z 3 連打 | exit 0 (= Detached) | stopped |
+    | `ctrlz_guard = false` + 単発 | 繋がったまま | stopped (= 素通し) |
+    | `ctrlz_guard_delay = "0"` + 単発 | exit 0 | live のまま |
+    | `ctrlz_guard_delay = "2s"` + 2 連打 | 繋がったまま | stopped |
+
   - 3 category (line-oriented / interactive REPL / TUI alt screen) での追試は
-    dogfooding で継続 (= 本 DR 時点では bash + sleep で確認)
+    dogfooding で継続 (= 本 DR 時点では `cat` / `bash -i` で確認。対話 bash は
+    job control shell として SIGTSTP を自分では受けないため、子の停止確認には
+    `cat` を使う)
+  - **未検証**: 停止中の子を正規手順で起こす経路。`hyoui kill --signal=CONT
+    --no-terminate` は現在 attach client を全員蹴る別 bug を踏む
+    (docs/issue/2026-07-21-sigcont-alive-child-session-vanish.md に根本原因候補を記録)。
+    kernel 直 `kill -CONT <child_pid>` では子が再開し attach も維持されることは確認済
 
 ## 関連
 
