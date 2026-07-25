@@ -29,8 +29,8 @@ DR-0013 (screen state 正本) の延長として位置づける。
 
 kawaz 提案 (2026-07-20)。以下 2 用途が既に確定している:
 
-1. DR-0026 Phase 2 の Ctrl+Z intercept 時の detach 案内 overlay
-   (DR-0026 本文で「一般機構の整備後」と明示保留済み)
+1. DR-0029 Phase 2 の Ctrl+Z intercept 時の detach 案内 overlay
+   (DR-0029 本文で「一般機構の整備後」と明示保留済み)
 2. web ターミナル (DR-0027) でのダイアログ/通知表示
 
 着手は web ターミナル (DR-0027) 完了後を想定。
@@ -48,7 +48,7 @@ kawaz 提案 (2026-07-20)。以下 2 用途が既に確定している:
 - [ ] overlay 配信先(client 個別 / 共通)の設計判断が DR に記録される
 - [ ] screen dump/snapshot と overlay 合成の扱いが確定する
 - [ ] WatchRegistration との構造共有方針が確定する
-- [ ] DR-0026 Phase 2 detach 案内 overlay が本機構上で実装される
+- [ ] DR-0029 Phase 2 detach 案内 overlay が本機構上で実装される
 - [ ] web ターミナル (DR-0027) のダイアログ/通知表示が本機構上で実装される
 
 ## 設計制約

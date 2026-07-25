@@ -1,16 +1,16 @@
 ---
 title: detach key (Ctrl-A d) が実端末で発火しない疑い — keyboard protocol 起因の可能性
-status: open
+status: discarded
 category: bug
 created: 2026-07-20T01:16:37+09:00
-last_read:
+last_read: 2026-07-25T00:00:00+09:00
 open_entered: 2026-07-20T01:16:37+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
-discarded_entered:
+discarded_entered: 2026-07-25T00:00:00+09:00
 resolved_entered:
-discard_reason:
+discard_reason: ["obsolete","DR-0029 で `Ctrl-A d` detach prefix と `HYOUI_DETACH_PREFIX` を機能ごと全廃したため、本 bug の対象が消滅した。detach は Ctrl+Z 単発に置換 (DR-0029 §2/§3)。keyboard protocol (kitty CSI-u 等) と単一 byte 入力の相互作用そのものは、必要になった時点で別 issue として立て直す"]
 pending_reason:
 close_reason:
 blocked_by:

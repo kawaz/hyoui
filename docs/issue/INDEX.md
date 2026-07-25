@@ -4,12 +4,12 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-07-25 | request | open | [request-attach-overlay-progress](./2026-07-25-request-attach-overlay-progress.md) | attach 画面最下行に detach 遅延の progress overlay (DR-0029 §5、`ctrlz_guard_overlay` は現在 no-op) |
 | 2026-07-21 | request | open | [daemon-graceful-upgrade-self-exec](./2026-07-21-daemon-graceful-upgrade-self-exec.md) | daemon の graceful upgrade (self-exec で fd/pid 引き継ぎ、DR 起草必須) |
-| 2026-07-21 | bug | open | [sigcont-alive-child-session-vanish](./2026-07-21-sigcont-alive-child-session-vanish.md) | SIGCONT を alive 中の子セッションに送るとセッションが消滅する疑い (実機観測、再現条件未確定) |
+| 2026-07-21 | bug | open | [sigcont-alive-child-session-vanish](./2026-07-21-sigcont-alive-child-session-vanish.md) | SIGCONT を送るとセッションが消滅する疑い — 根本原因候補特定 (`hyoui kill --no-terminate` が `detach_others: true` で全 client を蹴る、2026-07-25 実測) |
 | 2026-07-21 | request | idea | [screen-region-watch-api](./2026-07-21-screen-region-watch-api.md) | screen 仮想スクリーンの部分切り出し API + 監視エリアのマッチング検出インターフェース (DR-0025 母体、web ターミナル完了後着手) |
-| 2026-07-21 | design | open | [screen-overlay-general-mechanism](./2026-07-21-screen-overlay-general-mechanism.md) | screen state への動的仮想オーバーレイ一般機構 (DR-0013 延長、DR-0026 detach 案内 / web ターミナル ダイアログ用、web ターミナル完了後着手) |
+| 2026-07-21 | design | open | [screen-overlay-general-mechanism](./2026-07-21-screen-overlay-general-mechanism.md) | screen state への動的仮想オーバーレイ一般機構 (DR-0013 延長、DR-0029 detach 案内 / web ターミナル ダイアログ用、web ターミナル完了後着手) |
 | 2026-07-20 | bug | open | [socket-dir-tmp-fallback-macos-cleanup](./2026-07-20-socket-dir-tmp-fallback-macos-cleanup.md) | socket dir が /tmp 固定 fallback のため macOS 定期掃除で daemon 生存中に socket file が消える |
-| 2026-07-20 | bug | open | [detach-key-not-firing-keyboard-protocol](./2026-07-20-detach-key-not-firing-keyboard-protocol.md) | detach key (Ctrl-A d) が実端末で発火しない疑い — 端末 keyboard protocol (kitty CSI-u 等) 起因の可能性 |
 | 2026-07-04 | bug | open | [bug-flaky-outer-token-e2e-deadline](./2026-07-04-bug-flaky-outer-token-e2e-deadline.md) | outer_token_inheritance_skips_auto_acquire が単独実行でも稀に 30s deadline fail (macOS CI flaky と同一 test) |
 | 2026-07-04 | task | open | [dr0025-phase2b-raw-data-reducer](./2026-07-04-dr0025-phase2b-raw-data-reducer.md) | DR-0025 Phase 2-β — raw_data hot path の reducer→Effect→execute 化 |
 | 2026-07-03 | bug | open | [bug-flaky-serve-tail-follow-tail-end](./2026-07-03-bug-flaky-serve-tail-follow-tail-end.md) | serve_tail_follow_receives_tail_end_on_child_exit が ubuntu CI で flaky fail (並走 CI では pass) |
