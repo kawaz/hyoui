@@ -1851,8 +1851,7 @@ fn kill_command_single(cfg: KillConfig) -> ExitCode {
         // kill は daemon 側 `handle_kill` で `ensure_rw_mode` 必須 (= Round2 #6 で
         // 厳格化、`!Ro` → `Rw` のみに)。Ro で attach すると daemon が黙って
         // ErrorMessage 返して session terminate しない (= 旧実装の regression、
-        // 「送信完了」表示で exit 0 してた致命 bug)。`hyoui kill` は session
-        // terminate 操作なので Rw + detach_others で leader 確保が筋。
+        // 「送信完了」表示で exit 0 してた致命 bug)。
         mode: Mode::Rw,
         caps: hyoui::protocol::MVP_CAPS
             .iter()
@@ -1860,9 +1859,15 @@ fn kill_command_single(cfg: KillConfig) -> ExitCode {
             .collect(),
         token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
         exclusive: false,
-        // kill は破壊操作なので既存 leader を蹴ってでも実行する (= UX 上「kill が
-        // leader busy で失敗」より「kill は確実に効く」が期待される)。
-        detach_others: true,
+        // terminate 経路は破壊操作なので既存 leader を蹴ってでも実行する (= UX 上
+        // 「kill が leader busy で失敗」より「kill は確実に効く」が期待される)。
+        //
+        // 一方 `--no-terminate` は **signal を 1 発送るだけ**で session を畳まない
+        // 操作なので、他 client を蹴る必然性がない。ここで奪取すると
+        // `hyoui kill <s> --signal=CONT --no-terminate` (= 停止中の子を起こす正規手段、
+        // DR-0029 §1 の画面通知が案内する操作) が **attach client を全員切断する**
+        // 副作用を持ってしまう (docs/issue/2026-07-21-sigcont-alive-child-session-vanish.md)。
+        detach_others: !cfg.no_terminate,
     };
 
     // R5-FB4: socket 不存在系 errno は短時間 retry。

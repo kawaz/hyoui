@@ -38,7 +38,8 @@ attach client を繋いだまま時系列観測した (macOS、release build 0.9
 
 | 経路 | 子の resume | attach client | daemon |
 |---|---|---|---|
-| `hyoui kill <s> --signal=CONT --no-terminate` | (確認不能) | **切断される** (= client は「daemon との接続が失われました」で exit) | 生存 |
+| `hyoui kill <s> --signal=CONT --no-terminate` (**修正前**) | (確認不能) | **切断される** (= client は「daemon との接続が失われました」で exit) | 生存 |
+| `hyoui kill <s> --signal=CONT --no-terminate` (**修正後**) | **する** (= echo が返る) | 繋がったまま (`0:rw*` 維持) | 生存 |
 | kernel 直 `kill -CONT <child_pid>` | **する** (= 送った文字列が echo される) | 繋がったまま | 生存 |
 
 **根本原因候補**: `crates/hyoui-cli/src/main.rs` の `kill_command` が
@@ -59,13 +60,18 @@ attach client を繋いだまま時系列観測した (macOS、release build 0.9
 
 **影響**: DR-0029 §1 で attach client の follow を廃止したため、停止中の子を起こす正規手段が
 `hyoui kill --signal=CONT --no-terminate` になった (= 画面通知でもこれを案内している)。
-その正規手段が全 client を蹴る状態なので優先度が上がった。
+その正規手段が全 client を蹴る状態だったため、**2026-07-25 に修正した** (下記受け入れ条件の 1 件目)。
+kawaz 報告の「セッションが消滅する」現象がこれで全部説明できるかは未確定 (= alive 中の子に
+CONT を送った場合の観測がまだ)。残りの受け入れ条件は open のまま。
 
 ## 受け入れ条件
 
-- [ ] `kill_command` の `detach_others: true` を terminate 経路限定にする (= `--no-terminate`
-      では `detach_others: false` / mode も再検討)。修正後、上表の 1 行目が 2 行目と同じ結果に
-      なることを実機で確認
+- [x] `kill_command` の `detach_others: true` を terminate 経路限定にする (= `--no-terminate`
+      では `detach_others: false`)。**2026-07-25 修正済** (`detach_others: !cfg.no_terminate`)。
+      e2e `crates/hyoui-cli/tests/kill_no_terminate_keeps_clients.rs` で
+      「--no-terminate では client 維持」「terminate 経路では従来どおり終了」を固定。
+      修正前コードで RED (= client が exit 9 = ConnectionLost) になることも確認済。
+      実機でも CONT 送信後に rw leader が残り、子が resume する (= echo が返る) ことを確認
 - [ ] child が Alive 状態で SIGCONT を送った場合の挙動を実機で観測・記録
 - [ ] child が Stopped 状態で SIGCONT を送った場合の挙動を実機で観測・記録 (最低 3 category のマトリクス: TUI alt screen 系 / line-oriented 系 / interactive REPL 系)
 - [ ] セッション消滅の再現条件を特定 (or 再現しないことを確認)

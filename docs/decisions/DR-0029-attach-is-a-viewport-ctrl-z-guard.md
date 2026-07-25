@@ -237,10 +237,14 @@ DR-0019 §3 が却下済み (= 無人時に発動できないので有効な発�
     dogfooding で継続 (= 本 DR 時点では `cat` / `bash -i` で確認。対話 bash は
     job control shell として SIGTSTP を自分では受けないため、子の停止確認には
     `cat` を使う)
-  - **未検証**: 停止中の子を正規手順で起こす経路。`hyoui kill --signal=CONT
-    --no-terminate` は現在 attach client を全員蹴る別 bug を踏む
-    (docs/issue/2026-07-21-sigcont-alive-child-session-vanish.md に根本原因候補を記録)。
-    kernel 直 `kill -CONT <child_pid>` では子が再開し attach も維持されることは確認済
+  - 停止中の子を正規手順で起こす経路 (= 通知行が案内する
+    `hyoui kill <s> --signal=CONT --no-terminate`): 実行すると attach client が全員
+    切断される bug があったため 2026-07-25 に修正した (= `kill_command` が terminate 用の
+    `detach_others: true` を非 terminate 経路にも効かせていた、
+    docs/issue/2026-07-21-sigcont-alive-child-session-vanish.md)。修正後は rw leader が
+    繋がったまま子が resume することを実機で確認済。ただし `child_stopped` フラグは
+    resume 後も下りない別 bug が残る (docs/issue/2026-06-12-bug-child-stopped-flag-not-cleared.md、
+    表示のみの問題)
 
 ## 関連
 

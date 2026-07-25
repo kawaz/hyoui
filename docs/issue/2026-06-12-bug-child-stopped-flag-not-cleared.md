@@ -69,6 +69,29 @@ WCONTINUED poll。
 | notify | kill -STOP | T+ | stopped ✅ | stopped |
 | notify | kill -STOP → kill -CONT | S+ | stopped ❌ | running |
 
+## 追加観測 (2026-07-25、DR-0029 実装中) — **attached でも再現、推定原因を狭める必要あり**
+
+上記の再現はいずれも「attach client 不在の detached 状況」だったが、**rw leader が
+attach したまま**でも同じ症状が出ることを確認した (macOS / release 0.9.18 / 子 = `/bin/cat`)。
+
+```
+[ 2.01s] 起動直後      child_state=running child_stopped=False clients=[0:rw* 1:ro]
+[ 3.34s] Ctrl+Z 2 連打 child_state=stopped child_stopped=True  clients=[0:rw* 2:ro]
+[ 3.77s] CONT 送信     rc=0 (hyoui kill <s> --signal=CONT --no-terminate)
+[ 4.78s] CONT 直後     child_state=stopped child_stopped=True  clients=[0:rw* 4:ro]
+[ 6.35s] 子の応答      b'RESUMED-OK\r\nRESUMED-OK\r\n'   ← 子は確実に走っている
+[ 6.35s] 最終          child_state=stopped child_stopped=True  clients=[0:rw* 5:ro]
+```
+
+子は echo を返しており **実際に resume している**のに `child_stopped` は最後まで下りない。
+= 「§推定原因」の「detached 状況 (= client 不在 / serve_loop が idle) で Continued
+transition を拾えていない」という仮説は **不十分** (attached で serve_loop が
+生きていても拾えていない)。root cause 特定時はこの前提を外して調べること。
+
+| 状況 | policy | 操作 | 子の実挙動 | status child-state |
+|---|---|---|---|---|
+| **attached (rw leader あり)** | notify | Ctrl+Z 2 連打 → `kill --signal=CONT --no-terminate` | resume 済 (echo 応答あり) | stopped ❌ |
+
 ## TODO
 
 - [ ] detached (client 不在) で WCONTINUED transition が拾えない root cause 特定

@@ -4263,7 +4263,8 @@ fn usage_kill() -> String {
             --kill-on-timeout  --wait の timeout 超過時に SIGKILL 昇格して見届ける\n    \
             \x20               (= 確実に殺す)。`--wait` と併用必須\n    \
             --no-terminate  signal を送るだけで session を畳まない (= stopped child を\n    \
-            \x20               CONT で起こす用途等)。`--all` / `--wait` とは併用不可\n    \
+            \x20               CONT で起こす用途等)。attach 中の client も切断しない。\n    \
+            \x20               `--all` / `--wait` とは併用不可\n    \
             -N              POSIX kill 慣習: 短縮 signal 番号 (e.g. -9 = SIGKILL)\n    \
             -NAME           短縮 signal 名 (e.g. -KILL / -TERM / -SIGKILL も OK)\n    \
             -h, --help      Show this help and exit\n\
