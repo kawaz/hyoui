@@ -42,9 +42,20 @@ test は「s1 に何も broadcast が来ないこと」を 500ms の read timeou
 **失敗は必ず suite 全体が 32s かかった回**で起きている。32s の正体は
 `client::attach::tests::connect_token_mismatch_returns_specific_hint` が
 `/bin/sleep 30` を子に持ち、末尾で `daemon_handle.join()` して子の自然終了を待つ設計
-(= 実行のたび 30s 待つ回と待たない回があり、これ自体が非決定的)。この 30s の間
-他 test の daemon が滞留し、当該 test の session が SIGTERM されるタイミングと
-500ms 窓が重なる、という筋が有力 (= 未確定、機序の裏取りは未実施)。
+(= 実行のたび 30s 待つ回と待たない回があり、これ自体が非決定的)。
+
+**切り分け**: 当該 test だけ除外すると suite は常に 2.9s で green になる。
+
+```
+$ cargo test -p hyoui --lib -- --skip connect_token_mismatch   # 3 回連続
+test result: ok. 860 passed; 0 failed; ... finished in 2.89s
+test result: ok. 860 passed; 0 failed; ... finished in 2.87s
+test result: ok. 860 passed; 0 failed; ... finished in 2.88s
+```
+
+= 30s 居座る daemon が他 test の session 終了タイミングを押し出し、当該 test の
+500ms 窓に `SessionExitNotify(143)` が滑り込む、という筋。**SIGTERM の送出元までは
+未特定**。
 
 ## 受け入れ条件
 
