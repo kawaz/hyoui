@@ -39,9 +39,6 @@ use crate::sys::{
 use super::accept::{
     MAX_PENDING_HANDSHAKES, PendingHandshake, process_pending_handshakes, spawn_handshake_worker,
 };
-use super::broadcast::{
-    ClientHandle, MAX_CLIENTS_PER_DAEMON, broadcast_control, broadcast_master_bytes, send_control,
-};
 use super::control::{ClientFrameOutcome, FrameOrError, handle_client_frame};
 use super::lock::{SessionState, elevate_next_leader};
 use super::pty::{
@@ -50,6 +47,9 @@ use super::pty::{
 use super::reducer::{self, DaemonState, translate};
 use super::screen::ScreenState;
 use super::{ChildSuspendPolicy, DaemonConfig};
+use crate::daemon::broadcast::{
+    ClientHandle, MAX_CLIENTS_PER_DAEMON, broadcast_control, broadcast_master_bytes, send_control,
+};
 
 /// R5-H7: send `sig` to the child's whole process group instead of only the
 /// session-leader PID, so descendants that the shell may have backgrounded
@@ -648,7 +648,7 @@ impl Session {
                 exit_status: exit_code,
                 signal: None, // finalize_child 結果は 128+signum 数値化済、signal name は補足
             });
-            let _overflow = super::broadcast::broadcast_control_with_cap(
+            let _overflow = crate::daemon::broadcast::broadcast_control_with_cap(
                 &mut clients,
                 &notify,
                 "session-exit-v1",
@@ -807,7 +807,7 @@ fn linger_for_late_attach(
                 exit_status,
                 signal: None,
             });
-            let _ = super::broadcast::broadcast_control_with_cap(
+            let _ = crate::daemon::broadcast::broadcast_control_with_cap(
                 &mut clients,
                 &notify,
                 "session-exit-v1",
@@ -1138,33 +1138,31 @@ fn notify_child_stopped(
         return Vec::new();
     }
 
-    // leader を探す。複数 leader はあり得ない設計 (= broadcast.rs::elevate_next_leader)。
-    let leader_idx = clients.iter().position(|ch| ch.leader);
-    let Some(idx) = leader_idx else {
-        // leader 不在: DR-0017 §柱2 で auto-resume fallback を廃止。SIGCONT を
-        // 送らず stopped のまま残す (= 外側 API で起こせる)。notify 先がいないので
-        // 何もしない。
-        return Vec::new();
-    };
-    // cap check: leader が `child-state-v1` を持たない場合も同様に SIGCONT を送らず
-    // notify もしない (= stopped のまま残す、外側 API で起こせる)。
-    if !clients[idx]
-        .negotiated_caps
-        .iter()
-        .any(|c| c == "child-state-v1")
-    {
-        return Vec::new();
-    }
-    // notify 送信 (= 単一 receiver、cap-aware broadcast helper を使うほどでもない)
+    // DR-0017 §柱2 拡張 (2026-07-24): 全 rw client (= Rw / RwNoLeader) に broadcast。
+    // 旧実装は leader 1 client にのみ送っていたが、2 つ目以降の rw attach client
+    // (= 非 leader) が child stop を検知できず画面固着する bug (実測確定、docs/issue/
+    // 2026-07-24-bug-tstp-intercept-followups.md H3) の対策。ro client は「見に来た
+    // だけ」なので対象外、cap `child-state-v1` を持つ client のみ notify する。
+    // rw client が 0 or 全員 cap 未対応なら SIGCONT を送らず stopped のまま残す
+    // (= 外側 API `hyoui kill --signal=CONT` で起こせる、DR-0017 §柱2 の
+    // auto-resume fallback 廃止方針は維持)。
     let msg = ControlMessage::SessionChildStoppedNotify(SessionChildStoppedNotify {
         pid: child.as_raw() as u32,
         signal: Some(sig_name),
     });
-    if send_control(&clients[idx], msg) {
-        Vec::new()
-    } else {
-        vec![clients[idx].id]
+    let mut failed = Vec::new();
+    for ch in clients.iter() {
+        if matches!(ch.mode, Mode::Ro) {
+            continue;
+        }
+        if !ch.negotiated_caps.iter().any(|c| c == "child-state-v1") {
+            continue;
+        }
+        if !send_control(ch, msg.clone()) {
+            failed.push(ch.id);
+        }
     }
+    failed
 }
 
 /// DR-0016 §3: signal 番号から canonical な signal 名 (= "SIGTSTP" 等) を返す。
@@ -2332,6 +2330,93 @@ mod tests {
         let _ = nix::sys::signal::kill(child, Signal::SIGCONT);
         let _ = nix::sys::signal::kill(child, Signal::SIGKILL);
         let _ = waitpid(child, Some(WaitPidFlag::empty()));
+    }
+
+    /// DR-0017 §柱2 拡張 (2026-07-24 修正、H3):
+    /// `notify_child_stopped` は全 rw client (= `Rw` / `RwNoLeader`) に
+    /// `SessionChildStoppedNotify` を broadcast する。ro client には送らない。
+    /// cap `child-state-v1` 未対応 client も対象外。
+    ///
+    /// 旧実装は leader 1 client だけに送っていたため、非 leader rw client が
+    /// child stop を検知できず画面固着する bug があった (docs/issue/
+    /// 2026-07-24-bug-tstp-intercept-followups.md H3)。
+    #[test]
+    fn notify_child_stopped_broadcasts_to_all_rw_clients_excluding_ro() {
+        use crate::daemon::broadcast::Subscription;
+        use crate::protocol::Mode;
+        use std::os::unix::net::UnixStream;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc;
+
+        // ClientHandle を 4 種類作る:
+        // 0: leader rw + child-state-v1 → 受信すべし
+        // 1: non-leader rw + child-state-v1 → 受信すべし (本 fix の主対象)
+        // 2: ro + child-state-v1 → 受信しない (見に来ただけ)
+        // 3: rw + cap 未対応 → 受信しない (protocol 上通知できない)
+        let mut receivers: Vec<mpsc::Receiver<crate::daemon::broadcast::SharedBytes>> = Vec::new();
+        let mut peers: Vec<UnixStream> = Vec::new();
+        let mut clients: Vec<ClientHandle> = Vec::new();
+        for (id, mode, leader, caps) in [
+            (0u64, Mode::Rw, true, vec!["child-state-v1".to_string()]),
+            (
+                1,
+                Mode::RwNoLeader,
+                false,
+                vec!["child-state-v1".to_string()],
+            ),
+            (2, Mode::Ro, false, vec!["child-state-v1".to_string()]),
+            (3, Mode::Rw, false, vec![]),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            let (peer, reader) = UnixStream::pair().expect("pair");
+            clients.push(ClientHandle {
+                id,
+                mode,
+                leader,
+                subscription: Subscription::Raw,
+                negotiated_caps: caps,
+                writer_tx: tx,
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
+                buffer_limit: 1 << 20,
+                writer_thread: None,
+                reader,
+                connected_at_unix_ms: 0,
+            });
+            receivers.push(rx);
+            peers.push(peer);
+        }
+
+        let state = SessionState::default();
+        // policy default は Notify (= broadcast 経路)、AutoResume ではない。
+        // 適当な自己 pid を child として渡す (Notify policy では kill しないので安全)。
+        let self_pid = nix::unistd::Pid::from_raw(std::process::id() as i32);
+        let overflow = notify_child_stopped(self_pid, &mut clients, &state, Signal::SIGTSTP as i32);
+        assert!(
+            overflow.is_empty(),
+            "no writer 詰まりは発生しないはず: {overflow:?}"
+        );
+
+        // rw + cap 保持者だけが受信する
+        assert!(
+            receivers[0].try_recv().is_ok(),
+            "leader rw + cap: 受信すべき"
+        );
+        assert!(
+            receivers[1].try_recv().is_ok(),
+            "non-leader rw + cap: 受信すべき (本 fix の主対象)"
+        );
+        assert!(
+            receivers[2].try_recv().is_err(),
+            "ro client: 受信すべきでない (見に来ただけ)"
+        );
+        assert!(
+            receivers[3].try_recv().is_err(),
+            "cap 未対応 rw client: 受信すべきでない (protocol 上通知できない)"
+        );
+
+        // state 側の可観測性フラグは維持
+        assert!(state.child_stopped(), "child_stopped フラグは立てられる");
     }
 
     /// R4-H14: `ChildLifecycle` は SIGSTOP / SIGCONT の transition を取りこぼさず、

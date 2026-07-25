@@ -465,25 +465,35 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     // `None` で完全 disable (= --no-scrub-env or config の scrub_env_enabled=false)、
     // `Some(plan)` で daemon child の `env_scrub::apply` に渡す。
     //
-    // `--no-scrub-env` 指定時は config load 自体を skip する (= 完全 escape hatch、
-    // config 不在/不正の影響を受けず起動できる)。config パースエラーは exit non-zero
-    // で起動を拒否 (= 意図しない設定での起動は親 host Internal Context 漏洩リスク)。
+    // `--no-scrub-env` 指定時は config が壊れていても起動できる (= 完全 escape hatch)。
+    // それ以外では config パースエラーで exit non-zero で起動を拒否する (= 意図しない
+    // 設定での起動は親 host Internal Context 漏洩リスク)。
+    let config = match hyoui::config::load() {
+        Ok(c) => c,
+        Err(_) if cfg.no_scrub_env => hyoui::config::Config::default(),
+        Err(e) => {
+            eprintln!("hyoui: {e}");
+            eprintln!(
+                "hyoui: config ファイルを修正してから再実行してください。または \
+                 `--no-scrub-env` で起動して config の読み込みをスキップできます"
+            );
+            return ExitCode::from(2);
+        }
+    };
     let scrub_env_plan = if cfg.no_scrub_env {
         None
     } else {
-        let config = match hyoui::config::load() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("hyoui: {e}");
-                eprintln!(
-                    "hyoui: config ファイルを修正してから再実行してください。または \
-                     `--no-scrub-env` で起動して config の読み込みをスキップできます"
-                );
-                return ExitCode::from(2);
-            }
-        };
         hyoui::sys::env_scrub::resolve_plan(false, &config, &cfg.command)
     };
+    // DR-0029 §4: 子 stop 時の daemon policy。flag 明示 > config `[session] auto_resume`
+    // > builtin default (= notify、DR-0017 §柱2 の「勝手に起こさない」)。
+    let on_child_suspend = cfg
+        .on_child_suspend
+        .unwrap_or(if config.session.auto_resume {
+            hyoui::cli::OnChildSuspend::AutoResume
+        } else {
+            hyoui::cli::OnChildSuspend::Notify
+        });
     // size 解決 (= ユーザ指示 2026-05-29、stdin pipe 経由):
     // - 明示指定 (= --cols/--rows/--size) があればそれを使う
     // - 非 detached + 明示なし → 外側 TTY size (= stdin) を継承
@@ -535,7 +545,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
             scrollback_rows,
             cfg.debug_dump_server.clone(),
             namespace,
-            cfg.on_child_suspend,
+            on_child_suspend,
             cfg.timeout_ms,
             cfg.idle_timeout_ms,
             scrub_env_plan,
@@ -559,7 +569,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
         scrollback_rows,
         cfg.debug_dump_server.clone(),
         namespace.clone(),
-        cfg.on_child_suspend,
+        on_child_suspend,
         cfg.timeout_ms,
         cfg.idle_timeout_ms,
         scrub_env_plan,
@@ -678,18 +688,7 @@ fn resolve_session_by_index(index: i32, namespace: &str) -> Result<String, Strin
 }
 
 fn attach_command(cfg: AttachConfig) -> ExitCode {
-    // H3: HYOUI_DETACH_PREFIX を raw mode 入る **前** に validate。invalid なら
-    // 通常 terminal で stderr に出してから exit (= 旧 silent fallback で warning が
-    // raw mode 後の scrollback に流される罠を回避)。解決値は §5 の発見性ヒント
-    // (= 実 prefix を文言に反映) でも使う。
-    let detach_prefix = match hyoui::client::resolve_detach_prefix_from_env() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("hyoui: attach: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    // DR-0026: attach UX 設定は既存 config.toml 読み込み経路を共有する。
+    // DR-0029: attach UX 設定は既存 config.toml 読み込み経路を共有する。
     // 不正 config は raw mode / handshake より前に拒否し、意図しない介入設定で続行しない。
     let app_config = match hyoui::config::load() {
         Ok(config) => config,
@@ -802,12 +801,12 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         }
     };
 
-    // DR-0026 §2: rw attach は stopped child を操作する意思表明とみなし、handshake
+    // DR-0029 §4: rw attach は stopped child を操作する意思表明とみなし、handshake
     // snapshot が stopped の場合だけ既存 resume.request を即送る。ro / rw-no-leader は
     // 観察または非 leader 接続なので、設定値に関係なく子を起こさない。
     if conn.response.child_stopped
         && conn.response.mode == Mode::Rw
-        && app_config.attach.resume.on_reattach
+        && app_config.attach.resume_on_reattach
         && let Err(e) = conn.send_child_resume()
     {
         eprintln!("hyoui: attach: stopped child の resume 要求送信失敗: {e}");
@@ -824,20 +823,18 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
     // (= `enter_raw` の TCSAFLUSH が cooked 窓の入力 queue を破棄していた) を
     // TCSANOW で解消済み (Fable review M4、`sys/tty.rs` の regression test 参照)。
     //
-    // 文言は `HYOUI_DETACH_PREFIX` の解決値から生成 (= custom prefix を反映)。
-    // `none` (= detach key 無効化) ならヒント自体出さない (= 嘘の脱出方法を教えない)。
-    if !cfg.quiet
-        && is_tty(std::io::stderr().as_fd())
-        && let Some(prefix) = detach_prefix
-    {
-        let prefix_disp = match prefix {
-            // Ctrl byte (0x01..=0x1a) は "Ctrl-X" 表記。
-            1..=26 => format!("Ctrl-{}", (b'A' + prefix - 1) as char),
-            other => format!("0x{other:02x}"),
-        };
-        eprintln!(
-            "[hyoui] detach: {prefix_disp} d  |  peek (read-only): hyoui attach <session> --mode=ro"
-        );
+    // 文言は Ctrl+Z ガードの設定を反映する (= guard off なら detach 手段が無いので
+    // 嘘の脱出方法を教えず peek だけ案内する、DR-0029 §2)。
+    if !cfg.quiet && is_tty(std::io::stderr().as_fd()) {
+        if app_config.attach.ctrlz_guard {
+            eprintln!(
+                "[hyoui] detach: Ctrl+Z  |  子へ Ctrl+Z: 2 連打  |  peek (read-only): hyoui attach <session> --mode=ro"
+            );
+        } else {
+            eprintln!(
+                "[hyoui] detach: hyoui detach <session>  |  peek (read-only): hyoui attach <session> --mode=ro"
+            );
+        }
     }
 
     let stdin = std::io::stdin();
@@ -944,31 +941,9 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         }
     };
 
-    // 子 self-stop follow 時 (= ^Z で claude/vim 等を suspend) の外側端末状態管理
-    // (= issue 2026-06-11)。raw guard を保持しているとき (= stdin が tty)、`run` が
-    // SIGSTOP 直前に termios を cooked へ戻し、SIGCONT 復帰後に raw 再設定するよう
-    // suspend hook を渡す。reset escape の出力と daemon redraw 要求は `run` 内が担う。
-    // この hook は `install_attach_signal_thread` (= client 自身が外部 SIGTSTP を
-    // 受けた経路) とは別経路: こちらは「子が止まったので client も追従して止まる」経路。
-    let conn = if let Some(guard) = raw_guard.as_ref() {
-        let guard_suspend = std::sync::Arc::clone(guard);
-        let guard_resume = std::sync::Arc::clone(guard);
-        let hooks = hyoui::client::SuspendHooks::new(
-            Box::new(move || {
-                if let Ok(g) = guard_suspend.lock() {
-                    g.suspend();
-                }
-            }),
-            Box::new(move || {
-                if let Ok(g) = guard_resume.lock() {
-                    g.resume();
-                }
-            }),
-        );
-        conn.with_suspend_hooks(hooks)
-    } else {
-        conn
-    };
+    // 外側 stdout が raw mode の tty かを `run` に伝える (= detach 時の安全側 reset と
+    // 子停止の通知行を出すかの判定に使う、issue 2026-07-24 H4 / DR-0029 §1)。
+    let conn = conn.with_outer_tty_raw(raw_guard.is_some());
 
     // DR-0019 §5: pipe-through stdin EOF policy を解決して配線する。
     // - 明示 `--stdin-eof=detach|send-eof` があればそれを使う
@@ -983,9 +958,20 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         None if !stdin_is_tty => hyoui::client::StdinEofAction::SendEof,
         None => hyoui::client::StdinEofAction::Detach,
     };
+    // DR-0029 §2: Ctrl+Z ガードは **tty stdin 経路だけ**に効かせる。pipe / `< file`
+    // 経由の 0x1a は「アプリへのデータ」なので握らず素通しする (= `hyoui input
+    // key:C-z` が常に子へ届くのと同じ理由)。
+    let attach_config = if stdin_is_tty {
+        app_config.attach.clone()
+    } else {
+        hyoui::config::AttachConfig {
+            ctrlz_guard: false,
+            ..app_config.attach.clone()
+        }
+    };
     let conn = conn
         .with_stdin_eof_action(eof_action)
-        .with_tstp_config(app_config.attach.tstp.clone());
+        .with_attach_config(attach_config);
 
     // DR-0019 §6: SIGWINCH → Resize 配線。winch_source を注入し、attach 成立直後に
     // 初回 Resize を送る (= 別端末から attach した時のサイズ不一致を解消、leader 限定)。

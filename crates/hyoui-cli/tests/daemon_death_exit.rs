@@ -96,10 +96,10 @@ fn child_exit_propagates_code() {
     );
 }
 
-/// detach key (`Ctrl-A d`) で client が自分から離脱したら exit 0 (= Detached)。
-/// daemon と子は生き続ける (= ConnectionLost ではない)。
+/// Ctrl+Z 単発 (= ガード発火、DR-0029 §2) で client が自分から離脱したら exit 0
+/// (= Detached)。daemon と子は生き続ける (= ConnectionLost ではない)。
 #[test]
-fn detach_key_makes_client_exit_zero() {
+fn single_ctrl_z_makes_client_exit_zero() {
     let runner = HyouiTestRunner::new();
     let mut h = runner.spawn_hyoui("daemon-death-detach", &["run", "--", "/bin/sleep", "60"]);
 
@@ -109,15 +109,15 @@ fn detach_key_makes_client_exit_zero() {
     );
     settle();
 
-    // Ctrl-A (0x01) + 'd' を PTY 経由で送る → 自発 detach。
-    h.send_bytes(&[0x01, b'd']).expect("send detach key");
+    // Ctrl+Z (0x1a) を 1 発だけ PTY 経由で送る → delay 満了で自発 detach。
+    h.send_bytes(&[0x1a]).expect("send ctrl-z");
 
     // attach client は Detached で exit 0 する (= 子・daemon は残る)。
     let code = h.wait_exit_code(Duration::from_secs(10));
     assert_eq!(
         code,
         Some(0),
-        "detach key で client は exit 0 (Detached) するはず"
+        "Ctrl+Z 単発で client は exit 0 (Detached) するはず"
     );
 
     // 後始末: daemon と子 (/bin/sleep) はまだ生きている。client (= h.pid) は exec で

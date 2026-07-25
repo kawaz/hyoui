@@ -28,13 +28,32 @@ pub struct Config {
     #[serde(default)]
     pub scrub_env: ScrubEnvConfig,
 
-    /// attach client UX 設定 (= TOML の `[attach]` セクション、DR-0026)。
+    /// attach client UX 設定 (= TOML の `[attach]` セクション、DR-0029)。
     #[serde(default)]
     pub attach: AttachConfig,
+
+    /// session 単位の policy 設定 (= TOML の `[session]` セクション、DR-0029)。
+    #[serde(default)]
+    pub session: SessionConfig,
 
     /// Web gateway 設定 (= TOML の `[web]` セクション、DR-0027)。
     #[serde(default)]
     pub web: WebConfig,
+}
+
+/// session policy 設定 (= TOML の `[session]` 配下、DR-0029 §4)。
+///
+/// `hyoui run` が daemon に渡す既定値を持つ。CLI flag (`--on-child-suspend`) が
+/// あればそちらが優先する (= DR-0024 の flag 最小化方針、config は default 提供)。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct SessionConfig {
+    /// 子の stop を daemon が観測したら自動で `SIGCONT` を送る (= DR-0019 §3 の
+    /// `--on-child-suspend=auto-resume` の既定値)。
+    ///
+    /// default `false` (= notify のみ)。attach client の有無・stop の由来 (tty の
+    /// Ctrl+Z / `hyoui kill --signal=TSTP` / 子の self-suspend) に関わらず効く。
+    #[serde(default)]
+    pub auto_resume: bool,
 }
 
 /// Web gateway 設定 (= TOML の `[web]` 配下、DR-0027 §Decision.2)。
@@ -69,40 +88,40 @@ impl Default for WebConfig {
     }
 }
 
-/// attach client UX 設定 (= TOML の `[attach]` 配下、DR-0026 §3)。
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+/// attach client UX 設定 (= TOML の `[attach]` 配下、DR-0029 §3)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct AttachConfig {
-    /// Ctrl+Z intercept 設定。
-    #[serde(default)]
-    pub tstp: AttachTstpConfig,
-
-    /// stopped child の再 attach 時 resume 設定。
-    #[serde(default)]
-    pub resume: AttachResumeConfig,
-}
-
-/// Ctrl+Z intercept 設定 (= TOML の `[attach.tstp]`)。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-pub struct AttachTstpConfig {
-    /// Ctrl+Z state machine を有効にする。false なら完全 bypass。
+    /// tty stdin 経路の Ctrl+Z ガードを有効にする。
+    ///
+    /// `true` (default) なら Ctrl+Z 単発は「子に届けず client を detach」、2 発ごとに
+    /// 1 発だけ子へ届く (DR-0029 §2)。`false` で完全 bypass (= Ctrl+Z 素通し、
+    /// detach 手段は `hyoui detach` / SIGHUP 等の外側経路のみ)。
     #[serde(default = "default_true")]
-    pub intercept: bool,
+    pub ctrlz_guard: bool,
 
-    /// 最初の Ctrl+Z を保留して 2 打目を待つ時間。
-    #[serde(default = "default_short_debounce_ms")]
-    pub short_debounce_ms: u64,
+    /// Ctrl+Z を受けてから detach を確定するまでの遅延 (= 連打を待つ窓)。
+    ///
+    /// `"500ms"` (default) / `"1s"` / `"0"` のような duration 文字列、または整数
+    /// (= ミリ秒) で書ける。`0` にすると連打判定を行わず、Ctrl+Z 単発で即 detach
+    /// する (= 子には一切届かなくなる)。
+    #[serde(
+        default = "default_ctrlz_guard_delay",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub ctrlz_guard_delay: std::time::Duration,
 
-    /// Ctrl+Z を子へ通した後、連投を素通しする時間。
-    #[serde(default = "default_long_grace_ms")]
-    pub long_grace_ms: u64,
-}
-
-/// stopped child の再 attach 時 resume 設定 (= TOML の `[attach.resume]`)。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-pub struct AttachResumeConfig {
-    /// rw attach を復帰意思とみなし stopped child を resume する。
+    /// detach 遅延中に画面最下行へ残り時間の overlay を出す (= DR-0029 §5)。
+    ///
+    /// 現在は **未実装** で、値は受理されるが動作に影響しない (= 実装は
+    /// docs/issue/2026-07-25-request-attach-overlay-progress.md)。
     #[serde(default = "default_true")]
-    pub on_reattach: bool,
+    pub ctrlz_guard_overlay: bool,
+
+    /// stopped child への rw attach を復帰意思とみなして resume 要求を送る。
+    ///
+    /// default `true`。ro / rw-no-leader attach では設定に関わらず送らない。
+    #[serde(default = "default_true")]
+    pub resume_on_reattach: bool,
 }
 
 /// env scrub 設定 (= TOML の `[scrub_env]` 配下、DR-0024 §3)。
@@ -149,28 +168,72 @@ fn default_true() -> bool {
     true
 }
 
-fn default_short_debounce_ms() -> u64 {
-    300
+fn default_ctrlz_guard_delay() -> std::time::Duration {
+    std::time::Duration::from_millis(500)
 }
 
-fn default_long_grace_ms() -> u64 {
-    1500
-}
-
-impl Default for AttachTstpConfig {
+impl Default for AttachConfig {
     fn default() -> Self {
         Self {
-            intercept: true,
-            short_debounce_ms: default_short_debounce_ms(),
-            long_grace_ms: default_long_grace_ms(),
+            ctrlz_guard: true,
+            ctrlz_guard_delay: default_ctrlz_guard_delay(),
+            ctrlz_guard_overlay: true,
+            resume_on_reattach: true,
         }
     }
 }
 
-impl Default for AttachResumeConfig {
-    fn default() -> Self {
-        Self { on_reattach: true }
+/// duration 設定値を deserialize する。
+///
+/// 受理する形:
+/// - 文字列 + 単位: `"500ms"` / `"1s"` / `"1.5s"` / `"2m"` (単位省略時はミリ秒)
+/// - 整数: `500` (= ミリ秒)
+///
+/// 負値 / 未知の単位 / 数値でない文字列は Err (= DR-0024 の「不正 config は
+/// 起動を拒否」に合流させる)。
+fn deserialize_duration<'de, D>(de: D) -> Result<std::time::Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    use serde::de::Error as _;
+
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Int(u64),
+        Str(String),
     }
+
+    match Repr::deserialize(de)? {
+        Repr::Int(ms) => Ok(std::time::Duration::from_millis(ms)),
+        Repr::Str(s) => parse_duration(&s).ok_or_else(|| {
+            D::Error::custom(format!(
+                "invalid duration {s:?}: expected e.g. \"500ms\" / \"1s\" / \"1.5s\" / \"2m\" \
+                 (単位省略時はミリ秒)"
+            ))
+        }),
+    }
+}
+
+/// duration 文字列 (`"500ms"` 等) を [`std::time::Duration`] にする pure 関数。
+fn parse_duration(s: &str) -> Option<std::time::Duration> {
+    let t = s.trim();
+    let digits_end = t
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(t.len());
+    let (num, unit) = t.split_at(digits_end);
+    let value: f64 = num.parse().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let millis = match unit.trim() {
+        "" | "ms" => value,
+        "s" => value * 1000.0,
+        "m" => value * 60_000.0,
+        _ => return None,
+    };
+    Some(std::time::Duration::from_millis(millis.round() as u64))
 }
 
 impl Default for ScrubEnvConfig {
@@ -305,6 +368,7 @@ pub fn parse_str(s: &str, path: &Path) -> Result<Config, ConfigError> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn dummy_path() -> PathBuf {
         PathBuf::from("/tmp/test-config.toml")
@@ -315,11 +379,63 @@ mod tests {
         let c = Config::default();
         assert!(c.scrub_env.enabled);
         assert!(c.scrub_env.targets.is_empty());
-        assert!(c.attach.tstp.intercept);
-        assert_eq!(c.attach.tstp.short_debounce_ms, 300);
-        assert_eq!(c.attach.tstp.long_grace_ms, 1500);
-        assert!(c.attach.resume.on_reattach);
+        assert!(c.attach.ctrlz_guard);
+        assert_eq!(c.attach.ctrlz_guard_delay, Duration::from_millis(500));
+        assert!(c.attach.ctrlz_guard_overlay);
+        assert!(c.attach.resume_on_reattach);
+        assert!(!c.session.auto_resume);
         assert_eq!(c.web.listen, "127.0.0.1:43690");
+    }
+
+    #[test]
+    fn parse_session_auto_resume() {
+        let s = r#"
+[session]
+auto_resume = true
+"#;
+        let c = parse_str(s, &dummy_path()).unwrap();
+        assert!(c.session.auto_resume);
+    }
+
+    #[test]
+    fn parse_duration_accepts_units_and_bare_millis() {
+        assert_eq!(parse_duration("500ms"), Some(Duration::from_millis(500)));
+        assert_eq!(parse_duration("1s"), Some(Duration::from_secs(1)));
+        assert_eq!(parse_duration("1.5s"), Some(Duration::from_millis(1500)));
+        assert_eq!(parse_duration("2m"), Some(Duration::from_secs(120)));
+        assert_eq!(parse_duration(" 250 "), Some(Duration::from_millis(250)));
+        assert_eq!(parse_duration("0"), Some(Duration::ZERO));
+        assert_eq!(parse_duration("0ms"), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn parse_duration_rejects_garbage() {
+        assert_eq!(parse_duration("fast"), None);
+        assert_eq!(parse_duration("500 years"), None);
+        assert_eq!(parse_duration("-1s"), None);
+        assert_eq!(parse_duration(""), None);
+    }
+
+    #[test]
+    fn parse_ctrlz_guard_delay_as_integer_is_millis() {
+        let s = r#"
+[attach]
+ctrlz_guard_delay = 120
+"#;
+        let c = parse_str(s, &dummy_path()).unwrap();
+        assert_eq!(c.attach.ctrlz_guard_delay, Duration::from_millis(120));
+    }
+
+    #[test]
+    fn parse_ctrlz_guard_delay_invalid_string_is_error() {
+        let s = r#"
+[attach]
+ctrlz_guard_delay = "soon"
+"#;
+        assert!(matches!(
+            parse_str(s, &dummy_path()),
+            Err(ConfigError::Parse { .. })
+        ));
     }
 
     #[test]
@@ -356,36 +472,31 @@ listen = "0.0.0.0:8080"
     #[test]
     fn parse_partial_attach_config_keeps_missing_field_defaults() {
         let s = r#"
-[attach.tstp]
-short_debounce_ms = 125
-
-[attach.resume]
-on_reattach = false
+[attach]
+ctrlz_guard_delay = "125ms"
 "#;
         let c = parse_str(s, &dummy_path()).unwrap();
-        assert!(c.attach.tstp.intercept);
-        assert_eq!(c.attach.tstp.short_debounce_ms, 125);
-        assert_eq!(c.attach.tstp.long_grace_ms, 1500);
-        assert!(!c.attach.resume.on_reattach);
+        assert!(c.attach.ctrlz_guard);
+        assert_eq!(c.attach.ctrlz_guard_delay, Duration::from_millis(125));
+        assert!(c.attach.ctrlz_guard_overlay);
+        assert!(c.attach.resume_on_reattach);
         assert!(c.scrub_env.enabled);
     }
 
     #[test]
     fn parse_full_attach_config() {
         let s = r#"
-[attach.tstp]
-intercept = false
-short_debounce_ms = 10
-long_grace_ms = 20
-
-[attach.resume]
-on_reattach = false
+[attach]
+ctrlz_guard = false
+ctrlz_guard_delay = "1s"
+ctrlz_guard_overlay = false
+resume_on_reattach = false
 "#;
         let c = parse_str(s, &dummy_path()).unwrap();
-        assert!(!c.attach.tstp.intercept);
-        assert_eq!(c.attach.tstp.short_debounce_ms, 10);
-        assert_eq!(c.attach.tstp.long_grace_ms, 20);
-        assert!(!c.attach.resume.on_reattach);
+        assert!(!c.attach.ctrlz_guard);
+        assert_eq!(c.attach.ctrlz_guard_delay, Duration::from_secs(1));
+        assert!(!c.attach.ctrlz_guard_overlay);
+        assert!(!c.attach.resume_on_reattach);
     }
 
     #[test]

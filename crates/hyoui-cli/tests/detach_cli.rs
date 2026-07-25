@@ -230,10 +230,10 @@ fn attach_exclusive_denied_when_rw_client_present() {
 }
 
 /// DR-0020 §5 / Fable M4: attach 成立時の発見性ヒントが stderr (= PTY) に出る。
-/// 出力は raw mode 前 (= 外側端末の scrollback に残る位置)。文言は実 prefix
-/// (= default Ctrl-A) を反映する。
+/// 出力は raw mode 前 (= 外側端末の scrollback に残る位置)。文言は Ctrl+Z ガードの
+/// 有効時 default (DR-0029 §2) を反映する。
 #[test]
-fn attach_emits_discovery_hint_with_actual_prefix() {
+fn attach_emits_discovery_hint_for_ctrl_z_guard() {
     let runner = HyouiTestRunner::new();
     let session = "hint-emit";
 
@@ -242,8 +242,8 @@ fn attach_emits_discovery_hint_with_actual_prefix() {
         .wait_for("[hyoui] detach:", Duration::from_secs(10))
         .expect("ヒントが PTY (stderr) に出るべき");
     assert!(
-        out.contains("[hyoui] detach: Ctrl-A d"),
-        "ヒントは実 prefix (default Ctrl-A) を反映すべき。out={out:?}"
+        out.contains("[hyoui] detach: Ctrl+Z"),
+        "ヒントは Ctrl+Z ガードの操作を案内すべき。out={out:?}"
     );
 
     // 後始末。

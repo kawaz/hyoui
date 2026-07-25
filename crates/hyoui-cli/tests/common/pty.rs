@@ -182,10 +182,7 @@ impl HyouiTestRunner {
             // HYOUI_SESSION_ID / HYOUI_NAMESPACE が継承され、session 省略形の解決や
             // attach の self 判定が外側 session に向かう。test の隔離のため常に外す。
             .env_remove("HYOUI_SESSION_ID")
-            .env_remove("HYOUI_NAMESPACE")
-            // detach key の表記 / 有効性が外側設定に左右されないように外す
-            // (= ヒント文言 e2e が default Ctrl-A を仮定する)。
-            .env_remove("HYOUI_DETACH_PREFIX");
+            .env_remove("HYOUI_NAMESPACE");
 
         let child = cmd.spawn(pts).expect("spawn hyoui in pty");
         let pid = Pid::from_raw(child.id() as i32);

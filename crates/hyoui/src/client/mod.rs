@@ -8,7 +8,7 @@ mod attach;
 pub mod auto_lock;
 
 pub use attach::{
-    AttachOptions, ClientConnection, RunOutcome, SUSPEND_OUTER_TTY_RESET, StdinEofAction,
-    SuspendHooks, WinchSource, resolve_detach_prefix_from_env,
+    AttachOptions, CTRL_Z_BYTE, ClientConnection, OUTER_TTY_RESET, RunOutcome, StdinEofAction,
+    WinchSource,
 };
 pub use auto_lock::{AutoLockError, acquire_auto_lock, release_auto_lock};

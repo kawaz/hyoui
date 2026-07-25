@@ -183,10 +183,12 @@ pub struct RunConfig {
     /// `--session`: 自動採番 (`run-<pid>-<rand4hex>`) ではなく明示 session id を使う。
     /// socket path 自動解決にもこの値が入る。
     pub session: Option<String>,
-    /// Action when the child is suspended (preset by mode unless overridden).
-    /// DR-0015 §2.2: attach client が SessionChildStoppedNotify 受信時に発動する
-    /// policy。daemon には伝わらない (= client local)。
-    pub on_child_suspend: OnChildSuspend,
+    /// `--on-child-suspend`: 子が stop したときの daemon 側 policy (DR-0019 §3)。
+    ///
+    /// `None` = flag 未指定。この場合 caller (= `run_command`) が config.toml の
+    /// `[session] auto_resume` から既定値を解決する (DR-0029 §4)。flag 指定時は
+    /// config より優先される。
+    pub on_child_suspend: Option<OnChildSuspend>,
     /// vt100 内蔵 scrollback ring の **行数上限** (= DR-0013 §8 + §8 Update)。
     ///
     /// `screen dump --layer={scrollback,both}` / `screen snapshot` で過去 row を
@@ -263,8 +265,8 @@ pub struct AttachConfig {
 /// `--target=self|others` は CLI から出さない (Fable review M1 2026-06-12):
 /// detach CLI は一時接続で daemon に Detach を送る構造のため、self は「一時接続が
 /// 自分を切る」no-op、others は「一時接続以外 ≒ 全部」となり all と実質同義で、
-/// flag として嘘になる。中から自分の端末だけ抜けるのは attach の detach key
-/// (Ctrl-A d) の役割。protocol の `DetachTarget::{Myself, Others}` は detach key /
+/// flag として嘘になる。中から自分の端末だけ抜けるのは attach の Ctrl+Z ガード
+/// (DR-0029 §2) の役割。protocol の `DetachTarget::{Myself, Others}` は attach client /
 /// `--detach-others` 用として内部に残る。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DetachConfig {
@@ -2731,10 +2733,6 @@ fn parse_run(args: &[String]) -> Command {
         return Command::Error("no command given (use `-- cmd [args...]`)".into());
     }
 
-    // DR-0017 §柱2: default は **notify のみ** (= 子の suspend を勝手に起こさない)。
-    // `AutoResume` は opt-in (`--on-child-suspend=auto-resume`) でのみ選べる。
-    let final_child_suspend = on_child_suspend.unwrap_or(OnChildSuspend::Notify);
-
     // Virtual size: explicit 指定のみ Some、未指定なら None で caller (= run_command)
     // が外側 TTY size を継承する経路に流す (= ユーザ指示 2026-05-29)。
     Command::Run(RunConfig {
@@ -2746,7 +2744,7 @@ fn parse_run(args: &[String]) -> Command {
         socket,
         detached,
         session,
-        on_child_suspend: final_child_suspend,
+        on_child_suspend,
         scrollback_rows,
         debug_dump_server,
         debug_dump_client,
@@ -3901,7 +3899,7 @@ fn usage_run() -> String {
                 signal 死は 128+signum (= 130=SIGINT, 137=SIGKILL, 143=SIGTERM)。\n                          \
                 非 tty stdin の default (= send-eof) では stdin EOF で子が\n                          \
                 自然 exit し、その子の code がここに伝搬する\n    \
-            0                     detach key、または `--stdin-eof=detach` 時の stdin EOF で\n                          \
+            0                     Ctrl+Z ガード発火、または `--stdin-eof=detach` 時の stdin EOF で\n                          \
                 自分から離脱した (= 子は daemon 配下に残る)\n    \
             9                     daemon との接続が予期せず失われた (= daemon 消滅の疑い)\n    \
             1                     実行エラー (= protocol violation / 出力先への書き込み失敗 等)\n    \
@@ -3939,18 +3937,15 @@ fn usage_attach() -> String {
             1-based 指定で、`1` = 最古、`-1` = 最新、`2` = 2 番目に古い、...。\n    \
             stale socket は index 対象外。範囲外は error。session-id と --index は排他。\n\
         \n\
-        DETACH KEY (= session を生かしたまま client だけ抜ける):\n    \
-            Ctrl-A d              detach (session 維持 + 自分だけ Detach 送って終了)\n    \
-            Ctrl-A Ctrl-A         escape — literal Ctrl-A を子 PTY に送る\n    \
-            Ctrl-A <other>        prefix と当該キー両方を捨てる (= screen 慣例)\n\
+        CTRL+Z GUARD (= session を生かしたまま client だけ抜ける、DR-0029):\n    \
+            Ctrl+Z 単発           detach (session 維持 + 自分だけ Detach 送って終了)。\n                          \
+                子には届かない (= 覗き窓を閉じるだけで子は走り続ける)\n    \
+            Ctrl+Z 2 連打         子に Ctrl+Z を 1 発届ける (= detach しない)\n    \
+            Ctrl+Z N 連打         2 発ごとに子へ 1 発、余った 1 発が detach を起こす\n    \
+            設定                  ~/.config/hyoui/config.toml の [attach] セクション\n                          \
+                (ctrlz_guard / ctrlz_guard_delay)。guard=false で素通し\n\
         \n\
         ENVIRONMENT:\n    \
-            HYOUI_DETACH_PREFIX   detach prefix byte をカスタマイズ。値の形式:\n                                  \
-                * `Ctrl-B` / `^B` (= 0x02)\n                                  \
-                * `0x02` (hex)\n                                  \
-                * `2` (decimal 0..=255)\n                                  \
-                * `none` / `off` / `disable` (= detach key 無効化)\n                                  \
-                未設定なら Ctrl-A (0x01)\n    \
             HYOUI_LOCK_TOKEN      lock token を env で渡す (= handshake.token)\n\
         \n\
         EXIT STATUS:\n    \
@@ -3958,7 +3953,7 @@ fn usage_attach() -> String {
                 signal 死は 128+signum (= 130=SIGINT, 137=SIGKILL, 143=SIGTERM)。\n                          \
                 非 tty stdin の default (= send-eof) では stdin EOF で子が\n                          \
                 自然 exit し、その子の code がここに伝搬する\n    \
-            0                     detach key、または `--stdin-eof=detach` 時の stdin EOF で\n                          \
+            0                     Ctrl+Z ガード発火、または `--stdin-eof=detach` 時の stdin EOF で\n                          \
                 自分から離脱した (= 子は daemon 配下に残る)\n    \
             9                     daemon との接続が予期せず失われた (= daemon 消滅の疑い)\n    \
             1                     attach 実行エラー (= protocol violation / 出力先への書き込み失敗 等)\n    \
@@ -3972,7 +3967,6 @@ fn usage_attach() -> String {
             hyoui attach --index=2                  # 2 番古い live session に attach\n    \
             hyoui attach --socket=/tmp/x.sock       # 直接 socket 指定\n    \
             hyoui attach demo --mode=ro             # 読み取り専用 attach\n    \
-            HYOUI_DETACH_PREFIX=Ctrl-B hyoui attach demo  # prefix を Ctrl-B に変更\n\
         \n\
         RELATED:\n    \
             hyoui run --detached    daemon を background 起動\n    \
@@ -5998,7 +5992,7 @@ mod tests {
         match parse_args(&args(&["run", "--", "echo", "hello"])) {
             Command::Run(cfg) => {
                 assert_eq!(cfg.command, vec!["echo".to_string(), "hello".to_string()]);
-                assert_eq!(cfg.on_child_suspend, OnChildSuspend::Notify);
+                assert_eq!(cfg.on_child_suspend, None);
                 // DR-0019 §5: 未指定なら None (= exec attach 側で tty 判定して解決)。
                 assert_eq!(cfg.stdin_eof, None);
             }
@@ -6041,12 +6035,12 @@ mod tests {
     }
 
     #[test]
-    fn run_default_suspend_is_notify_only() {
-        // DR-0017 §柱2: default は notify-only。auto-resume は
-        // opt-in に限定 (= 勝手に子を起こさない)。
+    fn run_default_suspend_is_unspecified() {
+        // DR-0029 §4: flag 未指定は None のまま返し、config `[session] auto_resume`
+        // での解決を run_command に委ねる (= builtin default は notify-only)。
         match parse_args(&args(&["run", "--", "cat"])) {
             Command::Run(cfg) => {
-                assert_eq!(cfg.on_child_suspend, OnChildSuspend::Notify);
+                assert_eq!(cfg.on_child_suspend, None);
                 // size 未指定なら None = caller (= run_command) が外側 TTY size or
                 // 80x24 fallback で解決する経路 (= ユーザ指示 2026-05-29)。
                 assert_eq!(cfg.cols, None);
@@ -6103,7 +6097,7 @@ mod tests {
             "cat",
         ])) {
             Command::Run(cfg) => {
-                assert_eq!(cfg.on_child_suspend, OnChildSuspend::AutoResume);
+                assert_eq!(cfg.on_child_suspend, Some(OnChildSuspend::AutoResume));
             }
             other => panic!("expected Run, got {other:?}"),
         }
@@ -6168,10 +6162,10 @@ mod tests {
 
     #[test]
     fn run_explicit_suspend_overrides_default() {
-        // --on-child-suspend=notify を明示しても default (= Notify) と同じ。
+        // 明示 `notify` は config の auto_resume より優先される (= Some で返る)。
         match parse_args(&args(&["run", "--on-child-suspend=notify", "--", "cat"])) {
             Command::Run(cfg) => {
-                assert_eq!(cfg.on_child_suspend, OnChildSuspend::Notify);
+                assert_eq!(cfg.on_child_suspend, Some(OnChildSuspend::Notify));
             }
             other => panic!("expected Run, got {other:?}"),
         }
@@ -6968,10 +6962,20 @@ mod tests {
     }
 
     #[test]
-    fn attach_help_text_mentions_detach_key() {
+    fn attach_help_text_mentions_ctrl_z_guard() {
         let text = usage(&HelpTopic::Attach);
-        assert!(text.contains("Ctrl-A d"), "help should document Ctrl-A d");
-        assert!(text.contains("escape"), "help should document escape");
+        assert!(
+            text.contains("Ctrl+Z 単発"),
+            "help should document 単発 Ctrl+Z = detach"
+        );
+        assert!(
+            text.contains("Ctrl+Z 2 連打"),
+            "help should document 2 連打 = 子へ届く"
+        );
+        assert!(
+            text.contains("ctrlz_guard"),
+            "help should point at the config key"
+        );
         assert!(text.contains("--mode"), "help should mention --mode option");
     }
 
@@ -7423,7 +7427,7 @@ mod tests {
             (
                 HelpTopic::Attach,
                 "hyoui attach",
-                &["DETACH KEY", "--exclusive"],
+                &["CTRL+Z GUARD", "--exclusive"],
             ),
             (HelpTopic::List, "hyoui list", &["SCAN ORDER"]),
             (HelpTopic::Kill, "hyoui kill", &["--signal", "SIGTERM"]),
