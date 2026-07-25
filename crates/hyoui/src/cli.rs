@@ -4609,8 +4609,8 @@ fn usage_detach() -> String {
         \n\
         対象は常に全 client: detach CLI は一時接続で要求を送る構造のため、self /\n\
         others のような部分指定は CLI からは意味を成さない (= self は一時接続の\n\
-        no-op、others は実質 all)。attach 中の端末から自分だけ抜けるのは attach の\n\
-        detach key (Ctrl-A d) の役割。\n\
+        no-op、others は実質 all)。attach 中の端末から自分だけ抜けるのは Ctrl+Z\n\
+        (単発、DR-0029 の Ctrl+Z ガード) の役割。\n\
         \n\
         USAGE:\n    \
             hyoui detach <session-id>\n    \
