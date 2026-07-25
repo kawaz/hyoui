@@ -118,8 +118,7 @@
 - **signal wire name 化** ([[DR-0012]] 完了後の整理、cross-OS serve gateway 対応の前提)
 - **itumono skill 改修** (= `/tmp` → `docs/REVIEW-BACKLOG.md` 規約への移管、別 PR で実施)
 - ~~**[[DR-0006]] §8/§9 改訂**~~ (完了済 2026-05-27、§8 input family / §9 wait / §10 snapshot / §11 tail を state-based に書き直し済、旧仕様は Archive section に保全)
-- **detach key sequence の customize** (= `--detach-prefix` env / option で `Ctrl-A D` 固定を解除)
-- **attach subcommand 専用 `--help`** (= detach key 動作・mode 説明を専用 help に書く)
+- **attach subcommand 専用 `--help`** (= Ctrl+Z ガード動作・mode 説明を専用 help に書く)
 
 ### 横断的な改善 (= 時期未定、必要が出たら拾う)
 
@@ -135,7 +134,6 @@
 - error message に next-action hint (= R4-H2)
 - duration format の bare 数字 reject 時の hint (= R4-M5)
 - `hyoui run --help` option 順序の一貫性 (= R4-M6)
-- detach key と bash readline (`Ctrl-A`) 衝突の docs 警告 (= R4-M4)
 - session id 自動採番ルールの docs 化 (= R4-M7)
 - [[DR-0008]] に error code 一覧追記 (= R4-M11)
 - error code naming の階層化 (= R4-M9)

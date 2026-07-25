@@ -15,7 +15,7 @@
 - 中から `hyoui status` / `wait` / `screen dump` で自分を観測したい
 - hyoui in hyoui の事故 (= 自セッションへの attach ループ) を防ぎたい
 
-また同日、端末 B から覗き見 attach した際に「抜け方 (Ctrl-A d) と覗き方 (--mode=ro) が
+また同日、端末 B から覗き見 attach した際に「抜け方と覗き方 (--mode=ro) が
 発見できない」UX 問題も観測された (= 機能は実装済みだが発見性が壊滅)。
 
 ## Decision
@@ -62,7 +62,7 @@ hyoui detach [session]
 > となり all と実質同義 — flag として嘘になる。self / others は client addressing
 > (= どの client かを外から指定する仕組み、§Consequences の将来 DR 範囲) が無い
 > 現状の CLI では表現不能なので出さない。中から自分の端末だけ抜けるのは attach の
-> detach key (Ctrl-A d) の役割。
+> in-band detach キーの役割 (= 現行は Ctrl+Z ガード、[[DR-0029]] §2)。
 
 - 引数なし + 中から = 自セッションの全 client detach (= TUI 直起動からの脱出
   ユースケース)。外から = 明示 session の全 client 引き剥がし
@@ -83,12 +83,13 @@ hyoui detach [session]
 ### 5. 発見性の改善 (UX、透過原則の範囲内)
 
 - attach 成立時に **stderr** へ 1 行ヒントを出す:
-  `[hyoui] detach: <prefix> d | peek: --mode=ro`。文言は `HYOUI_DETACH_PREFIX` の
-  解決値を反映し、`none` (= detach key 無効) ならヒント自体出さない (Fable M4)。
+  `[hyoui] detach: Ctrl+Z | 子へ Ctrl+Z: 2 連打 | peek (read-only): ... --mode=ro`。
+  文言は Ctrl+Z ガードの設定を反映し、`ctrlz_guard = false` (= in-band detach 無効) なら
+  `hyoui detach <session>` を案内する (= 嘘の脱出方法を教えない、Fable M4 / [[DR-0029]] §2)。
   子の出力経路 (PTY) ではなく client の stderr なので透過性を壊さない (screen 慣行)。
   `--quiet` で抑止。非 tty stderr (= pipe 利用) では出さない
 - ヒントの出力位置は **raw mode に入る前** (= 外側端末の scrollback に残り、attach 後の
-  redraw に消されない)。raw 前の stderr 出力が detach key を取りこぼす回帰が一度
+  redraw に消されない)。raw 前の stderr 出力が入力を取りこぼす回帰が一度
   起きたが、root cause は `enter_raw` の `TCSAFLUSH` が cooked 窓の入力 queue を
   破棄していたこと (= TCSANOW 化で解消、`sys/tty.rs` の regression test で固定。
   Fable M4 2026-06-12)
@@ -99,9 +100,12 @@ hyoui detach [session]
 
 - **attach の self-ro 観戦許可**: 入れ子 attach の例外として ro なら無害の可能性はあるが、
   画面の無限再帰 (自画面を自画面に映す) の挙動が未検証。需要が出たら検証して再検討
-- **Ctrl-Z 等の追加キー intercept** (tmux 流 2 回打ち): DR-0017 案 A4 却下と同根。脱出
-  手段は既存の Ctrl-A prefix に集約済みで、これ以上の入力介入は透過原則に反する。
-  完全透過が欲しい場合の `HYOUI_DETACH_PREFIX=none` opt-out も既存
+- **Ctrl-Z 等の追加キー intercept** (tmux 流 2 回打ち): 当時は「脱出手段は既存の
+  Ctrl-A prefix に集約済み」を理由に却下した。
+  > **📌 再判断 (2026-07-25、[[DR-0029]] §2/§3)**: prefix 体系ごと廃止し、Ctrl+Z 単発を
+  > detach に割り当てた。「反射で押される唯一のキーが子を止める」方が透過原則より
+  > 優先度の高い問題だったため。完全透過が欲しい場合の opt-out は
+  > `[attach] ctrlz_guard = false`
 - **`hyoui detach` の引数なし = others**: 「中から打ったら自分以外」は shell からは便利
   だが、detach の主ユースケース (TUI 脱出 / 外からの引き剥がし) では all が直感的
 - **`hyoui detach --target=others|all|self` flag** (当初案): detach CLI の一時接続

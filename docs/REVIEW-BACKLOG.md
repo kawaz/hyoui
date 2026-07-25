@@ -93,7 +93,7 @@ Wild debugger / Competitive 分析 / Rust API 設計
   - module 分離: `crates/hyoui/src/daemon/control.rs` 新設 (626 行)、session.rs から -560 LOC
 - [ ] **R4-M3** `Session::serve` cleanup が Drop でない panic safety 欠如
   - 出典: Architect
-- [ ] **R4-M4** detach key と bash readline (`Ctrl-A`) 衝突警告が docs に無い
+- [x] **R4-M4** detach key と bash readline (`Ctrl-A`) 衝突警告が docs に無い — 解消: `Ctrl-A` prefix ごと廃止 ([[DR-0029]] §3)
   - 出典: 新人 / UX
 - [ ] **R4-M5** duration format の bare 数字 reject 時に hint が出ない
   - 出典: 新人 / UX
@@ -117,7 +117,7 @@ Wild debugger / Competitive 分析 / Rust API 設計
   - 出典: Test 戦略
 - [ ] **R4-M15** `Resize` clamp が silent (= 上限超えを silently truncate)
   - 出典: Wild debugger
-- [ ] **R4-M16** `process_detach_prefix` が literal `Ctrl-A` を飲み込む (= prefix 直後に取消したい場面でユーザ入力失う)
+- [x] **R4-M16** `process_detach_prefix` が literal `Ctrl-A` を飲み込む — 解消: prefix state machine ごと廃止 ([[DR-0029]] §3)
   - 出典: Wild debugger
 - [ ] **R4-M17** `instant_to_epoch_ms` の clock jump race
   - 出典: Wild debugger
@@ -379,7 +379,7 @@ Wild debugger / Competitive 分析 / Rust API 設計
   - 出典: Audit (R5-AUD-M6) / 該当: `daemon/config.rs:43`
   - 提案: `expected_token` を `secrecy::SecretString` 風 newtype に包むか、`DaemonConfig` Debug を手書きで redact
   - 解消: `DaemonConfig` の `#[derive(Debug)]` を撤去し、`impl std::fmt::Debug for DaemonConfig` を手書き。`expected_token` は `&self.expected_token.as_ref().map(|_| "<redacted>")` で token 値を表示しない
-- [ ] **R5-M26** `HYOUI_DETACH_PREFIX` env が printable byte (例: 'a') を受理 → ロックアウト DoS
+- [x] **R5-M26** `HYOUI_DETACH_PREFIX` env が printable byte (例: 'a') を受理 → ロックアウト DoS — 解消: env ごと廃止 ([[DR-0029]] §3)
   - 出典: Audit (R5-AUD-M7) / 該当: `client/attach.rs:94-127`
   - 提案: env validate で control character (0x20 未満 + 0x7f) のみ受理、printable byte は reject
 - [ ] **R5-M27** `serve_loop` 単一関数 292 行 = 1-page rule 違反、責務 7 つが直書き

@@ -42,7 +42,7 @@ hyoui run --detached -- claude
 # Terminal B: list, then attach
 hyoui list
 hyoui attach run-<pid>-<rand>
-# Detach with Ctrl-A D
+# Detach with a single Ctrl+Z
 ```
 
 ### 2. Observe in read-only mode

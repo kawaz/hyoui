@@ -69,8 +69,8 @@ hyoui kill <session> | --socket=PATH [--signum=N]
 内部実装:
 - daemon: pty fork、socket bind、multi-attach (= Session::serve、broadcast + multiplex)
 - protocol: CBOR ハイブリッド framing ([[DR-0008]])、cap flags 一本の schema evolution
-- attach client (`hyoui attach`): handshake + raw bytes 中継、`Ctrl-A D` detach prefix、
-  `Ctrl-A Ctrl-A` で literal escape
+- attach client (`hyoui attach`): handshake + raw bytes 中継、in-band detach キー
+  (= 現行は Ctrl+Z ガード、[[DR-0029]] §2)
 - leader 内部メカニズム (winsize 主体、cascade `latest`)
 - lock state machine (acquire / release / token verify、ただし wait queue は v0.2.0)
 - subscription 切替 (Raw / TailFollow)、scrollback ring buffer
@@ -193,7 +193,7 @@ hyoui play <session> --input FILE [--speed] [--input-only|--output-only]
 - protocol design ([[DR-0008]] 確定)、CBOR ハイブリッド framing、cap negotiation
 - daemon: pty 起動、socket bind、multi-attach、leader、lock 基本、subscription
 - CLI: `run` / `attach` / `list` / `kill` の 4 コマンド
-- attach client: `Ctrl-A D` detach、`Ctrl-A Ctrl-A` literal escape
+- attach client: in-band detach キー (= 現行は Ctrl+Z ガード、[[DR-0029]] §2)
 - 統計: 208 tests pass
 
 ### v0.2.0 への準備 (v0.1.0 時点で済んでいる)

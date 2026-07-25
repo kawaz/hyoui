@@ -180,8 +180,9 @@ Control message body (type=0x01) = CBOR map { "kind": "<dotted.name>", ...payloa
   stdout に書き出すだけで detach 時の画面を完全復元
 - stdin → frame writer (`type=0x00 raw data`)
 - frame reader → stdout
-- **detach prefix state machine**: `Ctrl-A D` で client 自身を detach、
-  `Ctrl-A Ctrl-A` で literal Ctrl-A を子に送る、`Ctrl-A <他>` は両捨て (screen 慣例)
+- **Ctrl+Z ガード state machine** ([[DR-0029]] §2): tty stdin で 2 発ごとに子へ
+  Ctrl+Z を 1 発届け、余った 1 発が `ctrlz_guard_delay` 後に client を detach する。
+  prefix キーは持たず、子には hyoui 由来の escape を一切足さない
 - 1-shot CLI (`input` / `screen dump` / `screen snapshot` / `tail` / `wait` /
   `lock` / `kill` / `list` / `status`) 用に `recv_frame()` / `recv_control(buffer_raw_data)` /
   `send_raw_bytes()` を提供

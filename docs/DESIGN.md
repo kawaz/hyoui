@@ -211,9 +211,10 @@ rejected because it cannot acquire a controlling terminal.
   pre-detach screen
 - stdin → frame writer (`type=0x00` raw data)
 - frame reader → stdout
-- **Detach prefix state machine**: `Ctrl-A D` detaches the client itself,
-  `Ctrl-A Ctrl-A` sends a literal Ctrl-A to the child, `Ctrl-A <other>` is
-  discarded (screen convention)
+- **Ctrl+Z guard state machine** ([[DR-0029]] §2): on tty stdin, every second
+  Ctrl+Z is forwarded to the child and a leftover odd press detaches the client
+  after `ctrlz_guard_delay`. No prefix key exists; the child never sees an
+  escape introduced by hyoui
 - For one-shot CLIs (`input` / `screen dump` / `screen snapshot` / `tail` /
   `wait` / `lock` / `kill` / `list` / `status`) the connection exposes
   `recv_frame()` / `recv_control(buffer_raw_data)` / `send_raw_bytes()`

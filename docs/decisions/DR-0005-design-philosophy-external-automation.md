@@ -17,15 +17,15 @@
 > | 当時の構想名 | 現行 CLI |
 > |---|---|
 > | `send` / `keys` / `paste` | `hyoui input` family に統合 (= `text:` / `hex:` / `file:` / `paste:` / `key:` spec を順序保証で送信、DR-0006 §8)。独立 subcommand 化せず |
-> | `detach` (out-of-band) | attach client 内の `Ctrl-A D` detach キー (下記) + daemon は linger 継続 (DR-0015)。`hyoui detach` は予約エラー |
+> | `detach` (out-of-band) | attach client の Ctrl+Z ガード ([[DR-0029]] §2) + `hyoui detach` CLI。daemon は linger 継続 (DR-0015) |
 > | `tx` | 未実装 (docs/issue/2026-05-27-tx-lock-unlock-cli-subcommands.md) |
->
-> **「in-band escape を一切導入しない」原則の唯一の例外**: attach client の `Ctrl-A D`
-> detach キー (= prefix `Ctrl-A` 0x01 + `d`、`HYOUI_DETACH_PREFIX` で変更可)。
-> これは **attach client (= ユーザが繋いでいる端末) のローカル解釈**であり、子プロセスには
-> 透過しない (= 子の stdin には届かない)。「ユーザ視点では in-band に見えるが、子プロセスには
-> out-of-band で透過」という整理で原則と両立する。子への入力経路 (`hyoui input`) には依然
-> prefix キーを一切持たない。
+
+> **📌 in-band escape 原則の改訂注記 (2026-07-25、[[DR-0029]] により)**: 本 DR の
+> 「in-band escape (prefix キー等) を一切導入しない」は **「子の stdin には hyoui 由来の
+> escape を一切足さない (= 子から見た完全透過)」** の意味に狭める。attach client の
+> tty stdin では Ctrl+Z 1 キーだけが hyoui のローカル解釈対象になる (= 単発で detach、
+> 2 連打で子へ 1 発、[[DR-0029]] §2)。prefix キー体系 (tmux/screen 流の語彙) は依然
+> 領域外で、子への入力経路 (`hyoui input`) には escape を一切持たない。
 
 ## Context
 

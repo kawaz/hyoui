@@ -111,7 +111,7 @@ echo "started: $SESS"
 # session 一覧 (session 名 と socket path)
 hyoui list
 
-# 既存 session に attach (= 入出力を中継、Ctrl-A D で detach)
+# 既存 session に attach (= 入出力を中継、Ctrl+Z で detach)
 hyoui attach "$SESS"
 
 # read-only で覗き見
@@ -228,10 +228,13 @@ namespace 内から別 namespace で起動したい場合は `--namespace=<別ns
 詳細仕様は [`docs/DESIGN.md`](./docs/DESIGN.md) と
 [`docs/decisions/INDEX.md`](./docs/decisions/INDEX.md) を参照。
 
-### Detach key
+### Ctrl+Z ガード
 
-attach 中の `Ctrl-A D` でクライアントだけ detach（screen 互換、子は生き続ける）。
-`Ctrl-A Ctrl-A` で literal Ctrl-A を子に送る。
+attach は「走り続けている子を覗く窓」なので、窓の操作で子は止まらない。
+attach 中の **Ctrl+Z 単発**でクライアントだけ detach（子は走り続ける）。
+子に Ctrl+Z を届けたいときは **2 連打**する（= 2 発ごとに子へ 1 発、余った 1 発が
+detach を起こす）。挙動は `~/.config/hyoui/config.toml` の `[attach]` セクション
+（`ctrlz_guard` / `ctrlz_guard_delay`）で変更できる。
 
 ## 既存ツールとの違い
 

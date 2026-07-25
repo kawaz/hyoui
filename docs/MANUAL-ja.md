@@ -40,7 +40,7 @@ hyoui run --detached -- claude
 # 端末 B: list で確認 → attach
 hyoui list
 hyoui attach run-<pid>-<rand>
-# detach は Ctrl-A D
+# detach は Ctrl+Z 単発
 ```
 
 ### 2. read-only で観察する

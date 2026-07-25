@@ -69,8 +69,16 @@ shell 起動で、shell が job control を肩代わりするため。逆に言�
 - 理由: ユーザ / 端末起因の stop (SIGTSTP / SIGSTOP) は **意図的な操作**であり、それを勝手に
   起こすのは介入である (DR-0005 透過原則に反する)。detached で子が stop したままでも、外側 API
   (`hyoui kill --signal=CONT` 等) で起こせるため、「**誰も起こせない**」状況は構造的に存在しない。
-- `SessionChildStoppedNotify` による leader への follow 通知は**維持**する (= attach client が
-  `raise(SIGSTOP)` して外側 shell に suspend を伝播する DR-0015 §2.2 の既存設計)。
+- `SessionChildStoppedNotify` は**全 rw client** (= `Rw` / `RwNoLeader`、cap `child-state-v1`
+  保持者) に broadcast する。ro client は「見に来ただけ」なので通知対象外。旧実装は
+  leader 1 client にのみ通知していたが、非 leader rw client が child stop を検知できず
+  画面固着する bug (2026-07-24 実測確定、docs/issue/2026-07-24-bug-tstp-intercept-followups.md
+  H3) を修正するため broadcast 化した。
+
+  > **📌 撤回注記 (2026-07-25、[[DR-0029]] §1 により)**: 「各 rw client が follow
+  > (`raise(SIGSTOP)`) して外側 shell に suspend を伝播する」(= DR-0015 §2.2) は撤回した。
+  > attach は覗き窓であり、子が止まっても client は止まらず attach を継続する。
+  > notify は follow の trigger ではなく「子が停止中」の画面通知に使う。
 - `OnChildSuspend::AutoResume` policy 自体は **opt-in 設定として残してよい** (= headless 用途等)。
   ただし **default は notify のみ** (= 勝手に起こさない) とする。
 - `list` / `status` で stopped 状態が見えることを要件とする (= 放置された stopped child の

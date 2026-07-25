@@ -1,6 +1,6 @@
 # DR-0026: attach UX 拡張 — Ctrl+Z 折衷 intercept + 再 attach 時 stopped child auto-resume
 
-- Status: Active
+- Status: **Superseded by DR-0029** (= 「単発 Ctrl+Z は子へ forward」の折衷が「attach は覗き窓であり client 操作で子を止めない」原則に反すると kawaz 裁定、2026-07-25)
 - Date: 2026-07-19
 - Related: DR-0005 (思想 — 透過原則の許容範囲を再検討), DR-0013 (screen state 正本 — 将来の overlay 枠組み参照先), DR-0017 (session anchor + suspend policy — 本 DR が UX 層で継承), DR-0019 (follow ハードコード / notify default — client 側の対称拡張), DR-0024 (config.toml 機構 — 本 DR が `[attach]` セクションで相乗り)
 - Origin: docs/QUESTIONS.md (2026-07-19 裁定完了、TSTP-Q0..Q3 + 2a)
