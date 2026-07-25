@@ -1,4 +1,4 @@
-//! DR-0026 §2: stopped child への再 attach auto-resume の CLI e2e。
+//! DR-0029 §5: stopped child への再 attach auto-resume の CLI e2e。
 //!
 //! mock daemon が handshake snapshot の `child_stopped` を制御し、attach process が
 //! 既存 `SessionChildResumeRequest` を送る条件を protocol frame 単位で検証する。

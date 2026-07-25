@@ -109,6 +109,18 @@ fn process_ctrlz_guard(
     DetachAction::Forward(forward)
 }
 
+/// 「子が停止中」を画面最下行に描く escape 列を組む (DR-0029 §1)。
+///
+/// `ESC 7` / `ESC 8` (= DECSC/DECRC) で cursor 位置を保存・復元し、間に最下行への移動 +
+/// 行消去 + 反転表示の 1 行を挟む。子の画面領域を一時的に上書きするだけで、daemon の
+/// screen state には何も書かない。
+fn child_stopped_notice(session_id: &str, rows: u16) -> String {
+    format!(
+        "\x1b7\x1b[{rows};1H\x1b[K\x1b[7m[hyoui] 子プロセスが停止中 — 再開: \
+         hyoui kill {session_id} --signal=CONT --no-terminate\x1b[m\x1b8"
+    )
+}
+
 /// 保留中の Ctrl+Z がある間だけ deadline まで poll を起こす timeout を返す。
 fn ctrlz_guard_poll_timeout(state: CtrlzGuardState, now: std::time::Instant) -> PollTimeout {
     let CtrlzGuardState::Pending { deadline } = state else {
@@ -553,19 +565,16 @@ impl ClientConnection {
     /// 反転表示で 1 行出し、cursor を戻す。子の画面領域を一時的に上書きするが、
     /// 子が resume して再描画すれば消える (= daemon の screen state は汚さない)。
     ///
-    /// 外側が tty でない、または端末サイズが取れない場合は何もしない。
-    fn draw_child_stopped_notice<W: Write>(&mut self, stdout: &mut W) {
+    /// 外側が tty でない、または端末サイズが取れない場合は何もしない。行数は外側端末の
+    /// fd から直接引く (= WINCH 配線 `winch_source` の有無に依存させない)。
+    fn draw_child_stopped_notice<W: Write>(&self, stdout: &mut W, rows: Option<u16>) {
         if !self.outer_tty_raw {
             return;
         }
-        let Some((_, rows)) = self.winch_source.as_mut().and_then(|s| (s.size_fn)()) else {
+        let Some(rows) = rows else {
             return;
         };
-        let session = self.response.session_id.clone();
-        let notice = format!(
-            "\x1b7\x1b[{rows};1H\x1b[K\x1b[7m[hyoui] 子プロセスが停止中 — 再開: \
-             hyoui kill {session} --signal=CONT --no-terminate\x1b[m\x1b8"
-        );
+        let notice = child_stopped_notice(&self.response.session_id, rows);
         let _ = stdout.write_all(notice.as_bytes());
         let _ = stdout.flush();
     }
@@ -744,7 +753,11 @@ impl ClientConnection {
                                     // client は止まらず attach を継続する。画面は子の出力が
                                     // 止まって固着するだけなので、それが「hyoui が壊れた」
                                     // ではなく「子が停止中」だと分かるよう最下行に 1 行出す。
-                                    self.draw_child_stopped_notice(stdout);
+                                    let rows = crate::sys::tty_size(stdin.as_fd())
+                                        .ok()
+                                        .flatten()
+                                        .map(|ws| ws.rows);
+                                    self.draw_child_stopped_notice(stdout, rows);
                                 }
                                 Ok(ControlMessage::LeaderNotify(n)) => {
                                     // Minor 4: leader 変更通知で自分の leader 状態を更新する。
@@ -1753,6 +1766,22 @@ mod tests {
             now,
         );
         assert_eq!(t, PollTimeout::from(1u16));
+    }
+
+    // ---- DR-0029 §1: 子 stopped の画面通知 ----
+
+    /// tty かつ行数が取れるときだけ、最下行に cursor 保存 → 上書き → 復元で 1 行出す。
+    #[test]
+    fn child_stopped_notice_draws_on_last_row() {
+        let s = child_stopped_notice("demo", 24);
+        assert!(s.starts_with("\x1b7"), "cursor 保存で始まる: {s:?}");
+        assert!(s.ends_with("\x1b8"), "cursor 復元で終わる: {s:?}");
+        assert!(s.contains("\x1b[24;1H"), "最下行へ移動する: {s:?}");
+        assert!(s.contains("子プロセスが停止中"), "停止中と伝える: {s:?}");
+        assert!(
+            s.contains("hyoui kill demo --signal=CONT --no-terminate"),
+            "session 名込みの復帰手順を案内する (= --no-terminate 必須): {s:?}"
+        );
     }
 
     // ---- OUTER_TTY_RESET (issue 2026-06-11 / 2026-07-24 H4) ----
