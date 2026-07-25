@@ -1,5 +1,5 @@
 ---
-title: "flaky: serve_ro_client_lock_acquire_rejected が suite 高負荷時に SessionExitNotify(143) を拾う"
+title: "flaky: serve_ro_client_lock_acquire_rejected / input_auto_lock_cli が高負荷時に落ちる"
 status: open
 category: bug
 created: 2026-07-25T00:00:00+09:00
@@ -56,6 +56,25 @@ test result: ok. 860 passed; 0 failed; ... finished in 2.88s
 = 30s 居座る daemon が他 test の session 終了タイミングを押し出し、当該 test の
 500ms 窓に `SessionExitNotify(143)` が滑り込む、という筋。**SIGTERM の送出元までは
 未特定**。
+
+## 併発する別 flaky: `input_auto_lock_cli` の deadline fail
+
+同じ高負荷環境 (= `load average 42`) で `crates/hyoui-cli/tests/input_auto_lock_cli.rs` の
+3 test (`single_input_succeeds_with_auto_lock` / `parallel_input_serialized_by_auto_lock` /
+`outer_token_inheritance_skips_auto_acquire`) が 5s / 15s / 30s の deadline で fail する。
+`outer_token_*` は既知 ([2026-07-04-bug-flaky-outer-token-e2e-deadline](./2026-07-04-bug-flaky-outer-token-e2e-deadline.md))
+だが、**同 binary の他 2 test も同様に落ちる**ことを確認した。
+
+DR-0029 の変更が原因でないことを、変更前 revision (`7c15f5a1`) の jj workspace を作って
+同一環境・交互実行で確認した:
+
+| コード | ok | fail |
+|---|---|---|
+| DR-0029 適用後 | 6 | 3 |
+| 変更前 (7c15f5a1) | 8 | 1 |
+
+**変更前でも落ちる** (= 本 flaky は DR-0029 起因ではない)。回数差は n=9 では有意でなく、
+load average 42 の環境ノイズと区別できない。
 
 ## 受け入れ条件
 
