@@ -15,6 +15,11 @@
 //!   で起動を拒否する (= 意図しない設定での起動は害)
 //! - unknown field は warn なしで無視 (= 前方互換性、`deny_unknown_fields` を
 //!   付けない)
+//!
+//! ## 実効設定の書き出し (= `hyoui config show`)
+//!
+//! 各 struct は `Serialize` も持ち、[`to_toml`] で実効値 (= default 込み) を
+//! TOML 文字列にできる。出力は同じ loader で読み直せる (= round-trip 可能)。
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -22,7 +27,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// hyoui 全体設定。
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Config {
     /// 子 PTY env scrub 設定 (= TOML の `[scrub_env]` セクション)。
     #[serde(default)]
@@ -45,7 +50,7 @@ pub struct Config {
 ///
 /// `hyoui run` が daemon に渡す既定値を持つ。CLI flag (`--on-child-suspend`) が
 /// あればそちらが優先する (= DR-0024 の flag 最小化方針、config は default 提供)。
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct SessionConfig {
     /// 子の stop を daemon が観測したら自動で `SIGCONT` を送る (= DR-0019 §3 の
     /// `--on-child-suspend=auto-resume` の既定値)。
@@ -60,7 +65,7 @@ pub struct SessionConfig {
 ///
 /// `hyoui web` subcommand が listen する host:port を持つ。CLI flag
 /// `--listen` があれば config を上書きする (= DR-0024 の flag 最小化方針)。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct WebConfig {
     /// listen する host:port (= default `127.0.0.1:43690` = 0xAAAA、DR-0027)。
     ///
@@ -71,7 +76,10 @@ pub struct WebConfig {
 
     /// 静的アセットの開発モード配信元 (= 指定時はローカル dir を都度読む、
     /// DR-0027 §4)。`None` (default) ならリリースビルドに埋め込まれた assets を返す。
-    #[serde(default)]
+    ///
+    /// TOML には「値なし」を表す形が無いため、`None` の時は serialize 時に
+    /// key ごと省略する (= `hyoui config show` の出力に現れない)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assets_dir: Option<std::path::PathBuf>,
 }
 
@@ -89,7 +97,7 @@ impl Default for WebConfig {
 }
 
 /// attach client UX 設定 (= TOML の `[attach]` 配下、DR-0029 §3)。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct AttachConfig {
     /// tty stdin 経路の Ctrl+Z ガードを有効にする。
     ///
@@ -106,7 +114,8 @@ pub struct AttachConfig {
     /// する (= 子には一切届かなくなる)。
     #[serde(
         default = "default_ctrlz_guard_delay",
-        deserialize_with = "deserialize_duration"
+        deserialize_with = "deserialize_duration",
+        serialize_with = "serialize_duration"
     )]
     pub ctrlz_guard_delay: std::time::Duration,
 
@@ -125,7 +134,7 @@ pub struct AttachConfig {
 }
 
 /// env scrub 設定 (= TOML の `[scrub_env]` 配下、DR-0024 §3)。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct ScrubEnvConfig {
     /// env scrub 全体の on/off (= CLI `--no-scrub-env` と同等)。
     ///
@@ -143,7 +152,7 @@ pub struct ScrubEnvConfig {
 }
 
 /// target 別 scrub 設定 (= TOML の `[scrub_env.targets.<name>]`、DR-0024 §3)。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct TargetConfig {
     /// `true` で builtin kill_glob / keep_glob を user 設定と concat する。
     ///
@@ -214,6 +223,17 @@ where
             ))
         }),
     }
+}
+
+/// duration 設定値を serialize する (= [`deserialize_duration`] が読み直せる形)。
+///
+/// 常に `"<ms>ms"` の文字列で出す (= 単位省略のミリ秒整数と違い、読み手が
+/// 単位を推測しなくてよい)。
+fn serialize_duration<S>(d: &std::time::Duration, se: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    se.serialize_str(&format!("{}ms", d.as_millis()))
 }
 
 /// duration 文字列 (`"500ms"` 等) を [`std::time::Duration`] にする pure 関数。
@@ -354,6 +374,17 @@ pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
             source: e,
         }),
     }
+}
+
+/// 実効設定を TOML 文字列にする (= `hyoui config show` の本体)。
+///
+/// 未設定項目も default 値込みで出る (= 差分ではなく「今どう動いているか」)。
+/// 出力は [`parse_str`] で読み直せる (= round-trip 可能)。
+///
+/// serialize が失敗するのは serde 実装側の不整合だけなので、失敗時は Err を
+/// そのまま返して caller に判断させる。
+pub fn to_toml(config: &Config) -> Result<String, toml::ser::Error> {
+    toml::to_string(config)
 }
 
 /// TOML 文字列から Config を直接 deserialize する (= test 用、エラー時の path 付帯のため `path` を取る)。
@@ -630,6 +661,79 @@ kill_glob = ["MYTOOL_SECRET"]
     // path 解決ロジックは pure 関数 `resolve_path_from(xdg, home)` に切り出して
     // env mutation なしで test する (= process global env を弄ると他 test と衝突 +
     // sys/* 外で unsafe を使うことになる)。
+    #[test]
+    fn to_toml_default_round_trips() {
+        let c = Config::default();
+        let s = to_toml(&c).unwrap();
+        let back = parse_str(&s, &dummy_path()).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn to_toml_custom_round_trips() {
+        let s = r#"
+[scrub_env]
+enabled = false
+
+[scrub_env.targets.claude]
+inherit_builtin = false
+kill_glob = ["FOO_*"]
+keep_glob = ["BAR"]
+
+[attach]
+ctrlz_guard = false
+ctrlz_guard_delay = "1.5s"
+
+[session]
+auto_resume = true
+
+[web]
+listen = "0.0.0.0:9999"
+assets_dir = "/tmp/assets"
+"#;
+        let c = parse_str(s, &dummy_path()).unwrap();
+        let rendered = to_toml(&c).unwrap();
+        let back = parse_str(&rendered, &dummy_path()).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn to_toml_emits_every_default_key() {
+        // 「差分ではなく実効値」= 未設定項目も default 込みで出る。
+        let s = to_toml(&Config::default()).unwrap();
+        for key in [
+            "[scrub_env]",
+            "enabled",
+            "[attach]",
+            "ctrlz_guard",
+            "ctrlz_guard_delay",
+            "ctrlz_guard_overlay",
+            "resume_on_reattach",
+            "[session]",
+            "auto_resume",
+            "[web]",
+            "listen",
+        ] {
+            assert!(s.contains(key), "to_toml output missing {key}:\n{s}");
+        }
+    }
+
+    #[test]
+    fn to_toml_duration_is_millisecond_string() {
+        let s = to_toml(&Config::default()).unwrap();
+        assert!(
+            s.contains("ctrlz_guard_delay = \"500ms\""),
+            "unexpected duration rendering:\n{s}"
+        );
+    }
+
+    #[test]
+    fn to_toml_omits_unset_assets_dir() {
+        // TOML に「値なし」は書けないので None は key ごと省略する。
+        let s = to_toml(&Config::default()).unwrap();
+        assert!(!s.contains("assets_dir"), "unexpected assets_dir:\n{s}");
+    }
+
     #[test]
     fn resolve_path_from_uses_xdg_when_present() {
         let p = resolve_path_from(Some(OsStr::new("/custom/xdg")), None).unwrap();

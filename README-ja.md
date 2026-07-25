@@ -219,6 +219,7 @@ namespace 内から別 namespace で起動したい場合は `--namespace=<別ns
 | `hyoui detach [session]` | 全 attach client を引き剥がす (daemon / 子は継続) |
 | `hyoui record start\|stop\|list <session>` | tty I/O timeline を永続録画 (= jsonl / raw)。**⚠ stdin redaction は未配線** |
 | `hyoui tail <session>` | raw bytes stream (= log / grep / asciinema 前段) |
+| `hyoui config path\|show` | 設定ファイルのパス / 実効設定 (TOML) を表示 |
 
 > **self-session (DR-0020)**: `hyoui run -- cmd` 配下の子プロセスには `HYOUI_SESSION_ID`
 > が常時注入される。session を取る subcommand (status / set / wait / detach 等) は

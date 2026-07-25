@@ -139,6 +139,12 @@ pub enum HelpTopic {
     RecordStop,
     /// Help for the `record list` subcommand (= DR-0016 §2)。
     RecordList,
+    /// Help for the `config` parent subcommand (= 子: `path` / `show`)。
+    Config,
+    /// Help for the `config path` subcommand (= 設定ファイルの解決パス表示)。
+    ConfigPath,
+    /// Help for the `config show` subcommand (= 実効設定の TOML 出力)。
+    ConfigShow,
     /// Help for the `web` subcommand (= DR-0027 Phase 1、HTTP gateway 起動)。
     Web,
     /// Help for the `upgrade` subcommand (= DR-0028 §2 Phase 3、graceful self-exec)。
@@ -907,6 +913,20 @@ pub enum RecordCommand {
     List(RecordListConfig),
 }
 
+/// `config` 親 subcommand の子 dispatch (= DR-0024 の config ファイルを見る道具)。
+///
+/// どちらも session / daemon に接続しない (= 純粋にローカル設定の解決結果を出す)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConfigCommand {
+    /// `config path` — 解決される config ファイルのパスを stdout に 1 行出す。
+    ///
+    /// ファイルが存在しなくてもパスは出す (= 「どこに作ればよいか」を知る用途)。
+    Path,
+    /// `config show` — 実効設定 (= default 込み) を TOML で stdout に出す。
+    Show,
+}
+
 /// Result of parsing argv (excluding argv[0]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -964,6 +984,8 @@ pub enum Command {
     /// 各 subcommand の executor は本 commit (Phase 7) では protocol message を
     /// 構築・送信できる構造のみ、daemon 側 hook 配線は Phase 4 で行う。
     Record(RecordCommand),
+    /// `config` 親 subcommand (= 子: `path` / `show`、DR-0024 の config ファイル閲覧)。
+    Config(ConfigCommand),
     /// `web <listen>` — HTTP gateway (= DR-0027 Phase 1)。
     Web(WebConfig),
     /// `upgrade [session]` — daemon graceful self-exec upgrade (DR-0028 §2 Phase 3)。
@@ -1023,6 +1045,7 @@ pub fn parse_args(args: &[String]) -> Command {
         "unlock" => parse_unlock(rest),
         "record" => parse_record(rest),
         "detach" => parse_detach(rest),
+        "config" => parse_config(rest),
         "web" => parse_web(rest),
         "upgrade" => parse_upgrade(rest),
         "completion" => parse_completion(rest),
@@ -2432,6 +2455,9 @@ pub fn usage(topic: &HelpTopic) -> String {
         HelpTopic::RecordStop => usage_record_stop(),
         HelpTopic::RecordList => usage_record_list(),
         HelpTopic::Completion => usage_completion(),
+        HelpTopic::Config => usage_config(),
+        HelpTopic::ConfigPath => usage_config_path(),
+        HelpTopic::ConfigShow => usage_config_show(),
         HelpTopic::Web => usage_web(),
         HelpTopic::Upgrade => usage_upgrade(),
     }
@@ -2466,6 +2492,73 @@ Options:
 The client sends `upgrade.request` and waits for `upgrade.ack`, then waits for
 the socket to close (= exec happened) and reconnects with backoff to verify the
 new daemon accepts commands. Cap `upgrade-v1` must be advertised by both sides.
+"
+    .to_string()
+}
+
+/// `hyoui config` 親 subcommand の usage。
+fn usage_config() -> String {
+    "\
+hyoui config <subcommand>
+
+Inspect the user config file (DR-0024). Both subcommands are local-only: they
+never connect to a daemon session.
+
+SUBCOMMANDS:
+  path        Print the config file path that hyoui resolves.
+  show        Print the effective configuration as TOML (defaults included).
+
+OPTIONS:
+  -h, --help  Show this help.
+
+The path is `$XDG_CONFIG_HOME/hyoui/config.toml`, or
+`$HOME/.config/hyoui/config.toml` when XDG_CONFIG_HOME is unset.
+"
+    .to_string()
+}
+
+/// `hyoui config path` subcommand の usage。
+fn usage_config_path() -> String {
+    "\
+hyoui config path
+
+Print the config file path that hyoui resolves, one line to stdout.
+
+The path is printed even when the file does not exist yet (= it tells you where
+to create it); in that case a note goes to stderr so that
+`$(hyoui config path)` stays usable in scripts.
+
+OPTIONS:
+  -h, --help  Show this help.
+
+Exit codes:
+  0  Path resolved (whether or not the file exists).
+  2  Neither $XDG_CONFIG_HOME nor $HOME is set, so no path can be resolved.
+"
+    .to_string()
+}
+
+/// `hyoui config show` subcommand の usage。
+fn usage_config_show() -> String {
+    "\
+hyoui config show
+
+Print the effective configuration as TOML to stdout.
+
+Every key is printed with its effective value, including keys the config file
+does not set (= this is the current behaviour, not a diff against defaults).
+With no config file the output is the full set of defaults. The output can be
+saved as a config file as-is (= it parses back to the same settings).
+
+Builtin env-scrub defaults (DR-0024 §4) are appended as TOML comments: they are
+applied per target when `inherit_builtin = true`, and are not config keys.
+
+OPTIONS:
+  -h, --help  Show this help.
+
+Exit codes:
+  0  Configuration printed.
+  2  The config file exists but could not be read or parsed.
 "
     .to_string()
 }
@@ -3701,6 +3794,52 @@ fn parse_record_list(args: &[String]) -> Command {
     }))
 }
 
+/// `hyoui config <path|show>` parser。
+///
+/// どちらの子も options を取らない (= 出力先 / 対象を選ぶ余地がない)。引数なしは
+/// help (= kawaz の CLI 設計方針: 引数なしは `--help` 相当)。
+fn parse_config(args: &[String]) -> Command {
+    if args.is_empty() {
+        return Command::Help {
+            topic: HelpTopic::Config,
+        };
+    }
+    let head = args[0].as_str();
+    let rest = &args[1..];
+    match head {
+        "--help" | "-h" => Command::Help {
+            topic: HelpTopic::Config,
+        },
+        "path" | "show" => {
+            let (topic, cmd) = if head == "path" {
+                (HelpTopic::ConfigPath, ConfigCommand::Path)
+            } else {
+                (HelpTopic::ConfigShow, ConfigCommand::Show)
+            };
+            // help flag はどの位置でも help を出す (= 他 subcommand と同じ流儀)。
+            if rest.iter().any(|a| a == "--help" || a == "-h") {
+                return Command::Help { topic };
+            }
+            match rest.first() {
+                Some(extra) => {
+                    Command::Error(format!("config {head}: unexpected argument: {extra}"))
+                }
+                None => Command::Config(cmd),
+            }
+        }
+        other if other.starts_with('-') => {
+            Command::Error(format!("config: unknown option: {other}"))
+        }
+        other => {
+            let base = format!("config: unknown subcommand `{other}` (supported: path, show)");
+            match suggest_closest(other, ["path", "show"]) {
+                Some(s) => Command::Error(format!("{base} (did you mean `config {s}`?)")),
+                None => Command::Error(base),
+            }
+        }
+    }
+}
+
 /// `hyoui web [--listen=<host:port>]` (= DR-0027 Phase 1)。
 fn parse_web(args: &[String]) -> Command {
     let mut listen: Option<String> = None;
@@ -3815,6 +3954,7 @@ fn usage_top(unknown: Option<&str>) -> String {
             unlock      Release a session lock (= `lock release` alias)\n    \
             detach      Detach all attached clients from a session (DR-0020)\n    \
             record      Record tty I/O timeline (DR-0016; start/stop/list)\n    \
+            config      Inspect the user config file (path/show)\n    \
             completion  Print a shell completion script (bash|zsh|fish)\n\
         \n\
         RESERVED (not yet implemented):\n    \
@@ -5624,6 +5764,7 @@ pub(crate) const TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
     "unlock",
     "record",
     "upgrade",
+    "config",
 ];
 
 // =============================================================================
@@ -5657,6 +5798,7 @@ pub const IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
     "detach",
     "record",
     "upgrade",
+    "config",
     "completion",
 ];
 
@@ -5675,6 +5817,9 @@ pub const LOCK_SUBCOMMANDS: &[&str] = &["acquire", "release"];
 
 /// `hyoui record` の子 subcommand 一覧 (= `parse_record` が dispatch する値)。
 pub const RECORD_SUBCOMMANDS: &[&str] = &["start", "stop", "list"];
+
+/// `hyoui config` の子 subcommand 一覧 (= `parse_config` が dispatch する値)。
+pub const CONFIG_SUBCOMMANDS: &[&str] = &["path", "show"];
 
 /// `hyoui screen snapshot --include` が受理する正規化済 component 名一覧。
 ///
@@ -9208,6 +9353,102 @@ mod tests {
         assert!(
             text.contains("input"),
             "top usage should list input subcommand"
+        );
+    }
+
+    // -------- `config` subcommand (= DR-0024 config ファイルの閲覧) --------
+
+    #[test]
+    fn parse_config_no_args_shows_help() {
+        // 引数なしは help (= cli-design-preferences の「引数なし実行時は --help」)。
+        match parse_args(&args(&["config"])) {
+            Command::Help {
+                topic: HelpTopic::Config,
+            } => {}
+            other => panic!("expected Help(Config), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_config_help_flag_shows_help() {
+        for flag in ["--help", "-h"] {
+            match parse_args(&args(&["config", flag])) {
+                Command::Help {
+                    topic: HelpTopic::Config,
+                } => {}
+                other => panic!("expected Help(Config) for {flag}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_config_path_and_show() {
+        assert_eq!(
+            parse_args(&args(&["config", "path"])),
+            Command::Config(ConfigCommand::Path)
+        );
+        assert_eq!(
+            parse_args(&args(&["config", "show"])),
+            Command::Config(ConfigCommand::Show)
+        );
+    }
+
+    #[test]
+    fn parse_config_child_help_flag_shows_child_help() {
+        match parse_args(&args(&["config", "path", "--help"])) {
+            Command::Help {
+                topic: HelpTopic::ConfigPath,
+            } => {}
+            other => panic!("expected Help(ConfigPath), got {other:?}"),
+        }
+        match parse_args(&args(&["config", "show", "-h"])) {
+            Command::Help {
+                topic: HelpTopic::ConfigShow,
+            } => {}
+            other => panic!("expected Help(ConfigShow), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_config_child_rejects_extra_arguments() {
+        // path / show は対象も出力先も選べない (= 引数を取らない)。
+        match parse_args(&args(&["config", "show", "--format=json"])) {
+            Command::Error(msg) => assert!(msg.contains("--format=json"), "unexpected: {msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        match parse_args(&args(&["config", "path", "demo"])) {
+            Command::Error(msg) => assert!(msg.contains("demo"), "unexpected: {msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_config_unknown_subcommand_suggests() {
+        match parse_args(&args(&["config", "shw"])) {
+            Command::Error(msg) => {
+                assert!(msg.contains("shw"), "unexpected: {msg}");
+                assert!(msg.contains("config show"), "no suggestion: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        match parse_args(&args(&["config", "--verbose"])) {
+            Command::Error(msg) => assert!(msg.contains("unknown option"), "unexpected: {msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_config_topics_render() {
+        assert!(usage(&HelpTopic::Config).contains("hyoui config <subcommand>"));
+        assert!(usage(&HelpTopic::ConfigPath).contains("hyoui config path"));
+        assert!(usage(&HelpTopic::ConfigShow).contains("hyoui config show"));
+    }
+
+    #[test]
+    fn usage_top_lists_config_subcommand() {
+        assert!(
+            usage(&HelpTopic::Top).contains("config"),
+            "top usage should list config subcommand"
         );
     }
 

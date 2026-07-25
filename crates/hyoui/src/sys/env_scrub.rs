@@ -25,6 +25,14 @@ use crate::sys::env::remove_var_at_startup;
 /// 等で意図的に子へ注入する env を保護する)。
 pub const PROTECTED_PREFIX: &str = "HYOUI_";
 
+/// builtin kill/keep default を持つ target 名一覧。
+///
+/// [`builtin_kill_defaults`] / [`builtin_keep_defaults`] が非空を返す target を
+/// 列挙する (= `hyoui config show` が builtin を注記として展開するための索引)。
+/// builtin を足すときは match arm と本定数を同時に更新する (= 対応は下の
+/// `builtin_targets_all_have_defaults` test で機械検証)。
+pub const BUILTIN_TARGETS: &[&str] = &["claude"];
+
 /// target ごとの組み込み default kill_glob patterns (DR-0024 §4)。
 ///
 /// 出典:
@@ -296,6 +304,18 @@ mod tests {
         assert!(d.contains(&"CLAUDE_CODE_SESSION_ID"));
         assert!(d.contains(&"AI_AGENT"));
         assert_eq!(d.len(), 9);
+    }
+
+    #[test]
+    fn builtin_targets_all_have_defaults() {
+        // BUILTIN_TARGETS は「builtin を持つ target の索引」。空を返す target が
+        // 混ざっていたら索引が腐っている。
+        for t in BUILTIN_TARGETS {
+            assert!(
+                !builtin_kill_defaults(t).is_empty() || !builtin_keep_defaults(t).is_empty(),
+                "BUILTIN_TARGETS lists `{t}` but it has no builtin defaults"
+            );
+        }
     }
 
     #[test]

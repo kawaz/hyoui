@@ -229,6 +229,7 @@ explicitly (e.g. `--namespace=default`).
 | `hyoui detach [session]` | Detach all attached clients (daemon and child keep running) |
 | `hyoui record start\|stop\|list <session>` | Persist the tty I/O timeline (jsonl / raw). **⚠ stdin redaction is not yet wired** |
 | `hyoui tail <session>` | Raw byte stream (logging / grep / asciinema preprocessing) |
+| `hyoui config path\|show` | Print the config file path, or the effective configuration as TOML |
 
 > **self-session (DR-0020)**: child processes under `hyoui run -- cmd` always get
 > `HYOUI_SESSION_ID` injected. Session-taking subcommands (status / set / wait /

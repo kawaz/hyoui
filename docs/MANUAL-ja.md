@@ -310,6 +310,17 @@ config パースエラー (= 不正 TOML / 型不一致) のときは hyoui の�
 (= 意図しない設定での起動は親 Internal Context 漏洩リスクがあるため)。一時的に
 迂回したい場合は `--no-scrub-env` を使う。
 
+どのファイルが読まれるか / 結局どう効いているかは以下で確認する:
+
+```bash
+hyoui config path   # 設定ファイルのパスを表示 (= 未作成でもパスは出る)
+hyoui config show   # 実効設定を TOML で表示 (= 未設定項目も default 込み)
+```
+
+`config show` は全 key を実効値で出すので、「何を書いたか」ではなく
+「今どう動いているか」が分かる。builtin の scrub default は config の key では
+ないので TOML コメントとして併記される。
+
 ## トラブルシューティング
 
 | 症状 | 対処 |

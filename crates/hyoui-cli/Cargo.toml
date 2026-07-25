@@ -36,6 +36,8 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `hyoui config show` の出力が valid TOML として読み直せることを e2e で検証する。
+toml = { workspace = true }
 # integration tests (tests/lock_cli.rs) で nix::sys::signal::kill を使う
 nix = { workspace = true }
 # DR-0014 マトリクス検証用 PTY harness (tests/common/pty.rs)。

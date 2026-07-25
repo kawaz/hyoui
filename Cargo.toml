@@ -45,7 +45,7 @@ version = "0.4"
 [workspace.dependencies.toml]
 version = "0.9"
 default-features = false
-features = ["parse", "serde"]
+features = ["parse", "display", "serde"]
 
 [profile.release]
 lto = "fat"

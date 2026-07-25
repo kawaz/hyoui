@@ -17,12 +17,12 @@ use std::os::fd::AsFd;
 use std::process::ExitCode;
 
 use hyoui::cli::{
-    AttachConfig, Command, HelpTopic, InputCommand, InputSpec, KillConfig, ListConfig, ListFormat,
-    LockAcquireConfig, LockCommand, LockMode, LockReleaseConfig, RecordCommand, RecordDirectionArg,
-    RecordFormatArg, RecordInputSecrecyArg, RecordListConfig, RecordListFormatArg,
-    RecordStartConfig, RecordStopConfig, ScreenCommand, ScreenDumpCliFormat, ScreenDumpCliLayer,
-    ScreenDumpConfig, ScreenSnapshotConfig, SnapshotCliComponent, StatusConfig, TailConfig,
-    WaitConfig, parse_args, usage,
+    AttachConfig, Command, ConfigCommand, HelpTopic, InputCommand, InputSpec, KillConfig,
+    ListConfig, ListFormat, LockAcquireConfig, LockCommand, LockMode, LockReleaseConfig,
+    RecordCommand, RecordDirectionArg, RecordFormatArg, RecordInputSecrecyArg, RecordListConfig,
+    RecordListFormatArg, RecordStartConfig, RecordStopConfig, ScreenCommand, ScreenDumpCliFormat,
+    ScreenDumpCliLayer, ScreenDumpConfig, ScreenSnapshotConfig, SnapshotCliComponent, StatusConfig,
+    TailConfig, WaitConfig, parse_args, usage,
 };
 use hyoui::client::{AttachOptions, ClientConnection, RunOutcome};
 use hyoui::protocol::messages::{
@@ -399,6 +399,19 @@ fn main() -> ExitCode {
             _ => {
                 eprintln!(
                     "hyoui: record: unsupported record subcommand variant (binary/library version skew)"
+                );
+                ExitCode::from(2)
+            }
+        },
+
+        Command::Config(sub) => match sub {
+            ConfigCommand::Path => config_path_command(),
+            ConfigCommand::Show => config_show_command(),
+            // `ConfigCommand` is `#[non_exhaustive]`; future variants surface as
+            // a generic skew error so older binaries report clearly.
+            _ => {
+                eprintln!(
+                    "hyoui: config: unsupported config subcommand variant (binary/library version skew)"
                 );
                 ExitCode::from(2)
             }
@@ -2290,6 +2303,93 @@ fn web_command(cfg: hyoui::cli::WebConfig) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// `hyoui config path` — 解決される config ファイルのパスを stdout に 1 行出す。
+///
+/// ファイル不在でもパスは出す (= 「どこに作ればよいか」を知るのが主用途)。
+/// 不在の注記は stderr へ回し、`$(hyoui config path)` が script でそのまま
+/// 使える状態を保つ。
+fn config_path_command() -> ExitCode {
+    let Some(path) = hyoui::config::resolve_path() else {
+        eprintln!(
+            "hyoui: config path: cannot resolve a config path \
+             (neither $XDG_CONFIG_HOME nor $HOME is set)"
+        );
+        return ExitCode::from(2);
+    };
+    println!("{}", path.display());
+    if !path.exists() {
+        eprintln!(
+            "hyoui: config path: no config file there yet; \
+             create it to override defaults (`hyoui config show` prints them)"
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// `hyoui config show` — 実効設定 (= default 込み) を TOML で stdout に出す。
+///
+/// config が壊れている場合は exit 2 (= DR-0024 §7 の「不正 config で起動しない」
+/// 方針と同じ扱い。ここでは起動ではなく表示だが、黙って default を出すと
+/// 「今どう動いているか」を偽ることになる)。
+fn config_show_command() -> ExitCode {
+    let path = hyoui::config::resolve_path();
+    let config = match hyoui::config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hyoui: config show: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let body = match hyoui::config::to_toml(&config) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("hyoui: config show: failed to render config as TOML: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    match path {
+        Some(p) if p.exists() => println!("# effective configuration (source: {})", p.display()),
+        Some(p) => println!(
+            "# effective configuration (defaults; no file at {})",
+            p.display()
+        ),
+        None => println!("# effective configuration (defaults; no config path resolvable)"),
+    }
+    print!("{body}");
+    print!("{}", builtin_scrub_notes());
+    ExitCode::SUCCESS
+}
+
+/// builtin env scrub default を TOML コメントとして描画する (DR-0024 §4)。
+///
+/// builtin は config ファイルの key ではなく、`inherit_builtin = true` の target
+/// に対して hyoui が持つ既定値。設定として出すと「user が書いた」に見えるので
+/// コメントに落とす (= 出力全体が valid TOML のまま読み直せる)。
+fn builtin_scrub_notes() -> String {
+    use hyoui::sys::env_scrub::{BUILTIN_TARGETS, builtin_keep_defaults, builtin_kill_defaults};
+
+    let mut out = String::from(
+        "\n# builtin env scrub defaults (DR-0024 §4) — not config keys; applied to a\n\
+         # target when its `inherit_builtin` is true (the default).\n",
+    );
+    for target in BUILTIN_TARGETS {
+        for (label, patterns) in [
+            ("kill_glob", builtin_kill_defaults(target)),
+            ("keep_glob", builtin_keep_defaults(target)),
+        ] {
+            if patterns.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("#   [scrub_env.targets.{target}] {label}:\n"));
+            for p in patterns {
+                out.push_str(&format!("#     {p}\n"));
+            }
+        }
+    }
+    out
 }
 
 fn detach_command(cfg: hyoui::cli::DetachConfig) -> ExitCode {

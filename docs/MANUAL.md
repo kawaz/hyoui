@@ -321,6 +321,17 @@ If the config has a parse error (= invalid TOML / type mismatch) hyoui refuses
 to start (= booting with an unintended config risks leaking the parent's
 Internal Context). Use `--no-scrub-env` if you need to bypass it temporarily.
 
+To see which file hyoui resolves and what it currently ends up with:
+
+```bash
+hyoui config path   # print the config file path (even if it does not exist yet)
+hyoui config show   # print the effective configuration as TOML, defaults included
+```
+
+`config show` prints every key with its effective value, so it answers "how is
+hyoui behaving right now" rather than "what did I write". Builtin scrub
+defaults are appended as TOML comments (= they are not config keys).
+
 ## Troubleshooting
 
 | Symptom | What to try |

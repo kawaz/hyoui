@@ -58,7 +58,7 @@ _hyoui() {
     if [[ -z "$sub" ]]; then
         # Top-level: implemented subcommands + global flags.
         # (reserved subcommands send/tx are intentionally omitted.)
-        COMPREPLY=( $(compgen -W "run attach list kill status set tail wait screen input lock unlock detach record upgrade completion --help -h --version -V" -- "$cur") )
+        COMPREPLY=( $(compgen -W "run attach list kill status set tail wait screen input lock unlock detach record upgrade config completion --help -h --version -V" -- "$cur") )
         return 0
     fi
 
@@ -175,6 +175,18 @@ _hyoui() {
                 COMPREPLY=( $(compgen -W "--socket --namespace --index --format --help -h" -- "$cur") )
                 return 0 ;;
         esac
+        return 0
+    fi
+
+    # Detect `config` sub-subcommand (= `config path` / `config show`).
+    if [[ "$sub" == "config" ]]; then
+        local config_sub
+        config_sub="$(_hyoui_child_of config)"
+        if [[ -z "$config_sub" ]]; then
+            COMPREPLY=( $(compgen -W "path show --help -h" -- "$cur") )
+            return 0
+        fi
+        COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
         return 0
     fi
 
@@ -460,6 +472,9 @@ _hyoui() {
                 record)
                     _hyoui_record
                     ;;
+                config)
+                    _hyoui_config
+                    ;;
             esac
             ;;
     esac
@@ -483,6 +498,7 @@ _hyoui_subcommands() {
         'detach:Detach all attached clients from a session'
         'record:Record tty I/O timeline (start, stop, list)'
         'upgrade:Trigger daemon graceful self-exec upgrade (DR-0028)'
+        'config:Inspect the user config file (path, show)'
         'completion:Print a shell completion script'
     )
     _describe -t commands 'hyoui subcommand' subs
@@ -638,6 +654,28 @@ _hyoui_record_subcommands() {
     _describe -t commands 'hyoui record subcommand' subs
 }
 
+_hyoui_config() {
+    local context state state_descr line
+    typeset -A opt_args
+    _arguments -C \
+        '1: :_hyoui_config_subcommands' \
+        '*::arg:->config_args'
+    case $state in
+        config_args)
+            _arguments '(-h --help)'{-h,--help}'[Show help]'
+            ;;
+    esac
+}
+
+_hyoui_config_subcommands() {
+    local -a subs
+    subs=(
+        'path:Print the resolved config file path'
+        'show:Print the effective configuration as TOML'
+    )
+    _describe -t commands 'hyoui config subcommand' subs
+}
+
 _hyoui_input() {
     # `input` の positional は <session> <spec>...。spec は order-preserved。
     # spec prefix を候補に出し、`file:` だけ path 補完を効かせる。
@@ -712,7 +750,7 @@ function __hyoui_using_subcommand
     set -e cmd[1]
     for arg in $cmd
         switch $arg
-            case run attach list kill status set tail wait screen input lock unlock detach record upgrade completion
+            case run attach list kill status set tail wait screen input lock unlock detach record upgrade config completion
                 if test "$arg" = "$argv[1]"
                     return 0
                 end
@@ -727,7 +765,7 @@ function __hyoui_no_subcommand
     set -e cmd[1]
     for arg in $cmd
         switch $arg
-            case run attach list kill status set tail wait screen input lock unlock detach record upgrade completion
+            case run attach list kill status set tail wait screen input lock unlock detach record upgrade config completion
                 return 1
         end
     end
@@ -806,6 +844,7 @@ complete -c hyoui -n __hyoui_no_subcommand -f -a lock       -d 'Acquire / releas
 complete -c hyoui -n __hyoui_no_subcommand -f -a unlock     -d 'Release a session lock (= lock release alias)'
 complete -c hyoui -n __hyoui_no_subcommand -f -a detach     -d 'Detach all attached clients from a session'
 complete -c hyoui -n __hyoui_no_subcommand -f -a record     -d 'Record tty I/O timeline'
+complete -c hyoui -n __hyoui_no_subcommand -f -a config     -d 'Inspect the user config file (path, show)'
 complete -c hyoui -n __hyoui_no_subcommand -f -a completion -d 'Print a shell completion script'
 
 # Top-level global flags.
@@ -1005,6 +1044,18 @@ complete -c hyoui -n '__hyoui_record_using_sub list' -l index  -x    -d 'Session
 complete -c hyoui -n '__hyoui_record_using_sub list' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_record_using_sub list' -l format -x -a 'table jsonl' -d 'Output format'
 complete -c hyoui -n '__hyoui_record_using_sub list' -s h -l help    -d 'Show help and exit'
+
+# `hyoui config` 子 subcommand
+function __hyoui_config_using_sub
+    __hyoui_child_using config $argv[1]
+end
+function __hyoui_config_no_sub
+    __hyoui_child_none config
+end
+complete -c hyoui -n __hyoui_config_no_sub -f -a path -d 'Print the resolved config file path'
+complete -c hyoui -n __hyoui_config_no_sub -f -a show -d 'Print the effective configuration as TOML'
+complete -c hyoui -n '__hyoui_config_using_sub path' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_config_using_sub show' -s h -l help -d 'Show help and exit'
 "#
 }
 
@@ -1012,11 +1063,11 @@ complete -c hyoui -n '__hyoui_record_using_sub list' -s h -l help    -d 'Show he
 mod tests {
     use super::*;
     use hyoui::cli::{
-        IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS, LIST_FORMAT_VALUES, LOCK_SUBCOMMANDS,
-        RECORD_INPUT_SECRECY_VALUES, RECORD_LIST_FORMAT_VALUES, RECORD_START_FORMAT_VALUES,
-        RECORD_SUBCOMMANDS, RESERVED_TOP_LEVEL_SUBCOMMANDS, SCREEN_DUMP_FORMAT_VALUES,
-        SCREEN_DUMP_LAYER_VALUES, SCREEN_SNAPSHOT_FORMAT_VALUES, SCREEN_SUBCOMMANDS,
-        SNAPSHOT_INCLUDE_VALUES, STATUS_FORMAT_VALUES,
+        CONFIG_SUBCOMMANDS, IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS, LIST_FORMAT_VALUES,
+        LOCK_SUBCOMMANDS, RECORD_INPUT_SECRECY_VALUES, RECORD_LIST_FORMAT_VALUES,
+        RECORD_START_FORMAT_VALUES, RECORD_SUBCOMMANDS, RESERVED_TOP_LEVEL_SUBCOMMANDS,
+        SCREEN_DUMP_FORMAT_VALUES, SCREEN_DUMP_LAYER_VALUES, SCREEN_SNAPSHOT_FORMAT_VALUES,
+        SCREEN_SUBCOMMANDS, SNAPSHOT_INCLUDE_VALUES, STATUS_FORMAT_VALUES,
     };
 
     const ALL_SHELLS: [Shell; 3] = [Shell::Bash, Shell::Zsh, Shell::Fish];
@@ -1184,6 +1235,19 @@ mod tests {
                 assert!(
                     contains_token(&s, sub),
                     "shell {sh:?} missing screen `{sub}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn completion_all_shells_mention_config_subsubcommands() {
+        for sh in ALL_SHELLS {
+            let s = script(sh);
+            for sub in CONFIG_SUBCOMMANDS {
+                assert!(
+                    contains_token(&s, sub),
+                    "shell {sh:?} missing config `{sub}`"
                 );
             }
         }
