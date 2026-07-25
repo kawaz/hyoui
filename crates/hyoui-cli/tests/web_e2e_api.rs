@@ -427,7 +427,10 @@ fn e2e_resize_endpoint() {
     // 軽量検証にとどめる (= 依存 crate を増やしたくない)。
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut matched = false;
+    let mut attempts = 0usize;
+    let mut last = String::new();
     while Instant::now() < deadline {
+        attempts += 1;
         let out = Command::new(hyoui_bin())
             .args([
                 "screen",
@@ -452,11 +455,18 @@ fn e2e_resize_endpoint() {
             matched = true;
             break;
         }
+        last = format!(
+            "status={:?} stdout={:?} stderr={:?}",
+            out.status.code(),
+            text,
+            String::from_utf8_lossy(&out.stderr)
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(
         matched,
-        "resize 後に snapshot の window_size が cols=123 rows=37 に反映されない"
+        "resize 後に snapshot の window_size が cols=123 rows=37 に反映されない \
+         (attempts={attempts}, last={last})"
     );
 
     drop(panic_guard);

@@ -76,6 +76,29 @@ DR-0029 の変更が原因でないことを、変更前 revision (`7c15f5a1`) �
 **変更前でも落ちる** (= 本 flaky は DR-0029 起因ではない)。回数差は n=9 では有意でなく、
 load average 42 の環境ノイズと区別できない。
 
+## 根にある環境要因: PTY 枯渇 (2026-07-25 実測)
+
+同日の別 run で、lib test が `start: Errno(ENXIO)` で落ちるのを観測した
+(`serve_screen_dump_without_cap_is_rejected` / `serve_signal_unknown_name_rejected`、
+いずれも helper `spawn_serve_thread` の `Session::start(cfg).expect("start")`)。
+ENXIO は macOS の **PTY 割当失敗**。
+
+```
+$ ls /dev/ttys* | wc -l        # 123  (macOS の legacy pty は 128 が上限)
+$ lsof -n | grep -c /dev/ttys  # 317  (= 1 pty あたり複数 fd)
+$ uptime                       # load average: 46.08 ...
+```
+
+= 開発機に常駐している長寿命 hyoui session + 端末 + test suite の並列 daemon が
+PTY を食い合っており、**test 側の問題ではなく資源枯渇**で落ちている run が混ざる。
+本 issue の 2 系統も、同じ資源圧の下で顕在化している可能性が高い。
+
+対処案 (どれも未着手):
+- test 実行時の並列度を絞る (= `--test-threads` 制限、あるいは PTY を使う test に
+  serial marker)
+- PTY を使う test の後始末を強化して滞留を減らす
+- CI と開発機で PTY 上限 (`kern.tty.ptmx_max` 等) を確認・記録する
+
 ## 受け入れ条件
 
 - [ ] `connect_token_mismatch_returns_specific_hint` の `/bin/sleep 30` を短命な子に

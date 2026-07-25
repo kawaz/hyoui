@@ -533,7 +533,25 @@ fn resize_blocking(socket_path: &std::path::Path, cols: u16, rows: u16) -> Resul
         rows,
     }))
     .map_err(|e| format!("send resize: {e}"))?;
-    Ok(())
+    // `Resize` は ack を持たない片道 message なので、送信直後に connection を畳むと
+    // 「daemon が frame を読む前に client が消える」race で **無言で捨てられる**
+    // (= HTTP は 204 を返すのに resize が効かない)。frame は FIFO で処理されるため、
+    // 直後に `StatusQuery` を 1 往復させれば「Resize が処理済み」を確認できる。
+    // 応答を待つのは高々 1 RTT (= 同一ホストの unix socket)。
+    conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|e| format!("set read timeout: {e}"))?;
+    conn.send_control(&ControlMessage::StatusQuery(
+        hyoui::protocol::messages::StatusQuery {},
+    ))
+    .map_err(|e| format!("send status query: {e}"))?;
+    loop {
+        match conn.recv_control(None) {
+            Ok(ControlMessage::StatusResponse(_)) => return Ok(()),
+            // 他 client 由来の broadcast (= leader.notify / mode.change 等) は読み飛ばす。
+            Ok(_) => continue,
+            Err(e) => return Err(format!("await resize completion: {e}")),
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
