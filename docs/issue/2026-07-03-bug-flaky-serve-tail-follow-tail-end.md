@@ -313,6 +313,70 @@ drain budget を 100ms → **2000ms** に上げても解決しない (8 回中 1
 3.0s → 4.9s に伸びるので **100ms のまま据え置いた**。
 = 第 2 の原因は「drain 時間が足りない」類ではない。
 
+### ee43651b は回帰の原因ではない (2026-07-27、高負荷 A/B で確定)
+
+`cargo test -p hyoui-cli` の `child_inherits_hyoui_session_id_env` が ee43651b で
+決定的に回帰した、という二分探索の報告があったが、**A/B を取り直したところ
+ee43651b は無罪**だった。
+
+まず通常負荷 (load ~20〜40) では ee43651b 込みのツリーで **34/34 green** で、
+一度も再現しない。再現には人工負荷が要る。CPU burner 40 本で load を 118 まで
+上げると、同じツリーで決定的に再現した:
+
+| revision | 高負荷時の結果 |
+|---|---|
+| HEAD (= ee43651b と code 完全一致) | **6 fail / 12** |
+| 4ed57674 (= ee43651b の直前) | **5 fail / 12** |
+
+`session.rs` を親 revision の内容に差し替えて再ビルドし、同一負荷下で 12 回ずつ
+回した結果 (作業後ツリーは復元済み)。**親でも同率で落ちる** ため、
+「ee43651b が回帰を入れた」は成立しない。二分探索時の
+「親は load 120 でも 0.98s で通った」という対照観測は、負荷のかかり方が
+その 1 回で偶々軽かった (= サンプル 1) と見るのが妥当。
+
+失敗の様式は毎回同一で、client には attach ヒント行 107 bytes だけが届き、
+子の出力が 1 byte も来ないまま 10s timeout:
+
+```
+wait_for("MARK=") timed out after 10s; output so far (107 bytes):
+"[hyoui] detach: Ctrl+Z  |  子へ Ctrl+Z: 2 連打  |  peek (read-only): hyoui attach <session> --mode=ro\r\n"
+```
+
+#### drain 窓が原因でないことの機構的裏付け
+
+疑われていた「drain 窓中に master を poll から外すので子出力が止まる」は、
+本 test では原理的に起きない:
+
+- 本 test の子は `echo MARK=...; sleep 30` で 30 秒生きる。`deferred_exit` が
+  立つのは `poll_with_transition` が `ChildState::Exited` を返した時だけで、
+  これは `waitpid` が実際に reap した場合に限る (`daemon/pty.rs:122-172`。
+  `StillAlive` も `Err` も `Alive`/`Stopped` を返すので、生きている子で
+  誤発火する経路が無い)。EIO 側の分岐も同じ `poll_with_transition` を通る
+- `poll_master = deferred_exit.is_none()` なので、子が生きている限り master は
+  常に poll 対象に載る
+
+#### 第 2 の原因と同根の可能性が高い
+
+失敗区間は **handshake 成立 (= ヒント行が出た) から最初の raw_data 受信まで**で、
+これは「次の調査方針」3 に書かれている `serve_screen_dump_*` /
+`serve_attach_redraw_*` の `read_until_contains: timed out` と同じ区間・同じ様式。
+= 第 2 の原因の症状群に本 test も含まれると見るのが自然。
+
+ただし本 test は **既存 2 仮説のどちらでも説明できない**ので、仮説側を
+狭める材料になる:
+
+- 「同一プロセス内で daemon を多数並走」説 → 本 test は 1 プロセス 1 daemon
+  の別プロセス実行なので該当しない
+- self-pipe degraded 説 (= 方針 1) → `SIGCHLD_SELFPIPE_LOCK` は
+  `static Mutex` (`session.rs:176`) で **プロセス内でしか効かない**。
+  別プロセスの daemon は常に self-pipe を取れるので degraded に落ちない。
+  加えて degraded 経路の差は検出 latency 500ms であって、10s timeout の
+  説明にならない
+
+= 残るのは「handshake 成立後〜初回 raw_data の区間で、高負荷時に子出力が
+client へ配送されない (もしくは子が exec まで到達していない)」という、
+より下層の何か。次はこの区間を daemon 側 trace で分解する。
+
 ### 次の調査方針 (更新)
 
 1. **最有力候補の裏取りから始める**: `SIGCHLD_SELFPIPE_LOCK` を取れなかった
@@ -329,6 +393,11 @@ drain budget を 100ms → **2000ms** に上げても解決しない (8 回中 1
 3. 子が長命な test 群 (`serve_screen_dump_*` / `serve_attach_redraw_*`) の
    失敗は `read_until_contains` timeout = **handshake → 最初の raw_data 受信**
    の区間で起きている。1 が外れたらこの区間の取りこぼし窓を疑う
+4. **本命に格上げ (2026-07-27)**: 上記 3 の区間を `child_inherits_hyoui_session_id_env`
+   で調べるのが最も速い。この test は CPU burner で load 100 超にすれば
+   **単独実行 + 別プロセスで 50% 再現**し、lib suite の並走も多数 daemon も
+   要らない (= 変数が最小)。1 / 「多数並走」説はどちらもこの test を
+   説明できないことが確定しているので、切り分け済みの土俵で trace できる
 
 ## 受け入れ条件
 
@@ -338,7 +407,10 @@ drain budget を 100ms → **2000ms** に上げても解決しない (8 回中 1
 - [x] product バグをもう 1 つ特定・修正 (= 子 exit 検出が client frame 処理を
       追い越して tail.request を捨てる race。**決定的再現あり**、regression test 追加)
 - [ ] **残る要因の特定** (= 上記 2 つの修正後も Linux suite 9/15、macOS
-      `daemon::session` 4/20 で失敗。単独実行は 30/30 green なので
-      「daemon 多数並走時の global state 共有」が最有力。self-pipe 取得の
-      成否 trace から着手する)
+      `daemon::session` 4/20 で失敗。**2026-07-27 で仮説が 2 つとも否定された**:
+      `child_inherits_hyoui_session_id_env` は別プロセス単独実行でも高負荷なら
+      50% 落ちるため「多数並走」でも「self-pipe degraded」でも説明できない。
+      handshake → 初回 raw_data 区間の daemon 側 trace が次の一手)
+- [x] ee43651b が回帰原因ではないことを確認 (= 高負荷 A/B で親 5/12 vs
+      HEAD 6/12、有意差なし)
 - [ ] CI 並列実行で安定して pass する (= 修正 push 後の CI で確認)
