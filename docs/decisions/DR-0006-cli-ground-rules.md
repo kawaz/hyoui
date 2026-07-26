@@ -54,7 +54,7 @@ override: --socket /any/path.sock
 - **in-band escape は一切なし** (DR-0005 の透明性思想)
 - detach は **out-of-band のみ**: `hyoui detach <name> [--all | --others]`
 - prefix キーバインドは設定オプションすら存在させない
-- nest 起動 (hyoui の中で hyoui) は **許可 + 1 行 warn**、`$HYOUI_NAME`/`$HYOUI_SOCK` を子 env に injection
+- nest 起動 (hyoui の中で hyoui) は **許可**。検知用 env (`$HYOUI_NAME`/`$HYOUI_SOCK`) 案は不採用 (§12 参照)
 
 ### 5. 複数 attach: rw/ro 区別 + leader 内部メカニズム
 
@@ -553,9 +553,10 @@ raw bytes は alternate screen 切替 / resize 不一致 / cursor 移動再演�
 
 | env | 内容 |
 |---|---|
-| `HYOUI_NAME` | nest 起動検知用 (子に注入) |
-| `HYOUI_SOCK` | nest 起動時の親 daemon socket path (子に注入) |
 | `HYOUI_LOCK_TOKEN` | lock 取得 token (tx の子に注入、全自動操作系コマンドが自動継承) |
+
+`HYOUI_NAME` / `HYOUI_SOCK` (nest 起動検知用として本 DR 初版で定義) は不採用。
+nest 検知は実装されず、必要になった時に再設計する (2026-07-26 CLI surface 棚卸しで確定)。
 
 ## Rejected alternatives
 
