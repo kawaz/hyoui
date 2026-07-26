@@ -136,13 +136,55 @@ lib test は 1 プロセス内で複数 daemon を動かすため、**1 つの d
 共有する global state、あるいは anchor 化不可経路そのものの副作用) が疑わしいが、
 裏取りできていない。
 
+### 決定的な機構の特定 (2026-07-26、C 最小再現で syscall レベル確認)
+
+**`forkpty(3)` は child を親と同じ process group に置く** ことを実機で確認した。
+`forkpty` は内部で `login_tty` → `setsid` を呼ぶが、**呼び出し元が既に session leader
+だと `setsid` が EPERM で失敗**し、child は親の pgrp に残る。
+
+```c
+pid_t pid = forkpty(&m, 0,0,0);
+printf("parent pid=%d pgid=%d\n", getpid(), getpgrp());
+printf("child  pid=%d pgid=%d\n", pid, getpgid(pid));
+```
+```
+parent pid=20 pgid=20
+child  pid=21 pgid=20      ← child は親と同じ pgrp
+=> kill(-child_pid) が自爆する
+```
+
+hyoui は `anchor 化不可` の時に `forkpty_then_exec_legacy` へ fallback する
+(= **失敗した CI ログには必ずこの warning が出ている**)。この経路の child は
+親 pgrp に居るため、`kill_pgrp` (= `kill(-pid)`) が **test プロセス自身と兄弟
+daemon を撃つ**。daemon 側の trace でも実際に発火を確認:
+
+```
+SELF_PGRP_AVOIDED child=287 sig=SIGCONT
+SELF_PGRP_AVOIDED child=516 sig=SIGTERM
+```
+
+(= `kill_pgrp` 修正で単体送信に落とした回数。修正前はこれが pgrp 送信だった)
+
+### 試して **失敗した** 修正案 (= 記録、再挑戦時の地雷)
+
+`forkpty_then_exec_legacy` の親子両側で `setpgid` を足して child を独立 pgrp に
+する案を実装したところ、**同 module 63 test 中ほぼ全部が落ちる大規模 regression**
+になった (8/8 で 28〜30 件失敗)。revert 済み。
+
+理由は未分析だが、legacy 経路は `forkpty` が `login_tty` で slave を controlling
+tty にする前提で組まれており、そこへ pgrp を動かすと foreground pgrp と
+controlling tty の対応が壊れて子への入出力が成立しなくなる、というのが有力な筋
+(= `tcsetpgrp` を伴わない `setpgid` 単独では不整合になる)。**修正するなら
+`tcsetpgrp` とセットで、legacy 経路全体の tty 設計を見直す必要がある**。
+
 ### 次の調査方針
 
-1. ノイズのない環境で A/B を取り直す (= 専有マシン or 他セッション停止時)
-2. `anchor 化不可` fallback (`forkpty_then_exec_legacy`) が controlling tty / pgrp に
-   与える副作用を精査する。全失敗ログにこの warning が出ている点が示唆的
-3. 失敗した test の socket が「いつ・誰に」閉じられたかを、daemon 側 fd の
-   close 時点まで追う (= 今回は kill_pgrp までしか追えていない)
+1. **本命**: test 側で `Session::start` を直接呼ぶのをやめ、`setsid` 済の状態で
+   anchor 経路に乗せる (= legacy fallback に落ちなければ pgrp 問題は原理的に消える)。
+   product の tty 設計に触らずに済むので安全side
+2. legacy 経路を直すなら `setpgid` + `tcsetpgrp` をセットで設計し直す
+   (= 上記「失敗した修正案」参照、単独 setpgid は不可)
+3. ノイズのない環境 (= 専有マシン) で A/B を取り直して有意差を確認する
 
 ## 受け入れ条件
 
