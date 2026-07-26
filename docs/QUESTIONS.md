@@ -12,4 +12,34 @@
 
 ---
 
-(現在、裁定待ちの質問はありません)
+## 👺RESUME-Q1: `hyoui run` の子が self-stop した時、attach client が起こしてよいか
+
+`notify_default_does_not_resume_self_stopped_child` (macOS Ignored job で 7/7 失敗、
+ローカルでも 6/6 再現) の真因が **DR-0019 と DR-0029 の規定衝突**だったため裁定を求めます。
+
+- **DR-0019 §3**: `on-child-suspend` の default は `notify` = 「daemon は勝手に起こさない」
+- **DR-0029 §5**: `[attach] resume_on_reattach = true` (default) で、rw attach 時に
+  stopped child へ resume 要求を送る
+- `hyoui run` は DR-0015 で「fork daemon + **attach client**」の合成なので、
+  **run した瞬間に attach 経路が発火して子を起こす**。daemon は notify を守っているが、
+  同居する client が起こすので、外から見た挙動は auto-resume と区別できない
+
+DR-0029 は自身を「DR-0019 の配置は不変、config default を足すだけ」と書いていますが、
+`run` 経路では **観測可能な挙動が変わっています** (= 自己申告と実態の齟齬)。
+
+選択肢:
+
+- **a (推奨): product を直す** — `run` が内部生成する attach では `resume_on_reattach` を
+  適用しない (= 明示的な `hyoui attach` でのみ resume する)。
+  根拠: DR-0019 の「勝手に起こさない」は子の self-stop (= アプリの意図的な停止、
+  `less` の SIGSTOP 等) を尊重する透過原則そのもので、`run` は「起動」であって
+  「復帰意思の表明」ではない。DR-0029 §5 の意図 (= 人間が再 attach した時の UX) とも
+  矛盾しない
+- b: test を現状に合わせる — DR-0019 の default が実質 auto-resume になったと認め、
+  test の期待値を反転する。**非推奨**: 透過原則 (DR-0005/0014) を CLI の都合で曲げる
+- c: `resume_on_reattach` の default を `false` にする。
+  影響範囲が a より広い (= 明示 attach の UX も変わる)
+
+参照: `crates/hyoui-cli/src/main.rs:820-823`、`crates/hyoui/src/config/mod.rs:190`、
+`docs/decisions/DR-0019-*.md` §3、`docs/decisions/DR-0029-*.md` §5、
+`crates/hyoui-cli/tests/jobcontrol_auto_resume.rs:77`
