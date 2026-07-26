@@ -99,10 +99,47 @@ PTY を食い合っており、**test 側の問題ではなく資源枯渇**で�
 - PTY を使う test の後始末を強化して滞留を減らす
 - CI と開発機で PTY 上限 (`kern.tty.ptmx_max` 等) を確認・記録する
 
+## CI 実データによる裏取り (2026-07-26)
+
+直近 12 run の blocking job `Test (os / stable)` ログから lib suite の所要時間と
+失敗の相関を集計した。**仮説どおり、失敗は 32s の回にしか起きていない**:
+
+| lib suite 所要 | 実行回数 | 失敗 |
+|---|---|---|
+| **32.0s** (= `/bin/sleep 30` を待った回) | 8 | **4 (50%)** |
+| 4.2〜4.8s | 6 | 0 |
+
+失敗内訳は `serve_tail_follow_receives_tail_end_on_child_exit` × 4 と
+`serve_ro_client_lock_acquire_rejected` × 1 (本 issue 起票時のローカル観測分を含む)。
+= 「32s 居座り daemon が他 test の時間依存 assert を圧迫する」構図が CI でも成立。
+
+## 原因と修正 (2026-07-26)
+
+`connect_token_mismatch_returns_specific_hint` の末尾コメントは
+「daemon thread は handshake 拒否で Err 終了」と書いていたが、**これが誤り**。
+handshake 拒否は session を畳まない (= 不正 token で daemon を殺せたら脆弱性)。
+そのため素の `daemon_handle.join()` が子 `/bin/sleep 30` の自然死を待って 30s block
+していた。
+
+修正: 正しい token (`secret-xyz`) で attach して `Kill{signal:SIGKILL, wait:true}` を
+送り、決定的に畳んでから join する (`crates/hyoui/src/client/attach.rs`)。
+
+実測 (macOS、`cargo test -p hyoui --lib` 5 連続):
+
+```
+test result: ok. 875 passed; ... finished in 2.89s
+test result: ok. 875 passed; ... finished in 2.91s
+test result: ok. 875 passed; ... finished in 2.86s
+test result: ok. 875 passed; ... finished in 2.88s
+test result: ok. 875 passed; ... finished in 2.88s
+```
+
+= 32s の bimodal が消え、常に ~2.9s。
+
 ## 受け入れ条件
 
-- [ ] `connect_token_mismatch_returns_specific_hint` の `/bin/sleep 30` を短命な子に
-      置き換える (= 30s 待ちの必然性がないなら削る)。suite 全体の所要が安定するか確認
+- [x] `connect_token_mismatch_returns_specific_hint` の `/bin/sleep 30` 待ちを解消する。
+      suite 全体の所要が安定するか確認 (= 32s → 常時 2.9s)
 - [ ] 上記でも再現するなら、`serve_ro_client_lock_acquire_rejected` が受け取る
       `SessionExitNotify` の発生源 (= 誰が SIGTERM を送っているか) を特定する
 - [ ] 「特定 message が来ないこと」を read timeout で確認する test 群を洗い出し、

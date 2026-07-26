@@ -4,7 +4,8 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
-| 2026-07-25 | bug | open | [daemon-drops-pending-frames-on-client-close](./2026-07-25-bug-daemon-drops-pending-frames-on-client-close.md) | 送信直後に切断した短命 client の control frame が daemon で無言に捨てられる (= web の resize が 204 なのに効かない形で observable、web 側は往復確認で回避済) |
+| 2026-07-26 | bug | open | [ignored-tests-job-permanently-red](./2026-07-26-bug-ignored-tests-job-permanently-red.md) | CI の ignored-tests job が continue-on-error で恒常 red を隠している (ubuntu は backpressure の 31s hang が 12/12、macOS は notify_default_* が 7/7 で固定失敗) |
+| 2026-07-25 | bug | open | [daemon-drops-pending-frames-on-client-close](./2026-07-25-bug-daemon-drops-pending-frames-on-client-close.md) | 送信直後に切断した短命 client の control frame が daemon で無言に捨てられる — **真因確定・修正済 (2026-07-26)**: WriterDead を disconnect 根拠にしていたため受信済み frame ごと client を破棄していた |
 | 2026-07-25 | bug | open | [flaky-serve-ro-lock-acquire-rejected](./2026-07-25-bug-flaky-serve-ro-lock-acquire-rejected.md) | 高負荷時の flaky 2 系統: `serve_ro_client_lock_acquire_rejected` (= 32s 回に SessionExitNotify(143) を拾う、元凶は `/bin/sleep 30` を待つ token test) と `input_auto_lock_cli` の deadline fail (= 変更前 revision でも再現、DR-0029 起因でないことを確認済)。根に PTY 枯渇 (123/128 使用、`start: Errno(ENXIO)`) |
 | 2026-07-25 | request | open | [request-attach-overlay-progress](./2026-07-25-request-attach-overlay-progress.md) | attach 画面最下行に detach 遅延の progress overlay (DR-0029 §5、`ctrlz_guard_overlay` は現在 no-op) |
 | 2026-07-21 | request | open | [daemon-graceful-upgrade-self-exec](./2026-07-21-daemon-graceful-upgrade-self-exec.md) | daemon の graceful upgrade (self-exec で fd/pid 引き継ぎ、DR 起草必須) |
@@ -12,12 +13,12 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 | 2026-07-21 | request | idea | [screen-region-watch-api](./2026-07-21-screen-region-watch-api.md) | screen 仮想スクリーンの部分切り出し API + 監視エリアのマッチング検出インターフェース (DR-0025 母体、web ターミナル完了後着手) |
 | 2026-07-21 | design | open | [screen-overlay-general-mechanism](./2026-07-21-screen-overlay-general-mechanism.md) | screen state への動的仮想オーバーレイ一般機構 (DR-0013 延長、DR-0029 detach 案内 / web ターミナル ダイアログ用、web ターミナル完了後着手) |
 | 2026-07-20 | bug | open | [socket-dir-tmp-fallback-macos-cleanup](./2026-07-20-socket-dir-tmp-fallback-macos-cleanup.md) | socket dir が /tmp 固定 fallback のため macOS 定期掃除で daemon 生存中に socket file が消える |
-| 2026-07-04 | bug | open | [bug-flaky-outer-token-e2e-deadline](./2026-07-04-bug-flaky-outer-token-e2e-deadline.md) | outer_token_inheritance_skips_auto_acquire が単独実行でも稀に 30s deadline fail (macOS CI flaky と同一 test) |
+| 2026-07-04 | bug | open | [bug-flaky-outer-token-e2e-deadline](./2026-07-04-bug-flaky-outer-token-e2e-deadline.md) | outer_token_inheritance_skips_auto_acquire が 30s deadline fail — **真因確定 (2026-07-26)**: daemon の WriterDead 起因 frame 破棄。修正後 25 回連続 green |
 | 2026-07-04 | task | open | [dr0025-phase2b-raw-data-reducer](./2026-07-04-dr0025-phase2b-raw-data-reducer.md) | DR-0025 Phase 2-β — raw_data hot path の reducer→Effect→execute 化 |
-| 2026-07-03 | bug | open | [bug-flaky-serve-tail-follow-tail-end](./2026-07-03-bug-flaky-serve-tail-follow-tail-end.md) | serve_tail_follow_receives_tail_end_on_child_exit が ubuntu CI で flaky fail (並走 CI では pass) |
-| 2026-07-03 | bug | open | [bug-macos-ci-flaky-pty-tests](./2026-07-03-bug-macos-ci-flaky-pty-tests.md) | macos CI で PTY 系 e2e が flaky fail (outer_token_inheritance / child_inherits_session_id_env、main red の実原因) |
+| 2026-07-03 | bug | open | [bug-flaky-serve-tail-follow-tail-end](./2026-07-03-bug-flaky-serve-tail-follow-tail-end.md) | serve_tail_follow_receives_tail_end_on_child_exit の flaky — **軸特定 (2026-07-26)**: lib suite が 32s になる回にのみ発生 (4/8)、32s の元凶を除去済 |
+| 2026-07-03 | bug | open | [bug-macos-ci-flaky-pty-tests](./2026-07-03-bug-macos-ci-flaky-pty-tests.md) | PTY 系 e2e の flaky (main red の実原因、blocking failure の 57%) — **真因確定 (2026-07-26)**: macOS 固有ではなく daemon の WriterDead 起因 frame 破棄。修正済 |
 | 2026-07-03 | bug | open | [bug-main-unittest-hang-ubuntu-ci](./2026-07-03-bug-main-unittest-hang-ubuntu-ci.md) | hyoui-cli main.rs unit tests が ubuntu CI で hang (send_raw_bytes_partial_byte_race_regression / list_marks_stale_socket、flaky) |
-| 2026-06-22 | bug | blocked | [backpressure-writer-pump-drop-sequence-deadlock](./2026-06-22-backpressure-writer-pump-drop-sequence-deadlock.md) | serve_backpressure_disconnects_slow_client が CI で 30s deadline hang する (真因未観測・調査継続) |
+| 2026-06-22 | bug | blocked | [backpressure-writer-pump-drop-sequence-deadlock](./2026-06-22-backpressure-writer-pump-drop-sequence-deadlock.md) | serve_backpressure_disconnects_slow_client が CI で 30s deadline hang する (真因未観測・調査継続、ubuntu CI では 12/12 で恒常失敗 = [[2026-07-26-bug-ignored-tests-job-permanently-red]]) |
 | 2026-06-22 | bug | blocked | [wait-scrollback-snapshot-coverage](./2026-06-22-wait-scrollback-snapshot-coverage.md) | hyoui wait の StateSnapshotRequest が scrollback を含まず viewport 外の出力を見逃す (DR-0013 Phase B 未完) |
 | 2026-05-28 | design | idea | [feature-cli-restructure-discussion](./2026-05-28-feature-cli-restructure-discussion.md) | CLI 設計大改修議論 (screen view 改名 / dump top-level 化 / screen write overlay / format 整理) |
 | 2026-06-16 | request | open | [feature-icanon-large-input-chunking](./2026-06-16-feature-icanon-large-input-chunking.md) | ICANON apps への大量 byte 送信時の chunk 化 helper / timeout 調整 |

@@ -54,15 +54,50 @@ window_size が変わらない、という形で observable だった。
 - 直前に別 connection の accept / close があると失敗率が上がる = daemon 側の
   scheduling 依存
 
-## 推定原因 (未確定)
+## 原因 (2026-07-26 確定、daemon serve_loop に計装を入れて直接観測)
 
-daemon は client ごとに writer thread を持ち、write 失敗 (= EPIPE) を検知した client を
-`overflow_ids` → `indices_to_drop` 経由で除去する。短命 client は control message を
-書いた直後に close するため、**daemon が reader 側でその frame を読む前に
-「writer が死んだ client」として drop される**経路があるとフレームが失われる。
-`crates/hyoui/src/daemon/session.rs` の serve_loop (client revents 処理 → 
-`frames_to_process` → `indices_to_drop` 適用) と `broadcast.rs` の writer thread 死活
-判定の順序を確認すること。
+**上記「推定原因」がそのまま正しかった。** `input_auto_lock_cli` の 30s hang
+(= [[2026-07-03-bug-macos-ci-flaky-pty-tests]] / [[2026-07-04-bug-flaky-outer-token-e2e-deadline]])
+が同一原因であることも判明し、そちらで再現させて観測した。
+
+serve_loop / accept / broadcast に一時トレースを入れ、失敗回の daemon 側イベントを取得:
+
+```
+[TR ...] handshake:promoted id=2 mode=Rw          ← 短命 client が client 化
+[TR ...] enqueue WRITER_DEAD id=2                 ← daemon→client の write が失敗
+[TR ...] TIMEOUT-branch overflow_id id=2
+[TR ...] TIMEOUT-branch client_drop id=2 idx=0    ← 受信済み frame を読まずに破棄
+[TR ...] poll:enter nclients=0 ...                ← 以降 client 0 のまま無限 poll
+```
+
+確定した機構:
+
+1. 短命 client が `connect` → `send_control(Kill)` → 即 `drop(conn)` する
+2. daemon は handshake 完了後、当該 client へ attach redraw / LeaderNotify を
+   enqueue しようとするが、peer は既に close 済なので writer thread が死んでいて
+   `EnqueueOutcome::WriterDead` になる
+3. `handle_enqueue_outcome` が **WriterDead を disconnect の根拠にして**
+   `overflow_ids` に push → 同一 iteration 内で `clients` から除去
+4. その client の **socket 受信バッファに残っている Kill frame は読まれずに消える**
+5. client が 0 になり、session を畳む契機が永久に来ない → 呼び出し側は deadline で fail
+
+`send_control` が `Ok` を返すのは「socket に bytes を書けた」だけで、daemon が
+処理したことを意味しない。そのため呼び出し側からは無言の欠落に見える。
+
+**負荷依存の理由**: 低負荷では daemon が client の close より先に Kill frame を
+読むため顕在化しない。高負荷 (= CI runner 3〜4 core) では close が先行する確率が上がる。
+
+## 修正 (2026-07-26)
+
+`EnqueueOutcome::WriterDead` を **disconnect の根拠にしない**ように変更した。
+
+- `crates/hyoui/src/daemon/broadcast.rs` `handle_enqueue_outcome`
+- `crates/hyoui/src/daemon/accept.rs` `send_attach_redraw`
+
+根拠: socket は全二重で、write 半分が死んでいることは「client が既に送ってきた
+frame」の有効性と無関係。正しい disconnect 点は reader 側の EOF であり、EOF 経路は
+`frames_to_process` で受信済み frame を全て処理した **後**に client を drop するため
+順序が保たれる。`Overflow` (= backpressure による意図的な切断) は従来どおり即 disconnect。
 
 ## 回避済みの箇所
 

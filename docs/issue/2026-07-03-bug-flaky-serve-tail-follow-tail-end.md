@@ -48,7 +48,27 @@ origin: Release run 28655240907 の ci gate fail 観測 (session a7761122)
 - panic 内容: `frame: Protocol(UnexpectedEof("size header"))`
 - suite: 806 passed; 1 failed; finished in 32.03s
 
+## 不安定さの軸を特定 (2026-07-26、CI 実データ集計)
+
+直近 12 run の blocking job ログから **lib suite の所要時間**と失敗の相関を取ったところ、
+きれいな bimodal で相関していた:
+
+| lib suite 所要 | 実行回数 | 失敗 |
+|---|---|---|
+| **32.0s** | 8 | **4 (50%)** |
+| 4.2〜4.8s | 6 | 0 |
+
+本 test の失敗 4 件は **すべて 32.0s の回**。前回観測 (v0.9.10) の
+`finished in 32.03s` も同じ。
+
+32s の正体は `client::attach::tests::connect_token_mismatch_returns_specific_hint` が
+子 `/bin/sleep 30` の自然死を 30s 待っていたこと (= 詳細と修正は
+[[2026-07-25-bug-flaky-serve-ro-lock-acquire-rejected]])。30s 居座る daemon が
+他 test の時間依存 assert を圧迫していた。
+
+修正後は lib suite が常時 ~2.9s になり (macOS 5 連続実測)、32s モード自体が消えた。
+
 ## 受け入れ条件
 
-- [ ] 不安定さの軸が観測データで特定されている
-- [ ] CI 並列実行で安定して pass する (または根拠付きで blocked_by DR-0025 Phase N)
+- [x] 不安定さの軸が観測データで特定されている (= lib suite が 32s になる回にのみ発生)
+- [ ] CI 並列実行で安定して pass する (= 修正 push 後の CI で確認)

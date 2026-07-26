@@ -40,11 +40,30 @@ daemon thread が 30s 内に終わらない。
 - Phase 1a 検証時 (reducer 化以前) にも workspace 並列で同 test の同様式 fail が
   観測されており、既知の「real-process e2e の負荷依存 deadline 超過」族と判定
 
-## 根治方向
+## 真因 (2026-07-26 確定)
 
-DR-0025 が予定する「test expectation を PTY echo 依存から daemon record event の
-順序 assert に変更」の族。個別対処より Phase 2-γ/Phase 8 の test 再編で吸収するのが
-合理的。
+**DR-0025 の test 再編を待つ必要はなかった。product 側の実バグだった。**
+
+daemon serve_loop に一時計装を入れて失敗回を直接観測した結果、真因は
+[[2026-07-25-bug-daemon-drops-pending-frames-on-client-close]] と同一と判明:
+
+test 末尾の `kill_daemon()` は `connect` → `send_control(Kill)` → 即 `drop(conn)`
+する短命 client。daemon は「writer thread が死んだ」ことを根拠にこの client を
+`clients` から即除去し、**socket 受信バッファに残った Kill frame を読まずに捨てる**。
+結果 session を畳む契機が消え、`join_with_deadline(daemon, 30s)` が deadline fail する。
+
+`send_control` が `Ok` を返すのは socket に書けただけなので、test 側からは
+「kill は成功したのに daemon が終わらない」に見えていた。
+
+負荷依存だったのは、低負荷では daemon が client の close より先に Kill frame を
+読めるため。修正内容は上記 issue を参照。
+
+## 検証 (macOS、`cargo test -p hyoui-cli --test input_auto_lock_cli`)
+
+| | 結果 |
+|---|---|
+| 修正前 | 15 回中 1 失敗 / 別ラウンドで 20 回中 1 失敗 (高負荷時は 1 回で 3 test 同時失敗も観測) |
+| 修正後 | **25 回連続 green** |
 
 ## 関連
 

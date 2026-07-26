@@ -69,7 +69,34 @@ fail した。同一 code の後続 run では pass しており flaky。
   並列 workspace test の CPU 資源競合による露出頻度上昇の可能性は残るが、
   実装側の意味論変更に起因する反証は得られていない
 
+## 真因 (2026-07-26 確定)
+
+daemon serve_loop への一時計装で直接観測し、
+[[2026-07-25-bug-daemon-drops-pending-frames-on-client-close]] と同一原因と確定した
+(= 「送信して即 close」した client の Kill frame を daemon が読まずに捨てる product バグ)。
+詳細と修正内容は当該 issue、検証は [[2026-07-04-bug-flaky-outer-token-e2e-deadline]] を参照。
+
+macOS 固有ではなく **ubuntu でも同頻度で発生**していた (下記 CI 集計)。
+`macos-latest` の runner 世代交代は無関係だった。
+
+## CI 実データ (2026-07-26、直近 12 run の blocking job `Test (os / stable)`)
+
+失敗テスト頻度 (= 21 件中):
+
+| テスト | 件数 |
+|---|---|
+| `single_input_succeeds_with_auto_lock` | 5 |
+| `outer_token_inheritance_skips_auto_acquire` | 4 |
+| `serve_tail_follow_receives_tail_end_on_child_exit` | 4 |
+| `parallel_input_serialized_by_auto_lock` | 3 |
+| `e2e_input_returns_409_while_external_client_holds_lock` | 2 |
+| `child_inherits_hyoui_session_id_env` / `child_exit_propagates_code` / `attach_emits_discovery_hint_with_actual_prefix` | 各 1 |
+
+= `input_auto_lock_cli` の 3 test で **12/21 (57%)**。本 issue の修正が最頻の
+blocking failure を潰す。`serve_tail_follow_*` (4 件) は
+[[2026-07-25-bug-flaky-serve-ro-lock-acquire-rejected]] の 32s 問題側で対処済。
+
 ## 受け入れ条件
 
-- [ ] 不安定さの軸が観測データで特定されている
-- [ ] 2 test が CI で安定して pass する (または根拠付きで blocked_by DR-0025 Phase N)
+- [x] 不安定さの軸が観測データで特定されている (= WriterDead 起因の frame 破棄、計装で直接観測)
+- [ ] 2 test が CI で安定して pass する (= 修正 push 後の CI で確認)
