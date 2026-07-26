@@ -853,6 +853,45 @@
     return false;
   }
 
+  // ---- Shift+Enter (kawaz 実機フィードバック 2026-07-26) ----
+  //
+  // xterm.js v5.3.0 の keymap は Enter で shiftKey を見ない
+  // (`case 13: o.key = e.altKey ? ESC+CR : CR`) ため、Shift+Enter でも素の CR
+  // が飛び、claude TUI ではメッセージが送信されてしまう。期待は「送信せず改行」。
+  //
+  // 何を送るのが正かは実測で確定させた。claude TUI (v2.1.220) を hyoui 配下で
+  // 起動して起動時の出力 bytes を観測すると、以下を有効化している:
+  //
+  //   ESC [ < u        kitty keyboard protocol を pop (継承状態のリセット)
+  //   ESC [ > 1 u      kitty keyboard protocol を push (flags=1 = disambiguate)
+  //   ESC [ > 4 ; 2 m  xterm modifyOtherKeys level 2
+  //
+  // その上で実際に bytes を送り込んで prompt の挙動を確認した (実測マトリクス):
+  //
+  //   0x0d (CR)          → メッセージ送信 (= 素の Enter)
+  //   0x0a (LF)          → 送信せず改行
+  //   ESC [ 1 3 ; 2 u    → 送信せず改行 (= kitty CSI-u の Shift+Enter)
+  //
+  // LF でも通るが、claude が kitty protocol を明示的に有効化している以上、
+  // Shift+Enter を表す正規の表現である CSI-u を送る。CSI-u なら「Shift 修飾付き
+  // Enter」という情報が保たれるので、修飾キーを区別するアプリに対しても正しい
+  // (LF は「改行文字」であって Shift+Enter ではない)。
+  //
+  // Design rationale: `attachCustomKeyEventHandler` は true/false しか返せず
+  // 送信 bytes を差し替えられないため、false を返して xterm.js の既定処理
+  // (CR 送信) を止めた上で、自前で CSI-u を WS へ流す。keydown だけを捕まえ、
+  // keypress / keyup は xterm.js 側で自然に無視される。
+  const SHIFT_ENTER_CSI_U = '\x1b[13;2u';
+  term.attachCustomKeyEventHandler((ev) => {
+    if (ev.type !== 'keydown') return true;
+    // 修飾は Shift のみ。Ctrl/Alt/Meta 併用は別のキーバインドなので触らない
+    // (= xterm.js の既定処理に委ねる)。
+    if (ev.key !== 'Enter' || !ev.shiftKey || ev.ctrlKey || ev.altKey || ev.metaKey) return true;
+    ev.preventDefault();
+    sendBytesToWs(SHIFT_ENTER_CSI_U);
+    return false; // xterm.js に CR を送らせない
+  });
+
   // xterm キー入力 → WS。onData は string (VT sequence 完成済み)、onBinary は
   // ISO-8859-1 として渡ってくる Uint8Array 相当 (mouse tracking 等)。
   term.onData((data) => {
