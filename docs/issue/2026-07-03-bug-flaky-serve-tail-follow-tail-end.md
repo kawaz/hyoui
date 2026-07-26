@@ -82,9 +82,67 @@ contention 自体でも落ちる。CI の相関データ (32s: 4/8 失敗、4.3s
 注: 観測に使った開発機は他セッション由来の常駐 hyoui 46 process + load 20〜40 という
 CI より遥かに過酷な条件。CI (= 専有 runner) で同率で落ちるとは限らない。
 
+## Linux での再現と切り分け (2026-07-26 第 2 弾)
+
+macOS では出ない (= 委譲元ローカルで 5 連続 green) が、**Docker で Linux を用意したら
+高頻度で再現**した。CI が ubuntu でだけ落ちる理由はこれ。
+
+再現環境: `docker run --cpus=4 ubuntu:24.04` + `taskset -c 0-3` (= runner 相当)。
+
+### 単独では落ちない、suite 全体でだけ落ちる
+
+| 実行単位 | 結果 |
+|---|---|
+| 当該 test 単独 × 10 | **10/10 green** |
+| `cargo test -p hyoui --lib` (全 878) | 高頻度で失敗 |
+
+失敗するのは本 test だけでなく、`serve_screen_dump_*` / `serve_propagates_child_exit_code`
+/ `serve_attach_redraw_*` / `serve_tail_request_*` / `serve_ro_client_lock_acquire_rejected`
+を含む **同族グループ**で、様式はすべて `UnexpectedEof("size header")` か
+`read_until_contains: timed out` (= 相手 socket が突然閉じる / 応答が来ない)。
+
+### 発見した product バグ (= 部分的原因、修正済み)
+
+`kill_pgrp` が `kill(-child_pid)` で pgrp 送信する際、**child が pgrp leader である前提を
+検証していなかった**。`setpgid` 失敗時 (= anchor 化不可経路、失敗ログに必ず出ている
+warning) は child の pgid が daemon 自身の pgid のままなので、自プロセスグループを撃つ。
+trace で直接観測:
+
+```
+kill_pgrp child=1140 sig=SIGTERM child_pgid=Some(Pid(10)) self_pgid=10 DANGER_SELF=true
+```
+
+lib test は 1 プロセス内で複数 daemon を動かすため、**1 つの daemon の finalize が test
+プロセス自身と兄弟 daemon を SIGTERM** し、無関係な test の socket が閉じる。これは
+`UnexpectedEof` の様式と完全に一致する。修正済み (= pgid 検証して単体送信にフォールバック)。
+
+### ただし「これで解決」ではない (= 未完)
+
+- DANGER_SELF の発火は **69 回中 1 回**で、失敗頻度に対して少なすぎる
+- 修正後も Linux suite は失敗する。修正前後の A/B (各 8 回) では **A(fix) 4 失敗 /
+  B(base) 1 失敗**と逆転しており、**有意差を示せていない**。ただし失敗が時間帯で
+  クラスタしており (A は r2-r5、B は r1)、観測に使った開発機が他セッションで
+  load 16〜20 だったため **環境ノイズと分離できていない**のが実情
+- `--test-threads=1` (直列) でも 3/6 で失敗するので、**単純な並列度の問題ではない**
+  (= 最初の 3/3 green は偶然だった。test-threads を 2/4/8/16 で振っても
+  8 だけ 2/3 pass という非単調な結果で、閾値として使えない)
+
+= **残る要因は未特定**。プロセス跨ぎでない何か (= 同一プロセス内の daemon 同士が
+共有する global state、あるいは anchor 化不可経路そのものの副作用) が疑わしいが、
+裏取りできていない。
+
+### 次の調査方針
+
+1. ノイズのない環境で A/B を取り直す (= 専有マシン or 他セッション停止時)
+2. `anchor 化不可` fallback (`forkpty_then_exec_legacy`) が controlling tty / pgrp に
+   与える副作用を精査する。全失敗ログにこの warning が出ている点が示唆的
+3. 失敗した test の socket が「いつ・誰に」閉じられたかを、daemon 側 fd の
+   close 時点まで追う (= 今回は kill_pgrp までしか追えていない)
+
 ## 受け入れ条件
 
 - [x] 不安定さの軸が **部分的に** 特定されている (= lib suite 32s が強い増悪要因)
-- [ ] 32s 除去後も残る contention 由来の失敗の真因特定 (= tail follow subscriber へ
-      TailEnd を送る経路と client drop の順序を疑う)
+- [x] Linux で再現環境を確保 (= Docker + cpus=4 + taskset、macOS では再現しない)
+- [x] product バグを 1 つ特定・修正 (= kill_pgrp の自プロセスグループ誤送信)
+- [ ] **残る要因の特定** (= kill_pgrp 修正後も再現。ノイズのない環境での A/B 再測が先)
 - [ ] CI 並列実行で安定して pass する (= 修正 push 後の CI で確認)
