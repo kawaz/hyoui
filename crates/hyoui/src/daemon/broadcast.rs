@@ -197,7 +197,20 @@ pub(super) enum EnqueueOutcome {
 pub(super) fn enqueue_for_client(ch: &ClientHandle, payload: SharedBytes) -> EnqueueOutcome {
     let size = payload.len();
     let cur = ch.queued_bytes.load(Ordering::Acquire);
-    if cur.saturating_add(size) > ch.buffer_limit {
+    // **単一 frame が buffer_limit を超える場合は overflow にしない** (= queue が空
+    // なら必ず 1 frame は受け入れる)。backpressure は「client が読み遅れて queue が
+    // 溜まった」ことを検出する機構であって、frame 1 個の大きさを検査するものではない。
+    //
+    // 旧実装は `cur + size > limit` だけを見ていたため、`size > limit` の frame が
+    // 来ると **queue が空 (cur == 0) の client すら即 disconnect** されていた。
+    // 子 PTY の読み取り chunk は 8 KiB 固定なので、`client_buffer_bytes` を 8 KiB
+    // 未満に設定すると全 client が attach 直後に切られ、**誰も接続できない daemon**
+    // になる (= kill も届かず serve が永久に終わらない)。
+    //
+    // 「空 queue なら 1 frame は通す」ことで、大きい frame も必ず前進する
+    // (= writer_pump が書き切れば queued_bytes は 0 に戻る)。読み遅れている client は
+    // cur > 0 のまま次の frame で overflow するので、backpressure の意図は保たれる。
+    if cur > 0 && cur.saturating_add(size) > ch.buffer_limit {
         return EnqueueOutcome::Overflow;
     }
     ch.queued_bytes.fetch_add(size, Ordering::AcqRel);
@@ -617,6 +630,41 @@ mod tests {
         assert!(
             found_backpressure,
             "overflow 時に backpressure.disconnect error が通知されるべき"
+        );
+    }
+
+    /// queue が空なら、`buffer_limit` を超える単一 frame でも受け入れる。
+    ///
+    /// 回帰対象: 旧実装は `cur + size > limit` だけを見ていたため、`size > limit` の
+    /// frame で **queue が空の client すら即 disconnect** されていた。子 PTY の読み取り
+    /// chunk は 8 KiB 固定なので、`client_buffer_bytes` が 8 KiB 未満だと全 client が
+    /// attach 直後に切られ、誰も接続できない daemon になる (= kill も届かない)。
+    #[test]
+    fn enqueue_accepts_oversized_frame_when_queue_is_empty() {
+        let (ch, rx, _peer) = make_test_client(1, 4096, vec![]);
+        // queue は空 (= 0)。limit 4096 に対し 8192 byte の payload を積む。
+        let outcome = enqueue_for_client(&ch, Arc::new(vec![0u8; 8192]));
+        assert_eq!(
+            outcome,
+            EnqueueOutcome::Sent,
+            "queue が空なら limit 超の単一 frame も通すべき (= 前進保証)"
+        );
+        assert_eq!(ch.queued_bytes.load(Ordering::Acquire), 8192);
+        assert!(rx.try_recv().is_ok(), "payload が writer queue に届くべき");
+    }
+
+    /// 読み遅れている client (= queue に残がある) は従来どおり overflow で切る。
+    /// 上の「空 queue なら通す」緩和が backpressure 自体を殺していないことの確認。
+    #[test]
+    fn enqueue_still_overflows_when_queue_is_non_empty() {
+        let (ch, _rx, _peer) = make_test_client(2, 4096, vec![]);
+        // 1 byte でも残っていれば、limit を超える追加は overflow。
+        ch.queued_bytes.store(1, Ordering::Release);
+        let outcome = enqueue_for_client(&ch, Arc::new(vec![0u8; 4096]));
+        assert_eq!(
+            outcome,
+            EnqueueOutcome::Overflow,
+            "queue に残がある client の limit 超過は従来どおり overflow"
         );
     }
 
