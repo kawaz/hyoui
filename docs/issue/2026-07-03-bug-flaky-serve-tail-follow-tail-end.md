@@ -256,10 +256,13 @@ regression test `serve_tail_follow_receives_tail_end_when_child_exits_immediatel
 
 | 検証 | 結果 |
 |---|---|
-| 5ms 子 (修正前) | 10/10 FAILED |
-| 5ms 子 (修正後) | 18/18 ok |
-| macOS lib suite 全 878 | ok (3.00s) |
+| 5ms 子 単独 (修正前) | 10/10 FAILED |
+| 5ms 子 単独 (修正後) | 30/30 ok |
+| serve_tail_follow 2 件 単独 × 10 | 10/10 ok |
 | clippy / fmt | clean |
+
+**単独実行では完全に消える** = 本 race に関する限り修正は有効。ただし
+suite 併走では下記のとおり別要因で落ちる。
 
 ### ただし CI flaky はこれで終わらない (= 未解決部分)
 
@@ -281,20 +284,51 @@ RESULT pass=3 fail=9  (修正込みのバイナリ)
 なお Linux 側の失敗は「32s かかる回」と「4s 前後で終わる回」の両方で起きて
 おり、前回特定した 32s 増悪要因とも別軸。
 
+#### 第 2 の原因は **macOS でも再現する** (= Linux 固有ではない、2026-07-27 訂正)
+
+当初「Linux でだけ残る」と書いたが、macOS でも suite 併走時に再現する。
+`cargo test -p hyoui --lib daemon::session` (= 65 test に絞る) を 20 回:
+
+```
+16 ok / 4 FAILED
+```
+
+落ちた test は毎回 1 件だが顔ぶれが変わる:
+
+- `serve_tail_request_no_follow_dumps_buffer`
+- `serve_tail_follow_receives_tail_end_when_child_exits_immediately`
+- `serve_tail_follow_receives_tail_end_on_child_exit`
+- `accept_loop_pending_cap_independent_from_clients_cap`
+
+一方、**単独実行なら同じ test が 30/30 green**。したがって第 2 の原因は
+「特定 test のロジック」ではなく **同一プロセス内で daemon を多数並走させた
+時に起きる何か** (= 前回から疑っている global state 共有) である可能性が高い。
+`accept_loop_pending_cap_*` (= tail と無関係な accept 系) まで落ちるのは
+その傍証。
+
+#### 試して効果が無かった対処 (= 記録)
+
+drain budget を 100ms → **2000ms** に上げても解決しない (8 回中 1 回失敗、
+落ちたのは `serve_tail_request_no_follow_dumps_buffer`)。suite 実行時間だけ
+3.0s → 4.9s に伸びるので **100ms のまま据え置いた**。
+= 第 2 の原因は「drain 時間が足りない」類ではない。
+
 ### 次の調査方針 (更新)
 
-1. 第 2 の原因を、本 race と同じやり方で **決定的再現に落とす** のが先決
-   (= 「Linux でだけ」「suite 全体でだけ」の条件を、timing パラメータを
-   振って決定的な形に還元する。本 race は子の寿命が rev だった)
-2. 対象は子が長命な test 群 (`serve_screen_dump_*` / `serve_attach_redraw_*`)。
-   共通するのは **handshake → 最初の raw_data 受信**の経路であり、
-   `read_until_contains` の timeout がその区間で起きている。handshake worker
-   登録と master 出力 broadcast の間に別の取りこぼし窓がある可能性
-3. 前セッションが疑っていた「同一プロセス内の daemon 同士が共有する global
-   state」も引き続き候補 (= `SIGCHLD_SELFPIPE_LOCK` を取れなかった serve は
-   self-pipe 無しの 500ms polling 経路に落ちる。lib test は 1 プロセスで
-   多数の daemon を動かすため、**self-pipe を取れるのは常に 1 つだけ**。
-   これは負荷でなく構造的な差分なので、有力)
+1. **最有力候補の裏取りから始める**: `SIGCHLD_SELFPIPE_LOCK` を取れなかった
+   serve は self-pipe 無しの **500ms polling 経路**に落ちる (`sigchld_pipe`
+   が None、`serve_loop` の `NO_SELFPIPE_POLL_CAP_MS`)。lib test は 1 プロセス
+   で多数の daemon を並走させるため **self-pipe を取れるのは常に 1 つだけ**で、
+   残りは全部 degraded 経路で動く。これは負荷でなく **構造的な差分**であり、
+   「単独なら 30/30 green / 併走だと落ちる」「落ちる test の顔ぶれが毎回違う」
+   「tail と無関係な accept 系まで落ちる」の 3 点すべてと整合する。
+   検証案: daemon ごとに self-pipe 取得の成否を trace し、落ちた test の
+   daemon が degraded 側だったかを確認する (= 本 race で使った trace と同じ手)
+2. 対象 test は `daemon::session` module に絞れば macOS で 4/20 再現するので、
+   Docker を待たずに反復できる (= 調査ループが速い)
+3. 子が長命な test 群 (`serve_screen_dump_*` / `serve_attach_redraw_*`) の
+   失敗は `read_until_contains` timeout = **handshake → 最初の raw_data 受信**
+   の区間で起きている。1 が外れたらこの区間の取りこぼし窓を疑う
 
 ## 受け入れ条件
 
@@ -303,6 +337,8 @@ RESULT pass=3 fail=9  (修正込みのバイナリ)
 - [x] product バグを 1 つ特定・修正 (= kill_pgrp の自プロセスグループ誤送信)
 - [x] product バグをもう 1 つ特定・修正 (= 子 exit 検出が client frame 処理を
       追い越して tail.request を捨てる race。**決定的再現あり**、regression test 追加)
-- [ ] **残る要因の特定** (= 上記 2 つの修正後も Linux suite は 9/15 で失敗。
-      子が長命な test 群も落ちるため第 2 の原因が独立に存在する)
+- [ ] **残る要因の特定** (= 上記 2 つの修正後も Linux suite 9/15、macOS
+      `daemon::session` 4/20 で失敗。単独実行は 30/30 green なので
+      「daemon 多数並走時の global state 共有」が最有力。self-pipe 取得の
+      成否 trace から着手する)
 - [ ] CI 並列実行で安定して pass する (= 修正 push 後の CI で確認)
