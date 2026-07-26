@@ -224,9 +224,17 @@ fn handle_enqueue_outcome(ch: &ClientHandle, outcome: EnqueueOutcome, overflow_i
             send_backpressure_error(ch, ch.queued_bytes.load(Ordering::Acquire));
             overflow_ids.push(ch.id);
         }
-        EnqueueOutcome::WriterDead => {
-            overflow_ids.push(ch.id);
-        }
+        // writer 死は **disconnect の根拠にしない**。socket は全二重で、write 半分が
+        // 死んでいることは「client が既に送ってきた frame」の有効性と無関係。ここで
+        // 即 disconnect すると、client の受信済み frame を serve_loop が読む前に
+        // ClientHandle ごと捨ててしまい、control message が無言で失われる
+        // (= 「送信して即 close」する短命 client の Kill / Resize が効かない実バグ)。
+        //
+        // 正しい disconnect 点は reader 側の EOF。EOF 経路は
+        // `frames_to_process` で受信済み frame を全て処理した **後**に当該 client を
+        // drop するため、順序が保たれる。writer が死ぬ状況では peer は既に閉じている
+        // ので reader EOF は直後に来る (= 居残りは 1 poll 周期程度)。
+        EnqueueOutcome::WriterDead => {}
     }
 }
 

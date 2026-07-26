@@ -2019,7 +2019,26 @@ mod tests {
             "must not fall through to generic message, got: {msg}"
         );
 
-        // daemon thread は handshake 拒否で Err 終了
+        // handshake 拒否は session を畳まない (= 不正 token で daemon を殺せたら
+        // それ自体が脆弱性)。したがって daemon は生きたままで、素の join は子
+        // `/bin/sleep 30` の自然死を待って **30 秒 block** する。lib test 全体が
+        // 32s に膨らみ、他 test の時間依存 assert を圧迫していた (= issue
+        // 2026-07-25-bug-flaky-serve-ro-lock-acquire-rejected)。
+        // 正しい token で attach して Kill を送り、決定的に畳んでから join する。
+        let mut killer = ClientConnection::connect(
+            &sock,
+            AttachOptions {
+                token: Some("secret-xyz".into()),
+                ..AttachOptions::default()
+            },
+        )
+        .expect("connect with correct token");
+        killer
+            .send_control(&ControlMessage::Kill(crate::protocol::messages::Kill {
+                signal: Some("SIGKILL".into()),
+                wait: true,
+            }))
+            .expect("send kill");
         let _ = daemon_handle.join();
     }
 

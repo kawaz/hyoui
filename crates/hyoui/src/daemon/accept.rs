@@ -623,7 +623,11 @@ pub(super) fn send_attach_redraw(
     let payload: SharedBytes = Arc::new(frame_bytes);
     match enqueue_for_client(ch, payload) {
         super::broadcast::EnqueueOutcome::Sent => {}
-        _ => overflow_ids.push(ch.id),
+        // writer 死は disconnect の根拠にしない (= 理由は
+        // `broadcast::handle_enqueue_outcome` の同 arm 参照)。attach 直後に
+        // client が閉じていても、受信済み frame は reader EOF 経路で処理する。
+        super::broadcast::EnqueueOutcome::WriterDead => {}
+        super::broadcast::EnqueueOutcome::Overflow => overflow_ids.push(ch.id),
     }
 }
 
