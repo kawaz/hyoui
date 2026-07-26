@@ -135,6 +135,57 @@
     term.onRender(imeSync);
   }
 
+  // ---- IME 変換キャンセル時の二重送信 (kawaz 実機フィードバック 2026-07-26) ----
+  //
+  // 再現: `mouhitotu,` と打って変換中 (画面は「もう一つ、」) に英数キーで変換を
+  // 解除すると、「もう一つ、もう一つ、」と 2 回送られる。
+  //
+  // 原因は xterm.js v5.3.0 の `_finalizeComposition` が 2 回走ること。実測トレース:
+  //
+  //   英数 keydown  → CompositionHelper.keydown が「composing 中に 229 以外の
+  //                   キーが来た」と判断し `_finalizeComposition(false)` を呼ぶ。
+  //                   これは同期的に textarea の変換範囲を送る (送信 1 回目)。
+  //                   同時に `_isComposing = false` になる。
+  //   compositionend → ブラウザは composition の終了を必ず通知するので、その後
+  //                   `_finalizeComposition(true)` が走る。`_isComposing` が既に
+  //                   false なので `value.substring(start)` が同じ文字列のまま
+  //                   残っており、もう一度送られる (送信 2 回目 = 重複)。
+  //
+  // 正常な Enter 確定では英数キー経路を通らないため `_finalizeComposition` は
+  // compositionend 側の 1 回だけで、その時点の `_isComposing` は true。つまり
+  // **compositionend 到達時に `_isComposing` が false なら、既に keydown 側で
+  // 送信済み** という判別ができる (実測で両経路のフラグ値を確認済み)。
+  //
+  // 対処: compositionend を capture フェーズで先取りし、上記の「送信済み」条件に
+  // 当てはまる場合だけ CompositionHelper へ伝播させない。xterm.js 側の
+  // compositionend listener は bubble フェーズ登録なので、capture で
+  // stopImmediatePropagation しても xterm の listener だけが止まり、
+  // 我々の (A) のクリア処理は同じ capture フェーズで自前に呼べばよい。
+  //
+  // Design rationale: `_finalizeComposition` を直接差し替える手もあるが、minify
+  // 済み内部関数の再実装は vendor 更新で壊れる。イベント経路で止めるほうが、
+  // 内部実装が変わっても「重複を防げなくなる」だけで済み、入力欠落にはならない。
+  if (imeSupported && term.textarea) {
+    const textarea = term.textarea;
+    textarea.addEventListener('compositionend', (ev) => {
+      const helper = imeCore._compositionHelper;
+      // `_isComposing` が false = keydown 経路で finalize 済み (= 送信済み)。
+      // このまま xterm.js に渡すと同じ文字列がもう一度送られる。
+      if (helper && helper.isComposing === false) {
+        ev.stopImmediatePropagation();
+        // xterm.js の listener を止めた分、value のクリアと位置同期は自前で行う
+        // (= (A) の後始末が走らなくなるため)。
+        setTimeout(() => {
+          textarea.value = '';
+          imeSync();
+        }, 0);
+        if (window.__hyouiDebug) {
+          window.__hyouiDebug('info', 'IME cancel: suppressed duplicate composition send');
+        }
+      }
+    }, true);
+  }
+
   const statusEl = document.getElementById('status');
   const sizeEl = document.getElementById('size');
   const autoEl = document.getElementById('auto');
