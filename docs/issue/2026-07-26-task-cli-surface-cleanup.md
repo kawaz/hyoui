@@ -1,11 +1,11 @@
 ---
 title: "CLI surface 棚卸し — 初期からの残骸・3 者不整合・幽霊 subcommand の整理"
-status: open
+status: wip
 category: task
 created: 2026-07-26T00:00:00+09:00
 last_read: 2026-07-27T00:58:13+09:00
 open_entered: 2026-07-26T00:00:00+09:00
-wip_entered:
+wip_entered: 2026-07-27T00:00:00+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
@@ -258,6 +258,32 @@ help 全文 grep で検査した結果、**残骸は見つからなかった**:
 7. DR-0006 §12 の `HYOUI_NAME` / `HYOUI_SOCK` に「不採用」を追記 (DR 側の整合)
 
 ---
+
+## 進捗 (2026-07-27)
+
+- **Phase 1 (help 修正)**: commit 済み (wnrnslwt, wtorrwkz, srznlvpp)
+  - `run --help` の `SHELL` fallback 記載削除
+  - `tail --help` の `--read-only` → `--mode=ro` 訂正
+  - `web` / `upgrade` の help 露出
+  - `screen dump/snapshot --timeout` の no-op 注記追加
+- **Phase 2 (completion 整合)**: commit 済み (同上コミット群)
+  - flag 補完漏れ 8 件を補充
+  - completion テストを subcommand 文脈を見る検査へ改善
+  - 抽出器の bash if-dispatch 対応
+- **D-1** (send 予約撤廃、tx は残す): 実装済み。実測: `send` は unknown subcommand
+  扱いになり typo suggest からも除外されている
+- **D-4** (`attach --debug-dump-client` の help/completion 露出): 実装済み。実測:
+  `attach --help` と bash/zsh/fish の 3 completion すべてに追加されている
+- **D-5** (`tail` の `--strip-ansi` / `--last-bytes` を primary 化): 実装済み。実測:
+  `tail --help` は長形が primary、短形は alias として併記
+- 上記 D-1/D-4/D-5 のコード内注記の整合は commit 4ed57674 で完了
+- DR-0006 §12 の `HYOUI_NAME` / `HYOUI_SOCK` 不採用追記: commit 済み (kpxrszky)
+- **残作業**:
+  - D-2 (`attach --exclusive` / `--detach-others` の扱い) → `QUESTIONS.md` の
+    CLI-Q1 として裁定待ち
+  - D-3 (`--include=style` / `=scrollback` の parse 段 reject 化) → `QUESTIONS.md`
+    の CLI-Q2 として裁定待ち
+  - F: `HYOUI_ALLOW_CORE` の露出判断 (user 向け化 or 内部専用明記) は未着手
 
 ## 関連
 
