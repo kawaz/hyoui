@@ -63,12 +63,56 @@ origin: CI flaky 根治タスク中に GitHub API で直近 12 run × 全 attemp
 「8s で出力 0 bytes」で fail した。低負荷での再実行と、CI runner との環境差
 (macOS バージョン / core 数) の切り分けが必要。
 
+## 真因確定と修正 (2026-07-26 第 2 弾)
+
+### (A) ubuntu `serve_backpressure_disconnects_slow_client` → **解決**
+
+Docker (ubuntu:24.04) + `--cpus=4` + `taskset -c 0-3` で **5/5 決定的に再現**した
+(= flaky ではなく Linux での確定的 hang。macOS では出ない)。daemon に計装を入れて観測:
+
+```
+promoted id=0 mode=Rw
+ENQ reject id=0 payload=4100 cur=0 limit=4096 single_frame_too_big=true
+READY-branch drop id=0
+poll:enter nclients=0 ...   ← 以降 31s 間 nclients=0 のまま yes(1) を空回り
+```
+
+真因は **product バグ**: `enqueue_for_client` が `cur + size > limit` だけを見ていたため、
+`size > limit` の単一 frame で **queue が空の client すら即 disconnect** していた。
+子 PTY の読み取り chunk は 8 KiB 固定なので、`client_buffer_bytes` が 8 KiB 未満だと
+全 client が attach 直後に切られ、**誰も接続できない daemon** になる (= kill も届かない)。
+
+修正: 空 queue なら limit 超の単一 frame も受け入れる (前進保証)。併せて test 側の
+`client_buffer_bytes = 4096` (< chunk 8 KiB) という自己矛盾も 12 KiB に修正。
+
+検証 (Linux 4core): 修正前 31.01s FAILED × 5/5 → 修正後 1.06〜1.12s ok × 8/8。
+
+### (B) macOS `notify_default_does_not_resume_self_stopped_child` → **裁定待ち**
+
+低負荷の macOS ローカルで **6/6 再現**した (= 環境要因ではない)。失敗内容:
+
+```
+notify default では子が起こされず marker は出ないはず:
+Ok("[hyoui] detach: ... \r\nRESUMED_MARKER\r\n")
+```
+
+真因は **DR-0019 と DR-0029 の規定衝突**:
+
+- DR-0019 §3: `on-child-suspend` default = `notify` = 「daemon は勝手に起こさない」
+- DR-0029 §5: `[attach] resume_on_reattach = true` (default) で rw attach 時に resume 要求
+- `hyoui run` は DR-0015 で「fork daemon + attach client」の合成なので、**run した瞬間に
+  attach 経路が発火して子を起こす**。daemon は notify を守っているが同居 client が起こす
+
+DR-0029 は自身を「DR-0019 の配置は不変、config default を足すだけ」と書いているが、
+`run` 経路では観測可能な挙動が変わっている (= 自己申告と実態の齟齬)。
+どちらの DR を優先するかは設計判断なので `docs/QUESTIONS.md` の **👺RESUME-Q1** で裁定待ち。
+
 ## 受け入れ条件
 
-- [ ] macOS の `notify_default_does_not_resume_self_stopped_child` の真因を特定して直す
-      (= 低負荷環境で再現を取り、DR-0019 の期待値と macOS 実挙動のどちらが正しいか判定)
-- [ ] ubuntu の `serve_backpressure_disconnects_slow_client` を
-      [[2026-06-22-backpressure-writer-pump-drop-sequence-deadlock]] 側で決着させる
+- [x] macOS の `notify_default_does_not_resume_self_stopped_child` の真因を特定
+      (= DR-0019 と DR-0029 の規定衝突。修正方針は 👺RESUME-Q1 の裁定待ち)
+- [x] ubuntu の `serve_backpressure_disconnects_slow_client` を解決
+      (= 単一 frame > buffer_limit で誰も attach できなくなる product バグ)
 - [ ] 上記 2 つの決着後、`continue-on-error: true` を外して恒常 red を検知可能にする。
       外せない test が残るなら、その test だけ除外して残りを blocking にする
       (= 「全部隠す」のをやめる)
