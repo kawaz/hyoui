@@ -1,11 +1,11 @@
 ---
 title: serve_tail_follow_receives_tail_end_on_child_exit が ubuntu CI で flaky fail する
-status: open
+status: wip
 category: bug
 created: 2026-07-03T19:50:00+09:00
-last_read:
+last_read: 2026-07-27T00:30:00+09:00
 open_entered: 2026-07-03T19:50:00+09:00
-wip_entered:
+wip_entered: 2026-07-27T00:30:00+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
@@ -186,10 +186,123 @@ controlling tty の対応が壊れて子への入出力が成立しなくなる�
    (= 上記「失敗した修正案」参照、単独 setpgid は不可)
 3. ノイズのない環境 (= 専有マシン) で A/B を取り直して有意差を確認する
 
+## 真因の 1 つを特定・修正 (2026-07-27、macOS で決定的再現)
+
+前回までは「Linux でしか再現しない環境依存」と整理していたが、**test の子を
+短命化すると macOS でも 10/10 で決定的に再現する**ことが分かった。flaky の
+正体は timing 依存の race であって、環境依存ではなかった (= ubuntu では
+runner 負荷でこの窓に入りやすいだけ)。
+
+### 再現手順 (決定的、macOS)
+
+`serve_tail_follow_receives_tail_end_on_child_exit` の子を
+`sleep 0.2` → `sleep 0.005` に変えるだけ:
+
+```
+test daemon::session::tests::serve_tail_follow_receives_tail_end_on_child_exit ... FAILED
+panicked at crates/hyoui/src/daemon/session.rs:3601:43:
+frame: Protocol(UnexpectedEof("size header"))
+```
+
+CI の panic 箇所・message と完全一致する (= `next_control` の
+`Frame::decode_from(s).expect("frame")`)。
+
+### 機構 (trace で直接観測)
+
+daemon 側に trace を入れて cleanup 段の状態を観測した:
+
+```
+XX exit-site L1677              ← master EOF で子 exit を検出、即 return
+XX cleanup outcome=ChildExited(Some(0)) clients=1 followers=0
+```
+
+**client は 1 人居るのに follower が 0 人**。つまり `handle_tail_request` が
+一度も呼ばれていない。したがって `broadcast_tail_end_to_followers` の送信対象が
+0 件になり、client は `TailEnd(ChildExited)` を受け取れないまま socket close
+だけを観測する。これが `UnexpectedEof("size header")` の正体。
+
+なぜ呼ばれないか — `serve_loop` の処理順が
+
+1. listener accept
+2. **master (= 子 PTY) 読み取り → EOF なら即 `return ChildExited`**
+3. client frame の decode → `handle_client_frame`
+
+で、**子 exit の検出が client frame 処理より前にある**。さらに client は
+handshake worker 経由で **poll_fds 構築後に登録される**。この 2 つが重なると:
+
+- (a) 同一 poll 周回で既に POLLIN していた client frame
+- (b) 登録が exit 検出に間に合わなかった client の frame
+
+がどちらも処理されず捨てられる。実際 trace では `client_revents=[]` で、
+tail.request は poll 対象にすら入っていなかった (= (b) のケース)。
+
+子が長生きすれば subscription 登録が先に済むので表面化しない。短命な子ほど
+窓に入る = CI で `sleep 0.2` が負荷で相対的に「短命化」すると落ちる。
+
+### 修正 (commit 済み)
+
+子 exit を即 return せず **100ms の drain 窓**に保留し、遅れて届く client frame
+も通常経路で処理してから抜ける。実装上の注意点 2 つ (どちらも実測で踏んだ):
+
+- 窓の間は **master を poll 対象から外す**。`POLLHUP` は要求 mask に関係なく
+  報告されるため、外さないと poll が即 return し続けて 100ms を busy-spin で
+  焼く
+- 締切判定は **ループ冒頭**に置く。末尾に置くと `Interrupted` / `Timeout` の
+  `continue` 経路が判定を飛ばし、**永久ループになる** (= 実際に suite が
+  ハングした)
+
+regression test `serve_tail_follow_receives_tail_end_when_child_exits_immediately`
+を追加 (子 5ms)。修正を revert すると RED になることを確認済み。
+
+| 検証 | 結果 |
+|---|---|
+| 5ms 子 (修正前) | 10/10 FAILED |
+| 5ms 子 (修正後) | 18/18 ok |
+| macOS lib suite 全 878 | ok (3.00s) |
+| clippy / fmt | clean |
+
+### ただし CI flaky はこれで終わらない (= 未解決部分)
+
+Docker (`--cpus=4` + `taskset -c 0-3` + `--test-threads=4`) で Linux 15 回:
+
+```
+RESULT pass=3 fail=9  (修正込みのバイナリ)
+```
+
+失敗するのは本 test だけでなく `serve_screen_dump_*` /
+`serve_attach_redraw_includes_pre_attach_output` /
+`serve_tail_request_no_follow_dumps_buffer` を含む同族グループで、様式は
+`UnexpectedEof("size header")` か `read_until_contains: timed out`。
+
+**これらは本 race では説明できない**: 該当 test の子は `sleep 30` 等で
+生き続けるので「子 exit が client frame を追い越す」窓に入りようがない。
+= **独立した第 2 の原因が残っている**。
+
+なお Linux 側の失敗は「32s かかる回」と「4s 前後で終わる回」の両方で起きて
+おり、前回特定した 32s 増悪要因とも別軸。
+
+### 次の調査方針 (更新)
+
+1. 第 2 の原因を、本 race と同じやり方で **決定的再現に落とす** のが先決
+   (= 「Linux でだけ」「suite 全体でだけ」の条件を、timing パラメータを
+   振って決定的な形に還元する。本 race は子の寿命が rev だった)
+2. 対象は子が長命な test 群 (`serve_screen_dump_*` / `serve_attach_redraw_*`)。
+   共通するのは **handshake → 最初の raw_data 受信**の経路であり、
+   `read_until_contains` の timeout がその区間で起きている。handshake worker
+   登録と master 出力 broadcast の間に別の取りこぼし窓がある可能性
+3. 前セッションが疑っていた「同一プロセス内の daemon 同士が共有する global
+   state」も引き続き候補 (= `SIGCHLD_SELFPIPE_LOCK` を取れなかった serve は
+   self-pipe 無しの 500ms polling 経路に落ちる。lib test は 1 プロセスで
+   多数の daemon を動かすため、**self-pipe を取れるのは常に 1 つだけ**。
+   これは負荷でなく構造的な差分なので、有力)
+
 ## 受け入れ条件
 
 - [x] 不安定さの軸が **部分的に** 特定されている (= lib suite 32s が強い増悪要因)
 - [x] Linux で再現環境を確保 (= Docker + cpus=4 + taskset、macOS では再現しない)
 - [x] product バグを 1 つ特定・修正 (= kill_pgrp の自プロセスグループ誤送信)
-- [ ] **残る要因の特定** (= kill_pgrp 修正後も再現。ノイズのない環境での A/B 再測が先)
+- [x] product バグをもう 1 つ特定・修正 (= 子 exit 検出が client frame 処理を
+      追い越して tail.request を捨てる race。**決定的再現あり**、regression test 追加)
+- [ ] **残る要因の特定** (= 上記 2 つの修正後も Linux suite は 9/15 で失敗。
+      子が長命な test 群も落ちるため第 2 の原因が独立に存在する)
 - [ ] CI 並列実行で安定して pass する (= 修正 push 後の CI で確認)
