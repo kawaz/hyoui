@@ -20,7 +20,7 @@
 
 ## 裁定待ち
 
-### 👺RESUME-Q1: `hyoui run` の子が self-stop した時、attach client が起こしてよいか
+### 👺RS-Q1: `hyoui run` の子が self-stop した時、attach client が起こしてよいか
 
 - [ ] a (推奨): `run` が内部生成する attach では resume を適用しない (明示 `hyoui attach` でのみ起こす)
 - [ ] b: test を現状に合わせる (default が実質 auto-resume になったと認める)
