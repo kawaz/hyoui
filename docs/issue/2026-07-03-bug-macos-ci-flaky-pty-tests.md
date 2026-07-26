@@ -125,6 +125,20 @@ wait_for("MARK=") timed out after 10s; output so far (107 bytes):
 blocking failure を潰す。`serve_tail_follow_*` (4 件) は
 [[2026-07-25-bug-flaky-serve-ro-lock-acquire-rejected]] の 32s 問題側で対処済。
 
+## 修正後に残る flaky (2026-07-26、クリーン環境 10 連続実測)
+
+修正適用後 (= 他の test 実行を併走させない条件) の `cargo test --workspace --no-fail-fast`
+10 連続:
+
+```
+P P P F P P P P P P     (9/10、失敗は round4 の child_exit_propagates_code のみ)
+```
+
+= `input_auto_lock_cli` の 3 test / `serve_tail_follow_*` / `child_inherits_session_id_env`
+はこの 10 回では 1 度も落ちなかった。残る `child_exit_propagates_code`
+(`daemon_death_exit.rs:92`) は `wait_exit_code(15s)` が `Some(7)` を得られない様式で、
+CI でも 1 件観測されている (run 29694355729)。**未調査**。
+
 ## 受け入れ条件
 
 - [x] `outer_token_*` 側の不安定さの軸が観測データで特定されている
