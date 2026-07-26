@@ -3,7 +3,7 @@ title: "CLI surface 棚卸し — 初期からの残骸・3 者不整合・幽�
 status: open
 category: task
 created: 2026-07-26T00:00:00+09:00
-last_read: 2026-07-26T00:00:00+09:00
+last_read: 2026-07-26T23:03:40+09:00
 open_entered: 2026-07-26T00:00:00+09:00
 wip_entered:
 blocked_entered:
