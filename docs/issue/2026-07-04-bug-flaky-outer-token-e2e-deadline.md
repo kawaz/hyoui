@@ -58,12 +58,33 @@ test 末尾の `kill_daemon()` は `connect` → `send_control(Kill)` → 即 `d
 負荷依存だったのは、低負荷では daemon が client の close より先に Kill frame を
 読めるため。修正内容は上記 issue を参照。
 
-## 検証 (macOS、`cargo test -p hyoui-cli --test input_auto_lock_cli`)
+## 検証 (macOS)
+
+### 単体 (`cargo test -p hyoui-cli --test input_auto_lock_cli`)
 
 | | 結果 |
 |---|---|
 | 修正前 | 15 回中 1 失敗 / 別ラウンドで 20 回中 1 失敗 (高負荷時は 1 回で 3 test 同時失敗も観測) |
 | 修正後 | **25 回連続 green** |
+
+### A/B (`cargo test --workspace`、修正前 workspace と**交互**実行で条件を揃える)
+
+回帰混入がないことを確認するため、修正前 revision (`2472c7df`) の jj workspace を
+作り、同一マシン・同一時間帯で A→B→A→B... と交互に full workspace test を回した:
+
+```
+round1 A ok      round1 B ok
+round2 A ok      round2 B ok
+round3 A ok      round3 B ok
+round4 A ok      round4 B FAIL  outer_token_inheritance_skips_auto_acquire
+round5 A ok      round5 B FAIL  single_input_succeeds_with_auto_lock
+round6 A ok      round6 B ok
+round7 A ok      round7 B ok
+=== A(fix) pass=7 fail=0 | B(prefix) pass=5 fail=2 ===
+```
+
+= 修正後は 7/7 green、修正前は 2 回失敗し、**失敗テストはいずれも本 issue の対象**。
+修正による回帰は観測されなかった。
 
 ## 関連
 
