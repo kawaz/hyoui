@@ -5,6 +5,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
 | 2026-07-26 | bug | open | [ignored-tests-job-permanently-red](./2026-07-26-bug-ignored-tests-job-permanently-red.md) | CI の ignored-tests job が continue-on-error で恒常 red を隠している (ubuntu は backpressure の 31s hang が 12/12、macOS は notify_default_* が 7/7 で固定失敗) |
+| 2026-07-26 | task | open | [web-ime-safari-ios-unverified](./2026-07-26-web-ime-safari-ios-unverified.md) | web ターミナルの IME カーソル追従、実機 Safari (macOS) / iOS Safari での未検証範囲 |
 | 2026-07-25 | bug | open | [daemon-drops-pending-frames-on-client-close](./2026-07-25-bug-daemon-drops-pending-frames-on-client-close.md) | 送信直後に切断した短命 client の control frame が daemon で無言に捨てられる — **真因確定・修正済 (2026-07-26)**: WriterDead を disconnect 根拠にしていたため受信済み frame ごと client を破棄していた |
 | 2026-07-25 | bug | open | [flaky-serve-ro-lock-acquire-rejected](./2026-07-25-bug-flaky-serve-ro-lock-acquire-rejected.md) | 高負荷時の flaky 2 系統: `serve_ro_client_lock_acquire_rejected` (= 32s 回に SessionExitNotify(143) を拾う、元凶は `/bin/sleep 30` を待つ token test) と `input_auto_lock_cli` の deadline fail (= 変更前 revision でも再現、DR-0029 起因でないことを確認済)。根に PTY 枯渇 (123/128 使用、`start: Errno(ENXIO)`) |
 | 2026-07-25 | request | open | [request-attach-overlay-progress](./2026-07-25-request-attach-overlay-progress.md) | attach 画面最下行に detach 遅延の progress overlay (DR-0029 §5、`ctrlz_guard_overlay` は現在 no-op) |
