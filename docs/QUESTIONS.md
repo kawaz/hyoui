@@ -28,7 +28,7 @@
 
 a の理由: `run` は「起動」であって「復帰意思の表明」ではない。子の self-stop を尊重する
 のが [DR-0019](docs/decisions/DR-0019-run-option-cleanup-and-suspend-policy-placement.md) §3
-の意図で、[DR-0029](docs/decisions/DR-0029-ctrlz-guard-and-attach-as-peephole.md) §5 の意図
+の意図で、[DR-0029](docs/decisions/DR-0029-attach-is-a-viewport-ctrl-z-guard.md) §5 の意図
 (人間が再 attach した時の UX) とも矛盾しない。c は明示 attach の UX まで変わり影響が広い。
 
 #### 背景説明 (基本省略、詳細を求められたら補充)
