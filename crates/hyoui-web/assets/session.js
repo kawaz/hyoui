@@ -70,6 +70,71 @@
   // xterm.js の内部 API なので副作用は限定的 (= UI ボタンを増やす代わり)。
   window.__hyouiTerm = term;
 
+  // ---- IME 変換位置の追従 (kawaz 実機フィードバック 2026-07-26) ----
+  //
+  // OS の IME 候補ウィンドウは「focus 中の editable 要素の *caret* 座標」に出る。
+  // xterm.js は隠し textarea (.xterm-helper-textarea) を 1 セル幅でカーソル位置に
+  // 移動させることでこれを実現しているが、v5.3.0 には追従が崩れる経路が 2 つある。
+  // どちらも実機観測済み (playwright + CDP Input.imeSetComposition)。
+  //
+  // (A) textarea.value が確定文字列を溜め込み続ける
+  //     CompositionHelper は compositionend 後も value をクリアしない。クリアするのは
+  //     Enter / Ctrl-C の keydown 経路 (xterm.js `_keyDown`) だけだが、IME 確定の
+  //     Enter は keyCode 229 として弾かれるためそこに到達しない。結果、同じ行で
+  //     変換を重ねるほど value が伸び、幅 1 セルの textarea の中で content が右へ
+  //     溢れる (実測: 5 語で scrollWidth 279px / clientWidth 8px = 271px の overflow)。
+  //     caret は content 座標の右端に居るので、OS はセル位置ではなく溢れた先を見る。
+  //     → 確定のたびに value を空へ戻し、caret を常に content 先頭へ張り付かせる。
+  //
+  // (B) resize 後に textarea が旧セル座標へ取り残される
+  //     xterm.js は textarea を `onCursorMove` でしか同期しない (`_syncTextArea`)。
+  //     resize でセル幅が変わってもカーソルの行列が変わらなければ move は発火せず、
+  //     旧 metrics の座標が残る (実測: 1280→900px で 5.8px ズレ)。embed の iframe は
+  //     ホスト側レイアウトで頻繁にリサイズされるのでこの経路を踏みやすい。
+  //     → resize / 描画のたびに再同期する。
+  //
+  // 変換中 (isComposing) は CompositionHelper が textarea の幅・位置を変換文字列に
+  // 合わせて拡張しているため、こちらからは触らない (= 上書きすると変換中の候補位置
+  // を壊す)。xterm.js 本体の `_syncTextArea` も同じ理由で composing 中は早期 return
+  // する。ここでは公開 API に無い内部にアクセスするので、存在チェック付きで呼ぶ
+  // (= vendored xterm.js を差し替えた際に silently 壊れるより、追従を諦めて本来の
+  // 挙動に戻るほうが安全)。
+  //
+  // Design rationale: 本来は upstream xterm.js を直すのが筋だが、vendored bundle は
+  // minify 済みで、パッチを当てるとバージョン更新のたびに再適用が必要になる。
+  // 外側から公開イベント (onRender / onResize) + 内部メソッド呼び出しで補正するほうが
+  // vendor 差し替えに強い。
+  const imeCore = term._core;
+  const imeSupported = !!(imeCore && typeof imeCore._syncTextArea === 'function');
+  if (!imeSupported && window.__hyouiDebug) {
+    window.__hyouiDebug('warn', 'IME position sync unavailable (xterm internals changed)');
+  }
+  const imeIsComposing = () =>
+    !!(imeCore && imeCore._compositionHelper && imeCore._compositionHelper.isComposing);
+  const imeSync = () => {
+    if (!imeSupported || imeIsComposing()) return;
+    try { imeCore._syncTextArea(); } catch (_e) { /* vendor 差し替え時は諦める */ }
+  };
+
+  if (imeSupported) {
+    const textarea = term.textarea;
+    // (A) 確定した文字列を捨てる。compositionend の時点ではまだ CompositionHelper が
+    // value を読んで daemon へ送る処理を setTimeout(0) で予約しているので、その後に
+    // 走るよう同じく setTimeout(0) で遅延させる (= 先にクリアすると入力が消える)。
+    if (textarea) {
+      textarea.addEventListener('compositionend', () => {
+        setTimeout(() => {
+          if (imeIsComposing()) return;
+          textarea.value = '';
+          imeSync();
+        }, 0);
+      });
+    }
+    // (B) resize / 描画のたびに再同期。onRender は変換確定直後の再配置も拾う。
+    term.onResize(imeSync);
+    term.onRender(imeSync);
+  }
+
   const statusEl = document.getElementById('status');
   const sizeEl = document.getElementById('size');
   const autoEl = document.getElementById('auto');
