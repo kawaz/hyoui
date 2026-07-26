@@ -68,7 +68,23 @@ origin: Release run 28655240907 の ci gate fail 観測 (session a7761122)
 
 修正後は lib suite が常時 ~2.9s になり (macOS 5 連続実測)、32s モード自体が消えた。
 
+### ただし「32s 除去 = 本 test 解決」ではない (2026-07-26 反証)
+
+32s 除去後のローカル `cargo test --workspace` 8 連続で、本 test が **再び 1 回失敗**した
+(`session.rs:3543`、round 1/8)。同ランでは `serve_tail_request_follow_switches_subscription`
+(session.rs:3763) も別 round で失敗している。
+
+= 32s 居座りは **増悪要因ではあるが唯一の原因ではない**。full-workspace 並列の
+contention 自体でも落ちる。CI の相関データ (32s: 4/8 失敗、4.3s: 0/6) は
+「32s だと失敗率が跳ね上がる」ことは示すが、4.3s 側のサンプルが 6 件しかないため
+「4.3s なら落ちない」までは主張できない。
+
+注: 観測に使った開発機は他セッション由来の常駐 hyoui 46 process + load 20〜40 という
+CI より遥かに過酷な条件。CI (= 専有 runner) で同率で落ちるとは限らない。
+
 ## 受け入れ条件
 
-- [x] 不安定さの軸が観測データで特定されている (= lib suite が 32s になる回にのみ発生)
+- [x] 不安定さの軸が **部分的に** 特定されている (= lib suite 32s が強い増悪要因)
+- [ ] 32s 除去後も残る contention 由来の失敗の真因特定 (= tail follow subscriber へ
+      TailEnd を送る経路と client drop の順序を疑う)
 - [ ] CI 並列実行で安定して pass する (= 修正 push 後の CI で確認)

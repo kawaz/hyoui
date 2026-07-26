@@ -69,8 +69,14 @@ fail した。同一 code の後続 run では pass しており flaky。
   並列 workspace test の CPU 資源競合による露出頻度上昇の可能性は残るが、
   実装側の意味論変更に起因する反証は得られていない
 
-## 真因 (2026-07-26 確定)
+## 真因 (2026-07-26) — 本 issue の 2 test は **別原因**だった
 
+本 issue は起票時に 2 test を束ねていたが、調査の結果 **失敗様式が違う別物**と判明した。
+片方だけ解決済み。
+
+### (1) `outer_token_inheritance_skips_auto_acquire` → 解決済み
+
+`pty.rs:96` の 30s join deadline 様式 (= `single_input_*` / `parallel_input_*` も同族)。
 daemon serve_loop への一時計装で直接観測し、
 [[2026-07-25-bug-daemon-drops-pending-frames-on-client-close]] と同一原因と確定した
 (= 「送信して即 close」した client の Kill frame を daemon が読まずに捨てる product バグ)。
@@ -78,6 +84,29 @@ daemon serve_loop への一時計装で直接観測し、
 
 macOS 固有ではなく **ubuntu でも同頻度で発生**していた (下記 CI 集計)。
 `macos-latest` の runner 世代交代は無関係だった。
+
+### (2) `child_inherits_hyoui_session_id_env` → **未解決 (別原因)**
+
+`self_session_id_env.rs:34` の `wait_for("MARK=", 10s)` timeout 様式で、上記の
+join deadline とは無関係。2026-07-26 にローカル full-workspace 並列実行で再現させ、
+失敗時の PTY 出力を採取した:
+
+```
+wait_for("MARK=") timed out after 10s; output so far (107 bytes):
+"[hyoui] detach: Ctrl+Z  |  子へ Ctrl+Z: 2 連打  |  peek (read-only): hyoui attach <session> --mode=ro\r\n"
+```
+
+= client の attach 自体は成功して banner を出している。しかし **attach 前に子が出力した
+`MARK=...` が attach redraw で再生されていない** (= 107 bytes は banner のみ)。
+
+`hyoui run` は DR-0015 で「fork daemon + attach client」の合成なので、
+子の `echo` が client の attach より先に走るのは正常系。その場合 attach redraw
+(DR-0013) が screen state から再生する責務を負うが、そこが高負荷時に取りこぼしている。
+
+- 単独実行では 20/20 green (= 並列 contention 依存)
+- 未検証: screen state への取り込みが間に合っていないのか、redraw の送信側で
+  落ちているのか。`serve_attach_redraw_preserves_alt_screen_flag` と同じ経路なので
+  そちらの観点で追うのが早い
 
 ## CI 実データ (2026-07-26、直近 12 run の blocking job `Test (os / stable)`)
 
@@ -98,5 +127,8 @@ blocking failure を潰す。`serve_tail_follow_*` (4 件) は
 
 ## 受け入れ条件
 
-- [x] 不安定さの軸が観測データで特定されている (= WriterDead 起因の frame 破棄、計装で直接観測)
+- [x] `outer_token_*` 側の不安定さの軸が観測データで特定されている
+      (= WriterDead 起因の frame 破棄、計装で直接観測)
+- [ ] `child_inherits_hyoui_session_id_env` の真因特定 (= attach redraw が attach 前の
+      子出力を取りこぼす経路。上記 (2) 参照)
 - [ ] 2 test が CI で安定して pass する (= 修正 push 後の CI で確認)
