@@ -76,18 +76,27 @@ use crate::daemon::broadcast::{
 /// test が `UnexpectedEof("size header")` で落ちていた。production でも
 /// 「daemon を起動した shell ごと落とす」事故になりうる。
 ///
-/// よって送る前に `pgid == child` を確認し、成り立たないときは pgrp ではなく
-/// **child 単体**に送る (= 巻き添えを防ぐ。孫の刈り取りは犠牲になるが、
-/// 無関係プロセスを撃つ方が遥かに有害)。
+/// よって送る前に「child の pgrp が **自分の pgrp と同一か**」を確認し、同一なら
+/// pgrp ではなく **child 単体**に送る (= 自爆回避)。
+///
+/// 判定を `pgid == child` (= leader か) ではなく `pgid == getpgrp()` (= 自分と
+/// 同じ group か) にしているのは意図的: 前者だと「leader ではないが他人の group に
+/// 居る child」まで単体送信に落ちてしまい、孫 (= `sh -c '... &'`) が刈り取られず
+/// PTY slave を掴んだまま残る → master EOF が来ず daemon が終わらない、という
+/// **別の hang** を生む。自爆する場合だけを最小限に切り分ける。
 fn kill_pgrp(child: Pid, sig: Signal) -> nix::Result<()> {
+    // 単体送信へ落とすのは **自爆になる場合だけ** に限定する。
+    //
+    // 「child が pgrp leader でない」だけを条件に単体送信へ落とすと、child が
+    // 孫を持つケース (= `sh -c '... & '`) で孫が刈り取られず、PTY slave を掴んだまま
+    // 生き残る → master EOF が来ず daemon が終わらない、という **別の hang** を生む。
+    // よって pgrp 送信は原則維持し、「child の pgrp が自分の pgrp と同じ」= 撃つと
+    // 自分と同居プロセスに当たる場合に限って child 単体へ切り替える。
     match nix::unistd::getpgid(Some(child)) {
-        // 期待どおり child が pgrp leader → pgrp 全体に送る (孫まで届く)
-        Ok(pgid) if pgid == child => kill(Pid::from_raw(-child.as_raw()), sig),
-        // setpgid に失敗している (= child が自分と同じ pgrp に居る等)。
-        // pgrp 送信は自爆なので child 単体に送る。
-        Ok(_) => kill(child, sig),
-        // pgid が取れない (= 既に reap 済 等) → 単体送信で best-effort
-        Err(_) => kill(child, sig),
+        Ok(pgid) if pgid == nix::unistd::getpgrp() => kill(child, sig),
+        // 自分の pgrp とは別 (= leader でなくても他人の group) → 従来どおり pgrp 送信。
+        // 孫まで確実に届く。
+        _ => kill(Pid::from_raw(-child.as_raw()), sig),
     }
 }
 
@@ -2058,30 +2067,22 @@ mod tests {
     /// **test プロセス自身と兄弟 daemon を SIGTERM** していた。無関係な test が
     /// `UnexpectedEof("size header")` で落ちる原因。
     ///
-    /// 検証方法: 自分自身 (= 確実に pgrp leader ではない状況を作れる) を対象に
-    /// signal 0 (= 存在確認のみ、実際には配送されない) を送り、pgrp 経路に
-    /// 落ちないことを確認する。SIGKILL 等を使うと test 自身が死ぬので使わない。
+    /// 検証方法: 自分自身を対象にする (= child の pgrp == 自分の pgrp という、
+    /// まさに自爆する条件)。SIGCONT は既に動作中のプロセスには実質無害なので、
+    /// 単体送信に落ちていれば test は生き残る。旧実装なら pgrp 送信になっていた。
     #[test]
-    fn kill_pgrp_does_not_signal_own_process_group_when_child_is_not_leader() {
+    fn kill_pgrp_falls_back_to_single_target_when_child_shares_our_group() {
         let me = nix::unistd::getpid();
-        let my_pgid = nix::unistd::getpgrp();
-        // test プロセスが pgrp leader だと前提が作れないので、その場合は skip
-        // (= cargo test は通常 leader ではないが、環境により異なる)。
-        if me == my_pgid {
-            return;
-        }
-        // signal 0 は「送信可能かの確認」だけで配送されない (POSIX kill(2))。
-        // 旧実装ならここで pgrp 全体 (= 自分含む) を対象にしていた。
-        // 新実装は pgid != child を検出して child 単体送信に落ちる。
+        // 前提の明示: 自分自身は当然「自分と同じ pgrp」に居る。
+        assert_eq!(
+            nix::unistd::getpgid(Some(me)).expect("getpgid"),
+            nix::unistd::getpgrp(),
+            "この test は「対象が自分と同じ process group に居る」状況を前提にする"
+        );
+        // 新実装は同一 pgrp を検出して単体送信に落ちる (= 自爆しない)。
         assert!(
             kill_pgrp(me, Signal::SIGCONT).is_ok(),
-            "自分自身を対象にしても pgrp 送信で自爆せず、単体送信で成功するべき"
-        );
-        // 実際に pgrp leader でないことを確認 (= 前提の明示)
-        assert_ne!(
-            nix::unistd::getpgid(Some(me)).expect("getpgid"),
-            me,
-            "この test は「child が pgrp leader でない」状況を前提にする"
+            "自分と同じ pgrp の対象には単体送信で届くべき"
         );
     }
 
