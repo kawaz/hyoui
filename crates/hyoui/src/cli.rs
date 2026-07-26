@@ -22,8 +22,8 @@
 //!   after a `--` separator: `hyoui run [opts] -- cmd [args...]`.
 //! * `completion <shell>` — print a shell completion script.
 //!
-//! Reserved (not yet implemented): `send`, `attach`, `status` for socket-based
-//! remote control.
+//! Reserved (not yet implemented): `tx` for socket-based remote control
+//! (= `RESERVED_TOP_LEVEL_SUBCOMMANDS` が正本)。
 //!
 //! When no subcommand is given, or an unknown subcommand is supplied, or the
 //! user passes `--help` / `-h`, the parser returns `Command::Help`. There is
@@ -1756,7 +1756,8 @@ fn parse_tail(args: &[String]) -> Command {
             follow = true;
             Ok(false)
         }
-        // DR-0006 §11 では `--strip`、現状実装は `--strip-ansi`。両対応 (= 後方互換 + DR 整合)。
+        // primary は `--strip-ansi` (= 長形、cli-design-preferences)。`--strip` は
+        // DR-0006 §11 由来の alias として受理し続ける。
         "--strip" | "--strip-ansi" => {
             strip_ansi = true;
             Ok(false)
@@ -1772,7 +1773,8 @@ fn parse_tail(args: &[String]) -> Command {
             since_strict = true;
             Ok(false)
         }
-        // DR-0006 §11 では `--last`、現状実装は `--last-bytes`。両対応 (= 後方互換 + DR 整合)。
+        // primary は `--last-bytes` (= 長形で単位が明示される)。`--last` は
+        // DR-0006 §11 由来の alias として受理し続ける。
         "--last" | "--last-bytes" => {
             let v = value.ok_or_else(|| Command::Error(format!("tail: {opt} requires a value")))?;
             let n = v
@@ -6783,7 +6785,7 @@ mod tests {
 
     #[test]
     fn parse_tail_strip_dr_alias() {
-        // DR-0006 §11 では `--strip`。現状実装は `--strip-ansi`。両 alias 動作確認。
+        // primary は `--strip-ansi`、`--last` 同様に短形 `--strip` も alias として受理する。
         match parse_args(&args(&["tail", "demo", "--strip"])) {
             Command::Tail(cfg) => assert!(cfg.strip_ansi),
             other => panic!("expected Tail, got {other:?}"),
@@ -6796,7 +6798,7 @@ mod tests {
 
     #[test]
     fn parse_tail_last_dr_alias() {
-        // DR-0006 §11 では `--last N`。現状実装は `--last-bytes N`。両 alias 動作確認。
+        // primary は `--last-bytes N`、短形 `--last N` も alias として受理する。
         match parse_args(&args(&["tail", "demo", "--last=4096"])) {
             Command::Tail(cfg) => assert_eq!(cfg.last_bytes, Some(4096)),
             other => panic!("expected Tail, got {other:?}"),
