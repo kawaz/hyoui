@@ -1139,23 +1139,77 @@ mod tests {
         false
     }
 
-    /// `<indent>` + `label)` の形をした case arm ラベル行か (indent 一致で判定)。
-    fn is_arm_label_at(line: &str, indent: usize) -> bool {
-        let lead = line.len() - line.trim_start().len();
-        if lead != indent {
-            return false;
+    /// bash script から、ある subcommand の候補ブロックの行範囲を切り出す。
+    ///
+    /// bash 側のブロックは 2 形ある: `case "$sub"` の arm (`run)` ... `;;`) と、
+    /// 早期 dispatch する `if [[ "$sub" == "input" ]]` ... `fi`。両方に対応する。
+    /// `parent` を渡すと、その parent ブロックの内側だけを探す (= `screen dump` 等の
+    /// 子 arm、および top-level `list)` と `record list)` の取り違え防止)。
+    fn bash_block<'a>(s: &'a str, sub: &str, parent: Option<&str>) -> Vec<&'a str> {
+        let lines: Vec<&str> = s.lines().collect();
+        let indent = |l: &str| l.len() - l.trim_start().len();
+        // parent 指定時は探索範囲を parent ブロックに限定する。
+        let (lo, hi) = match parent {
+            // parent 無しは top-level。`case "$sub" in` 以降に限定しないと、先に現れる
+            // 入れ子 arm (= `record` ブロック内の `list)`) を掴んでしまう。
+            None => (
+                lines
+                    .iter()
+                    .position(|l| l.trim() == "case \"$sub\" in")
+                    .unwrap_or(0),
+                lines.len(),
+            ),
+            Some(p) => {
+                let start = lines
+                    .iter()
+                    .position(|l| l.contains(&format!("\"$sub\" == \"{p}\"")))
+                    .unwrap_or(0);
+                let base = indent(lines[start]);
+                let end = lines[start + 1..]
+                    .iter()
+                    .position(|l| l.trim() == "fi" && indent(l) == base)
+                    .map(|i| start + 1 + i)
+                    .unwrap_or(lines.len());
+                (start, end)
+            }
+        };
+        let arm = format!("{sub})");
+        let if_head = format!("\"$sub\" == \"{sub}\"");
+        // `if [[ "$sub" == "input" ]]` 形の早期 dispatch は `case "$sub" in` より
+        // 手前にあるので、範囲を絞る前に script 全体から探す。
+        let start = lines
+            .iter()
+            .position(|l| l.contains(&if_head))
+            .filter(|_| parent.is_none())
+            .or_else(|| {
+                (lo..hi).find(|&i| {
+                    let t = lines[i].trim();
+                    t == arm || t.starts_with(&format!("{arm} "))
+                })
+            });
+        let Some(start) = start else {
+            return Vec::new();
+        };
+        let base = indent(lines[start]);
+        let is_if = lines[start].contains(&if_head);
+        let mut out = Vec::new();
+        let end = hi.max(start + 1);
+        for &line in &lines[start + 1..end] {
+            let t = line.trim();
+            let ind = indent(line);
+            let ends = if is_if {
+                t == "fi" && ind == base
+            } else {
+                // 次の同 indent arm ラベル、または case の終端。
+                (ind == base && t.ends_with(')') && !t.starts_with('-') && !t.contains(' '))
+                    || (t == "esac" && ind < base)
+            };
+            if ends {
+                break;
+            }
+            out.push(line);
         }
-        let t = line.trim();
-        t.ends_with(')') && !t.contains(' ') && !t.starts_with('-')
-    }
-
-    /// `label)` 形の case arm ラベル行を全部探し、`(行番号, indent)` を返す。
-    fn arm_starts(s: &str, label: &str) -> Vec<(usize, usize)> {
-        s.lines()
-            .enumerate()
-            .filter(|(_, l)| l.trim() == format!("{label})"))
-            .map(|(i, l)| (i, l.len() - l.trim_start().len()))
-            .collect()
+        out
     }
 
     /// Long flags a shell script offers **for a specific subcommand**.
@@ -1178,11 +1232,10 @@ mod tests {
                 if !name.is_empty() {
                     out.insert(name);
                 }
-                rest = &after[..];
-                if rest.is_empty() {
+                if after.is_empty() {
                     break;
                 }
-                rest = &rest[1..];
+                rest = &after[1..];
             }
         };
         match sh {
@@ -1197,26 +1250,21 @@ mod tests {
                     // fish は `-l name` で long option を宣言する。
                     let mut it = line.split_whitespace().peekable();
                     while let Some(tok) = it.next() {
-                        if tok == "-l" {
-                            if let Some(name) = it.peek() {
-                                out.insert((*name).to_string());
-                            }
+                        if tok == "-l"
+                            && let Some(name) = it.peek()
+                        {
+                            out.insert((*name).to_string());
                         }
                     }
                 }
             }
             Shell::Bash => {
-                // case arm を **同じ indent の次の arm ラベルまで** で切り出す。
-                // 内側 case (= `--socket)` 等) の `;;` で打ち切ると arm 本体の
-                // 候補行を取りこぼすため、終端は indent で判定する。
-                let key = sub.rsplit(' ').next().unwrap_or(sub);
-                for (label_line, indent) in arm_starts(&s, key) {
-                    for line in s.lines().skip(label_line + 1) {
-                        if is_arm_label_at(line, indent) {
-                            break;
-                        }
-                        push_long_flags(line, &mut out);
-                    }
+                let (parent, leaf) = match sub.split_once(' ') {
+                    Some((p, c)) => (Some(p), c),
+                    None => (None, sub),
+                };
+                for line in bash_block(&s, leaf, parent) {
+                    push_long_flags(line, &mut out);
                 }
             }
             _ => {
@@ -1234,9 +1282,19 @@ mod tests {
                     }
                     return out;
                 }
-                let leaf = sub.rsplit(' ').next().unwrap_or(sub);
+                // 親付き (= `record list`) は親関数 `_hyoui_<parent>()` の内側だけを
+                // 見る。top-level `list)` と `record list)` は同名 arm なので、範囲を
+                // 絞らないと取り違える。
+                let (scope, leaf) = match sub.split_once(' ') {
+                    Some((parent, child)) => {
+                        let head = format!("_hyoui_{parent}() {{");
+                        let start = s.find(&head).map_or(0, |i| i);
+                        (&s[start..], child)
+                    }
+                    None => (s.as_str(), sub),
+                };
                 let mut in_arm = false;
-                for line in s.lines() {
+                for line in scope.lines() {
                     let t = line.trim();
                     if !in_arm {
                         if t == format!("{leaf})") {
@@ -1286,12 +1344,20 @@ mod tests {
         ];
         for sh in ALL_SHELLS {
             for (sub, argv0) in targets {
-                for flag in flags_for(sh, sub) {
-                    if flag == "help" {
-                        continue; // help は必ず Help topic に落ちる
+                let flags = flags_for(sh, sub);
+                // 抽出器がブロックを見つけられないと候補 0 件で「素通り green」に
+                // なる (= 検証が空回りする)。空集合自体を失敗として扱う。
+                assert!(
+                    !flags.is_empty(),
+                    "shell {sh:?}: no flags extracted for `{sub}` (extractor out of sync?)"
+                );
+                for flag in flags {
+                    // `--help` / `--version` は subcommand 引数ではなく global flag
+                    // (= Help / Version topic に落ちる) なので受理検査の対象外。
+                    if flag == "help" || flag == "version" {
+                        continue;
                     }
-                    let mut argv: Vec<String> =
-                        argv0.iter().map(|s| (*s).to_string()).collect();
+                    let mut argv: Vec<String> = argv0.iter().map(|s| (*s).to_string()).collect();
                     // value 有無を問わず「未知 option」判定だけを見たいので、値付きで渡す。
                     argv.push(format!("--{flag}=x"));
                     if let hyoui::cli::Command::Error(msg) = hyoui::cli::parse_args(&argv) {
