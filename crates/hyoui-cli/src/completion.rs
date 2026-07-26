@@ -11,7 +11,7 @@
 //! `SCREEN_SUBCOMMANDS`, `LOCK_SUBCOMMANDS`, `RECORD_SUBCOMMANDS`,
 //! `SNAPSHOT_INCLUDE_VALUES`, ...). The completion tests assert that every
 //! element of those constants appears in all three shell scripts and that no
-//! reserved subcommand (`send` / `tx`) leaks into the candidates.
+//! reserved subcommand leaks into the candidates.
 //!
 //! Reserved-but-unimplemented subcommands are intentionally **not** offered:
 //! `parse_args` returns a "reserved but not yet implemented" error for them, so
@@ -57,8 +57,8 @@ _hyoui() {
 
     if [[ -z "$sub" ]]; then
         # Top-level: implemented subcommands + global flags.
-        # (reserved subcommands send/tx are intentionally omitted.)
-        COMPREPLY=( $(compgen -W "run attach list kill status set tail wait screen input lock unlock detach record upgrade config completion --help -h --version -V" -- "$cur") )
+        # (reserved-but-unimplemented subcommands are intentionally omitted.)
+        COMPREPLY=( $(compgen -W "run attach list kill status set tail wait screen input lock unlock detach record web upgrade config completion --help -h --version -V" -- "$cur") )
         return 0
     fi
 
@@ -194,7 +194,7 @@ _hyoui() {
     if [[ "$sub" == "input" ]]; then
         case "$prev" in
             --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-            --namespace|--index|--timeout|--lock-token|--max-file-bytes) return 0 ;;
+            --namespace|--index|--timeout|--lock-token|--max-file-bytes|--auto-lock-timeout-acquire) return 0 ;;
         esac
         # spec prefix の途中 (= "text:" / "key:" 等) に来たら value 部分は補完しない
         # (= 任意文字列 / regex / path)。ただし "file:" の場合は path 補完を提供。
@@ -217,7 +217,7 @@ _hyoui() {
                 done
                 return 0 ;;
         esac
-        COMPREPLY=( $(compgen -W "--socket --namespace --index --timeout --lock-token --max-file-bytes --help -h text: hex: file: paste: key: wait: wait-idle:" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--socket --namespace --index --timeout --lock-token --max-file-bytes --auto-lock-timeout-acquire --help -h text: hex: file: paste: key: wait: wait-idle:" -- "$cur") )
         return 0
     fi
 
@@ -228,9 +228,9 @@ _hyoui() {
                     COMPREPLY=( $(compgen -W "notify auto-resume" -- "$cur") ); return 0 ;;
                 --stdin-eof)
                     COMPREPLY=( $(compgen -W "detach send-eof" -- "$cur") ); return 0 ;;
-                --socket)
+                --socket|--debug-dump-server|--debug-dump-client)
                     _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                --namespace|--timeout|--idle-timeout|--until|--size|--cols|--rows|--scrollback-rows)
+                --namespace|--session|--timeout|--idle-timeout|--until|--size|--cols|--rows|--scrollback-rows)
                     return 0 ;;
             esac
             case "$cur" in
@@ -239,14 +239,14 @@ _hyoui() {
                 --stdin-eof=*)
                     COMPREPLY=( $(compgen -W "detach send-eof" -- "${cur#*=}") ); return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --timeout --idle-timeout --until --on-child-suspend --stdin-eof --scrollback-rows --size --cols --rows --help -h --" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --namespace --session --detached --timeout --idle-timeout --until --on-child-suspend --stdin-eof --scrollback-rows --no-scrub-env --debug-dump-server --debug-dump-client --size --cols --rows --help -h --" -- "$cur") )
             return 0 ;;
         completion)
             COMPREPLY=( $(compgen -W "bash zsh fish --help -h" -- "$cur") )
             return 0 ;;
         attach)
             case "$prev" in
-                --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                --socket|--debug-dump-client) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
                 --mode) COMPREPLY=( $(compgen -W "rw ro rw-no-leader" -- "$cur") ); return 0 ;;
                 --stdin-eof) COMPREPLY=( $(compgen -W "detach send-eof" -- "$cur") ); return 0 ;;
                 --namespace|--index) return 0 ;;
@@ -255,7 +255,7 @@ _hyoui() {
                 --stdin-eof=*)
                     COMPREPLY=( $(compgen -W "detach send-eof" -- "${cur#*=}") ); return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --index --mode --stdin-eof --exclusive --detach-others --quiet --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --namespace --index --mode --stdin-eof --exclusive --detach-others --quiet --debug-dump-client --help -h" -- "$cur") )
             return 0 ;;
         list)
             case "$cur" in
@@ -297,6 +297,13 @@ _hyoui() {
                 --namespace|--index|--since|--last-bytes) return 0 ;;
             esac
             COMPREPLY=( $(compgen -W "--socket --namespace --index --follow --strip-ansi --since --since-strict --last-bytes --help -h" -- "$cur") )
+            return 0 ;;
+        web)
+            case "$prev" in
+                --web-assets-dir) _filedir -d 2>/dev/null || COMPREPLY=( $(compgen -d -- "$cur") ); return 0 ;;
+                --listen) return 0 ;;
+            esac
+            COMPREPLY=( $(compgen -W "--listen --web-assets-dir --help -h" -- "$cur") )
             return 0 ;;
         wait)
             case "$prev" in
@@ -369,6 +376,7 @@ _hyoui() {
                         '--exclusive[Deny attach if another rw client is present]' \
                         '--detach-others[Detach other clients on attach (steal)]' \
                         '--quiet[Suppress the detach/peek hint on attach]' \
+                        '--debug-dump-client=[Append daemon->client raw bytes to a file]:file:_files' \
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:session id:'
                     ;;
@@ -472,6 +480,12 @@ _hyoui() {
                 record)
                     _hyoui_record
                     ;;
+                web)
+                    _arguments \
+                        '--listen=[Bind address host:port (default 127.0.0.1:43690)]:address:' \
+                        '--web-assets-dir=[Serve static assets from a local directory]:dir:_files -/' \
+                        '(-h --help)'{-h,--help}'[Show help]'
+                    ;;
                 config)
                     _hyoui_config
                     ;;
@@ -497,6 +511,7 @@ _hyoui_subcommands() {
         'unlock:Release a session lock (= lock release alias)'
         'detach:Detach all attached clients from a session'
         'record:Record tty I/O timeline (start, stop, list)'
+        'web:Start the HTTP gateway (REST + HTML UI, DR-0027)'
         'upgrade:Trigger daemon graceful self-exec upgrade (DR-0028)'
         'config:Inspect the user config file (path, show)'
         'completion:Print a shell completion script'
@@ -686,6 +701,7 @@ _hyoui_input() {
         '--timeout=[Per-spec timeout (e.g. 5s)]:duration:' \
         '--lock-token=[Explicit lock token (overrides HYOUI_LOCK_TOKEN)]:token:' \
         '--max-file-bytes=[Max bytes for file: spec (0 = unlimited)]:bytes:' \
+        '--auto-lock-timeout-acquire=[Auto-lock acquire timeout (default 30s, DR-0022)]:duration:' \
         '(-h --help)'{-h,--help}'[Show help]' \
         '*::spec:_hyoui_input_spec'
 }
@@ -723,6 +739,8 @@ _hyoui_run() {
     _arguments \
         '--socket=[Unix socket path]:socket:_files' \
         '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
+        '--session=[Explicit session id instead of auto-numbering (DR-0015)]:session:' \
+        '--detached[Fork the daemon and exit immediately (DR-0015)]' \
         '--timeout=[Overall timeout (e.g. 30s / 1m / 1h30m)]:duration:' \
         '--idle-timeout=[Output idle timeout (e.g. 500ms / 5s)]:duration:' \
         '--until=[Terminate when PATTERN appears in output]:pattern:' \
@@ -732,6 +750,9 @@ _hyoui_run() {
         '--on-child-suspend=[Action when child is stopped]:action:(notify auto-resume)' \
         '--stdin-eof=[stdin EOF action]:action:(detach send-eof)' \
         '--scrollback-rows=[vt100 scrollback ring max rows (default 1000)]:rows:' \
+        '--no-scrub-env[Disable child env scrubbing (DR-0024 escape hatch)]' \
+        '--debug-dump-server=[Append child PTY raw bytes to a file]:file:_files' \
+        '--debug-dump-client=[Append daemon->client raw bytes to a file]:file:_files' \
         '(-h --help)'{-h,--help}'[Show help]' \
         '*::child command:_normal'
 }
@@ -744,13 +765,13 @@ fn fish() -> &'static str {
     r#"# fish completion for hyoui
 
 # Detect whether a known (implemented) subcommand has already been provided.
-# reserved subcommands send/tx are intentionally not listed.
+# Reserved-but-unimplemented subcommands are intentionally not listed.
 function __hyoui_using_subcommand
     set -l cmd (commandline -opc)
     set -e cmd[1]
     for arg in $cmd
         switch $arg
-            case run attach list kill status set tail wait screen input lock unlock detach record upgrade config completion
+            case run attach list kill status set tail wait screen input lock unlock detach record web upgrade config completion
                 if test "$arg" = "$argv[1]"
                     return 0
                 end
@@ -765,7 +786,7 @@ function __hyoui_no_subcommand
     set -e cmd[1]
     for arg in $cmd
         switch $arg
-            case run attach list kill status set tail wait screen input lock unlock detach record upgrade config completion
+            case run attach list kill status set tail wait screen input lock unlock detach record web upgrade config completion
                 return 1
         end
     end
@@ -829,7 +850,7 @@ function __hyoui_screen_no_sub
     __hyoui_child_none screen
 end
 
-# Top-level: implemented subcommands (reserved send/tx omitted).
+# Top-level: implemented subcommands (reserved ones omitted).
 complete -c hyoui -n __hyoui_no_subcommand -f -a run        -d 'Run a command inside a PTY as a transparent proxy'
 complete -c hyoui -n __hyoui_no_subcommand -f -a attach     -d 'Attach to a running session'
 complete -c hyoui -n __hyoui_no_subcommand -f -a list       -d 'List daemon sessions'
@@ -844,6 +865,8 @@ complete -c hyoui -n __hyoui_no_subcommand -f -a lock       -d 'Acquire / releas
 complete -c hyoui -n __hyoui_no_subcommand -f -a unlock     -d 'Release a session lock (= lock release alias)'
 complete -c hyoui -n __hyoui_no_subcommand -f -a detach     -d 'Detach all attached clients from a session'
 complete -c hyoui -n __hyoui_no_subcommand -f -a record     -d 'Record tty I/O timeline'
+complete -c hyoui -n __hyoui_no_subcommand -f -a web        -d 'Start the HTTP gateway (REST + HTML UI, DR-0027)'
+complete -c hyoui -n __hyoui_no_subcommand -f -a upgrade    -d 'Trigger daemon graceful self-exec upgrade (DR-0028)'
 complete -c hyoui -n __hyoui_no_subcommand -f -a config     -d 'Inspect the user config file (path, show)'
 complete -c hyoui -n __hyoui_no_subcommand -f -a completion -d 'Print a shell completion script'
 
@@ -863,6 +886,11 @@ complete -c hyoui -n '__hyoui_using_subcommand run' -l rows              -x     
 complete -c hyoui -n '__hyoui_using_subcommand run' -l on-child-suspend  -x -a 'notify auto-resume'       -d 'Action when child is stopped'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l stdin-eof         -x -a 'detach send-eof'          -d 'stdin EOF action'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l scrollback-rows   -x                              -d 'vt100 scrollback ring max rows (default 1000)'
+complete -c hyoui -n '__hyoui_using_subcommand run' -l session           -x                              -d 'Explicit session id instead of auto-numbering (DR-0015)'
+complete -c hyoui -n '__hyoui_using_subcommand run' -l detached                                           -d 'Fork the daemon and exit immediately (DR-0015)'
+complete -c hyoui -n '__hyoui_using_subcommand run' -l no-scrub-env                                       -d 'Disable child env scrubbing (DR-0024 escape hatch)'
+complete -c hyoui -n '__hyoui_using_subcommand run' -l debug-dump-server -r -F                          -d 'Append child PTY raw bytes to a file'
+complete -c hyoui -n '__hyoui_using_subcommand run' -l debug-dump-client -r -F                          -d 'Append daemon->client raw bytes to a file'
 complete -c hyoui -n '__hyoui_using_subcommand run' -s h -l help                                          -d 'Show help and exit'
 
 # `hyoui completion` options.
@@ -878,6 +906,7 @@ complete -c hyoui -n '__hyoui_using_subcommand attach' -l stdin-eof      -x -a '
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l exclusive                                     -d 'Deny attach if another rw client is present'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l detach-others                                 -d 'Detach other clients on attach (steal)'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l quiet                                          -d 'Suppress the detach/peek hint on attach'
+complete -c hyoui -n '__hyoui_using_subcommand attach' -l debug-dump-client -r -F                        -d 'Append daemon->client raw bytes to a file'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -s h -l help                                    -d 'Show help and exit'
 
 # `hyoui list` options.
@@ -963,6 +992,7 @@ complete -c hyoui -n '__hyoui_using_subcommand input' -l namespace -x -d 'Sessio
 complete -c hyoui -n '__hyoui_using_subcommand input' -l timeout         -x      -d 'Per-spec timeout (e.g. 5s)'
 complete -c hyoui -n '__hyoui_using_subcommand input' -l lock-token      -x      -d 'Explicit lock token (overrides HYOUI_LOCK_TOKEN)'
 complete -c hyoui -n '__hyoui_using_subcommand input' -l max-file-bytes  -x      -d 'Max bytes for file: spec (0 = unlimited)'
+complete -c hyoui -n '__hyoui_using_subcommand input' -l auto-lock-timeout-acquire -x -d 'Auto-lock acquire timeout (default 30s, DR-0022)'
 complete -c hyoui -n '__hyoui_using_subcommand input' -s h -l help              -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_using_subcommand input' -f -a 'text\: hex\: file\: paste\: key\: wait\: wait-idle\:' -d 'Input spec prefix'
 
@@ -1003,6 +1033,19 @@ complete -c hyoui -n '__hyoui_using_subcommand detach' -l socket -r -F -d 'Expli
 complete -c hyoui -n '__hyoui_using_subcommand detach' -l index  -x    -d 'Session selector (1=oldest, -1=newest)'
 complete -c hyoui -n '__hyoui_using_subcommand detach' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand detach' -s h -l help    -d 'Show help and exit'
+
+# `hyoui web` options (DR-0027)
+complete -c hyoui -n '__hyoui_using_subcommand web' -l listen          -x    -d 'Bind address host:port (default 127.0.0.1:43690)'
+complete -c hyoui -n '__hyoui_using_subcommand web' -l web-assets-dir  -r -F -d 'Serve static assets from a local directory'
+complete -c hyoui -n '__hyoui_using_subcommand web' -s h -l help             -d 'Show help and exit'
+
+# `hyoui upgrade` options (DR-0028)
+complete -c hyoui -n '__hyoui_using_subcommand upgrade' -l socket -r -F -d 'Explicit socket path'
+complete -c hyoui -n '__hyoui_using_subcommand upgrade' -l index  -x    -d 'Session selector (1=oldest, -1=newest)'
+complete -c hyoui -n '__hyoui_using_subcommand upgrade' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
+complete -c hyoui -n '__hyoui_using_subcommand upgrade' -l binary -r -F -d 'Override the daemon exec target path'
+complete -c hyoui -n '__hyoui_using_subcommand upgrade' -l skip-version-check -d 'Skip <binary> --version pre-check (test only)'
+complete -c hyoui -n '__hyoui_using_subcommand upgrade' -s h -l help    -d 'Show help and exit'
 
 # `hyoui record` 子 subcommand
 function __hyoui_record_using_sub
@@ -1094,6 +1137,243 @@ mod tests {
             start = i + 1;
         }
         false
+    }
+
+    /// `<indent>` + `label)` の形をした case arm ラベル行か (indent 一致で判定)。
+    fn is_arm_label_at(line: &str, indent: usize) -> bool {
+        let lead = line.len() - line.trim_start().len();
+        if lead != indent {
+            return false;
+        }
+        let t = line.trim();
+        t.ends_with(')') && !t.contains(' ') && !t.starts_with('-')
+    }
+
+    /// `label)` 形の case arm ラベル行を全部探し、`(行番号, indent)` を返す。
+    fn arm_starts(s: &str, label: &str) -> Vec<(usize, usize)> {
+        s.lines()
+            .enumerate()
+            .filter(|(_, l)| l.trim() == format!("{label})"))
+            .map(|(i, l)| (i, l.len() - l.trim_start().len()))
+            .collect()
+    }
+
+    /// Long flags a shell script offers **for a specific subcommand**.
+    ///
+    /// 全文 substring 検索では「どの subcommand の候補か」を問えないため、各 shell の
+    /// 構文に沿って当該 subcommand のブロックだけを切り出して flag を集める。
+    /// `sub` は `"run"` のような top-level 名、または `"screen dump"` のような
+    /// 親子ペア。返るのは `--` を除いた flag 名 (= `socket` / `detached` ...)。
+    fn flags_for(sh: Shell, sub: &str) -> std::collections::BTreeSet<String> {
+        let s = script(sh);
+        let mut out = std::collections::BTreeSet::new();
+        let push_long_flags = |line: &str, out: &mut std::collections::BTreeSet<String>| {
+            let mut rest = line;
+            while let Some(i) = rest.find("--") {
+                let after = &rest[i + 2..];
+                let name: String = after
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .collect();
+                if !name.is_empty() {
+                    out.insert(name);
+                }
+                rest = &after[..];
+                if rest.is_empty() {
+                    break;
+                }
+                rest = &rest[1..];
+            }
+        };
+        match sh {
+            Shell::Fish => {
+                // `complete -c hyoui -n '__hyoui_using_subcommand run' -l socket ...`
+                // 親子は `__hyoui_<parent>_using_sub <child>`。
+                let needle = match sub.split_once(' ') {
+                    Some((parent, child)) => format!("__hyoui_{parent}_using_sub {child}'"),
+                    None => format!("__hyoui_using_subcommand {sub}'"),
+                };
+                for line in s.lines().filter(|l| l.contains(&needle)) {
+                    // fish は `-l name` で long option を宣言する。
+                    let mut it = line.split_whitespace().peekable();
+                    while let Some(tok) = it.next() {
+                        if tok == "-l" {
+                            if let Some(name) = it.peek() {
+                                out.insert((*name).to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Shell::Bash => {
+                // case arm を **同じ indent の次の arm ラベルまで** で切り出す。
+                // 内側 case (= `--socket)` 等) の `;;` で打ち切ると arm 本体の
+                // 候補行を取りこぼすため、終端は indent で判定する。
+                let key = sub.rsplit(' ').next().unwrap_or(sub);
+                for (label_line, indent) in arm_starts(&s, key) {
+                    for line in s.lines().skip(label_line + 1) {
+                        if is_arm_label_at(line, indent) {
+                            break;
+                        }
+                        push_long_flags(line, &mut out);
+                    }
+                }
+            }
+            _ => {
+                // zsh: top-level は `_hyoui_<sub>()` 関数 or `case $line[1]` の arm、
+                // 親子は `_hyoui_<parent>()` 内の子 arm。どちらも「`sub)` から次の
+                // `;;` まで」または「`_hyoui_sub() {` から `}` まで」で切り出す。
+                let key = sub.replace(' ', "_");
+                let fn_head = format!("_hyoui_{key}() {{");
+                if let Some(start) = s.find(&fn_head) {
+                    for line in s[start..].lines().skip(1) {
+                        if line.starts_with('}') {
+                            break;
+                        }
+                        push_long_flags(line, &mut out);
+                    }
+                    return out;
+                }
+                let leaf = sub.rsplit(' ').next().unwrap_or(sub);
+                let mut in_arm = false;
+                for line in s.lines() {
+                    let t = line.trim();
+                    if !in_arm {
+                        if t == format!("{leaf})") {
+                            in_arm = true;
+                        }
+                        continue;
+                    }
+                    if t == ";;" {
+                        break;
+                    }
+                    push_long_flags(line, &mut out);
+                }
+            }
+        }
+        out
+    }
+
+    /// 逆方向検証: completion が出す flag を実装 (`parse_args`) が受理するか。
+    ///
+    /// 既存テストは「実装/SSOT → completion」の片方向しか見ておらず、completion 側に
+    /// だけ存在する幽霊 flag (= 実装が `unknown option` で弾く) を検出できなかった
+    /// (`self-written-rule-blind-spots` の片面ルール)。本テストがその対極を埋める。
+    #[test]
+    fn completion_flags_are_accepted_by_parser() {
+        // (subcommand, completion 抽出キー, parse 用の前置引数)。
+        let targets: &[(&str, &[&str])] = &[
+            ("run", &["run"]),
+            ("attach", &["attach"]),
+            ("list", &["list"]),
+            ("kill", &["kill"]),
+            ("status", &["status"]),
+            ("set", &["set"]),
+            ("tail", &["tail"]),
+            ("wait", &["wait"]),
+            ("input", &["input"]),
+            ("unlock", &["unlock"]),
+            ("detach", &["detach"]),
+            ("upgrade", &["upgrade"]),
+            ("web", &["web"]),
+            ("screen dump", &["screen", "dump"]),
+            ("screen snapshot", &["screen", "snapshot"]),
+            ("lock acquire", &["lock", "acquire"]),
+            ("lock release", &["lock", "release"]),
+            ("record start", &["record", "start"]),
+            ("record stop", &["record", "stop"]),
+            ("record list", &["record", "list"]),
+        ];
+        for sh in ALL_SHELLS {
+            for (sub, argv0) in targets {
+                for flag in flags_for(sh, sub) {
+                    if flag == "help" {
+                        continue; // help は必ず Help topic に落ちる
+                    }
+                    let mut argv: Vec<String> =
+                        argv0.iter().map(|s| (*s).to_string()).collect();
+                    // value 有無を問わず「未知 option」判定だけを見たいので、値付きで渡す。
+                    argv.push(format!("--{flag}=x"));
+                    if let hyoui::cli::Command::Error(msg) = hyoui::cli::parse_args(&argv) {
+                        // 値エラー (= `unknown signal: "x"`) は「flag 自体は受理」なので
+                        // 対象外。flag 名が未知の場合だけを落とす。
+                        let unknown_flag = (msg.contains("unknown") && msg.contains("option"))
+                            || msg.contains("unexpected argument");
+                        assert!(
+                            !unknown_flag,
+                            "shell {sh:?}: `{sub}` completes `--{flag}` but parser rejects it: {msg}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// SSOT: 主要 flag が **その subcommand の文脈で** 補完される。
+    ///
+    /// 全文検索だと他 subcommand のブロックに同名 flag があるだけで green になる
+    /// (= fish の `upgrade` 欠落がすり抜けた原因と同型)。
+    #[test]
+    fn completion_subcommand_scoped_flags_present() {
+        let expect: &[(&str, &[&str])] = &[
+            (
+                "run",
+                &[
+                    "socket",
+                    "session",
+                    "detached",
+                    "no-scrub-env",
+                    "debug-dump-server",
+                    "debug-dump-client",
+                ],
+            ),
+            ("attach", &["mode", "debug-dump-client"]),
+            ("tail", &["strip-ansi", "last-bytes"]),
+            ("input", &["auto-lock-timeout-acquire"]),
+            ("web", &["listen", "web-assets-dir"]),
+            ("upgrade", &["binary", "skip-version-check"]),
+        ];
+        for sh in ALL_SHELLS {
+            for (sub, flags) in expect {
+                let got = flags_for(sh, sub);
+                for f in *flags {
+                    assert!(
+                        got.contains(*f),
+                        "shell {sh:?}: `{sub}` does not complete `--{f}` (got: {got:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 全 shell が top-level 候補として `web` / `upgrade` を **実際に出す**。
+    ///
+    /// fish はヘルパ関数 `__hyoui_using_subcommand` の `case` にも同じ token が並ぶ
+    /// ため、token 検索だけでは候補行の欠落を検出できない (= 実際にすり抜けた)。
+    /// ここでは候補宣言そのものの形を検査する。
+    #[test]
+    fn completion_top_level_candidate_lines_exist() {
+        for sub in ["web", "upgrade"] {
+            let fish = script(Shell::Fish);
+            assert!(
+                fish.contains(&format!("-a {sub} ")) || fish.contains(&format!("-a {sub}\n")),
+                "fish missing top-level candidate line for `{sub}`"
+            );
+            let zsh = script(Shell::Zsh);
+            assert!(
+                zsh.contains(&format!("'{sub}:")),
+                "zsh missing top-level candidate entry for `{sub}`"
+            );
+            let bash = script(Shell::Bash);
+            let top = bash
+                .lines()
+                .find(|l| l.contains("compgen -W \"run attach"))
+                .expect("bash top-level candidate line not found");
+            assert!(
+                contains_token(top, sub),
+                "bash top-level candidate line missing `{sub}`"
+            );
+        }
     }
 
     #[test]
