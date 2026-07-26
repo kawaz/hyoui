@@ -474,7 +474,7 @@ pub struct SetConfig {
 /// timestamp filter (= `--since` / `--since-strict`) も byte-base scrollback 上で動作する。
 ///
 /// 用途は **log / script monitor**、**asciinema record の前段**、**daemon に届く生 bytes
-/// の debug 確認** など。画面 mirror 用途は `hyoui attach --read-only` を使う (= DR §11.3)。
+/// の debug 確認** など。画面 mirror 用途は `hyoui attach --mode=ro` を使う (= DR §11.3)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TailConfig {
     /// Target socket path (explicit) または session_id から resolve。
@@ -1051,13 +1051,11 @@ pub fn parse_args(args: &[String]) -> Command {
         "completion" => parse_completion(rest),
         // Reserved for future stages.
         //
-        // `send` は旧 leaf 設計の名残として予約。
-        //
         // `tx` は DR-0006 §7 の自動操作排他 wrapper (= 子 process 起動 + env 注入 +
         // 子 exit で自動 unlock)。`lock` / `unlock` は実装済 (= task #20)、tx 本体は
         // `--process-bound` 等の daemon-side 機能が要るので別 task に切り出し中。
         // 詳細は `docs/issue/2026-05-27-tx-lock-unlock-cli-subcommands.md` 参照。
-        "send" | "tx" => Command::Error(format!(
+        "tx" => Command::Error(format!(
             "subcommand `{head}` is reserved but not yet implemented"
         )),
         other => Command::Help {
@@ -3948,17 +3946,19 @@ fn usage_top(unknown: Option<&str>) -> String {
             set         Change a runtime setting (set <session> <key>=<value>)\n    \
             tail        Stream scrollback / live output (--follow で継続)\n    \
             wait        Wait until predicate (text/pattern/idle) matches\n    \
-            screen      Dump / inspect virtual screen state (subcommands: dump)\n    \
+            screen      Dump / inspect virtual screen state (subcommands: dump, snapshot)\n    \
             input       Send input via spec list (DR-0006 §8; text:/key:/wait: ...)\n    \
             lock        Acquire / release a session lock (DR-0006 §7)\n    \
             unlock      Release a session lock (= `lock release` alias)\n    \
             detach      Detach all attached clients from a session (DR-0020)\n    \
             record      Record tty I/O timeline (DR-0016; start/stop/list)\n    \
             config      Inspect the user config file (path/show)\n    \
+            web         Start the HTTP gateway (REST + HTML UI, DR-0027)\n    \
+            upgrade     Trigger daemon graceful self-exec upgrade (DR-0028)\n    \
             completion  Print a shell completion script (bash|zsh|fish)\n\
         \n\
         RESERVED (not yet implemented):\n    \
-            send, tx   将来 protocol 拡張用に予約\n\
+            tx         将来 protocol 拡張用に予約\n\
         \n\
         GLOBAL OPTIONS:\n    \
             -h, --help     Show this help and exit\n    \
@@ -4014,7 +4014,6 @@ fn usage_run() -> String {
             -h, --help                    Show this help and exit\n\
         \n\
         ENVIRONMENT:\n    \
-            SHELL                  Fallback command when none is given (legacy)\n    \
             XDG_RUNTIME_DIR        Preferred base for the auto-generated socket path\n    \
             XDG_STATE_HOME         Fallback base when XDG_RUNTIME_DIR is unavailable\n                                   \
                 (otherwise $HOME/.local/state/hyoui is used; TMPDIR is not consulted)\n    \
@@ -4065,6 +4064,9 @@ fn usage_attach() -> String {
             --exclusive           他に rw client が attach 中なら attach を拒否 (DR-0020 §4)\n    \
             --detach-others       attach 成立時に他 client を全て detach して奪取 (DR-0020 §4)\n    \
             --quiet               attach 成立時の detach/peek ヒント (stderr) を抑止 (DR-0020 §5)\n    \
+            --debug-dump-client PATH\n                          \
+                daemon → client の raw bytes を file に append\n                          \
+                (state-based redraw / attach 復元込み = user の terminal 表示)\n    \
             --stdin-eof=detach|send-eof\n                          \
                 stdin EOF 時の挙動 (DR-0019)。default: 非 tty stdin なら\n                          \
                 send-eof (= EOT を子に送る)、tty なら detach\n    \
@@ -4202,7 +4204,7 @@ fn usage_tail() -> String {
         daemon の byte-base scrollback layer + 現在の子 PTY bytes stream を生のまま流す\n\
         (= DR-0013 §8 責務分離。state-based の wait/screen dump/screen snapshot とは別 layer)。\n\
         用途: log/script monitor、asciinema record の前段、debug。\n\
-        画面 mirror 用途には使わない (= ANSI 再演で崩壊する。代わりに `hyoui attach --read-only`)。\n\
+        画面 mirror 用途には使わない (= ANSI 再演で崩壊する。代わりに `hyoui attach --mode=ro`)。\n\
         \n\
         USAGE:\n    \
             hyoui tail <session-id> [options]\n    \
@@ -4215,10 +4217,10 @@ fn usage_tail() -> String {
             --index N            Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
             --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --follow             子 PTY exit / TailEnd まで stream を継続する\n    \
-            --strip              ANSI escape を strip 済の bytes を受け取る (= `--strip-ansi` alias)\n    \
+            --strip-ansi         ANSI escape を strip 済の bytes を受け取る (alias: `--strip`)\n    \
             --since DUR          過去 DUR 以内の chunk のみ流す。単位必須 (例: 500ms / 2s / 1m)\n    \
             --since-strict       --since の範囲が scrollback から evict 済なら exit 非 0\n    \
-            --last N             末尾 N bytes に絞る (= `--last-bytes` alias)\n    \
+            --last-bytes N       末尾 N bytes に絞る (alias: `--last`)\n    \
             -h, --help           Show this help and exit\n\
         \n\
         DURATION FORMAT (kawaz/timespec.mbt 仕様 + sub-ms 拡張):\n    \
@@ -4241,7 +4243,7 @@ fn usage_tail() -> String {
             hyoui tail demo --follow              # live stream を継続\n    \
             hyoui tail demo --since=10s           # 過去 10 秒分\n    \
             hyoui tail demo --since=10s --since-strict   # 10 秒が evict 済なら exit 非 0\n    \
-            hyoui tail demo --last=8192           # 末尾 8 KiB\n\
+            hyoui tail demo --last-bytes=8192     # 末尾 8 KiB\n\
         \n\
         RELATED:\n    \
             hyoui wait <id> ...       条件達成まで block (= state-based、画面 visible match)\n    \
@@ -4504,7 +4506,8 @@ fn usage_screen_dump() -> String {
                  に従って rows が cap される。0 設定なら空 payload)\n    \
             --rect X,Y,W,H      矩形指定 (forward-compat: daemon 現状無視)\n    \
             --output PATH       書き出し先 (= 未指定なら stdout)\n    \
-            --timeout DUR       response 受信 timeout (= default 5s。DUR 形式: 5s/500ms/...)\n    \
+            --timeout DUR       response 受信 timeout (DUR 形式: 5s/500ms/...)\n                        \
+                (現状 no-op: 値は parse されるが response 待ちに配線されていない)\n    \
             -h, --help          Show this help and exit\n\
         \n\
         ENVIRONMENT:\n    \
@@ -4551,7 +4554,8 @@ fn usage_screen_snapshot() -> String {
                 cbor — CBOR encoded StateSnapshotResponse (= 機械処理、default)\n                        \
                 json — JSON encoded StateSnapshotResponse (= CLI 段で serde_json 変換、jq 等で直接処理可)\n    \
             --output PATH       書き出し先 (= 未指定なら stdout)\n    \
-            --timeout DUR       response 受信 timeout (= default 5s。DUR 形式: 5s/500ms/...)\n    \
+            --timeout DUR       response 受信 timeout (DUR 形式: 5s/500ms/...)\n                        \
+                (現状 no-op: 値は parse されるが response 待ちに配線されていない)\n    \
             -h, --help          Show this help and exit\n\
         \n\
         ENVIRONMENT:\n    \
@@ -5740,8 +5744,7 @@ const INPUT_SPEC_PREFIXES: &[&str] = &["text", "hex", "file", "paste", "key", "w
 
 /// 既知の top-level subcommand 一覧 (= unknown subcommand 時の suggest 用)。
 ///
-/// reserved (`send` / `detach` / `tx`) も含める
-/// (= 「予約済」と気づかせるほうが UX 改善になる)。
+/// reserved (`tx`) も含める (= 「予約済」と気づかせるほうが UX 改善になる)。
 ///
 /// 実装済 subcommand のみが欲しい場合は [`IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS`] を使う
 /// (= completion script の single source of truth)。reserved だけが欲しい場合は
@@ -5752,17 +5755,18 @@ pub(crate) const TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
     "list",
     "kill",
     "status",
+    "set",
     "tail",
     "wait",
     "screen",
     "input",
     "completion",
-    "send",
     "detach",
     "tx",
     "lock",
     "unlock",
     "record",
+    "web",
     "upgrade",
     "config",
 ];
@@ -5779,7 +5783,7 @@ pub(crate) const TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
 /// 実装済 (= dispatch 経路が存在する) top-level subcommand 一覧。
 ///
 /// completion script はこの全要素を補完候補として出力しなければならない
-/// (= completion.rs のテストで機械検証)。reserved 語 (`send` / `tx`) は
+/// (= completion.rs のテストで機械検証)。reserved 語 (`tx`) は
 /// **含めない** (= 実装では `parse_args` が「予約だが未実装」error を返すため、
 /// 補完候補に出すと user を誤誘導する)。
 pub const IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
@@ -5797,6 +5801,7 @@ pub const IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
     "unlock",
     "detach",
     "record",
+    "web",
     "upgrade",
     "config",
     "completion",
@@ -5807,7 +5812,7 @@ pub const IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
 /// completion script はこれらを補完候補に **出してはならない**
 /// (= completion.rs のテストで機械検証、出ると user を誤誘導する)。
 /// `detach` は DR-0020 §4 で実装済 (= IMPLEMENTED へ移動)。
-pub const RESERVED_TOP_LEVEL_SUBCOMMANDS: &[&str] = &["send", "tx"];
+pub const RESERVED_TOP_LEVEL_SUBCOMMANDS: &[&str] = &["tx"];
 
 /// `hyoui screen` の子 subcommand 一覧 (= `parse_screen` が dispatch する値)。
 pub const SCREEN_SUBCOMMANDS: &[&str] = &["dump", "snapshot"];
@@ -6623,11 +6628,10 @@ mod tests {
     #[test]
     fn reserved_subcommands_return_error() {
         // attach / list / kill / status / tail / wait は実装済 (= 別 test)。
-        // `send` / `detach` は旧 leaf 設計の reserved。
         // `tx` は DR-0006 §7 の wrapper、別 task で実装中。
         // `lock` / `unlock` は task #20 で実装済 (= `parse_lock_*` がある)、本テストでは
         // 「引数なしで Error にならない (= Help か Error)」を別 test で確認するため除外。
-        for name in ["send", "detach", "tx"] {
+        for name in ["tx"] {
             match parse_args(&args(&[name])) {
                 Command::Error(msg) => assert!(msg.contains(name), "msg = {msg}"),
                 other => panic!("expected Error for `{name}`, got {other:?}"),
