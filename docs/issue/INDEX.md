@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-07-26 | task | open | [cli-surface-cleanup](./2026-07-26-task-cli-surface-cleanup.md) | CLI 全面棚卸し — `web` が全 SSOT/help/completion から欠落した幽霊 subcommand、`upgrade` が `--help` 未掲載、`run --help` の `SHELL` fallback は実装ゼロのゴミ、completion の flag 補完漏れ 8 件 + テストの構造的欠陥。要裁定 5 件 (D-1〜D-5) |
 | 2026-07-26 | bug | open | [ignored-tests-job-permanently-red](./2026-07-26-bug-ignored-tests-job-permanently-red.md) | CI の ignored-tests job が continue-on-error で恒常 red を隠している (ubuntu は backpressure の 31s hang が 12/12、macOS は notify_default_* が 7/7 で固定失敗) |
 | 2026-07-26 | task | open | [web-ime-safari-ios-unverified](./2026-07-26-web-ime-safari-ios-unverified.md) | IME 変換位置ズレの原因 2 件 (textarea 溢れ / resize 後のズレ) を特定し session.js で修正済み、検証は Chromium のみ — 実機 macOS/iOS Safari が未検証 |
 | 2026-07-25 | bug | open | [daemon-drops-pending-frames-on-client-close](./2026-07-25-bug-daemon-drops-pending-frames-on-client-close.md) | 送信直後に切断した短命 client の control frame が daemon で無言に捨てられる — **真因確定・修正済 (2026-07-26)**: WriterDead を disconnect 根拠にしていたため受信済み frame ごと client を破棄していた |
