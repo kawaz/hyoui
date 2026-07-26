@@ -65,8 +65,30 @@ use crate::daemon::broadcast::{
 /// matching `tmux` / `screen` / `abduco` which always treat this as a
 /// best-effort terminate. The function still returns the underlying
 /// `nix::Result` for tests that need to assert delivery.
+/// **前提の検証が必須**: 上記「child は必ず process group leader」は
+/// `setpgid(0, 0)` が成功した場合の話で、**失敗しうる** (= fork〜exec 間の race、
+/// あるいは anchor 化不可経路)。その場合 child の pgid は **daemon 自身の pgid**
+/// のままなので、`kill(-pid)` は自分と同居プロセスを巻き添えにする。
+///
+/// 実害 (2026-07-26 に Linux コンテナで直接観測): lib test は 1 プロセス内で
+/// 複数 daemon を動かすため、1 つの daemon の finalize が
+/// `kill_pgrp(SIGTERM)` で **test プロセス自身と兄弟 daemon を撃ち**、無関係な
+/// test が `UnexpectedEof("size header")` で落ちていた。production でも
+/// 「daemon を起動した shell ごと落とす」事故になりうる。
+///
+/// よって送る前に `pgid == child` を確認し、成り立たないときは pgrp ではなく
+/// **child 単体**に送る (= 巻き添えを防ぐ。孫の刈り取りは犠牲になるが、
+/// 無関係プロセスを撃つ方が遥かに有害)。
 fn kill_pgrp(child: Pid, sig: Signal) -> nix::Result<()> {
-    kill(Pid::from_raw(-child.as_raw()), sig)
+    match nix::unistd::getpgid(Some(child)) {
+        // 期待どおり child が pgrp leader → pgrp 全体に送る (孫まで届く)
+        Ok(pgid) if pgid == child => kill(Pid::from_raw(-child.as_raw()), sig),
+        // setpgid に失敗している (= child が自分と同じ pgrp に居る等)。
+        // pgrp 送信は自爆なので child 単体に送る。
+        Ok(_) => kill(child, sig),
+        // pgid が取れない (= 既に reap 済 等) → 単体送信で best-effort
+        Err(_) => kill(child, sig),
+    }
 }
 
 /// R5-FB1: `run --until PATTERN` の sliding window scanner。
@@ -2028,6 +2050,41 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    /// `kill_pgrp` は「child が process group leader でない」場合に
+    /// **pgrp 送信をしない** (= 自プロセスグループを巻き添えにしない)。
+    ///
+    /// 回帰対象 (2026-07-26 Linux で直接観測): `setpgid(0, 0)` が失敗した child は
+    /// daemon 自身と同じ pgid のままで、旧実装の `kill(-child_pid)` が
+    /// **test プロセス自身と兄弟 daemon を SIGTERM** していた。無関係な test が
+    /// `UnexpectedEof("size header")` で落ちる原因。
+    ///
+    /// 検証方法: 自分自身 (= 確実に pgrp leader ではない状況を作れる) を対象に
+    /// signal 0 (= 存在確認のみ、実際には配送されない) を送り、pgrp 経路に
+    /// 落ちないことを確認する。SIGKILL 等を使うと test 自身が死ぬので使わない。
+    #[test]
+    fn kill_pgrp_does_not_signal_own_process_group_when_child_is_not_leader() {
+        let me = nix::unistd::getpid();
+        let my_pgid = nix::unistd::getpgrp();
+        // test プロセスが pgrp leader だと前提が作れないので、その場合は skip
+        // (= cargo test は通常 leader ではないが、環境により異なる)。
+        if me == my_pgid {
+            return;
+        }
+        // signal 0 は「送信可能かの確認」だけで配送されない (POSIX kill(2))。
+        // 旧実装ならここで pgrp 全体 (= 自分含む) を対象にしていた。
+        // 新実装は pgid != child を検出して child 単体送信に落ちる。
+        assert!(
+            kill_pgrp(me, Signal::SIGCONT).is_ok(),
+            "自分自身を対象にしても pgrp 送信で自爆せず、単体送信で成功するべき"
+        );
+        // 実際に pgrp leader でないことを確認 (= 前提の明示)
+        assert_ne!(
+            nix::unistd::getpgid(Some(me)).expect("getpgid"),
+            me,
+            "この test は「child が pgrp leader でない」状況を前提にする"
+        );
+    }
+
     fn make_temp_socket_dir() -> TempDir {
         let dir = tempfile::Builder::new()
             .prefix("hyoui-test-")
@@ -3808,7 +3865,7 @@ mod tests {
     /// Phase 12: client_buffer_bytes を超過すると当該 client は backpressure.disconnect
     /// で切断され、socket は close される。他の client は影響を受けず通常動作。
     #[test]
-    #[ignore = "yes(1) + PTY + backpressure timing 依存のため ubuntu CI で daemon thread join が hang する (2026-05-28 6h timeout 観測)。ローカルは `cargo test -- --ignored` で実行する"]
+    #[ignore = "yes(1) + 実 PTY を使うため負荷の高い環境で実行時間が伸びる。ローカル / CI とも `cargo test -- --ignored` で実行する"]
     fn serve_backpressure_disconnects_slow_client() {
         // yes(1) は "y\n" を fast loop で出力 → 子 PTY master に大量の bytes が積まれる
         let yes_path = if std::path::Path::new("/usr/bin/yes").exists() {
@@ -3819,7 +3876,12 @@ mod tests {
         let dir = make_temp_socket_dir();
         let sock_path = dir.path().join("test.sock");
         let mut cfg = DaemonConfig::new("demo", sock_path.clone(), vec![yes_path.into()]);
-        cfg.client_buffer_bytes = 4096; // 小さくして即超過させる
+        // 小さくして即超過させる。ただし **子 PTY の読み取り chunk (8 KiB) より大きく**
+        // 取る必要がある: 単一 frame が limit を超えると「queue が空でも受け入れられない」
+        // 状態になり、backpressure ではなく「そもそも誰も attach できない」ことの検証に
+        // すり替わる (= 2026-07-26 に ubuntu CI の 31s hang の真因として特定)。
+        // 12 KiB なら 1 frame (8 KiB + header) は通り、2 frame 目で超過する。
+        cfg.client_buffer_bytes = 12 * 1024;
         let session = Session::start(cfg).expect("start");
         let handle = std::thread::spawn(move || session.serve());
 
