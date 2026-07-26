@@ -99,6 +99,23 @@ frame」の有効性と無関係。正しい disconnect 点は reader 側の EOF
 `frames_to_process` で受信済み frame を全て処理した **後**に client を drop するため
 順序が保たれる。`Overflow` (= backpressure による意図的な切断) は従来どおり即 disconnect。
 
+受け入れ条件の「drop 前に pending 受信 frame を drain する **or** writer 死と reader
+処理の順序を入れ替える」のうち、**後者**を採った (= drain 用の非同期読み出しを
+serve_loop に足すより、既存の EOF 経路に載せる方が介入が小さい)。
+
+### 採用に伴うトレードオフ (要フォロー判断)
+
+旧実装の「WriterDead で即 disconnect」は、**writer が死んだ client の slot を
+確実に回収する**副次効果も持っていた。本修正でその保証は失われ、
+「read 側だけ閉じて (`shutdown(SHUT_RD)`) socket は開けたまま」の client は
+reader EOF が来ないため `clients` に居残りうる (= `MAX_CLIENTS_PER_DAEMON` = 64 の
+slot を占有)。
+
+現状の評価: hyoui の信頼境界は同一 UID の unix socket であり、同一 UID の攻撃者は
+既により直接的な手段を持つため深刻度は低いと判断して未対処。気になるなら
+「writer 死 + reader が一定時間 readable にならない」を条件に bounded で回収する
+形が follow-up 候補 (= 即 disconnect には戻さない、それが本 bug の原因なので)。
+
 ## 回避済みの箇所
 
 - `crates/hyoui-web/src/lib.rs` の `resize_blocking`: 送信後に `StatusQuery` を
