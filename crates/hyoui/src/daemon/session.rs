@@ -1342,6 +1342,25 @@ fn serve_loop(
     // あり、`daemon_state.lock` は未使用の空 stub のまま置く (= 二重管理して食い違わせ
     // ない、Phase 2 で SessionState.lock を DaemonState へ移設する)。
     let mut daemon_state = DaemonState::default();
+    // 子 exit を検出しても即 return せず、**遅れて到着する client frame を
+    // 短時間だけ処理し続けてから** serve_loop を抜けるための保留枠と締切。
+    //
+    // Design rationale: 子 exit の検出 (= step 2 の master EOF / EIO) は client
+    // frame の処理 (= step 3) より前にあり、しかも client は handshake worker 経由で
+    // **poll_fds 構築後に登録される**。即 return すると、(a) 同一周回で既に POLLIN
+    // していた frame、(b) 登録が exit 検出に間に合わなかった client の frame、が
+    // どちらも処理されずに捨てられる。短命な子では tail.request(follow=true) が
+    // この窓に落ちて subscription が張られず、cleanup 段の
+    // broadcast_tail_end_to_followers が対象 0 件になる。client は
+    // TailEnd(ChildExited) を受け取れないまま socket close だけを観測する
+    // (= `UnexpectedEof("size header")`、ubuntu CI で頻発していた flaky の実体)。
+    //
+    // 子は既に死んでいるので新規出力は増えない。残りは「既に飛んできた / 飛びかけて
+    // いる client 要求を捌く」だけであり、短い固定 budget で drain してから抜ければ
+    // 取りこぼしが無くなる。budget 経過後は従来どおり cleanup へ進む。
+    const EXIT_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+    let mut deferred_exit: Option<RelayOutcome> = None;
+    let mut exit_drain_deadline: Option<Instant> = None;
     loop {
         // DR-0028 §2 (Phase 3): upgrade.request 受理後は drain (= 同期 raw_data 経路の
         // 既完了性) を trivially 満たすので次回 iteration 冒頭で UpgradeRequested を返す。
@@ -1349,6 +1368,20 @@ fn serve_loop(
         // ここに来て即 return する (= 「ack 送信 → drain → exec」の順序保証)。
         if state.is_upgrade_pending() {
             return RelayOutcome::UpgradeRequested;
+        }
+
+        // 子 exit 検出後は drain budget を使い切った時点で serve_loop を抜ける
+        // (= `deferred_exit` の doc 参照)。budget 内は poll に戻り、遅れて届く
+        // client frame を通常経路で処理し続ける。
+        //
+        // 判定を **ループ冒頭** に置くのが要点: serve_loop の途中には
+        // Interrupted / Timeout 等の `continue` 経路が複数あり、末尾で判定すると
+        // それらの周回で締切チェックを飛ばして永久ループになる (= 実測、
+        // master を poll から外した後は Timeout 経路だけが回り続ける)。
+        if exit_drain_deadline.is_some_and(|d| Instant::now() >= d)
+            && let Some(o) = deferred_exit.take()
+        {
+            return o;
         }
 
         // DR-0019 §4: 終了条件の発火判定 (= ループ冒頭で毎回チェック)。発火したら
@@ -1379,7 +1412,16 @@ fn serve_loop(
         let mut poll_fds: Vec<PollFd> =
             Vec::with_capacity(2 + clients.len() + usize::from(sigchld_pipe.is_some()));
         poll_fds.push(PollFd::new(listener_fd, PollFlags::POLLIN));
-        poll_fds.push(PollFd::new(master_fd, PollFlags::POLLIN));
+        // drain 窓 (= `deferred_exit`) 中は master を poll 対象から **外す**。子は
+        // 既に死んでおり新規出力は無い一方、master は POLLHUP が立ちっぱなしで
+        // (= POLLHUP は要求 mask に関係なく報告される) poll が即 return し続け、
+        // 100ms の budget を busy-spin で焼いてしまうため。
+        let poll_master = deferred_exit.is_none();
+        if poll_master {
+            poll_fds.push(PollFd::new(master_fd, PollFlags::POLLIN));
+        }
+        // client slot の開始 index (= master を外した周回では 1 つ手前にずれる)。
+        let client_base = poll_fds.len();
         for ch in clients.iter() {
             poll_fds.push(PollFd::new(ch.reader.as_fd(), PollFlags::POLLIN));
         }
@@ -1418,6 +1460,14 @@ fn serve_loop(
             const NO_SELFPIPE_POLL_CAP_MS: u16 = 500;
             poll_timeout = cap_poll_timeout(poll_timeout, NO_SELFPIPE_POLL_CAP_MS);
         }
+        // 子 exit 後の drain 窓 (= `deferred_exit`) 中は、残り budget で poll を
+        // cap して締切ちょうどで wake する (= master EOF は既に消費済で二度と
+        // ready にならないため、cap しないと budget 経過に気づけず block する)。
+        if let Some(deadline) = exit_drain_deadline {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            let cap = u16::try_from(rem.as_millis()).unwrap_or(u16::MAX);
+            poll_timeout = cap_poll_timeout(poll_timeout, cap);
+        }
         // DR-0019 §4: overall / idle timeout が有効なら、deadline までの残りで
         // poll を cap し、deadline 到達時に確実に wake してループ冒頭の eval_timeout
         // で発火させる。u16 上限 (= 約 65s) を超える残りは 65s ごとに wake して
@@ -1441,11 +1491,20 @@ fn serve_loop(
         let (listener_revents, master_revents, client_revents, sigchld_ready) = match outcome_kind {
             Ok(PollOutcome::Ready(_)) => {
                 let lrev = poll_fds[0].revents().unwrap_or(PollFlags::empty());
-                let mrev = poll_fds[1].revents().unwrap_or(PollFlags::empty());
+                // master を積まなかった周回 (= drain 窓) は revents 無しとして扱う。
+                let mrev = if poll_master {
+                    poll_fds[1].revents().unwrap_or(PollFlags::empty())
+                } else {
+                    PollFlags::empty()
+                };
                 let crev: Vec<PollFlags> = clients
                     .iter()
                     .enumerate()
-                    .map(|(i, _)| poll_fds[2 + i].revents().unwrap_or(PollFlags::empty()))
+                    .map(|(i, _)| {
+                        poll_fds[client_base + i]
+                            .revents()
+                            .unwrap_or(PollFlags::empty())
+                    })
                     .collect();
                 let sig_ready = sigchld_idx
                     .map(|i| {
@@ -1644,6 +1703,8 @@ fn serve_loop(
         }
 
         // 2. master: 子 PTY 出力を全 client に broadcast
+        // drain 窓では master_revents は空 (= poll 対象から外している) なので、
+        // ここは自然に false になる。
         let pty_ready = master_revents.contains(PollFlags::POLLIN)
             || master_revents.contains(PollFlags::POLLHUP)
             || master_revents.contains(PollFlags::POLLERR);
@@ -1673,7 +1734,12 @@ fn serve_loop(
                                 clients,
                                 &mut overflow_ids,
                             );
-                            return RelayOutcome::ChildExited(code);
+                            // 即 return せず保留し、drain 窓を開く (= 遅れて届く
+                            // client frame も処理する)。`deferred_exit` の doc 参照。
+                            if deferred_exit.is_none() {
+                                deferred_exit = Some(RelayOutcome::ChildExited(code));
+                                exit_drain_deadline = Some(Instant::now() + EXIT_DRAIN_BUDGET);
+                            }
                         }
                         ChildState::Stopped => {
                             // R4-H14: SIGTSTP'd 子で master EOF/POLLHUP が連続する間の
@@ -1757,7 +1823,13 @@ fn serve_loop(
                         _ => {}
                     }
                     match child_state {
-                        ChildState::Exited(code) => return RelayOutcome::ChildExited(code),
+                        // EOF と同じく保留する (= EIO も master 側の子終了検出点)。
+                        ChildState::Exited(code) => {
+                            if deferred_exit.is_none() {
+                                deferred_exit = Some(RelayOutcome::ChildExited(code));
+                                exit_drain_deadline = Some(Instant::now() + EXIT_DRAIN_BUDGET);
+                            }
+                        }
                         ChildState::Stopped => {
                             std::thread::sleep(STOPPED_POLL_INTERVAL);
                         }
@@ -3745,6 +3817,67 @@ mod tests {
             }
         }
         assert!(got_child_exited, "expected TailEnd(ChildExited)");
+
+        let _ = handle.join().expect("daemon thread");
+    }
+
+    /// 子が **tail.request 到着前後に exit する** 極短命ケースでも
+    /// TailEnd(ChildExited) が届く。
+    ///
+    /// 上の `serve_tail_follow_receives_tail_end_on_child_exit` は子が 0.2 秒
+    /// 生きるため、subscription 登録が子 exit に先行するのが通常で、race 窓に
+    /// 入るのは負荷次第 (= ubuntu CI でだけ落ちる flaky だった)。子を 5ms に
+    /// 縮めると窓へ確実に入り、修正前は 10/10 で
+    /// `UnexpectedEof("size header")` を再現した (= 子 exit 検出が client frame
+    /// 処理より先に serve_loop を抜け、tail.request が捨てられて follower 0 件で
+    /// TailEnd が誰にも送られない)。本 test はその回帰を固定する。
+    #[test]
+    fn serve_tail_follow_receives_tail_end_when_child_exits_immediately() {
+        use crate::protocol::messages::TailRequest;
+
+        let cmd = vec!["/bin/sh".into(), "-c".into(), "sleep 0.005".into()];
+        let dir = make_temp_socket_dir();
+        let sock_path = dir.path().join("test.sock");
+        let cfg = DaemonConfig::new("demo", sock_path.clone(), cmd);
+        let session = Session::start(cfg).expect("start");
+        let handle = std::thread::spawn(move || session.serve());
+
+        let mut s = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut s);
+        let _ = Frame::decode_from(&mut s).expect("leader.notify");
+
+        Frame::cbor_control(
+            ControlMessage::TailRequest(TailRequest {
+                since_ms: None,
+                since_strict: false,
+                follow: true,
+                strip_ansi: false,
+                last_bytes: None,
+            })
+            .encode_to_vec()
+            .expect("encode"),
+        )
+        .encode_to(&mut s)
+        .expect("send");
+        s.flush().expect("flush");
+
+        let mut got_child_exited = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match next_control(&mut s) {
+                ControlMessage::TailEnd(te) => {
+                    if te.reason == TailEndReason::ChildExited {
+                        got_child_exited = true;
+                        break;
+                    }
+                }
+                _ => continue,
+            }
+        }
+        assert!(
+            got_child_exited,
+            "expected TailEnd(ChildExited) even when the child exits immediately"
+        );
 
         let _ = handle.join().expect("daemon thread");
     }
