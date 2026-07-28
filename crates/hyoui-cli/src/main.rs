@@ -800,8 +800,10 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
             .map(|s| (*s).to_string())
             .collect(),
         token,
-        exclusive: cfg.exclusive,
-        detach_others: cfg.detach_others,
+        // CLI-Q1 裁定 (2026-07-29): `attach --exclusive` / `--detach-others` は
+        // parse 段で拒否するため、attach 経路からは常に false で handshake する。
+        exclusive: false,
+        detach_others: false,
     };
 
     // R5-FB4: socket 不存在系 errno は短時間 retry (= 別 process の daemon が
@@ -814,12 +816,12 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         }
     };
 
-    // DR-0029 §4: rw attach は stopped child を操作する意思表明とみなし、handshake
-    // snapshot が stopped の場合だけ既存 resume.request を即送る。ro / rw-no-leader は
-    // 観察または非 leader 接続なので、設定値に関係なく子を起こさない。
+    // DR-0030: rw attach は子を操作する意思表明とみなし、handshake snapshot が
+    // stopped なら既存 resume.request を即送る。attach 中に子が stop した場合は
+    // `AttachSession::run` の `SessionChildStoppedNotify` 経路が同じ要求を送る。
+    // ro / rw-no-leader は観察または非 leader 接続なので、設定値に関係なく起こさない。
     if conn.response.child_stopped
-        && conn.response.mode == Mode::Rw
-        && app_config.attach.resume_on_reattach
+        && hyoui::client::should_resume_stopped_child(conn.response.mode, &app_config.attach)
         && let Err(e) = conn.send_child_resume()
     {
         eprintln!("hyoui: attach: stopped child の resume 要求送信失敗: {e}");
