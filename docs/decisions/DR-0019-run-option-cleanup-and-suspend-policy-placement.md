@@ -154,6 +154,10 @@ silent no-op (= 指定が黙って無視される) の放置は [[DR-0014]] 検�
 実装が入るまで parse 段で「未実装」を明示するエラーを返す (= `hyoui detach` 等の
 予約エラーと同じ流儀、[[DR-0004]])。実装自体は本 DR の射程外として別 issue に切り出す。
 
+> **Update (CLI-Q1 裁定 2026-07-29)**: 本節の決定は長らく未実装で、parse を通過して
+> daemon まで到達していた。裁定により parse 段封鎖を実施し、help / completion からも
+> 除去した (= 決定と実態の乖離を解消)。daemon 側の判定は `kill` 経路が使うため残す。
+
 ### 7. help 残骸の除去
 
 `usage_run()` に残る `--on-parent-suspend` の記載 (= parser からは [[DR-0015]] で削除済)

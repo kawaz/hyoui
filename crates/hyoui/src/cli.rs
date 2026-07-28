@@ -236,10 +236,6 @@ pub struct AttachConfig {
     pub session_id: Option<String>,
     /// 動作 mode (rw / ro)。MVP は文字列のみ受理。
     pub mode_str: Option<String>,
-    /// `--exclusive` (= 起動時占有要求)。
-    pub exclusive: bool,
-    /// `--detach-others` (= attach 時に他 client を奪取)。
-    pub detach_others: bool,
     /// `--debug-dump-client=<path>`: client 側受信 bytes を file に append (debug)。
     /// `hyoui run` の同名 flag と同じ意味 (= attach 単体で使うときの名前統一)。
     pub debug_dump_client: Option<String>,
@@ -272,8 +268,8 @@ pub struct AttachConfig {
 /// detach CLI は一時接続で daemon に Detach を送る構造のため、self は「一時接続が
 /// 自分を切る」no-op、others は「一時接続以外 ≒ 全部」となり all と実質同義で、
 /// flag として嘘になる。中から自分の端末だけ抜けるのは attach の Ctrl+Z ガード
-/// (DR-0029 §2) の役割。protocol の `DetachTarget::{Myself, Others}` は attach client /
-/// `--detach-others` 用として内部に残る。
+/// (DR-0029 §2) の役割。protocol の `DetachTarget::{Myself, Others}` は attach client
+/// および `kill` の内部経路用として残る。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DetachConfig {
     /// Target socket path. `Some(p)` で explicit、`None` なら session_id から resolve。
@@ -2276,8 +2272,6 @@ fn parse_attach(args: &[String]) -> Command {
         socket: None,
         session_id: None,
         mode_str: None,
-        exclusive: false,
-        detach_others: false,
         debug_dump_client: None,
         index: None,
         namespace: None,
@@ -2290,8 +2284,8 @@ fn parse_attach(args: &[String]) -> Command {
     while i < args.len() {
         let arg = args[i].as_str();
         let (name, inline_value) = split_eq(arg);
-        // bool flag (= `--exclusive` / `--detach-others`) の inline value 検出用に
-        // move 前に保存する (= `--exclusive=x` のような不正形を弾く)。
+        // bool flag (= `--quiet`) の inline value 検出用に move 前に保存する
+        // (= `--quiet=x` のような不正形を弾く)。
         let had_inline = inline_value.is_some();
         let mut consumed_extra = false;
         let value: Option<String> = match inline_value {
@@ -2328,23 +2322,15 @@ fn parse_attach(args: &[String]) -> Command {
                 Some(v) => cfg.mode_str = Some(v),
                 None => return Command::Error("--mode requires a value".into()),
             },
-            // DR-0020 §4: `--exclusive` (= 他 rw client が居れば attach 拒否) /
-            // `--detach-others` (= attach 成立時に他 client を奪取)。daemon 側
-            // handshake 統合経路に実装済 (= accept.rs)。bool flag なので next token は
-            // consume しない (= consumed_extra=false)、inline value は不正。
-            "--exclusive" => {
-                if had_inline {
-                    return Command::Error("attach: --exclusive does not take a value".into());
-                }
-                cfg.exclusive = true;
-                consumed_extra = false;
-            }
-            "--detach-others" => {
-                if had_inline {
-                    return Command::Error("attach: --detach-others does not take a value".into());
-                }
-                cfg.detach_others = true;
-                consumed_extra = false;
+            // CLI-Q1 裁定 (2026-07-29): DR-0020 §4 の占有 / 奪取は CLI から出さない。
+            // daemon 側の handshake 判定は残っているが、CLI 経路は parse 段で塞ぐ
+            // (= 中途半端に通って「効いたように見える」状態を作らない、DR-0019)。
+            "--exclusive" | "--detach-others" => {
+                return Command::Error(format!(
+                    "attach: {name} は現在利用できません (= CLI から提供していない)。\
+                     他 client を切り離してから attach するには `hyoui detach <session>` を、\
+                     観察のみなら `--mode=ro` を使ってください。"
+                ));
             }
             // DR-0020 §5: attach 成立時の stderr ヒント (= detach/peek 案内) を抑止。
             "--quiet" => {
@@ -3137,8 +3123,8 @@ fn parse_snapshot_include(s: &str) -> Result<Vec<SnapshotCliComponent>, String> 
         }
         let lower = trimmed.to_ascii_lowercase();
         let normalized: String = lower.chars().filter(|c| *c != '-' && *c != '_').collect();
-        // 正規化済名 → enum は `snapshot_component_from_normalized` が正本
-        // (= SSOT 定数 SNAPSHOT_INCLUDE_VALUES と同じ対応表を共有)。
+        // 正規化済名 → enum は `snapshot_component_from_normalized` が正本。
+        // help / completion に出す部分集合は SNAPSHOT_INCLUDE_VALUES 側が持つ。
         let comp = match snapshot_component_from_normalized(normalized.as_str()) {
             Some(c) => c,
             None => {
@@ -4063,8 +4049,6 @@ fn usage_attach() -> String {
             --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --mode rw|ro|rw-no-leader\n                          \
                 Operating mode (default: rw)\n    \
-            --exclusive           他に rw client が attach 中なら attach を拒否 (DR-0020 §4)\n    \
-            --detach-others       attach 成立時に他 client を全て detach して奪取 (DR-0020 §4)\n    \
             --quiet               attach 成立時の detach/peek ヒント (stderr) を抑止 (DR-0020 §5)\n    \
             --debug-dump-client PATH\n                          \
                 daemon → client の raw bytes を file に append\n                          \
@@ -4550,8 +4534,7 @@ fn usage_screen_snapshot() -> String {
             --index N           Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
             --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --include SET       Components (comma-separated, case-insensitive; default: all)\n                        \
-                Cells, Cursor, Mode, Style, Scrollback, WindowSize, Buffer, SequenceNo\n                        \
-                (Scrollback は daemon 側で未実装 → 明示指定すると error)\n    \
+                Cells, Cursor, Mode, WindowSize, Buffer, SequenceNo\n    \
             --format FMT        Output format (default: cbor)\n                        \
                 cbor — CBOR encoded StateSnapshotResponse (= 機械処理、default)\n                        \
                 json — JSON encoded StateSnapshotResponse (= CLI 段で serde_json 変換、jq 等で直接処理可)\n    \
@@ -4785,7 +4768,6 @@ fn usage_detach() -> String {
             hyoui detach         # 中から: 自セッションの全 client 切断 (= TUI 脱出)\n\
         \n\
         RELATED:\n    \
-            hyoui attach <id> --detach-others  Attach しつつ他 client を奪取\n    \
             hyoui kill <id>                    session ごと終了 (= 子に signal)\n",
     )
 }
@@ -5828,19 +5810,20 @@ pub const RECORD_SUBCOMMANDS: &[&str] = &["start", "stop", "list"];
 /// `hyoui config` の子 subcommand 一覧 (= `parse_config` が dispatch する値)。
 pub const CONFIG_SUBCOMMANDS: &[&str] = &["path", "show"];
 
-/// `hyoui screen snapshot --include` が受理する正規化済 component 名一覧。
+/// `hyoui screen snapshot --include` の help / completion に出す component 名一覧。
 ///
-/// `parse_snapshot_include` が本定数を正本として参照する (= 乖離防止)。
-/// completion script は本定数の全要素を `--include` の補完候補に出す。
-/// 値は parse 段の正規化 (= lowercase + `-`/`_` 除去) 後の形 (= `windowsize` /
-/// `sequenceno`) で持つ。`SnapshotCliComponent` との対応は
-/// [`snapshot_component_from_normalized`] で 1:1。
+/// completion script は本定数の全要素を `--include` の補完候補に出す。値は parse 段の
+/// 正規化 (= lowercase + `-`/`_` 除去) 後の形 (= `windowsize` / `sequenceno`) で持つ。
+/// `SnapshotCliComponent` との対応は [`snapshot_component_from_normalized`] で 1:1。
+///
+/// CLI-Q2 裁定 (2026-07-29): `style` / `scrollback` は daemon 側が未実装で指定すると
+/// 必ず失敗するため、本一覧から外す (= 選んでも error になる値を補完しない、
+/// `RECORD_INPUT_SECRECY_VALUES` と同じ方針)。parse (`parse_snapshot_include`) は
+/// forward-compat のため受理を続けるので、本定数は parse の正本ではない。
 pub const SNAPSHOT_INCLUDE_VALUES: &[&str] = &[
     "cells",
     "cursor",
     "mode",
-    "style",
-    "scrollback",
     "windowsize",
     "buffer",
     "sequenceno",
@@ -7084,8 +7067,6 @@ mod tests {
             Command::Attach(cfg) => {
                 assert_eq!(cfg.session_id.as_deref(), Some("demo"));
                 assert_eq!(cfg.socket, None);
-                assert!(!cfg.exclusive);
-                assert!(!cfg.detach_others);
                 assert_eq!(cfg.mode_str, None);
             }
             other => panic!("got {other:?}"),
@@ -7143,28 +7124,20 @@ mod tests {
     }
 
     #[test]
-    fn attach_exclusive_sets_flag() {
-        // DR-0020 §4: `--exclusive` は実装済 (= daemon handshake で占有判定)。
-        match parse_args(&args(&["attach", "demo", "--exclusive"])) {
-            Command::Attach(cfg) => {
-                assert!(cfg.exclusive, "exclusive フラグが立つべき");
-                assert!(!cfg.detach_others);
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+    fn attach_exclusive_and_detach_others_are_rejected() {
+        // CLI-Q1 裁定 (2026-07-29): 占有 / 奪取は CLI から出さない。parse 段で
+        // 代替手段を案内して弾く (= daemon まで到達させない)。
+        for flag in ["--exclusive", "--detach-others"] {
+            match parse_args(&args(&["attach", "demo", flag])) {
+                Command::Error(msg) => {
+                    assert!(msg.contains(flag), "エラーは対象 flag 名を含むべき: {msg}");
+                    assert!(
+                        msg.contains("hyoui detach") && msg.contains("--mode=ro"),
+                        "エラーは代替手段を案内すべき: {msg}"
+                    );
+                }
+                other => panic!("expected Error for {flag}, got {other:?}"),
             }
-            other => panic!("expected Attach, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn attach_detach_others_sets_flag() {
-        // DR-0020 §4: `--detach-others` は実装済 (= daemon handshake で奪取)。
-        match parse_args(&args(&["attach", "demo", "--detach-others"])) {
-            Command::Attach(cfg) => {
-                assert!(cfg.detach_others, "detach_others フラグが立つべき");
-                assert!(!cfg.exclusive);
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
-            }
-            other => panic!("expected Attach, got {other:?}"),
         }
     }
 
@@ -7579,7 +7552,7 @@ mod tests {
             (
                 HelpTopic::Attach,
                 "hyoui attach",
-                &["CTRL+Z GUARD", "--exclusive"],
+                &["CTRL+Z GUARD", "--stdin-eof"],
             ),
             (HelpTopic::List, "hyoui list", &["SCAN ORDER"]),
             (HelpTopic::Kill, "hyoui kill", &["--signal", "SIGTERM"]),

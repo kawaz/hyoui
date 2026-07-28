@@ -285,6 +285,24 @@ help 全文 grep で検査した結果、**残骸は見つからなかった**:
     の CLI-Q2 として裁定待ち
   - F: `HYOUI_ALLOW_CORE` の露出判断 (user 向け化 or 内部専用明記) は未着手
 
+## 進捗 (2026-07-29)
+
+- **D-2 (CLI-Q1) = 選択肢 a で完了**。`attach --exclusive` / `--detach-others` を
+  `parse_attach` で明示エラー化 (= 代替手段 `hyoui detach` / `--mode=ro` を案内)、
+  attach help / detach help RELATED / bash・zsh・fish completion から除去。
+  `AttachConfig` の 2 field も削除して CLI 経路からの到達不能を構造で担保した
+  (= コメントによる注意書きでなく型で表現)。daemon 側 `accept.rs` の占有 / 奪取判定は
+  **残す** — `hyoui kill` が terminate 時に `detach_others: true` を送る現役経路であり、
+  安全に除去できないため。CLI から到達しない旨は同箇所にコメントで明示。
+  CLI 経由で daemon 挙動を検証していた `detach_cli.rs` の 2 test は削除
+  (= `accept.rs` の unit test 群が daemon 側の carrier として残る)
+- **D-3 (CLI-Q2) = 選択肢 b で完了**。`screen snapshot --include=style` / `=scrollback` を
+  SSOT 定数 `SNAPSHOT_INCLUDE_VALUES` から外し、help の component 一覧と 3 shell の
+  completion 候補から除去。`parse_snapshot_include` は forward-compat のため受理を継続
+  (= `RECORD_INPUT_SECRECY_VALUES` と同じ「error になる値を補完しない」方針)。
+  `--rect` は裁定通り現状維持
+- frontmatter は変更していない (= status は wip のまま。D-1 / D-4 / D-5 が未裁定)
+
 ## 関連
 
 - CLAUDE.md「介入判断 self-check」「コードと DR の双方向整合性」

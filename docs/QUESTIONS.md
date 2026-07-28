@@ -30,24 +30,6 @@
 の「勝手に起こさない」と [DR-0029](docs/decisions/DR-0029-attach-is-a-viewport-ctrl-z-guard.md) §5 の衝突)。
 c は明示 attach の UX まで変わる。
 
-### 👺CLI-Q1: `attach --exclusive` / `--detach-others` の扱い
-
-- [ ] a (推奨): parse 段でエラー化し help/completion から消す (需要が出たら再実装)
-- [ ] b: daemon 側の占有判定 / 奪取処理を実装完成させる
-- [ ] c: 現状維持 (中途半端に通る) + DR-0019 の記述を実態に合わせる
-
-[DR-0019](docs/decisions/DR-0019-run-option-cleanup-and-suspend-policy-placement.md) は parse 段エラー化を決定したが実際は daemon まで到達しており、
-この経路の中途半端さが `kill --no-terminate` の全 client 蹴りバグの温床になった。
-[DR-0020](docs/decisions/DR-0020-attach-exclusive-and-detach-others.md) §4 の正式機能を消す判断なので裁定要。
-
-### 👺CLI-Q2: 必ず失敗する `screen snapshot --include=style/scrollback` の扱い
-
-- [ ] a (推奨): parse 段で明示エラー化 (未実装の旨を案内)
-- [ ] b: 実装されるまで help/completion から隠す (parse は受理)
-- [ ] c: 現状維持 (daemon エラーで返る)
-
-`--rect` (無視されるだけで無害、help に注記済み) は現状維持とし、必ず失敗する値のみが対象。
-
 ## 確認待ち
 
 (現在なし)

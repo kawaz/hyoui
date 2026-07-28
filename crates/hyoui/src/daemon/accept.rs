@@ -317,6 +317,12 @@ fn finalize_accepted_client(
         Err::<(), Error>(Error::Invalid(why))
     };
 
+    // CLI-Q1 裁定 (2026-07-29): `attach --exclusive` / `--detach-others` は CLI の
+    // parse 段で拒否するため、以下 2 つの判定に **attach client から到達する経路は無い**。
+    // `detach_others` は `hyoui kill` (= terminate 時に true) が今も使うため残す。
+    // `exclusive` は現状 producer が居ないが、handshake field は protocol に残っており
+    // 外部 client (= hyoui-web 等) から送られうるので判定は維持する。
+    //
     // Fable review M2 (2026-06-12): `--detach-others` (= 他 client の奪取) は破壊的
     // 操作なので Ro 観察者には許さない (= `Detach{Others/All}` の ensure_not_ro と
     // 同じ権限ゲートを handshake 経路にも適用)。

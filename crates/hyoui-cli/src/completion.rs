@@ -102,7 +102,7 @@ _hyoui() {
             snapshot)
                 case "$prev" in
                     --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                    --include) COMPREPLY=( $(compgen -W "cells cursor mode style scrollback windowsize buffer sequenceno" -- "$cur") ); return 0 ;;
+                    --include) COMPREPLY=( $(compgen -W "cells cursor mode windowsize buffer sequenceno" -- "$cur") ); return 0 ;;
                     --format) COMPREPLY=( $(compgen -W "cbor json" -- "$cur") ); return 0 ;;
                     --output) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
                     --namespace|--index|--timeout) return 0 ;;
@@ -255,7 +255,7 @@ _hyoui() {
                 --stdin-eof=*)
                     COMPREPLY=( $(compgen -W "detach send-eof" -- "${cur#*=}") ); return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --index --mode --stdin-eof --exclusive --detach-others --quiet --debug-dump-client --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --namespace --index --mode --stdin-eof --quiet --debug-dump-client --help -h" -- "$cur") )
             return 0 ;;
         list)
             case "$cur" in
@@ -373,8 +373,6 @@ _hyoui() {
                         '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '--mode=[Operating mode]:mode:(rw ro rw-no-leader)' \
                         '--stdin-eof=[stdin EOF action]:action:(detach send-eof)' \
-                        '--exclusive[Deny attach if another rw client is present]' \
-                        '--detach-others[Detach other clients on attach (steal)]' \
                         '--quiet[Suppress the detach/peek hint on attach]' \
                         '--debug-dump-client=[Append daemon->client raw bytes to a file]:file:_files' \
                         '(-h --help)'{-h,--help}'[Show help]' \
@@ -546,7 +544,7 @@ _hyoui_screen() {
                         '--socket=[Explicit socket path]:socket:_files' \
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
                         '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
-                        '--include=[Snapshot components to include]:component:(cells cursor mode style scrollback windowsize buffer sequenceno)' \
+                        '--include=[Snapshot components to include]:component:(cells cursor mode windowsize buffer sequenceno)' \
                         '--format=[Output format]:format:(cbor json)' \
                         '--output=[Output file path]:file:_files' \
                         '--timeout=[Response timeout]:duration:' \
@@ -903,8 +901,6 @@ complete -c hyoui -n '__hyoui_using_subcommand attach' -l index          -x     
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l mode           -x -a 'rw ro rw-no-leader'   -d 'Operating mode'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l stdin-eof      -x -a 'detach send-eof'        -d 'stdin EOF action'
-complete -c hyoui -n '__hyoui_using_subcommand attach' -l exclusive                                     -d 'Deny attach if another rw client is present'
-complete -c hyoui -n '__hyoui_using_subcommand attach' -l detach-others                                 -d 'Detach other clients on attach (steal)'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l quiet                                          -d 'Suppress the detach/peek hint on attach'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l debug-dump-client -r -F                        -d 'Append daemon->client raw bytes to a file'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -s h -l help                                    -d 'Show help and exit'
@@ -979,7 +975,7 @@ complete -c hyoui -n '__hyoui_screen_using_sub dump' -s h -l help               
 complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l socket  -r -F                                -d 'Explicit socket path'
 complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l index   -x                                    -d 'Session selector (1=oldest, -1=newest)'
 complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
-complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l include -x -a 'cells cursor mode style scrollback windowsize buffer sequenceno' -d 'Snapshot components to include'
+complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l include -x -a 'cells cursor mode windowsize buffer sequenceno' -d 'Snapshot components to include'
 complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l format  -x -a 'cbor json'                     -d 'Output format'
 complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l output  -r -F                                -d 'Output file path'
 complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l timeout -x                                    -d 'Response timeout'
@@ -1487,8 +1483,8 @@ mod tests {
     /// offering them as completion candidates would mislead users.
     ///
     /// Boundaries here are stricter than `contains_token` (= whitespace / quote /
-    /// line edge only), so legitimate substrings like `detach-others` (an attach
-    /// flag) do not trip the check — only a bare `detach` candidate would.
+    /// line edge only), so a reserved name appearing as a substring of a longer
+    /// flag or value does not trip the check — only a bare candidate would.
     #[test]
     fn completion_all_shells_omit_reserved_subcommands() {
         let is_boundary = |c: Option<char>| match c {
@@ -1530,6 +1526,9 @@ mod tests {
                 "--no-strip-escapes",   // 旧 wait flag (廃止)
                 "--newline-convert-lf", // 旧 wait flag (廃止)
                 "--on-parent-suspend",  // DR-0015 で run から廃止
+                // CLI-Q1 裁定 (2026-07-29): attach の占有 / 奪取は parse 段で拒否する。
+                "--exclusive",
+                "--detach-others",
             ] {
                 assert!(
                     !s.contains(flag),
@@ -1635,6 +1634,30 @@ mod tests {
                 !s.contains("size mode title"),
                 "shell {sh:?} still lists bogus snapshot include set (size/title)"
             );
+        }
+        // CLI-Q2 裁定 (2026-07-29): daemon 未実装で必ず失敗する `style` / `scrollback` は
+        // include の候補に出さない。`scrollback` は `--layer` の値や `--scrollback-rows`
+        // として正当に登場するので、include を宣言している行だけを見る (bash/zsh は
+        // `--include`、fish は `-l include` と綴るので両方拾う)。
+        for sh in ALL_SHELLS {
+            let s = script(sh);
+            let include_lines: Vec<&str> = s
+                .lines()
+                .filter(|l| l.contains("--include") || l.contains("-l include"))
+                .collect();
+            // 抽出できないと「候補 0 件で素通り green」になるので空集合を失敗にする。
+            assert!(
+                !include_lines.is_empty(),
+                "shell {sh:?} has no `--include` declaration line to check"
+            );
+            for line in include_lines {
+                for hidden in ["style", "scrollback"] {
+                    assert!(
+                        !line.contains(hidden),
+                        "shell {sh:?} still offers unimplemented include value `{hidden}`: {line}"
+                    );
+                }
+            }
         }
     }
 

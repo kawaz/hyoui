@@ -80,6 +80,11 @@ hyoui detach [session]
   乗っ取る」が自然な意味、Fable review Minor2)。併用時は exclusive 判定をスキップ
   (= 奪取後は自分だけが残るので占有は自動的に成立する)
 
+> **Update (CLI-Q1 裁定 2026-07-29)**: `attach --exclusive` / `--detach-others` は
+> CLI の parse 段で封鎖し、help / completion からも外した。daemon 側の占有 / 奪取判定
+> (`accept.rs`) は `kill` の内部経路と外部 client のために残すが、CLI からは到達しない。
+> 需要が出たら再実装する。
+
 ### 5. 発見性の改善 (UX、透過原則の範囲内)
 
 - attach 成立時に **stderr** へ 1 行ヒントを出す:
