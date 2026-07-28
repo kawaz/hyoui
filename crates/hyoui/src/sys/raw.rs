@@ -187,7 +187,20 @@ pub fn openpty_fork_anchor_exec(
             // 同 session のまま新 pgrp の leader になる。
             libc::setpgid(0, 0);
             // 自 pgrp を controlling tty の foreground に。
+            //
+            // `tcsetpgrp` は **呼び出し側が background pgrp に居ると SIGTTOU を
+            // 生成する** (POSIX)。直前の `setpgid(0,0)` で自分は新 pgrp に移った
+            // 一方、slave の foreground pgrp は親が `tcsetpgrp` を実行するまで
+            // 親のままなので、親より先にここへ来た子は background 扱いになり
+            // SIGTTOU で **停止する** (= 既定 disposition は stop)。誰も SIGCONT
+            // を送らないため子は exec に到達せず、daemon は永久に子出力を待つ。
+            // 親側 (下記 parent path) が同じ理由で SIG_IGN してから呼ぶのと対称に、
+            // 子側でも一時 ignore する。exec 後の子に ignore を漏らさないよう
+            // (= execve は ignored disposition を引き継ぐ) 直後に旧 disposition へ
+            // 戻す。`signal` は async-signal-safe。
+            let old_ttou = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
             libc::tcsetpgrp(slave_raw, libc::getpid());
+            libc::signal(libc::SIGTTOU, old_ttou);
             // slave を std fd 0/1/2 に複製。
             libc::dup2(slave_raw, 0);
             libc::dup2(slave_raw, 1);
