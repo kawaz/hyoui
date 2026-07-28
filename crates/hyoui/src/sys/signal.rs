@@ -184,6 +184,65 @@ extern "C" fn selfpipe_handler(sig: libc::c_int) {
     }
 }
 
+/// fork した子が **親から継承した [`selfpipe_handler`]** を走らせないよう、子側で
+/// write fd の登録を外す。`fork(2)` 直後・`execve(2)` 前の子で呼ぶ。
+///
+/// 子は handler の disposition と self-pipe の write fd を両方継承する。fd は
+/// `FD_CLOEXEC` なので exec 時に閉じるが、**fork〜exec の窓では生きている**。この窓で
+/// 子に signal が届くと handler が走り、**親の self-pipe に signal byte を書き込む**。
+/// 親はそれを自分宛ての signal として解釈するため、送っていない SIGTERM を受けたと
+/// 誤認する (= 実測。1 プロセスで複数 daemon を動かすテストでは、無関係な daemon が
+/// 落とされて `UnexpectedEof` になっていた)。
+///
+/// 単体では `fork` から本関数の実行までの窓が残るため、[`block_handled_signals`] と
+/// 併用する。async-signal-safe (= atomic store のみ)。
+pub fn disarm_self_pipe_in_child() {
+    SELFPIPE_WRITE_FD.store(-1, Ordering::Relaxed);
+}
+
+/// 自前 handler を張りうる signal 群 (= [`block_handled_signals`] の対象)。
+const HANDLED_SIGNALS: [libc::c_int; 8] = [
+    libc::SIGTERM,
+    libc::SIGINT,
+    libc::SIGHUP,
+    libc::SIGQUIT,
+    libc::SIGCHLD,
+    libc::SIGWINCH,
+    libc::SIGUSR1,
+    libc::SIGTSTP,
+];
+
+/// Signal mask saved by [`block_handled_signals`], restored via [`restore_mask`].
+pub struct SavedMask(libc::sigset_t);
+
+/// `fork(2)` の **直前** に呼び、自前 handler を張る signal を block する。
+///
+/// これで子は [`disarm_self_pipe_in_child`] を終えるまで signal を受け取らず、
+/// 「fork 済みだが disarm 前」の窓が閉じる。親・子とも用が済んだら
+/// [`restore_mask`] で戻すこと。**`execve` は signal mask を引き継ぐ**ため、
+/// 子側での復元は必須 (= 忘れると exec 後の子が SIGTERM を受け付けなくなる)。
+pub fn block_handled_signals() -> SavedMask {
+    // SAFETY: sigset_t の初期化・操作を libc の API のみで行う。
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for sig in HANDLED_SIGNALS {
+            libc::sigaddset(&mut set, sig);
+        }
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
+        SavedMask(old)
+    }
+}
+
+/// Restore a mask saved by [`block_handled_signals`]. async-signal-safe。
+pub fn restore_mask(saved: &SavedMask) {
+    // SAFETY: `saved` は block 時に kernel が埋めた有効な sigset_t。
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_SETMASK, &saved.0, std::ptr::null_mut());
+    }
+}
+
 /// Create the self-pipe. Both ends are set non-blocking and `FD_CLOEXEC`. The
 /// write end is stashed in a module-private atomic so [`selfpipe_handler`] can
 /// reach it.

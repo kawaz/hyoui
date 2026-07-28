@@ -173,15 +173,23 @@ pub fn openpty_fork_anchor_exec(
     // SAFETY: `fork(2)`。child path では async-signal-safe な操作のみ
     // (setpgid / tcsetpgrp / dup2 / close / execvp / _exit)。alloc / lock /
     // Rust destructor を一切走らせない。argv ポインタ配列は fork 前に構築済。
+    // 継承 handler 対策: fork を signal block で囲み、子は disarm 後に mask を戻す
+    // (= `super::signal::disarm_self_pipe_in_child` の doc 参照)。
+    let saved_mask = super::signal::block_handled_signals();
     let pid = unsafe { libc::fork() };
     if pid == -1 {
         let err = Errno::last();
+        super::signal::restore_mask(&saved_mask);
         // master / slave は OwnedFd の Drop で close される。
         return Err(Error::from(err));
     }
 
     if pid == 0 {
         // ===== child path (async-signal-safe のみ) =====
+        // 継承した self-pipe handler を無効化してから mask を戻す (= この順序で
+        // ないと窓が残る)。`execve` は mask を引き継ぐので復元は必須。
+        super::signal::disarm_self_pipe_in_child();
+        super::signal::restore_mask(&saved_mask);
         // SAFETY: 以下はすべて async-signal-safe な libc 直呼び。
         unsafe {
             // 同 session のまま新 pgrp の leader になる。
@@ -229,6 +237,7 @@ pub fn openpty_fork_anchor_exec(
     }
 
     // ===== parent path (= daemon) =====
+    super::signal::restore_mask(&saved_mask);
     // race 対策: child の `setpgid(0,0)` と競合しても結果が同じになるよう、
     // parent からも `setpgid(child, child)` を試みる。EACCES は child が既に
     // exec 済の印 (= setpgid は exec 後の子に対して EACCES) なので無視可。
@@ -306,10 +315,24 @@ pub fn forkpty_then_exec_legacy(
     // we only call `chdir` / `execvp` (async-signal-safe) and on failure
     // `_exit(127)` (async-signal-safe). No allocation, no locks, no Rust
     // destructors of our own.
-    let result = unsafe { nix::pty::forkpty(&ws, None) }.map_err(Error::from)?;
+    // 継承 handler 対策 (= anchor 経路と同じ、`disarm_self_pipe_in_child` の doc 参照)。
+    let saved_mask = super::signal::block_handled_signals();
+    let result = match unsafe { nix::pty::forkpty(&ws, None) } {
+        Ok(r) => r,
+        Err(e) => {
+            super::signal::restore_mask(&saved_mask);
+            return Err(Error::from(e));
+        }
+    };
     match result {
-        ForkptyResult::Parent { child, master } => Ok(ForkedChild { child, master }),
+        ForkptyResult::Parent { child, master } => {
+            super::signal::restore_mask(&saved_mask);
+            Ok(ForkedChild { child, master })
+        }
         ForkptyResult::Child => {
+            // 継承した self-pipe handler を無効化してから mask を戻す。
+            super::signal::disarm_self_pipe_in_child();
+            super::signal::restore_mask(&saved_mask);
             // cwd 伝搬: 起動元 dir に chdir してから exec (= 透過性回復、本体は
             // openpty_fork_anchor_exec と同じ contract)。失敗時は exec を中止して
             // _exit(127)。
