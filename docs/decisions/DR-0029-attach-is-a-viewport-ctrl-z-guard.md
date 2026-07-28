@@ -2,7 +2,7 @@
 
 - Status: Active
 - Date: 2026-07-25
-- Related: DR-0005 (思想 — 「in-band escape の唯一の例外」条項を本 DR で撤回), DR-0007 (MVP scope — `Ctrl-A D` 記述を撤回), DR-0017 (session anchor + suspend policy — §柱2 の client follow を本 DR で撤回), DR-0019 (daemon 側 auto-resume policy — 本 DR は config default を足すだけで配置は不変), DR-0020 (発見性ヒント / 追加キー intercept 却下 — 本 DR で再判断), DR-0024 (config.toml 機構 — `[attach]` / `[session]` セクションで相乗り), DR-0026 (**本 DR が Supersede**)
+- Related: DR-0005 (思想 — 「in-band escape の唯一の例外」条項を本 DR で撤回), DR-0007 (MVP scope — `Ctrl-A D` 記述を撤回), DR-0017 (session anchor + suspend policy — §柱2 の client follow を本 DR で撤回), DR-0019 (daemon 側 auto-resume policy — 本 DR は config default を足すだけで配置は不変), DR-0020 (発見性ヒント / 追加キー intercept 却下 — 本 DR で再判断), DR-0024 (config.toml 機構 — `[attach]` / `[session]` セクションで相乗り), DR-0026 (**本 DR が Supersede**), DR-0030 (§5 の resume 発火点を拡張 — attach 中の子 stop も trigger にする)
 - Origin: docs/QUESTIONS.md SUSP-Q1..Q3 (2026-07-25 kawaz 裁定)
 
 ## 原則: attach は覗き窓であり、client 操作で子を止めない
@@ -128,7 +128,7 @@ DR-0005 の思想「子プロセスへの入力は完全透過。in-band escape 
 ctrlz_guard = true            # false で完全 bypass (= Ctrl+Z 素通し)
 ctrlz_guard_delay = "500ms"   # 0 で連打判定なしの即 detach
 ctrlz_guard_overlay = true    # 未実装 (= 受理のみ、issue 2026-07-25 参照)
-resume_on_reattach = true     # stopped child への rw attach で resume 要求を送る
+resume_stopped_child = true   # rw attach 中は子を停止させたままにしない (DR-0030 で改名)
 
 [session]
 auto_resume = false           # 子の stop を daemon が観測したら自動 SIGCONT
@@ -139,7 +139,7 @@ auto_resume = false           # 子の stop を daemon が観測したら自動 
 top-level scalar が最初のセクションより前にしか書けないため、ファイル末尾に追記した
 ユーザの `auto_resume = false` が `[web]` 配下に吸われる罠がある。セクション化で回避する。
 
-- `ctrlz_guard*` / `resume_on_reattach` は attach client の UX なので `[attach]`
+- `ctrlz_guard*` / `resume_stopped_child` は attach client の UX なので `[attach]`
 - `auto_resume` は attach の有無に関係ない session 単位の policy なので `[session]`
 
 **`ctrlz_guard_delay` は duration 文字列** (`"500ms"` / `"1s"` / `"1.5s"` / `"2m"`)。
@@ -163,7 +163,13 @@ DR-0026 §2 (= rw attach 時に `child_stopped` なら `SessionChildResumeReques
 ro / rw-no-leader は送らない) は本 DR でもそのまま引き継ぐ。§1 で撤回したのは
 「client が子に **合わせて止まる**」であって、「人間が rw attach した = 操作意思」を
 trigger にした resume は原則と矛盾しない (= 覗き窓を開けた人が操作するために起こす)。
-config key 名だけ `[attach] resume_on_reattach` に平坦化した。
+config key 名だけ `[attach]` 配下に平坦化した。
+
+> **📌 注記 ([[DR-0030]]、2026-07-29)**: 本節の trigger は「rw attach した時点で子が
+> stopped」の 1 つだけだったが、それでは attach 成立**後**に子が self-stop した場合に
+> 起こす主体が居らず、「attach しているのに操作が一切効かない」状態になっていた。
+> DR-0030 が trigger に「attach 中の `SessionChildStoppedNotify` 受信」を追加し、
+> config key を `resume_stopped_child` に改名した。本節の ro / rw-no-leader 除外は不変。
 
 ## Rejected alternatives
 

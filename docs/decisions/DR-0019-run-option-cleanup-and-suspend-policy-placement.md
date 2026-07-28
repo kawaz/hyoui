@@ -2,7 +2,7 @@
 
 - Status: Active
 - Date: 2026-06-11
-- Related: DR-0001 (jobcontrol 2 軸 — 本 DR で preset 表を partially supersede), DR-0005 (思想 — pipe-through の透過性回復を justify), DR-0006 (CLI ground rules — `--exclusive` / `--detach-others` の原典), DR-0014 (検証主義 — silent no-op 禁止の根拠), DR-0015 (run = fork + exec attach — 軸 2 廃止、§2.2 の policy 配置を本 DR で変更), DR-0017 (notify-only default + AutoResume opt-in 温存 — 本 DR がその唯一実現可能な配置を確定)
+- Related: DR-0001 (jobcontrol 2 軸 — 本 DR で preset 表を partially supersede), DR-0005 (思想 — pipe-through の透過性回復を justify), DR-0006 (CLI ground rules — `--exclusive` / `--detach-others` の原典), DR-0014 (検証主義 — silent no-op 禁止の根拠), DR-0015 (run = fork + exec attach — 軸 2 廃止、§2.2 の policy 配置を本 DR で変更), DR-0017 (notify-only default + AutoResume opt-in 温存 — 本 DR がその唯一実現可能な配置を確定), DR-0030 (§3 の client 側配置却下の射程を「無人時の policy」に限定 — 有人時は client 側 resume が担う)
 - Origin: docs/findings/2026-06-11-signal-suspend-interaction-audit.md (2 系統監査の正本)
 
 ## Context
@@ -98,6 +98,13 @@ NAT 越えで接続を維持し、スマホ / ブラウザの専用 UI からネ
 唯一の解であり、attach client が存在しない場面でそれができるのは daemon だけ — これが
 auto-resume = daemon 責務 (client 側 policy 不採用、§Rejected) の決定根拠である。
 default は引き続き `notify` (= 勝手に起こさない、[[DR-0017]] 不変)。
+
+> **📌 注記 ([[DR-0030]]、2026-07-29)**: 本節の「勝手に起こさない」および下記
+> Rejected alternatives の client 側配置却下は、**誰も rw attach していない時の規定**
+> として維持される。rw attach client が居る間は DR-0030 の client 側 resume が発動し、
+> 子は停止したまま留まらない。却下理由「client 側では無人時に発動できない」は、
+> 発動条件が「client が居ること」そのものである経路には当たらないため、2 経路は
+> 競合ではなく補完関係にある。
 
 なお [[DR-0015]] §2.2 の「`on-child-suspend` policy は client の cap negotiate payload に
 含め、daemon は leader の policy を覚える」という配置は、実装されないまま本 DR で

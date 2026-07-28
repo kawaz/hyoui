@@ -20,15 +20,7 @@
 
 ## 裁定待ち
 
-### 👺RS-Q1: `hyoui run` の子が self-stop した時、attach client が起こしてよいか
-
-- [ ] a (推奨): `run` が内部生成する attach では resume を適用しない (明示 `hyoui attach` でのみ起こす)
-- [ ] b: test を現状に合わせる (default が実質 auto-resume になったと認める)
-- [ ] c: `resume_on_reattach` の default を `false` にする
-
-`run` は「起動」であって「復帰意思の表明」ではない ([DR-0019](docs/decisions/DR-0019-run-option-cleanup-and-suspend-policy-placement.md) §3
-の「勝手に起こさない」と [DR-0029](docs/decisions/DR-0029-attach-is-a-viewport-ctrl-z-guard.md) §5 の衝突)。
-c は明示 attach の UX まで変わる。
+(現在なし)
 
 ## 確認待ち
 
