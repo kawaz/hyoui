@@ -126,11 +126,13 @@ pub struct AttachConfig {
     #[serde(default = "default_true")]
     pub ctrlz_guard_overlay: bool,
 
-    /// stopped child への rw attach を復帰意思とみなして resume 要求を送る。
+    /// rw attach 中は子を停止させたままにせず resume 要求を送る (DR-0030)。
     ///
-    /// default `true`。ro / rw-no-leader attach では設定に関わらず送らない。
+    /// 発火点は 2 つ: attach 成立時に既に stopped だった場合と、attach 中に子が
+    /// stop した場合。default `true`。ro / rw-no-leader attach では設定に関わらず
+    /// 送らない (= 観察 / 非 leader 接続は操作意思とみなさない)。
     #[serde(default = "default_true")]
-    pub resume_on_reattach: bool,
+    pub resume_stopped_child: bool,
 }
 
 /// env scrub 設定 (= TOML の `[scrub_env]` 配下、DR-0024 §3)。
@@ -187,7 +189,7 @@ impl Default for AttachConfig {
             ctrlz_guard: true,
             ctrlz_guard_delay: default_ctrlz_guard_delay(),
             ctrlz_guard_overlay: true,
-            resume_on_reattach: true,
+            resume_stopped_child: true,
         }
     }
 }
@@ -413,7 +415,7 @@ mod tests {
         assert!(c.attach.ctrlz_guard);
         assert_eq!(c.attach.ctrlz_guard_delay, Duration::from_millis(500));
         assert!(c.attach.ctrlz_guard_overlay);
-        assert!(c.attach.resume_on_reattach);
+        assert!(c.attach.resume_stopped_child);
         assert!(!c.session.auto_resume);
         assert_eq!(c.web.listen, "127.0.0.1:43690");
     }
@@ -510,7 +512,7 @@ ctrlz_guard_delay = "125ms"
         assert!(c.attach.ctrlz_guard);
         assert_eq!(c.attach.ctrlz_guard_delay, Duration::from_millis(125));
         assert!(c.attach.ctrlz_guard_overlay);
-        assert!(c.attach.resume_on_reattach);
+        assert!(c.attach.resume_stopped_child);
         assert!(c.scrub_env.enabled);
     }
 
@@ -521,13 +523,13 @@ ctrlz_guard_delay = "125ms"
 ctrlz_guard = false
 ctrlz_guard_delay = "1s"
 ctrlz_guard_overlay = false
-resume_on_reattach = false
+resume_stopped_child = false
 "#;
         let c = parse_str(s, &dummy_path()).unwrap();
         assert!(!c.attach.ctrlz_guard);
         assert_eq!(c.attach.ctrlz_guard_delay, Duration::from_secs(1));
         assert!(!c.attach.ctrlz_guard_overlay);
-        assert!(!c.attach.resume_on_reattach);
+        assert!(!c.attach.resume_stopped_child);
     }
 
     #[test]
@@ -708,7 +710,7 @@ assets_dir = "/tmp/assets"
             "ctrlz_guard",
             "ctrlz_guard_delay",
             "ctrlz_guard_overlay",
-            "resume_on_reattach",
+            "resume_stopped_child",
             "[session]",
             "auto_resume",
             "[web]",

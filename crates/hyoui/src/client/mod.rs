@@ -9,6 +9,6 @@ pub mod auto_lock;
 
 pub use attach::{
     AttachOptions, CTRL_Z_BYTE, ClientConnection, OUTER_TTY_RESET, RunOutcome, StdinEofAction,
-    WinchSource,
+    WinchSource, should_resume_stopped_child,
 };
 pub use auto_lock::{AutoLockError, acquire_auto_lock, release_auto_lock};

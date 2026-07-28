@@ -109,6 +109,19 @@ fn process_ctrlz_guard(
     DetachAction::Forward(forward)
 }
 
+/// この attach client が停止中の子を起こすべきか (DR-0030)。
+///
+/// 「rw attach が開いている = 子を操作する意思がある」を trigger にする。判定は
+/// attach 成立時 (= handshake snapshot が stopped) と attach 中に子が stop した
+/// 場合の両方で共通なので、条件を 1 箇所に集約して両 call site から使う。
+///
+/// `ro` は観察のみ、`rw-no-leader` は非 leader 接続なので、どちらも操作意思とは
+/// みなさず設定値に関係なく起こさない。
+#[must_use]
+pub fn should_resume_stopped_child(mode: Mode, config: &crate::config::AttachConfig) -> bool {
+    mode == Mode::Rw && config.resume_stopped_child
+}
+
 /// 「子が停止中」を画面最下行に描く escape 列を組む (DR-0029 §1)。
 ///
 /// `ESC 7` / `ESC 8` (= DECSC/DECRC) で cursor 位置を保存・復元し、間に最下行への移動 +
@@ -749,15 +762,31 @@ impl ClientConnection {
                                     });
                                 }
                                 Ok(ControlMessage::SessionChildStoppedNotify(_)) => {
-                                    // DR-0029 §1: attach は覗き窓なので、子が止まっても
-                                    // client は止まらず attach を継続する。画面は子の出力が
-                                    // 止まって固着するだけなので、それが「hyoui が壊れた」
-                                    // ではなく「子が停止中」だと分かるよう最下行に 1 行出す。
-                                    let rows = crate::sys::tty_size(stdin.as_fd())
-                                        .ok()
-                                        .flatten()
-                                        .map(|ws| ws.rows);
-                                    self.draw_child_stopped_notice(stdout, rows);
+                                    // DR-0030: rw attach 中は子を停止させたままにしない。
+                                    // 覗き窓が開いている = 操作意思がある状態なので、子が
+                                    // 止まったら即 resume を要求する (= DR-0029 §5 の
+                                    // 「rw attach 時点で stopped なら起こす」を、attach 中に
+                                    // 止まった場合まで広げたもの。同じ
+                                    // `SessionChildResumeRequest` を使い新機構は足さない)。
+                                    //
+                                    // ro / rw-no-leader は観察 or 非 leader 接続なので
+                                    // 起こさない (= DR-0029 §5 と同じ切り分け)。
+                                    let resuming = should_resume_stopped_child(
+                                        self.response.mode,
+                                        &self.attach_config,
+                                    ) && self.send_child_resume().is_ok();
+                                    if !resuming {
+                                        // DR-0029 §1: 起こさない場合は attach を継続したまま
+                                        // 画面が固着するので、それが「hyoui が壊れた」では
+                                        // なく「子が停止中」だと分かるよう最下行に 1 行出す。
+                                        // 起こす場合は子の再描画で消える通知を出すだけ無駄
+                                        // なので描かない。
+                                        let rows = crate::sys::tty_size(stdin.as_fd())
+                                            .ok()
+                                            .flatten()
+                                            .map(|ws| ws.rows);
+                                        self.draw_child_stopped_notice(stdout, rows);
+                                    }
                                 }
                                 Ok(ControlMessage::LeaderNotify(n)) => {
                                     // Minor 4: leader 変更通知で自分の leader 状態を更新する。
@@ -1586,7 +1615,7 @@ mod tests {
             ctrlz_guard: true,
             ctrlz_guard_delay: Duration::from_millis(500),
             ctrlz_guard_overlay: true,
-            resume_on_reattach: true,
+            resume_stopped_child: true,
         }
     }
 
@@ -1766,6 +1795,29 @@ mod tests {
             now,
         );
         assert_eq!(t, PollTimeout::from(1u16));
+    }
+
+    // ---- DR-0030: 停止中の子を起こす判定 ----
+
+    /// rw attach が開いている間だけ子を起こす。ro / rw-no-leader は操作意思と
+    /// みなさないので、設定が有効でも起こさない。
+    #[test]
+    fn only_rw_attach_resumes_stopped_child() {
+        let cfg = crate::config::AttachConfig::default();
+        assert!(cfg.resume_stopped_child, "default は起こす側 (DR-0030)");
+        assert!(should_resume_stopped_child(Mode::Rw, &cfg));
+        assert!(!should_resume_stopped_child(Mode::Ro, &cfg));
+        assert!(!should_resume_stopped_child(Mode::RwNoLeader, &cfg));
+    }
+
+    /// `resume_stopped_child = false` は rw attach でも起こさない (= opt-out)。
+    #[test]
+    fn resume_stopped_child_false_opts_out_even_for_rw() {
+        let cfg = crate::config::AttachConfig {
+            resume_stopped_child: false,
+            ..crate::config::AttachConfig::default()
+        };
+        assert!(!should_resume_stopped_child(Mode::Rw, &cfg));
     }
 
     // ---- DR-0029 §1: 子 stopped の画面通知 ----
