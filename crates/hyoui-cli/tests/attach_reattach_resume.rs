@@ -88,7 +88,7 @@ fn run_case(mode: Mode, child_stopped: bool, on_reattach: Option<bool>) -> bool 
         std::fs::create_dir_all(&config_dir).expect("create config dir");
         std::fs::write(
             config_dir.join("config.toml"),
-            format!("[attach]\nresume_on_reattach = {enabled}\n"),
+            format!("[attach]\nresume_stopped_child = {enabled}\n"),
         )
         .expect("write config");
     }

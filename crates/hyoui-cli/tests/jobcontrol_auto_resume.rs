@@ -10,8 +10,10 @@
 //!   → 子が復帰して `MARKER` を出力
 //! ```
 //!
-//! 対比として default (= notify) では子が起こされず、短時間 `MARKER` が出ない
-//! ことを確認する (= auto-resume の効果が daemon 配線由来であることの裏取り)。
+//! default (= notify) では daemon は起こさないが、`hyoui run` は DR-0015 で
+//! 「fork daemon + attach client」の合成なので rw attach client が同居しており、
+//! DR-0030 によりその client が resume を要求する。したがって `run` 経由では
+//! default でも子は復帰する (= 起動直後 / attach 中のどちらで止まっても同じ)。
 //!
 //! `#[ignore]`: PTY child + signal を使うため CI 安定性の都合でローカル実行
 //! (= `cargo test -- --ignored`)。jobcontrol_follow.rs と同じ運用。
@@ -55,11 +57,19 @@ fn auto_resume_resumes_self_stopped_child() {
     let _ = h.kill();
 }
 
-/// notify (default): 子が self-stop すると daemon は起こさない。leader (= attach)
-/// が follow して止まり、子も stopped のまま → 短時間 `RESUMED_MARKER` は出ない。
+/// 起動直後に self-stop する子。attach 成立時点で既に stopped なので、handshake
+/// snapshot 経由の resume 経路 (DR-0030 の発火点その 1) が効く。
+///
+/// **仕様変更の記録**: 本 test は 2026-07-29 の kawaz 裁定 (👺RS-Q1) で期待値が
+/// 反転した。旧 test `notify_default_does_not_resume_self_stopped_child` は
+/// 「default では起こされない」を期待していたが、それは DR-0019 §3 (daemon は
+/// 勝手に起こさない) だけを見て `run` に同居する attach client を見落とした
+/// 期待値だった。DR-0030 が「rw attach 中は子を停止させたままにしない」を原則と
+/// して確定したので、現在は起こされるのが正。**失敗を消すための test 改変ではなく、
+/// 裁定による仕様変更**である (経緯は DR-0030 §Context)。
 #[ignore = "PTY child + signal を使う、ローカルで --ignored 実行 (DR-0019)"]
 #[test]
-fn notify_default_does_not_resume_self_stopped_child() {
+fn run_resumes_child_that_is_already_stopped_at_attach() {
     let runner = HyouiTestRunner::new();
     let mut h = runner.spawn_hyoui(
         "jobcontrol-notify-default",
@@ -72,11 +82,48 @@ fn notify_default_does_not_resume_self_stopped_child() {
         ],
     );
 
-    // notify では子は stopped のまま。短い timeout で marker が出ない (= Err) ことを確認。
-    let result = h.wait_for("RESUMED_MARKER", Duration::from_secs(2));
+    let out = h
+        .wait_for("RESUMED_MARKER", Duration::from_secs(8))
+        .expect("DR-0030: rw attach 中なので default policy でも子は復帰するはず");
     assert!(
-        result.is_err(),
-        "notify default では子が起こされず marker は出ないはず: {result:?}"
+        out.contains("RESUMED_MARKER"),
+        "resume 後の出力に marker が含まれない: {out:?}"
+    );
+
+    let _ = h.kill();
+}
+
+/// attach **成立後**に self-stop する子。handshake snapshot は running なので、
+/// DR-0030 の発火点その 2 (= attach 中の `SessionChildStoppedNotify` 受信) だけが
+/// 復帰経路になる。
+///
+/// 裁定の主眼はこちら: 「TUI アプリを hyoui 直で起動した時、attach しているのに
+/// 一切の操作が効かなくなる」害の再発防止 (= 起動直後 self-stop は稀で、実運用で
+/// 効くのは走行中の self-stop)。
+#[ignore = "PTY child + signal を使う、ローカルで --ignored 実行 (DR-0019)"]
+#[test]
+fn run_resumes_child_that_stops_while_attached() {
+    let runner = HyouiTestRunner::new();
+    let mut h = runner.spawn_hyoui(
+        "jobcontrol-stop-while-attached",
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            // attach 成立を STARTED で同期してから止まる (= handshake 時は running)。
+            "echo STARTED; sleep 1; kill -STOP $$; echo RESUMED_MARKER; sleep 5",
+        ],
+    );
+
+    h.wait_for("STARTED", Duration::from_secs(8))
+        .expect("子が起動して STARTED を出すはず");
+    let out = h
+        .wait_for("RESUMED_MARKER", Duration::from_secs(8))
+        .expect("DR-0030: attach 中に止まった子も rw client の要求で復帰するはず");
+    assert!(
+        out.contains("RESUMED_MARKER"),
+        "resume 後の出力に marker が含まれない: {out:?}"
     );
 
     let _ = h.kill();
