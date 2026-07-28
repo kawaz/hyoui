@@ -377,7 +377,107 @@ wait_for("MARK=") timed out after 10s; output so far (107 bytes):
 client へ配送されない (もしくは子が exec まで到達していない)」という、
 より下層の何か。次はこの区間を daemon 側 trace で分解する。
 
-### 次の調査方針 (更新)
+## 第 2 の原因を特定・修正 (2026-07-28、anchor 経路の SIGTTOU race)
+
+前節の「次の調査方針」4 (= `child_inherits_hyoui_session_id_env` を高負荷下で
+daemon 側 trace) を実施し、**真因を特定して修正した**。ただし後述のとおり
+lib suite (= legacy 経路) の失敗は別原因として残る。
+
+### 観測 (= 3 段階で切り分け)
+
+CPU burner 40 本 (load 60〜250) で再現させ、以下を順に観測した。
+
+**1) 配送ではなく子が喋っていない**: 既存の `--debug-dump-server` (= master
+read 直後の生 bytes) と `--debug-dump-client` を test から有効化したところ、
+失敗時は **両方 0 byte**。daemon は子から 1 byte も読んでいなかった。
+
+**2) 子は exec に到達していない**: 子 script に PTY を経由しないマーカー
+(`: > <dir>/child_exec`) を仕込むと、失敗 3 回すべてで **マーカーが作られない**。
+`sh` は最初のコマンドすら実行していない。
+
+**3) 子は fork 済みで T (stopped) のまま**: daemon に trace を入れ、失敗時に
+`ps` を撮った。
+
+```
+XXTRACE daemon start-ok pid=35983
+XXTRACE serve-enter pid=35983 pgid=Pid(35983) sid=Some(Pid(35983)) child=35984
+[hyoui] detach: Ctrl+Z  |  子へ Ctrl+Z: 2 連打  |  peek (read-only): ...
+```
+```
+  PID  PPID  PGID STAT TTY      COMMAND
+35983 35949 35983 Ss   ttys121  hyoui run --detached -- sh -c ...
+35984 35983 35984 T+   ttys121  hyoui run --detached -- sh -c ...
+```
+
+子 35984 は **`T` = stopped**、かつ COMMAND がまだ親のもの (= `execve` 前)。
+`PGID == 自 PID` なので `setpgid(0,0)` は成功済み。
+
+### 機構
+
+`sys/raw.rs` の `openpty_fork_anchor_exec` の child path:
+
+```rust
+libc::setpgid(0, 0);                          // 新 pgrp の leader になる
+libc::tcsetpgrp(slave_raw, libc::getpid());   // ← ここで SIGTTOU
+```
+
+POSIX では **`tcsetpgrp` を background process group から呼ぶと SIGTTOU が
+生成され**、ignore / block されていなければプロセスは **停止する**。
+直前の `setpgid(0,0)` で子は新 pgrp に移った一方、slave の foreground pgrp は
+**親が `tcsetpgrp` を実行するまで親のまま**なので、親より先にここへ来た子は
+background 扱いになり停止する。誰も SIGCONT を送らないので子は exec に到達せず、
+daemon は永久に子出力を待つ。
+
+親側 (同関数の parent path) は **同じ罠を認識して `signal(SIGTTOU, SIG_IGN)`
+してから `tcsetpgrp` を呼んでいた**。子側にだけこのガードが無い、片面実装。
+
+flaky になる理由も説明がつく: 親と子が同じ `tcsetpgrp` を競走しており、
+**親が先なら子は foreground なので無傷、子が先なら停止**する。高負荷ほど
+子が先行する確率が上がるため、負荷依存で顔を出す。
+
+### 修正
+
+子側でも `tcsetpgrp` を SIGTTOU 一時 ignore で挟む (= 親側と対称)。exec 後の
+子に ignore を漏らさないよう (`execve` は ignored disposition を引き継ぐ)
+旧 disposition へ戻す。`signal` は async-signal-safe。
+
+### A/B (高負荷、交互実行で順序バイアス除去)
+
+env switch で修正を無効化できるようにし、A (修正あり) / B (修正なし) を
+1 回ずつ交互に 14 iteration:
+
+| 条件 | 結果 |
+|---|---|
+| **A (fix)** | **0 fail / 14** |
+| **B (base)** | **6 fail / 14** |
+
+Fisher 正確検定 両側 **p = 0.016** (= 有意)。switch を除去した clean な
+バイナリでも load 247 で **14/14 green**。
+
+### lib suite の失敗は別原因として残る (= 未解決)
+
+burner を止めて `cargo test -p hyoui --lib daemon::session` を 20 回:
+
+```
+pass=17 fail=3
+  serve_ro_client_lock_acquire_rejected
+  serve_tail_follow_receives_tail_end_on_child_exit
+  serve_tail_follow_receives_tail_end_when_child_exits_immediately
+```
+
+前任の観測 (4/20) と同水準で、**改善していない**。理由は明快で、失敗した
+3 run すべてのログに `session anchor 化不可` warning が出ている = lib test は
+`Session::start` を直接呼ぶため **legacy 経路 (`forkpty_then_exec_legacy`)**
+に落ちており、今回修正した anchor 経路を通らない。
+
+= 本修正が効くのは **production 経路 (`hyoui run` = setsid 済 daemon)** のみ。
+CI で落ちている lib 側の flaky には、legacy 経路側の別調査が要る
+(= 「試して失敗した修正案」節の `setpgid` + `tcsetpgrp` 設計見直しが該当領域)。
+
+なお本件は test だけの問題ではなく **production の実害**である点に注意:
+高負荷マシンで `hyoui run` すると、子が exec 前に停止して永久に起動しない。
+
+### 次の調査方針 (旧、方針 4 は上記で完了)
 
 1. **最有力候補の裏取りから始める**: `SIGCHLD_SELFPIPE_LOCK` を取れなかった
    serve は self-pipe 無しの **500ms polling 経路**に落ちる (`sigchld_pipe`
@@ -406,11 +506,17 @@ client へ配送されない (もしくは子が exec まで到達していな�
 - [x] product バグを 1 つ特定・修正 (= kill_pgrp の自プロセスグループ誤送信)
 - [x] product バグをもう 1 つ特定・修正 (= 子 exit 検出が client frame 処理を
       追い越して tail.request を捨てる race。**決定的再現あり**、regression test 追加)
-- [ ] **残る要因の特定** (= 上記 2 つの修正後も Linux suite 9/15、macOS
-      `daemon::session` 4/20 で失敗。**2026-07-27 で仮説が 2 つとも否定された**:
-      `child_inherits_hyoui_session_id_env` は別プロセス単独実行でも高負荷なら
-      50% 落ちるため「多数並走」でも「self-pipe degraded」でも説明できない。
-      handshake → 初回 raw_data 区間の daemon 側 trace が次の一手)
+- [x] product バグをもう 1 つ特定・修正 (= **anchor 経路の子が `tcsetpgrp` を
+      background pgrp から呼んで SIGTTOU で停止し、exec に到達しない race**。
+      2026-07-28、`ps` で `T` + 未 exec を直接観測。高負荷 A/B で
+      A(fix) 0/14 vs B(base) 6/14、Fisher 両側 p=0.016)
+- [ ] **legacy 経路 (`forkpty_then_exec_legacy`) 側の残存要因**
+      (= lib test は `Session::start` 直呼びで anchor 化不可 → legacy に落ちる
+      ため上記修正が効かない。修正後も `daemon::session` 20 回で 3 失敗。
+      `serve_ro_client_lock_acquire_rejected` /
+      `serve_tail_follow_receives_tail_end_{on_child_exit,when_child_exits_immediately}`。
+      同じ手 (= 失敗時に子の `ps` STAT を撮る) で legacy 経路の子が
+      停止しているかを最初に確認するのが安い)
 - [x] ee43651b が回帰原因ではないことを確認 (= 高負荷 A/B で親 5/12 vs
       HEAD 6/12、有意差なし)
 - [ ] CI 並列実行で安定して pass する (= 修正 push 後の CI で確認)
