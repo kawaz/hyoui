@@ -3,7 +3,7 @@ title: serve_tail_follow_receives_tail_end_on_child_exit が ubuntu CI で flaky
 status: wip
 category: bug
 created: 2026-07-03T19:50:00+09:00
-last_read: 2026-07-27T00:30:00+09:00
+last_read: 2026-07-29T04:20:00+09:00
 open_entered: 2026-07-03T19:50:00+09:00
 wip_entered: 2026-07-27T00:30:00+09:00
 blocked_entered:
@@ -499,6 +499,82 @@ CI で落ちている lib 側の flaky には、legacy 経路側の別調査が�
    要らない (= 変数が最小)。1 / 「多数並走」説はどちらもこの test を
    説明できないことが確定しているので、切り分け済みの土俵で trace できる
 
+## 第 3 の原因を特定・修正 (2026-07-29、fork〜exec 窓の継承 self-pipe handler)
+
+前節が残した「legacy 経路側の残存要因」を trace で特定した。legacy 経路そのものの
+tty 設計とは無関係で、**fork した子が親の self-pipe に signal byte を書き込む**のが
+機構だった。したがって「試して失敗した修正案」の `setpgid` + `tcsetpgrp` 見直しは
+不要 (= 地雷を踏み直さずに済む)。
+
+### 機構
+
+`SELFPIPE_WRITE_FD` は **プロセス global な raw fd** で、`fork` した子は
+signal handler の disposition と write fd の両方を継承する。fd は `FD_CLOEXEC` だが
+**`fork` から `execve` までの窓では生きている**。この窓で子に signal が届くと
+継承 handler が走り、**親の self-pipe に signal byte を書き込む**。
+
+lib test は 1 プロセスで多数の daemon を並走させるため被害が顕在化する:
+
+1. ある test の `Session::drop` が `kill_pgrp(child, SIGTERM)` を撃つ
+2. その子がまだ exec 前なら、子の継承 handler が byte 15 を**共有 self-pipe** に write
+3. **無関係な daemon** の `serve_loop` がその byte を drain し「SIGTERM を受けた」と誤認
+4. 自分の子を SIGTERM して socket close → 被害 test の client が
+   `UnexpectedEof("size header")`
+
+### 観測 (= trace で直接確認、対応は 1:1)
+
+handler 内で `getpid() != owner_pid` を検出する probe (`XXFOREIGN`) を仕込んだ。
+
+```
+XXKILL  thread=session_drop_kills_orphan_child child=71784 mode=pgrp sig=SIGTERM target=-71784
+XXFOREIGN sig=15 writer_pid=71784 owner_pid=71736      ← 子が親のパイプに書いた
+XXSIGTERM-RECV self_pid=71736 child=71777 term_sender=-1 reason=sigterm  ← 無関係な daemon が誤認
+```
+
+`term_sender` は `SA_SIGINFO` の `si_pid` を記録したもので、**-1 = SIGTERM は
+一度も届いていない**。byte が signal 由来でないことの直接証拠。
+予備の 30 run では probe 発火 3 run が失敗 3 run と完全一致した。
+
+### 修正
+
+2 段構え。子側で write fd の登録を外す (`disarm_self_pipe_in_child`) **だけでは
+`fork` から disarm 実行までの窓が残り、実測で再発した** (A 群 16 回中 1 回、
+XXFOREIGN 付き)。そこで `fork` 自体を `block_handled_signals` で囲み、子は
+disarm 後に mask を戻す。`execve` は signal mask を引き継ぐため子側の復元は必須。
+anchor / legacy の両 spawn 経路に入れた。
+
+### A/B (交互実行、専有した jj workspace で 100 pair)
+
+`HYOUI_AB_NO_CHILD_DISARM=1` で修正を無効化できるようにし、A (修正あり) /
+B (修正なし) を 1 回ずつ交互に 100 iteration (`cargo test -p hyoui --lib daemon::session`)。
+
+| 指標 | A (fix) | B (base) | Fisher 両側 |
+|---|---|---|---|
+| suite 失敗 | **2/100** | **11/100** | **p = 0.018** |
+| 機構マーカー `XXFOREIGN` | **0/100** | **10/100** | **p = 0.0015** |
+
+B の失敗 11 件中 10 件がマーカーを伴い、A では **100 回すべてマーカーが出ない**
+(= 機構が消えたことの直接確認)。
+
+### 残る失敗 (= 第 4 の原因、未特定)
+
+マーカーを伴わない失敗が A/B 双方に残る:
+
+- `serve_attach_redraw_preserves_alt_screen_flag` / `serve_screen_dump_ansi_*` の
+  `read_until_contains: timed out` (B38 / B48)。子が長命な test 群で、
+  「handshake 成立 → 最初の raw_data 受信」区間で止まる既知の様式
+- `serve_tail_follow_receives_tail_end_when_child_exits_immediately` の
+  `UnexpectedEof` が A 群で 1 回 (A86)。マーカーなしなので別経路
+- `run_until_terminates_child_on_pattern_match` が `start: Errno(UnknownErrno)` で
+  1 回 (A47)。`Session::start` 自体の失敗で症状群が違う。100 pair 中 1 回のみ
+
+### 測定上の注意 (= 1 回目の A/B を破棄した経緯)
+
+最初 `hyoui/main` で A/B を回したが、**別セッションが同じ workspace に並行 commit**
+しており (同一 crate の `client/attach.rs` 等)、毎 iteration の `cargo test` が
+異なるソースからビルドしていた。汚染とみなして破棄し、`jj workspace add` で
+専有 workspace を作って取り直した。**この種の A/B は専有 workspace で回すこと**。
+
 ## 受け入れ条件
 
 - [x] 不安定さの軸が **部分的に** 特定されている (= lib suite 32s が強い増悪要因)
@@ -510,13 +586,16 @@ CI で落ちている lib 側の flaky には、legacy 経路側の別調査が�
       background pgrp から呼んで SIGTTOU で停止し、exec に到達しない race**。
       2026-07-28、`ps` で `T` + 未 exec を直接観測。高負荷 A/B で
       A(fix) 0/14 vs B(base) 6/14、Fisher 両側 p=0.016)
-- [ ] **legacy 経路 (`forkpty_then_exec_legacy`) 側の残存要因**
-      (= lib test は `Session::start` 直呼びで anchor 化不可 → legacy に落ちる
-      ため上記修正が効かない。修正後も `daemon::session` 20 回で 3 失敗。
-      `serve_ro_client_lock_acquire_rejected` /
-      `serve_tail_follow_receives_tail_end_{on_child_exit,when_child_exits_immediately}`。
-      同じ手 (= 失敗時に子の `ps` STAT を撮る) で legacy 経路の子が
-      停止しているかを最初に確認するのが安い)
+- [x] **legacy 経路側の残存要因** — 実体は legacy 固有ではなく
+      **fork〜exec 窓の子が継承 self-pipe handler で親のパイプに signal byte を
+      書き込む**バグだった (2026-07-29)。`XXFOREIGN` probe で直接観測、専有
+      workspace の 100 pair A/B で suite 失敗 2/100 vs 11/100 (p=0.018)、
+      機構マーカー 0/100 vs 10/100 (p=0.0015)。anchor / legacy 両経路を修正
+- [ ] **第 4 の原因**: マーカーを伴わない残存失敗
+      (= `serve_attach_redraw_*` / `serve_screen_dump_*` の
+      `read_until_contains: timed out` (= handshake→初回 raw_data 区間)、および
+      マーカーなしの `UnexpectedEof` 1 件。100 pair 中 A 2 / B 1 なので
+      修正の有無に依らず残る軸)
 - [x] ee43651b が回帰原因ではないことを確認 (= 高負荷 A/B で親 5/12 vs
       HEAD 6/12、有意差なし)
 - [ ] CI 並列実行で安定して pass する (= 修正 push 後の CI で確認)
