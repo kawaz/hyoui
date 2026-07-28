@@ -87,14 +87,7 @@ poll:enter nclients=0 ...   ← 以降 31s 間 nclients=0 のまま yes(1) を�
 
 検証 (Linux 4core): 修正前 31.01s FAILED × 5/5 → 修正後 1.06〜1.12s ok × 8/8。
 
-### (B) macOS `notify_default_does_not_resume_self_stopped_child` → **裁定待ち**
-
-低負荷の macOS ローカルで **6/6 再現**した (= 環境要因ではない)。失敗内容:
-
-```
-notify default では子が起こされず marker は出ないはず:
-Ok("[hyoui] detach: ... \r\nRESUMED_MARKER\r\n")
-```
+### (B) macOS `notify_default_does_not_resume_self_stopped_child` → **裁定済み・実装済み**
 
 真因は **DR-0019 と DR-0029 の規定衝突**:
 
@@ -103,17 +96,23 @@ Ok("[hyoui] detach: ... \r\nRESUMED_MARKER\r\n")
 - `hyoui run` は DR-0015 で「fork daemon + attach client」の合成なので、**run した瞬間に
   attach 経路が発火して子を起こす**。daemon は notify を守っているが同居 client が起こす
 
-DR-0029 は自身を「DR-0019 の配置は不変、config default を足すだけ」と書いているが、
-`run` 経路では観測可能な挙動が変わっている (= 自己申告と実態の齟齬)。
-どちらの DR を優先するかは設計判断なので `docs/QUESTIONS.md` の **👺RESUME-Q1** で裁定待ち。
+2026-07-29 kawaz 裁定 (👺RS-Q1) により [[DR-0030]] を起票・実装済み。原則は
+「rw attach client が存在する間、hyoui は子を停止させたままにしない」で、
+DR-0029 §5 の resume 発火点を「handshake 時に stopped」に加えて「attach 中の
+`SessionChildStoppedNotify` 受信」にも拡張した。旧 test
+`notify_default_does_not_resume_self_stopped_child` は「default では起こされない」
+という、この裁定前の (誤った) 期待値だったため、`run_resumes_child_that_is_already_stopped_at_attach`
+等に置き換えて期待値を反転済み (`crates/hyoui-cli/tests/jobcontrol_auto_resume.rs`)。
 
 ## 受け入れ条件
 
 - [x] macOS の `notify_default_does_not_resume_self_stopped_child` の真因を特定
-      (= DR-0019 と DR-0029 の規定衝突。修正方針は 👺RESUME-Q1 の裁定待ち)
+      (= DR-0019 と DR-0029 の規定衝突)
+- [x] 修正方針の裁定 (👺RS-Q1、2026-07-29 kawaz) と [[DR-0030]] による実装
+      (= resume 発火点の拡張、対象 test の期待値反転)
 - [x] ubuntu の `serve_backpressure_disconnects_slow_client` を解決
       (= 単一 frame > buffer_limit で誰も attach できなくなる product バグ)
-- [ ] 上記 2 つの決着後、`continue-on-error: true` を外して恒常 red を検知可能にする。
+- [ ] 上記の決着を受けて `continue-on-error: true` を外して恒常 red を検知可能にする。
       外せない test が残るなら、その test だけ除外して残りを blocking にする
       (= 「全部隠す」のをやめる)
 
