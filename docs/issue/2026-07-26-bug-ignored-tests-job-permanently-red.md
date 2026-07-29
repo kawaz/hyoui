@@ -258,3 +258,80 @@ config は `HyouiTestRunner::spawn_hyoui_with_config` が runner 固有の
 無いことを確認した。timeout 延長や poll 間隔短縮ではなく、仕様変更で無効になった test の
 前提だけを明示的に固定しており、失敗を隠す変更ではない。
 
+## ignored test 総ざらい 2026-07-29
+
+`crates/` 配下の `#[ignore]` test 全 29 件を列挙し、DR-0029 と DR-0030、および各 test が
+参照する現行 DR と突き合わせた。
+
+| test | 判定 | 根拠・扱い |
+|---|---|---|
+| `headless_stdin_eof_terminates_child_reading_bc` | (a) | stdin EOF の event 経路。attach stop/resume 仕様と独立 |
+| `notify_child_stopped_does_not_auto_resume_without_leader` | (a) | DR-0030 §4 の無人時 `notify` を直接検証 |
+| `serve_backpressure_disconnects_slow_client` | (a) | backpressure 仕様。ubuntu 側は既知 issue のため本調査の実装スコープ外 |
+| `session_anchor_makes_child_stoppable` | (a) | DR-0017 の session anchor。attach client 不在 |
+| `list_marks_stale_socket_when_no_ping_response` | (a) | stale socket 判定。jobcontrol と独立 |
+| `interactive_typing_survives_raw_ack` | (a) | DR-0021 RawAck regression |
+| `daemon_sigterm_terminates_child_and_unlinks_socket` | (a) | daemon graceful shutdown |
+| `daemon_second_sigterm_during_shutdown_completes_unlink` | (a) | shutdown 中の再 SIGTERM 耐性 |
+| `auto_resume_resumes_self_stopped_child` | (c) | daemon `auto-resume` 固有経路を意図するが、DR-0030 の rw attach resume でも marker が出る。隔離要否は裁定待ち |
+| `run_resumes_child_that_is_already_stopped_at_attach` | (a) | DR-0030 発火点1 |
+| `run_resumes_child_that_stops_while_attached` | (a) | DR-0030 発火点2 |
+| `status_child_state_returns_to_running_after_resume` | (a) | resume 後の daemon state regression |
+| `daemon_sigcont_wakes_stopped_child` | (a) | runner-scoped config で attach resume から隔離済み |
+| `daemon_cont_wakes_child_stopped_during_daemon_stop` | (b) | attach resume が daemon fallback 不発を隠す偽 green。`resume_stopped_child=false` で隔離 |
+| `follow_child_self_stop_makes_attach_stopped` | (b) | DR-0029 §1 が client follow を撤回。新仕様の attach 継続＋通知行 test へ置換 |
+| `lock_acquire_prints_token_and_blocks_until_sigterm` | (a) | lock lifecycle。jobcontrol と独立 |
+| `restore_simple_echo_visible_in_screen_dump` | (a) | DR-0013 screen state |
+| `restore_dump_is_idempotent_across_calls` | (a) | DR-0013 dump 冪等性 |
+| `restore_dump_contains_ansi_control_sequences` | (a) | DR-0013 attach redraw |
+| `restore_snapshot_normalized` | (a) | DR-0013 snapshot regression |
+| `wait_explicit_session_wins_over_env` | (a) | DR-0020 session 解決順。ignore 理由は scrollback 未対応 |
+| `wait_single_positional_resolves_self_with_env` | (a) | DR-0020 self session 解決。ignore 理由は同上 |
+| `smoke_hyoui_run_echo` | (a) | DR-0015 run/attach round-trip |
+| `pipe_send_eof_default_terminates_child` | (a) | DR-0019 stdin EOF `send-eof` |
+| `pipe_detach_leaves_child_under_daemon` | (a) | DR-0019 stdin EOF `detach` |
+| `pipe_dev_null_no_spin_and_terminates` | (a) | pipe POLLNVAL/POLLHUP regression |
+| `idle_timeout_terminates_silent_child` | (a) | DR-0019 idle timeout |
+| `overall_timeout_terminates_busy_child` | (a) | DR-0019 overall timeout |
+| `no_timeout_keeps_silent_child_alive` | (a) | timeout 未指定の対照 |
+
+集計は (a) 26 件、(b) 2 件、(c) 1 件。判断割れの
+`auto_resume_resumes_self_stopped_child` は変更していない。
+
+### (b) の修正
+
+- `follow_child_self_stop_makes_attach_stopped` を
+  `stopped_child_keeps_attach_running_and_draws_notice` に置換し、test file も
+  `jobcontrol_stopped_notice.rs` へ改名した。test 固有 config で
+  `resume_stopped_child=false` とし、子が実際に `T` の間も attach が `T` にならず、
+  DR-0029 §1 の停止通知行が描画されることを e2e で検証する。
+- `daemon_cont_wakes_child_stopped_during_daemon_stop` に同じ runner-scoped config を適用した。
+  daemon の同一 drain batch fallback が不発でも、後段の rw attach resume で子が起きて
+  green になる経路を除外した。
+- test harness と production comment に残っていた `follow → raise(SIGSTOP)` の現行仕様扱いを
+  DR-0029/0030 の責務分担へ更新した。
+
+### fresh 検証
+
+| 検証 | 結果 | 所要時間 |
+|---|---:|---:|
+| `stopped_child_keeps_attach_running_and_draws_notice` | 20/20 PASS | 初回 compile 込み 4.12s、以降 1.17〜1.39s |
+| `daemon_cont_wakes_child_stopped_during_daemon_stop` | 20/20 PASS | 2.67〜2.90s |
+| 対照 `run_resumes_child_that_stops_while_attached` | 5/5 PASS | 初回 compile 込み 4.92s、以降 2.09〜2.14s |
+| 対照 `daemon_sigcont_wakes_stopped_child` | 5/5 PASS | 1.91〜1.97s |
+
+CI と同一コマンドを macOS で 3 周実行した。
+
+```console
+cargo test --workspace -- --ignored
+```
+
+| round | 結果 | ignored test 数 | 全所要時間 |
+|---:|---|---:|---:|
+| 1 | PASS | 29/29 | 20.93s |
+| 2 | PASS | 29/29 | 20.24s |
+| 3 | PASS | 29/29 | 19.72s |
+
+`cargo fmt --all -- --check` も成功。test session 名で `pgrep -fl` を確認し、調査由来の
+残骸 process が無いことを確認した。
+

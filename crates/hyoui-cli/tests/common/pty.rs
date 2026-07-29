@@ -529,12 +529,10 @@ impl SpawnedHyoui {
 
     /// attach client (= leader) が daemon に接続済みになるまで待つ。
     ///
-    /// **readiness race 対策 (= issue 2026-06-11)**: `hyoui run` は子 PTY を
-    /// daemon が fork した直後に process として観測できるが、follow policy
-    /// (`SessionChildStoppedNotify` → attach の `raise(SIGSTOP)`) は **attach client が
-    /// daemon socket に接続して leader 登録を終えて初めて**配線される。子 process の
-    /// 出現だけを見て SIGSTOP を送ると、leader 不在の窓で notify が空振りし、attach が
-    /// STOPPED にならない (= 旧テストの偽 fail 原因)。
+    /// 子 process は attach handshake より先に起動するため、子の出現だけでは client 側の
+    /// stopped-child 処理が利用可能とは限らない。`SessionChildStoppedNotify` の受信、
+    /// DR-0030 の resume 要求、DR-0029 の停止通知描画を検証する test は、先に rw leader
+    /// 登録の完了をこの helper で確認する。
     ///
     /// `hyoui status` の clients に `leader` 付き client が現れるまで poll する
     /// (= status 自身も一時 client を張るが、leader は attach client のみ)。timeout で

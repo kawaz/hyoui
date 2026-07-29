@@ -111,17 +111,12 @@ impl ChildLifecycle {
     /// 返り値 `.1` (= `Option<ChildTransition>`) は `waitpid` が今回呼び出しで
     /// **初めて** 取り出した遷移のみ `Some` (= `WaitStatus::Stopped` /
     /// `Continued` / `Exited` を初めて drain した瞬間)。`StillAlive` や
-    /// transient error では `None`。caller はこの transition を見て軸 1
-    /// policy (= `OnChildSuspend::Follow` で `raise(SIGSTOP)` / `AutoResume`
-    /// で `killpg(child, SIGCONT)`) を発火させる。
+    /// transient error では `None`。caller は `Stopped` を daemon policy
+    /// (`notify` / `auto-resume`) に渡し、notify の場合は rw client へ
+    /// `SessionChildStoppedNotify` を送る。client 側の resume 判定は DR-0030 の責務。
     ///
-    /// 旧 `child_actually_exited` 単体関数からの差し替え。state を持つので
-    /// caller は `ChildLifecycle` インスタンスを 1 つ loop 全体で使い回す。
-    ///
-    /// 通常の latched state だけを返す path は廃止 (= 毎周期で `Stopped` を
-    /// 返してしまい、policy 側で何度も SIGCONT を投げる事故の温床になる)。
-    /// caller は本 method の返り値 `.1` を毎回 `Some` 判定し、必要なら policy
-    /// を発火させる。
+    /// caller は `ChildLifecycle` インスタンスを loop 全体で使い回し、遷移が `Some` の
+    /// 時だけ policy を発火する。同じ stopped latch から SIGCONT や通知を重複送信しない。
     pub(super) fn poll_with_transition(
         &mut self,
         child: Pid,

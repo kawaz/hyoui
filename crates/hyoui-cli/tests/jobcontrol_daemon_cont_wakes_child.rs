@@ -108,9 +108,13 @@ fn daemon_cont_wakes_child_stopped_during_daemon_stop() {
     use common::pty::{find_descendants, process_state_of};
 
     let runner = HyouiTestRunner::new();
-    let mut h = runner.spawn_hyoui(
+    // DR-0030 の attach 側 resume が後段の stopped notify で子を起こすと、daemon の
+    // 同一 drain batch フォールバックが不発でも test が通る。この test が保証する
+    // daemon 経路だけを観測するため、rw leader を維持したまま attach resume を止める。
+    let mut h = runner.spawn_hyoui_with_config(
         "jobcontrol-batch-cont",
         &["run", "--", ECHO_LOOP[0], ECHO_LOOP[1], ECHO_LOOP[2]],
+        "[attach]\nresume_stopped_child = false\n",
     );
 
     assert!(
