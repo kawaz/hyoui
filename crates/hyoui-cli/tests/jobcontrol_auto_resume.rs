@@ -128,3 +128,51 @@ fn run_resumes_child_that_stops_while_attached() {
 
     let _ = h.kill();
 }
+
+/// resume 後に `hyoui status` の `child-state` が running へ戻ることを検証する。
+///
+/// 上の 3 test は「子が復帰したか」を子の出力 (= RESUMED_MARKER) だけで見ており、
+/// daemon が保持する `child_stopped` latch が下りたかを一切見ていなかった。
+/// そのため「子は動いているのに status は stopped に貼り付く」状態
+/// (docs/issue/2026-06-12-bug-child-stopped-flag-not-cleared.md) を素通しし、
+/// DR-0030 が実機で動いていないという誤診の原因になった。観測可能な state も
+/// 復帰することをここで押さえる。
+#[ignore = "PTY child + signal を使う、ローカルで --ignored 実行 (DR-0019)"]
+#[test]
+fn status_child_state_returns_to_running_after_resume() {
+    let runner = HyouiTestRunner::new();
+    let mut h = runner.spawn_hyoui(
+        "jobcontrol-status-after-resume",
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "echo STARTED; sleep 1; kill -STOP $$; echo RESUMED_MARKER; sleep 10",
+        ],
+    );
+
+    h.wait_for("STARTED", Duration::from_secs(8))
+        .expect("子が起動して STARTED を出すはず");
+    h.wait_for("RESUMED_MARKER", Duration::from_secs(8))
+        .expect("DR-0030: attach 中に止まった子は復帰するはず");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut last = String::new();
+    let mut running = false;
+    while std::time::Instant::now() < deadline {
+        h.pump_pty();
+        last = h.status_text().unwrap_or_default();
+        if last.contains("child-state: running") {
+            running = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        running,
+        "resume 後は child-state が running に戻るはず: {last}"
+    );
+
+    let _ = h.kill();
+}
