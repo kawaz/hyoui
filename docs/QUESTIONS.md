@@ -28,9 +28,9 @@
 
 - [ ] a: kawaz の普段使い (TUI を SHELL 挟まず hyoui 直起動 → attach 中に ^Z 系で self-stop) で、操作不能にならず自動で走行復帰することを確認
 
-v0.9.24 時点では**未動作** (AI 実機観測: rw attach 中に SIGTSTP → stopped のまま)。
-test green と実機の乖離を修正中で、修正版リリース後に確認可能になったらチャットで知らせる。
-それまでこの項目はチェック不能。
+**v0.9.25 で確認可能** (brew 反映済み)。v0.9.24 の「stopped のまま」は表示の貼り付き
+(macOS が self-stop 子の continued を waitpid で報告しない) で、v0.9.25 で修正。
+AI 実機 e2e では SIGTSTP 1 秒後に child-state: running + ps STAT S+ を確認済み。
 
 ### 👺RC-C2: 残骸ディレクトリの削除 (AI 権限で不可)
 
@@ -43,4 +43,4 @@ flaky A/B 検証用の隔離 workspace 残骸 (jj workspace forget 済み、中�
 
 - [ ] a: ヘッダクリックソートと cwd 全体が読めるセル表示の使用感を確認
 
-実装 worker 走行中。リリースに乗ったらチャットで知らせる。
+**v0.9.25 で確認可能** (web gateway 再起動済み、https://hyoui.kawaz-mbp16-20211217.kawaz.jp の Sessions ページ)。
