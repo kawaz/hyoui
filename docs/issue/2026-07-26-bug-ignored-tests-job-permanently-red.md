@@ -234,3 +234,27 @@ attach 側の規定を前提から落としていた。
 - 修正案(実装しない): testの目的であるdaemon SIGCONT防衛策を隔離するため、このtestだけ runner-scoped config で `[attach] resume_stopped_child = false` にしてrw leader接続は維持しつつattach側auto-resumeを無効化する。その後 marker未出力を同期的に確認しdaemon SIGCONTを送る。単にtimeout延長・poll間隔短縮は既に消滅したleaderを探すだけなので不適切。別案はdetached daemon + ro attachだがleaderを持たず元test構造から変わるため第一案を推奨。
 - `pgrep -fl` で調査由来の残骸processなし。既存process未接触。一時コピー削除済み。
 
+#### 修正 2026-07-29
+
+`daemon_sigcont_wakes_stopped_child` だけに runner-scoped config
+`[attach] resume_stopped_child = false` を適用した。rw leader 接続は維持し、DR-0030 の
+attach 側 resume だけを opt-out することで、この test が保証する daemon
+`SIGCONT` 防衛経路を他の resume 経路から隔離した。
+
+config は `HyouiTestRunner::spawn_hyoui_with_config` が runner 固有の
+`<runtime_dir>/xdg-config/hyoui/config.toml` に書き、spawn した process だけへ
+`XDG_CONFIG_HOME` を渡す。process-global env を変更しないため、並列 test や既存 config に
+干渉しない。
+
+修正後の macOS 実機結果:
+
+| test | 反復結果 | 所要時間 |
+|---|---:|---:|
+| `daemon_sigcont_wakes_stopped_child` | 20/20 PASS | 1.81〜2.03s |
+| `daemon_cont_wakes_child_stopped_during_daemon_stop` | 5/5 PASS | 2.73〜2.86s |
+| 同 integration test binary の ignored test 全体 | 2/2 PASS | 2.55s |
+
+`cargo fmt --all -- --check` も成功。`pgrep -fl` で test session 名に一致する残骸 process が
+無いことを確認した。timeout 延長や poll 間隔短縮ではなく、仕様変更で無効になった test の
+前提だけを明示的に固定しており、失敗を隠す変更ではない。
+

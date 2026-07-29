@@ -33,7 +33,11 @@ const SELF_STOP_THEN_ECHO: &[&str] = &["sh", "-c", "kill -STOP $$; echo RESUMED_
 #[test]
 fn daemon_sigcont_wakes_stopped_child() {
     let runner = HyouiTestRunner::new();
-    let mut h = runner.spawn_hyoui(
+    // DR-0030 の default では rw attach が stopped child を即 resume するため、外部
+    // daemon SIGCONT を送る前に子が exit してしまう。この test が保証する daemon 側の
+    // SIGCONT 防衛策だけを観測するため、runner 固有 config で attach 側 resume を止める。
+    // rw leader 接続は維持するので、daemon/attach の構造自体は通常の `hyoui run` と同じ。
+    let mut h = runner.spawn_hyoui_with_config(
         "jobcontrol-daemon-cont",
         &[
             "run",
@@ -42,6 +46,7 @@ fn daemon_sigcont_wakes_stopped_child() {
             SELF_STOP_THEN_ECHO[1],
             SELF_STOP_THEN_ECHO[2],
         ],
+        "[attach]\nresume_stopped_child = false\n",
     );
 
     // leader 接続が成立するまで待つ (= daemon が稼働し socket 確立)。

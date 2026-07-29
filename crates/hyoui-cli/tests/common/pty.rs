@@ -143,6 +143,33 @@ impl HyouiTestRunner {
     ///
     /// PTY size は 24x80 (= hyoui-cli の `--cols/--rows` default と一致)。
     pub fn spawn_hyoui(&self, session: &str, args: &[&str]) -> SpawnedHyoui {
+        self.spawn_hyoui_inner(session, args, None)
+    }
+
+    /// runner 固有の XDG config を適用して hyoui-cli を spawn する。
+    ///
+    /// process-global env を変更せず、他 test と config を共有しない。設定は
+    /// `<runtime_dir>/xdg-config/hyoui/config.toml` に置き、spawn した process だけへ
+    /// `XDG_CONFIG_HOME` を渡す。
+    pub fn spawn_hyoui_with_config(
+        &self,
+        session: &str,
+        args: &[&str],
+        config_toml: &str,
+    ) -> SpawnedHyoui {
+        let config_home = self.runtime_dir.path().join("xdg-config");
+        let config_dir = config_home.join("hyoui");
+        std::fs::create_dir_all(&config_dir).expect("create runner config dir");
+        std::fs::write(config_dir.join("config.toml"), config_toml).expect("write runner config");
+        self.spawn_hyoui_inner(session, args, Some(&config_home))
+    }
+
+    fn spawn_hyoui_inner(
+        &self,
+        session: &str,
+        args: &[&str],
+        config_home: Option<&Path>,
+    ) -> SpawnedHyoui {
         let socket = self.socket_path(session);
         let socket_arg = format!("--socket={}", socket.display());
 
@@ -183,6 +210,9 @@ impl HyouiTestRunner {
             // attach の self 判定が外側 session に向かう。test の隔離のため常に外す。
             .env_remove("HYOUI_SESSION_ID")
             .env_remove("HYOUI_NAMESPACE");
+        if let Some(config_home) = config_home {
+            cmd = cmd.env("XDG_CONFIG_HOME", config_home);
+        }
 
         let child = cmd.spawn(pts).expect("spawn hyoui in pty");
         let pid = Pid::from_raw(child.id() as i32);
