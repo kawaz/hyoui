@@ -24,4 +24,23 @@
 
 ## 確認待ち
 
-(現在なし)
+### 👺RC-C1: DR-0030 (attach 中の self-stop 自動 resume) の実機確認
+
+- [ ] a: kawaz の普段使い (TUI を SHELL 挟まず hyoui 直起動 → attach 中に ^Z 系で self-stop) で、操作不能にならず自動で走行復帰することを確認
+
+v0.9.24 時点では**未動作** (AI 実機観測: rw attach 中に SIGTSTP → stopped のまま)。
+test green と実機の乖離を修正中で、修正版リリース後に確認可能になったらチャットで知らせる。
+それまでこの項目はチェック不能。
+
+### 👺RC-C2: 残骸ディレクトリの削除 (AI 権限で不可)
+
+- [ ] a: `rm -rf ~/.local/share/repos/github.com/kawaz/hyoui/legacy-flaky` を実行
+
+flaky A/B 検証用の隔離 workspace 残骸 (jj workspace forget 済み、中身は検証時のコピーのみ、
+作成者 worker が削除可と確認済み)。AI の rm は権限拒否のため kawaz の手が必要。
+
+### 👺RC-C3: webui Sessions テーブル改善の使用感確認 (実装完了後)
+
+- [ ] a: ヘッダクリックソートと cwd 全体が読めるセル表示の使用感を確認
+
+実装 worker 走行中。リリースに乗ったらチャットで知らせる。
