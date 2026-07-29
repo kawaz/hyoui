@@ -81,23 +81,44 @@ CSI-u を実際の claude セッションに注入すると `Claude Code has bee
 
 # 修正 (2026-07-29、DR-0029 §2 の範囲内で改訂)
 
-ガードの認識対象を「byte `0x1a`」から「Ctrl+Z **キー押下**の 3 符号化」へ広げた。
-判定表の正本は DR-0029 §2 に置き、実装は `CTRLZ_SEQUENCES`
-(`crates/hyoui/src/client/attach.rs`) の列挙 + `scan_ctrlz` の照合。
+ガードの認識対象を「byte `0x1a`」から「Ctrl+Z **キー押下**」へ広げ、あわせて
+**符号化の知識を decode 層に隔離**した。判定表の正本は DR-0029 §2。
+
+## 層構造
+
+| 層 | 場所 | 責務 |
+|---|---|---|
+| decode | `crates/hyoui/src/client/key_decoder.rs` (新設) | byte stream → `KeyToken` 列。符号化差 / `read(2)` 境界の再組立 / 外れた prefix の flush を閉じ込める |
+| policy | `process_ctrlz_guard` (`client/attach.rs`) | DR-0029 §2 の状態機械。トークンだけを消費し、**符号化を一切知らない** |
+
+`KeyToken` は `CtrlZ { bytes }` と `Passthrough(bytes)` の 2 つだけ。`CtrlZ` が原 byte 列を
+持つので、policy が「子へ 1 発届ける」判断をした時はそれをそのまま流せる (= `0x1a` へ
+正規化しない。子は自分が要求した protocol の符号化を期待している)。
+
+汎用 keymap 機構にはしていない (= 他キーを扱う予定が無い、DR-0029 §3 で prefix key 体系を
+全廃済み)。キーを増やす必要が出たら符号化テーブルと `KeyToken` の variant を足すだけで済む。
+
+## decode 層の規則
 
 - 対象: `0x1a` / kitty CSI-u `CSI 122;5u` (event type `:1` `:2`、alternate key
   `122:122` の変種込み) / xterm modifyOtherKeys `CSI 27;5;122~`
 - key release (`:3`) は押下ではないので素通し
-- 子へ 1 発届ける時は **受信した符号化のまま**送る (= `0x1a` へ正規化しない)
-- 列挙に無い符号化は素通し = 修正前の挙動に倒れる (= 誤検出で無関係なキーを握り潰さない)
-- `read(2)` 境界で割れた sequence は、Ctrl+Z 符号化の途中まで一致している間だけ 20ms
-  保持して判定する (`PARTIAL_KEY_HOLD`)。`ESC` 単打もこの保持に入るが、子アプリ側の
-  `ESC` 曖昧性解決 timeout (通常 25ms 以上) より短いので Esc の解釈は変わらない
-- 保持が満了した byte 列は捨てずに通常入力として子へ流す。run loop の poll timeout は
+- テーブルに無い符号化は素通し = ガード無効に倒れる (= 誤検出で無関係なキーを握り潰さない)
+- `read(2)` 境界で割れた sequence は、符号化の途中まで一致している間だけ 20ms 保持して
+  判定する。`ESC` 単打もこの保持に入るが、子アプリ側の `ESC` 曖昧性解決 timeout
+  (通常 25ms 以上) より短いので Esc の解釈は変わらない
+- 保持が満了した byte 列は捨てずに `Passthrough` として出す。run loop の poll timeout は
   detach 保留と保持期限の早い方に合わせる
 
 DR-0029 §2 の意味論 (= 2 発ごとに子へ 1 発、余り 1 発で detach タイマー、他キー割り込みで
 保留破棄、`delay=0` で即 detach、`guard=false` で完全 bypass) は不変。
+
+## 分離作業中に自前で踏んだ bug (test で検出、修正済)
+
+保持期限を `feed` のたびに張り直していたため、**入力が無い呼び出し (= poll 満了での
+`feed(&[], now)`) でも期限が再武装され、未確定 byte を永久に握り続ける**状態だった。
+期限を延ばすのは「続きの byte が実際に届いた時」だけに限定して解消
+(`idle_feed_does_not_extend_hold` / `arriving_continuation_extends_hold` で固定)。
 
 ## repeat (`:2`) を press 扱いにした判断
 
@@ -107,24 +128,25 @@ DR-0029 の目的 (= 反射的な Ctrl+Z で子を止めない) の真逆にな�
 
 ## 修正後の実機マトリクス (0.9.26 自ビルド、ネスト hyoui、内側の子が `CSI > 1 u` を push)
 
-| 注入 | 子到達 | attach client |
-|---|---|---|
-| `key:C-z` 単発 (= 0x1a) | 0 | detach ✅ |
-| `key:C-z` 2 連打 | 1 | 繋がったまま ✅ |
-| CSI-u 単発 | 0 | detach ✅ |
-| CSI-u 2 連打 | 1 | 繋がったまま ✅ |
-| CSI-u 3 連打 | 1 | detach ✅ |
-| CSI-u release (`:3`) | 1 (素通し) | 繋がったまま ✅ |
-| `ESC` 単打 + `a` | 1 (素通し) | 繋がったまま ✅ |
+| 注入 | 子到達 | attach client | inner |
+|---|---|---|---|
+| `key:C-z` 単発 (= 0x1a) | 0 | detach ✅ | live |
+| `key:C-z` 2 連打 | 1 | 繋がったまま ✅ | live |
+| `key:C-z` 3 連打 | 1 | detach ✅ | live |
+| CSI-u 単発 | 0 | detach ✅ | live |
+| CSI-u 2 連打 | 1 | 繋がったまま ✅ | live |
+| CSI-u 3 連打 | 1 | detach ✅ | live |
+| CSI-u release (`:3`) | 1 (素通し) | 繋がったまま ✅ | live |
+| modifyOtherKeys 単発 | 0 | detach ✅ | live |
+| modifyOtherKeys 2 連打 | 1 | 繋がったまま ✅ | live |
+| `ESC` 単打 + `a` | 1 (素通し) | 繋がったまま ✅ | live |
 
-detach した回でも inner セッションは live のまま (= 覗き窓を閉じても子は走り続ける)。
+detach した回でも inner は live のまま (= 覗き窓を閉じても子は走り続ける)。
 
 ## 残作業
 
-- **kawaz の実端末 (Ghostty × claude code) での最終確認が未了**。ネスト hyoui では
-  外側端末の符号化を注入で模しているだけなので、実キーボード経由の確認が要る
-- 検証は `122;5u` 系と `0x1a` のみ。`CSI 27;5;122~` (modifyOtherKeys) は unit test だけで
-  実端末未確認 (= Ghostty は kitty protocol を優先するため実機で出しにくい)
+**kawaz の実端末 (Ghostty × claude code) での最終確認が未了**。ネスト hyoui では外側端末の
+符号化を byte 注入で模しているだけなので、実キーボード経由の確認は代替できない。
 
 # 修正前に検討した論点 (= DR 改訂の要否)
 

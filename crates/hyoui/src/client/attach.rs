@@ -11,6 +11,7 @@ use std::path::Path;
 use nix::poll::{PollFd, PollTimeout};
 
 use crate::Error;
+use crate::client::key_decoder::{KeyDecoder, KeyToken};
 use crate::protocol::messages::{Detach, DetachTarget, RawAck, RawAckResult};
 use crate::protocol::{
     ControlMessage, ErrorCode, Frame, FrameError, HandshakeRequest, HandshakeResponse, MVP_CAPS,
@@ -27,47 +28,6 @@ enum DetachAction {
     TriggerDetach(Vec<u8>),
 }
 
-/// Ctrl+Z (= `SIGTSTP` を生む byte)。
-pub const CTRL_Z_BYTE: u8 = 0x1a;
-
-/// Ctrl+Z キー押下として扱う byte 列 (DR-0029 §2)。
-///
-/// 端末が送る Ctrl+Z の符号化は **子アプリが有効化した keyboard protocol で変わる**。
-/// 素の `0x1a` だけを見ていると、`ESC [ > 1 u` (kitty keyboard protocol) や
-/// `ESC [ > 4 ; 2 m` (xterm modifyOtherKeys) を出す TUI の下でガードが丸ごと素通りする
-/// (= Ghostty × claude code で実測、issue 2026-07-29)。
-///
-/// - `\x1a`: protocol 無効時の legacy 符号化
-/// - `CSI 122;5u` 系: kitty CSI-u (`z`=122 / ctrl=5)。event type 付き (`:1` press /
-///   `:2` repeat) と alternate key 付き (`122:122`) の変種を含む。release (`:3`) は
-///   キー押下ではないので**含めない** (= 素通しして子に届ける)
-/// - `CSI 27;5;122~`: xterm modifyOtherKeys (formatOtherKeys=0)。formatOtherKeys=1 は
-///   CSI-u と同形なので上でカバーされる
-///
-/// 列挙で持つのは、拾えなかった符号化が「素通し」= 修正前の挙動に倒れるため
-/// (= 誤検出で無関係なキーを握り潰すより安全)。
-const CTRLZ_SEQUENCES: &[&[u8]] = &[
-    &[CTRL_Z_BYTE],
-    b"\x1b[122;5u",
-    b"\x1b[122;5:1u",
-    b"\x1b[122;5:2u",
-    b"\x1b[122:122;5u",
-    b"\x1b[122:122;5:1u",
-    b"\x1b[122:122;5:2u",
-    b"\x1b[27;5;122~",
-];
-
-/// 未確定 (= Ctrl+Z 符号化の途中まで一致) の byte 列を保持する上限。
-///
-/// 端末は 1 キーイベントを 1 write で送るので通常この保留は起きない。`read(2)` 境界を
-/// 跨いで分割着信した場合だけ効く救済措置。
-///
-/// Design rationale: 値を 20ms にしたのは `ESC` 単打 (= Esc キー) の即時性を壊さない
-/// ため。`ESC` は CSI-u 符号化の先頭 byte でもあるので保留対象になるが、子アプリ側は
-/// `ESC` の曖昧性解決に 25ms 以上待つのが通例なので、20ms 以内に送り出せば子から見た
-/// Esc の解釈は変わらない。
-const PARTIAL_KEY_HOLD: std::time::Duration = std::time::Duration::from_millis(20);
-
 /// Ctrl+Z ガードの state (DR-0029 §2)。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum CtrlzGuardState {
@@ -81,48 +41,14 @@ enum CtrlzGuardState {
     },
 }
 
-/// Ctrl+Z ガードが持ち越す状態の全体。
+/// Ctrl+Z ガードが持ち越す状態。
 ///
-/// `state` (= 保留 Ctrl+Z の 1 bit) と、chunk 境界を跨いだ未確定 byte 列を束ねる。
-/// 両者は独立に進む (= 保留 Ctrl+Z がある最中に次の Ctrl+Z の先頭が届きうる)。
+/// 保留 Ctrl+Z の 1 bit (`state`) と、byte stream をキーイベントに割る decoder を束ねる。
+/// 両者は独立に進む (= 保留 Ctrl+Z がある最中に次のキーの先頭 byte が届きうる)。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CtrlzGuard {
     state: CtrlzGuardState,
-    /// Ctrl+Z 符号化の途中まで一致していて、続きが来ないと判定できない byte 列。
-    partial: Vec<u8>,
-    /// `partial` を諦めて通常入力として流す時刻。
-    partial_deadline: Option<std::time::Instant>,
-}
-
-/// `scan_ctrlz` の判定結果。
-#[derive(Debug, PartialEq, Eq)]
-enum KeyScan {
-    /// 先頭 `len` bytes が Ctrl+Z 押下。
-    Ctrlz { len: usize },
-    /// 先頭 1 byte は Ctrl+Z 符号化の一部になり得ない (= 通常入力)。
-    Other,
-    /// 先頭が Ctrl+Z 符号化の途中まで一致。続きを見ないと判定できない。
-    Incomplete,
-}
-
-/// buffer 先頭が Ctrl+Z 押下かを判定する (= 3 符号化 + 変種の照合)。
-fn scan_ctrlz(buf: &[u8]) -> KeyScan {
-    let mut incomplete = false;
-    for seq in CTRLZ_SEQUENCES {
-        if buf.len() >= seq.len() {
-            if &buf[..seq.len()] == *seq {
-                return KeyScan::Ctrlz { len: seq.len() };
-            }
-        } else if seq.starts_with(buf) {
-            // buf 全体が seq の途中まで一致 = まだ Ctrl+Z になり得る。
-            incomplete = true;
-        }
-    }
-    if incomplete {
-        KeyScan::Incomplete
-    } else {
-        KeyScan::Other
-    }
+    decoder: KeyDecoder,
 }
 
 /// tty stdin 経路の Ctrl+Z ガード state machine (DR-0029 §2)。
@@ -138,10 +64,14 @@ fn scan_ctrlz(buf: &[u8]) -> KeyScan {
 ///
 /// - 窓は「最後の Ctrl+Z から `delay`」で、連打のたび実質延長される (= 偶数打で
 ///   保留が解消し、奇数打で新しい deadline が張られるため)
-/// - 窓の途中で Ctrl+Z 以外の byte が来たら detach 保留を **キャンセル** し、保留中の
-///   Ctrl+Z は **破棄** する (= 子には送らない)。当該 byte は通常入力として forward
+/// - 窓の途中で Ctrl+Z 以外のキーが来たら detach 保留を **キャンセル** し、保留中の
+///   Ctrl+Z は **破棄** する (= 子には送らない)。当該キーは通常入力として forward
 /// - `delay == 0` なら連打判定をせず、Ctrl+Z 単発で即 detach (= 子には一切届かない)
 /// - `guard == false` なら完全 bypass (= Ctrl+Z を素通し)
+///
+/// 本関数は **符号化を一切知らない**。「どの byte 列が Ctrl+Z 押下か」は
+/// [`KeyDecoder`] の責務で、ここはトークンだけを消費する。子へ届ける 1 発は decoder が
+/// 保持していた原 byte 列をそのまま流す (= 正規化しない)。
 ///
 /// `now` を caller から受け取ることで wall-clock 依存を局所化し、chunk 境界と時定数を
 /// deterministic に test できる。空 chunk 呼び出しは deadline 判定だけを行う。
@@ -152,14 +82,14 @@ fn process_ctrlz_guard(
     config: &crate::config::AttachConfig,
 ) -> DetachAction {
     if !config.ctrlz_guard {
-        let mut forward = std::mem::take(&mut guard.partial);
+        let mut forward = guard.decoder.take_partial();
         *guard = CtrlzGuard::default();
         forward.extend_from_slice(chunk);
         return DetachAction::Forward(forward);
     }
 
-    // deadline 到達 = detach 確定。同 chunk の残り byte と未確定 partial は detach と
-    // 共に捨てる (= 以後この connection は畳まれるので送っても意味がない)。
+    // deadline 到達 = detach 確定。同 chunk の残り byte と decoder が保持中の未確定 byte は
+    // detach と共に捨てる (= 以後この connection は畳まれるので送っても意味がない)。
     if let CtrlzGuardState::Pending { deadline } = guard.state
         && now >= deadline
     {
@@ -167,52 +97,28 @@ fn process_ctrlz_guard(
         return DetachAction::TriggerDetach(Vec::new());
     }
 
-    let mut forward = Vec::with_capacity(chunk.len() + guard.partial.len());
-    // 未確定 partial の保持期限切れ = Ctrl+Z 符号化ではなかった。他キー割り込みとして
-    // 扱い (= 保留 Ctrl+Z を破棄)、溜めた byte を通常入力として流す。
-    if !guard.partial.is_empty() && guard.partial_deadline.is_some_and(|d| now >= d) {
-        forward.append(&mut guard.partial);
-        guard.state = CtrlzGuardState::Idle;
-    }
-    let mut buf = std::mem::take(&mut guard.partial);
-    buf.extend_from_slice(chunk);
-    guard.partial_deadline = None;
-
-    let mut i = 0;
-    while i < buf.len() {
-        match scan_ctrlz(&buf[i..]) {
-            // 続きが来ないと判定できないので保持する。ここで forward してしまうと、
-            // 後続 byte で Ctrl+Z と確定しても先頭の ESC が既に子へ漏れている。
-            KeyScan::Incomplete => {
-                guard.partial = buf[i..].to_vec();
-                guard.partial_deadline = Some(now + PARTIAL_KEY_HOLD);
-                break;
-            }
-            KeyScan::Ctrlz { len } => {
-                match guard.state {
-                    CtrlzGuardState::Idle => {
-                        if config.ctrlz_guard_delay.is_zero() {
-                            return DetachAction::TriggerDetach(forward);
-                        }
-                        guard.state = CtrlzGuardState::Pending {
-                            deadline: now + config.ctrlz_guard_delay,
-                        };
+    let mut forward = Vec::with_capacity(chunk.len());
+    for token in guard.decoder.feed(chunk, now) {
+        match token {
+            KeyToken::CtrlZ { bytes } => match guard.state {
+                CtrlzGuardState::Idle => {
+                    if config.ctrlz_guard_delay.is_zero() {
+                        return DetachAction::TriggerDetach(forward);
                     }
-                    // 偶数個目: 保留を解消して 1 発だけ子へ届ける (= detach しない)。
-                    // 送るのは **受信した符号化そのまま** (= 子が要求した protocol の
-                    // 符号化。0x1a へ正規化すると CSI-u しか解さない子が取りこぼす)。
-                    CtrlzGuardState::Pending { .. } => {
-                        guard.state = CtrlzGuardState::Idle;
-                        forward.extend_from_slice(&buf[i..i + len]);
-                    }
+                    guard.state = CtrlzGuardState::Pending {
+                        deadline: now + config.ctrlz_guard_delay,
+                    };
                 }
-                i += len;
-            }
+                // 偶数個目: 保留を解消して 1 発だけ子へ届ける (= detach しない)。
+                CtrlzGuardState::Pending { .. } => {
+                    guard.state = CtrlzGuardState::Idle;
+                    forward.extend_from_slice(&bytes);
+                }
+            },
             // 他キー割り込み: detach 保留をキャンセル、保留 Ctrl+Z は破棄。
-            KeyScan::Other => {
+            KeyToken::Passthrough(bytes) => {
                 guard.state = CtrlzGuardState::Idle;
-                forward.push(buf[i]);
-                i += 1;
+                forward.extend_from_slice(&bytes);
             }
         }
     }
@@ -244,7 +150,7 @@ fn child_stopped_notice(session_id: &str, rows: u16) -> String {
     )
 }
 
-/// 保留中の Ctrl+Z / 未確定 sequence がある間だけ deadline まで poll を起こす timeout。
+/// 保留中の Ctrl+Z / decoder の未確定 byte がある間だけ deadline まで poll を起こす timeout。
 ///
 /// 両方保留中なら早い方に合わせる (= 遅い方に寄せると、先に満了した側の処理が次の
 /// 入力まで遅れる)。
@@ -253,7 +159,7 @@ fn ctrlz_guard_poll_timeout(guard: &CtrlzGuard, now: std::time::Instant) -> Poll
         CtrlzGuardState::Pending { deadline } => Some(deadline),
         CtrlzGuardState::Idle => None,
     };
-    let deadline = match (pending, guard.partial_deadline) {
+    let deadline = match (pending, guard.decoder.hold_deadline()) {
         (Some(a), Some(b)) => a.min(b),
         (Some(d), None) | (None, Some(d)) => d,
         (None, None) => return PollTimeout::NONE,
@@ -1351,6 +1257,7 @@ impl ClientConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::key_decoder::CTRL_Z_BYTE;
     use crate::daemon::{DaemonConfig, Session};
     use std::time::Duration;
     use tempfile::TempDir;
@@ -1749,7 +1656,8 @@ mod tests {
     }
 
     /// 実端末が Ctrl+Z に使う 3 符号化 (= legacy / kitty CSI-u / modifyOtherKeys)。
-    /// どれで来ても DR-0029 §2 の規則は同じでなければならない。
+    /// 符号化の網羅は `key_decoder` 側の責務だが、ここでは
+    /// **decoder と state machine の合成**が符号化に依らないことを確かめる。
     const ENCODINGS: &[(&str, &[u8])] = &[
         ("legacy 0x1a", &[CTRL_Z_BYTE]),
         ("kitty CSI-u", b"\x1b[122;5u"),
@@ -1865,34 +1773,31 @@ mod tests {
         assert_eq!(guard.state, CtrlzGuardState::Idle, "detach 保留も張らない");
     }
 
-    /// Ctrl+Z 以外の CSI sequence (= 矢印キー等) は握らず素通しする。
+    /// decoder が未確定 byte を保持する期限より十分長い時間 (= 保持が満了する側に倒す)。
+    const AFTER_HOLD: Duration = Duration::from_millis(200);
+
+    /// Ctrl+Z 以外のキーは握らず素通しし、detach タイマーも張らない。
     #[test]
-    fn ctrlz_guard_passes_through_other_csi_sequences() {
+    fn ctrlz_guard_passes_through_other_keys() {
         let t0 = std::time::Instant::now();
-        let mut guard = CtrlzGuard::default();
-        // Up (CSI A) / ctrl+a の CSI-u (= 97;5u) / Esc 単打 + 通常文字。
-        for seq in [&b"\x1b[A"[..], &b"\x1b[97;5u"[..], &b"\x1b"[..], &b"x"[..]] {
-            let out = process_ctrlz_guard(seq, &mut guard, t0, &guard_config());
-            let DetachAction::Forward(bytes) = out else {
-                panic!("detach してはいけない: {seq:?}");
-            };
-            // ESC 単打だけは「CSI-u の途中かもしれない」ので即時には流れない。
-            if seq == b"\x1b" {
-                assert!(bytes.is_empty(), "ESC は保留される");
-                assert_eq!(guard.partial, b"\x1b".to_vec());
-                // 保持期限が過ぎたら通常入力として流れる。
-                assert_eq!(
-                    process_ctrlz_guard(&[], &mut guard, t0 + PARTIAL_KEY_HOLD, &guard_config()),
-                    DetachAction::Forward(b"\x1b".to_vec()),
-                    "続きが来なければ Esc キーとして子へ届く"
-                );
-            } else {
-                assert_eq!(bytes, seq.to_vec());
-            }
+        // Up (CSI A) / ctrl+a の CSI-u (= 97;5u) / 通常文字。
+        for seq in [&b"\x1b[A"[..], &b"\x1b[97;5u"[..], &b"x"[..]] {
+            let mut guard = CtrlzGuard::default();
+            assert_eq!(
+                process_ctrlz_guard(seq, &mut guard, t0, &guard_config()),
+                DetachAction::Forward(seq.to_vec()),
+                "{seq:?} は素通し"
+            );
+            assert_eq!(
+                guard.state,
+                CtrlzGuardState::Idle,
+                "{seq:?} で保留を張らない"
+            );
         }
     }
 
     /// `read(2)` 境界で符号化が割れても 1 つの Ctrl+Z として扱う (= 分割着信)。
+    /// 再組立自体は decoder の責務で、ここは state machine への効き方を見る。
     #[test]
     fn ctrlz_guard_handles_sequence_split_across_chunks() {
         let t0 = std::time::Instant::now();
@@ -1906,7 +1811,6 @@ mod tests {
                 DetachAction::Forward(Vec::new()),
                 "split={split}: 未確定 byte を子へ漏らさない"
             );
-            assert!(guard.partial_deadline.is_some());
             // 後半が届いて Ctrl+Z 確定 → 単発なので子へ 0 発 + detach 保留。
             assert_eq!(
                 process_ctrlz_guard(
@@ -1922,14 +1826,13 @@ mod tests {
                 matches!(guard.state, CtrlzGuardState::Pending { .. }),
                 "split={split}: detach タイマーが張られる"
             );
-            assert!(guard.partial.is_empty(), "split={split}: 保留は解消済み");
         }
     }
 
     /// 分割着信の続きが来ないまま保持期限を過ぎたら、通常入力として流し切る
     /// (= 子への入力を握ったまま失わない)。
     #[test]
-    fn ctrlz_guard_flushes_partial_after_hold_expires() {
+    fn ctrlz_guard_flushes_held_bytes_after_hold_expires() {
         let t0 = std::time::Instant::now();
         let cfg = guard_config();
         let mut guard = CtrlzGuard::default();
@@ -1938,7 +1841,7 @@ mod tests {
             DetachAction::Forward(Vec::new())
         );
         assert_eq!(
-            process_ctrlz_guard(&[], &mut guard, t0 + PARTIAL_KEY_HOLD, &cfg),
+            process_ctrlz_guard(&[], &mut guard, t0 + AFTER_HOLD, &cfg),
             DetachAction::Forward(b"\x1b[122".to_vec()),
             "Ctrl+Z にならなかった byte 列は捨てずに子へ届ける"
         );
@@ -2061,19 +1964,19 @@ mod tests {
     #[test]
     fn ctrlz_guard_disabled_is_complete_bypass() {
         let mut cfg = guard_config();
-        cfg.ctrlz_guard = false;
         let now = std::time::Instant::now();
-        let mut guard = CtrlzGuard {
-            state: CtrlzGuardState::Pending {
-                deadline: now + Duration::from_millis(500),
-            },
-            partial: b"\x1b[122".to_vec(),
-            partial_deadline: Some(now + PARTIAL_KEY_HOLD),
-        };
+        // ガードが有効な間に「保留 Ctrl+Z + 未確定 byte」を作ってから無効化する
+        // (= 設定に関わらず握ったままの byte を失わないこと)。
+        let mut guard = CtrlzGuard::default();
+        let _ = process_ctrlz_guard(&[CTRL_Z_BYTE], &mut guard, now, &cfg);
+        let _ = process_ctrlz_guard(b"\x1b[122", &mut guard, now, &cfg);
+        assert!(matches!(guard.state, CtrlzGuardState::Pending { .. }));
+
+        cfg.ctrlz_guard = false;
         assert_eq!(
             process_ctrlz_guard(&[CTRL_Z_BYTE, CTRL_Z_BYTE, b'x'], &mut guard, now, &cfg),
-            DetachAction::Forward([&b"\x1b[122"[..], &[CTRL_Z_BYTE, CTRL_Z_BYTE, b'x']].concat(),),
-            "保留していた byte も含めて全部素通しする"
+            DetachAction::Forward([&b"\x1b[122"[..], &[CTRL_Z_BYTE, CTRL_Z_BYTE, b'x']].concat()),
+            "保持していた byte も含めて全部素通しする"
         );
         assert_eq!(guard, CtrlzGuard::default());
     }
@@ -2107,25 +2010,30 @@ mod tests {
             ctrlz_guard_poll_timeout(&expired, now),
             PollTimeout::from(1u16)
         );
-        // 未確定 sequence の保持期限も poll を起こす。両方あるなら早い方。
-        let partial_only = CtrlzGuard {
-            partial: b"\x1b".to_vec(),
-            partial_deadline: Some(now + Duration::from_millis(20)),
-            ..CtrlzGuard::default()
-        };
+        // decoder が未確定 byte を保持している間も poll を起こす。期限の値は decoder の
+        // 持ち物なので、ここでは「decoder が申告した期限に一致する」ことだけを見る。
+        let mut held = CtrlzGuard::default();
+        held.decoder.feed(b"\x1b", now);
+        let hold_ms = held
+            .decoder
+            .hold_deadline()
+            .expect("ESC を保持したら期限が立つ")
+            .saturating_duration_since(now)
+            .as_millis() as u16;
+        assert!(hold_ms > 0);
         assert_eq!(
-            ctrlz_guard_poll_timeout(&partial_only, now),
-            PollTimeout::from(20u16)
+            ctrlz_guard_poll_timeout(&held, now),
+            PollTimeout::from(hold_ms)
         );
+        // 両方あるなら早い方 (= 遅い方に寄せると先に満了した側の処理が次の入力まで遅れる)。
         let both = CtrlzGuard {
-            partial: b"\x1b".to_vec(),
-            partial_deadline: Some(now + Duration::from_millis(20)),
+            decoder: held.decoder.clone(),
             ..pending(500)
         };
         assert_eq!(
             ctrlz_guard_poll_timeout(&both, now),
-            PollTimeout::from(20u16),
-            "早い方 (= partial の保持期限) に合わせる"
+            PollTimeout::from(hold_ms),
+            "早い方 (= decoder の保持期限) に合わせる"
         );
     }
 
