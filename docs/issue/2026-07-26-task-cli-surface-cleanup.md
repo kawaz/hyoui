@@ -283,7 +283,10 @@ help 全文 grep で検査した結果、**残骸は見つからなかった**:
     CLI-Q1 として裁定待ち
   - D-3 (`--include=style` / `=scrollback` の parse 段 reject 化) → `QUESTIONS.md`
     の CLI-Q2 として裁定待ち
-  - F: `HYOUI_ALLOW_CORE` の露出判断 (user 向け化 or 内部専用明記) は未着手
+  - F: `HYOUI_ALLOW_CORE` の露出判断 → **内部デバッグ専用と裁定、help 非掲載を維持** (2026-07-29 統括判断)。
+    実体は「子 crash 時の core dump 抑止 (R5-H12) を debug 目的で opt-out する開発者向け escape hatch」
+    (session.rs:288-318 の doc comment が用途を記載済み)。core dump を有効化する knob を user help に
+    出すのは誤用を招くだけで、debug する開発者はコードを読む。user 向け化の需要が出たらその時再検討
 
 ## 進捗 (2026-07-29)
 
