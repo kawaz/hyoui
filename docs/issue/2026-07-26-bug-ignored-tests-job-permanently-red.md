@@ -222,3 +222,15 @@ attach 側の規定を前提から落としていた。
 - resume 判定を `should_resume_stopped_child` に集約し、handshake と stopped notify の
   2 call site で条件を共有する (`crates/hyoui/src/client/attach.rs:128-139`, `:799-823`)。
 
+### 追加調査: `daemon_sigcont_wakes_stopped_child`
+
+- 現 HEAD / macOS Darwin 25.5.0 で `cargo test -p hyoui-cli --test jobcontrol_daemon_cont_wakes_child daemon_sigcont_wakes_stopped_child -- --ignored --exact --nocapture` を無負荷で20回反復し20/20 FAILED。run1 16.32s、run2-20 は12.30〜12.55s、全回 panic は `attach client が leader として daemon に接続しない`。無負荷で決定的再現したためCPU高負荷試験は不要。
+- 対照 `daemon_cont_wakes_child_stopped_during_daemon_stop` は5/5 green、2.66〜3.08s。
+- 一時コピーへの観測計装(追跡ファイル無変更)で、外部 daemon SIGCONT 前に `wait_for("RESUMED_BY_DAEMON_CONT", 3s)` が `Ok("[hyoui] detach: ...\r\nRESUMED_BY_DAEMON_CONT\r\n")`。最初の status は `SessionExitNotify { exit_status: 0 }` を unexpected response として失敗、以降は socket ENOENT。daemon_pid=None。
+- 機構: test の子は起動直後 `kill -STOP $$`。`hyoui run` はrw attachを合成し、DR-0030により handshake snapshot の stopped child を defaultでresumeする(main.rs:819-829、config/mod.rs:135,192)。子はmarker出力後即exitする。したがって外部SIGCONT前に対象sessionとleaderが消える。`wait_for_leader_ready` は status polling 50ms(common/pty.rs:500-524)だが、消滅済leaderは観測不能。
+- deadline: 外側 leader wait 10s。各 status helper は capture deadline 10sだが、statusの `connect_with_retry` は100ms×20 attempts≒2s(main.rs:164-211)。socket消滅後は1 attemptが約2sを消費し、外側deadlineはblocking status call後にしか評価されないため全体約12.3〜12.5s(cleanup込み)になる。CI 12.73sと一致。固定sleepが真因ではない。500ms sleep(test:55)は到達しない。
+- 履歴: 対象test最終更新は2026-06-12 commit 389d5a146e09、DR-0030は2026-07-29 commit c767388f892a。仕様変更時にこのtestの前提更新が漏れた。
+- 分岐判定は「test の前提不備」。product bugでもCI環境固有でもない。productのrw attach resumeはDR-0030どおり正しい。
+- 修正案(実装しない): testの目的であるdaemon SIGCONT防衛策を隔離するため、このtestだけ runner-scoped config で `[attach] resume_stopped_child = false` にしてrw leader接続は維持しつつattach側auto-resumeを無効化する。その後 marker未出力を同期的に確認しdaemon SIGCONTを送る。単にtimeout延長・poll間隔短縮は既に消滅したleaderを探すだけなので不適切。別案はdetached daemon + ro attachだがleaderを持たず元test構造から変わるため第一案を推奨。
+- `pgrep -fl` で調査由来の残骸processなし。既存process未接触。一時コピー削除済み。
+
