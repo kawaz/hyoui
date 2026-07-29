@@ -70,7 +70,7 @@ H3 修正) は維持する。follow はしないが「子が止まった」事�
 
 ### 2. tty stdin 経路の Ctrl+Z ガード
 
-attach client の **tty stdin 経路**でのみ、Ctrl+Z (0x1a) を以下の規則で扱う
+attach client の **tty stdin 経路**でのみ、Ctrl+Z を以下の規則で扱う
 (kawaz 提示、2026-07-25):
 
 | 窓内の連打数 | 子へ届く Ctrl+Z | client detach |
@@ -83,6 +83,25 @@ attach client の **tty stdin 経路**でのみ、Ctrl+Z (0x1a) を以下の規�
 一般則は **「2 発ごとに子へ 1 発、余った 1 発が detach タイマーを起動する」**。
 state は「保留中の Ctrl+Z があるか」の 1 bit だけで表現でき、連打回数の計数は要らない
 (= 偶数打で保留が解消し、奇数打で新しい deadline が張られる)。
+
+**「Ctrl+Z」の判定は符号化に依存する**。端末が送る byte 列は子アプリが有効化した
+keyboard protocol で変わるので、ガードは以下すべてを Ctrl+Z 押下として扱う:
+
+| 符号化 | byte 列 | 出る条件 |
+|---|---|---|
+| legacy | `0x1a` | keyboard protocol 無効時 |
+| kitty CSI-u | `CSI 122;5u` (event type 付き `:1` press / `:2` repeat、alternate key 付き `122:122` を含む) | 子が `CSI > 1 u` 等を出した時 |
+| xterm modifyOtherKeys | `CSI 27;5;122~` | 子が `CSI > 4;2 m` を出した時 (formatOtherKeys=1 は CSI-u と同形) |
+
+- key **release** (= kitty の event type `:3`) は押下ではないので握らず素通しする
+- 子へ 1 発届けるときは **受信した符号化のまま**送る (= `0x1a` へ正規化しない。子は
+  自分が要求した protocol の符号化を期待している)
+- 列挙に無い符号化は素通し = ガード無効に倒れる (= 誤検出で無関係なキーを握り潰すより
+  安全側)
+- `read(2)` 境界で sequence が割れた場合は、Ctrl+Z 符号化の途中まで一致している間だけ
+  短時間 (20ms) 保持して判定する。それ以外の入力は遅延させない。`ESC` 単打も原理上
+  この保持に入るが、子アプリ側の `ESC` 曖昧性解決 timeout (通常 25ms 以上) より短いので
+  Esc キーの解釈は変わらない
 
 - **窓の定義**: 「最後の Ctrl+Z から `ctrlz_guard_delay`」。連打のたび実質的に延長される
 - **他キー割り込み**: 窓の途中で Ctrl+Z 以外の byte が来たら detach 保留をキャンセルし、
@@ -222,9 +241,12 @@ DR-0019 §3 が却下済み (= 無人時に発動できないので有効な発�
 - **detach 時の端末 reset は全経路で共通**: Ctrl+Z ガード発火 / stdin EOF / stdin read
   error のいずれでも `OUTER_TTY_RESET` を吐く (= 2026-07-24 H4 の対策を維持)
 - **`docs/issue/2026-07-20-detach-key-not-firing-keyboard-protocol.md` は機能ごと廃止で
-  解消**。keyboard protocol と Ctrl+Z の相互作用 (= CSI-u 有効端末で 0x1a が単一 byte
-  で来るか) は残る観測課題だが、detach 前に client が `\x1b[<u` を吐く現行 reset とは
-  別問題として扱う
+  解消**。detach 前に client が `\x1b[<u` を吐く現行 reset は別問題として扱う
+- **keyboard protocol 有効端末での Ctrl+Z は実害が確認され、ガードを 3 符号化対応に
+  拡張した** (2026-07-29、docs/issue/2026-07-29-bug-ctrlz-guard-bypassed-by-keyboard-protocol.md)。
+  Ghostty × claude code (= `CSI > 1 u` / `CSI > 4;2 m` を出す) では Ctrl+Z が
+  `\x1b[122;5u` で届き、`0x1a` だけを見ていたガードが完全に素通りしていた
+  (= 連打数に関係なく毎回子へ貫通 + detach 不能)。判定対象は §2 の表を正本とする
 - **検証要件 (DR-0014 マトリクス)**:
   - 連打 1/2/3/4/5 × (子へ届く Ctrl+Z 数, detach 有無) を state machine unit test で網羅
   - 窓延長 / 他キー割り込み / `delay=0` / `guard=false` / poll timeout も unit test

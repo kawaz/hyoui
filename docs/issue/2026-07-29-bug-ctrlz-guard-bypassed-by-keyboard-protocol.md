@@ -1,11 +1,11 @@
 ---
 title: "Ctrl+Z ガードが keyboard protocol 有効端末で完全に不発 (= 0x1a 単一 byte でなく CSI-u で届く)"
-status: open
+status: wip
 category: bug
 created: 2026-07-29T00:00:00+09:00
-last_read:
+last_read: 2026-07-29T00:00:00+09:00
 open_entered: 2026-07-29T00:00:00+09:00
-wip_entered:
+wip_entered: 2026-07-29T00:00:00+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
@@ -79,9 +79,56 @@ CSI-u を実際の claude セッションに注入すると `Claude Code has bee
 つまり **0x1a 経路のガードは正しく動いており、実装バグではない**。ガードの定義が
 「byte 0x1a」に閉じていることが原因。
 
-# 修正には設計判断が要る (= 実装を止めた理由)
+# 修正 (2026-07-29、DR-0029 §2 の範囲内で改訂)
 
-局所修正で済まないため DR-0029 §2 の改訂が要る。論点:
+ガードの認識対象を「byte `0x1a`」から「Ctrl+Z **キー押下**の 3 符号化」へ広げた。
+判定表の正本は DR-0029 §2 に置き、実装は `CTRLZ_SEQUENCES`
+(`crates/hyoui/src/client/attach.rs`) の列挙 + `scan_ctrlz` の照合。
+
+- 対象: `0x1a` / kitty CSI-u `CSI 122;5u` (event type `:1` `:2`、alternate key
+  `122:122` の変種込み) / xterm modifyOtherKeys `CSI 27;5;122~`
+- key release (`:3`) は押下ではないので素通し
+- 子へ 1 発届ける時は **受信した符号化のまま**送る (= `0x1a` へ正規化しない)
+- 列挙に無い符号化は素通し = 修正前の挙動に倒れる (= 誤検出で無関係なキーを握り潰さない)
+- `read(2)` 境界で割れた sequence は、Ctrl+Z 符号化の途中まで一致している間だけ 20ms
+  保持して判定する (`PARTIAL_KEY_HOLD`)。`ESC` 単打もこの保持に入るが、子アプリ側の
+  `ESC` 曖昧性解決 timeout (通常 25ms 以上) より短いので Esc の解釈は変わらない
+- 保持が満了した byte 列は捨てずに通常入力として子へ流す。run loop の poll timeout は
+  detach 保留と保持期限の早い方に合わせる
+
+DR-0029 §2 の意味論 (= 2 発ごとに子へ 1 発、余り 1 発で detach タイマー、他キー割り込みで
+保留破棄、`delay=0` で即 detach、`guard=false` で完全 bypass) は不変。
+
+## repeat (`:2`) を press 扱いにした判断
+
+指示は press (`:1`) と release (`:3`) の扱いのみだったが、repeat (= キー長押し) は
+press 扱いで握る側にした。素通しにすると「Ctrl+Z を長押しした 1 回」で子が止まり、
+DR-0029 の目的 (= 反射的な Ctrl+Z で子を止めない) の真逆になるため。
+
+## 修正後の実機マトリクス (0.9.26 自ビルド、ネスト hyoui、内側の子が `CSI > 1 u` を push)
+
+| 注入 | 子到達 | attach client |
+|---|---|---|
+| `key:C-z` 単発 (= 0x1a) | 0 | detach ✅ |
+| `key:C-z` 2 連打 | 1 | 繋がったまま ✅ |
+| CSI-u 単発 | 0 | detach ✅ |
+| CSI-u 2 連打 | 1 | 繋がったまま ✅ |
+| CSI-u 3 連打 | 1 | detach ✅ |
+| CSI-u release (`:3`) | 1 (素通し) | 繋がったまま ✅ |
+| `ESC` 単打 + `a` | 1 (素通し) | 繋がったまま ✅ |
+
+detach した回でも inner セッションは live のまま (= 覗き窓を閉じても子は走り続ける)。
+
+## 残作業
+
+- **kawaz の実端末 (Ghostty × claude code) での最終確認が未了**。ネスト hyoui では
+  外側端末の符号化を注入で模しているだけなので、実キーボード経由の確認が要る
+- 検証は `122;5u` 系と `0x1a` のみ。`CSI 27;5;122~` (modifyOtherKeys) は unit test だけで
+  実端末未確認 (= Ghostty は kitty protocol を優先するため実機で出しにくい)
+
+# 修正前に検討した論点 (= DR 改訂の要否)
+
+DR-0029 §2 の範囲内で解けると判断したが、以下は判断が要った点:
 
 1. **ガードの対象を「byte」から「キーイベント」へ広げるか**。広げるなら client の
    stdin を最低限パースすることになり、「入力は完全透過」(DR-0005) との距離が変わる
