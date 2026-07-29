@@ -450,6 +450,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "stable-which",
  "tempfile",
  "tokio",
  "toml",
@@ -929,6 +930,12 @@ dependencies = [
  "libc",
  "windows-sys",
 ]
+
+[[package]]
+name = "stable-which"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7d85a200aac1a2cc331f3e2eadd55a484f1cf6e0cd771f5d6f5d82e552c1813"
 
 [[package]]
 name = "syn"

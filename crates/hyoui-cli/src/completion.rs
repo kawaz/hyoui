@@ -190,6 +190,34 @@ _hyoui() {
         return 0
     fi
 
+    # `web service` の nested leaf を補完。`hyoui web` 自体は従来の gateway options。
+    if [[ "$sub" == "web" ]]; then
+        local web_sub
+        web_sub="$(_hyoui_child_of web)"
+        if [[ -z "$web_sub" ]]; then
+            COMPREPLY=( $(compgen -W "service --listen --web-assets-dir --help -h" -- "$cur") )
+            return 0
+        fi
+        if [[ "$web_sub" == "service" ]]; then
+            local service_sub
+            service_sub="$(_hyoui_child_of service)"
+            if [[ -z "$service_sub" ]]; then
+                COMPREPLY=( $(compgen -W "register unregister status --help -h" -- "$cur") )
+                return 0
+            fi
+            case "$service_sub" in
+                register)
+                    case "$prev" in --listen) return 0 ;; esac
+                    COMPREPLY=( $(compgen -W "--listen --help -h" -- "$cur") )
+                    return 0 ;;
+                unregister|status)
+                    COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
+                    return 0 ;;
+            esac
+        fi
+        return 0
+    fi
+
     # `input` の spec prefix を current word の状態に応じて補完。
     if [[ "$sub" == "input" ]]; then
         case "$prev" in
@@ -479,10 +507,7 @@ _hyoui() {
                     _hyoui_record
                     ;;
                 web)
-                    _arguments \
-                        '--listen=[Bind address host:port (default 127.0.0.1:43690)]:address:' \
-                        '--web-assets-dir=[Serve static assets from a local directory]:dir:_files -/' \
-                        '(-h --help)'{-h,--help}'[Show help]'
+                    _hyoui_web
                     ;;
                 config)
                     _hyoui_config
@@ -667,6 +692,28 @@ _hyoui_record_subcommands() {
     _describe -t commands 'hyoui record subcommand' subs
 }
 
+_hyoui_web() {
+    if (( ${words[(I)service]} )); then
+        if (( ${words[(I)register]} )); then
+            _arguments \
+                '--listen=[Bake bind address into the service command]:address:' \
+                '(-h --help)'{-h,--help}'[Show help]'
+        elif (( ${words[(I)unregister]} || ${words[(I)status]} )); then
+            _arguments '(-h --help)'{-h,--help}'[Show help]'
+        else
+            _arguments \
+                '1:service subcommand:(register unregister status)' \
+                '(-h --help)'{-h,--help}'[Show help]'
+        fi
+    else
+        _arguments \
+            '--listen=[Bind address host:port (default 127.0.0.1:43690)]:address:' \
+            '--web-assets-dir=[Serve static assets from a local directory]:dir:_files -/' \
+            '1:subcommand:(service)' \
+            '(-h --help)'{-h,--help}'[Show help]'
+    fi
+}
+
 _hyoui_config() {
     local context state state_descr line
     typeset -A opt_args
@@ -837,6 +884,15 @@ function __hyoui_child_none
         return 0
     end
     return 1
+end
+
+# `web service` leaf 検出。
+function __hyoui_web_service_using_sub
+    __hyoui_child_using service $argv[1]
+end
+
+function __hyoui_web_service_no_sub
+    __hyoui_child_none service
 end
 
 # screen 子 subcommand 検出 (= `screen dump` / `screen snapshot`)。
@@ -1030,10 +1086,18 @@ complete -c hyoui -n '__hyoui_using_subcommand detach' -l index  -x    -d 'Sessi
 complete -c hyoui -n '__hyoui_using_subcommand detach' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand detach' -s h -l help    -d 'Show help and exit'
 
-# `hyoui web` options (DR-0027)
-complete -c hyoui -n '__hyoui_using_subcommand web' -l listen          -x    -d 'Bind address host:port (default 127.0.0.1:43690)'
-complete -c hyoui -n '__hyoui_using_subcommand web' -l web-assets-dir  -r -F -d 'Serve static assets from a local directory'
-complete -c hyoui -n '__hyoui_using_subcommand web' -s h -l help             -d 'Show help and exit'
+# `hyoui web` gateway options + `web service` family (DR-0027 / DR-0031)
+complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -l listen          -x    -d 'Bind address host:port (default 127.0.0.1:43690)'
+complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -l web-assets-dir  -r -F -d 'Serve static assets from a local directory'
+complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -f -a service -d 'Manage OS startup integration'
+complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n __hyoui_web_service_no_sub -f -a register -d 'Install or replace and start the service'
+complete -c hyoui -n __hyoui_web_service_no_sub -f -a unregister -d 'Stop and remove the service'
+complete -c hyoui -n __hyoui_web_service_no_sub -f -a status -d 'Print registration and running state'
+complete -c hyoui -n '__hyoui_web_service_using_sub register' -l listen -x -d 'Bake bind address into the service command'
+complete -c hyoui -n '__hyoui_web_service_using_sub register' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_web_service_using_sub unregister' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_web_service_using_sub status' -s h -l help -d 'Show help and exit'
 
 # `hyoui upgrade` options (DR-0028)
 complete -c hyoui -n '__hyoui_using_subcommand upgrade' -l socket -r -F -d 'Explicit socket path'
@@ -1106,7 +1170,7 @@ mod tests {
         LOCK_SUBCOMMANDS, RECORD_INPUT_SECRECY_VALUES, RECORD_LIST_FORMAT_VALUES,
         RECORD_START_FORMAT_VALUES, RECORD_SUBCOMMANDS, RESERVED_TOP_LEVEL_SUBCOMMANDS,
         SCREEN_DUMP_FORMAT_VALUES, SCREEN_DUMP_LAYER_VALUES, SCREEN_SNAPSHOT_FORMAT_VALUES,
-        SCREEN_SUBCOMMANDS, SNAPSHOT_INCLUDE_VALUES, STATUS_FORMAT_VALUES,
+        SCREEN_SUBCOMMANDS, SNAPSHOT_INCLUDE_VALUES, STATUS_FORMAT_VALUES, WEB_SERVICE_SUBCOMMANDS,
     };
 
     const ALL_SHELLS: [Shell; 3] = [Shell::Bash, Shell::Zsh, Shell::Fish];
@@ -1239,8 +1303,8 @@ mod tests {
                 // `complete -c hyoui -n '__hyoui_using_subcommand run' -l socket ...`
                 // 親子は `__hyoui_<parent>_using_sub <child>`。
                 let needle = match sub.split_once(' ') {
-                    Some((parent, child)) => format!("__hyoui_{parent}_using_sub {child}'"),
-                    None => format!("__hyoui_using_subcommand {sub}'"),
+                    Some((parent, child)) => format!("__hyoui_{parent}_using_sub {child}"),
+                    None => format!("__hyoui_using_subcommand {sub}"),
                 };
                 for line in s.lines().filter(|l| l.contains(&needle)) {
                     // fish は `-l name` で long option を宣言する。
@@ -1474,6 +1538,28 @@ mod tests {
                     "shell {sh:?} missing implemented subcommand `{sub}`"
                 );
             }
+        }
+    }
+
+    /// `web service` の全 leaf と register 固有 `--listen` を 3 shell で同期する。
+    #[test]
+    fn completion_all_shells_cover_web_service_surface() {
+        for sh in ALL_SHELLS {
+            let script = script(sh);
+            assert!(
+                contains_token(&script, "service"),
+                "shell {sh:?} missing `web service`"
+            );
+            for sub in WEB_SERVICE_SUBCOMMANDS {
+                assert!(
+                    contains_token(&script, sub),
+                    "shell {sh:?} missing `web service {sub}`"
+                );
+            }
+            assert!(
+                offers_long_opt(&script, "listen"),
+                "shell {sh:?} missing `web service register --listen`"
+            );
         }
     }
 

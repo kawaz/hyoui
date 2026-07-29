@@ -33,6 +33,9 @@ serde = { workspace = true }
 # を env シリアライズで渡す。JSON は env value の text-safe な serialize 形式として
 # 採用 (= 独自 parse の脆さ回避、kawaz 指示 2026-05-29)。
 serde_json = { workspace = true }
+# `web service register` が current_exe から Homebrew upgrade を跨ぐ安定 PATH
+# symlink を選び、plist / unit に焼き込む (= DR-0031)。
+stable-which = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

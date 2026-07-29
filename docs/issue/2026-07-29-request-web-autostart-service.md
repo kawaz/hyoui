@@ -40,6 +40,15 @@ LaunchAgent (`~/Library/LaunchAgents/com.github.kawaz.hyoui-web.plist`、authsoc
   欠点: 実装コストが a より大きい、CLI surface が増える (CLI 棚卸し直後)。
 - a を先に入れて b は需要が出たら、の段階導入も可。
 
+## 裁定・実装
+
+- **AS-Q1=b 裁定 (2026-07-29)**: `hyoui web service register|unregister|status` を採用
+- macOS LaunchAgent + Linux `systemd --user` を同一 CLI で管理する実装を追加
+- DR: [DR-0031](../decisions/DR-0031-web-service-subcommand.md)
+- `stable-which` で安定 binary path を解決し、macOS の同 label 手書き plist は register 時の
+  bootout + 置換経路で移行する
+- **実装済み**。issue status は統括での確認・close まで open のまま維持
+
 ## メモ
 
 - `hyoui web` の listen は config `[web].listen` or default `127.0.0.1:43690` なので

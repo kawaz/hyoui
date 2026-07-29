@@ -145,8 +145,16 @@ pub enum HelpTopic {
     ConfigPath,
     /// Help for the `config show` subcommand (= 実効設定の TOML 出力)。
     ConfigShow,
-    /// Help for the `web` subcommand (= DR-0027 Phase 1、HTTP gateway 起動)。
+    /// Help for the `web` subcommand (= HTTP gateway 起動 + service 管理)。
     Web,
+    /// Help for the `web service` parent subcommand (= DR-0031)。
+    WebService,
+    /// Help for `web service register` (= DR-0031)。
+    WebServiceRegister,
+    /// Help for `web service unregister` (= DR-0031)。
+    WebServiceUnregister,
+    /// Help for `web service status` (= DR-0031)。
+    WebServiceStatus,
     /// Help for the `upgrade` subcommand (= DR-0028 §2 Phase 3、graceful self-exec)。
     Upgrade,
     /// User invoked an unknown subcommand; render top-level help with note.
@@ -163,6 +171,36 @@ pub struct WebConfig {
     /// assets ではなくローカル dir を都度読む。`None` の時は config
     /// `[web].assets_dir` にフォールバック、それも `None` なら埋め込みを使う。
     pub assets_dir: Option<std::path::PathBuf>,
+}
+
+/// `web service register` configuration (= DR-0031)。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WebServiceRegisterConfig {
+    /// サービス定義へ焼き込む listen address。未指定なら `hyoui web` と同じく
+    /// config `[web].listen` / built-in default を実行時に解決する。
+    pub listen: Option<String>,
+}
+
+/// `web service` の leaf command (= DR-0031)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WebServiceCommand {
+    /// サービス定義を書き、登録して即起動する。
+    Register(WebServiceRegisterConfig),
+    /// サービスを停止し、登録定義を削除する。
+    Unregister,
+    /// 登録有無・稼働状態・pid・定義パスを表示する。
+    Status,
+}
+
+/// `web` の gateway 起動と service 管理を同じ family に束ねる dispatch。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WebCommand {
+    /// `hyoui web [options]` — HTTP gateway を foreground 起動する。
+    Serve(WebConfig),
+    /// `hyoui web service ...` — OS の per-user service を管理する。
+    Service(WebServiceCommand),
 }
 
 /// Fully parsed `run` subcommand configuration.
@@ -982,8 +1020,8 @@ pub enum Command {
     Record(RecordCommand),
     /// `config` 親 subcommand (= 子: `path` / `show`、DR-0024 の config ファイル閲覧)。
     Config(ConfigCommand),
-    /// `web <listen>` — HTTP gateway (= DR-0027 Phase 1)。
-    Web(WebConfig),
+    /// `web` — HTTP gateway 起動または per-user service 管理。
+    Web(WebCommand),
     /// `upgrade [session]` — daemon graceful self-exec upgrade (DR-0028 §2 Phase 3)。
     ///
     /// session 省略時は `$HYOUI_SESSION_ID` (= 中から実行) で自セッションに解決される。
@@ -2445,6 +2483,10 @@ pub fn usage(topic: &HelpTopic) -> String {
         HelpTopic::ConfigPath => usage_config_path(),
         HelpTopic::ConfigShow => usage_config_show(),
         HelpTopic::Web => usage_web(),
+        HelpTopic::WebService => usage_web_service(),
+        HelpTopic::WebServiceRegister => usage_web_service_register(),
+        HelpTopic::WebServiceUnregister => usage_web_service_unregister(),
+        HelpTopic::WebServiceStatus => usage_web_service_status(),
         HelpTopic::Upgrade => usage_upgrade(),
     }
 }
@@ -2549,32 +2591,91 @@ Exit codes:
     .to_string()
 }
 
-/// `hyoui web` subcommand の usage (DR-0027 Phase 1)。
+/// `hyoui web` subcommand の usage (DR-0027 + DR-0031)。
 fn usage_web() -> String {
     "\
 hyoui web [--listen=<host:port>] [--web-assets-dir=<path>]
+hyoui web service <subcommand>
 
-Start the HTTP gateway that exposes hyoui sessions over REST + HTML UI
-(DR-0027 Phase 1/2).
+Start the HTTP gateway, or manage its per-user OS service.
 
-Options:
+SUBCOMMANDS:
+  service    Register, unregister, or inspect OS startup integration.
+
+OPTIONS:
   --listen=<host:port>       Override bind address (default: config
                              `[web].listen` or `127.0.0.1:43690`).
   --web-assets-dir=<path>    Serve static assets from a local directory (dev
                              mode). Falls back to config `[web].assets_dir`;
-                             when both are unset, the release build's
-                             embedded assets are used.
+                             when both are unset, embedded assets are used.
   --help, -h                 Show this help.
 
 Endpoints:
   GET  /                           HTML session list page.
   GET  /sessions/:id               HTML session view (xterm.js + input form).
-  GET  /assets/*                   Static assets (HTML/JS/CSS + vendored xterm.js).
+  GET  /assets/*                   Static assets.
   GET  /api/sessions               List live sessions as JSON.
-  GET  /api/sessions/:id/screen    ANSI dump of the session's screen
-                                   (text/plain; charset=utf-8).
-  POST /api/sessions/:id/input     Send input specs. Body JSON:
-                                   {\"specs\": [\"text:hello\", \"key:Enter\"]}
+  GET  /api/sessions/:id/screen    ANSI screen dump.
+  POST /api/sessions/:id/input     Send input specs.
+"
+    .to_string()
+}
+
+fn usage_web_service() -> String {
+    "\
+hyoui web service <subcommand>
+
+Manage the HTTP gateway as a per-user LaunchAgent (macOS) or systemd user
+service (Linux). No arguments prints this help.
+
+SUBCOMMANDS:
+  register      Install or replace the definition, enable it, and start now.
+  unregister    Stop the service and remove its definition.
+  status        Print registration and running state.
+
+OPTIONS:
+  --help, -h    Show this help.
+"
+    .to_string()
+}
+
+fn usage_web_service_register() -> String {
+    "\
+hyoui web service register [--listen=<host:port>]
+
+Install or idempotently replace the web gateway service and start it now.
+The installed command is `<stable hyoui path> web`; an explicit --listen is
+baked into the definition.
+
+OPTIONS:
+  --listen=<host:port>    Bake this listen address into the service command.
+  --help, -h              Show this help.
+"
+    .to_string()
+}
+
+fn usage_web_service_unregister() -> String {
+    "\
+hyoui web service unregister
+
+Stop the web gateway service and remove its definition. If it is not
+registered, this command succeeds without changing anything.
+
+OPTIONS:
+  --help, -h    Show this help.
+"
+    .to_string()
+}
+
+fn usage_web_service_status() -> String {
+    "\
+hyoui web service status
+
+Print the service label, registration state, running state, pid, and definition
+path. The command succeeds even when the service is not registered.
+
+OPTIONS:
+  --help, -h    Show this help.
 "
     .to_string()
 }
@@ -3826,8 +3927,12 @@ fn parse_config(args: &[String]) -> Command {
     }
 }
 
-/// `hyoui web [--listen=<host:port>]` (= DR-0027 Phase 1)。
+/// `hyoui web [options]` / `hyoui web service ...` (= DR-0027 + DR-0031)。
 fn parse_web(args: &[String]) -> Command {
+    if args.first().map(String::as_str) == Some("service") {
+        return parse_web_service(&args[1..]);
+    }
+
     let mut listen: Option<String> = None;
     let mut assets_dir: Option<std::path::PathBuf> = None;
     let mut i = 0usize;
@@ -3869,13 +3974,98 @@ fn parse_web(args: &[String]) -> Command {
                     _ => return Command::Error("web: --web-assets-dir requires a path".into()),
                 }
             }
+            other => return Command::Error(format!("web: unexpected argument: {other}")),
+        }
+        i += 1;
+    }
+    Command::Web(WebCommand::Serve(WebConfig { listen, assets_dir }))
+}
+
+fn parse_web_service(args: &[String]) -> Command {
+    let Some(head) = args.first().map(String::as_str) else {
+        return Command::Help {
+            topic: HelpTopic::WebService,
+        };
+    };
+    if matches!(head, "--help" | "-h") {
+        return Command::Help {
+            topic: HelpTopic::WebService,
+        };
+    }
+
+    let rest = &args[1..];
+    match head {
+        "register" => parse_web_service_register(rest),
+        "unregister" | "status" => {
+            let topic = if head == "unregister" {
+                HelpTopic::WebServiceUnregister
+            } else {
+                HelpTopic::WebServiceStatus
+            };
+            if rest.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+                return Command::Help { topic };
+            }
+            if let Some(arg) = rest.first() {
+                return Command::Error(format!("web service {head}: unexpected argument: {arg}"));
+            }
+            let command = if head == "unregister" {
+                WebServiceCommand::Unregister
+            } else {
+                WebServiceCommand::Status
+            };
+            Command::Web(WebCommand::Service(command))
+        }
+        other if other.starts_with('-') => {
+            Command::Error(format!("web service: unknown option: {other}"))
+        }
+        other => Command::Error(format!(
+            "web service: unknown subcommand `{other}` (supported: register, unregister, status)"
+        )),
+    }
+}
+
+fn parse_web_service_register(args: &[String]) -> Command {
+    let mut listen = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "--help" | "-h" => {
+                return Command::Help {
+                    topic: HelpTopic::WebServiceRegister,
+                };
+            }
+            _ if arg.starts_with("--listen=") => {
+                let value = &arg["--listen=".len()..];
+                if value.is_empty() {
+                    return Command::Error(
+                        "web service register: --listen requires a value".into(),
+                    );
+                }
+                listen = Some(value.to_string());
+            }
+            "--listen" => {
+                i += 1;
+                match args.get(i) {
+                    Some(value) if !value.is_empty() => listen = Some(value.clone()),
+                    _ => {
+                        return Command::Error(
+                            "web service register: --listen requires a value".into(),
+                        );
+                    }
+                }
+            }
             other => {
-                return Command::Error(format!("web: unexpected argument: {other}"));
+                return Command::Error(format!(
+                    "web service register: unexpected argument: {other}"
+                ));
             }
         }
         i += 1;
     }
-    Command::Web(WebConfig { listen, assets_dir })
+    Command::Web(WebCommand::Service(WebServiceCommand::Register(
+        WebServiceRegisterConfig { listen },
+    )))
 }
 
 fn parse_completion(args: &[String]) -> Command {
@@ -5809,6 +5999,9 @@ pub const RECORD_SUBCOMMANDS: &[&str] = &["start", "stop", "list"];
 
 /// `hyoui config` の子 subcommand 一覧 (= `parse_config` が dispatch する値)。
 pub const CONFIG_SUBCOMMANDS: &[&str] = &["path", "show"];
+
+/// `hyoui web service` の子 subcommand 一覧 (= DR-0031)。
+pub const WEB_SERVICE_SUBCOMMANDS: &[&str] = &["register", "unregister", "status"];
 
 /// `hyoui screen snapshot --include` の help / completion に出す component 名一覧。
 ///
@@ -10260,5 +10453,74 @@ mod tests {
         assert!(parse_max_bytes("").is_err());
         assert!(parse_max_bytes("abc").is_err());
         assert!(parse_max_bytes("1.5m").is_err()); // decimal 非対応
+    }
+
+    /// `hyoui web` の既存 no-arg gateway 起動 semantics は service family 追加後も維持する。
+    #[test]
+    fn parse_web_no_args_starts_gateway() {
+        assert_eq!(
+            parse_args(&args(&["web"])),
+            Command::Web(WebCommand::Serve(WebConfig::default()))
+        );
+    }
+
+    /// service parent の引数なし実行は leaf を推測せず、子一覧 help を表示する。
+    #[test]
+    fn parse_web_service_no_args_shows_help() {
+        assert_eq!(
+            parse_args(&args(&["web", "service"])),
+            Command::Help {
+                topic: HelpTopic::WebService
+            }
+        );
+    }
+
+    /// register は listen の空値を拒否し、明示値だけをサービス定義へ渡す。
+    #[test]
+    fn parse_web_service_register_listen() {
+        assert_eq!(
+            parse_args(&args(&[
+                "web",
+                "service",
+                "register",
+                "--listen=127.0.0.1:54321"
+            ])),
+            Command::Web(WebCommand::Service(WebServiceCommand::Register(
+                WebServiceRegisterConfig {
+                    listen: Some("127.0.0.1:54321".into())
+                }
+            )))
+        );
+        assert!(matches!(
+            parse_args(&args(&["web", "service", "register", "--listen="])),
+            Command::Error(message) if message.contains("requires a value")
+        ));
+    }
+
+    /// unregister/status は引数を取らない独立 leaf として parse される。
+    #[test]
+    fn parse_web_service_parameterless_leaves() {
+        assert_eq!(
+            parse_args(&args(&["web", "service", "unregister"])),
+            Command::Web(WebCommand::Service(WebServiceCommand::Unregister))
+        );
+        assert_eq!(
+            parse_args(&args(&["web", "service", "status"])),
+            Command::Web(WebCommand::Service(WebServiceCommand::Status))
+        );
+        assert!(matches!(
+            parse_args(&args(&["web", "service", "status", "extra"])),
+            Command::Error(message) if message.contains("unexpected argument")
+        ));
+    }
+
+    /// service help は親と各 leaf の操作面を別々に説明する。
+    #[test]
+    fn usage_web_service_topics_are_specific() {
+        assert!(usage(&HelpTopic::Web).contains("service"));
+        assert!(usage(&HelpTopic::WebService).contains("register"));
+        assert!(usage(&HelpTopic::WebServiceRegister).contains("--listen"));
+        assert!(usage(&HelpTopic::WebServiceUnregister).contains("remove"));
+        assert!(usage(&HelpTopic::WebServiceStatus).contains("running state"));
     }
 }
