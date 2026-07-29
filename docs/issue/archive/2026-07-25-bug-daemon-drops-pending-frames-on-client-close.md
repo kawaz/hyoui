@@ -1,18 +1,18 @@
 ---
 title: "BUG: 送信直後に切断した client の control frame が daemon で無言で捨てられる"
-status: open
+status: resolved
 category: bug
 created: 2026-07-25T00:00:00+09:00
-last_read:
+last_read: 2026-07-29T13:45:00+09:00
 open_entered: 2026-07-25T00:00:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-29T13:45:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: 真因確定・修正済 (2026-07-26)。WriterDead を disconnect 根拠にして受信済み frame ごと client を破棄していた実装を削除。修正後 CI green 継続 (v0.9.24〜25 rerun なし一発 green)
 blocked_by:
 origin: web_e2e_api::e2e_resize_endpoint の flaky 調査 (2026-07-25)。web の resize endpoint 側は往復確認で回避済だが、daemon 側の一般則として残る
 ---

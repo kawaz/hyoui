@@ -1,18 +1,18 @@
 ---
 title: outer_token_inheritance_skips_auto_acquire が単独実行でも稀に 30s deadline fail する
-status: open
+status: resolved
 category: bug
 created: 2026-07-04T01:07:04+09:00
-last_read: 2026-07-20T10:22:16+09:00
+last_read: 2026-07-29T13:45:00+09:00
 open_entered: 2026-07-04T01:07:04+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-29T13:45:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: 真因確定 (2026-07-26、daemon の WriterDead 起因 frame 破棄 = daemon-drops-pending-frames と同根)。修正後 25 回連続 green + v0.9.24〜25 の CI rerun なし一発 green で確認
 blocked_by:
 origin: 自リポ TODO — ローカル test 反復実行での flaky 観測 (2026-07-04)
 ---
