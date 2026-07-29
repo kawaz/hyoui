@@ -20,14 +20,7 @@
 
 ## 裁定待ち
 
-### 👺AS-Q1: hyoui web 自動起動の製品側提供方式
-
-- [ ] a: formula に `service do` block (`brew services start kawaz/tap/hyoui`、実装数行、次リリースから) — 推し
-- [ ] b: `hyoui web service register` サブコマンド (brew 非依存、Linux systemd にも展開可、実装コスト大)
-- [ ] c: a を先行し b は需要が出たら (段階導入)
-
-現状はこのマシンに手書き LaunchAgent 設置済みで稼働中 (再起動後も自動起動する)。
-詳細: [docs/issue/2026-07-29-request-web-autostart-service.md](issue/2026-07-29-request-web-autostart-service.md)
+(現在なし)
 
 ## 確認待ち
 
@@ -40,6 +33,3 @@
 kitty CSI-u / modifyOtherKeys / 0x1a の 3 符号化対応 + decode/policy 層分離で修正。
 brew v0.9.27 反映済み。詳細: [issue](issue/2026-07-29-bug-ctrlz-guard-bypassed-by-keyboard-protocol.md)
 
-### 👺CZ-C2: 絵文字・記号の幅修正 (v0.9.26) の web 表示確認
-
-- [ ] a: web ターミナルをリロードし、絵文字 (😀 等) と記号 (⚠ ★ ✻ 等) が隣の文字と重ならないことを確認 (① のみ軽微に残る既知事項)
