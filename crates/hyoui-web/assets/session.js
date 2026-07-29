@@ -20,11 +20,95 @@
     document.body.classList.add('embed');
   }
 
+  // ---- 表示設定の URL query 上書き (kawaz 要望 2026-07-29) ----
+  //
+  // iframe 埋め込み側 (ccmsg webui Terminal タブ等) がホスト UI に合わせて
+  // フォント・色・scrollback を選べるよう、xterm.js の表示オプションを query で
+  // 上書きできるようにする。優先は「query → 既定」の 1 段だけで、config ファイル
+  // ([web]) との連携はしない (= 表示は閲覧するクライアント側の都合であって
+  // daemon/gateway の設定ではない)。
+  //
+  // 不正値は既定に落として warn を出す。埋め込み先では devtools が見えないことが
+  // あるので console.warn 経由で debug panel (session.html の __hyouiDebug) にも
+  // 流れるようにしている。
+  //
+  //   fontsize=<6..40>      px。既定 13
+  //   lineheight=<1.0..2.0> 既定 1.0 (xterm.js は 1 未満を throw で弾く)
+  //   scrollback=<0..100000> 行。既定 2000
+  //   fontfamily=<names>    カンマ区切り。既定チェーンの先頭に挿入する
+  //   bg=<hex> / fg=<hex>   背景 / 前景。`#` は省略可 (URL で %23 を書かずに済む)
+  const params = new URLSearchParams(location.search);
+  const warnParam = (name, raw, why) => {
+    console.warn(`hyoui: ignoring ?${name}=${raw} (${why})`);
+  };
+  const numParam = (name, def, min, max, integer) => {
+    const raw = params.get(name);
+    if (raw === null) return def;
+    const v = Number(raw.trim());
+    if (raw.trim() === '' || !Number.isFinite(v)) {
+      warnParam(name, raw, 'not a number');
+      return def;
+    }
+    if (v < min || v > max) {
+      warnParam(name, raw, `out of range ${min}-${max}`);
+      return def;
+    }
+    return integer ? Math.round(v) : v;
+  };
+  const colorParam = (name, def) => {
+    const raw = params.get(name);
+    if (raw === null) return def;
+    const s = raw.trim().replace(/^#/, '');
+    // 3/4/6/8 桁 hex (xterm.js の theme は #RGB / #RRGGBB / #RRGGBBAA を解釈する)
+    if (!/^(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(s)) {
+      warnParam(name, raw, 'not a hex color');
+      return def;
+    }
+    return '#' + s;
+  };
+  // 半角ブロック罫線 (▀▄▉ 等) の上下ズレ対策として lineHeight は 1.0 が既定。
+  // fontFamily は同梱の HackGen Console NF (SIL OFL、半角:全角=1:2、Nerd Font +
+  // 日本語 JIS 第 1-2 水準入り) を最優先。host 依存フォントを消してメトリクス
+  // を安定化させる。fallback は既存 monospace 列。
+  const DEFAULT_FONT_FAMILY =
+    '"HackGen Console NF", Menlo, "DejaVu Sans Mono", Consolas, "Courier New", monospace';
+  const fontFamilyParam = () => {
+    const raw = params.get('fontfamily');
+    if (raw === null) return DEFAULT_FONT_FAMILY;
+    const s = raw.trim();
+    // 値は xterm.js が element の inline style に直接入れるため、font-family 名に
+    // 現れうる文字だけを通す (= `;` `{` `(` 等を弾いて他プロパティの注入を防ぐ)。
+    if (!s || !/^[\w \-'",.]+$/.test(s)) {
+      warnParam('fontfamily', raw, 'invalid font family name');
+      return DEFAULT_FONT_FAMILY;
+    }
+    const list = s.split(',').map((t) => t.trim().replace(/['"]/g, '')).filter(Boolean);
+    if (list.length === 0) {
+      warnParam('fontfamily', raw, 'empty font family name');
+      return DEFAULT_FONT_FAMILY;
+    }
+    // 既定チェーンは置き換えず先頭に挿入する。指定フォントが持たないグリフは
+    // 従来どおり HackGen / host monospace へ落ちる。
+    const quoted = list.map((t) => (/^[\w-]+$/.test(t) ? t : `"${t}"`));
+    return quoted.concat(DEFAULT_FONT_FAMILY).join(', ');
+  };
+
+  const fontSize = numParam('fontsize', 13, 6, 40, true);
+  const lineHeight = numParam('lineheight', 1.0, 1.0, 2.0, false);
+  const scrollback = numParam('scrollback', 2000, 0, 100000, true);
+  const fontFamily = fontFamilyParam();
+  const background = colorParam('bg', '#111');
+  const foreground = colorParam('fg', '#e0e0e0');
+  // #term は style.css で背景 #111 固定。padding 4px 分がターミナル本体の外側に
+  // 覗くので、bg を変えたらコンテナ側も合わせる。
+  const termEl = document.getElementById('term');
+  if (termEl) termEl.style.background = background;
+
   const term = new Terminal({
     cols: COLS,
     rows: ROWS,
     convertEol: false,
-    scrollback: 2000,
+    scrollback,
     // DR-0027 Phase 3: WS attach 接続後は raw stream で xterm.js が直接キー入力を
     // WS に流すため、stdin を有効化する。WS 未接続時のフォーカス入力は WS が
     // 復活するまで無害 (= term.onData で input queue に貯まるが送り先が無いので
@@ -34,14 +118,10 @@
     // 自体が throw する (= unicode11 addon の activate が register に到達できず、
     // 幅計算は UnicodeV6 のまま = 絵文字が幅 1 になる)。
     allowProposedApi: true,
-    // 半角ブロック罫線 (▀▄▉ 等) の上下ズレ対策として lineHeight を 1.0 に固定。
-    // fontFamily は同梱の HackGen Console NF (SIL OFL、半角:全角=1:2、Nerd Font +
-    // 日本語 JIS 第 1-2 水準入り) を最優先。host 依存フォントを消してメトリクス
-    // を安定化させる。fallback は既存 monospace 列。
-    lineHeight: 1.0,
-    fontFamily: '"HackGen Console NF", Menlo, "DejaVu Sans Mono", Consolas, "Courier New", monospace',
-    fontSize: 13,
-    theme: { background: '#111', foreground: '#e0e0e0' },
+    lineHeight,
+    fontFamily,
+    fontSize,
+    theme: { background, foreground },
   });
   // Unicode 11 addon (絵文字を width=2 として扱う。daemon 側 vt100 emulator と一致)。
   if (window.Unicode11Addon) {
@@ -69,7 +149,7 @@
   } else if (window.__hyouiDebug) {
     window.__hyouiDebug('warn', 'FitAddon global not found');
   }
-  term.open(document.getElementById('term'));
+  term.open(termEl);
   // playwright / devtools 用の debug hook。production でも露出しているが
   // xterm.js の内部 API なので副作用は限定的 (= UI ボタンを増やす代わり)。
   window.__hyouiTerm = term;

@@ -62,6 +62,28 @@ xterm.js + 素の HTML/JS (bundler なし、vendored コピー)。リリース�
 crate に埋め込み (include_dir 系)、開発中は `--web-assets-dir` でローカルファイルを
 返す二段構え (kawaz 方針 r40m22)。
 
+### 5. セッションページの URL query パラメータ
+
+`GET /sessions/:id` の見た目・挙動はすべて URL query で制御する。閲覧クライアント
+(iframe 埋め込み側 / ブックマーク) ごとに違う値を選べる必要があり、gateway 側の
+config (`[web]`) に持たせると全閲覧者で共有されてしまうため。優先は「query → 既定」
+の 1 段だけで、config との合成はしない。
+
+| param | 型 / 範囲 | 既定 | 効果 |
+|---|---|---|---|
+| `embed` | `1` | off | header / debug panel を隠して viewport にフィット |
+| `resize` | `1` | off | auto-resize (PTY) を強制 ON |
+| `fontsize` | 整数 6-40 (px) | `13` | xterm.js `fontSize` |
+| `lineheight` | 数値 1.0-2.0 | `1.0` | xterm.js `lineHeight` (xterm.js は 1 未満を拒否する) |
+| `scrollback` | 整数 0-100000 (行) | `2000` | xterm.js `scrollback` |
+| `fontfamily` | font family 名のカンマ区切り | (なし) | 既定チェーンの**先頭に挿入**。指定フォントが持たないグリフは HackGen Console NF → host monospace へ落ちる |
+| `bg` / `fg` | hex 3/4/6/8 桁、`#` 省略可 | `#111` / `#e0e0e0` | terminal の背景 / 前景 |
+
+不正値・範囲外は既定に落として `console.warn` を出す (= ページ内 debug panel にも
+残る)。`#` を省略できるのは、URL に `%23` を書かずに済ませるため。`fontfamily` は
+font family 名に現れうる文字だけを通し、`;` `{` `(` 等を含む値は拒否する
+(= 値は xterm.js が inline style に直接入れるため)。
+
 ## Rejected alternatives
 
 - **別 repo `hyoui-serve`** (DR-0010 §2): 上表の通り。breaking 期の共進化コストが利益を上回る
