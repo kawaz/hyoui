@@ -1,19 +1,19 @@
 ---
 title: "BUG: auto-resume / 外部 SIGCONT 後も `child-state: stopped` が恒久的に下りない"
-status: blocked
+status: resolved
 category: bug
 created: 2026-06-12T00:00:00+09:00
-last_read:
+last_read: 2026-07-29T09:29:17+09:00
 open_entered: 2026-06-12T00:00:00+09:00
 wip_entered:
 blocked_entered: 2026-07-03T16:01:05+09:00
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-29T00:00:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
-blocked_by: DR-0025 Phase 3
+close_reason: root cause (macOS が self-stop した子の continued を waitpid で報告しない) を特定して修正、実機マトリクス 6 ケース green
+blocked_by:
 origin: DR-0019 Update (set/可視化) 実装の push 前 Fable レビュー (2026-06-12)。本 diff 起因ではなく v0.6.3 に既存
 ---
 
@@ -92,17 +92,44 @@ transition を拾えていない」という仮説は **不十分** (attached �
 |---|---|---|---|---|
 | **attached (rw leader あり)** | notify | Ctrl+Z 2 連打 → `kill --signal=CONT --no-terminate` | resume 済 (echo 応答あり) | stopped ❌ |
 
-## TODO
+## Root cause (2026-07-29 特定)
 
-- [ ] detached (client 不在) で WCONTINUED transition が拾えない root cause 特定
-  (self-pipe / poll timeout 経路の lifecycle poll 条件を確認)
-- [ ] `record_child_continued` 発火の実機確認 (lifecycle event `child-continued-observed`
-  が jsonl に出るか)
-- [ ] 修正 + マトリクス再検証 (attached / detached × auto-resume / notify × STOP/CONT)
+原因は 2 つの kernel 挙動の重なりで、いずれも macOS で実測した (`/tmp` の C 再現片で
+`sigaction(SIGCHLD)` + `waitpid(WNOHANG|WUNTRACED|WCONTINUED)` を直接叩いて確認):
 
-## Triage (2026-07-03)
+1. **macOS は子の continue で SIGCHLD を送らない**。stop では handler が 1 回呼ばれるが、
+   SIGCONT では 0 回。daemon は SIGCHLD self-pipe でしか wake しないため、
+   `poll_with_transition` を回す契機が来ず Continued を drain できない。
+   → serve_loop の poll timeout を「子が stopped の間だけ」200ms で cap し、
+   Timeout 経路でも lifecycle を poll するようにした。
+2. **子が自分で自分を止めた場合、`waitpid(WCONTINUED)` は continued を一切報告しない**。
+   CONT の送り主 (daemon 経由 / 外部 `kill -CONT`) に依らず報告されない。
+   外部から `kill -TSTP <pid>` で止めた子は報告される。
+   → `waitpid` に依存しない観測経路として `crate::sys::procstate::is_stopped`
+   (macOS: `proc_pidinfo(PROC_PIDTBSDINFO)` の `pbi_status`、Linux: `/proc/<pid>/stat`) を
+   追加し、latch が stopped の間だけ直読みして復帰を確認する。
 
-DR-0025 Phase 3 (Child state machine 化、ChildEvent 整理、DR-0001 axis 1 / DR-0017 anchor /
-DR-0019 OnChildSuspend を ChildState 内部に formal 化) で child_stopped フラグ管理が
-一元化され、detached 状況での WCONTINUED/Continued transition 取りこぼしが構造的に解消される
-見込み。Phase 3 完了待ちとして blocked に遷移する。
+1 だけでは `kill -STOP $$` する子 (= テストや shell script で最も多い形) が救われず、
+2 だけでは polling 契機が無い。両方が要る。
+
+なお 2 の帰結として、self-stop した子については DR-0016 §3 の 4 段階 lifecycle event の
+うち `child-continued-observed` が `waitpid` 由来では出ない。現在は procstate 観測を
+根拠に同 event を push している。
+
+## 検証 (2026-07-29 実機、debug build)
+
+| # | ケース | ps STAT | status child-state |
+|---|---|---|---|
+| 1 | rw attach 中に子が self-stop (SIGSTOP) | S+ | running |
+| 2 | rw attach 中に子が self-stop (SIGTSTP) | S+ | running |
+| 3 | attach 成立前に self-stop | S+ | running |
+| 4a | rw client 無しで self-stop (停止維持) | T+ | stopped |
+| 4b | 上記に外部 `kill -CONT` | S+ | running |
+| 5 | vim + rw attach + 外部 `kill -TSTP` | S+ | running |
+| 6 | `--on-child-suspend=auto-resume` | S+ | running |
+
+4a が「本当に停止中なら stopped のまま」を押さえている (= 一律 clear ではない)。
+
+回帰 test: `jobcontrol_auto_resume::status_child_state_returns_to_running_after_resume`。
+既存 3 test は子の出力 (RESUMED_MARKER) しか見ておらず、daemon 側 latch を検証して
+いなかったため本 bug を素通ししていた。

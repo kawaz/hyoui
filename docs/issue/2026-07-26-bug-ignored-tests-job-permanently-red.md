@@ -121,3 +121,25 @@ DR-0029 §5 の resume 発火点を「handshake 時に stopped」に加えて「
 `continue-on-error` は「不安定な test で workflow を止めない」ための仕組みだが、
 現状は **恒常的に壊れている事実を隠す**方向に働いている。この job が緑/赤どちらでも
 同じ扱いなので、新しい regression が入っても気づけない (= 検知能力ゼロ)。
+
+## 追記 (2026-07-29): §(B) の後日談 — 「実機で動かない」は誤診だった
+
+DR-0030 land 後、`hyoui status` の `child-state` が resume 後も stopped のままなのを見て
+「DR-0030 が実機で効いていない」と報告が上がったが、実機で切り分けた結果 **DR-0030 の
+resume 自体は正しく動いていた** (子は `ps` で `S+` = 走行中、rw client 無しの対照では
+`T+` のまま維持される)。stopped 表示は別 bug
+([[2026-06-12-bug-child-stopped-flag-not-cleared]]、2026-07-29 に root cause 特定・修正) の
+症状で、それを resume 失敗と読み違えていた。
+
+この誤診が成立してしまった構造的な理由が 2 つあり、本 issue の射程に直接効く:
+
+1. **`#[ignore]` された test の green を「green」と読んでいた**。
+   `cargo test -p hyoui-cli --test jobcontrol_auto_resume` は DR-0030 の 3 test を
+   ignored のまま skip して `ok` を返す。`-- --ignored` を付けない限り検証していない。
+   「test green なのに実機 red」という前提自体が、実際には「test を走らせていない」だった。
+2. **test が daemon 側の観測可能な state を一切見ていなかった**。
+   3 test はいずれも子の標準出力 (`RESUMED_MARKER`) だけを assert しており、
+   `hyoui status` が報告する `child-state` を見ていない。人間が実機で最初に見るのは
+   status の表示なので、test が green でも「見え方」の回帰は素通しになる。
+   回帰 test `status_child_state_returns_to_running_after_resume` を追加して塞いだ。
+
