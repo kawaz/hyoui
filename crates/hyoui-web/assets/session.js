@@ -30,6 +30,10 @@
     // 復活するまで無害 (= term.onData で input queue に貯まるが送り先が無いので
     // WS 接続時に flush される。UX 上は input 欄経由が primary な fallback)。
     disableStdin: false,
+    // term.unicode は xterm.js の proposed API 扱いで、この option が無いと getter
+    // 自体が throw する (= unicode11 addon の activate が register に到達できず、
+    // 幅計算は UnicodeV6 のまま = 絵文字が幅 1 になる)。
+    allowProposedApi: true,
     // 半角ブロック罫線 (▀▄▉ 等) の上下ズレ対策として lineHeight を 1.0 に固定。
     // fontFamily は同梱の HackGen Console NF (SIL OFL、半角:全角=1:2、Nerd Font +
     // 日本語 JIS 第 1-2 水準入り) を最優先。host 依存フォントを消してメトリクス
