@@ -1460,6 +1460,18 @@ fn serve_loop(
             const NO_SELFPIPE_POLL_CAP_MS: u16 = 500;
             poll_timeout = cap_poll_timeout(poll_timeout, NO_SELFPIPE_POLL_CAP_MS);
         }
+        // 子が stopped の間は self-pipe があっても poll を cap する。
+        //
+        // Design rationale: macOS (BSD) の kernel は子の **stop では SIGCHLD を
+        // 送るが、continue では送らない** (実測 2026-07-29: sigaction(SIGCHLD)
+        // 登録下で SIGSTOP 時に handler 1 回、SIGCONT 時に 0 回)。self-pipe wake
+        // だけに頼ると復帰を検出する契機が永久に来ず、`child_stopped` latch が
+        // 下りないまま `hyoui status` の `child-state` が stopped に貼り付く。
+        // stopped の間だけ短周期で wake して復帰確認を回す。
+        if lifecycle.is_stopped() {
+            const STOPPED_CHILD_POLL_CAP_MS: u16 = 200;
+            poll_timeout = cap_poll_timeout(poll_timeout, STOPPED_CHILD_POLL_CAP_MS);
+        }
         // 子 exit 後の drain 窓 (= `deferred_exit`) 中は、残り budget で poll を
         // cap して締切ちょうどで wake する (= master EOF は既に消費済で二度と
         // ready にならないため、cap しないと budget 経過に気づけず block する)。
@@ -1552,7 +1564,10 @@ fn serve_loop(
                 // legacy polling 経路で子の STOP / CONT / exit を拾う。
                 // self-pipe を持つ通常 path はここで lifecycle を触らない
                 // (= Interrupted / sigchld_ready 経路で処理済、二重 poll を避ける)。
-                if sigchld_pipe.is_none() {
+                // 例外は子が stopped の間で、macOS は continue で SIGCHLD を
+                // 送らないため self-pipe 経路では復帰を拾えない (= 上の
+                // poll timeout cap と対の措置)。
+                if sigchld_pipe.is_none() || lifecycle.is_stopped() {
                     let (child_state, transition) = lifecycle.poll_with_transition(child);
                     if let ChildState::Exited(code) = child_state {
                         return RelayOutcome::ChildExited(code);
@@ -1564,6 +1579,15 @@ fn serve_loop(
                         }
                         Some(ChildTransition::Continued) => record_child_continued(state, child),
                         _ => {}
+                    }
+                    // `waitpid` が continued を報告しない環境 (= macOS の self-stop
+                    // した子) 向けの補完。kernel の process state を直読みして
+                    // 「実は走っている」ことを確認できたら latch を下ろす。
+                    if lifecycle.is_stopped()
+                        && crate::sys::procstate::is_stopped(child.as_raw()) == Some(false)
+                    {
+                        lifecycle.clear_stopped();
+                        record_child_continued(state, child);
                     }
                 }
                 process_pending_handshakes(

@@ -10,6 +10,7 @@ pub mod env_scrub;
 pub mod error;
 pub mod fd;
 pub mod poll;
+pub mod procstate;
 pub mod pty;
 pub mod raw;
 pub mod signal;

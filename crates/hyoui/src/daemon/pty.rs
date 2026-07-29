@@ -17,8 +17,8 @@ use nix::unistd::Pid;
 pub(super) const ALIVE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// 子が SIGTSTP/SIGSTOP で stopped 中の master poll 間隔 (R4-H14)。
-/// 子から出力が来る見込みが無いため大きめに (= ~2Hz)。SIGCONT を検出する
-/// `waitpid(WCONTINUED)` の latency もこの上限になる。
+/// 子から出力が来る見込みが無いため大きめに (= ~2Hz)。子の復帰検出そのものは
+/// serve_loop が stopped 中に張る poll timeout cap 側が担う。
 pub(super) const STOPPED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// 子 process の状態判定結果 (R4-H14: Stopped と Continued を区別)。
@@ -85,6 +85,14 @@ impl ChildLifecycle {
     /// この取りこぼしを回避する (= issue 2026-06-11 優先2 の root cause)。
     pub(super) fn is_stopped(&self) -> bool {
         self.stopped
+    }
+
+    /// `waitpid` 由来ではない観測 (= kernel の process state 直読み) で子の復帰を
+    /// 確認したときに latch を下ろす。macOS は self-stop した子の continued を
+    /// `waitpid(WCONTINUED)` で報告しないため、この経路が無いと latch が残り続ける
+    /// (詳細は [`crate::sys::procstate`])。
+    pub(super) fn clear_stopped(&mut self) {
+        self.stopped = false;
     }
 
     /// `poll_with_transition` の latched state だけを返す薄い wrapper。
