@@ -3,7 +3,7 @@ title: "CI の ignored-tests job が continue-on-error で恒常 red を隠し�
 status: open
 category: bug
 created: 2026-07-26T09:40:00+09:00
-last_read: 2026-07-26T09:40:00+09:00
+last_read: 2026-07-29T18:45:00+09:00
 open_entered: 2026-07-26T09:40:00+09:00
 wip_entered:
 blocked_entered:
@@ -142,4 +142,83 @@ resume 自体は正しく動いていた** (子は `ps` で `S+` = 走行中、r
    `hyoui status` が報告する `child-state` を見ていない。人間が実機で最初に見るのは
    status の表示なので、test が green でも「見え方」の回帰は素通しになる。
    回帰 test `status_child_state_returns_to_running_after_resume` を追加して塞いだ。
+
+## 調査 2026-07-29 (macOS notify_default_*)
+
+### 「7/7」の単位
+
+集計表の `7` は 7 個の test ではなく、直近 CI 12 run のうち macOS で
+`notify_default_does_not_resume_self_stopped_child` が失敗した **7 run 全件**を指す。
+旧コードに該当 test は 1 個だけで、現 HEAD では DR-0030 に従う 4 個の ignored test に
+置き換わっている。
+
+### 旧 assert の fresh 再現
+
+現 HEAD の product code に DR-0030 裁定前の旧 test ファイルだけを一時コピー上で戻し、
+次を 7 回個別実行した。リポの追跡ファイルは変更していない。
+
+```console
+cargo test -p hyoui-cli --test jobcontrol_auto_resume \
+  notify_default_does_not_resume_self_stopped_child \
+  -- --ignored --exact --nocapture
+```
+
+| run | 結果 | 所要時間 | `result` の実値 |
+|---:|---|---:|---|
+| 1 | FAILED | 0.82s | `Ok("[hyoui] detach: ...\\r\\nRESUMED_MARKER\\r\\n")` |
+| 2 | FAILED | 0.81s | 同上 |
+| 3 | FAILED | 0.82s | 同上 |
+| 4 | FAILED | 0.79s | 同上 |
+| 5 | FAILED | 0.84s | 同上 |
+| 6 | FAILED | 0.82s | 同上 |
+| 7 | FAILED | 0.81s | 同上 |
+
+全 7 回で `wait_for("RESUMED_MARKER", 2s)` は `Err` ではなく同一内容の `Ok` を返した。
+失敗 assert は旧 test の `assert!(result.is_err())` であり、marker は timeout 前に必ず観測された。
+CI runner の負荷・macOS version・資源枯渇で説明する余地のない決定的失敗をローカルでも再現した。
+
+### 現 HEAD の関連 test
+
+置換後の `crates/hyoui-cli/tests/jobcontrol_auto_resume.rs` の ignored test を個別実行した。
+
+| test | 結果 | 所要時間 | 検証経路 |
+|---|---|---:|---|
+| `auto_resume_resumes_self_stopped_child` | ok | 1.06s | daemon policy が resume |
+| `run_resumes_child_that_is_already_stopped_at_attach` | ok | 0.93s | handshake snapshot が stopped |
+| `run_resumes_child_that_stops_while_attached` | ok | 1.82s | attach 中の stopped notify |
+| `status_child_state_returns_to_running_after_resume` | ok | 1.87s | resume 後の daemon state |
+
+`pgrep -fl hyoui` でテスト由来の daemon 残骸 process が無いことを確認した。調査前から
+走行している別セッションの `hyoui` process には触れていない。
+
+### 真因と分岐判定
+
+**test の前提不備**。product bug でも CI 環境固有でもない。
+
+旧 test は daemon policy の default `notify` を「`hyoui run` 全体では誰も子を起こさない」
+と解釈していた。しかし実装上は次の 3 点が同時に成立する。
+
+1. `hyoui run` は detached daemon を起動した後、自身を `hyoui attach` に置換する
+   (`crates/hyoui-cli/src/main.rs:569-604`)。
+2. attach 設定は stopped child の resume を default `true` とする
+   (`crates/hyoui/src/config/mod.rs:135`, `:192`)。
+3. rw attach は handshake 時に `child_stopped` なら `SessionChildResumeRequest` を送る
+   (`crates/hyoui-cli/src/main.rs:819-829`)。
+
+したがって daemon は `notify` 規定どおり自発的に resume していなくても、`run` に合成された
+rw attach client が resume を要求し、旧 test の `RESUMED_MARKER` が出る。旧 assert は
+DR-0019 の daemon policy だけを検証対象とみなし、DR-0015 の `run = daemon + attach` と
+attach 側の規定を前提から落としていた。
+
+### 修正の妥当性
+
+単に assert を実測値へ緩めるのではなく、DR-0030 で現行仕様を
+「rw attach 中は子を停止させたままにしない」と裁定した上で、旧 test の検証意図を
+現行仕様へ置き換えるのが正しい。現 HEAD は以下を満たしている。
+
+- 起動時点で stopped の経路と、attach 成立後に stop する経路を別 test で検証する。
+- daemon の明示 `auto-resume` policy も独立 test のまま維持する。
+- marker 出力だけでなく `child-state: running` への復帰も検証する。
+- resume 判定を `should_resume_stopped_child` に集約し、handshake と stopped notify の
+  2 call site で条件を共有する (`crates/hyoui/src/client/attach.rs:128-139`, `:799-823`)。
 
