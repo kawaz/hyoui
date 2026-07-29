@@ -29,15 +29,15 @@ lint-rust:
     cargo fmt --check
     cargo clippy --workspace --all-targets -- -D warnings
 
-# unsafe 封じ込め gate: unsafe は sys/raw.rs / sys/signal.rs / sys/env.rs のみに限定。
+# unsafe 封じ込め gate: unsafe は sys/raw.rs / sys/signal.rs / sys/env.rs / sys/procstate.rs のみに限定。
 # 他に漏れたら fail。grep がマッチ無しでも exit 0 扱いとする (= 漏れなし = 成功)。
 [private]
 [script]
 lint-unsafe:
     leaked=$(grep -rnE '\bunsafe[[:space:]]+(fn|impl|trait|extern|\{)' crates/hyoui/src --include='*.rs' \
-      | grep -v 'src/sys/raw.rs\|src/sys/signal.rs\|src/sys/env.rs' || true)
+      | grep -v 'src/sys/raw.rs\|src/sys/signal.rs\|src/sys/env.rs\|src/sys/procstate.rs' || true)
     if [ -n "$leaked" ]; then
-      echo "ERROR: unsafe leaked outside whitelisted files (sys/raw.rs, sys/signal.rs, sys/env.rs):" >&2
+      echo "ERROR: unsafe leaked outside whitelisted files (sys/raw.rs, sys/signal.rs, sys/env.rs, sys/procstate.rs):" >&2
       echo "$leaked" >&2
       exit 1
     fi

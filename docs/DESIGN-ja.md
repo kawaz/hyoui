@@ -104,8 +104,9 @@ crates/
 
 daemon module の責務分割は [[DR-0009]]、screen 配下は [[DR-0013]] が正本。
 
-`#![forbid(unsafe_code)]` は `hyoui-cli` 全体に、`hyoui` lib では `sys/raw.rs` と
-`sys/signal.rs` の 2 ファイルに `unsafe` を封じ込め（残部は nix 安全 API のみ）。
+`#![forbid(unsafe_code)]` は `hyoui-cli` 全体に、`hyoui` lib では `sys/` 配下の
+whitelist (`raw.rs` / `signal.rs` / `env.rs` / `procstate.rs`、justfile の
+`lint-unsafe` gate が正本) に `unsafe` を封じ込め（残部は nix 安全 API のみ）。
 Rust 一本化の判断は [[DR-0003]]。
 
 ### 2.2 protocol（wire format）
@@ -230,8 +231,9 @@ ANSI escape sequence (CSI / OSC / DCS / single char) state machine による str
 
 ### 2.8 sys モジュール
 
-unsafe を `sys/raw.rs` (forkpty / login_tty / TIOCSWINSZ) と `sys/signal.rs` (sigaction
-/ self-pipe) の 2 ファイルに封じ込め。`sys/socket.rs` で perm 0600 / dir 0700 enforce、
+unsafe を whitelist 4 ファイルに封じ込め: `sys/raw.rs` (forkpty / login_tty /
+TIOCSWINSZ)、`sys/signal.rs` (sigaction / self-pipe)、`sys/env.rs` (環境変数の
+非スレッドセーフ操作)、`sys/procstate.rs` (proc_pidinfo / procfs による子状態直読み)。`sys/socket.rs` で perm 0600 / dir 0700 enforce、
 `sys/poll.rs` で poll(2) を type-safe に wrap、`sys/clock.rs` で Instant ↔ epoch ms。
 
 ### 2.9 Record (`crates/hyoui/src/daemon/record.rs`)

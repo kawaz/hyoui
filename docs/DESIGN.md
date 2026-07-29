@@ -117,8 +117,9 @@ The daemon module split is canonical in [[DR-0009]]; the `screen/` subtree is
 canonical in [[DR-0013]].
 
 `#![forbid(unsafe_code)]` is applied to the entire `hyoui-cli` crate. In the
-`hyoui` library, `unsafe` is confined to `sys/raw.rs` and `sys/signal.rs`
-only — the rest uses safe `nix` APIs. The Rust-only choice is detailed in
+`hyoui` library, `unsafe` is confined to the whitelist under `sys/`
+(`raw.rs` / `signal.rs` / `env.rs` / `procstate.rs`; the `lint-unsafe` gate
+in the justfile is the source of truth) — the rest uses safe `nix` APIs. The Rust-only choice is detailed in
 [[DR-0003]].
 
 ### 2.2 Protocol (wire format)
@@ -274,8 +275,10 @@ State-machine ANSI escape sequence stripper (CSI / OSC / DCS / single-char).
 
 ### 2.8 sys module
 
-All `unsafe` is confined to `sys/raw.rs` (forkpty / login_tty / TIOCSWINSZ)
-and `sys/signal.rs` (sigaction / self-pipe). `sys/socket.rs` enforces perm
+All `unsafe` is confined to four whitelisted files: `sys/raw.rs` (forkpty /
+login_tty / TIOCSWINSZ), `sys/signal.rs` (sigaction / self-pipe), `sys/env.rs`
+(non-thread-safe environment mutation), and `sys/procstate.rs` (direct child
+state reads via proc_pidinfo / procfs). `sys/socket.rs` enforces perm
 0600 / dir 0700, `sys/poll.rs` wraps poll(2) type-safely, `sys/clock.rs`
 provides Instant ↔ epoch ms.
 
