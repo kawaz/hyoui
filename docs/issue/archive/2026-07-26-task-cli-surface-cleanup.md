@@ -1,18 +1,18 @@
 ---
 title: "CLI surface 棚卸し — 初期からの残骸・3 者不整合・幽霊 subcommand の整理"
-status: wip
+status: resolved
 category: task
 created: 2026-07-26T00:00:00+09:00
-last_read: 2026-07-27T00:58:13+09:00
+last_read: 2026-07-29T23:45:00+09:00
 open_entered: 2026-07-26T00:00:00+09:00
 wip_entered: 2026-07-27T00:00:00+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-29T23:45:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: 全項目完了 — Phase 1/2 + D-1/D-4/D-5 実装、D-2 (CLI-Q1=a) / D-3 (CLI-Q2=b) 裁定反映済み、F (HYOUI_ALLOW_CORE) は内部デバッグ専用と裁定 (2026-07-29)。G の残骸チェックも良好
 blocked_by:
 origin: kawaz 指示「引数とか初期の頃からのゴミが大量に残ってるから一度整理するべき」(2026-07-26) を受けた全 subcommand / flag / env / help / completion の棚卸し
 ---

@@ -1,18 +1,18 @@
 ---
 title: hyoui web の自動起動を製品側で提供する (brew services or service サブコマンド)
-status: open
+status: resolved
 category: request
 created: 2026-07-29T13:10:00+09:00
-last_read: 2026-07-29T13:10:00+09:00
+last_read: 2026-07-29T23:45:00+09:00
 open_entered: 2026-07-29T13:10:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-29T23:45:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: AS-Q1=b 裁定 → `hyoui web service register|unregister|status` を DR-0031 として実装、v0.9.29 でリリース。本マシンは brew バイナリで register 済み (手書き plist を置換、stable path /opt/homebrew/bin/hyoui、KeepAlive 稼働・API 200 確認)
 blocked_by:
 origin: kawaz ccmsg 依頼「hyoui web を PC 再起動時に自動起動するようにしておきたい」(2026-07-29)
 ---

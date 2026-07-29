@@ -31,5 +31,16 @@
 
 真因は「端末が Ctrl+Z を CSI-u sequence で送るのにガードが 0x1a しか見ていない」。
 kitty CSI-u / modifyOtherKeys / 0x1a の 3 符号化対応 + decode/policy 層分離で修正。
-brew v0.9.27 反映済み。詳細: [issue](issue/2026-07-29-bug-ctrlz-guard-bypassed-by-keyboard-protocol.md)
+brew v0.9.27 反映済み (現行 v0.9.29 にも収録)。詳細: [issue](issue/2026-07-29-bug-ctrlz-guard-bypassed-by-keyboard-protocol.md)
+
+### 👺WP-C1: web 表示パラメータ (v0.9.29) の使用感確認
+
+- [ ] a: `?fontsize=` `bg=` `fg=` `scrollback=` `lineheight=` `fontfamily=` を試して要望どおりか確認 (embed でも有効。例: `/sessions/<id>?embed=1&fontsize=16&bg=000`)
+
+### 👺SV-C1: 自動起動の再起動実機確認 (kawaz にしか不可)
+
+- [ ] a: 次回 PC 再起動後に web (https://hyoui.kawaz-mbp16-20211217.kawaz.jp) が自動で生きていることを確認
+
+`hyoui web service register` (v0.9.29、DR-0031) で brew バイナリを launchd 登録済み。
+KeepAlive の kill→復帰と API 200 は AI 実機確認済み、RunAtLoad の実再起動だけが未検証。
 
