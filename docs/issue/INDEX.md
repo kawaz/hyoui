@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-07-29 | bug | open | [ctrlz-guard-bypassed-by-keyboard-protocol](./2026-07-29-bug-ctrlz-guard-bypassed-by-keyboard-protocol.md) | DR-0029 §2 の Ctrl+Z ガードが keyboard protocol 有効端末 (Ghostty × claude) で完全不発。子が `\x1b[>1u` / `\x1b[>4;2m` を出すと外側端末が Ctrl+Z を CSI-u (`\x1b[122;5u`) で送るため、0x1a しか見ないガードを素通りする。修正は DR-0029 §2 改訂が必要 |
 | 2026-07-29 | request | open | [web-narrow-symbol-fallback-font](./2026-07-29-request-web-narrow-symbol-fallback-font.md) | 記号グリフ幅対策の unicode-range fallback が macOS/iOS でしか効かない (Linux は DejaVu が全角)。narrow symbol subset webfont 同梱が本筋。① U+2460 は macOS にも narrow グリフが無く未解決 |
 | 2026-07-29 | request | open | [web-autostart-service](./2026-07-29-request-web-autostart-service.md) | hyoui web の自動起動を製品側で提供 (formula service block or service サブコマンド)。手書き LaunchAgent で即時対応済み、製品化の方式選定待ち |
 | 2026-07-26 | task | wip | [cli-surface-cleanup](./2026-07-26-task-cli-surface-cleanup.md) | Phase 1/2 (help 修正・completion 整合) と D-1/D-4/D-5 は実装済み。残り D-2/D-3 は QUESTIONS.md 裁定待ち、F の HYOUI_ALLOW_CORE 露出判断は未着手 |
