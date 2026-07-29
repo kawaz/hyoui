@@ -324,6 +324,27 @@ mod tests {
         assert_eq!(d.feed(&[], deadline), vec![pass(b"\x1b")]);
     }
 
+    /// `ESC` 単打は CSI-u 符号化の先頭 byte でもあるので保持されるが、子アプリの `ESC`
+    /// 曖昧性解決 timeout (通常 25ms) より早く出す (= 子から見た Esc の解釈を変えない)。
+    /// [`HOLD`] の Design rationale を定数として固定する。
+    #[test]
+    fn lone_esc_is_released_within_child_disambiguation_budget() {
+        const CHILD_ESC_TIMEOUT: Duration = Duration::from_millis(25);
+        assert!(
+            HOLD < CHILD_ESC_TIMEOUT,
+            "保持 {HOLD:?} が子の ESC 判定 {CHILD_ESC_TIMEOUT:?} を超えると Esc の解釈が変わる"
+        );
+
+        let t0 = Instant::now();
+        let mut d = KeyDecoder::default();
+        assert_eq!(d.feed(b"\x1b", t0), vec![]);
+        assert_eq!(
+            d.feed(&[], t0 + CHILD_ESC_TIMEOUT),
+            vec![pass(b"\x1b")],
+            "子が Esc と判定するまでに素通しされない"
+        );
+    }
+
     /// 続きの byte が実際に届いた場合は期限を延ばす (= 分割着信が進行中なら待つ)。
     #[test]
     fn arriving_continuation_extends_hold() {

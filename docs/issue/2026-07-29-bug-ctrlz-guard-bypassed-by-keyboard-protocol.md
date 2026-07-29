@@ -107,8 +107,10 @@ CSI-u を実際の claude セッションに注入すると `Claude Code has bee
 - `read(2)` 境界で割れた sequence は、符号化の途中まで一致している間だけ 20ms 保持して
   判定する。`ESC` 単打もこの保持に入るが、子アプリ側の `ESC` 曖昧性解決 timeout
   (通常 25ms 以上) より短いので Esc の解釈は変わらない
+  (`lone_esc_is_released_within_child_disambiguation_budget` が定数として固定)
 - 保持が満了した byte 列は捨てずに `Passthrough` として出す。run loop の poll timeout は
-  detach 保留と保持期限の早い方に合わせる
+  detach 保留と保持期限の早い方に合わせる。20ms 以内に続きが来なかった分割はガードが
+  効かず素通しになる (= 実端末は 1 キー = 1 write なので通常起きない、下記マトリクス末尾で実測)
 
 DR-0029 §2 の意味論 (= 2 発ごとに子へ 1 発、余り 1 発で detach タイマー、他キー割り込みで
 保留破棄、`delay=0` で即 detach、`guard=false` で完全 bypass) は不変。
@@ -126,27 +128,48 @@ DR-0029 §2 の意味論 (= 2 発ごとに子へ 1 発、余り 1 発で detach 
 press 扱いで握る側にした。素通しにすると「Ctrl+Z を長押しした 1 回」で子が止まり、
 DR-0029 の目的 (= 反射的な Ctrl+Z で子を止めない) の真逆になるため。
 
-## 修正後の実機マトリクス (0.9.26 自ビルド、ネスト hyoui、内側の子が `CSI > 1 u` を push)
+## 修正後の実機マトリクス (0.9.26 自ビルド `target/release/hyoui`、ネスト hyoui)
 
-| 注入 | 子到達 | attach client | inner |
+内側 = `sh -c 'stty raw -echo; exec cat -v'` (= 届いた byte を可視形でそのまま画面に出す)、
+外側 = `hyoui run --detached -- hyoui attach <inner>`。外側 PTY に `hyoui input` で注入し、
+内側は `screen dump --format=plain`、detach 有無は外側 `hyoui status` の生死で判定。
+
+| 注入 | inner に届いた入力 | attach client | inner |
 |---|---|---|---|
-| `key:C-z` 単発 (= 0x1a) | 0 | detach ✅ | live |
-| `key:C-z` 2 連打 | 1 | 繋がったまま ✅ | live |
-| `key:C-z` 3 連打 | 1 | detach ✅ | live |
-| CSI-u 単発 | 0 | detach ✅ | live |
-| CSI-u 2 連打 | 1 | 繋がったまま ✅ | live |
-| CSI-u 3 連打 | 1 | detach ✅ | live |
-| CSI-u release (`:3`) | 1 (素通し) | 繋がったまま ✅ | live |
-| modifyOtherKeys 単発 | 0 | detach ✅ | live |
-| modifyOtherKeys 2 連打 | 1 | 繋がったまま ✅ | live |
-| `ESC` 単打 + `a` | 1 (素通し) | 繋がったまま ✅ | live |
+| 0x1a 単発 | (到達なし) | detach | live |
+| 0x1a 2 連打 | `^Z` | 繋がったまま | live |
+| 0x1a 3 連打 | `^Z` | detach | live |
+| 0x1a 4 連打 | `^Z^Z` | 繋がったまま | live |
+| CSI-u 単発 | (到達なし) | detach | live |
+| CSI-u 2 連打 | `^[[122;5u` | 繋がったまま | live |
+| CSI-u 3 連打 | `^[[122;5u` | detach | live |
+| CSI-u release (`:3`) | `^[[122;5:3u` | 繋がったまま | live |
+| modifyOtherKeys 単発 | (到達なし) | detach | live |
+| modifyOtherKeys 2 連打 | `^[[27;5;122~` | 繋がったまま | live |
+| CSI-u 単発を 1 byte ずつ連続 write | (到達なし) | detach | live |
+| CSI-u 単発を 65ms 間隔で分割 | `^[[122;5u` | 繋がったまま | live |
+| `ESC` 単打 + `a` | `^[a` | 繋がったまま | live |
+| 他キー (`hi`) | `hi` | 繋がったまま | live |
+| Ctrl+Z 単発 + 他キー (`x`) | `x` | 繋がったまま | live |
 
-detach した回でも inner は live のまま (= 覗き窓を閉じても子は走り続ける)。
+DR-0029 §2 の連打表 (1→0 / 2→1 / 3→1 / 4→2 発) が 3 符号化すべてで一致。detach した回でも
+inner は live のまま (= 覗き窓を閉じても子は走り続ける)。最終行は「他キー割り込みで保留
+Ctrl+Z を破棄」が効いていること (= `x` だけ届き `^Z` は消える) の確認。
 
-## 残作業
+### 分割着信の 2 行について
 
-**kawaz の実端末 (Ghostty × claude code) での最終確認が未了**。ネスト hyoui では外側端末の
+最初は分割注入を `hyoui input` の別プロセス呼び出しで組んだところ素通しになった。
+計測すると **`hyoui input` 1 回あたり約 65ms** かかっており、保持期限 20ms を超えて
+partial が満了していただけで、decoder の bug ではなかった。同一プロセス内で spec を
+並べた連続 write (= 実端末の 1 キー = 1 write に相当) では正しく 1 キーへ再組立される。
+両方を行として残し、fail-open の境界が実測で見えるようにしてある。
+
+## 残作業 (= status を wip のままにしている理由)
+
+**kawaz の実端末 (Ghostty × claude code) での最終確認が未了**。ネスト hyoui は外側端末の
 符号化を byte 注入で模しているだけなので、実キーボード経由の確認は代替できない。
+確認したいのは「Ghostty が実際に送る Ctrl+Z の byte 列が上表の 3 符号化のどれかに
+収まっているか」で、外れていれば `CTRLZ_ENCODINGS` に 1 行足すだけで済む。
 
 # 修正前に検討した論点 (= DR 改訂の要否)
 
