@@ -9,6 +9,11 @@
   const refreshBtn = document.getElementById('refresh');
 
   let timer = null;
+  // 直近の取得結果。ヘッダクリック時に再 fetch せず並べ替えるために保持する。
+  let sessions = [];
+  // sort 状態。key === null はサーバ返却順 (= 未ソート)。
+  let sortKey = null;
+  let sortAsc = true;
 
   function esc(s) {
     if (s === null || s === undefined) return '';
@@ -41,6 +46,46 @@
     try { return new Date(startedUnixMs).toISOString(); } catch { return ''; }
   }
 
+  // ソート用の比較値。数値カラムは数値、それ以外は小文字文字列を返す。
+  // uptime は「経過時間の長さ」で比べる (= started_unix_ms の大小とは逆向き)。
+  function sortValue(s, key) {
+    switch (key) {
+      case 'session_id': return String(s.session_id || '').toLowerCase();
+      case 'namespace': return String(s.namespace || '').toLowerCase();
+      case 'status': return (s.status === 'stopped' || s.child_stopped)
+        ? 'stopped' : String(s.status || '').toLowerCase();
+      case 'uptime': return s.started_unix_ms ? Date.now() - s.started_unix_ms : -1;
+      case 'clients': return Number(s.clients ?? -1);
+      case 'suspend': return String(s.on_child_suspend || '').toLowerCase();
+      case 'version': return String(s.daemon_version || '').toLowerCase();
+      case 'argv': return fmtArgv(s.argv).toLowerCase();
+      case 'cwd': return String(s.cwd || '').toLowerCase();
+      default: return '';
+    }
+  }
+
+  function sorted(list) {
+    if (!sortKey) return list;
+    const dir = sortAsc ? 1 : -1;
+    return list.slice().sort((a, b) => {
+      const va = sortValue(a, sortKey);
+      const vb = sortValue(b, sortKey);
+      if (va < vb) return -dir;
+      if (va > vb) return dir;
+      return 0;
+    });
+  }
+
+  // ヘッダの矢印表示と aria-sort を現在の状態に合わせる。
+  function syncHeaders() {
+    for (const th of document.querySelectorAll('#sessions thead th[data-sort]')) {
+      const active = th.dataset.sort === sortKey;
+      th.classList.toggle('sorted', active);
+      th.dataset.dir = active ? (sortAsc ? 'asc' : 'desc') : '';
+      th.setAttribute('aria-sort', active ? (sortAsc ? 'ascending' : 'descending') : 'none');
+    }
+  }
+
   async function fetchSessions() {
     statusEl.textContent = 'fetching…';
     try {
@@ -55,13 +100,15 @@
   }
 
   function render(list) {
+    sessions = Array.isArray(list) ? list : [];
     tbody.innerHTML = '';
-    if (!list || list.length === 0) {
+    syncHeaders();
+    if (sessions.length === 0) {
       emptyEl.hidden = false;
       return;
     }
     emptyEl.hidden = true;
-    for (const s of list) {
+    for (const s of sorted(sessions)) {
       const tr = document.createElement('tr');
       const isLive = s.status === 'live';
       const isStopped = s.status === 'stopped' || !!s.child_stopped;
@@ -105,6 +152,17 @@
     if (autoEl.checked) {
       timer = setInterval(fetchSessions, REFRESH_MS);
     }
+  }
+
+  // ヘッダクリックでソート。同じ列を再クリックすると昇順/降順をトグルする。
+  // 再 fetch はせず、保持済みの直近取得結果を並べ替えるだけ。
+  for (const th of document.querySelectorAll('#sessions thead th[data-sort]')) {
+    th.addEventListener('click', () => {
+      const key = th.dataset.sort;
+      if (sortKey === key) sortAsc = !sortAsc;
+      else { sortKey = key; sortAsc = true; }
+      render(sessions);
+    });
   }
 
   autoEl.addEventListener('change', schedule);

@@ -30,15 +30,15 @@
   <table id="sessions">
     <thead>
       <tr>
-        <th>session_id</th>
-        <th>namespace</th>
-        <th>status</th>
-        <th title="uptime since started">uptime</th>
-        <th title="attached clients">clients</th>
-        <th title="on-child-suspend policy (notify: leader へ通知のみ / auto-resume: daemon が SIGCONT で復帰)">suspend</th>
-        <th>version</th>
-        <th>argv</th>
-        <th>cwd</th>
+        <th data-sort="session_id">session_id</th>
+        <th data-sort="namespace">namespace</th>
+        <th data-sort="status">status</th>
+        <th data-sort="uptime" title="uptime since started">uptime</th>
+        <th data-sort="clients" title="attached clients">clients</th>
+        <th data-sort="suspend" title="on-child-suspend policy (notify: leader へ通知のみ / auto-resume: daemon が SIGCONT で復帰)">suspend</th>
+        <th data-sort="version">version</th>
+        <th data-sort="argv">argv</th>
+        <th data-sort="cwd">cwd</th>
       </tr>
     </thead>
     <tbody></tbody>

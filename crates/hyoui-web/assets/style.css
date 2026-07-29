@@ -101,6 +101,21 @@ th {
   text-transform: uppercase;
   letter-spacing: 0.02em;
 }
+/* ソート可能ヘッダ。矢印は常に領域を確保し、クリックでの列幅の揺れを防ぐ。 */
+th[data-sort] {
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+th[data-sort]:hover { color: var(--fg); }
+th[data-sort]::after {
+  content: "↕";
+  margin-left: 0.35em;
+  opacity: 0.3;
+}
+th[data-sort].sorted { color: var(--accent); }
+th[data-sort][data-dir="asc"]::after { content: "▲"; opacity: 1; }
+th[data-sort][data-dir="desc"]::after { content: "▼"; opacity: 1; }
 tr.row-stale td { color: var(--muted); }
 td.argv code, td.cwd {
   font-family: "HackGen Console NF", Menlo, "DejaVu Sans Mono", Consolas, monospace;
@@ -219,11 +234,12 @@ body.embed #term .xterm-screen {
 }
 .muted { color: var(--muted); }
 td.uptime, td.suspend { white-space: nowrap; font-size: 0.82rem; color: var(--muted); }
+/* argv / cwd は末尾側 (= サブコマンド / プロジェクト名) が情報価値を持つので
+   省略せず折り返す。幅は 40ch で頭打ちにして他カラムを押し出さない。 */
 td.argv, td.cwd {
   max-width: 40ch;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 #inputText {
   font-family: "HackGen Console NF", Menlo, "DejaVu Sans Mono", Consolas, monospace;
