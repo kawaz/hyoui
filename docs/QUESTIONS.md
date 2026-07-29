@@ -20,7 +20,14 @@
 
 ## 裁定待ち
 
-(現在なし)
+### 👺AS-Q1: hyoui web 自動起動の製品側提供方式
+
+- [ ] a: formula に `service do` block (`brew services start kawaz/tap/hyoui`、実装数行、次リリースから) — 推し
+- [ ] b: `hyoui web service register` サブコマンド (brew 非依存、Linux systemd にも展開可、実装コスト大)
+- [ ] c: a を先行し b は需要が出たら (段階導入)
+
+現状はこのマシンに手書き LaunchAgent 設置済みで稼働中 (再起動後も自動起動する)。
+詳細: [docs/issue/2026-07-29-request-web-autostart-service.md](issue/2026-07-29-request-web-autostart-service.md)
 
 ## 確認待ち
 
