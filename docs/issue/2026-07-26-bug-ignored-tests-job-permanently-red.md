@@ -273,7 +273,7 @@ config は `HyouiTestRunner::spawn_hyoui_with_config` が runner 固有の
 | `interactive_typing_survives_raw_ack` | (a) | DR-0021 RawAck regression |
 | `daemon_sigterm_terminates_child_and_unlinks_socket` | (a) | daemon graceful shutdown |
 | `daemon_second_sigterm_during_shutdown_completes_unlink` | (a) | shutdown 中の再 SIGTERM 耐性 |
-| `auto_resume_resumes_self_stopped_child` | (c) | daemon `auto-resume` 固有経路を意図するが、DR-0030 の rw attach resume でも marker が出る。隔離要否は裁定待ち |
+| `auto_resume_resumes_self_stopped_child` | (a) | 裁定により `resume_stopped_child=false` で client 経路から隔離し、daemon `auto-resume` policy を単独検証 |
 | `run_resumes_child_that_is_already_stopped_at_attach` | (a) | DR-0030 発火点1 |
 | `run_resumes_child_that_stops_while_attached` | (a) | DR-0030 発火点2 |
 | `status_child_state_returns_to_running_after_resume` | (a) | resume 後の daemon state regression |
@@ -295,8 +295,7 @@ config は `HyouiTestRunner::spawn_hyoui_with_config` が runner 固有の
 | `overall_timeout_terminates_busy_child` | (a) | DR-0019 overall timeout |
 | `no_timeout_keeps_silent_child_alive` | (a) | timeout 未指定の対照 |
 
-集計は (a) 26 件、(b) 2 件、(c) 1 件。判断割れの
-`auto_resume_resumes_self_stopped_child` は変更していない。
+裁定反映後の集計は (a) 27 件、(b) 2 件、(c) 0 件。
 
 ### (b) の修正
 
@@ -311,16 +310,26 @@ config は `HyouiTestRunner::spawn_hyoui_with_config` が runner 固有の
 - test harness と production comment に残っていた `follow → raise(SIGSTOP)` の現行仕様扱いを
   DR-0029/0030 の責務分担へ更新した。
 
+### (c) の裁定反映
+
+`auto_resume_resumes_self_stopped_child` は `--on-child-suspend=auto-resume` が指定する
+**daemon policy 自体**の regression test である。DR-0030 §4 の rw attach resume でも同じ
+marker が出る構成では daemon policy が壊れても検出できないため、runner-scoped config で
+`resume_stopped_child=false` とし、daemon が単独で子を起こす経路へ隔離した。
+
 ### fresh 検証
 
 | 検証 | 結果 | 所要時間 |
 |---|---:|---:|
+| `auto_resume_resumes_self_stopped_child` (daemon 経路隔離後) | 20/20 PASS | 初回 compile 込み 5.82s、以降 0.95〜1.08s |
 | `stopped_child_keeps_attach_running_and_draws_notice` | 20/20 PASS | 初回 compile 込み 4.12s、以降 1.17〜1.39s |
 | `daemon_cont_wakes_child_stopped_during_daemon_stop` | 20/20 PASS | 2.67〜2.90s |
 | 対照 `run_resumes_child_that_stops_while_attached` | 5/5 PASS | 初回 compile 込み 4.92s、以降 2.09〜2.14s |
 | 対照 `daemon_sigcont_wakes_stopped_child` | 5/5 PASS | 1.91〜1.97s |
 
-CI と同一コマンドを macOS で 3 周実行した。
+CI と同一コマンドを macOS で 3 周実行した。共有 workspace には別作業の未完了差分が
+存在したため、親 commit に本 test 変更だけを載せた一時 jj workspace で検証し、他の差分を
+混入させていない。
 
 ```console
 cargo test --workspace -- --ignored
@@ -328,9 +337,9 @@ cargo test --workspace -- --ignored
 
 | round | 結果 | ignored test 数 | 全所要時間 |
 |---:|---|---:|---:|
-| 1 | PASS | 29/29 | 20.93s |
-| 2 | PASS | 29/29 | 20.24s |
-| 3 | PASS | 29/29 | 19.72s |
+| 1 | PASS | 29/29 | 45.98s (compile 込み) |
+| 2 | PASS | 29/29 | 18.60s |
+| 3 | PASS | 29/29 | 19.35s |
 
 `cargo fmt --all -- --check` も成功。test session 名で `pgrep -fl` を確認し、調査由来の
 残骸 process が無いことを確認した。

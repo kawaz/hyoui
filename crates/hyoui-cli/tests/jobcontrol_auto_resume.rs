@@ -33,7 +33,11 @@ const SELF_STOP_THEN_ECHO: &[&str] = &["sh", "-c", "kill -STOP $$; echo RESUMED_
 #[test]
 fn auto_resume_resumes_self_stopped_child() {
     let runner = HyouiTestRunner::new();
-    let mut h = runner.spawn_hyoui(
+    // DR-0030 §4 では daemon policy と rw attach resume が補完関係にあるが、この test
+    // が名指しする退行は daemon の `auto-resume` 経路。attach 側でも同じ marker が出る
+    // 状態では daemon policy の破壊を検出できないため、runner 固有 config で client
+    // resume を止め、daemon が単独で子を起こすことを検証する。
+    let mut h = runner.spawn_hyoui_with_config(
         "jobcontrol-auto-resume",
         &[
             "run",
@@ -43,6 +47,7 @@ fn auto_resume_resumes_self_stopped_child() {
             SELF_STOP_THEN_ECHO[1],
             SELF_STOP_THEN_ECHO[2],
         ],
+        "[attach]\nresume_stopped_child = false\n",
     );
 
     // daemon が auto-resume で子を起こせば、復帰後の echo が PTY に出る。
