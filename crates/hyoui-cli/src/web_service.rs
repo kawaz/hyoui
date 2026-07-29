@@ -60,6 +60,7 @@ pub fn default_log_path() -> Option<String> {
     })
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn launchd_definition_path(home: &Path, label: &str) -> PathBuf {
     home.join("Library/LaunchAgents")
         .join(format!("{label}.plist"))
@@ -75,6 +76,7 @@ pub fn systemd_definition_path(config_home: &Path, label: &str) -> PathBuf {
     config_home.join("systemd/user").join(unit)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -82,6 +84,7 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn render_launchd_plist(def: &ServiceDefinition) -> String {
     let mut out = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -381,6 +384,7 @@ impl Backend for SystemdBackend {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn parse_launchctl_pid(text: &str) -> Option<u32> {
     text.lines().find_map(|line| {
         line.trim()
@@ -419,6 +423,26 @@ mod tests {
             Some("127.0.0.1:54321"),
             Some("/Users/test/Library/Logs/hyoui-web/output.log".to_string()),
         )
+    }
+
+    /// launchd の純関数群は host OS に関係なく compile・実行される契約を固定する。
+    ///
+    /// live backend は macOS 限定だが、path / escaping / renderer / status parsing は
+    /// Linux CI でも同じ入力に同じ結果を返す必要がある (= DR-0031 §4)。
+    #[test]
+    fn launchd_pure_helpers_run_cross_platform() {
+        assert_eq!(
+            launchd_definition_path(Path::new("/home/test"), MACOS_LABEL),
+            PathBuf::from("/home/test/Library/LaunchAgents/com.github.kawaz.hyoui-web.plist")
+        );
+        assert_eq!(xml_escape("a&b<c>"), "a&amp;b&lt;c&gt;");
+        let rendered = render_launchd_plist(&sample_definition());
+        assert!(rendered.contains("<key>RunAtLoad</key>"));
+        assert!(rendered.contains("<key>KeepAlive</key>"));
+        assert_eq!(
+            parse_launchctl_pid("state = running\npid = 4242\n"),
+            Some(4242)
+        );
     }
 
     /// OS 名差は label だけで、各 backend の定義 basename と 1:1 に対応する。
