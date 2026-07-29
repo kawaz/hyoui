@@ -1,12 +1,70 @@
 /* HackGen Console NF (SIL OFL 1.1)。半角:全角=1:2、Nerd Font + 日本語入り。
    罫線・半ブロック・Powerline のメトリクス安定が狙い (= host font 依存を消す)。
-   詳細は assets/vendor/README.md / assets/vendor/fonts/LICENSE.md。 */
+   詳細は assets/vendor/README.md / assets/vendor/fonts/LICENSE.md。
+
+   unicode-range で 1657 個のコードポイントを HackGen の適用範囲から外し、
+   fallback フォント (macOS では Menlo) に描かせている。対象は「HackGen が
+   全角 advance (1080/1024em) で描く ∧ xterm.js の unicode11 が幅 1 と数える」
+   文字 (⚠ U+26A0 / ★ U+2605 / ① U+2460 / ✓ U+2713 等)。これらは 1 セルしか
+   割り当てられないのに 2 セル分のグリフで描かれるため、隣の文字と重なる。
+
+   Design rationale: 幅の意味論を変えて解決しない。daemon の vt100・TUI アプリ
+   本体・xterm.js の三者はこれらを幅 1 として一致しており (実測で確認)、web だけ
+   幅 2 にすると screen state 正本からの乖離と行内の桁ずれを生む (DR-0013 /
+   DR-0005)。原因はグリフの寸法なので、フォント層で解く。
+
+   環境依存の限界: fallback 先が narrow グリフを持つ前提に立っている。実測で
+   Menlo は対象記号をすべて 1.00 セル幅で描くが、Linux ブラウザの既定 fallback に
+   なりがちな DejaVu Sans Mono は 2.25 セル幅で、この対策は効かない。tailnet 内で
+   macOS / iOS から閲覧する主用途に合わせた割り切り。クロスプラットフォーム対応は
+   docs/issue/2026-07-29-request-web-narrow-symbol-fallback-font.md を参照。
+
+   PUA (U+E000-F8FF ほか) は除外していない。Nerd Font のアイコングリフは HackGen
+   側で半角 advance (540) で描かれており重ならないうえ、fallback フォントは
+   これらのグリフを持たないため除外すると tofu 化する。
+
+   再生成 (フォント差し替え時): fonttools で両ウェイトの hmtx から
+   advance == 1080 の cmap エントリを集め (Regular/Bold の和集合)、その各
+   コードポイントを xterm.js の UnicodeService.wcwidth('11') に通して 1 の
+   ものだけを残す。その補集合をここに書く。
+     from fontTools.ttLib import TTFont
+     f = TTFont(".../HackGenConsoleNF-Regular.woff2")
+     hmtx, cmap = f["hmtx"], f.getBestCmap()
+     [cp for cp, n in cmap.items() if hmtx[n][0] == 1080]
+   フォント版数: assets/vendor/fonts/ の woff2 (unitsPerEm=1024、advance は
+   540=半角 / 1080=全角 の 2 値のみ)。 */
 @font-face {
   font-family: 'HackGen Console NF';
   src: url('/assets/vendor/fonts/HackGenConsoleNF-Regular.woff2') format('woff2');
   font-weight: 400;
   font-style: normal;
   font-display: block;
+  unicode-range:
+    U+0-17F, U+192, U+1A0-1A1, U+1A4, U+1AF-1B0, U+1C4-1C7, U+1CA-1CB, U+1E6-1E7, U+1F1-1F3, U+1F6,
+    U+1FE-1FF, U+218-21B, U+2A5, U+2C6-2C7, U+2D8-2DD, U+300-36F, U+378-379, U+37F-386, U+388-3CE,
+    U+3E2-3EF, U+3F4, U+3F6, U+400-45F, U+462-46D, U+472-473, U+478-479, U+482-489, U+490-49B,
+    U+4A2-4A6, U+4A8-4B3, U+4BA-4BB, U+4C0-4C4, U+4C7-4C8, U+4CB-4CC, U+4CF-4F9, U+508, U+50A,
+    U+510-511, U+514-5BD, U+5BF, U+5C1-5C2, U+5C4-5CF, U+5EB-5EF, U+5F5-1CFF, U+1D02-1D03,
+    U+1D08-1D09, U+1D11-1D14, U+1D16-1D17, U+1D1C-1D1F, U+1D24-1D25, U+1D2C-1D2F, U+1D31-1D34,
+    U+1D36-1D37, U+1D3B-1D3F, U+1D41-1D47, U+1D4B-1D4F, U+1D51-1D56, U+1D58-1D59, U+1D5C, U+1D5F,
+    U+1D62-1D7A, U+1D7C-1D90, U+1D92-1D9B, U+1D9D, U+1D9F, U+1DA1-1DA5, U+1DA7, U+1DA9-1DAA,
+    U+1DAC-1DAF, U+1DB1-1DBA, U+1DBC-1DBE, U+1DC0-1DFF, U+1E80-1E85, U+1EBC-1EBD, U+1EF2-1EF3,
+    U+1EF8-1EF9, U+1F16-1F17, U+1F1E-1F1F, U+1F46-1F47, U+1F4E-1F4F, U+1F58, U+1F5A, U+1F5C,
+    U+1F5E, U+1F7E-1F7F, U+1FB5, U+1FC5, U+1FD4-1FD5, U+1FDC, U+1FF0-1FF1, U+1FF5, U+1FFF-203A,
+    U+203C-203F, U+2041, U+2044-2049, U+204B-204E, U+2053-20FF, U+2101, U+2104, U+2106-2108,
+    U+210B-210C, U+210E, U+2110, U+2112, U+2114, U+2116, U+211B, U+211F, U+2122-2123, U+2125-2126,
+    U+2128, U+212C-212D, U+212F-2131, U+2133-2134, U+2139, U+213C-2140, U+2145-214A, U+214C-214D,
+    U+214F-215F, U+2180-2182, U+2186-21E9, U+21EB-2215, U+2217-2224, U+2227-222D, U+2230,
+    U+2234-2269, U+226C-22A4, U+22A6-22BA, U+22BE, U+22C2-22ED, U+22EF-22FF, U+2301, U+2303-2304,
+    U+2308-2311, U+2313-2317, U+2319-2324, U+2326-23AF, U+23B2-23BD, U+23CD, U+23D0-23D9,
+    U+23DC-23FF, U+2427-245F, U+2500-25FF, U+2604, U+2607-2608, U+260A-260D, U+2613-2615,
+    U+2618-261B, U+2620-262E, U+2630-2639, U+263D-263F, U+2643-265F, U+2665, U+266A, U+2670-2671,
+    U+267E-269F, U+26A1, U+26A7, U+26AA-26AC, U+26AE-26B8, U+26BA-2701, U+2703-2712, U+2719,
+    U+271E-273C, U+273E, U+2741-2775, U+2794-2933, U+2936-29BE, U+29C0-2A02, U+2A07-2A08,
+    U+2A0A-2A0C, U+2A10-2A15, U+2A17-2C70, U+2C72-2C7A, U+2C7C-2E16, U+2E18-2E27, U+2E2A-303E,
+    U+3040-3247, U+3250-A730, U+A732-A789, U+A78B-FAFF, U+FB07-1D537, U+1D53A, U+1D53F, U+1D545,
+    U+1D547-1D549, U+1D54B-1D55B, U+1D55D-1D714, U+1D716-1D7D7, U+1D7DA-1D7F5, U+1D7F7-1F0FF,
+    U+1F10B-1F10F, U+1F12F, U+1F16C-1F16F, U+1F18E, U+1F191-10FFFF;
 }
 @font-face {
   font-family: 'HackGen Console NF';
@@ -14,6 +72,32 @@
   font-weight: 700;
   font-style: normal;
   font-display: block;
+  unicode-range:
+    U+0-17F, U+192, U+1A0-1A1, U+1A4, U+1AF-1B0, U+1C4-1C7, U+1CA-1CB, U+1E6-1E7, U+1F1-1F3, U+1F6,
+    U+1FE-1FF, U+218-21B, U+2A5, U+2C6-2C7, U+2D8-2DD, U+300-36F, U+378-379, U+37F-386, U+388-3CE,
+    U+3E2-3EF, U+3F4, U+3F6, U+400-45F, U+462-46D, U+472-473, U+478-479, U+482-489, U+490-49B,
+    U+4A2-4A6, U+4A8-4B3, U+4BA-4BB, U+4C0-4C4, U+4C7-4C8, U+4CB-4CC, U+4CF-4F9, U+508, U+50A,
+    U+510-511, U+514-5BD, U+5BF, U+5C1-5C2, U+5C4-5CF, U+5EB-5EF, U+5F5-1CFF, U+1D02-1D03,
+    U+1D08-1D09, U+1D11-1D14, U+1D16-1D17, U+1D1C-1D1F, U+1D24-1D25, U+1D2C-1D2F, U+1D31-1D34,
+    U+1D36-1D37, U+1D3B-1D3F, U+1D41-1D47, U+1D4B-1D4F, U+1D51-1D56, U+1D58-1D59, U+1D5C, U+1D5F,
+    U+1D62-1D7A, U+1D7C-1D90, U+1D92-1D9B, U+1D9D, U+1D9F, U+1DA1-1DA5, U+1DA7, U+1DA9-1DAA,
+    U+1DAC-1DAF, U+1DB1-1DBA, U+1DBC-1DBE, U+1DC0-1DFF, U+1E80-1E85, U+1EBC-1EBD, U+1EF2-1EF3,
+    U+1EF8-1EF9, U+1F16-1F17, U+1F1E-1F1F, U+1F46-1F47, U+1F4E-1F4F, U+1F58, U+1F5A, U+1F5C,
+    U+1F5E, U+1F7E-1F7F, U+1FB5, U+1FC5, U+1FD4-1FD5, U+1FDC, U+1FF0-1FF1, U+1FF5, U+1FFF-203A,
+    U+203C-203F, U+2041, U+2044-2049, U+204B-204E, U+2053-20FF, U+2101, U+2104, U+2106-2108,
+    U+210B-210C, U+210E, U+2110, U+2112, U+2114, U+2116, U+211B, U+211F, U+2122-2123, U+2125-2126,
+    U+2128, U+212C-212D, U+212F-2131, U+2133-2134, U+2139, U+213C-2140, U+2145-214A, U+214C-214D,
+    U+214F-215F, U+2180-2182, U+2186-21E9, U+21EB-2215, U+2217-2224, U+2227-222D, U+2230,
+    U+2234-2269, U+226C-22A4, U+22A6-22BA, U+22BE, U+22C2-22ED, U+22EF-22FF, U+2301, U+2303-2304,
+    U+2308-2311, U+2313-2317, U+2319-2324, U+2326-23AF, U+23B2-23BD, U+23CD, U+23D0-23D9,
+    U+23DC-23FF, U+2427-245F, U+2500-25FF, U+2604, U+2607-2608, U+260A-260D, U+2613-2615,
+    U+2618-261B, U+2620-262E, U+2630-2639, U+263D-263F, U+2643-265F, U+2665, U+266A, U+2670-2671,
+    U+267E-269F, U+26A1, U+26A7, U+26AA-26AC, U+26AE-26B8, U+26BA-2701, U+2703-2712, U+2719,
+    U+271E-273C, U+273E, U+2741-2775, U+2794-2933, U+2936-29BE, U+29C0-2A02, U+2A07-2A08,
+    U+2A0A-2A0C, U+2A10-2A15, U+2A17-2C70, U+2C72-2C7A, U+2C7C-2E16, U+2E18-2E27, U+2E2A-303E,
+    U+3040-3247, U+3250-A730, U+A732-A789, U+A78B-FAFF, U+FB07-1D537, U+1D53A, U+1D53F, U+1D545,
+    U+1D547-1D549, U+1D54B-1D55B, U+1D55D-1D714, U+1D716-1D7D7, U+1D7DA-1D7F5, U+1D7F7-1F0FF,
+    U+1F10B-1F10F, U+1F12F, U+1F16C-1F16F, U+1F18E, U+1F191-10FFFF;
 }
 
 :root {
