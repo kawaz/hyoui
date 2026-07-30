@@ -24,6 +24,13 @@
 
 ## 確認待ち
 
+### 👺DR32-C1: DR-0032 実装 (v0.9.31) の実機確認
+
+- [ ] a: `~/.config/hyoui/config.toml` に `[session]` `on_child_suspend = "show_child_action_menu"` を書き、attach 中に ^Z×2 等で子を止めると menu が出て各操作 (c/z/d/i/h/k/Esc) が効く
+- [ ] b: `[attach]` `ctrlz_x1_action = "select_on_demand"` で、^Z 単発 → 1 行プロンプト → ^Z/^C/Esc の 3 択が効く (他キーは無反応)
+
+既知の調整候補 (チャット報告済み): menu を閉じた後の描画跡が redraw まで残る / 閉じた後の再表示手段が無い。使用感と合わせて感想ください。
+
 ### 👺SV-C1: 自動起動の再起動実機確認 (kawaz にしか不可)
 
 - [ ] a: 次回 PC 再起動後に web (https://hyoui.kawaz-mbp16-20211217.kawaz.jp) が自動で生きていることを確認
