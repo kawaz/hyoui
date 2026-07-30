@@ -76,8 +76,11 @@ leader / mode の変化時に次の text frame を browser へ送る。daemon pr
 {"kind":"attach.info","mode":"rw","leader":true}
 ```
 
-表示設定の出自は `URL 指定` / `default` / `embed 中に変更` の 3 区分とし、第三の区分は変更操作を
-追加する段階で使う。embed 中の変更値は外側の reload でリセットされる。
+表示設定の出自は `URL 指定` / `default` / `embed 中に変更` の 3 区分とする。情報タブ上で
+unicode / ambw / fontsize / lineheight / scrollback / fontfamily / bg / fg を変更でき、変更した項目は
+第三の出自へ切り替える。font / lineheight は xterm.js option 更新後に既存 fit/resize 経路を通し、
+unicode / ambw は provider を再選択して daemon screen dump を再描画する。変更値は URL や storage
+へ保存せず、外側の reload で URL 指定または default にリセットされる。
 
 ### 4. 静的アセット
 

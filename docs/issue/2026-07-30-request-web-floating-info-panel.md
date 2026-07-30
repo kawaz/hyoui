@@ -52,7 +52,7 @@ embed されたターミナル内に、以下を表示するフローティン�
 
 ## 実装状況
 
-Phase 1 の表示を実装済み。
+Phase 1 (表示) + Phase 2a (表示設定変更) を実装済み。Phase 2b (leader 昇格) は未実装。
 
 - 既存キーボード FAB のフローティングを「入力」「情報」の 2 タブ化。入力機能は維持
 - gateway 内部の WS text frame `attach.info` で daemon handshake の mode / leader を表示し、
@@ -60,4 +60,11 @@ Phase 1 の表示を実装済み。
 - unicode / ambw / fontsize / lineheight / scrollback / fontfamily / bg / fg の実効値と、
   `URL 指定` / `default` / `embed 中に変更` の出自構造を表示
 - 既存 `/api/sessions` から hyoui_session_id / child pid / child-state / attach client 数を表示
-- Phase 2 の変更操作は未実装
+- **Phase 2a (表示設定変更、実装済み)**: 情報タブから unicode / ambw / fontsize /
+  lineheight / scrollback / fontfamily / bg / fg をその場で変更可能。font 系
+  (fontsize / lineheight / fontfamily) は xterm options 更新 + 既存 fit/resize 経路で反映、
+  unicode / ambw は provider 再選択 + screen dump 再描画で反映。変更した項目の出自表示は
+  「embed 中に変更」になる。URL / storage へは永続化せず、reload すると URL 指定 or
+  default にリセットされる
+- **Phase 2b (leader 昇格、未実装、別 scope)**: `leader.request` (DR-0008 §2.2 で
+  v0.2.0+ 予約) の daemon protocol 実装が前提

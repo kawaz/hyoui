@@ -72,16 +72,23 @@
     }
     return settingValue(name, s, 'url');
   };
-  const colorParam = (name, def) => {
-    const raw = params.get(name);
-    if (raw === null) return settingValue(name, def, 'default');
+  const normalizeColor = (raw) => {
     const s = raw.trim().replace(/^#/, '');
     // 3/4/6/8 桁 hex (xterm.js の theme は #RGB / #RRGGBB / #RRGGBBAA を解釈する)
     if (!/^(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(s)) {
-      warnParam(name, raw, 'not a hex color');
+      throw new Error('not a hex color');
+    }
+    return '#' + s;
+  };
+  const colorParam = (name, def) => {
+    const raw = params.get(name);
+    if (raw === null) return settingValue(name, def, 'default');
+    try {
+      return settingValue(name, normalizeColor(raw), 'url');
+    } catch (e) {
+      warnParam(name, raw, e.message);
       return settingValue(name, def, 'default');
     }
-    return settingValue(name, '#' + s, 'url');
   };
   // 半角ブロック罫線 (▀▄▉ 等) の上下ズレ対策として lineHeight は 1.0 が既定。
   // fontFamily は同梱の HackGen Console NF (SIL OFL、半角:全角=1:2、Nerd Font +
@@ -89,37 +96,38 @@
   // を安定化させる。fallback は既存 monospace 列。
   const DEFAULT_FONT_FAMILY =
     '"HackGen Console NF", Menlo, "DejaVu Sans Mono", Consolas, "Courier New", monospace';
-  const fontFamilyParam = () => {
-    const raw = params.get('fontfamily');
-    if (raw === null) return settingValue('fontfamily', DEFAULT_FONT_FAMILY, 'default');
+  const normalizeFontFamily = (raw) => {
     const s = raw.trim();
     // 値は xterm.js が element の inline style に直接入れるため、font-family 名に
     // 現れうる文字だけを通す (= `;` `{` `(` 等を弾いて他プロパティの注入を防ぐ)。
-    if (!s || !/^[\w \-'",.]+$/.test(s)) {
-      warnParam('fontfamily', raw, 'invalid font family name');
-      return settingValue('fontfamily', DEFAULT_FONT_FAMILY, 'default');
-    }
+    if (!s || !/^[\w \-'",.]+$/.test(s)) throw new Error('invalid font family name');
+    if (s === DEFAULT_FONT_FAMILY || s.endsWith(`, ${DEFAULT_FONT_FAMILY}`)) return s;
     const list = s.split(',').map((t) => t.trim().replace(/['"]/g, '')).filter(Boolean);
-    if (list.length === 0) {
-      warnParam('fontfamily', raw, 'empty font family name');
+    if (list.length === 0) throw new Error('empty font family name');
+    const quoted = list.map((t) => (/^[\w-]+$/.test(t) ? t : `"${t}"`));
+    return quoted.concat(DEFAULT_FONT_FAMILY).join(', ');
+  };
+  const fontFamilyParam = () => {
+    const raw = params.get('fontfamily');
+    if (raw === null) return settingValue('fontfamily', DEFAULT_FONT_FAMILY, 'default');
+    try {
+      return settingValue('fontfamily', normalizeFontFamily(raw), 'url');
+    } catch (e) {
+      warnParam('fontfamily', raw, e.message);
       return settingValue('fontfamily', DEFAULT_FONT_FAMILY, 'default');
     }
-    // 既定チェーンは置き換えず先頭に挿入する。指定フォントが持たないグリフは
-    // 従来どおり HackGen / host monospace へ落ちる。
-    const quoted = list.map((t) => (/^[\w-]+$/.test(t) ? t : `"${t}"`));
-    return settingValue('fontfamily', quoted.concat(DEFAULT_FONT_FAMILY).join(', '), 'url');
   };
 
-  const fontSize = numParam('fontsize', 13, 6, 40, true);
-  const lineHeight = numParam('lineheight', 1.0, 1.0, 2.0, false);
-  const scrollback = numParam('scrollback', 2000, 0, 100000, true);
-  const fontFamily = fontFamilyParam();
-  const background = colorParam('bg', '#111');
-  const foreground = colorParam('fg', '#e0e0e0');
+  let fontSize = numParam('fontsize', 13, 6, 40, true);
+  let lineHeight = numParam('lineheight', 1.0, 1.0, 2.0, false);
+  let scrollback = numParam('scrollback', 2000, 0, 100000, true);
+  let fontFamily = fontFamilyParam();
+  let background = colorParam('bg', '#111');
+  let foreground = colorParam('fg', '#e0e0e0');
   // unicode: 11 が既定。6 は xterm.js 内蔵の UnicodeV6 テーブルで、Unicode 6 当時に
   // 存在しなかった絵文字が幅 1 になる (= v0.9.25 より前の hyoui web の挙動)。
-  const unicodeVersion = enumParam('unicode', '11', ['6', '11']);
-  const ambWidth = enumParam('ambw', 'half', ['half', 'full']);
+  let unicodeVersion = enumParam('unicode', '11', ['6', '11']);
+  let ambWidth = enumParam('ambw', 'half', ['half', 'full']);
   // #term は style.css で背景 #111 固定。padding 4px 分がターミナル本体の外側に
   // 覗くので、bg を変えたらコンテナ側も合わせる。
   const termEl = document.getElementById('term');
@@ -144,32 +152,37 @@
     fontSize,
     theme: { background, foreground },
   });
-  // 文字幅計算。既定は Unicode 11 (絵文字を width=2 として扱う。daemon 側 vt100
-  // emulator と一致)。?unicode=6 で xterm.js 内蔵の V6 テーブルに戻せる。
-  // ?ambw=full なら選んだ版の provider に委譲しつつ Ambiguous を 2 にする provider を
-  // 重ねる (トレードオフは unicode-ambiguous.js の冒頭コメント参照)。
-  if (window.Unicode11Addon) {
-    try {
-      term.loadAddon(new window.Unicode11Addon.Unicode11Addon());
-      term.unicode.activeVersion = unicodeVersion;
-      if (ambWidth === 'full') {
-        // wrap 対象の base provider を取る。V11 は addon の activate() 経由で公開 API
-        // だけで取れるが、V6 は UnicodeService が constructor で自前生成するため
-        // addon 経路が無く、内部の provider 表を見るしかない。vendor は in-repo で
-        // 固定なので許容し、形が変わっていたら ambw を諦める (= 幅計算が黙って
-        // 壊れるより、指定を無視して既定の挙動に戻るほうが安全)。
+  // 文字幅 provider は初期 URL 設定と情報パネル内の runtime 変更で同じ関数を使う。
+  // ambw provider は Unicode 版ごとに 1 回だけ register し、以後は activeVersion の
+  // 切替だけにする (= 同じ version の重複登録や provider の無制限増加を避ける)。
+  const registeredAmbwVersions = new Set();
+  let unicodeWidthAvailable = false;
+  function applyUnicodeWidth() {
+    if (!unicodeWidthAvailable) throw new Error('Unicode width provider is unavailable');
+    term.unicode.activeVersion = unicodeVersion;
+    if (ambWidth === 'full') {
+      const version = `${unicodeVersion}-ambw`;
+      if (!registeredAmbwVersions.has(version)) {
+        // V11 は addon の公開 activate 経路で取得できる。V6 は constructor 組み込みで
+        // addon が無いため、固定 vendor の provider table を存在確認付きで参照する。
         const base = unicodeVersion === '11'
           ? window.HyouiAmbiguousWidth.captureUnicode11()
           : (term._core.unicodeService._providers || {})[unicodeVersion];
-        if (base) {
-          const version = `${unicodeVersion}-ambw`;
-          term.unicode.register(window.HyouiAmbiguousWidth.wrapProvider(base, version));
-          term.unicode.activeVersion = version;
-        } else {
-          console.warn(`hyoui: ignoring ?ambw=full (no width provider for unicode=${unicodeVersion})`);
-        }
+        if (!base) throw new Error(`no width provider for unicode=${unicodeVersion}`);
+        term.unicode.register(window.HyouiAmbiguousWidth.wrapProvider(base, version));
+        registeredAmbwVersions.add(version);
       }
-      if (window.__hyouiDebug) window.__hyouiDebug('info', 'unicode activeVersion=' + term.unicode.activeVersion);
+      term.unicode.activeVersion = version;
+    }
+    if (window.__hyouiDebug) {
+      window.__hyouiDebug('info', 'unicode activeVersion=' + term.unicode.activeVersion);
+    }
+  }
+  if (window.Unicode11Addon) {
+    try {
+      term.loadAddon(new window.Unicode11Addon.Unicode11Addon());
+      unicodeWidthAvailable = true;
+      applyUnicodeWidth();
     } catch (e) {
       if (window.__hyouiDebug) window.__hyouiDebug('warn', 'unicode width setup failed: ' + e.message);
     }
@@ -386,35 +399,198 @@
   const infoChildState = document.getElementById('infoChildState');
   const infoAttachClients = document.getElementById('infoAttachClients');
 
+  const displaySettingStatus = document.getElementById('displaySettingStatus');
   const sourceLabels = {
     url: ['URL 指定', 'source-url'],
     default: ['default', 'source-default'],
     runtime: ['embed 中に変更', 'source-runtime'],
   };
+  const displaySettingSourcesByName = new Map();
+
+  const parseRuntimeNumber = (raw, min, max, integer) => {
+    const value = Number(raw.trim());
+    if (raw.trim() === '' || !Number.isFinite(value)) throw new Error('数値を入力してください');
+    if (value < min || value > max) throw new Error(`${min}〜${max} の範囲で入力してください`);
+    return integer ? Math.round(value) : value;
+  };
+  const loadRuntimeFont = async (family, size) => {
+    if (!document.fonts || typeof document.fonts.load !== 'function') return;
+    await Promise.race([
+      document.fonts.load(`${size}px ${family}`),
+      new Promise((resolve) => setTimeout(resolve, FONT_LOAD_TIMEOUT_MS)),
+    ]).catch(() => {});
+  };
+  const redrawForWidthChange = async () => {
+    // Unicode provider の切替は既存 buffer cell の保存済み width を遡及変更しない。
+    // daemon の screen dump を同じ xterm に再投入して、新 provider で cell を組み直す。
+    lastPayload = '';
+    await fetchScreen();
+  };
   const displaySettings = [
-    ['unicode', unicodeVersion],
-    ['ambw', ambWidth],
-    ['fontsize', `${fontSize}px`],
-    ['lineheight', String(lineHeight)],
-    ['scrollback', String(scrollback)],
-    ['fontfamily', fontFamily],
-    ['bg', background],
-    ['fg', foreground],
+    {
+      name: 'unicode', type: 'select', value: () => unicodeVersion,
+      options: [['6', '6'], ['11', '11']],
+      disabled: () => !unicodeWidthAvailable,
+      unavailable: 'Unicode width provider を初期化できないため変更できません',
+      apply: async (raw) => {
+        const previous = unicodeVersion;
+        unicodeVersion = raw;
+        try {
+          applyUnicodeWidth();
+          await redrawForWidthChange();
+          return raw;
+        } catch (e) {
+          unicodeVersion = previous;
+          applyUnicodeWidth();
+          throw e;
+        }
+      },
+    },
+    {
+      name: 'ambw', type: 'select', value: () => ambWidth,
+      options: [['half', 'half'], ['full', 'full']],
+      disabled: () => !unicodeWidthAvailable,
+      unavailable: 'Unicode width provider を初期化できないため変更できません',
+      apply: async (raw) => {
+        const previous = ambWidth;
+        ambWidth = raw;
+        try {
+          applyUnicodeWidth();
+          await redrawForWidthChange();
+          return raw;
+        } catch (e) {
+          ambWidth = previous;
+          applyUnicodeWidth();
+          throw e;
+        }
+      },
+    },
+    {
+      name: 'fontsize', type: 'number', value: () => String(fontSize), min: 6, max: 40, step: 1,
+      apply: async (raw) => {
+        const value = parseRuntimeNumber(raw, 6, 40, true);
+        await loadRuntimeFont(fontFamily, value);
+        term.options.fontSize = value;
+        fontSize = value;
+        scheduleFit(true);
+        return String(value);
+      },
+    },
+    {
+      name: 'lineheight', type: 'number', value: () => String(lineHeight), min: 1, max: 2, step: 0.1,
+      apply: async (raw) => {
+        const value = parseRuntimeNumber(raw, 1, 2, false);
+        term.options.lineHeight = value;
+        lineHeight = value;
+        scheduleFit(true);
+        return String(value);
+      },
+    },
+    {
+      name: 'scrollback', type: 'number', value: () => String(scrollback), min: 0, max: 100000, step: 1,
+      apply: async (raw) => {
+        const value = parseRuntimeNumber(raw, 0, 100000, true);
+        term.options.scrollback = value;
+        scrollback = value;
+        return String(value);
+      },
+    },
+    {
+      name: 'fontfamily', type: 'text', value: () => fontFamily,
+      apply: async (raw) => {
+        const value = normalizeFontFamily(raw);
+        await loadRuntimeFont(value, fontSize);
+        term.options.fontFamily = value;
+        fontFamily = value;
+        scheduleFit(true);
+        return value;
+      },
+    },
+    {
+      name: 'bg', type: 'text', value: () => background,
+      apply: async (raw) => {
+        const value = normalizeColor(raw);
+        term.options.theme = { ...term.options.theme, background: value, foreground };
+        termEl.style.background = value;
+        background = value;
+        return value;
+      },
+    },
+    {
+      name: 'fg', type: 'text', value: () => foreground,
+      apply: async (raw) => {
+        const value = normalizeColor(raw);
+        term.options.theme = { ...term.options.theme, background, foreground: value };
+        foreground = value;
+        return value;
+      },
+    },
   ];
-  for (const [name, value] of displaySettings) {
-    const row = document.createElement('div');
-    row.className = 'info-setting-row';
-    const key = document.createElement('span');
-    key.className = 'info-setting-name';
-    key.textContent = name;
-    const effective = document.createElement('span');
-    effective.className = 'info-setting-value';
-    effective.textContent = value;
-    const source = document.createElement('span');
-    const [label, className] = sourceLabels[displaySettingSources[name] || 'default'];
+
+  const setRuntimeSource = (name) => {
+    displaySettingSources[name] = 'runtime';
+    const source = displaySettingSourcesByName.get(name);
+    if (!source) return;
+    const [label, className] = sourceLabels.runtime;
     source.className = `source-badge ${className}`;
     source.textContent = label;
-    row.append(key, effective, source);
+  };
+
+  for (const setting of displaySettings) {
+    const row = document.createElement('div');
+    row.className = 'info-setting-row';
+    const label = document.createElement('label');
+    label.className = 'info-setting-name';
+    label.htmlFor = `displaySetting-${setting.name}`;
+    label.textContent = setting.name;
+    const control = document.createElement(setting.type === 'select' ? 'select' : 'input');
+    control.id = `displaySetting-${setting.name}`;
+    control.className = 'info-setting-control';
+    if (setting.type === 'select') {
+      for (const [value, text] of setting.options) {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = text;
+        control.appendChild(option);
+      }
+    } else {
+      control.type = setting.type;
+      if (setting.min !== undefined) control.min = String(setting.min);
+      if (setting.max !== undefined) control.max = String(setting.max);
+      if (setting.step !== undefined) control.step = String(setting.step);
+      control.spellcheck = false;
+    }
+    control.value = setting.value();
+    if (setting.disabled?.()) {
+      control.disabled = true;
+      control.title = setting.unavailable;
+      label.title = setting.unavailable;
+    }
+    const source = document.createElement('span');
+    const [sourceLabel, className] = sourceLabels[displaySettingSources[setting.name] || 'default'];
+    source.className = `source-badge ${className}`;
+    source.textContent = sourceLabel;
+    displaySettingSourcesByName.set(setting.name, source);
+    control.addEventListener('change', async () => {
+      if (control.value === setting.value()) return;
+      control.disabled = true;
+      displaySettingStatus.textContent = `${setting.name} を反映中…`;
+      try {
+        const applied = await setting.apply(control.value);
+        control.value = applied;
+        control.setCustomValidity('');
+        setRuntimeSource(setting.name);
+        displaySettingStatus.textContent = `${setting.name} を変更しました。外側の reload で元に戻ります。`;
+      } catch (e) {
+        control.value = setting.value();
+        control.setCustomValidity(e.message);
+        control.reportValidity();
+        displaySettingStatus.textContent = `${setting.name}: ${e.message}`;
+      } finally {
+        control.disabled = false;
+      }
+    });
+    row.append(label, control, source);
     infoDisplaySettings.appendChild(row);
   }
   infoSessionId.textContent = sid;
