@@ -42,7 +42,30 @@ struct Nested {
 impl Nested {
     /// outer (bash) / inner (cat) の detached session を起こし、pid を解決する。
     fn setup(name: &str) -> Self {
+        Self::setup_with_config(name, None)
+    }
+
+    /// config を与えて入れ子環境を起こす (DR-0032 §3 の `ctrlz_x1_action` 検証用)。
+    ///
+    /// config は runner 固有の `XDG_CONFIG_HOME` に置き、outer session の子 (= bash) に
+    /// env として渡す。bash から起動する attach client がそれを継承して読む
+    /// (= 被験体は「bash の foreground で走る attach client」なので、client の config を
+    /// 差し替えるにはこの経路しかない)。
+    fn setup_with_config(name: &str, config_toml: Option<&str>) -> Self {
         let runner = HyouiTestRunner::new();
+        let env: Vec<(String, String)> = match config_toml {
+            Some(toml) => {
+                let config_home = runner.runtime_dir().join("xdg-config");
+                let config_dir = config_home.join("hyoui");
+                std::fs::create_dir_all(&config_dir).expect("create config dir");
+                std::fs::write(config_dir.join("config.toml"), toml).expect("write config");
+                vec![(
+                    "XDG_CONFIG_HOME".to_string(),
+                    config_home.display().to_string(),
+                )]
+            }
+            None => Vec::new(),
+        };
         let outer_sock = runner.socket_path(&format!("{name}-outer"));
         let inner_sock = runner.socket_path(&format!("{name}-inner"));
         // bash は job control を持つ interactive shell として起こす (= `-i`)。rc は読ま
@@ -59,6 +82,7 @@ impl Nested {
                 "--noprofile",
                 "-i",
             ],
+            &env,
         );
         spawn_detached(
             &runner,
@@ -69,6 +93,7 @@ impl Nested {
                 "--",
                 "/bin/cat",
             ],
+            &env,
         );
         let shell_pid = wait_child_pid(&runner, &outer_sock).expect("outer session の子 pid");
         let child_pid = wait_child_pid(&runner, &inner_sock).expect("inner session の子 pid");
@@ -143,8 +168,12 @@ impl Nested {
 /// stdout/stderr は **必ず `Stdio::null()`** にする: fork した daemon が pipe の write 端を
 /// 継承したまま常駐するため、`output()` のような pipe 経由の待ち方をすると EOF が来ずに
 /// 親が永久 block する (= 実測)。
-fn spawn_detached(runner: &HyouiTestRunner, args: &[&str]) {
-    let status = Command::new(hyoui_bin())
+fn spawn_detached(runner: &HyouiTestRunner, args: &[&str], env: &[(String, String)]) {
+    let mut cmd = Command::new(hyoui_bin());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let status = cmd
         .args(args)
         .env("XDG_RUNTIME_DIR", runner.runtime_dir())
         .env("TMPDIR", runner.runtime_dir())
@@ -361,5 +390,242 @@ fn suspended_client_dies_when_parent_shell_disappears() {
     assert!(
         !child.is_state('Z'),
         "client の自滅は子に波及してはいけない: {child:?}"
+    );
+}
+
+// ---- DR-0032 §3: ctrlz_x1_action (単発確定後の action) ----
+
+/// `client_detach`: 単発 Ctrl+Z で覗き窓を畳む (= 子は走り続ける)。
+///
+/// DR-0029 Rejected の「単発 = detach」は **default としては** 不適という判断だった。
+/// opt-in 値として復活させても「client 操作で子を止めない」原則は破らないことを見る。
+#[ignore = "入れ子 PTY + job control signal を使う、ローカルで --ignored 実行 (DR-0032 §3)"]
+#[test]
+fn ctrlz_x1_client_detach_closes_window_and_child_keeps_running() {
+    let n = Nested::setup_with_config(
+        "ctrlz-x1-detach",
+        Some("[attach]\nctrlz_x1_action = \"client_detach\"\n"),
+    );
+    let client = n.attach_from_shell();
+
+    n.input(&["key:C-z".to_string()]);
+    assert!(
+        wait_gone(client, Duration::from_secs(10)),
+        "単発 Ctrl+Z で client が終了するはず: state={}",
+        state_of(client)
+    );
+    let child = process_state_of(n.child_pid).expect("子は生存しているはず");
+    assert!(
+        !child.is_state('T') && !child.is_state('Z'),
+        "detach でも子は走り続けるべき: {child:?}"
+    );
+}
+
+/// `select_on_demand`: 単発 Ctrl+Z でプロンプトが出て、Ctrl+Z で client suspend。
+#[ignore = "入れ子 PTY + job control signal を使う、ローカルで --ignored 実行 (DR-0032 §3)"]
+#[test]
+fn ctrlz_x1_select_on_demand_prompt_then_ctrl_z_suspends() {
+    let n = Nested::setup_with_config("ctrlz-x1-sel-z", Some(SELECT_ON_DEMAND));
+    let client = n.attach_from_shell();
+
+    n.input(&["key:C-z".to_string()]);
+    assert!(
+        wait_prompt(&n),
+        "単発確定でプロンプトが出るはず。outer 画面:\n{}",
+        n.outer_screen()
+    );
+    let child = process_state_of(n.child_pid).expect("子の state");
+    assert!(
+        !child.is_state('T'),
+        "プロンプト表示中も子は走り続ける: {child:?}"
+    );
+
+    n.input(&["key:C-z".to_string()]);
+    let stopped = wait_state(client, 'T', Duration::from_secs(10)).unwrap_or_else(|| {
+        panic!(
+            "プロンプトの Ctrl+Z で client が停止するはず: state={}",
+            state_of(client)
+        )
+    });
+    assert!(stopped.is_state('T'), "client は stopped: {stopped:?}");
+}
+
+/// `select_on_demand`: プロンプトの Ctrl+C は client を終了する (= 子は走り続ける)。
+#[ignore = "入れ子 PTY + job control signal を使う、ローカルで --ignored 実行 (DR-0032 §3)"]
+#[test]
+fn ctrlz_x1_select_on_demand_prompt_ctrl_c_quits_client() {
+    let n = Nested::setup_with_config("ctrlz-x1-sel-c", Some(SELECT_ON_DEMAND));
+    let client = n.attach_from_shell();
+
+    n.input(&["key:C-z".to_string()]);
+    assert!(wait_prompt(&n), "プロンプトが出るはず");
+
+    n.input(&["key:C-c".to_string()]);
+    assert!(
+        wait_gone(client, Duration::from_secs(10)),
+        "プロンプトの Ctrl+C で client が終了するはず: state={}",
+        state_of(client)
+    );
+    let child = process_state_of(n.child_pid).expect("子は生存しているはず");
+    assert!(
+        !child.is_state('T') && !child.is_state('Z'),
+        "client 終了は子に影響しない: {child:?}"
+    );
+}
+
+/// `select_on_demand`: Esc は attach 表示に戻り、以後の打鍵は子まで届く。
+#[ignore = "入れ子 PTY + job control signal を使う、ローカルで --ignored 実行 (DR-0032 §3)"]
+#[test]
+fn ctrlz_x1_select_on_demand_prompt_esc_returns_to_attach() {
+    let n = Nested::setup_with_config("ctrlz-x1-sel-esc", Some(SELECT_ON_DEMAND));
+    let client = n.attach_from_shell();
+
+    n.input(&["key:C-z".to_string()]);
+    assert!(wait_prompt(&n), "プロンプトが出るはず");
+
+    n.input(&["key:Esc".to_string()]);
+    let running = wait_state(client, 'S', Duration::from_secs(10))
+        .unwrap_or_else(|| panic!("Esc 後も client は走行中: state={}", state_of(client)));
+    assert!(running.is_state('S'), "client は running: {running:?}");
+
+    // forward が再開している (= プロンプト状態を抜けた証拠)。
+    n.type_line("HELLO-AFTER-ESC");
+    assert!(
+        wait_inner_screen(&n, "HELLO-AFTER-ESC"),
+        "Esc 後の入力は子まで届くはず"
+    );
+}
+
+/// `select_on_demand`: 明示 3 キー以外は無視して破棄する (= 子へも流さない、timeout なし)。
+#[ignore = "入れ子 PTY + job control signal を使う、ローカルで --ignored 実行 (DR-0032 §3)"]
+#[test]
+fn ctrlz_x1_select_on_demand_prompt_ignores_other_keys() {
+    let n = Nested::setup_with_config("ctrlz-x1-sel-other", Some(SELECT_ON_DEMAND));
+    let client = n.attach_from_shell();
+
+    n.input(&["key:C-z".to_string()]);
+    assert!(wait_prompt(&n), "プロンプトが出るはず");
+
+    // 明示キー以外を打つ (= 放置後の復帰で無自覚に打つキーの模擬)。
+    n.input(&["text:IGNORED-KEYS".to_string(), "key:Enter".to_string()]);
+    std::thread::sleep(Duration::from_millis(300));
+    let state = process_state_of(client).expect("client の state");
+    assert!(
+        !state.is_state('T'),
+        "他キーで suspend してはいけない: {state:?}"
+    );
+    assert!(
+        !wait_inner_screen(&n, "IGNORED-KEYS"),
+        "プロンプト中の入力は子へ流してはいけない。inner 画面:\n{}",
+        inner_screen(&n)
+    );
+
+    // プロンプトは持続しているので、その後の Ctrl+Z が効く (= timeout なし)。
+    n.input(&["key:C-z".to_string()]);
+    assert!(
+        wait_state(client, 'T', Duration::from_secs(10)).is_some(),
+        "他キーの後もプロンプトは生きており Ctrl+Z が効くはず: state={}",
+        state_of(client)
+    );
+}
+
+/// `select_on_demand` の config (= DR-0032 §3)。
+const SELECT_ON_DEMAND: &str = "[attach]\nctrlz_x1_action = \"select_on_demand\"\n";
+
+/// outer 画面にプロンプト行が出るまで待つ。
+fn wait_prompt(n: &Nested) -> bool {
+    wait_for(Duration::from_secs(10), || {
+        n.outer_screen()
+            .contains("^Z: client suspend")
+            .then_some(())
+    })
+    .is_some()
+}
+
+/// inner session の画面 (= `/bin/cat` の echo) を text で取る。
+fn inner_screen(n: &Nested) -> String {
+    let out = run_hyoui(
+        &n.runner,
+        &[
+            "screen",
+            "dump",
+            &format!("--socket={}", n.inner_sock.display()),
+            "--format=text",
+        ],
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// inner 画面に `needle` が出るまで待つ (= 出なければ false)。
+fn wait_inner_screen(n: &Nested, needle: &str) -> bool {
+    wait_for(Duration::from_secs(5), || {
+        inner_screen(n).contains(needle).then_some(())
+    })
+    .is_some()
+}
+
+// ---- DR-0032 §2: menu の client suspend 項目 (= job control 親 shell が要る) ----
+
+/// menu の `z` (client suspend) は窓を閉じずに外側 shell へ戻り、**`fg` 復帰と同時に
+/// 子も起こす** (DR-0032 §2 メニュー項目表)。
+///
+/// 「一旦どけて戻ったら続きをやる」明示操作なので、`show_child_action_menu` (= 通常は
+/// 勝手に起こさない設定) でもこの操作に限り resume 要求を送る。job control を持つ親
+/// shell が要るため、child_action_menu.rs (= 単一 PTY) ではなく本ファイルの入れ子
+/// harness に置く。
+#[ignore = "入れ子 PTY + job control signal を使う、ローカルで --ignored 実行 (DR-0032 §2)"]
+#[test]
+fn menu_client_suspend_item_wakes_child_on_fg() {
+    let n = Nested::setup_with_config(
+        "menu-z-suspend",
+        Some("[session]\non_child_suspend = \"show_child_action_menu\"\n"),
+    );
+    let client = n.attach_from_shell();
+
+    // 子を止めて menu を出す (= attach 中の停止検知経路)。
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(n.child_pid),
+        nix::sys::signal::Signal::SIGSTOP,
+    )
+    .expect("kill -STOP child");
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            n.outer_screen()
+                .contains("操作を選んでください")
+                .then_some(())
+        })
+        .is_some(),
+        "停止検知で menu が出るはず。outer 画面:\n{}",
+        n.outer_screen()
+    );
+
+    n.input(&["text:z".to_string()]);
+    assert!(
+        wait_state(client, 'T', Duration::from_secs(10)).is_some(),
+        "menu の `z` で client が停止するはず: state={}",
+        state_of(client)
+    );
+    assert!(
+        process_state_of(n.child_pid)
+            .expect("子の state")
+            .is_state('T'),
+        "suspend した時点では子はまだ停止のまま"
+    );
+
+    n.type_line("fg");
+    assert!(
+        wait_state(client, 'S', Duration::from_secs(10)).is_some(),
+        "fg で client が復帰するはず: state={}",
+        state_of(client)
+    );
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            process_state_of(n.child_pid)
+                .ok()
+                .filter(|p| !p.is_state('T'))
+        })
+        .is_some(),
+        "fg 復帰と同時に子も起きるはず: child state={}",
+        state_of(n.child_pid)
     );
 }

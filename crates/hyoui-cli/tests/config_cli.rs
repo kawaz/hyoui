@@ -209,3 +209,31 @@ fn config_no_args_shows_help() {
     assert!(text.contains("path"), "{text}");
     assert!(text.contains("show"), "{text}");
 }
+
+/// DR-0032 §1 migration: 廃止された旧 bool key が書かれていたら起動を拒否し、
+/// 移行先 (`on_child_suspend`) を案内する。
+#[test]
+fn removed_bool_keys_reject_startup_with_migration_hint() {
+    for (toml, expected_key) in [
+        ("[session]\nauto_resume = true\n", "[session] auto_resume"),
+        (
+            "[attach]\nresume_stopped_child = false\n",
+            "[attach] resume_stopped_child",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("hyoui");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), toml).unwrap();
+
+        let out = run_config(&["show"], Some(tmp.path()), None);
+        assert!(
+            !out.status.success(),
+            "旧 key が残った config では起動を拒否するはず: {}",
+            stdout_of(&out)
+        );
+        let err = stderr_of(&out);
+        assert!(err.contains(expected_key), "旧 key 名を出す: {err}");
+        assert!(err.contains("on_child_suspend"), "移行先を案内する: {err}");
+    }
+}
