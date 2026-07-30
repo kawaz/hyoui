@@ -483,14 +483,9 @@ struct ResizeRequest {
 
 /// `POST /api/sessions/:id/resize` — PTY と ScreenState を同期 resize させる。
 ///
-/// **Multi-client tradeoff (kawaz 割り切り 2026-07-21)**: 本 endpoint は毎回
-/// 短命 Rw connection を張って `Resize` message を送るだけの実装。daemon 側は
-/// resize を leader 限定で受理する (DR-0008 §2.3) ため、既に別の Rw client
-/// (= `hyoui attach` の対話 leader 等) が居る場合は本 request は **silently
-/// 効かない** (daemon が Error frame を返すがこの ephemeral 接続では recv しない)。
-/// 逆に他 web page からの concurrent resize は daemon 内で serialize されるので
-/// 「後着が勝つ」動作。DR-0013 Phase C の multi-client resize 調停は本 task の
-/// scope 外 (kawaz 明示)。
+/// 本 endpoint は WS 未接続時の fallback。短命 Rw connection が leader を取得できた
+/// 場合だけ resize を受理し、既存 leader と競合した場合は 409 を返す。通常の browser
+/// terminal は WS bridge の persistent leader connection 経由で resize する。
 async fn post_resize(
     Path(id): Path<String>,
     State(_state): State<AppState>,
@@ -510,13 +505,21 @@ async fn post_resize(
     let result = tokio::task::spawn_blocking(move || resize_blocking(&sock, cols, rows)).await;
     match result {
         Ok(Ok(())) => (StatusCode::NO_CONTENT, "").into_response(),
-        Ok(Err(msg)) => internal_error(format!("resize failed: {msg}")),
+        Ok(Err(ResizeError::Conflict(msg))) => conflict(format!("resize failed: {msg}")),
+        Ok(Err(ResizeError::Internal(msg))) => internal_error(format!("resize failed: {msg}")),
         Err(e) => internal_error(format!("resize join error: {e}")),
     }
 }
 
-fn resize_blocking(socket_path: &std::path::Path, cols: u16, rows: u16) -> Result<(), String> {
+#[derive(Debug)]
+enum ResizeError {
+    Conflict(String),
+    Internal(String),
+}
+
+fn resize_blocking(socket_path: &std::path::Path, cols: u16, rows: u16) -> Result<(), ResizeError> {
     use hyoui::client::{AttachOptions, ClientConnection};
+    use hyoui::protocol::messages::ErrorCode;
     use hyoui::protocol::{ControlMessage, MVP_CAPS, Mode};
 
     let opts = AttachOptions {
@@ -527,29 +530,52 @@ fn resize_blocking(socket_path: &std::path::Path, cols: u16, rows: u16) -> Resul
         detach_others: false,
     };
     let mut conn = ClientConnection::connect(socket_path, opts)
-        .map_err(|e| format!("connect/handshake: {e}"))?;
+        .map_err(|e| ResizeError::Internal(format!("connect/handshake: {e}")))?;
+    if !conn.response.leader {
+        return Err(ResizeError::Conflict(
+            "another client owns the resize leader role".to_string(),
+        ));
+    }
     conn.send_control(&ControlMessage::Resize(hyoui::protocol::messages::Resize {
         cols,
         rows,
     }))
-    .map_err(|e| format!("send resize: {e}"))?;
+    .map_err(|e| ResizeError::Internal(format!("send resize: {e}")))?;
     // `Resize` は ack を持たない片道 message なので、送信直後に connection を畳むと
     // 「daemon が frame を読む前に client が消える」race で **無言で捨てられる**
     // (= HTTP は 204 を返すのに resize が効かない)。frame は FIFO で処理されるため、
     // 直後に `StatusQuery` を 1 往復させれば「Resize が処理済み」を確認できる。
     // 応答を待つのは高々 1 RTT (= 同一ホストの unix socket)。
     conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))
-        .map_err(|e| format!("set read timeout: {e}"))?;
+        .map_err(|e| ResizeError::Internal(format!("set read timeout: {e}")))?;
     conn.send_control(&ControlMessage::StatusQuery(
         hyoui::protocol::messages::StatusQuery {},
     ))
-    .map_err(|e| format!("send status query: {e}"))?;
+    .map_err(|e| ResizeError::Internal(format!("send status query: {e}")))?;
     loop {
         match conn.recv_control(None) {
             Ok(ControlMessage::StatusResponse(_)) => return Ok(()),
+            Ok(ControlMessage::Error(error)) if error.code == ErrorCode::ModeNotLeader => {
+                return Err(ResizeError::Conflict(format!(
+                    "{}: {}",
+                    error.code.as_str(),
+                    error.message
+                )));
+            }
+            Ok(ControlMessage::Error(error)) => {
+                return Err(ResizeError::Internal(format!(
+                    "{}: {}",
+                    error.code.as_str(),
+                    error.message
+                )));
+            }
             // 他 client 由来の broadcast (= leader.notify / mode.change 等) は読み飛ばす。
             Ok(_) => continue,
-            Err(e) => return Err(format!("await resize completion: {e}")),
+            Err(e) => {
+                return Err(ResizeError::Internal(format!(
+                    "await resize completion: {e}"
+                )));
+            }
         }
     }
 }
@@ -681,6 +707,10 @@ fn bad_request(msg: impl Into<String>) -> Response {
 
 fn not_found(msg: impl Into<String>) -> Response {
     (StatusCode::NOT_FOUND, msg.into()).into_response()
+}
+
+fn conflict(msg: impl Into<String>) -> Response {
+    (StatusCode::CONFLICT, msg.into()).into_response()
 }
 
 fn internal_error(msg: impl Into<String>) -> Response {

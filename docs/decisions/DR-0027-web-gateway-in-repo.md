@@ -56,6 +56,16 @@ DR-0010 §2 の「serve gateway は別 repo `kawaz/hyoui-serve`」を覆し、�
   (transport 非依存 CBOR) を WS binary message に 1:1 転写、client 側は xterm.js。
   detach = WS close。1 WS 接続 = 1 `ClientConnection`
 
+WS の binary frame は PTY 入出力 bytes、text frame は browser↔gateway の制御 JSON とする。
+resize は `{"kind":"resize","requestId":N,"cols":W,"rows":H}` を送り、gateway が同じ
+WS bridge の leader `ClientConnection` から既存 daemon `Resize` message を発行する。応答は
+`{"kind":"resize.result","requestId":N,"ok":true}` (失敗時は `ok:false` + `error`)。
+daemon protocol / capability は増やさない。browser は成功応答後だけ xterm.js grid を変更し、
+応答前・失敗時・`resize` off では旧 grid を維持する。
+
+`POST /api/sessions/:id/resize` は WS 未接続時の fallback として残す。短命接続が leader を
+取得できない場合は daemon の `mode.not-leader` を握りつぶさず HTTP 409 で返す。
+
 ### 4. 静的アセット
 
 xterm.js + 素の HTML/JS (bundler なし、vendored コピー)。リリースビルドは

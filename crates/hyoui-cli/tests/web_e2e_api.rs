@@ -570,6 +570,86 @@ fn e2e_ws_attach_bridge_roundtrip() {
         String::from_utf8_lossy(&cum)
     );
 
+    // WS bridge が persistent leader を保持中、fallback POST は正直に 409 を返す。
+    let post_body = serde_json::to_vec(&serde_json::json!({"cols": 77u16, "rows": 22u16})).unwrap();
+    let response = http_request(
+        port,
+        "POST",
+        &format!("/api/sessions/{sid}/resize"),
+        Some(("application/json", &post_body)),
+    );
+    assert_eq!(
+        response.status,
+        409,
+        "WS leader 保持中の POST resize は 409 になるべき: body={}",
+        String::from_utf8_lossy(&response.body)
+    );
+
+    // 同じ WS leader connection の text control message から resize する。
+    ws.send(Message::Text(
+        serde_json::json!({
+            "kind": "resize",
+            "requestId": 42u64,
+            "cols": 91u16,
+            "rows": 33u16,
+        })
+        .to_string()
+        .into(),
+    ))
+    .expect("WS resize send");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut resize_ack = None;
+    while Instant::now() < deadline {
+        match ws.read() {
+            Ok(Message::Text(text)) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(text.as_str()).expect("WS control response JSON");
+                if value["kind"] == "resize.result" && value["requestId"] == 42u64 {
+                    resize_ack = Some(value);
+                    break;
+                }
+            }
+            Ok(Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
+            Ok(Message::Close(_)) => break,
+            Err(tungstenite::Error::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(e) => panic!("WS resize read error: {e}"),
+        }
+    }
+    let resize_ack = resize_ack.expect("WS resize.result が届くこと");
+    assert_eq!(resize_ack["ok"], true, "resize ack={resize_ack}");
+
+    // 成功応答は FIFO barrier 後なので、直後の snapshot で実サイズを観測できる。
+    let out = Command::new(hyoui_bin())
+        .args([
+            "screen",
+            "snapshot",
+            sid,
+            "--include=WindowSize",
+            "--format=json",
+        ])
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env_remove("HYOUI_SESSION_ID")
+        .env_remove("HYOUI_LOCK_TOKEN")
+        .env_remove("HYOUI_NAMESPACE")
+        .stdin(Stdio::null())
+        .output()
+        .expect("screen snapshot after WS resize");
+    assert!(out.status.success(), "snapshot stderr={:?}", out.stderr);
+    let compact: String = String::from_utf8_lossy(&out.stdout)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(
+        compact.contains("\"cols\":91") && compact.contains("\"rows\":33"),
+        "WS resize が daemon window size に反映されていない: {compact}"
+    );
+
     // client → daemon: 明示 Close。daemon 側 attach が cleanup されて daemon の
     // client 数が減ることは snapshot でも観測可能だが本 test では skip (= 別 test で
     // sessions API が client 数を出すのを確認済み)。

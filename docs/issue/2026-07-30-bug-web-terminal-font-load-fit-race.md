@@ -142,3 +142,26 @@ WS browser を閉じて leader 不在にした実測では、連続 POST 100x40 
 3. frontend は `proposeDimensions` → resize POST → 204確認 → `term.resize` の順に変更し、失敗時は旧 grid + 横スクロールを維持する。連続 resize は応答待ち中の最新寸法を coalesce し、古い応答で新しい寸法へ戻さない。
 
 font-load race と resize leader bug は別原因。font race は初回寸法を誤らせ、leader bug は2回目以降のPTY追従を止める。後者により xterm reflow だけが継続して、報告された「ずっと折り返されたまま」になる。
+
+## 修正
+
+- browser→gateway の WS binary frame を PTY input、text frame を制御 JSON に分離した。
+  resize は `{"kind":"resize","requestId":N,"cols":W,"rows":H}`、応答は
+  `{"kind":"resize.result","requestId":N,"ok":true}` (失敗時は `error` 付き)。
+- gateway は persistent WS bridge が保持する同じ leader `ClientConnection` から既存 daemon
+  `Resize` を発行し、後続 `StatusQuery` / `StatusResponse` を FIFO barrier にして成功応答する。
+  daemon protocol / capability は変更していない。
+- frontend は `FitAddon.proposeDimensions()` で目標だけ計算し、resize 成功応答後だけ
+  `term.resize()` する。応答待ち中に新寸法が来た場合は最新だけを採用する。`resize` off・失敗時は
+  旧 grid を維持する。
+- `#term` は `overflow-x:auto; overflow-y:hidden` とし、PTY と viewport の cols が一致するまで
+  xterm buffer を reflow せず横スクロールで表示する。
+- fallback の `POST /resize` は handshake 時点の `leader=false` と daemon の
+  `ControlMessage::Error` を明示失敗にし、leader 衝突は HTTP 409 を返す。
+
+## 回帰テスト
+
+`crates/hyoui-cli/tests/web_e2e_api.rs::e2e_ws_attach_bridge_roundtrip` で、persistent WS leader
+接続中の POST が 409 になること、同じ WS 接続から `91x33` resize を送り成功応答後の
+`screen snapshot --include=WindowSize` が `91x33` になることを検証する。既存
+`e2e_resize_endpoint` は leader 不在時の fallback POST 204 と daemon 反映を継続検証する。

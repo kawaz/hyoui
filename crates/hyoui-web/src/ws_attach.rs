@@ -42,13 +42,50 @@ use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
+
+/// Browser → gateway の text frame。binary frame は従来どおり PTY input 専用。
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind")]
+enum WsControlRequest {
+    #[serde(rename = "resize")]
+    Resize {
+        #[serde(rename = "requestId")]
+        request_id: u64,
+        cols: u16,
+        rows: u16,
+    },
+}
+
+/// Gateway → browser の text frame。PTY output は binary frame のまま。
+#[derive(Debug, Serialize)]
+struct WsResizeResult {
+    kind: &'static str,
+    #[serde(rename = "requestId")]
+    request_id: u64,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
 
 /// bridge thread への入力コマンド。
 enum BridgeCmd {
     /// WS から受け取った raw bytes (= xterm.js の key input)。daemon の PTY input へ。
     Bytes(Vec<u8>),
+    /// Browser が提案した grid を同じ leader connection から daemon へ反映する。
+    Resize {
+        request_id: u64,
+        cols: u16,
+        rows: u16,
+    },
     /// WS close 相当。bridge を Ok で終わらせる。
     Shutdown,
+}
+
+/// bridge thread から WS writer task への出力。
+enum BridgeOutput {
+    Bytes(Vec<u8>),
+    Control(String),
 }
 
 /// WS handler の中身 (= `on_upgrade` 内で呼ぶ本体)。socket_path は事前解決済み。
@@ -59,7 +96,7 @@ enum BridgeCmd {
 pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf) -> Result<(), String> {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (input_tx, input_rx) = std::sync::mpsc::channel::<BridgeCmd>();
-    let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<BridgeOutput>();
     let (wake_r, wake_w) = nix::unistd::pipe().map_err(|e| format!("pipe: {e}"))?;
     let wake_w = Arc::new(wake_w);
 
@@ -68,14 +105,30 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf) -> Result<(), Str
     let input_tx_a = input_tx;
     let reader_task = tokio::spawn(async move {
         while let Some(msg) = ws_rx.next().await {
-            let bytes = match msg {
-                Ok(Message::Binary(b)) => b.to_vec(),
-                Ok(Message::Text(s)) => s.as_str().as_bytes().to_vec(),
+            let cmd = match msg {
+                Ok(Message::Binary(b)) => BridgeCmd::Bytes(b.to_vec()),
+                Ok(Message::Text(s)) => {
+                    match serde_json::from_str::<WsControlRequest>(s.as_str()) {
+                        Ok(WsControlRequest::Resize {
+                            request_id,
+                            cols,
+                            rows,
+                        }) => BridgeCmd::Resize {
+                            request_id,
+                            cols,
+                            rows,
+                        },
+                        Err(e) => {
+                            eprintln!("hyoui-web: invalid WS control message: {e}");
+                            continue;
+                        }
+                    }
+                }
                 Ok(Message::Ping(_) | Message::Pong(_)) => continue, // axum が自動応答
                 Ok(Message::Close(_)) => break,
                 Err(_) => break,
             };
-            if input_tx_a.send(BridgeCmd::Bytes(bytes)).is_err() {
+            if input_tx_a.send(cmd).is_err() {
                 break;
             }
             // wake pipe に 1 byte 書いて bridge thread の poll を起こす。
@@ -87,8 +140,12 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf) -> Result<(), Str
 
     // Task B: bridge output → WS binary。
     let writer_task = tokio::spawn(async move {
-        while let Some(bytes) = output_rx.recv().await {
-            if ws_tx.send(Message::Binary(bytes.into())).await.is_err() {
+        while let Some(output) = output_rx.recv().await {
+            let message = match output {
+                BridgeOutput::Bytes(bytes) => Message::Binary(bytes.into()),
+                BridgeOutput::Control(text) => Message::Text(text.into()),
+            };
+            if ws_tx.send(message).await.is_err() {
                 break;
             }
         }
@@ -120,7 +177,7 @@ fn bridge_loop(
     sock_path: &Path,
     input_rx: std::sync::mpsc::Receiver<BridgeCmd>,
     wake_r: std::os::fd::OwnedFd,
-    output_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    output_tx: tokio::sync::mpsc::UnboundedSender<BridgeOutput>,
 ) -> Result<(), String> {
     use hyoui::client::{AttachOptions, ClientConnection};
     use hyoui::protocol::{MVP_CAPS, Mode, TYPE_RAW_DATA};
@@ -162,7 +219,9 @@ fn bridge_loop(
         if reader_ready {
             match conn.recv_frame() {
                 Ok(frame) => {
-                    if frame.ty == TYPE_RAW_DATA && output_tx.send(frame.body).is_err() {
+                    if frame.ty == TYPE_RAW_DATA
+                        && output_tx.send(BridgeOutput::Bytes(frame.body)).is_err()
+                    {
                         // WS 側 writer が閉じた = client 離脱、正常終了。
                         return Ok(());
                     }
@@ -183,10 +242,16 @@ fn bridge_loop(
             // frame 数削減、DR-0021 raw_ack 待ちも 1 回で済む)。Shutdown は途中で
             // 見つかれば残 bytes 送信後に return する。
             let mut batch = Vec::new();
+            let mut resizes = Vec::new();
             let mut shutdown = false;
             loop {
                 match input_rx.try_recv() {
                     Ok(BridgeCmd::Bytes(b)) => batch.extend_from_slice(&b),
+                    Ok(BridgeCmd::Resize {
+                        request_id,
+                        cols,
+                        rows,
+                    }) => resizes.push((request_id, cols, rows)),
                     Ok(BridgeCmd::Shutdown) => {
                         shutdown = true;
                         break;
@@ -210,11 +275,84 @@ fn bridge_loop(
                     Err(e) => return Err(format!("send_raw_bytes: {e}")),
                 }
             }
+            for (request_id, cols, rows) in resizes {
+                let result = resize_on_connection(&mut conn, cols, rows, &output_tx);
+                let response = WsResizeResult {
+                    kind: "resize.result",
+                    request_id,
+                    ok: result.is_ok(),
+                    error: result.err(),
+                };
+                let text = serde_json::to_string(&response)
+                    .map_err(|e| format!("encode resize result: {e}"))?;
+                if output_tx.send(BridgeOutput::Control(text)).is_err() {
+                    return Ok(());
+                }
+            }
             if shutdown {
                 return Ok(());
             }
         }
     }
+}
+
+/// WS bridge が保持する leader connection から resize を送り、StatusResponse を
+/// FIFO barrier として処理完了を確認する。途中の raw output は browser へ転送する。
+fn resize_on_connection(
+    conn: &mut hyoui::client::ClientConnection,
+    cols: u16,
+    rows: u16,
+    output_tx: &tokio::sync::mpsc::UnboundedSender<BridgeOutput>,
+) -> Result<(), String> {
+    use hyoui::protocol::ControlMessage;
+    use hyoui::protocol::messages::{ErrorCode, Resize, StatusQuery};
+
+    if cols == 0 || rows == 0 {
+        return Err(format!(
+            "cols/rows must be > 0 (got cols={cols}, rows={rows})"
+        ));
+    }
+    if !conn.response.leader {
+        return Err("WS attach connection is not the resize leader".to_string());
+    }
+
+    conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|e| format!("set resize timeout: {e}"))?;
+    let result = (|| {
+        conn.send_control(&ControlMessage::Resize(Resize { cols, rows }))
+            .map_err(|e| format!("send resize: {e}"))?;
+        conn.send_control(&ControlMessage::StatusQuery(StatusQuery {}))
+            .map_err(|e| format!("send status query: {e}"))?;
+
+        let mut raw = Vec::new();
+        loop {
+            let message = conn
+                .recv_control(Some(&mut raw))
+                .map_err(|e| format!("await resize completion: {e}"))?;
+            if !raw.is_empty() {
+                let bytes = std::mem::take(&mut raw);
+                output_tx
+                    .send(BridgeOutput::Bytes(bytes))
+                    .map_err(|_| "WS writer closed".to_string())?;
+            }
+            match message {
+                ControlMessage::StatusResponse(_) => return Ok(()),
+                ControlMessage::Error(error) => {
+                    let code = error.code.as_str();
+                    let prefix = if error.code == ErrorCode::ModeNotLeader {
+                        "resize leader conflict"
+                    } else {
+                        "resize rejected"
+                    };
+                    return Err(format!("{prefix} ({code}): {}", error.message));
+                }
+                _ => {}
+            }
+        }
+    })();
+    conn.set_read_timeout(None)
+        .map_err(|e| format!("clear resize timeout: {e}"))?;
+    result
 }
 
 /// axum handler の型ヘルパ。`WebSocketUpgrade::on_upgrade` から `run_bridge` を呼ぶ。

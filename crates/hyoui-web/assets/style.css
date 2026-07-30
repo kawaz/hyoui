@@ -252,7 +252,8 @@ body.embed #term .xterm-screen {
      高さは xterm.js が rows*cell-height に自動追従する。 */
   width: 100%;
   box-sizing: border-box;
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 #inputForm {
   display: flex;

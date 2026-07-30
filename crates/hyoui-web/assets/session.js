@@ -376,85 +376,108 @@
 
   let timer = null;
   let lastPayload = '';
-  let lastCols = COLS;
-  let lastRows = ROWS;
 
-  // ---- resize logic (kawaz 要望 2026-07-21) ----
+  // ---- resize logic ----
   //
-  // 責務: (a) 表示 fit (= xterm.js の grid を viewport に合わせる) は default on。
-  //       (b) daemon 側 PTY の resize (= 実 TUI 再レイアウト) は明示 opt-in
-  //           (autoResizeEl checkbox、localStorage 保持、default off)。
-  //
-  // なぜ (b) が opt-in か: iframe 埋め込み (ccmsg webui Terminal タブ等) で
-  // 意図せず PTY resize が発火して稼働中の TUI (claude / vim) を勝手に
-  // 再レイアウトさせないため。
+  // fit addon は viewport に収まる目標 grid の計算だけに使う。xterm.js の grid を
+  // 先に縮めると normal buffer が reflow して、PTY が旧サイズのままなのに表示だけ
+  // 折り返される。daemon が resize を受理した応答を受けてから term.resize する。
+  // resize off / request 失敗中は旧 grid を維持し、CSS の横スクロールで表示する。
   const LS_AUTO_RESIZE = 'hyoui.session.autoResize';
   try {
     autoResizeEl.checked = localStorage.getItem(LS_AUTO_RESIZE) === '1';
   } catch (_e) { /* private mode 等で失敗しても既定 off */ }
-  // ?resize=1 で auto-resize を強制 ON (embed では header ごとトグルが消える +
-  // iframe の third-party storage 分離で localStorage が親ページと共有されない
-  // 環境があるため、URL で明示 opt-in できる経路を用意する)。
   if (new URLSearchParams(location.search).get('resize') === '1') {
     autoResizeEl.checked = true;
   }
+
+  let resizePending = null;
+  let resizeRunning = false;
+
   autoResizeEl.addEventListener('change', () => {
     try { localStorage.setItem(LS_AUTO_RESIZE, autoResizeEl.checked ? '1' : '0'); } catch (_e) {}
-    // opt-in した瞬間に現サイズを一度 PTY に反映。
-    if (autoResizeEl.checked) sendResizeIfChanged(true);
+    if (autoResizeEl.checked) scheduleFit(true);
+    else resizePending = null;
   });
 
-  async function sendResizeIfChanged(force) {
-    const cols = term.cols;
-    const rows = term.rows;
-    if (!force && cols === lastCols && rows === lastRows) return;
-    lastCols = cols;
-    lastRows = rows;
-    if (sizeEl) sizeEl.textContent = `${cols}x${rows}`;
-    if (!autoResizeEl.checked) return;
-    try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/resize`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ cols, rows }),
-      });
-      if (!r.ok) {
-        const txt = await r.text();
-        if (window.__hyouiDebug) window.__hyouiDebug('warn', `resize HTTP ${r.status}: ${txt}`);
-        return;
-      }
-      // resize 後は daemon が新サイズで redraw するので screen を取り直す。
-      setTimeout(fetchScreen, 200);
-    } catch (e) {
-      if (window.__hyouiDebug) window.__hyouiDebug('warn', 'resize failed: ' + e.message);
+  async function postResize(cols, rows) {
+    const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/resize`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cols, rows }),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      throw new Error(`HTTP ${r.status}: ${text}`);
     }
   }
 
+  async function requestResize(cols, rows) {
+    if (wsIsOpen()) return sendResizeOverWs(cols, rows);
+    // 初回 WS handshake 中に POST を並走させると、WS が先に leader を取った直後に
+    // fallback が 409 になる race を作る。接続確立時の scheduleFit に任せる。
+    if (ws && ws.readyState === WebSocket.CONNECTING) {
+      throw new Error('WS is still connecting');
+    }
+    return postResize(cols, rows);
+  }
+
+  async function drainResizeQueue() {
+    if (resizeRunning) return;
+    resizeRunning = true;
+    try {
+      while (resizePending) {
+        const target = resizePending;
+        resizePending = null;
+        try {
+          await requestResize(target.cols, target.rows);
+          // 応答待ちの間に新しい viewport 寸法が来た場合、古い成功応答では
+          // browser grid を動かさず、次の最新寸法だけを適用する。
+          if (resizePending || !autoResizeEl.checked) continue;
+          term.resize(target.cols, target.rows);
+          if (sizeEl) sizeEl.textContent = `${target.cols}x${target.rows}`;
+        } catch (e) {
+          if (window.__hyouiDebug) window.__hyouiDebug('warn', 'resize failed: ' + e.message);
+        }
+      }
+    } finally {
+      resizeRunning = false;
+      if (resizePending) drainResizeQueue();
+    }
+  }
+
+  function proposeAndQueueResize(force) {
+    if (!fitAddon || !autoResizeEl.checked) {
+      if (sizeEl) sizeEl.textContent = `${term.cols}x${term.rows}`;
+      return;
+    }
+    let proposed;
+    try {
+      proposed = fitAddon.proposeDimensions();
+    } catch (e) {
+      if (window.__hyouiDebug) window.__hyouiDebug('warn', 'fit proposal failed: ' + e.message);
+      return;
+    }
+    if (!proposed || !Number.isFinite(proposed.cols) || !Number.isFinite(proposed.rows)) return;
+    if (!force && proposed.cols === term.cols && proposed.rows === term.rows) return;
+    resizePending = { cols: proposed.cols, rows: proposed.rows };
+    drainResizeQueue();
+  }
+
   let fitTimer = null;
-  function scheduleFit() {
+  function scheduleFit(force = false) {
     if (!fitAddon) return;
     if (fitTimer) clearTimeout(fitTimer);
     fitTimer = setTimeout(() => {
       fitTimer = null;
-      try {
-        fitAddon.fit();
-        sendResizeIfChanged(false);
-      } catch (e) {
-        if (window.__hyouiDebug) window.__hyouiDebug('warn', 'fit failed: ' + e.message);
-      }
-    }, 150); // debounce (数百 ms オーダで十分、resize drag 中の連射を抑える)
+      proposeAndQueueResize(force);
+    }, force ? 0 : 150);
   }
 
-  // 初回 fit は open() 直後の layout 完了を待って 1 tick 後に。
+  // 初回も PTY resize 成功前には browser grid を変えない。
   setTimeout(() => {
-    if (fitAddon) {
-      try { fitAddon.fit(); } catch (_e) {}
-    }
-    lastCols = term.cols;
-    lastRows = term.rows;
     if (sizeEl) sizeEl.textContent = `${term.cols}x${term.rows}`;
-    // auto-resize が既に ON (localStorage / ?resize=1) なら初回サイズを即 PTY へ。
-    if (autoResizeEl.checked) sendResizeIfChanged(true);
+    if (autoResizeEl.checked) scheduleFit(true);
   }, 0);
 
   window.addEventListener('resize', scheduleFit);
@@ -975,6 +998,10 @@
   const wsPendingInput = [];
   let wsPendingBytes = 0;
   const WS_PENDING_MAX = 8 * 1024;
+  const wsTextEncoder = new TextEncoder();
+  const wsResizePending = new Map();
+  let nextWsResizeId = 1;
+  const WS_RESIZE_TIMEOUT_MS = 5000;
 
   // 接続状態バッジ (existing status 領域の右側に別 element を新設)。
   const wsStatusEl = document.createElement('span');
@@ -992,6 +1019,33 @@
 
   function wsIsOpen() { return ws && ws.readyState === WebSocket.OPEN; }
 
+  function sendResizeOverWs(cols, rows) {
+    if (!wsIsOpen()) return Promise.reject(new Error('WS is not connected'));
+    const requestId = nextWsResizeId++;
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        wsResizePending.delete(requestId);
+        reject(new Error('WS resize response timed out'));
+      }, WS_RESIZE_TIMEOUT_MS);
+      wsResizePending.set(requestId, {
+        resolve: () => { clearTimeout(timeout); resolve(); },
+        reject: (error) => { clearTimeout(timeout); reject(error); },
+      });
+      try {
+        ws.send(JSON.stringify({ kind: 'resize', requestId, cols, rows }));
+      } catch (e) {
+        wsResizePending.delete(requestId);
+        clearTimeout(timeout);
+        reject(e);
+      }
+    });
+  }
+
+  function rejectPendingWsResizes(reason) {
+    for (const pending of wsResizePending.values()) pending.reject(new Error(reason));
+    wsResizePending.clear();
+  }
+
   function flushPendingToWs() {
     if (!wsIsOpen() || wsPendingInput.length === 0) return;
     for (const b of wsPendingInput) {
@@ -1002,19 +1056,21 @@
   }
 
   function sendBytesToWs(bytes) {
-    // bytes は Uint8Array or string (xterm.js onData は string、onBinary は Uint8Array)
+    // WS text frame は gateway 制御 JSON 専用。PTY input は文字列も UTF-8 の
+    // Uint8Array に変換し、常に binary frame として送る。
+    const payload = typeof bytes === 'string' ? wsTextEncoder.encode(bytes) : bytes;
     if (wsIsOpen()) {
       try {
-        ws.send(bytes);
+        ws.send(payload);
         return true;
       } catch (e) {
         if (window.__hyouiDebug) window.__hyouiDebug('warn', 'ws.send failed: ' + e.message);
       }
     }
     // queue (上限あり)
-    const size = typeof bytes === 'string' ? bytes.length : bytes.byteLength;
+    const size = payload.byteLength;
     if (wsPendingBytes + size <= WS_PENDING_MAX) {
-      wsPendingInput.push(bytes);
+      wsPendingInput.push(payload);
       wsPendingBytes += size;
     }
     return false;
@@ -1096,6 +1152,7 @@
       autoEl.disabled = true;
       autoEl.title = 'WS 接続中は auto refresh 無効 (scrollback / 選択保護)';
       flushPendingToWs();
+      if (autoResizeEl.checked) scheduleFit(true);
       // 接続直後は daemon 側が redraw をまだ送っていない可能性がある。
       // 一度だけ screen dump を fetch して初期状態を xterm に流し込む
       // (= WS 経由の incremental だけだと画面が空のまま長時間になる懸念を潰す)。
@@ -1109,12 +1166,23 @@
         const u8 = new Uint8Array(ev.data);
         term.write(u8);
       } else if (typeof ev.data === 'string') {
-        term.write(ev.data);
+        try {
+          const message = JSON.parse(ev.data);
+          if (message.kind !== 'resize.result') return;
+          const pending = wsResizePending.get(message.requestId);
+          if (!pending) return;
+          wsResizePending.delete(message.requestId);
+          if (message.ok) pending.resolve();
+          else pending.reject(new Error(message.error || 'resize rejected'));
+        } catch (e) {
+          if (window.__hyouiDebug) window.__hyouiDebug('warn', 'invalid WS control response: ' + e.message);
+        }
       }
     };
     ws.onclose = (ev) => {
       setWsStatus('disconnected (code=' + ev.code + ')');
       ws = null;
+      rejectPendingWsResizes('WS disconnected before resize completed');
       // WS 切断後は fallback ポーリング + auto refresh 再有効化。
       autoEl.disabled = false;
       autoEl.title = '';
