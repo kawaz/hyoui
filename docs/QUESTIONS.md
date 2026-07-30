@@ -24,15 +24,6 @@
 
 ## 確認待ち
 
-### 👺CZ-C1: Ctrl+Z ガード修正 (v0.9.27) の実機確認
-
-- [ ] a: claude を hyoui 直起動 → attach 中に ^Z **単発** → 子に届かず、500ms 後に detach する (claude は走り続け、再 attach できる)
-- [ ] b: ^Z **2 連打** → claude に 1 発届く (suspend メッセージ 1 回 → auto-resume)、detach しない
-
-真因は「端末が Ctrl+Z を CSI-u sequence で送るのにガードが 0x1a しか見ていない」。
-kitty CSI-u / modifyOtherKeys / 0x1a の 3 符号化対応 + decode/policy 層分離で修正。
-brew v0.9.27 反映済み (現行 v0.9.29 にも収録)。詳細: [issue](issue/2026-07-29-bug-ctrlz-guard-bypassed-by-keyboard-protocol.md)
-
 ### 👺WP-C1: web 表示パラメータ (v0.9.29) の使用感確認
 
 - [ ] a: `?fontsize=` `bg=` `fg=` `scrollback=` `lineheight=` `fontfamily=` を試して要望どおりか確認 (embed でも有効。例: `/sessions/<id>?embed=1&fontsize=16&bg=000`)
