@@ -40,43 +40,48 @@
   //   unicode=<6|11>        文字幅計算の Unicode 版。既定 11
   //   ambw=<half|full>      East Asian Ambiguous の幅。既定 half
   const params = new URLSearchParams(location.search);
+  const displaySettingSources = {};
+  const settingValue = (name, value, source) => {
+    displaySettingSources[name] = source;
+    return value;
+  };
   const warnParam = (name, raw, why) => {
     console.warn(`hyoui: ignoring ?${name}=${raw} (${why})`);
   };
   const numParam = (name, def, min, max, integer) => {
     const raw = params.get(name);
-    if (raw === null) return def;
+    if (raw === null) return settingValue(name, def, 'default');
     const v = Number(raw.trim());
     if (raw.trim() === '' || !Number.isFinite(v)) {
       warnParam(name, raw, 'not a number');
-      return def;
+      return settingValue(name, def, 'default');
     }
     if (v < min || v > max) {
       warnParam(name, raw, `out of range ${min}-${max}`);
-      return def;
+      return settingValue(name, def, 'default');
     }
-    return integer ? Math.round(v) : v;
+    return settingValue(name, integer ? Math.round(v) : v, 'url');
   };
   const enumParam = (name, def, allowed) => {
     const raw = params.get(name);
-    if (raw === null) return def;
+    if (raw === null) return settingValue(name, def, 'default');
     const s = raw.trim();
     if (!allowed.includes(s)) {
       warnParam(name, raw, `expected one of ${allowed.join('|')}`);
-      return def;
+      return settingValue(name, def, 'default');
     }
-    return s;
+    return settingValue(name, s, 'url');
   };
   const colorParam = (name, def) => {
     const raw = params.get(name);
-    if (raw === null) return def;
+    if (raw === null) return settingValue(name, def, 'default');
     const s = raw.trim().replace(/^#/, '');
     // 3/4/6/8 桁 hex (xterm.js の theme は #RGB / #RRGGBB / #RRGGBBAA を解釈する)
     if (!/^(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(s)) {
       warnParam(name, raw, 'not a hex color');
-      return def;
+      return settingValue(name, def, 'default');
     }
-    return '#' + s;
+    return settingValue(name, '#' + s, 'url');
   };
   // 半角ブロック罫線 (▀▄▉ 等) の上下ズレ対策として lineHeight は 1.0 が既定。
   // fontFamily は同梱の HackGen Console NF (SIL OFL、半角:全角=1:2、Nerd Font +
@@ -86,23 +91,23 @@
     '"HackGen Console NF", Menlo, "DejaVu Sans Mono", Consolas, "Courier New", monospace';
   const fontFamilyParam = () => {
     const raw = params.get('fontfamily');
-    if (raw === null) return DEFAULT_FONT_FAMILY;
+    if (raw === null) return settingValue('fontfamily', DEFAULT_FONT_FAMILY, 'default');
     const s = raw.trim();
     // 値は xterm.js が element の inline style に直接入れるため、font-family 名に
     // 現れうる文字だけを通す (= `;` `{` `(` 等を弾いて他プロパティの注入を防ぐ)。
     if (!s || !/^[\w \-'",.]+$/.test(s)) {
       warnParam('fontfamily', raw, 'invalid font family name');
-      return DEFAULT_FONT_FAMILY;
+      return settingValue('fontfamily', DEFAULT_FONT_FAMILY, 'default');
     }
     const list = s.split(',').map((t) => t.trim().replace(/['"]/g, '')).filter(Boolean);
     if (list.length === 0) {
       warnParam('fontfamily', raw, 'empty font family name');
-      return DEFAULT_FONT_FAMILY;
+      return settingValue('fontfamily', DEFAULT_FONT_FAMILY, 'default');
     }
     // 既定チェーンは置き換えず先頭に挿入する。指定フォントが持たないグリフは
     // 従来どおり HackGen / host monospace へ落ちる。
     const quoted = list.map((t) => (/^[\w-]+$/.test(t) ? t : `"${t}"`));
-    return quoted.concat(DEFAULT_FONT_FAMILY).join(', ');
+    return settingValue('fontfamily', quoted.concat(DEFAULT_FONT_FAMILY).join(', '), 'url');
   };
 
   const fontSize = numParam('fontsize', 13, 6, 40, true);
@@ -369,6 +374,51 @@
   const keypadToggle = document.getElementById('keypadToggle');
   const stoppedBanner = document.getElementById('stoppedBanner');
   const resumeBtn = document.getElementById('resumeBtn');
+  const inputTab = document.getElementById('inputTab');
+  const infoTab = document.getElementById('infoTab');
+  const inputTabPanel = document.getElementById('inputTabPanel');
+  const infoTabPanel = document.getElementById('infoTabPanel');
+  const infoDisplaySettings = document.getElementById('infoDisplaySettings');
+  const infoAttachMode = document.getElementById('infoAttachMode');
+  const infoAttachLeader = document.getElementById('infoAttachLeader');
+  const infoSessionId = document.getElementById('infoSessionId');
+  const infoChildPid = document.getElementById('infoChildPid');
+  const infoChildState = document.getElementById('infoChildState');
+  const infoAttachClients = document.getElementById('infoAttachClients');
+
+  const sourceLabels = {
+    url: ['URL 指定', 'source-url'],
+    default: ['default', 'source-default'],
+    runtime: ['embed 中に変更', 'source-runtime'],
+  };
+  const displaySettings = [
+    ['unicode', unicodeVersion],
+    ['ambw', ambWidth],
+    ['fontsize', `${fontSize}px`],
+    ['lineheight', String(lineHeight)],
+    ['scrollback', String(scrollback)],
+    ['fontfamily', fontFamily],
+    ['bg', background],
+    ['fg', foreground],
+  ];
+  for (const [name, value] of displaySettings) {
+    const row = document.createElement('div');
+    row.className = 'info-setting-row';
+    const key = document.createElement('span');
+    key.className = 'info-setting-name';
+    key.textContent = name;
+    const effective = document.createElement('span');
+    effective.className = 'info-setting-value';
+    effective.textContent = value;
+    const source = document.createElement('span');
+    const [label, className] = sourceLabels[displaySettingSources[name] || 'default'];
+    source.className = `source-badge ${className}`;
+    source.textContent = label;
+    row.append(key, effective, source);
+    infoDisplaySettings.appendChild(row);
+  }
+  infoSessionId.textContent = sid;
+
   // HTML の `hidden` 属性に加え script 側でも明示的に hide しておく (belt-and-suspenders)。
   // 初回 fetch が成功して child_stopped=true と判明するまでは絶対に表示させない
   // (= false-positive で banner が一瞬映る過渡を潰す。CSS 側の override も別途施した)。
@@ -503,6 +553,15 @@
       const me = Array.isArray(list) ? list.find((s) => s.session_id === sid) : null;
       const stopped = !!(me && me.child_stopped);
       stoppedBanner.hidden = !stopped;
+      if (me) {
+        infoChildPid.textContent = me.child_pid == null ? '—' : String(me.child_pid);
+        infoChildState.textContent = me.status || (stopped ? 'stopped' : 'running');
+        infoAttachClients.textContent = me.clients == null ? '—' : String(me.clients);
+      } else {
+        infoChildPid.textContent = '—';
+        infoChildState.textContent = 'not found';
+        infoAttachClients.textContent = '—';
+      }
     } catch (_e) {
       // best-effort。失敗しても画面は動かす。
     }
@@ -902,6 +961,22 @@
     });
   }
 
+  function selectPanelTab(tab) {
+    const showInfo = tab === 'info';
+    inputTab.classList.toggle('active', !showInfo);
+    infoTab.classList.toggle('active', showInfo);
+    inputTab.setAttribute('aria-selected', showInfo ? 'false' : 'true');
+    infoTab.setAttribute('aria-selected', showInfo ? 'true' : 'false');
+    inputTabPanel.hidden = showInfo;
+    infoTabPanel.hidden = !showInfo;
+    requestAnimationFrame(() => {
+      if (floatPos) applyEdgePos(inputPanel, floatPos);
+      if (!showInfo) inputText.focus();
+    });
+  }
+  inputTab.addEventListener('click', () => selectPanelTab('input'));
+  infoTab.addEventListener('click', () => selectPanelTab('info'));
+
   function openPanel() {
     // FAB と Panel は「同一浮遊物の折りたたみ/展開」なので、位置引き継ぎは
     // 左上座標でなく edge-relative pos (floatPos) を共有する。左上座標で
@@ -913,6 +988,7 @@
     applyEdgePos(inputPanel, pos);
     savePos(pos);
     requestAnimationFrame(() => {
+      if (inputTabPanel.hidden) return;
       inputText.focus();
       const l = inputText.value.length;
       try { inputText.setSelectionRange(l, l); } catch (_e) {}
@@ -1021,6 +1097,10 @@
   }
   function setWsStatus(text) {
     wsStatusEl.textContent = 'ws: ' + text;
+  }
+  function updateAttachInfo(message) {
+    infoAttachMode.textContent = message.mode || 'unknown';
+    infoAttachLeader.textContent = message.leader ? 'yes' : 'no';
   }
 
   function wsIsOpen() { return ws && ws.readyState === WebSocket.OPEN; }
@@ -1174,6 +1254,10 @@
       } else if (typeof ev.data === 'string') {
         try {
           const message = JSON.parse(ev.data);
+          if (message.kind === 'attach.info') {
+            updateAttachInfo(message);
+            return;
+          }
           if (message.kind !== 'resize.result') return;
           const pending = wsResizePending.get(message.requestId);
           if (!pending) return;
@@ -1187,6 +1271,8 @@
     };
     ws.onclose = (ev) => {
       setWsStatus('disconnected (code=' + ev.code + ')');
+      infoAttachMode.textContent = 'disconnected';
+      infoAttachLeader.textContent = '—';
       ws = null;
       rejectPendingWsResizes('WS disconnected before resize completed');
       // WS 切断後は fallback ポーリング + auto refresh 再有効化。

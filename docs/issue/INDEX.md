@@ -4,7 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
-| 2026-07-30 | request | open | [web-floating-info-panel](./2026-07-30-request-web-floating-info-panel.md) | 既存キーボード FAB を拡張し、フローティング内タブで入力/情報モード切替。情報モードに attach (ro/rw/leader)・embed パラメータ・セッション情報を表示 (Phase 1)、変更操作は Phase 2 (leader 昇格は leader.request 実装が前提) |
+| 2026-07-30 | request | wip | [web-floating-info-panel](./2026-07-30-request-web-floating-info-panel.md) | Phase 1 実装済み: 既存キーボード FAB 内を入力/情報タブ化し、attach mode/leader、表示設定の実効値と出自、セッション情報を read-only 表示。Phase 2 は表示設定変更と leader 昇格 (leader.request 実装が前提) |
 | 2026-07-30 | design | open | [child-suspend-action-menu](./2026-07-30-design-child-suspend-action-menu.md) | 子 suspend 時動作の enum 統合 (auto_resume 2 bool の置換) + resume_stopped_child=false 時の attach 内操作メニュー (kawaz 骨子裁定済み、DR 起草待ち) |
 | 2026-07-30 | bug | open | [zero-size-tty-daemon-panic](./2026-07-30-bug-zero-size-tty-daemon-panic.md) | winsize 未設定 (0x0) の PTY で `hyoui run` が vt100 grid の subtract overflow で panic し socket も作られない。初期サイズ経路に下限 clamp が無い疑い (DR-0032 実装の実機 probe 中に偶発発見) |
 | 2026-07-30 | bug | open | [stdout-epipe-panic](./2026-07-30-bug-stdout-epipe-panic.md) | `hyoui status \| head` 等で stdout が早期 close されると Broken pipe panic。EPIPE は正常終了に倒すべき (SIGPIPE 復元 vs BrokenPipe 握り分けの検討要) |

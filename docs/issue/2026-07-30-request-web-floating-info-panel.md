@@ -1,11 +1,11 @@
 ---
 title: web ターミナルに attach/embed/session 情報のフローティングパネル (表示 → 変更操作の 2 段階)
-status: open
+status: wip
 category: request
 created: 2026-07-30T15:10:00+09:00
-last_read: 2026-07-30T15:10:00+09:00
+last_read: 2026-07-30T15:40:39+09:00
 open_entered: 2026-07-30T15:10:00+09:00
-wip_entered:
+wip_entered: 2026-07-30T15:40:39+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
@@ -49,3 +49,15 @@ embed されたターミナル内に、以下を表示するフローティン�
   provider 再 register)。URL 書き換えとの整合 (リロードで残るか) を設計
 - **leader 昇格: `leader.request` (DR-0008 §2.2 で v0.2.0+ 予約、未実装) の実装が前提**。
   daemon protocol 拡張になるので DR 起草必須
+
+## 実装状況
+
+Phase 1 の表示を実装済み。
+
+- 既存キーボード FAB のフローティングを「入力」「情報」の 2 タブ化。入力機能は維持
+- gateway 内部の WS text frame `attach.info` で daemon handshake の mode / leader を表示し、
+  `leader.notify` / `mode.change` を受信したら更新
+- unicode / ambw / fontsize / lineheight / scrollback / fontfamily / bg / fg の実効値と、
+  `URL 指定` / `default` / `embed 中に変更` の出自構造を表示
+- 既存 `/api/sessions` から hyoui_session_id / child pid / child-state / attach client 数を表示
+- Phase 2 の変更操作は未実装

@@ -468,3 +468,91 @@ td.argv, td.cwd {
   color: #999;
   min-height: 1em;
 }
+.panel-tabs {
+  display: flex;
+  gap: 0.25rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+.panel-tab {
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 0.35rem 0.8rem;
+  color: #aaa;
+}
+.panel-tab.active {
+  border-bottom-color: #6db4ff;
+  color: #fff;
+}
+.panel-tab-content {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  min-height: 0;
+}
+.panel-tab-content[hidden] { display: none; }
+.info-panel {
+  overflow-y: auto;
+  padding-right: 0.15rem;
+}
+.info-panel section + section {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding-top: 0.45rem;
+}
+.info-panel h2 {
+  margin: 0 0 0.35rem;
+  font-size: 0.82rem;
+  color: #aaa;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.info-list {
+  margin: 0;
+  display: grid;
+  gap: 0.25rem;
+}
+.info-list > div,
+.info-setting-row {
+  display: grid;
+  grid-template-columns: minmax(8rem, 0.8fr) minmax(0, 1.2fr) auto;
+  gap: 0.5rem;
+  align-items: baseline;
+}
+.info-list dt,
+.info-setting-name {
+  color: #aaa;
+  font-size: 0.78rem;
+}
+.info-list dd,
+.info-setting-value {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: "HackGen Console NF", Menlo, "DejaVu Sans Mono", Consolas, monospace;
+  font-size: 0.8rem;
+}
+.info-settings {
+  display: grid;
+  gap: 0.25rem;
+}
+.source-badge {
+  display: inline-block;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+  padding: 0.05rem 0.4rem;
+  font-size: 0.68rem;
+  white-space: nowrap;
+}
+.source-url { color: #8bc5ff; border-color: rgba(109, 180, 255, 0.55); }
+.source-default { color: #bbb; }
+.source-runtime { color: #d6a8ff; border-color: rgba(198, 128, 255, 0.5); }
+.info-source-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+.info-note {
+  margin: 0.35rem 0;
+  color: #999;
+  font-size: 0.72rem;
+}

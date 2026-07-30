@@ -67,6 +67,18 @@ daemon protocol / capability は増やさない。browser は成功応答後だ�
 `POST /api/sessions/:id/resize` は WS 未接続時の fallback として残す。短命接続が leader を
 取得できない場合は daemon の `mode.not-leader` を握りつぶさず HTTP 409 で返す。
 
+既存キーボード FAB のフローティングパネルは「入力」「情報」の 2 タブを持つ。情報タブは
+attach の実効 mode / leader、URL query から決まる表示設定と出自、`/api/sessions` で取得できる
+session id / child pid / child state / attach client 数を read-only 表示する。gateway は WS 確立時と
+leader / mode の変化時に次の text frame を browser へ送る。daemon protocol は変更しない。
+
+```json
+{"kind":"attach.info","mode":"rw","leader":true}
+```
+
+表示設定の出自は `URL 指定` / `default` / `embed 中に変更` の 3 区分とし、第三の区分は変更操作を
+追加する段階で使う。embed 中の変更値は外側の reload でリセットされる。
+
 ### 4. 静的アセット
 
 xterm.js + 素の HTML/JS (bundler なし、vendored コピー)。リリースビルドは

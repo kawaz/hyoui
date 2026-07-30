@@ -68,6 +68,14 @@ struct WsResizeResult {
     error: Option<String>,
 }
 
+/// Gateway が保持する daemon attach の実効 mode / leader 状態。
+#[derive(Debug, Serialize)]
+struct WsAttachInfo {
+    kind: &'static str,
+    mode: &'static str,
+    leader: bool,
+}
+
 /// bridge thread への入力コマンド。
 enum BridgeCmd {
     /// WS から受け取った raw bytes (= xterm.js の key input)。daemon の PTY input へ。
@@ -171,6 +179,30 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf) -> Result<(), Str
     }
 }
 
+fn mode_label(mode: hyoui::protocol::Mode) -> &'static str {
+    match mode {
+        hyoui::protocol::Mode::Rw => "rw",
+        hyoui::protocol::Mode::Ro => "ro",
+        hyoui::protocol::Mode::RwNoLeader => "rw-no-leader",
+        _ => "unknown",
+    }
+}
+
+fn send_attach_info(
+    response: &hyoui::protocol::messages::HandshakeResponse,
+    output_tx: &tokio::sync::mpsc::UnboundedSender<BridgeOutput>,
+) -> Result<(), String> {
+    let info = WsAttachInfo {
+        kind: "attach.info",
+        mode: mode_label(response.mode),
+        leader: response.leader,
+    };
+    let text = serde_json::to_string(&info).map_err(|e| format!("encode attach info: {e}"))?;
+    output_tx
+        .send(BridgeOutput::Control(text))
+        .map_err(|_| "WS writer closed".to_string())
+}
+
 /// blocking bridge の本体。`ClientConnection` を Rw で connect し、
 /// `reader_fd` + `wake_fd` を poll しながら双方向転送する。
 fn bridge_loop(
@@ -180,7 +212,7 @@ fn bridge_loop(
     output_tx: tokio::sync::mpsc::UnboundedSender<BridgeOutput>,
 ) -> Result<(), String> {
     use hyoui::client::{AttachOptions, ClientConnection};
-    use hyoui::protocol::{MVP_CAPS, Mode, TYPE_RAW_DATA};
+    use hyoui::protocol::{ControlMessage, MVP_CAPS, Mode, TYPE_CBOR_CONTROL, TYPE_RAW_DATA};
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use std::os::fd::AsFd;
 
@@ -193,6 +225,7 @@ fn bridge_loop(
     };
     let mut conn = ClientConnection::connect(sock_path, opts)
         .map_err(|e| format!("connect/handshake: {e}"))?;
+    send_attach_info(&conn.response, &output_tx)?;
 
     loop {
         let reader_fd = conn.reader_fd();
@@ -219,16 +252,31 @@ fn bridge_loop(
         if reader_ready {
             match conn.recv_frame() {
                 Ok(frame) => {
-                    if frame.ty == TYPE_RAW_DATA
-                        && output_tx.send(BridgeOutput::Bytes(frame.body)).is_err()
-                    {
-                        // WS 側 writer が閉じた = client 離脱、正常終了。
-                        return Ok(());
+                    if frame.ty == TYPE_RAW_DATA {
+                        if output_tx.send(BridgeOutput::Bytes(frame.body)).is_err() {
+                            // WS 側 writer が閉じた = client 離脱、正常終了。
+                            return Ok(());
+                        }
+                    } else if frame.ty == TYPE_CBOR_CONTROL {
+                        match ControlMessage::decode_from(frame.body.as_slice()) {
+                            Ok(ControlMessage::LeaderNotify(notify)) => {
+                                conn.response.leader =
+                                    notify.client_id == Some(conn.response.client_id);
+                                send_attach_info(&conn.response, &output_tx)?;
+                            }
+                            Ok(ControlMessage::ModeChange(change)) => {
+                                if let Some(mode) = change.client_mode {
+                                    conn.response.mode = mode;
+                                    send_attach_info(&conn.response, &output_tx)?;
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                return Err(format!("decode daemon control message: {e}"));
+                            }
+                        }
                     }
-                    // CBOR control (LeaderNotify / ModeChange 等) や RAW_ACK は現状
-                    // WS に転写しない (= xterm.js は raw stream しか消費しない)。将来
-                    // UI に leader バッジ等を出したくなったら CBOR → JSON text message で
-                    // 転送する余地あり。
+                    // RAW_ACK は `send_raw_bytes` 内で同期消費されるため、通常ここには来ない。
                 }
                 Err(e) => return Err(format!("recv_frame: {e}")),
             }
@@ -362,4 +410,22 @@ pub fn on_upgrade(ws: WebSocketUpgrade, sock_path: PathBuf) -> axum::response::R
             eprintln!("hyoui-web: WS attach ended: {e}");
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attach_info_json_uses_browser_control_schema() {
+        let info = WsAttachInfo {
+            kind: "attach.info",
+            mode: mode_label(hyoui::protocol::Mode::Ro),
+            leader: false,
+        };
+        let json = serde_json::to_value(info).expect("serialize attach info");
+        assert_eq!(json["kind"], "attach.info");
+        assert_eq!(json["mode"], "ro");
+        assert_eq!(json["leader"], serde_json::Value::Bool(false));
+    }
 }

@@ -50,31 +50,68 @@
   <button id="inputFab" type="button"
           title="Input パネルを開く (ドラッグで移動)"
           aria-label="Open input panel">⌨&#xFE0F;</button>
-  <div id="inputPanel" class="input-panel" hidden role="dialog" aria-label="Input panel">
+  <div id="inputPanel" class="input-panel" hidden role="dialog" aria-label="Terminal panel">
     <div class="input-panel-head">
-      <span class="input-panel-title">Input</span>
+      <span class="input-panel-title">Terminal</span>
       <button type="button" id="inputPanelClose" class="input-panel-close" aria-label="close">×</button>
     </div>
-    <textarea id="inputText" spellcheck="false" autocomplete="off" autocapitalize="off"
-              rows="4" placeholder="Cmd/Ctrl+Enter で送信 / Enter は改行"></textarea>
-    <div class="input-panel-buttons">
-      <button type="button" id="sendBtn" class="send-primary">Send  <kbd>⌘↩</kbd></button>
-      <label class="opt" title="各行末に Enter (0x0d) を挟む。off だと生 bytes だけ送る"><input type="checkbox" id="sendEnterAfter" checked> Enter/行</label>
-      <button type="button" id="keypadToggle" aria-expanded="false" aria-controls="keypad">Keys ▾</button>
-      <button type="button" id="sendKey" title="任意 key 名 (例: Escape, Tab, Ctrl-C, C-a)">Key…</button>
+    <div class="panel-tabs" role="tablist" aria-label="Terminal panel tabs">
+      <button type="button" id="inputTab" class="panel-tab active" role="tab"
+              aria-selected="true" aria-controls="inputTabPanel">入力</button>
+      <button type="button" id="infoTab" class="panel-tab" role="tab"
+              aria-selected="false" aria-controls="infoTabPanel">情報</button>
     </div>
-    <div id="keypad" class="keypad" aria-label="special key pad" hidden>
-      <button type="button" data-spec="key:Up" title="Up (↑)">↑</button>
-      <button type="button" data-spec="key:Down" title="Down (↓)">↓</button>
-      <button type="button" data-spec="key:Left" title="Left (←)">←</button>
-      <button type="button" data-spec="key:Right" title="Right (→)">→</button>
-      <button type="button" data-spec="key:Tab" title="Tab">Tab</button>
-      <button type="button" data-spec="hex:1b5b5a" title="Shift+Tab (CSI Z / BackTab)">⇧Tab</button>
-      <button type="button" data-spec="key:Escape" title="Escape">Esc</button>
-      <button type="button" data-spec="key:Enter" title="Enter">Enter</button>
-      <button type="button" data-spec="key:Ctrl-C" title="Ctrl+C">^C</button>
+    <div id="inputTabPanel" class="panel-tab-content" role="tabpanel" aria-labelledby="inputTab">
+      <textarea id="inputText" spellcheck="false" autocomplete="off" autocapitalize="off"
+                rows="4" placeholder="Cmd/Ctrl+Enter で送信 / Enter は改行"></textarea>
+      <div class="input-panel-buttons">
+        <button type="button" id="sendBtn" class="send-primary">Send  <kbd>⌘↩</kbd></button>
+        <label class="opt" title="各行末に Enter (0x0d) を挟む。off だと生 bytes だけ送る"><input type="checkbox" id="sendEnterAfter" checked> Enter/行</label>
+        <button type="button" id="keypadToggle" aria-expanded="false" aria-controls="keypad">Keys ▾</button>
+        <button type="button" id="sendKey" title="任意 key 名 (例: Escape, Tab, Ctrl-C, C-a)">Key…</button>
+      </div>
+      <div id="keypad" class="keypad" aria-label="special key pad" hidden>
+        <button type="button" data-spec="key:Up" title="Up (↑)">↑</button>
+        <button type="button" data-spec="key:Down" title="Down (↓)">↓</button>
+        <button type="button" data-spec="key:Left" title="Left (←)">←</button>
+        <button type="button" data-spec="key:Right" title="Right (→)">→</button>
+        <button type="button" data-spec="key:Tab" title="Tab">Tab</button>
+        <button type="button" data-spec="hex:1b5b5a" title="Shift+Tab (CSI Z / BackTab)">⇧Tab</button>
+        <button type="button" data-spec="key:Escape" title="Escape">Esc</button>
+        <button type="button" data-spec="key:Enter" title="Enter">Enter</button>
+        <button type="button" data-spec="key:Ctrl-C" title="Ctrl+C">^C</button>
+      </div>
+      <p id="sendStatus" class="meta"></p>
     </div>
-    <p id="sendStatus" class="meta"></p>
+    <div id="infoTabPanel" class="panel-tab-content info-panel" role="tabpanel"
+         aria-labelledby="infoTab" hidden>
+      <section>
+        <h2>Attach</h2>
+        <dl class="info-list">
+          <div><dt>mode</dt><dd id="infoAttachMode">接続待ち</dd></div>
+          <div><dt>leader</dt><dd id="infoAttachLeader">接続待ち</dd></div>
+        </dl>
+      </section>
+      <section>
+        <h2>表示設定</h2>
+        <div id="infoDisplaySettings" class="info-settings"></div>
+        <p class="info-note">「embed 中に変更」は Phase 2 用です。変更値は外側の reload でリセットされます。</p>
+        <div class="info-source-legend" aria-label="設定値の出自">
+          <span class="source-badge source-url">URL 指定</span>
+          <span class="source-badge source-default">default</span>
+          <span class="source-badge source-runtime">embed 中に変更</span>
+        </div>
+      </section>
+      <section>
+        <h2>Session</h2>
+        <dl class="info-list">
+          <div><dt>hyoui_session_id</dt><dd id="infoSessionId"></dd></div>
+          <div><dt>child pid</dt><dd id="infoChildPid">取得中</dd></div>
+          <div><dt>child-state</dt><dd id="infoChildState">取得中</dd></div>
+          <div><dt>attach clients</dt><dd id="infoAttachClients">取得中</dd></div>
+        </dl>
+      </section>
+    </div>
   </div>
   <details id="debugPanel">
     <summary>debug log (<span id="debugCount">0</span>)</summary>
