@@ -31,10 +31,6 @@
 
 m41-43 の裁定 (閉じる廃止 / Esc=resume / UX 視点の 2 群) は v0.9.32 で反映済み。
 
-### 👺IP-C1: FAB 情報パネル Phase 1 (v0.9.32) の確認
-
-- [ ] a: web ターミナルの FAB → 「情報」タブで attach (mode/leader)・表示設定 (出自バッジ付き)・セッション情報が見える
-
 ### 👺SV-C1: 自動起動の再起動実機確認 (kawaz にしか不可)
 
 - [ ] a: 次回 PC 再起動後に web (https://hyoui.kawaz-mbp16-20211217.kawaz.jp) が自動で生きていることを確認
