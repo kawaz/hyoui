@@ -1,7 +1,7 @@
 // hyoui web — session page.
 // Fetches /api/sessions/:id/screen (ANSI) every few seconds, writes bytes into
 // an xterm.js instance. Input form POSTs to /api/sessions/:id/input.
-(() => {
+(async () => {
   const REFRESH_MS = 2000;
   const COLS = 80;
   const ROWS = 24;
@@ -184,7 +184,55 @@
   } else if (window.__hyouiDebug) {
     window.__hyouiDebug('warn', 'FitAddon global not found');
   }
+  // ---- webfont のロードを待ってから open する (font-load / fit race 対策) ----
+  //
+  // xterm.js は open() 時に測った 1 セルの実寸で grid を確定し、以降は要素の実寸が
+  // 変わるまで再測定しない。fit() / refresh() / 同値の fontFamily 再設定でも
+  // 再測定されないことを実測済み (docs/issue/2026-07-30-bug-web-terminal-font-load-
+  // fit-race.md)。webfont 未ロードのまま open すると fallback フォントのセル寸法
+  // (実測 7.81px) で cols/rows が固まり、HackGen の実寸 (6.84px) に切り替わるのは
+  // 次に viewport が動いた時になる。?resize=1 ではその誤ったサイズが PTY へ送られ、
+  // 初回表示直後に子 TUI が不自然に再レイアウトされる。
+  //
+  // style.css の font-display: block は glyph の描画を遅らせるだけで、JS からの
+  // セル測定も open() も block しないため、ここで明示的に待つ必要がある。
+  // 待つのは実際に使う font shorthand そのもの (= query の fontfamily を含む
+  // チェーン全体) で、既定の HackGen だけを特別扱いしない。
+  //
+  // フォントを配れない環境 (404 / オフライン / 未対応ブラウザ) で terminal 自体が
+  // 起動しなくなるのは避けたいので、reject も timeout も「fallback フォントの
+  // メトリクスで続行」として扱う。
+  const FONT_LOAD_TIMEOUT_MS = 2000;
+  if (document.fonts && typeof document.fonts.load === 'function') {
+    try {
+      await Promise.race([
+        document.fonts.load(`${fontSize}px ${fontFamily}`),
+        new Promise((resolve) => setTimeout(resolve, FONT_LOAD_TIMEOUT_MS)),
+      ]);
+    } catch (e) {
+      console.warn(`hyoui: font load failed (${e.message}), using fallback metrics`);
+    }
+  }
   term.open(termEl);
+  // font load が timeout した場合の保険。open 後にセル寸法が変わったら grid を
+  // 作り直す。xterm.js 5.3 の fit() は自前で再測定しないので、内部の
+  // CharSizeService に測り直させてから fit する (= 公開 API に代替が無い。
+  // dispose → 再 open は scrollback と WS の状態を失うので採らない)。
+  // 内部 API なので存在チェック付きで呼び、無ければ何もしない (vendor 差し替えで
+  // silently 壊れるより、この保険を諦めるほうが安全)。
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(() => {
+      const charSize = term._core && term._core._charSizeService;
+      if (!charSize || typeof charSize.measure !== 'function') return;
+      const before = charSize.width;
+      try { charSize.measure(); } catch (_e) { return; }
+      if (charSize.width === before) return;
+      if (window.__hyouiDebug) {
+        window.__hyouiDebug('info', `cell width changed after font load: ${before} -> ${charSize.width}, refitting`);
+      }
+      scheduleFit();
+    });
+  }
   // playwright / devtools 用の debug hook。production でも露出しているが
   // xterm.js の内部 API なので副作用は限定的 (= UI ボタンを増やす代わり)。
   window.__hyouiTerm = term;
