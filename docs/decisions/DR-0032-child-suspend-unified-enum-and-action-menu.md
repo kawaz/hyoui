@@ -2,7 +2,7 @@
 
 - Status: Draft (= kawaz レビュー後に Active 化)
 - Date: 2026-07-30
-- Related: DR-0005 (思想 — 子から見た透過、DR-0029 で狭めた原則との整合), DR-0013 (screen state 正本 — menu 描画が正本を汚さない制約), DR-0014 (self-check — 本 DR の in-band 解釈拡張の justify), DR-0019 (daemon 側 auto-resume policy — 写像先、CLI flag / `hyoui set` の語彙は不変), DR-0024 (config ファイル機構 — CLI flag 最小化の思想を本 DR が踏襲), DR-0029 (attach は覗き窓 — §1 通知行を menu の第 1 段描画が拡張、§2 単発 action を `ctrlz_action` で設定化, §4 config を本 DR が統合), DR-0030 (rw attach 中は子を停止させたままにしない — 本 DR の enum default が同原則を維持、menu は opt-out 側の UX 改善)
+- Related: DR-0005 (思想 — 子から見た透過、DR-0029 で狭めた原則との整合), DR-0013 (screen state 正本 — menu 描画が正本を汚さない制約), DR-0014 (self-check — 本 DR の in-band 解釈拡張の justify), DR-0019 (daemon 側 auto-resume policy — 写像先、CLI flag / `hyoui set` の語彙は不変), DR-0024 (config ファイル機構 — CLI flag 最小化の思想を本 DR が踏襲), DR-0029 (attach は覗き窓 — §1 通知行を menu の第 1 段描画が拡張、§2 単発 action を `ctrlz_x1_action` で設定化, §4 config を本 DR が統合), DR-0030 (rw attach 中は子を停止させたままにしない — 本 DR の enum default が同原則を維持、menu は opt-out 側の UX 改善)
 - Origin: docs/issue/2026-07-30-design-child-suspend-action-menu.md (kawaz 骨子裁定 2026-07-30、ccmsg r92 m18-20)
 
 ## Context
@@ -32,7 +32,7 @@ kawaz 裁定 (2026-07-30) の骨子:
 2. 子 suspend 時の動作を 1 つの enum に統合する (= bool 2 個の統合リファクタを兼ねる)。
    原案 `on_child_suspend_action = auto_resume_always | auto_resume_on_attached | show_child_action_menu`、
    語彙は既存との整合性を考えて調整 (= AI 側に委任)
-3. `ctrlz_action = client_suspend | client_detach` (既定 `client_suspend`) で detach 派の選択肢を復活
+3. `ctrlz_x1_action = client_suspend | client_detach | select_on_demand` (既定 `client_suspend`) で detach 派の選択肢の復活 + 単発確定後の選択プロンプト
 4. メニュー項目: client detach / client suspend (fg 復帰で子も起こす) / SIGCONT /
    SIGINT・SIGHUP・SIGKILL (終了系として別グループ)
 
@@ -53,7 +53,7 @@ on_child_suspend = "auto_resume_on_attached"
 理由: 既存 daemon CLI flag `--on-child-suspend=notify|auto-resume` ([[DR-0019]] §3) と
 1:1 対応する名前にすることで「同じ概念の設定」であることが読者に見える。
 `on_child_suspend` は前置詞句として既に「子 suspend 時に何をするか」を意味しており、
-`_action` suffix は情報を足さない (`ctrlz_action` は key 全体で「ctrlz の action」を
+`_action` suffix は情報を足さない (`ctrlz_x1_action` は key 全体で「ctrlz 単発の action」を
 構成するので suffix が必要、という違い)。**値名は原案 3 値をそのまま採用**する
 (= snake_case、TOML key の既存慣習と一致。長いが自己説明的で、config は補完が効かない
 分だけ読み時の自明性を優先する)。
@@ -190,16 +190,47 @@ signal 送信) を再利用する。**新 protocol message / cap flag は追加�
 メニュー内の具体的キーバインド (項目選択キー、番号 / カーソル移動、キャンセルキー) は
 本 DR では確定せず後続 issue とする (§Consequences)。
 
-### 3. `[attach] ctrlz_action = client_suspend | client_detach`
+### 3. `[attach] ctrlz_x1_action = client_suspend | client_detach | select_on_demand`
 
 ```toml
 [attach]
-ctrlz_action = "client_suspend"   # 単発 Ctrl+Z の action。client_detach で detach に変更
+ctrlz_x1_action = "client_suspend"   # 単発 Ctrl+Z 確定時の action
 ```
 
 [[DR-0029]] §2 の Ctrl+Z ガードの「余った 1 発」が起動する action (= 現在 client suspend
 にハードコード) を設定化する。既定 `client_suspend` (= DR-0029 の挙動そのまま)。
 `client_detach` を選ぶと単発 Ctrl+Z で detach する (= 接続を畳む。子は走り続ける)。
+
+**key 名に `x1` を含めるのは、この設定が司るのが「ガード窓で単発 (×1) と確定した後の
+action だけ」であることを名前から読めるようにするため** (kawaz 裁定 2026-07-30)。
+ガード窓そのもの (単発判定・連打 forward・他キー割り込み) はこの設定では変わらない。
+
+#### `select_on_demand` — 単発確定後にプロンプト状態へ遷移する第 3 の値
+
+即 suspend / 即 detach の代わりに、**単発確定を「選択待ち」に変える**:
+
+1. 単発 Ctrl+Z が確定すると、client は alt screen を抜けて (= 全画面 TUI の表示から
+   通常画面に戻し)、最下行にその場限りの 1 行プロンプトを描画する:
+   `[hyoui] ^Z: client suspend / ^C: client 終了 / その他のキー: 戻る`
+2. プロンプト状態のキー表:
+
+   | キー | 動作 |
+   |---|---|
+   | Ctrl+Z | client suspend (= `client_suspend` と同じ) |
+   | Ctrl+C | client 終了 (= detach。子は走り続ける) |
+   | その他 | キャンセルして attach 表示に戻る (当該キーは**破棄**、子へ送らない) |
+
+3. timeout は設けない (= 子は走り続けており急ぐ理由がない。プロンプトは次のキーまで
+   持続する)。この 3 点はいずれも提案値で、kawaz レビューで調整する
+4. この状態は**単発アクション確定後の client 側の状態機械**であり、ガード窓とは別物。
+   ガード窓の 2 連打 forward (= 子へ Ctrl+Z を届ける経路) は本モードでもそのまま使える
+5. プロンプト状態中のキーは hyoui が飲み、PTY へ流さない (= §2 menu と同じ in-band
+   解釈。justify も同じ「明示的にユーザが hyoui の操作面を呼び出した状態に限定」——
+   ここでは Ctrl+Z 単発がその呼び出しにあたる)
+6. 描画は §4 第 1 段と同じその場限り方式 (screen state 不汚染、[[DR-0013]])
+
+位置づけは **§2 child action menu の client 版** (kawaz 原文)。menu が「子が止まった時の
+子への操作面」であるのに対し、こちらは「client をどう畳むかの操作面」で、対象が違う。
 
 **[[DR-0029]] Rejected「Ctrl+Z 単発を detach に割り当てる」との関係**: あの却下は
 「**default として**は `fg` で戻れず re-attach を強いるので不適」という判断であり、
@@ -252,7 +283,7 @@ menu の意味論 (発動条件 / 項目 / 入力の扱い) は変わらない�
 
 ### key 名を kawaz 原案どおり `on_child_suspend_action` にする
 
-`ctrlz_action` と suffix が揃う利点はあるが、既存 CLI flag `--on-child-suspend` との
+`ctrlz_x1_action` と suffix が揃う利点はあるが、既存 CLI flag `--on-child-suspend` との
 対応が名前から見えなくなる。`on_child_suspend` は句として action を既に含意しており、
 suffix は冗長 (§1)。
 
@@ -312,7 +343,7 @@ menu のキー操作と子への入力が同じ打鍵から二重解釈される
   - 終了系項目で stopped な子が実際に終了すること (= SIGCONT 併送の実効。
     `kill -STOP` した `cat` / `bash -i` / TUI の 3 category、[[DR-0014]] 検証主義)
   - 旧 config key での起動エラーと hint 文言
-  - ctrlz_action 両値 × 単発 / 2 連打 (= DR-0029 §2 の表の action 差し替え確認)
+  - ctrlz_x1_action 全 3 値 × 単発 / 2 連打 (= DR-0029 §2 の表の action 差し替え確認。select_on_demand はプロンプト状態のキー表 3 分岐も)
 - **後続 issue として残す (= 本 DR では確定しない)**:
   - メニューのキーバインド詳細 (項目選択・キャンセルのキー割当、表示レイアウト文言)
   - web UI ([[DR-0027]]) 側での同等機能 (= browser client での menu 相当の操作 UI)
