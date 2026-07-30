@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-07-30 | request | open | [web-floating-info-panel](./2026-07-30-request-web-floating-info-panel.md) | 既存キーボード FAB を拡張し、フローティング内タブで入力/情報モード切替。情報モードに attach (ro/rw/leader)・embed パラメータ・セッション情報を表示 (Phase 1)、変更操作は Phase 2 (leader 昇格は leader.request 実装が前提) |
 | 2026-07-30 | design | open | [child-suspend-action-menu](./2026-07-30-design-child-suspend-action-menu.md) | 子 suspend 時動作の enum 統合 (auto_resume 2 bool の置換) + resume_stopped_child=false 時の attach 内操作メニュー (kawaz 骨子裁定済み、DR 起草待ち) |
 | 2026-07-30 | bug | open | [stdout-epipe-panic](./2026-07-30-bug-stdout-epipe-panic.md) | `hyoui status \| head` 等で stdout が早期 close されると Broken pipe panic。EPIPE は正常終了に倒すべき (SIGPIPE 復元 vs BrokenPipe 握り分けの検討要) |
 | 2026-07-30 | bug | wip | [web-terminal-font-load-fit-race](./2026-07-30-bug-web-terminal-font-load-fit-race.md) | 3 独立原因を修正済み: webfont load 待ち後に xterm を open、fit は寸法提案だけ行い WS leader 接続から daemon resize が成功してから browser grid を変更、待機中/失敗/resize off は旧 grid + 横スクロールを維持。fallback POST は leader 衝突を 409 で返す。WS E2E と dev gateway + Playwright で daemon PTY 追従・横スクロール・409 を検証済み |
