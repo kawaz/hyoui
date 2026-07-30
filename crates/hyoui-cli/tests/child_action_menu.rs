@@ -10,6 +10,9 @@
 //!   → 項目キーで SIGCONT / 終了系 signal / detach を実行
 //! ```
 //!
+//! 観測は 2 側面 (DR-0014 の「期待 vs 実態」): 子の `ps` STAT (= kernel 側) と
+//! `hyoui status` の `child-state:` (= daemon 側の認識)。
+//!
 //! `#[ignore]`: PTY child + signal を使うため CI では走らせずローカルで `--ignored` 実行
 //! (= jobcontrol_*.rs / ctrlz_suspend_client.rs と同じ運用)。
 
@@ -26,9 +29,14 @@ const MENU_CONFIG: &str = "[session]\non_child_suspend = \"show_child_action_men
 /// menu の第 1 行 (= DR-0029 §1 通知行を N 行に拡張したもの)。
 const MENU_HEADER: &str = "子プロセスが停止中";
 
-/// menu が出ている状態の被験体一式 (= runner を握って test 終了まで生かす)。
+/// menu が出ている状態の被験体一式。
+///
+/// `runner` を field で持つのは **socket を生かすため**: runner が抱える TempDir が
+/// drop されると runtime dir ごと消えて daemon の socket が消滅する (= 実測で踏んだ)。
+/// `let Stopped { h, .. } = ...` のような destructuring は runner を即 drop するので
+/// 使わない。
 struct Stopped {
-    /// runtime dir を握る runner (= drop で TempDir が消えるので保持が必要)。
+    /// runtime dir (= socket 置き場) を握る runner。
     _runner: HyouiTestRunner,
     /// PTY 内の `hyoui run` (= daemon を fork した attach client)。
     h: SpawnedHyoui,
@@ -78,34 +86,32 @@ fn stopped_with_menu(session: &str, child_argv: &[&str]) -> Stopped {
 #[ignore = "PTY child + signal を使う、ローカルで --ignored 実行 (DR-0032 §2)"]
 #[test]
 fn menu_appears_on_stop_and_c_resumes_child() {
-    let Stopped {
-        mut h, child_pid, ..
-    } = stopped_with_menu("menu-resume", &["/bin/cat"]);
-
+    let mut s = stopped_with_menu("menu-resume", &["/bin/cat"]);
     assert!(
-        process_state_of(child_pid)
+        process_state_of(s.child_pid)
             .expect("子の state")
             .is_state('T'),
         "menu を出す設定では子は停止したままであるべき"
     );
+    assert!(
+        wait_child_state(&s.h, "stopped", Duration::from_secs(5)),
+        "daemon 側も stopped と認識しているはず: {:?}",
+        s.h.status_text()
+    );
 
-    h.send_bytes(b"c").expect("menu key: c");
-    let resumed = {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let st = process_state_of(child_pid).expect("子の state");
-            if !st.is_state('T') {
-                break true;
-            }
-            if std::time::Instant::now() >= deadline {
-                break false;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    };
-    assert!(resumed, "menu の `c` (SIGCONT) で子が起きるはず");
+    s.h.send_bytes(b"c").expect("menu key: c");
+    assert!(
+        wait_not_stopped(s.child_pid, Duration::from_secs(5)),
+        "menu の `c` (SIGCONT) で子が起きるはず: {}",
+        state_of(s.child_pid)
+    );
+    assert!(
+        wait_child_state(&s.h, "running", Duration::from_secs(5)),
+        "daemon 側の child-state も running に戻るはず: {:?}",
+        s.h.status_text()
+    );
 
-    let _ = h.kill();
+    let _ = s.h.kill();
 }
 
 /// menu 表示中の入力は client が飲み、PTY へ forward されない (DR-0032 §2)。
@@ -115,52 +121,44 @@ fn menu_appears_on_stop_and_c_resumes_child() {
 #[ignore = "PTY child + signal を使う、ローカルで --ignored 実行 (DR-0032 §2)"]
 #[test]
 fn menu_swallows_input_and_does_not_forward_to_child() {
-    let Stopped {
-        mut h, child_pid, ..
-    } = stopped_with_menu("menu-swallow", &["/bin/cat"]);
+    let mut s = stopped_with_menu("menu-swallow", &["/bin/cat"]);
 
-    // 表に無いキーだけで構成した marker (= 項目キー c/z/d/i/h/k/q を含まない)。
-    h.send_bytes(b"MENU-SWALLOWED\r").expect("menu 中の入力");
+    s.h.send_bytes(b"MENU-SWALLOWED\r").expect("menu 中の入力");
     std::thread::sleep(Duration::from_millis(300));
 
     // `c` で resume してから、forward が再開したことを別 marker で確かめる。
-    h.send_bytes(b"c").expect("menu key: c");
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while process_state_of(child_pid)
-        .expect("子の state")
-        .is_state('T')
-    {
-        assert!(std::time::Instant::now() < deadline, "子が resume しない");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    h.send_bytes(b"AFTER-RESUME\r").expect("resume 後の入力");
-    let after = h
-        .wait_for("AFTER-RESUME", Duration::from_secs(5))
-        .expect("resume 後の入力は子 (cat) が echo するはず");
+    s.h.send_bytes(b"c").expect("menu key: c");
+    assert!(
+        wait_not_stopped(s.child_pid, Duration::from_secs(5)),
+        "子が resume しない: {}",
+        state_of(s.child_pid)
+    );
+    s.h.send_bytes(b"AFTER-RESUME\r").expect("resume 後の入力");
+    let after =
+        s.h.wait_for("AFTER-RESUME", Duration::from_secs(5))
+            .expect("resume 後の入力は子 (cat) が echo するはず");
     assert!(
         !after.contains("MENU-SWALLOWED"),
         "menu 中の入力は子へ流れてはいけない: {after:?}"
     );
 
-    let _ = h.kill();
+    let _ = s.h.kill();
 }
 
 /// 終了系 `k` (SIGKILL) は停止中の子を実際に終わらせる (DR-0032 §2)。
 #[ignore = "PTY child + signal を使う、ローカルで --ignored 実行 (DR-0032 §2)"]
 #[test]
 fn menu_sigkill_terminates_stopped_child() {
-    let Stopped {
-        mut h, child_pid, ..
-    } = stopped_with_menu("menu-sigkill", &["/bin/cat"]);
+    let mut s = stopped_with_menu("menu-sigkill", &["/bin/cat"]);
 
-    h.send_bytes(b"k").expect("menu key: k");
+    s.h.send_bytes(b"k").expect("menu key: k");
     assert!(
-        wait_gone(child_pid, Duration::from_secs(5)),
+        wait_gone(s.child_pid, Duration::from_secs(5)),
         "SIGKILL は stopped な子にも即効くはず: {}",
-        state_of(child_pid)
+        state_of(s.child_pid)
     );
 
-    let _ = h.kill();
+    let _ = s.h.kill();
 }
 
 /// 終了系 `i` (SIGCONT + SIGINT) は停止中の子を起こしてから終わらせる (DR-0032 §2)。
@@ -170,50 +168,78 @@ fn menu_sigkill_terminates_stopped_child() {
 #[ignore = "PTY child + signal を使う、ローカルで --ignored 実行 (DR-0032 §2)"]
 #[test]
 fn menu_sigint_wakes_and_terminates_stopped_child() {
-    let Stopped {
-        mut h, child_pid, ..
-    } = stopped_with_menu("menu-sigint", &["/bin/cat"]);
+    let mut s = stopped_with_menu("menu-sigint", &["/bin/cat"]);
 
-    h.send_bytes(b"i").expect("menu key: i");
+    s.h.send_bytes(b"i").expect("menu key: i");
     assert!(
-        wait_gone(child_pid, Duration::from_secs(5)),
+        wait_gone(s.child_pid, Duration::from_secs(5)),
         "SIGCONT 併送で SIGINT が配送され子が終わるはず: {}",
-        state_of(child_pid)
+        state_of(s.child_pid)
     );
 
-    let _ = h.kill();
+    let _ = s.h.kill();
 }
 
 /// 継続系 `d` (detach) は client を畳み、子は停止したまま残る (DR-0032 §2)。
 #[ignore = "PTY child + signal を使う、ローカルで --ignored 実行 (DR-0032 §2)"]
 #[test]
 fn menu_detach_closes_client_and_leaves_child_stopped() {
-    let Stopped {
-        mut h, child_pid, ..
-    } = stopped_with_menu("menu-detach", &["/bin/cat"]);
+    let mut s = stopped_with_menu("menu-detach", &["/bin/cat"]);
 
-    h.send_bytes(b"d").expect("menu key: d");
-    let code = h
-        .wait_exit_code(Duration::from_secs(5))
-        .expect("detach で client が終了するはず");
+    s.h.send_bytes(b"d").expect("menu key: d");
+    let code =
+        s.h.wait_exit_code(Duration::from_secs(5))
+            .expect("detach で client が終了するはず");
     assert_eq!(code, 0, "自発 detach は exit 0 (= 正常離脱)");
     assert!(
-        process_state_of(child_pid)
+        process_state_of(s.child_pid)
             .expect("子の state")
             .is_state('T'),
         "detach 後も子は停止したまま残る (= 無人なので停止維持、DR-0030 §3)"
     );
 
     // 子は daemon 配下に残っているので、CLI から始末する。
-    let _ = h.kill();
+    let _ = s.h.kill();
 }
 
+/// daemon 側の `child-state:` (= `hyoui status` の 1 行) が `expected` になるまで待つ。
+fn wait_child_state(h: &SpawnedHyoui, expected: &str, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(text) = h.status_text()
+            && let Some(line) = text.lines().find(|l| l.starts_with("child-state:"))
+            && line.contains(expected)
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// 子の `ps` STAT が停止 (`T`) を抜けるまで待つ。
+fn wait_not_stopped(pid: i32, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if process_state_of(pid).is_ok_and(|st| !st.is_state('T')) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// 子が終了する (= 消える or zombie になる) まで待つ。
 fn wait_gone(pid: i32, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match process_state_of(pid) {
             Err(_) => return true,
-            // 子は daemon が waitpid するまで zombie で残りうる (= 終了済み扱い)。
+            // daemon が waitpid するまで zombie で残りうる (= 終了済み扱い)。
             Ok(st) if st.is_state('Z') => return true,
             Ok(_) => {}
         }

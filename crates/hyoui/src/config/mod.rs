@@ -387,8 +387,8 @@ const REMOVED_KEYS: &[RemovedKey] = &[
         name: "resume_stopped_child",
         display: "[attach] resume_stopped_child",
         hint: "`[session] on_child_suspend = \"auto_resume_on_attached\"` (旧 true、= default) / \
-               `\"show_child_action_menu\"` (旧 false、= 起こさず child action menu を出す) に \
-               書き換えてください",
+               `\"show_child_action_menu\"` (旧 false、= 起こさず child action menu を出す) \
+               に書き換えてください",
     },
 ];
 
