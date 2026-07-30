@@ -24,9 +24,26 @@
 
 ## 確認待ち
 
-### 👺WP-C1: web 表示パラメータ (v0.9.29) の使用感確認
+### 👺WP-C1: 文字幅パラメータ (v0.9.30) の確認 — 本命の要望分
 
-- [ ] a: `?fontsize=` `bg=` `fg=` `scrollback=` `lineheight=` `fontfamily=` を試して要望どおりか確認 (embed でも有効。例: `/sessions/<id>?embed=1&fontsize=16&bg=000`)
+- [ ] a: `?ambw=full` で ambiguous 文字 (① ★ ⚠ 等) が全角幅になることを確認 (既定 half = 現状)
+- [ ] b: `?unicode=6` で旧 (v0.9.25 以前) の幅挙動に戻ることを確認 (既定 11)
+
+補足: 前回誤解して入れた `?fontsize= bg= fg= scrollback= lineheight= fontfamily=` もそのまま使えます。
+
+### 👺CZ2-C1: ^Z 単発 = client suspend (v0.9.30) の実機確認
+
+- [ ] a: attach 中に ^Z 単発 (1 秒待つ) → client が suspend して shell に戻り、`fg` で即復帰 + 再描画。子は走り続ける
+- [ ] b: 2 連打 → 子に 1 発だけ届く (従来どおり)
+
+親シェル消滅時の suspend client 自動消滅・suspend 中 kill の子無影響は AI 実機検証済み (e2e にも固定)。
+
+### 👺RS-C1: embed リサイズ修正 (v0.9.30) の実機確認
+
+- [ ] a: ccmsg webui 等の iframe 縮小で表示が追従し、折り返しが出ない (追従前は横スクロール) ことを確認
+
+真因は WS が leader を持つ間 resize POST が拒否されつつ 204 偽成功を返していたこと。
+resize を WS 経由に変更 + 偽成功根絶 + PTY 成功後にのみ再レイアウト。
 
 ### 👺SV-C1: 自動起動の再起動実機確認 (kawaz にしか不可)
 
