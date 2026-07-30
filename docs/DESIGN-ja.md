@@ -182,8 +182,9 @@ Control message body (type=0x01) = CBOR map { "kind": "<dotted.name>", ...payloa
 - stdin → frame writer (`type=0x00 raw data`)
 - frame reader → stdout
 - **Ctrl+Z ガード state machine** ([[DR-0029]] §2): tty stdin で 2 発ごとに子へ
-  Ctrl+Z を 1 発届け、余った 1 発が `ctrlz_guard_delay` 後に client を detach する。
-  prefix キーは持たず、子には hyoui 由来の escape を一切足さない
+  Ctrl+Z を 1 発届け、余った 1 発が `ctrlz_guard_delay` 後に **client 自身を suspend**
+  する (= 外側 shell に戻り、`fg` で同じ接続に復帰。接続は畳まない)。prefix キーは
+  持たず、子には hyoui 由来の escape を一切足さない
 - 1-shot CLI (`input` / `screen dump` / `screen snapshot` / `tail` / `wait` /
   `lock` / `kill` / `list` / `status`) 用に `recv_frame()` / `recv_control(buffer_raw_data)` /
   `send_raw_bytes()` を提供

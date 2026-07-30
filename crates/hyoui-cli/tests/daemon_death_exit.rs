@@ -96,12 +96,18 @@ fn child_exit_propagates_code() {
     );
 }
 
-/// Ctrl+Z 単発 (= ガード発火、DR-0029 §2) で client が自分から離脱したら exit 0
-/// (= Detached)。daemon と子は生き続ける (= ConnectionLost ではない)。
+/// Ctrl+Z 単発 (= ガード発火、DR-0029 §2) は **detach ではなく client suspend** なので、
+/// client process は終了せず attach も維持される (= 2026-07-30 kawaz 裁定で仕様変更。
+/// 旧 test は exit 0 = Detached を期待していた)。
+///
+/// この test process が spawn した client の pgrp は orphan (= 親が別 session) なので、
+/// POSIX により SIGTSTP は破棄され実際には停止しない。ここで確かめるのは
+/// 「**client が終了しない**」ことだけで、停止 / `fg` 復帰の観測は job control を持つ
+/// 親 shell が要るため e2e `ctrlz_suspend_client.rs` が担当する。
 #[test]
-fn single_ctrl_z_makes_client_exit_zero() {
+fn single_ctrl_z_does_not_terminate_client() {
     let runner = HyouiTestRunner::new();
-    let mut h = runner.spawn_hyoui("daemon-death-detach", &["run", "--", "/bin/sleep", "60"]);
+    let mut h = runner.spawn_hyoui("daemon-death-suspend", &["run", "--", "/bin/sleep", "60"]);
 
     assert!(
         h.wait_for_leader_ready(Duration::from_secs(10)),
@@ -109,20 +115,17 @@ fn single_ctrl_z_makes_client_exit_zero() {
     );
     settle();
 
-    // Ctrl+Z (0x1a) を 1 発だけ PTY 経由で送る → delay 満了で自発 detach。
+    // Ctrl+Z (0x1a) を 1 発だけ PTY 経由で送る → delay 満了で client suspend が起動。
     h.send_bytes(&[0x1a]).expect("send ctrl-z");
 
-    // attach client は Detached で exit 0 する (= 子・daemon は残る)。
-    let code = h.wait_exit_code(Duration::from_secs(10));
+    // suspend は接続を畳まないので、client は exit しないまま生き続ける。
+    let code = h.wait_exit_code(Duration::from_secs(3));
     assert_eq!(
-        code,
-        Some(0),
-        "Ctrl+Z 単発で client は exit 0 (Detached) するはず"
+        code, None,
+        "Ctrl+Z 単発で client が終了してはいけない (= suspend であって detach ではない)"
     );
 
-    // 後始末: daemon と子 (/bin/sleep) はまだ生きている。client (= h.pid) は exec で
-    // attach に化けた後 detach で exit 済なので、Drop の subtree 掃除は daemon を
-    // 拾えない (= daemon は ppid=1 に re-parent 済)。正規経路で daemon を畳む。
+    // 後始末: 正規経路で daemon を畳んでから client を落とす。
     h.kill_daemon_via_cli();
     let _ = h.kill();
 }

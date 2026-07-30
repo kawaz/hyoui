@@ -111,7 +111,7 @@ echo "started: $SESS"
 # session 一覧 (session 名 と socket path)
 hyoui list
 
-# 既存 session に attach (= 入出力を中継、Ctrl+Z で detach)
+# 既存 session に attach (= 入出力を中継、Ctrl+Z 単発で suspend / fg で復帰)
 hyoui attach "$SESS"
 
 # read-only で覗き見
@@ -232,10 +232,12 @@ namespace 内から別 namespace で起動したい場合は `--namespace=<別ns
 ### Ctrl+Z ガード
 
 attach は「走り続けている子を覗く窓」なので、窓の操作で子は止まらない。
-attach 中の **Ctrl+Z 単発**でクライアントだけ detach（子は走り続ける）。
-子に Ctrl+Z を届けたいときは **2 連打**する（= 2 発ごとに子へ 1 発、余った 1 発が
-detach を起こす）。挙動は `~/.config/hyoui/config.toml` の `[attach]` セクション
-（`ctrlz_guard` / `ctrlz_guard_delay`）で変更できる。
+attach 中の **Ctrl+Z 単発**は、クライアント自身を suspend して外側の shell に戻す
+（= 子は走り続け、接続も保たれる。`fg` で同じ窓に戻る）。子に Ctrl+Z を届けたいときは
+**2 連打**する（= 2 発ごとに子へ 1 発、余った 1 発が client suspend を起こす）。
+接続そのものを畳むなら `hyoui detach <session>`。挙動は
+`~/.config/hyoui/config.toml` の `[attach]` セクション
+（`ctrlz_guard` / `ctrlz_guard_delay`、既定 1s）で変更できる。
 
 ## 既存ツールとの違い
 

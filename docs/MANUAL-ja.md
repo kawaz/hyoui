@@ -40,7 +40,8 @@ hyoui run --detached -- claude
 # 端末 B: list で確認 → attach
 hyoui list
 hyoui attach run-<pid>-<rand>
-# detach は Ctrl+Z 単発
+# Ctrl+Z 単発で client を suspend (= shell に戻る、fg で復帰)
+# 接続を畳むなら hyoui detach run-<pid>-<rand>
 ```
 
 ### 2. read-only で観察する

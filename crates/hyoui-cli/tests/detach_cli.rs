@@ -144,11 +144,15 @@ fn attach_emits_discovery_hint_for_ctrl_z_guard() {
 
     let mut leader = runner.spawn_hyoui(session, &["run", "--", "sh", "-c", "sleep 30"]);
     let out = leader
-        .wait_for("[hyoui] detach:", Duration::from_secs(10))
+        .wait_for("[hyoui] suspend", Duration::from_secs(10))
         .expect("ヒントが PTY (stderr) に出るべき");
     assert!(
-        out.contains("[hyoui] detach: Ctrl+Z"),
+        out.contains("Ctrl+Z"),
         "ヒントは Ctrl+Z ガードの操作を案内すべき。out={out:?}"
+    );
+    assert!(
+        out.contains("detach: hyoui detach"),
+        "接続を畳む手段 (= 外側 CLI) も案内すべき。out={out:?}"
     );
 
     // 後始末。

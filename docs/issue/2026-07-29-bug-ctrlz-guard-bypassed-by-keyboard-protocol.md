@@ -3,7 +3,7 @@ title: "Ctrl+Z ガードが keyboard protocol 有効端末で完全に不発 (= 
 status: wip
 category: bug
 created: 2026-07-29T00:00:00+09:00
-last_read: 2026-07-29T00:00:00+09:00
+last_read: 2026-07-30T00:00:00+09:00
 open_entered: 2026-07-29T00:00:00+09:00
 wip_entered: 2026-07-29T00:00:00+09:00
 blocked_entered:
@@ -171,6 +171,51 @@ partial が満了していただけで、decoder の bug ではなかった。�
 確認したいのは「Ghostty が実際に送る Ctrl+Z の byte 列が上表の 3 符号化のどれかに
 収まっているか」で、外れていれば `CTRLZ_ENCODINGS` に 1 行足すだけで済む。
 
+# 追加改訂 (2026-07-30 kawaz 裁定): 単発 = detach → **client suspend**、窓 1000ms
+
+3 符号化対応を実機に載せたうえで、kawaz が単発時のアクションと窓の長さを裁定した:
+
+> a 500ms じゃなく 1000ms に変更しといて。
+> b ok
+> ただし、ctrlz 1 回のときはデタッチじゃなく client の suspend にしてください。fg で
+> すぐに戻れないのは不便すぎる。バックグラウンドのままの client は kill で始末なりしても
+> 子プロセスには影響ないよう。また親シェルがいなくなったら suspend 中の client は
+> 親なしのゴミプロセスとして残らず勝手に死んでほしい
+
+反映内容 (DR-0029 §2 を改訂、正本は DR):
+
+- **単発 = attach client 自身の suspend**。`OUTER_TTY_RESET` → `TtyGuard::suspend` →
+  `sys::signal::suspend_self()` (= `SIGTSTP` を `SIG_DFL` に戻して `raise`) → `SIGCONT`
+  復帰後に `TtyGuard::resume` + redraw 要求。外部 SIGTSTP を受けたときの既存経路
+  (DR-0015 §2.3 の signal thread) と同じ helper を共有しており、新機構は足していない
+- 再描画は独立 message が無いので既存 `SessionChildResumeRequest` (= daemon が redraw →
+  SIGCONT の順で処理する) に相乗り。送る条件は DR-0030 の resume 条件と同じ
+- 接続は畳まないので `RunOutcome::Detached` の発生源は stdin EOF / read error だけになった
+- `ctrlz_guard_delay` default: 500ms → **1000ms**
+- 連打規則 (2 発ごとに子へ 1 発 / 他キー割り込みで保留破棄 / 子へは受信符号化のまま) は不変
+
+## 実機確認 (2026-07-30、macOS、debug 0.9.29、default 1000ms)
+
+停止の観測には job control を持つ親 shell が要る (= test process 直下の client は pgrp が
+orphan なので POSIX により SIGTSTP が破棄される)。入れ子 hyoui で測った:
+
+| 操作 | attach client | 子 (`/bin/cat`) |
+|---|---|---|
+| `0x1a` 単発 | `T` (= stopped) | `S+` |
+| 単発 → `fg` | `S+` (= 同接続で復帰、以後の打鍵が子へ届く) | `S+` |
+| `0x1a` 2 連打 | `S+` (= suspend しない) | `T+` (= 0x1a が届いた) |
+| CSI-u 単発 | `T` | `S+` |
+| CSI-u 2 連打 | `S+` | `S+` + echo に `^[[122;5u` (= 符号化そのまま 1 発) |
+| suspend 中に client を `kill -9` | 消滅 | `S+` / daemon も `child-state: running` |
+| suspend 中に親 shell を `kill -9` | **500ms 以内に消滅** | `S+` |
+
+親シェル消滅時の自滅は **POSIX の orphaned process group 規則**に乗っている
+(= stopped メンバーを含む pgrp が orphan 化すると kernel が SIGHUP + SIGCONT を配送、
+client は SIGHUP に handler を張っていないので default で終了)。`getppid()` 監視のような
+保険コードは実測で不要と確認したため入れていない。`hyoui run -- <cmd>` 形 (= fork daemon +
+exec attach) でも同結果。この 3 ケースは e2e
+`crates/hyoui-cli/tests/ctrlz_suspend_client.rs` (`#[ignore]`、入れ子 PTY + signal) に固定。
+
 # 修正前に検討した論点 (= DR 改訂の要否)
 
 DR-0029 §2 の範囲内で解けると判断したが、以下は判断が要った点:
@@ -189,4 +234,5 @@ DR-0029 §2 の範囲内で解けると判断したが、以下は判断が要�
 
 # 暫定回避
 
-現状 attach 中に窓から抜ける手段が無いので、別端末から `hyoui detach <session>`。
+不要になった (= Ctrl+Z 単発で shell に戻れる)。ガードを切っている場合や
+未知の符号化に落ちた場合は、別端末から `hyoui detach <session>`。

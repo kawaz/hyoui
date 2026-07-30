@@ -61,8 +61,8 @@ hyoui detach [session]
 > CLI から見た self は「一時接続が自分を切る」no-op、others は「一時接続以外 ≒ 全部」
 > となり all と実質同義 — flag として嘘になる。self / others は client addressing
 > (= どの client かを外から指定する仕組み、§Consequences の将来 DR 範囲) が無い
-> 現状の CLI では表現不能なので出さない。中から自分の端末だけ抜けるのは attach の
-> in-band detach キーの役割 (= 現行は Ctrl+Z ガード、[[DR-0029]] §2)。
+> 現状の CLI では表現不能なので出さない。中から自分の端末を一時的に離すのは attach の
+> Ctrl+Z ガード (= client suspend、[[DR-0029]] §2) の役割。
 
 - 引数なし + 中から = 自セッションの全 client detach (= TUI 直起動からの脱出
   ユースケース)。外から = 明示 session の全 client 引き剥がし
@@ -88,9 +88,9 @@ hyoui detach [session]
 ### 5. 発見性の改善 (UX、透過原則の範囲内)
 
 - attach 成立時に **stderr** へ 1 行ヒントを出す:
-  `[hyoui] detach: Ctrl+Z | 子へ Ctrl+Z: 2 連打 | peek (read-only): ... --mode=ro`。
-  文言は Ctrl+Z ガードの設定を反映し、`ctrlz_guard = false` (= in-band detach 無効) なら
-  `hyoui detach <session>` を案内する (= 嘘の脱出方法を教えない、Fable M4 / [[DR-0029]] §2)。
+  `[hyoui] suspend (fg で復帰): Ctrl+Z | 子へ Ctrl+Z: 2 連打 | detach: hyoui detach <session> | peek (read-only): ... --mode=ro`。
+  文言は Ctrl+Z ガードの設定を反映し、`ctrlz_guard = false` (= Ctrl+Z 素通し) なら
+  `hyoui detach <session>` だけを案内する (= 嘘の脱出方法を教えない、Fable M4 / [[DR-0029]] §2)。
   子の出力経路 (PTY) ではなく client の stderr なので透過性を壊さない (screen 慣行)。
   `--quiet` で抑止。非 tty stderr (= pipe 利用) では出さない
 - ヒントの出力位置は **raw mode に入る前** (= 外側端末の scrollback に残り、attach 後の

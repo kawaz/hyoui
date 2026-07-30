@@ -77,7 +77,7 @@ default `true` に倒れる。既定値が同じなので旧 config でも挙動
 本 DR の帰結として、**rw attach 中は子を停止状態に留めておけない**。
 [[DR-0029]] §2 の Ctrl+Z 2 連打で子に SIGTSTP が 1 発届く挙動、および
 attach 中の `hyoui kill --signal=TSTP` は、いずれも **届いた直後に resume される**。
-子を止めたまま置きたい場合は、detach してから (= 誰も rw attach していない状態で)
+子を止めたまま置きたい場合は、`hyoui detach` してから (= 誰も rw attach していない状態で)
 `hyoui kill --signal=TSTP` を使う。
 
 kawaz 裁定 (2026-07-29) の原文要点:
@@ -136,8 +136,8 @@ policy を分岐する state を背負う。§4 のとおり「起こしたい�
   `resume_stopped_child` に改名。旧名は無視され default `true` に倒れる (= 既定値が
   同じなので明示的に `false` にしていた利用者だけが影響を受ける)
 - **[[DR-0029]] §2 の Ctrl+Z 連打表のうち「子へ届く Ctrl+Z」は、attach 中は
-  「届くが即 resume される」** に実効が変わる。detach 側 (= 単発 detach / 2 連打で
-  detach しない) の規則は不変
+  「届くが即 resume される」** に実効が変わる。client 側 (= 単発で client suspend /
+  2 連打では suspend しない) の規則は不変
 - `child_stopped` フラグが resume 後も下りない既知バグ
   (docs/issue/2026-06-12-bug-child-stopped-flag-not-cleared.md) は本 DR で解消しない。
   `hyoui status` の `child-state: stopped` が実態と食い違って見える場面が増える

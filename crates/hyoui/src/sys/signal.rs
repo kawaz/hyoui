@@ -65,6 +65,31 @@ pub fn raise(signum: Signal) -> Result<()> {
     nix::sys::signal::raise(signum).map_err(Error::from)
 }
 
+/// 自プロセスを `SIGTSTP` で停止させ、`SIGCONT` (= 外側 shell の `fg` / `bg`) で
+/// 復帰したら return する (= 同期的に「^Z で shell に戻る」を実現する)。
+///
+/// `SIGTSTP` に [`register_self_pipe`] で handler を張っていると `raise` しても
+/// handler が走るだけで停止しないため、一時的に `SIG_DFL` へ戻して kernel に
+/// 停止させ、復帰後に handler を張り直す。self-pipe が未設置 (= write fd が -1) の
+/// 場合は張り直さない (= 元から default disposition のはず)。
+///
+/// 端末 termios の退避・復元は呼び出し側の責務 (= [`super::TtyGuard::suspend`] /
+/// [`super::TtyGuard::resume`] を前後に挟む)。
+///
+/// # Errors
+///
+/// `sigaction` / `raise` が失敗した場合。
+pub fn suspend_self() -> Result<()> {
+    let selfpipe_armed = SELFPIPE_WRITE_FD.load(Ordering::Relaxed) >= 0;
+    install_default(Signal::SIGTSTP)?;
+    // ここで process 全体が STOPPED になる。SIGCONT を受けると raise から戻る。
+    raise(Signal::SIGTSTP)?;
+    if selfpipe_armed {
+        register_self_pipe(Signal::SIGTSTP)?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // SIGWINCH forwarder
 // ---------------------------------------------------------------------------

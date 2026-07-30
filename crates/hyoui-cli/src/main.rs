@@ -93,7 +93,7 @@ fn install_attach_signal_thread(
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     winch_notify_wr: Option<std::os::fd::OwnedFd>,
 ) -> Result<std::thread::JoinHandle<()>, hyoui::sys::Error> {
-    use hyoui::sys::signal::{install_default, install_self_pipe, raise, register_self_pipe};
+    use hyoui::sys::signal::{install_self_pipe, register_self_pipe, suspend_self};
     use nix::sys::signal::Signal;
     use std::sync::atomic::Ordering;
 
@@ -121,14 +121,13 @@ fn install_attach_signal_thread(
                 let signum = sig as i32;
                 if signum == Signal::SIGTSTP as i32 {
                     // 外側 TTY を pre-raw に戻す → SIGTSTP を kernel default で処理させて
-                    // STOPPED へ。復帰時 (= SIGCONT 受信時) に raw 再設定。
+                    // STOPPED へ。復帰時 (= SIGCONT 受信時) に raw 再設定。停止 / 復帰の
+                    // signal 操作は `suspend_self` に集約 (= Ctrl+Z ガードの client suspend
+                    // と同じ経路、DR-0029 §2)。
                     if let Ok(g) = guard.lock() {
                         g.suspend();
                     }
-                    let _ = install_default(Signal::SIGTSTP);
-                    let _ = raise(Signal::SIGTSTP);
-                    // STOPPED → SIGCONT で復帰。disposition を self-pipe に戻して raw 再設定。
-                    let _ = register_self_pipe(Signal::SIGTSTP);
+                    let _ = suspend_self();
                     if let Ok(g) = guard.lock() {
                         g.resume();
                     }
@@ -858,7 +857,7 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
     if !cfg.quiet && is_tty(std::io::stderr().as_fd()) {
         if app_config.attach.ctrlz_guard {
             eprintln!(
-                "[hyoui] detach: Ctrl+Z  |  子へ Ctrl+Z: 2 連打  |  peek (read-only): hyoui attach <session> --mode=ro"
+                "[hyoui] suspend (fg で復帰): Ctrl+Z  |  子へ Ctrl+Z: 2 連打  |  detach: hyoui detach <session>  |  peek (read-only): hyoui attach <session> --mode=ro"
             );
         } else {
             eprintln!(
@@ -974,6 +973,12 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
     // 外側 stdout が raw mode の tty かを `run` に伝える (= detach 時の安全側 reset と
     // 子停止の通知行を出すかの判定に使う、issue 2026-07-24 H4 / DR-0029 §1)。
     let conn = conn.with_outer_tty_raw(raw_guard.is_some());
+    // DR-0029 §2: Ctrl+Z 単発の client suspend で termios を戻す / 戻し直すため、signal
+    // thread と同じ raw guard を run loop にも共有する。
+    let conn = match raw_guard.as_ref() {
+        Some(g) => conn.with_outer_tty_guard(std::sync::Arc::clone(g)),
+        None => conn,
+    };
 
     // DR-0019 §5: pipe-through stdin EOF policy を解決して配線する。
     // - 明示 `--stdin-eof=detach|send-eof` があればそれを使う
@@ -1037,8 +1042,9 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
             let masked = u8::try_from(exit_status & 0xFF).unwrap_or(255);
             ExitCode::from(masked)
         }
-        // 自発 detach (= detach key / `--stdin-eof=detach` の EOF) は正常離脱。子は
+        // 自発 detach (= `--stdin-eof=detach` の EOF / stdin read error) は正常離脱。子は
         // daemon 配下に残る。スクリプトから見ても「意図通り離れた」なので exit 0。
+        // Ctrl+Z 単発は suspend (= 接続維持) なのでここには来ない (DR-0029 §2)。
         Ok(RunOutcome::Detached) => ExitCode::SUCCESS,
         // issue 2026-06-11 優先1: 予期しない接続喪失 (= daemon 消滅の疑い) は非 0 で
         // 終わり、stderr に 1 行出す。旧実装はこれを exit 0 にしていたため、スクリプト

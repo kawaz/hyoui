@@ -213,9 +213,11 @@ rejected because it cannot acquire a controlling terminal.
 - stdin → frame writer (`type=0x00` raw data)
 - frame reader → stdout
 - **Ctrl+Z guard state machine** ([[DR-0029]] §2): on tty stdin, every second
-  Ctrl+Z is forwarded to the child and a leftover odd press detaches the client
-  after `ctrlz_guard_delay`. No prefix key exists; the child never sees an
-  escape introduced by hyoui
+  Ctrl+Z is forwarded to the child and a leftover odd press **suspends the
+  client itself** after `ctrlz_guard_delay` (= control returns to the outer
+  shell and `fg` resumes the very same connection; the attach is never torn
+  down). No prefix key exists; the child never sees an escape introduced by
+  hyoui
 - For one-shot CLIs (`input` / `screen dump` / `screen snapshot` / `tail` /
   `wait` / `lock` / `kill` / `list` / `status`) the connection exposes
   `recv_frame()` / `recv_control(buffer_raw_data)` / `send_raw_bytes()`

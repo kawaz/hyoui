@@ -120,7 +120,7 @@ echo "started: $SESS"
 # list active sessions (id and socket path)
 hyoui list
 
-# attach to an existing session (I/O bridge; detach with Ctrl+Z)
+# attach to an existing session (I/O bridge; a single Ctrl+Z suspends the client, `fg` returns)
 hyoui attach "$SESS"
 
 # read-only observer
@@ -243,11 +243,14 @@ See [`docs/DESIGN.md`](./docs/DESIGN.md) and
 ### Ctrl+Z guard
 
 An attach session is a viewport onto a child that keeps running, so operating
-the viewport never stops the child. While attached, a **single Ctrl+Z** detaches
-the client (the child keeps running). To deliver Ctrl+Z to the child, **press it
-twice** — every second press sends one Ctrl+Z through, and a leftover odd press
-triggers the detach. Tune it under `[attach]` in
-`~/.config/hyoui/config.toml` (`ctrlz_guard` / `ctrlz_guard_delay`).
+the viewport never stops the child. While attached, a **single Ctrl+Z** suspends
+the client itself and hands control back to the outer shell (the child keeps
+running and the connection stays open; `fg` returns you to the very same
+viewport). To deliver Ctrl+Z to the child, **press it twice** — every second
+press sends one Ctrl+Z through, and a leftover odd press suspends the client.
+To close the connection instead, run `hyoui detach <session>`. Tune it under
+`[attach]` in `~/.config/hyoui/config.toml`
+(`ctrlz_guard` / `ctrlz_guard_delay`, default 1s).
 
 ## How it differs from existing tools
 

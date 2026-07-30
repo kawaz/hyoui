@@ -97,9 +97,10 @@ fn config_show_without_file_prints_defaults_as_valid_toml() {
 
     let parsed: toml::Value = toml::from_str(&text).expect("output must be valid TOML");
     assert_eq!(parsed["scrub_env"]["enabled"].as_bool(), Some(true));
+    // DR-0029 §4 (2026-07-30 改訂): 連打窓の default は 1000ms。
     assert_eq!(
         parsed["attach"]["ctrlz_guard_delay"].as_str(),
-        Some("500ms")
+        Some("1000ms")
     );
     assert_eq!(parsed["session"]["auto_resume"].as_bool(), Some(false));
     assert_eq!(

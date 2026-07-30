@@ -42,7 +42,8 @@ hyoui run --detached -- claude
 # Terminal B: list, then attach
 hyoui list
 hyoui attach run-<pid>-<rand>
-# Detach with a single Ctrl+Z
+# A single Ctrl+Z suspends the client (back to the shell; `fg` to return)
+# To close the connection: hyoui detach run-<pid>-<rand>
 ```
 
 ### 2. Observe in read-only mode

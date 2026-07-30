@@ -101,16 +101,16 @@ impl Default for WebConfig {
 pub struct AttachConfig {
     /// tty stdin 経路の Ctrl+Z ガードを有効にする。
     ///
-    /// `true` (default) なら Ctrl+Z 単発は「子に届けず client を detach」、2 発ごとに
-    /// 1 発だけ子へ届く (DR-0029 §2)。`false` で完全 bypass (= Ctrl+Z 素通し、
-    /// detach 手段は `hyoui detach` / SIGHUP 等の外側経路のみ)。
+    /// `true` (default) なら Ctrl+Z 単発は「子に届けず attach client 自身を
+    /// suspend (= 外側 shell に戻る、`fg` で復帰)」、2 発ごとに 1 発だけ子へ届く
+    /// (DR-0029 §2)。`false` で完全 bypass (= Ctrl+Z 素通し)。
     #[serde(default = "default_true")]
     pub ctrlz_guard: bool,
 
-    /// Ctrl+Z を受けてから detach を確定するまでの遅延 (= 連打を待つ窓)。
+    /// Ctrl+Z を受けてから client suspend を確定するまでの遅延 (= 連打を待つ窓)。
     ///
-    /// `"500ms"` (default) / `"1s"` / `"0"` のような duration 文字列、または整数
-    /// (= ミリ秒) で書ける。`0` にすると連打判定を行わず、Ctrl+Z 単発で即 detach
+    /// `"1s"` (default) / `"500ms"` / `"0"` のような duration 文字列、または整数
+    /// (= ミリ秒) で書ける。`0` にすると連打判定を行わず、Ctrl+Z 単発で即 suspend
     /// する (= 子には一切届かなくなる)。
     #[serde(
         default = "default_ctrlz_guard_delay",
@@ -119,7 +119,7 @@ pub struct AttachConfig {
     )]
     pub ctrlz_guard_delay: std::time::Duration,
 
-    /// detach 遅延中に画面最下行へ残り時間の overlay を出す (= DR-0029 §5)。
+    /// suspend 遅延中に画面最下行へ残り時間の overlay を出す (= DR-0029 §5)。
     ///
     /// 現在は **未実装** で、値は受理されるが動作に影響しない (= 実装は
     /// docs/issue/2026-07-25-request-attach-overlay-progress.md)。
@@ -180,7 +180,7 @@ fn default_true() -> bool {
 }
 
 fn default_ctrlz_guard_delay() -> std::time::Duration {
-    std::time::Duration::from_millis(500)
+    std::time::Duration::from_millis(1000)
 }
 
 impl Default for AttachConfig {
@@ -413,7 +413,7 @@ mod tests {
         assert!(c.scrub_env.enabled);
         assert!(c.scrub_env.targets.is_empty());
         assert!(c.attach.ctrlz_guard);
-        assert_eq!(c.attach.ctrlz_guard_delay, Duration::from_millis(500));
+        assert_eq!(c.attach.ctrlz_guard_delay, Duration::from_millis(1000));
         assert!(c.attach.ctrlz_guard_overlay);
         assert!(c.attach.resume_stopped_child);
         assert!(!c.session.auto_resume);
@@ -724,7 +724,7 @@ assets_dir = "/tmp/assets"
     fn to_toml_duration_is_millisecond_string() {
         let s = to_toml(&Config::default()).unwrap();
         assert!(
-            s.contains("ctrlz_guard_delay = \"500ms\""),
+            s.contains("ctrlz_guard_delay = \"1000ms\""),
             "unexpected duration rendering:\n{s}"
         );
     }

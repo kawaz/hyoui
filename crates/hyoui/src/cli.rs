@@ -305,8 +305,8 @@ pub struct AttachConfig {
 /// `--target=self|others` は CLI から出さない (Fable review M1 2026-06-12):
 /// detach CLI は一時接続で daemon に Detach を送る構造のため、self は「一時接続が
 /// 自分を切る」no-op、others は「一時接続以外 ≒ 全部」となり all と実質同義で、
-/// flag として嘘になる。中から自分の端末だけ抜けるのは attach の Ctrl+Z ガード
-/// (DR-0029 §2) の役割。protocol の `DetachTarget::{Myself, Others}` は attach client
+/// flag として嘘になる。中から自分の端末を一時的に離すのは attach の Ctrl+Z ガード
+/// (= client suspend、DR-0029 §2) の役割。protocol の `DetachTarget::{Myself, Others}` は attach client
 /// および `kill` の内部経路用として残る。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DetachConfig {
@@ -4216,8 +4216,8 @@ fn usage_run() -> String {
                 signal 死は 128+signum (= 130=SIGINT, 137=SIGKILL, 143=SIGTERM)。\n                          \
                 非 tty stdin の default (= send-eof) では stdin EOF で子が\n                          \
                 自然 exit し、その子の code がここに伝搬する\n    \
-            0                     Ctrl+Z ガード発火、または `--stdin-eof=detach` 時の stdin EOF で\n                          \
-                自分から離脱した (= 子は daemon 配下に残る)\n    \
+            0                     `--stdin-eof=detach` 時の stdin EOF で自分から離脱した\n                          \
+                (= 子は daemon 配下に残る)。Ctrl+Z 単発は suspend なので終了しない\n    \
             9                     daemon との接続が予期せず失われた (= daemon 消滅の疑い)\n    \
             1                     実行エラー (= protocol violation / 出力先への書き込み失敗 等)\n    \
             2                     usage / 引数エラー\n",
@@ -4255,11 +4255,12 @@ fn usage_attach() -> String {
             1-based 指定で、`1` = 最古、`-1` = 最新、`2` = 2 番目に古い、...。\n    \
             stale socket は index 対象外。範囲外は error。session-id と --index は排他。\n\
         \n\
-        CTRL+Z GUARD (= session を生かしたまま client だけ抜ける、DR-0029):\n    \
-            Ctrl+Z 単発           detach (session 維持 + 自分だけ Detach 送って終了)。\n                          \
-                子には届かない (= 覗き窓を閉じるだけで子は走り続ける)\n    \
-            Ctrl+Z 2 連打         子に Ctrl+Z を 1 発届ける (= detach しない)\n    \
-            Ctrl+Z N 連打         2 発ごとに子へ 1 発、余った 1 発が detach を起こす\n    \
+        CTRL+Z GUARD (= session も attach も生かしたまま shell に戻る、DR-0029):\n    \
+            Ctrl+Z 単発           client 自身を suspend (= 外側 shell に戻る、`fg` で復帰)。\n                          \
+                子には届かない (= 子は走り続け、attach 接続も維持される)\n    \
+            Ctrl+Z 2 連打         子に Ctrl+Z を 1 発届ける (= suspend しない)\n    \
+            Ctrl+Z N 連打         2 発ごとに子へ 1 発、余った 1 発が client suspend を起こす\n    \
+            接続を畳む            `hyoui detach <session>` (= 別端末 or suspend 後の shell から)\n    \
             設定                  ~/.config/hyoui/config.toml の [attach] セクション\n                          \
                 (ctrlz_guard / ctrlz_guard_delay)。guard=false で素通し\n\
         \n\
@@ -4271,8 +4272,8 @@ fn usage_attach() -> String {
                 signal 死は 128+signum (= 130=SIGINT, 137=SIGKILL, 143=SIGTERM)。\n                          \
                 非 tty stdin の default (= send-eof) では stdin EOF で子が\n                          \
                 自然 exit し、その子の code がここに伝搬する\n    \
-            0                     Ctrl+Z ガード発火、または `--stdin-eof=detach` 時の stdin EOF で\n                          \
-                自分から離脱した (= 子は daemon 配下に残る)\n    \
+            0                     `--stdin-eof=detach` 時の stdin EOF で自分から離脱した\n                          \
+                (= 子は daemon 配下に残る)。Ctrl+Z 単発は suspend なので終了しない\n    \
             9                     daemon との接続が予期せず失われた (= daemon 消滅の疑い)\n    \
             1                     attach 実行エラー (= protocol violation / 出力先への書き込み失敗 等)\n    \
             2                     usage / 引数エラー\n\
@@ -4929,8 +4930,8 @@ fn usage_detach() -> String {
         \n\
         対象は常に全 client: detach CLI は一時接続で要求を送る構造のため、self /\n\
         others のような部分指定は CLI からは意味を成さない (= self は一時接続の\n\
-        no-op、others は実質 all)。attach 中の端末から自分だけ抜けるのは Ctrl+Z\n\
-        (単発、DR-0029 の Ctrl+Z ガード) の役割。\n\
+        no-op、others は実質 all)。attach 中の端末から抜けるだけなら Ctrl+Z 単発\n\
+        (= client suspend、DR-0029 の Ctrl+Z ガード) で shell に戻れる。\n\
         \n\
         USAGE:\n    \
             hyoui detach <session-id>\n    \
@@ -7292,7 +7293,7 @@ mod tests {
         let text = usage(&HelpTopic::Attach);
         assert!(
             text.contains("Ctrl+Z 単発"),
-            "help should document 単発 Ctrl+Z = detach"
+            "help should document 単発 Ctrl+Z = client suspend"
         );
         assert!(
             text.contains("Ctrl+Z 2 連打"),
