@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-07-30 | bug | open | [stdout-epipe-panic](./2026-07-30-bug-stdout-epipe-panic.md) | `hyoui status \| head` 等で stdout が早期 close されると Broken pipe panic。EPIPE は正常終了に倒すべき (SIGPIPE 復元 vs BrokenPipe 握り分けの検討要) |
 | 2026-07-30 | bug | wip | [web-terminal-font-load-fit-race](./2026-07-30-bug-web-terminal-font-load-fit-race.md) | 3 独立原因を修正済み: webfont load 待ち後に xterm を open、fit は寸法提案だけ行い WS leader 接続から daemon resize が成功してから browser grid を変更、待機中/失敗/resize off は旧 grid + 横スクロールを維持。fallback POST は leader 衝突を 409 で返す。WS E2E と dev gateway + Playwright で daemon PTY 追従・横スクロール・409 を検証済み |
 | 2026-07-29 | bug | wip | [ctrlz-guard-bypassed-by-keyboard-protocol](./2026-07-29-bug-ctrlz-guard-bypassed-by-keyboard-protocol.md) | DR-0029 §2 の Ctrl+Z ガードが keyboard protocol 有効端末 (Ghostty × claude) で完全不発。子が `\x1b[>1u` / `\x1b[>4;2m` を出すと外側端末が Ctrl+Z を CSI-u (`\x1b[122;5u`) で送るため、0x1a しか見ないガードを素通りしていた。**3 符号化対応に拡張して修正済 + ネスト実機でマトリクス再検証済**。2026-07-30 の kawaz 裁定で単発アクションを detach → **client suspend** に変更 (`fg` で同接続復帰 / 窓 default 1000ms / 親シェル消滅時の自滅も実機確認) 。残るは kawaz の実端末での最終確認 |
 | 2026-07-29 | request | open | [web-narrow-symbol-fallback-font](./2026-07-29-request-web-narrow-symbol-fallback-font.md) | 記号グリフ幅対策の unicode-range fallback が macOS/iOS でしか効かない (Linux は DejaVu が全角)。narrow symbol subset webfont 同梱が本筋。① U+2460 は macOS にも narrow グリフが無く未解決 |
