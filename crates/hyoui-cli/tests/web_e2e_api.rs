@@ -585,7 +585,49 @@ fn e2e_ws_attach_bridge_roundtrip() {
         String::from_utf8_lossy(&response.body)
     );
 
-    // 同じ WS leader connection の text control message から resize する。
+    // zero size は daemon に転送せず、同じ WS 上で明示 error result を返す。
+    ws.send(Message::Text(
+        serde_json::json!({
+            "kind": "resize",
+            "requestId": 41u64,
+            "cols": 0u16,
+            "rows": 1u16,
+        })
+        .to_string()
+        .into(),
+    ))
+    .expect("WS zero resize send");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let zero_ack = loop {
+        assert!(Instant::now() < deadline, "WS zero resize.result timeout");
+        match ws.read() {
+            Ok(Message::Text(text)) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(text.as_str()).expect("WS control response JSON");
+                if value["kind"] == "resize.result" && value["requestId"] == 41u64 {
+                    break value;
+                }
+            }
+            Ok(Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
+            Ok(Message::Close(_)) => panic!("WS closed before zero resize result"),
+            Err(tungstenite::Error::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(e) => panic!("WS zero resize read error: {e}"),
+        }
+    };
+    assert_eq!(zero_ack["ok"], false, "zero resize ack={zero_ack}");
+    assert!(
+        zero_ack["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("must be > 0")),
+        "zero resize error={zero_ack}"
+    );
+
+    // 同じ WS leader connection の text control message から有効な resize を送る。
     ws.send(Message::Text(
         serde_json::json!({
             "kind": "resize",

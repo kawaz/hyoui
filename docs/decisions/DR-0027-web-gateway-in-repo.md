@@ -61,7 +61,8 @@ resize は `{"kind":"resize","requestId":N,"cols":W,"rows":H}` を送り、gatew
 WS bridge の leader `ClientConnection` から既存 daemon `Resize` message を発行する。応答は
 `{"kind":"resize.result","requestId":N,"ok":true}` (失敗時は `ok:false` + `error`)。
 daemon protocol / capability は増やさない。browser は成功応答後だけ xterm.js grid を変更し、
-応答前・失敗時・`resize` off では旧 grid を維持する。
+応答前・失敗時・`resize` off では旧 grid を維持する。極小 viewport では vt100 に 0 行/列を
+渡さないため、提案寸法を最低 `2x2` に clamp してから送る。
 
 `POST /api/sessions/:id/resize` は WS 未接続時の fallback として残す。短命接続が leader を
 取得できない場合は daemon の `mode.not-leader` を握りつぶさず HTTP 409 で返す。

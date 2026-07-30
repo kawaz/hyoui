@@ -391,6 +391,10 @@
     autoResizeEl.checked = true;
   }
 
+  // vt100 grid は 0 行/列で panic し得る。FitAddon 自身は cols>=2 だが rows>=1
+  // なので、極小 iframe でも daemon へ送る寸法を両軸 2 以上に固定する。
+  const MIN_RESIZE_COLS = 2;
+  const MIN_RESIZE_ROWS = 2;
   let resizePending = null;
   let resizeRunning = false;
 
@@ -459,8 +463,10 @@
       return;
     }
     if (!proposed || !Number.isFinite(proposed.cols) || !Number.isFinite(proposed.rows)) return;
-    if (!force && proposed.cols === term.cols && proposed.rows === term.rows) return;
-    resizePending = { cols: proposed.cols, rows: proposed.rows };
+    const cols = Math.max(MIN_RESIZE_COLS, Math.floor(proposed.cols));
+    const rows = Math.max(MIN_RESIZE_ROWS, Math.floor(proposed.rows));
+    if (!force && cols === term.cols && rows === term.rows) return;
+    resizePending = { cols, rows };
     drainResizeQueue();
   }
 
