@@ -202,6 +202,78 @@ fn menu_detach_closes_client_and_leaves_child_stopped() {
     let _ = s.h.kill();
 }
 
+/// 無人時に子が止まった場合、次の rw attach 成立時 (= handshake snapshot が stopped) に
+/// menu が出る (DR-0032 §2 発動条件 3 の前半 / §Consequences「attach 不在ウィンドウ」)。
+#[ignore = "PTY child + signal を使う、ローカルで --ignored 実行 (DR-0032 §2)"]
+#[test]
+fn menu_appears_on_next_attach_when_child_stopped_while_unattended() {
+    let runner = HyouiTestRunner::new();
+    // 無人 (= detached) で起こしてから子を止める。menu を出す先が居ないので daemon は
+    // notify のまま何もせず待つ。
+    let mut boot = runner.spawn_hyoui_with_config(
+        "menu-unattended",
+        &["run", "--detached", "--", "/bin/cat"],
+        MENU_CONFIG,
+    );
+    let child_pid = wait_for_child_pid(&runner, "menu-unattended");
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(child_pid), Signal::SIGSTOP)
+        .expect("kill -STOP child");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !process_state_of(child_pid)
+        .expect("子の state")
+        .is_state('T')
+    {
+        assert!(std::time::Instant::now() < deadline, "子が停止しない");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // ここで初めて rw attach する (= handshake snapshot が stopped)。
+    let mut h = runner.spawn_hyoui_with_config("menu-unattended", &["attach"], MENU_CONFIG);
+    h.wait_for(MENU_HEADER, Duration::from_secs(10))
+        .expect("attach 成立時に stopped なら menu が出るはず");
+    assert!(
+        process_state_of(child_pid)
+            .expect("子の state")
+            .is_state('T'),
+        "menu を出す設定では attach しても子を起こさない"
+    );
+
+    let _ = h.kill();
+    let _ = boot.kill();
+}
+
+/// `hyoui status` の `child-pid:` から子 pid を取る (= daemon 起動待ちも兼ねる)。
+fn wait_for_child_pid(runner: &HyouiTestRunner, session: &str) -> i32 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(out) = std::process::Command::new(env!("CARGO_BIN_EXE_hyoui"))
+            .args([
+                "status",
+                &format!("--socket={}", runner.socket_path(session).display()),
+            ])
+            .env("XDG_RUNTIME_DIR", runner.runtime_dir())
+            .env("TMPDIR", runner.runtime_dir())
+            .env_remove("HYOUI_LOCK_TOKEN")
+            .env_remove("HYOUI_SESSION_ID")
+            .env_remove("HYOUI_NAMESPACE")
+            .stdin(std::process::Stdio::null())
+            .output()
+            && let Some(pid) = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find_map(|l| l.strip_prefix("child-pid:"))
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|s| s.parse::<i32>().ok())
+        {
+            return pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon が起動して child-pid を返さない"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// daemon 側の `child-state:` (= `hyoui status` の 1 行) が `expected` になるまで待つ。
 fn wait_child_state(h: &SpawnedHyoui, expected: &str, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
