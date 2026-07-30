@@ -2670,7 +2670,10 @@ mod tests {
         assert!(s.contains("\x1b[24;1H"), "最下行まで使う: {s:?}");
         assert!(s.contains("起こす (SIGCONT)"), "子への操作の項目: {s:?}");
         assert!(s.contains("SIGKILL"), "子への操作の項目: {s:?}");
-        assert!(s.contains("脱出 (client の操作)"), "脱出グループ見出し: {s:?}");
+        assert!(
+            s.contains("脱出 (client の操作)"),
+            "脱出グループ見出し: {s:?}"
+        );
         for line in MENU_LINES {
             assert!(s.contains(line), "全項目を描く: {line}");
         }
