@@ -140,7 +140,7 @@ size = 1 (type byte) + body_len
 
 v0.2.0+ 予約:
 - `snapshot.request` / `snapshot.response` (画面 dump)
-- `leader.request` (leader CLI 解放)
+- `leader.request` (leader CLI 解放。実体化の設計は [[DR-0033]])
 - `record.start` / `record.stop` / `play.start` (record/play)
 - `sink.attach` / `sink.detach` (永続出力先)
 
