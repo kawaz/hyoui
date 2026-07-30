@@ -497,6 +497,13 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     // 設定での起動は親 host Internal Context 漏洩リスク)。
     let config = match hyoui::config::load() {
         Ok(c) => c,
+        // DR-0032 §1: 廃止 key は `--no-scrub-env` でも迂回させない (= escape hatch の
+        // 対象は「config が壊れていて読めない」ケースで、廃止 key は読めているのに
+        // 意図が silent に default へ倒れるケースなので、移行を促して止める)。
+        Err(e @ hyoui::config::ConfigError::RemovedKey { .. }) => {
+            eprintln!("hyoui: {e}");
+            return ExitCode::from(2);
+        }
         Err(_) if cfg.no_scrub_env => hyoui::config::Config::default(),
         Err(e) => {
             eprintln!("hyoui: {e}");
@@ -512,15 +519,13 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     } else {
         hyoui::sys::env_scrub::resolve_plan(false, &config, &cfg.command)
     };
-    // DR-0029 §4: 子 stop 時の daemon policy。flag 明示 > config `[session] auto_resume`
-    // > builtin default (= notify、DR-0017 §柱2 の「勝手に起こさない」)。
+    // DR-0029 §4 / DR-0032 §1: 子 stop 時の daemon policy。flag 明示 >
+    // config `[session] on_child_suspend` の daemon 写像 > builtin default
+    // (= notify、DR-0017 §柱2 の「勝手に起こさない」)。flag が override するのは
+    // daemon policy だけで、attach 側の写像 (resume / menu) は config の enum に従う。
     let on_child_suspend = cfg
         .on_child_suspend
-        .unwrap_or(if config.session.auto_resume {
-            hyoui::cli::OnChildSuspend::AutoResume
-        } else {
-            hyoui::cli::OnChildSuspend::Notify
-        });
+        .unwrap_or_else(|| config.session.on_child_suspend.daemon_policy());
     // size 解決 (= ユーザ指示 2026-05-29、stdin pipe 経由):
     // - 明示指定 (= --cols/--rows/--size) があればそれを使う
     // - 非 detached + 明示なし → 外側 TTY size (= stdin) を継承
@@ -830,12 +835,17 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         }
     };
 
-    // DR-0030: rw attach は子を操作する意思表明とみなし、handshake snapshot が
-    // stopped なら既存 resume.request を即送る。attach 中に子が stop した場合は
-    // `AttachSession::run` の `SessionChildStoppedNotify` 経路が同じ要求を送る。
-    // ro / rw-no-leader は観察または非 leader 接続なので、設定値に関係なく起こさない。
+    // DR-0030 / DR-0032 §1: rw attach は子を操作する意思表明とみなし、handshake
+    // snapshot が stopped なら既存 resume.request を即送る。attach 中に子が stop した
+    // 場合は `ClientConnection::run` の `SessionChildStoppedNotify` 経路が同じ判定を
+    // する。ro / rw-no-leader は観察または非 leader 接続なので、設定値に関係なく
+    // 起こさない。`show_child_action_menu` の場合は起こさず、raw mode に入った直後に
+    // `run` が child action menu を出す (= 描画は raw mode 前提、DR-0032 §2 条件 4)。
     if conn.response.child_stopped
-        && hyoui::client::should_resume_stopped_child(conn.response.mode, &app_config.attach)
+        && hyoui::client::stopped_child_action(
+            conn.response.mode,
+            app_config.session.on_child_suspend,
+        ) == hyoui::client::StoppedChildAction::Resume
         && let Err(e) = conn.send_child_resume()
     {
         eprintln!("hyoui: attach: stopped child の resume 要求送信失敗: {e}");
@@ -853,11 +863,17 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
     // TCSANOW で解消済み (Fable review M4、`sys/tty.rs` の regression test 参照)。
     //
     // 文言は Ctrl+Z ガードの設定を反映する (= guard off なら detach 手段が無いので
-    // 嘘の脱出方法を教えず peek だけ案内する、DR-0029 §2)。
+    // 嘘の脱出方法を教えず peek だけ案内する、DR-0029 §2)。単発 Ctrl+Z が何をするかは
+    // `ctrlz_x1_action` で変わるので、そこも設定どおりに案内する (DR-0032 §3)。
     if !cfg.quiet && is_tty(std::io::stderr().as_fd()) {
         if app_config.attach.ctrlz_guard {
+            let x1 = match app_config.attach.ctrlz_x1_action {
+                hyoui::config::CtrlzX1Action::ClientSuspend => "suspend (fg で復帰): Ctrl+Z",
+                hyoui::config::CtrlzX1Action::ClientDetach => "detach: Ctrl+Z",
+                hyoui::config::CtrlzX1Action::SelectOnDemand => "操作を選ぶ: Ctrl+Z",
+            };
             eprintln!(
-                "[hyoui] suspend (fg で復帰): Ctrl+Z  |  子へ Ctrl+Z: 2 連打  |  detach: hyoui detach <session>  |  peek (read-only): hyoui attach <session> --mode=ro"
+                "[hyoui] {x1}  |  子へ Ctrl+Z: 2 連打  |  detach: hyoui detach <session>  |  peek (read-only): hyoui attach <session> --mode=ro"
             );
         } else {
             eprintln!(
@@ -1006,7 +1022,10 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
     };
     let conn = conn
         .with_stdin_eof_action(eof_action)
-        .with_attach_config(attach_config);
+        .with_attach_config(attach_config)
+        // DR-0032 §1: 子 stopped 検知時の 3 分岐 (resume / menu / 何もしない) を
+        // run loop でも同じ設定から判定させる。
+        .with_on_child_suspend(app_config.session.on_child_suspend);
 
     // DR-0019 §6: SIGWINCH → Resize 配線。winch_source を注入し、attach 成立直後に
     // 初回 Resize を送る (= 別端末から attach した時のサイズ不一致を解消、leader 限定)。

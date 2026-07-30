@@ -46,19 +46,71 @@ pub struct Config {
     pub web: WebConfig,
 }
 
-/// session policy 設定 (= TOML の `[session]` 配下、DR-0029 §4)。
+/// session policy 設定 (= TOML の `[session]` 配下、DR-0029 §4 / DR-0032 §1)。
 ///
 /// `hyoui run` が daemon に渡す既定値を持つ。CLI flag (`--on-child-suspend`) が
 /// あればそちらが優先する (= DR-0024 の flag 最小化方針、config は default 提供)。
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct SessionConfig {
-    /// 子の stop を daemon が観測したら自動で `SIGCONT` を送る (= DR-0019 §3 の
-    /// `--on-child-suspend=auto-resume` の既定値)。
-    ///
-    /// default `false` (= notify のみ)。attach client の有無・stop の由来 (tty の
-    /// Ctrl+Z / `hyoui kill --signal=TSTP` / 子の self-suspend) に関わらず効く。
+    /// 子が suspend (stopped) した時のふるまい (DR-0032 §1)。
     #[serde(default)]
-    pub auto_resume: bool,
+    pub on_child_suspend: OnChildSuspendSetting,
+}
+
+/// 子 suspend 時のふるまい (= TOML `[session] on_child_suspend`、DR-0032 §1)。
+///
+/// 利用者が認識する概念は「子が suspend したらどうなるか」の 1 つの選択なので、
+/// daemon policy と attach client policy の 2 レイヤを 1 つの enum で表す。
+/// **wire には乗らない** (= 読み込み時に [`Self::daemon_policy`] で daemon policy へ、
+/// `client::stopped_child_action` で attach 側の挙動へ写像する)。
+///
+/// [`crate::cli::OnChildSuspend`] とは別物: あちらは daemon policy 2 値
+/// (`notify` / `auto-resume`) で、CLI flag / `hyoui set` / protocol の語彙。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnChildSuspendSetting {
+    /// daemon が常に即 `SIGCONT` (= attach の有無に関係なく起こす)。
+    AutoResumeAlways,
+    /// rw attach client が居る間だけ起こす (= 無人時は停止を維持)。default。
+    #[default]
+    AutoResumeOnAttached,
+    /// 起こさず、rw attach client が child action menu を表示する (DR-0032 §2)。
+    ShowChildActionMenu,
+}
+
+impl OnChildSuspendSetting {
+    /// daemon policy への写像 (DR-0032 §1 の表)。
+    ///
+    /// attach 側の 2 値 (resume / menu) は daemon に伝えても意味がないので、
+    /// どちらも `Notify` (= daemon は起こさず leader に通知するだけ) に落ちる。
+    #[must_use]
+    pub fn daemon_policy(self) -> crate::cli::OnChildSuspend {
+        match self {
+            Self::AutoResumeAlways => crate::cli::OnChildSuspend::AutoResume,
+            Self::AutoResumeOnAttached | Self::ShowChildActionMenu => {
+                crate::cli::OnChildSuspend::Notify
+            }
+        }
+    }
+}
+
+/// Ctrl+Z 単発 (= ガード窓で ×1 と確定した後) の action (= TOML
+/// `[attach] ctrlz_x1_action`、DR-0032 §3)。
+///
+/// 司るのは「確定後の action」だけで、ガード窓そのもの (単発判定 / 連打 forward /
+/// 他キー割り込み) は [`AttachConfig::ctrlz_guard`] / [`AttachConfig::ctrlz_guard_delay`]
+/// のまま不変 (DR-0029 §2)。値名の `client_` prefix は action の対象が子ではなく
+/// client 自身であることを示す。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CtrlzX1Action {
+    /// client 自身を suspend (= `raise(SIGTSTP)`、`fg` で同じ接続に復帰)。default。
+    #[default]
+    ClientSuspend,
+    /// client を畳む (= detach。子は走り続ける)。
+    ClientDetach,
+    /// 選択プロンプトを出して次の明示キー (^Z / ^C / Esc) を待つ (DR-0032 §3)。
+    SelectOnDemand,
 }
 
 /// Web gateway 設定 (= TOML の `[web]` 配下、DR-0027 §Decision.2)。
@@ -126,13 +178,10 @@ pub struct AttachConfig {
     #[serde(default = "default_true")]
     pub ctrlz_guard_overlay: bool,
 
-    /// rw attach 中は子を停止させたままにせず resume 要求を送る (DR-0030)。
-    ///
-    /// 発火点は 2 つ: attach 成立時に既に stopped だった場合と、attach 中に子が
-    /// stop した場合。default `true`。ro / rw-no-leader attach では設定に関わらず
-    /// 送らない (= 観察 / 非 leader 接続は操作意思とみなさない)。
-    #[serde(default = "default_true")]
-    pub resume_stopped_child: bool,
+    /// Ctrl+Z 単発が確定した後の action (DR-0032 §3)。default `client_suspend`
+    /// (= DR-0029 §2 の挙動そのまま)。
+    #[serde(default)]
+    pub ctrlz_x1_action: CtrlzX1Action,
 }
 
 /// env scrub 設定 (= TOML の `[scrub_env]` 配下、DR-0024 §3)。
@@ -189,7 +238,7 @@ impl Default for AttachConfig {
             ctrlz_guard: true,
             ctrlz_guard_delay: default_ctrlz_guard_delay(),
             ctrlz_guard_overlay: true,
-            resume_stopped_child: true,
+            ctrlz_x1_action: CtrlzX1Action::ClientSuspend,
         }
     }
 }
@@ -294,6 +343,71 @@ pub enum ConfigError {
         /// underlying TOML deserialize error。
         source: toml::de::Error,
     },
+    /// 廃止済み key が書かれていた (DR-0032 §1 migration)。
+    ///
+    /// unknown field 一般は前方互換のため無視するが、廃止 key は「明示設定者の意図が
+    /// silent に default へ倒れる」ので起動を拒否して移行先を案内する。
+    RemovedKey {
+        /// 読み込んだパス。
+        path: PathBuf,
+        /// 廃止 key の TOML 上の書き方 (= `[session] auto_resume`)。
+        key: &'static str,
+        /// 移行先の案内 (= 何に書き換えればよいか)。
+        hint: &'static str,
+    },
+}
+
+/// 廃止 key の一覧 (= section, key, 移行案内)。
+///
+/// DR-0032 §1: 旧 bool 2 個は `[session] on_child_suspend` の enum に統合された。
+/// 旧 default の組合せ (`auto_resume = false` + `resume_stopped_child = true`) は
+/// enum default `auto_resume_on_attached` と同挙動なので、明示設定していた人だけが
+/// この経路に来る。
+struct RemovedKey {
+    /// TOML の section 名 (= `[session]` の `session`)。
+    section: &'static str,
+    /// section 内の key 名。
+    name: &'static str,
+    /// error 表示用の書き方 (= `[session] auto_resume`)。
+    display: &'static str,
+    /// 移行先の案内。
+    hint: &'static str,
+}
+
+const REMOVED_KEYS: &[RemovedKey] = &[
+    RemovedKey {
+        section: "session",
+        name: "auto_resume",
+        display: "[session] auto_resume",
+        hint: "`[session] on_child_suspend = \"auto_resume_always\"` (旧 true) / \
+               `\"auto_resume_on_attached\"` (旧 false、= default) に書き換えてください",
+    },
+    RemovedKey {
+        section: "attach",
+        name: "resume_stopped_child",
+        display: "[attach] resume_stopped_child",
+        hint: "`[session] on_child_suspend = \"auto_resume_on_attached\"` (旧 true、= default) / \
+               `\"show_child_action_menu\"` (旧 false、= 起こさず child action menu を出す) に \
+               書き換えてください",
+    },
+];
+
+/// 廃止 key が書かれていないか検査する (DR-0032 §1 migration)。
+fn check_removed_keys(table: &toml::Table, path: &Path) -> Result<(), ConfigError> {
+    for removed in REMOVED_KEYS {
+        let present = table
+            .get(removed.section)
+            .and_then(toml::Value::as_table)
+            .is_some_and(|t| t.contains_key(removed.name));
+        if present {
+            return Err(ConfigError::RemovedKey {
+                path: path.to_path_buf(),
+                key: removed.display,
+                hint: removed.hint,
+            });
+        }
+    }
+    Ok(())
 }
 
 impl fmt::Display for ConfigError {
@@ -305,6 +419,13 @@ impl fmt::Display for ConfigError {
             Self::Parse { path, source } => {
                 write!(f, "config file parse failed ({}): {source}", path.display())
             }
+            Self::RemovedKey { path, key, hint } => {
+                write!(
+                    f,
+                    "config key `{key}` は削除されました ({}): {hint}",
+                    path.display()
+                )
+            }
         }
     }
 }
@@ -314,6 +435,7 @@ impl std::error::Error for ConfigError {
         match self {
             Self::Read { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
+            Self::RemovedKey { .. } => None,
         }
     }
 }
@@ -390,11 +512,17 @@ pub fn to_toml(config: &Config) -> Result<String, toml::ser::Error> {
 }
 
 /// TOML 文字列から Config を直接 deserialize する (= test 用、エラー時の path 付帯のため `path` を取る)。
+///
+/// 一度 [`toml::Table`] にしてから廃止 key を検査し (DR-0032 §1)、その後 `Config` へ
+/// deserialize する (= 廃止 key を unknown field として silent に無視しないため)。
 pub fn parse_str(s: &str, path: &Path) -> Result<Config, ConfigError> {
-    toml::from_str(s).map_err(|e| ConfigError::Parse {
+    let to_parse_err = |e: toml::de::Error| ConfigError::Parse {
         path: path.to_path_buf(),
         source: e,
-    })
+    };
+    let table: toml::Table = toml::from_str(s).map_err(to_parse_err)?;
+    check_removed_keys(&table, path)?;
+    toml::Value::Table(table).try_into().map_err(to_parse_err)
 }
 
 #[cfg(test)]
@@ -415,19 +543,112 @@ mod tests {
         assert!(c.attach.ctrlz_guard);
         assert_eq!(c.attach.ctrlz_guard_delay, Duration::from_millis(1000));
         assert!(c.attach.ctrlz_guard_overlay);
-        assert!(c.attach.resume_stopped_child);
-        assert!(!c.session.auto_resume);
+        assert_eq!(c.attach.ctrlz_x1_action, CtrlzX1Action::ClientSuspend);
+        assert_eq!(
+            c.session.on_child_suspend,
+            OnChildSuspendSetting::AutoResumeOnAttached
+        );
         assert_eq!(c.web.listen, "127.0.0.1:43690");
     }
 
+    /// DR-0032 §1: enum 3 値がすべて設定語彙 (snake_case) で読める。
     #[test]
-    fn parse_session_auto_resume() {
+    fn parse_session_on_child_suspend_accepts_all_three_values() {
+        for (written, expected) in [
+            (
+                "auto_resume_always",
+                OnChildSuspendSetting::AutoResumeAlways,
+            ),
+            (
+                "auto_resume_on_attached",
+                OnChildSuspendSetting::AutoResumeOnAttached,
+            ),
+            (
+                "show_child_action_menu",
+                OnChildSuspendSetting::ShowChildActionMenu,
+            ),
+        ] {
+            let s = format!("[session]\non_child_suspend = \"{written}\"\n");
+            let c = parse_str(&s, &dummy_path()).unwrap();
+            assert_eq!(c.session.on_child_suspend, expected, "value {written}");
+        }
+    }
+
+    /// 未知の enum 値は起動拒否 (= DR-0024 の「不正 config は読まない」流儀)。
+    #[test]
+    fn parse_session_on_child_suspend_unknown_value_is_error() {
         let s = r#"
 [session]
-auto_resume = true
+on_child_suspend = "resume_maybe"
 "#;
-        let c = parse_str(s, &dummy_path()).unwrap();
-        assert!(c.session.auto_resume);
+        assert!(matches!(
+            parse_str(s, &dummy_path()),
+            Err(ConfigError::Parse { .. })
+        ));
+    }
+
+    /// DR-0032 §1: enum → daemon policy の写像 (= 全対応)。
+    #[test]
+    fn on_child_suspend_maps_to_daemon_policy() {
+        use crate::cli::OnChildSuspend as Policy;
+        assert_eq!(
+            OnChildSuspendSetting::AutoResumeAlways.daemon_policy(),
+            Policy::AutoResume
+        );
+        assert_eq!(
+            OnChildSuspendSetting::AutoResumeOnAttached.daemon_policy(),
+            Policy::Notify
+        );
+        assert_eq!(
+            OnChildSuspendSetting::ShowChildActionMenu.daemon_policy(),
+            Policy::Notify,
+        );
+    }
+
+    /// DR-0032 §3: `ctrlz_x1_action` 3 値がすべて読める。
+    #[test]
+    fn parse_attach_ctrlz_x1_action_accepts_all_three_values() {
+        for (written, expected) in [
+            ("client_suspend", CtrlzX1Action::ClientSuspend),
+            ("client_detach", CtrlzX1Action::ClientDetach),
+            ("select_on_demand", CtrlzX1Action::SelectOnDemand),
+        ] {
+            let s = format!("[attach]\nctrlz_x1_action = \"{written}\"\n");
+            let c = parse_str(&s, &dummy_path()).unwrap();
+            assert_eq!(c.attach.ctrlz_x1_action, expected, "value {written}");
+        }
+    }
+
+    /// DR-0032 §1 migration: 廃止された旧 bool 2 個は silent 無視せず起動拒否し、
+    /// 移行先を案内する。
+    #[test]
+    fn removed_bool_keys_are_startup_errors_with_migration_hint() {
+        for (s, expected_key) in [
+            ("[session]\nauto_resume = true\n", "[session] auto_resume"),
+            (
+                "[attach]\nresume_stopped_child = false\n",
+                "[attach] resume_stopped_child",
+            ),
+        ] {
+            match parse_str(s, &dummy_path()) {
+                Err(e @ ConfigError::RemovedKey { .. }) => {
+                    let msg = e.to_string();
+                    assert!(msg.contains(expected_key), "旧 key 名を出す: {msg}");
+                    assert!(msg.contains("on_child_suspend"), "移行先を案内する: {msg}");
+                }
+                other => panic!("旧 key は RemovedKey で拒否されるべき: {other:?}"),
+            }
+        }
+    }
+
+    /// 旧 key と同名でも別 section なら誤検出しない (= section 込みで判定する)。
+    #[test]
+    fn removed_key_check_is_section_scoped() {
+        let s = r#"
+[scrub_env.targets.auto_resume]
+kill_glob = ["FOO"]
+"#;
+        assert!(parse_str(s, &dummy_path()).is_ok());
     }
 
     #[test]
@@ -512,7 +733,7 @@ ctrlz_guard_delay = "125ms"
         assert!(c.attach.ctrlz_guard);
         assert_eq!(c.attach.ctrlz_guard_delay, Duration::from_millis(125));
         assert!(c.attach.ctrlz_guard_overlay);
-        assert!(c.attach.resume_stopped_child);
+        assert_eq!(c.attach.ctrlz_x1_action, CtrlzX1Action::ClientSuspend);
         assert!(c.scrub_env.enabled);
     }
 
@@ -523,13 +744,13 @@ ctrlz_guard_delay = "125ms"
 ctrlz_guard = false
 ctrlz_guard_delay = "1s"
 ctrlz_guard_overlay = false
-resume_stopped_child = false
+ctrlz_x1_action = "client_detach"
 "#;
         let c = parse_str(s, &dummy_path()).unwrap();
         assert!(!c.attach.ctrlz_guard);
         assert_eq!(c.attach.ctrlz_guard_delay, Duration::from_secs(1));
         assert!(!c.attach.ctrlz_guard_overlay);
-        assert!(!c.attach.resume_stopped_child);
+        assert_eq!(c.attach.ctrlz_x1_action, CtrlzX1Action::ClientDetach);
     }
 
     #[test]
@@ -687,7 +908,7 @@ ctrlz_guard = false
 ctrlz_guard_delay = "1.5s"
 
 [session]
-auto_resume = true
+on_child_suspend = "show_child_action_menu"
 
 [web]
 listen = "0.0.0.0:9999"
@@ -710,9 +931,9 @@ assets_dir = "/tmp/assets"
             "ctrlz_guard",
             "ctrlz_guard_delay",
             "ctrlz_guard_overlay",
-            "resume_stopped_child",
+            "ctrlz_x1_action",
             "[session]",
-            "auto_resume",
+            "on_child_suspend",
             "[web]",
             "listen",
         ] {

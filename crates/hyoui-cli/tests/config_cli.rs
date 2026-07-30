@@ -102,7 +102,10 @@ fn config_show_without_file_prints_defaults_as_valid_toml() {
         parsed["attach"]["ctrlz_guard_delay"].as_str(),
         Some("1000ms")
     );
-    assert_eq!(parsed["session"]["auto_resume"].as_bool(), Some(false));
+    assert_eq!(
+        parsed["session"]["on_child_suspend"].as_str(),
+        Some("auto_resume_on_attached")
+    );
     assert_eq!(
         parsed["web"]["listen"].as_str(),
         Some("127.0.0.1:43690"),
@@ -141,7 +144,10 @@ fn config_show_with_file_prints_effective_values_including_untouched_defaults() 
         Some(true)
     );
     assert_eq!(parsed["attach"]["ctrlz_guard"].as_bool(), Some(true));
-    assert_eq!(parsed["session"]["auto_resume"].as_bool(), Some(false));
+    assert_eq!(
+        parsed["session"]["on_child_suspend"].as_str(),
+        Some("auto_resume_on_attached")
+    );
     // ヘッダは読み込み元を示す。
     assert!(
         text.lines().next().unwrap().contains("config.toml"),

@@ -31,6 +31,21 @@ struct GuardOutcome {
     suspend: bool,
 }
 
+/// tty stdin の入力を誰が解釈するか (DR-0032 §2 / §3)。
+///
+/// `Child` 以外は **hyoui の操作面が開いている状態**で、入力を client が飲み PTY へ
+/// 一切 forward しない。どちらも「ユーザが明示的に操作面を呼び出した / 子が入力を
+/// 消費できない」期間に限定されるので、DR-0029 §3 の「子から見た透過」は破らない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputFocus {
+    /// 通常 (= Ctrl+Z ガードを通して子へ forward)。
+    Child,
+    /// child action menu 表示中 (DR-0032 §2)。
+    ChildMenu,
+    /// `select_on_demand` のプロンプト表示中 (DR-0032 §3)。
+    X1Prompt,
+}
+
 /// Ctrl+Z ガードの state (DR-0029 §2)。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum CtrlzGuardState {
@@ -136,17 +151,43 @@ fn process_ctrlz_guard(
     GuardOutcome { forward, suspend }
 }
 
-/// この attach client が停止中の子を起こすべきか (DR-0030)。
+/// 子が stopped だと分かった attach client が取る行動 (DR-0032 §1 の写像先)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoppedChildAction {
+    /// `SessionChildResumeRequest` を送って起こす (DR-0030 の 2 発火点そのまま)。
+    Resume,
+    /// 起こさず child action menu を表示する (DR-0032 §2)。
+    Menu,
+    /// 何もしない (= 停止通知行だけ描く)。ro / rw-no-leader はここに落ちる。
+    Nothing,
+}
+
+/// この attach client が停止中の子に対して何をするか (DR-0032 §1 / DR-0030)。
 ///
 /// 「rw attach が開いている = 子を操作する意思がある」を trigger にする。判定は
 /// attach 成立時 (= handshake snapshot が stopped) と attach 中に子が stop した
-/// 場合の両方で共通なので、条件を 1 箇所に集約して両 call site から使う。
+/// 場合の両方で共通なので、条件を 1 箇所に集約して両 call site から使う (= drift 防止)。
 ///
 /// `ro` は観察のみ、`rw-no-leader` は非 leader 接続なので、どちらも操作意思とは
-/// みなさず設定値に関係なく起こさない。
+/// みなさず設定値に関係なく [`StoppedChildAction::Nothing`] (= menu も出さない、
+/// DR-0029 §5 / DR-0032 §2 発動条件 2)。
+///
+/// `auto_resume_always` で `Resume` を返すのは安全側の残り火 (= daemon が先に
+/// 起こすので発動機会はほぼ無いが、handshake snapshot が stopped だった race では
+/// client が起こす)。
 #[must_use]
-pub fn should_resume_stopped_child(mode: Mode, config: &crate::config::AttachConfig) -> bool {
-    mode == Mode::Rw && config.resume_stopped_child
+pub fn stopped_child_action(
+    mode: Mode,
+    setting: crate::config::OnChildSuspendSetting,
+) -> StoppedChildAction {
+    use crate::config::OnChildSuspendSetting as Setting;
+    if mode != Mode::Rw {
+        return StoppedChildAction::Nothing;
+    }
+    match setting {
+        Setting::AutoResumeAlways | Setting::AutoResumeOnAttached => StoppedChildAction::Resume,
+        Setting::ShowChildActionMenu => StoppedChildAction::Menu,
+    }
 }
 
 /// 「子が停止中」を画面最下行に描く escape 列を組む (DR-0029 §1)。
@@ -159,6 +200,141 @@ fn child_stopped_notice(session_id: &str, rows: u16) -> String {
         "\x1b7\x1b[{rows};1H\x1b[K\x1b[7m[hyoui] 子プロセスが停止中 — 再開: \
          hyoui kill {session_id} --signal=CONT --no-terminate\x1b[m\x1b8"
     )
+}
+
+/// child action menu の項目 (DR-0032 §2 のメニュー項目表)。
+///
+/// キーバインドは DR が後続 issue にした部分。**1 項目 = 1 mnemonic 文字**の最小形を
+/// 採る (= 番号割当やカーソル移動より実装が小さく、画面に出す文字がそのまま押す
+/// キーになるので説明が要らない)。Esc に加えて `q` を閉じるキーにするのは、子が
+/// kitty keyboard protocol を有効化している場面で Esc が `CSI 27 u` に符号化されて
+/// 単独 `0x1b` として届かなくなるため (= 平文 letter の逃げ道を残す)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuAction {
+    /// 子を起こす (= 継続系)。
+    Resume,
+    /// client suspend (= 継続系、fg 復帰で子も起こす)。
+    ClientSuspend,
+    /// detach (= 継続系、子は停止のまま残る)。
+    Detach,
+    /// `SIGCONT` + `SIGINT` (= 終了系)。
+    Sigint,
+    /// `SIGCONT` + `SIGHUP` (= 終了系)。
+    Sighup,
+    /// `SIGKILL` (= 終了系)。
+    Sigkill,
+    /// メニューを閉じる (= 明示キャンセル、何もしない)。
+    Close,
+}
+
+/// menu 表示中の入力 chunk を項目に解釈する (= 該当なしは `None` で **破棄**)。
+///
+/// 受理するのは **chunk 全体が 1 byte** の場合だけ (= 1 打鍵 1 write という端末の
+/// 振る舞いに合わせる)。複数 byte の chunk を走査して項目キーを探すと、貼り付けや
+/// 矢印キー (`ESC [ A`) の中の 1 文字で SIGKILL 等の破壊的項目が発火しうる
+/// (= 実測: `MENU-SWALLOWED` の `D` が detach を起動した)。打鍵として届いていない
+/// bytes は無視する方が安全側。
+fn menu_action_for_input(chunk: &[u8]) -> Option<MenuAction> {
+    let [b] = chunk else {
+        return None;
+    };
+    if *b == 0x1b {
+        return Some(MenuAction::Close);
+    }
+    match b.to_ascii_lowercase() {
+        b'c' => Some(MenuAction::Resume),
+        b'z' => Some(MenuAction::ClientSuspend),
+        b'd' => Some(MenuAction::Detach),
+        b'i' => Some(MenuAction::Sigint),
+        b'h' => Some(MenuAction::Sighup),
+        b'k' => Some(MenuAction::Sigkill),
+        b'q' => Some(MenuAction::Close),
+        _ => None,
+    }
+}
+
+/// child action menu の表示行 (DR-0032 §2、上から順に描く)。
+///
+/// 継続系 / 終了系の 2 グループを見出し付きで分ける (= 区分基準は「子を終わらせるか」)。
+const MENU_LINES: &[&str] = &[
+    "\x1b[7m[hyoui] 子プロセスが停止中 — 操作を選んでください\x1b[m",
+    "  継続系 (= 子は終わらせない)",
+    "    c    子を起こす (SIGCONT)",
+    "    z    client suspend (= fg で復帰すると子も起こす)",
+    "    d    detach (= 子は停止したまま残る)",
+    "  終了系 (= 子を終わらせる)",
+    "    i    SIGINT  (= SIGCONT 併送)",
+    "    h    SIGHUP  (= SIGCONT 併送)",
+    "    k    SIGKILL",
+    "  Esc / q  閉じる (= 何もしない)",
+];
+
+/// 画面下部 N 行に child action menu を描く escape 列を組む (DR-0032 §4 第 1 段)。
+///
+/// [`child_stopped_notice`] の 1 行通知を N 行に広げただけ (= `DECSC`/`DECRC` で
+/// cursor 退避、各行を消してから上書き)。daemon の screen state には何も書かない。
+/// 端末が menu 行数より短い場合は入り切る分だけ (= 末尾側を優先して) 描く。
+fn child_action_menu(rows: u16) -> String {
+    let n = MENU_LINES.len() as u16;
+    let skip = usize::from(n.saturating_sub(rows));
+    let start = rows.saturating_sub(n).saturating_add(1).max(1);
+    let mut s = String::from("\x1b7");
+    for (i, line) in MENU_LINES.iter().skip(skip).enumerate() {
+        let row = start + u16::try_from(i).unwrap_or(0);
+        s.push_str(&format!("\x1b[{row};1H\x1b[K{line}"));
+    }
+    s.push_str("\x1b[m\x1b8");
+    s
+}
+
+/// 外側端末の行数を引く (= 通知行 / menu / プロンプトの描画位置決め用)。
+///
+/// 行数は外側端末の fd から直接引く (= WINCH 配線 `winch_source` の有無に依存させない)。
+fn outer_tty_rows(fd: std::os::fd::BorrowedFd<'_>) -> Option<u16> {
+    crate::sys::tty_size(fd).ok().flatten().map(|ws| ws.rows)
+}
+
+/// `select_on_demand` のプロンプト行 (DR-0032 §3)。
+///
+/// menu と違い alt screen を抜けた通常画面に出す 1 行なので、最下行への移動と
+/// 行消去だけ行い cursor は行末に置いたままにする (= 次の明示キーを待つ状態)。
+fn ctrlz_x1_prompt(rows: u16) -> String {
+    format!(
+        "\x1b[{rows};1H\x1b[K\x1b[7m[hyoui] ^Z: client suspend / ^C: client 終了 / \
+         Esc: attach に戻る\x1b[m"
+    )
+}
+
+/// `select_on_demand` プロンプト中の明示キー (DR-0032 §3 のキー表)。
+///
+/// 表に無いキーは `None` = **無視して破棄** (= 放置後の復帰で無自覚に打ったキーで
+/// 状態が変わる事故を避ける)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum X1PromptChoice {
+    /// Ctrl+Z — client suspend。
+    ClientSuspend,
+    /// Ctrl+C — client 終了 (= detach、子は走り続ける)。
+    ClientQuit,
+    /// Esc — attach 表示に戻る。
+    BackToAttach,
+}
+
+/// プロンプト中の入力 chunk を明示キーに解釈する。
+///
+/// プロンプト状態に入る前に [`OUTER_TTY_RESET`] で kitty keyboard protocol を pop
+/// してあるので、Ctrl+Z / Ctrl+C / Esc は legacy 符号化 (= 単一 byte) で届く。
+/// [`menu_action_for_input`] と同じく **1 byte chunk だけ**受理する (= 貼り付けや
+/// escape sequence の一部で状態が変わらないようにする)。
+fn x1_prompt_choice_for_input(chunk: &[u8]) -> Option<X1PromptChoice> {
+    let [b] = chunk else {
+        return None;
+    };
+    match *b {
+        crate::client::CTRL_Z_BYTE => Some(X1PromptChoice::ClientSuspend),
+        0x03 => Some(X1PromptChoice::ClientQuit),
+        0x1b => Some(X1PromptChoice::BackToAttach),
+        _ => None,
+    }
 }
 
 /// 保留中の Ctrl+Z (= suspend 待ち) / decoder の未確定 byte がある間だけ deadline まで
@@ -381,6 +557,11 @@ pub struct ClientConnection {
     pending_frames: std::collections::VecDeque<Frame>,
     /// attach client UX 設定 (= Ctrl+Z ガード等、DR-0029)。
     attach_config: crate::config::AttachConfig,
+    /// 子 suspend 時のふるまい (= `[session] on_child_suspend` の設定値、DR-0032 §1)。
+    ///
+    /// attach client 側の写像は [`stopped_child_action`] が担う (= resume / menu /
+    /// 何もしない)。daemon policy への写像は起動側 (`hyoui run`) の責務。
+    on_child_suspend: crate::config::OnChildSuspendSetting,
     /// `send_raw_bytes` の ack 待ちが timeout で打ち切られた / I/O error で失敗した後、
     /// 同一 connection への新規送信を禁止するためのフラグ (DR-0021 M2)。
     ///
@@ -511,6 +692,7 @@ impl ClientConnection {
             winch_source: None,
             pending_frames: std::collections::VecDeque::new(),
             attach_config: crate::config::AttachConfig::default(),
+            on_child_suspend: crate::config::OnChildSuspendSetting::default(),
             poisoned: false,
         })
     }
@@ -562,6 +744,16 @@ impl ClientConnection {
     #[must_use]
     pub fn with_attach_config(mut self, config: crate::config::AttachConfig) -> Self {
         self.attach_config = config;
+        self
+    }
+
+    /// 子 suspend 時のふるまい (= `[session] on_child_suspend`) を適用する (DR-0032 §1)。
+    ///
+    /// 未設定時は default (= `auto_resume_on_attached`、rw attach 中は子を停止させた
+    /// ままにしない)。
+    #[must_use]
+    pub fn with_on_child_suspend(mut self, setting: crate::config::OnChildSuspendSetting) -> Self {
+        self.on_child_suspend = setting;
         self
     }
 
@@ -653,10 +845,15 @@ impl ClientConnection {
     /// 5. 画面を復元する。独立した redraw 要求 message は protocol に無いので、既存の
     ///    `SessionChildResumeRequest` (= daemon が **redraw bytes を送ってから** SIGCONT
     ///    する経路、`handle_session_child_resume_request`) に相乗りする。送る条件は
-    ///    DR-0030 の resume 条件と同じ [`should_resume_stopped_child`] なので、
-    ///    `resume_stopped_child = false` / ro / rw-no-leader では再描画も行わない
+    ///    DR-0030 の resume 条件と同じ [`stopped_child_action`] なので、
+    ///    `show_child_action_menu` / ro / rw-no-leader では再描画も行わない
     ///    (= 子を勝手に起こさない設定を、再描画の都合で破らない)
-    fn suspend_client<W: Write>(&mut self, stdout: &mut W) {
+    ///
+    /// `resume_after_fg = true` を渡すと上記 gate を無視して必ず resume 要求を送る
+    /// (= child action menu の client suspend 項目。「一旦どけて戻ったら続きをやる」
+    /// 明示操作なので、`show_child_action_menu` 下でも復帰と同時に子を起こす、
+    /// DR-0032 §2 メニュー項目表)。
+    fn suspend_client<W: Write>(&mut self, stdout: &mut W, resume_after_fg: bool) {
         self.emit_outer_tty_reset(stdout);
         if let Some(guard) = self.outer_tty_guard.as_ref()
             && let Ok(g) = guard.lock()
@@ -671,9 +868,154 @@ impl ClientConnection {
         {
             g.resume();
         }
-        if suspended && should_resume_stopped_child(self.response.mode, &self.attach_config) {
+        if suspended && (resume_after_fg || self.redraw_request_allowed()) {
             let _ = self.send_child_resume();
         }
+    }
+
+    /// 画面復元のために `SessionChildResumeRequest` を送ってよい設定か (DR-0032 §1)。
+    ///
+    /// 同 message は「redraw bytes 送信 + 子 pgrp へ SIGCONT」なので、子を勝手に
+    /// 起こさない設定 (`show_child_action_menu`) と ro / rw-no-leader では送らない
+    /// (= 再描画の都合で policy を破らない)。
+    fn redraw_request_allowed(&self) -> bool {
+        stopped_child_action(self.response.mode, self.on_child_suspend)
+            == StoppedChildAction::Resume
+    }
+
+    /// child action menu を画面下部に描く (DR-0032 §4 第 1 段)。
+    ///
+    /// 前提は [`draw_child_stopped_notice`](Self::draw_child_stopped_notice) と同じ
+    /// (= 外側 stdout が raw mode の tty で行数が取れる)。満たさない場合は何も描かない
+    /// (= DR-0032 §2 発動条件 4)。
+    fn draw_child_action_menu<W: Write>(&self, stdout: &mut W, rows: Option<u16>) {
+        if !self.outer_tty_raw {
+            return;
+        }
+        let Some(rows) = rows else {
+            return;
+        };
+        let _ = stdout.write_all(child_action_menu(rows).as_bytes());
+        let _ = stdout.flush();
+    }
+
+    /// 子 pgrp を起こしてから終了系 signal を送る (DR-0032 §2 終了系項目)。
+    ///
+    /// stopped なプロセスに送った terminate 系 signal は pending になるだけで
+    /// SIGCONT まで配送されないので、`SIGCONT` を併送して起こしてから効かせる
+    /// (= 併送しないと「メニューで SIGINT を選んだのに何も起きない」silent no-op。
+    /// daemon 側 finalize escalation / `hyoui kill` と同じ流儀)。
+    ///
+    /// 経路は既存 `kind = "signal"` message の 2 連送のみ (= 新 message / cap flag
+    /// なし)。`SIGKILL` は stopped でも即効くので併送しない。
+    fn send_terminating_signal(&mut self, name: &str) -> Result<(), Error> {
+        if name != "SIGKILL" {
+            self.send_control(&ControlMessage::Signal(crate::protocol::messages::Signal {
+                signal: "SIGCONT".to_string(),
+            }))?;
+        }
+        self.send_control(&ControlMessage::Signal(crate::protocol::messages::Signal {
+            signal: name.to_string(),
+        }))
+    }
+
+    /// 単発 Ctrl+Z 確定後の action を実行する (DR-0032 §3 `ctrlz_x1_action`)。
+    ///
+    /// 戻り値が `Some` なら `run` はその outcome で抜ける (= `client_detach`)。
+    /// `select_on_demand` は外側端末を reset してプロンプトを描き、`focus` を
+    /// [`InputFocus::X1Prompt`] に移すだけで抜けない (= 次の明示キーを待つ)。
+    fn run_ctrlz_x1_action<W: Write>(
+        &mut self,
+        stdout: &mut W,
+        focus: &mut InputFocus,
+        rows: Option<u16>,
+    ) -> Option<RunOutcome> {
+        match self.attach_config.ctrlz_x1_action {
+            crate::config::CtrlzX1Action::ClientSuspend => {
+                self.suspend_client(stdout, false);
+                None
+            }
+            crate::config::CtrlzX1Action::ClientDetach => Some(self.finish_detach(stdout)),
+            crate::config::CtrlzX1Action::SelectOnDemand => {
+                // alt screen / kitty keyboard 等を解除してから 1 行プロンプトを出す
+                // (= client suspend で外側 shell に戻る時と同じ前処理。以降のキーが
+                // legacy 符号化で届くようにもなる)。
+                self.emit_outer_tty_reset(stdout);
+                if let Some(rows) = rows.filter(|_| self.outer_tty_raw) {
+                    let _ = stdout.write_all(ctrlz_x1_prompt(rows).as_bytes());
+                    let _ = stdout.flush();
+                }
+                *focus = InputFocus::X1Prompt;
+                None
+            }
+        }
+    }
+
+    /// `select_on_demand` プロンプトの明示キーを実行する (DR-0032 §3 のキー表)。
+    ///
+    /// 戻り値が `Some` なら `run` はその outcome で抜ける (= Ctrl+C の client 終了)。
+    fn run_x1_prompt_choice<W: Write>(
+        &mut self,
+        choice: X1PromptChoice,
+        stdout: &mut W,
+        focus: &mut InputFocus,
+    ) -> Option<RunOutcome> {
+        match choice {
+            X1PromptChoice::ClientSuspend => {
+                *focus = InputFocus::Child;
+                self.suspend_client(stdout, false);
+                None
+            }
+            X1PromptChoice::ClientQuit => Some(self.finish_detach(stdout)),
+            X1PromptChoice::BackToAttach => {
+                *focus = InputFocus::Child;
+                // プロンプトのために alt screen を抜けているので、attach 表示は
+                // daemon の redraw で復元する (= client 側に screen state は無い)。
+                if self.redraw_request_allowed() {
+                    let _ = self.send_child_resume();
+                }
+                None
+            }
+        }
+    }
+
+    /// child action menu の項目を実行する (DR-0032 §2 メニュー項目表)。
+    ///
+    /// 戻り値が `Some` なら `run` はその outcome で抜ける (= detach 項目)。それ以外は
+    /// メニューを閉じて (= `focus` を [`InputFocus::Child`] に戻して) forward を再開する。
+    /// 終了系で子が実際に死んだ場合は、後続の `SessionExitNotify` で `run` が抜ける。
+    fn run_menu_action<W: Write>(
+        &mut self,
+        action: MenuAction,
+        stdout: &mut W,
+        focus: &mut InputFocus,
+    ) -> Option<RunOutcome> {
+        if action == MenuAction::Detach {
+            return Some(self.finish_detach(stdout));
+        }
+        *focus = InputFocus::Child;
+        match action {
+            MenuAction::Resume => {
+                // 既存 `SessionChildResumeRequest` (= redraw bytes → 子 pgrp へ SIGCONT)。
+                // menu が上書きした行も daemon の redraw で戻る。
+                let _ = self.send_child_resume();
+            }
+            MenuAction::ClientSuspend => self.suspend_client(stdout, true),
+            MenuAction::Sigint => {
+                let _ = self.send_terminating_signal("SIGINT");
+            }
+            MenuAction::Sighup => {
+                let _ = self.send_terminating_signal("SIGHUP");
+            }
+            MenuAction::Sigkill => {
+                let _ = self.send_terminating_signal("SIGKILL");
+            }
+            // 明示キャンセル: 表示を消す代わりに何もしない (= 子は停止のまま、次の
+            // 出力 / redraw で menu の描画跡は消える)。
+            MenuAction::Close => {}
+            MenuAction::Detach => unreachable!("detach は上で早期 return 済み"),
+        }
+        None
     }
 
     /// 子が停止したことを画面最下行に 1 行で知らせる (DR-0029 §1)。
@@ -725,6 +1067,21 @@ impl ClientConnection {
         stdout: &mut W,
     ) -> Result<RunOutcome, Error> {
         let mut ctrlz = CtrlzGuard::default();
+        // DR-0032 §2 発動条件 3 (前半): attach 成立時の handshake snapshot が stopped
+        // だった場合。`show_child_action_menu` なら raw mode に入った直後の今ここで
+        // menu を出す (= resume する設定では CLI 層が既に resume 要求を送っている)。
+        let mut focus = InputFocus::Child;
+        if self.response.child_stopped
+            && stopped_child_action(self.response.mode, self.on_child_suspend)
+                == StoppedChildAction::Menu
+        {
+            focus = InputFocus::ChildMenu;
+            let rows = crate::sys::tty_size(stdin.as_fd())
+                .ok()
+                .flatten()
+                .map(|ws| ws.rows);
+            self.draw_child_action_menu(stdout, rows);
+        }
         // DR-0019 §5: SendEof で stdin EOF 観測後、stdin はもう読まない (= EOT 送出
         // 済) が、子の出力 (= bc の計算結果) と SessionExitNotify を拾い切るため
         // loop は継続する。
@@ -770,6 +1127,8 @@ impl ClientConnection {
             });
 
             let now = std::time::Instant::now();
+            // 操作面 (= menu / プロンプト) が開いている間はガードの保留が無い
+            // (= focus 遷移時に reset 済み) ので、timeout は NONE に落ちる。
             let poll_timeout = ctrlz_guard_poll_timeout(&ctrlz, now);
             let poll_timed_out = match poll(&mut fds, poll_timeout) {
                 Ok(PollOutcome::Ready(_)) => false,
@@ -782,22 +1141,29 @@ impl ClientConnection {
             // 飢餓させない。poll outcome に関係なく deadline を評価してから ready fd を処理する。
             // 未確定 sequence の保持期限も同じ経路で満了し、Ctrl+Z でなかったと確定した
             // byte 列がここで forward される (= 打鍵が続かなくても子へ届く)。
-            let outcome = process_ctrlz_guard(
-                &[],
-                &mut ctrlz,
-                std::time::Instant::now(),
-                &self.attach_config,
-            );
-            if !outcome.forward.is_empty() {
-                let frame = Frame::raw_data(outcome.forward);
-                if frame.encode_to(&mut self.writer).is_err() {
-                    return Ok(RunOutcome::ConnectionLost);
+            if focus == InputFocus::Child {
+                let outcome = process_ctrlz_guard(
+                    &[],
+                    &mut ctrlz,
+                    std::time::Instant::now(),
+                    &self.attach_config,
+                );
+                if !outcome.forward.is_empty() {
+                    let frame = Frame::raw_data(outcome.forward);
+                    if frame.encode_to(&mut self.writer).is_err() {
+                        return Ok(RunOutcome::ConnectionLost);
+                    }
                 }
-            }
-            if outcome.suspend {
-                self.suspend_client(stdout);
-                // 停止中に溜まった出力 / 復帰後の redraw を拾うため、poll から組み直す。
-                continue;
+                if outcome.suspend {
+                    // DR-0032 §3: 単発確定後の action は config で決まる
+                    // (client suspend / detach / 選択プロンプト)。
+                    let rows = outer_tty_rows(stdin.as_fd());
+                    if let Some(o) = self.run_ctrlz_x1_action(stdout, &mut focus, rows) {
+                        return Ok(o);
+                    }
+                    // 停止中に溜まった出力 / 復帰後の redraw を拾うため、poll から組み直す。
+                    continue;
+                }
             }
             if poll_timed_out {
                 continue;
@@ -853,6 +1219,23 @@ impl ClientConnection {
                 match Frame::decode_from(&mut self.reader) {
                     Ok(frame) => match frame.ty {
                         TYPE_RAW_DATA => {
+                            // DR-0032 §2: menu 表示中に子の出力が届いたら「menu 以外の
+                            // 要因で子が resume した」証拠として menu を畳み、forward を
+                            // 再開する。socket は順序保証があり、stop 前の出力は
+                            // StoppedNotify より先に処理済みなので、notify 後の raw_data は
+                            // 停止後に生まれた bytes = 子が動いている (or daemon の redraw)。
+                            // 残る race は daemon の PTY read が waitpid に遅れて stop 前の
+                            // 出力を後から流す場合だけで、その時は menu を早く閉じる側に
+                            // 倒れる (= 次の stop 通知で出し直せる、安全側)。
+                            if focus == InputFocus::ChildMenu {
+                                focus = InputFocus::Child;
+                            }
+                            // プロンプト表示中 (= alt screen を抜けた通常画面) の子の出力は
+                            // 捨てる (= 1 行プロンプトを壊さない)。attach に戻る時に daemon の
+                            // redraw で画面を復元する。
+                            if focus == InputFocus::X1Prompt {
+                                continue;
+                            }
                             if stdout.write_all(&frame.body).is_err() {
                                 // 出力先 (= 端末 / pipe) が閉じた。daemon との接続は
                                 // 健在なので `ConnectionLost` (= daemon 消滅) とは別扱い。
@@ -887,21 +1270,36 @@ impl ClientConnection {
                                     //
                                     // ro / rw-no-leader は観察 or 非 leader 接続なので
                                     // 起こさない (= DR-0029 §5 と同じ切り分け)。
-                                    let resuming = should_resume_stopped_child(
+                                    //
+                                    // DR-0032 §1: 起こす / menu を出す / 何もしないの 3 分岐は
+                                    // `stopped_child_action` に集約 (= handshake snapshot 経路と
+                                    // 同じ判定を共有する)。
+                                    let rows = outer_tty_rows(stdin.as_fd());
+                                    match stopped_child_action(
                                         self.response.mode,
-                                        &self.attach_config,
-                                    ) && self.send_child_resume().is_ok();
-                                    if !resuming {
-                                        // DR-0029 §1: 起こさない場合は attach を継続したまま
-                                        // 画面が固着するので、それが「hyoui が壊れた」では
-                                        // なく「子が停止中」だと分かるよう最下行に 1 行出す。
-                                        // 起こす場合は子の再描画で消える通知を出すだけ無駄
-                                        // なので描かない。
-                                        let rows = crate::sys::tty_size(stdin.as_fd())
-                                            .ok()
-                                            .flatten()
-                                            .map(|ws| ws.rows);
-                                        self.draw_child_stopped_notice(stdout, rows);
+                                        self.on_child_suspend,
+                                    ) {
+                                        StoppedChildAction::Resume => {
+                                            if self.send_child_resume().is_err() {
+                                                // 送信失敗時だけ通知行を描く (= 起こせた場合は
+                                                // 子の再描画で消える通知を出すだけ無駄)。
+                                                self.draw_child_stopped_notice(stdout, rows);
+                                            }
+                                        }
+                                        StoppedChildAction::Menu => {
+                                            // DR-0032 §2 発動条件 3 (後半)。保留 Ctrl+Z は
+                                            // 捨てて操作面に移る (= menu が入力を飲む)。
+                                            ctrlz = CtrlzGuard::default();
+                                            focus = InputFocus::ChildMenu;
+                                            self.draw_child_action_menu(stdout, rows);
+                                        }
+                                        StoppedChildAction::Nothing => {
+                                            // DR-0029 §1: 起こさない場合は attach を継続した
+                                            // まま画面が固着するので、それが「hyoui が壊れた」
+                                            // ではなく「子が停止中」だと分かるよう最下行に
+                                            // 1 行出す。
+                                            self.draw_child_stopped_notice(stdout, rows);
+                                        }
                                     }
                                 }
                                 Ok(ControlMessage::LeaderNotify(n)) => {
@@ -1014,25 +1412,49 @@ impl ClientConnection {
                         // `--stdin-eof=detach`: 自発 detach (= 子は残す)。
                         return Ok(self.finish_detach(stdout));
                     }
-                    Ok(n) => {
-                        let outcome = process_ctrlz_guard(
-                            &buf[..n],
-                            &mut ctrlz,
-                            std::time::Instant::now(),
-                            &self.attach_config,
-                        );
-                        if !outcome.forward.is_empty() {
-                            let frame = Frame::raw_data(outcome.forward);
-                            if frame.encode_to(&mut self.writer).is_err() {
-                                return Ok(RunOutcome::ConnectionLost);
+                    Ok(n) => match focus {
+                        // DR-0032 §2 / §3: 操作面が開いている間は入力を client が飲み、
+                        // PTY へ一切 forward しない。表に無いキーは破棄する。
+                        InputFocus::ChildMenu => {
+                            if let Some(action) = menu_action_for_input(&buf[..n])
+                                && let Some(o) = self.run_menu_action(action, stdout, &mut focus)
+                            {
+                                return Ok(o);
                             }
                         }
-                        if outcome.suspend {
-                            // `ctrlz_guard_delay = 0` で即 suspend する経路 (= 保留窓を
-                            // 使わない設定)。入力は上で送り切ってから停止する。
-                            self.suspend_client(stdout);
+                        InputFocus::X1Prompt => {
+                            if let Some(choice) = x1_prompt_choice_for_input(&buf[..n])
+                                && let Some(o) =
+                                    self.run_x1_prompt_choice(choice, stdout, &mut focus)
+                            {
+                                return Ok(o);
+                            }
                         }
-                    }
+                        InputFocus::Child => {
+                            let outcome = process_ctrlz_guard(
+                                &buf[..n],
+                                &mut ctrlz,
+                                std::time::Instant::now(),
+                                &self.attach_config,
+                            );
+                            if !outcome.forward.is_empty() {
+                                let frame = Frame::raw_data(outcome.forward);
+                                if frame.encode_to(&mut self.writer).is_err() {
+                                    return Ok(RunOutcome::ConnectionLost);
+                                }
+                            }
+                            if outcome.suspend {
+                                // `ctrlz_guard_delay = 0` で即 suspend / detach / プロンプトへ
+                                // 遷移する経路 (= 保留窓を使わない設定)。入力は上で送り切って
+                                // から action を実行する。
+                                let rows = outer_tty_rows(stdin.as_fd());
+                                if let Some(o) = self.run_ctrlz_x1_action(stdout, &mut focus, rows)
+                                {
+                                    return Ok(o);
+                                }
+                            }
+                        }
+                    },
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     // stdin read error: 入力経路が壊れた。子は daemon 配下に残せるので
                     // 自発 detach 相当 (= 接続喪失ではない)。
@@ -1403,6 +1825,7 @@ mod tests {
             winch_source: None,
             pending_frames: std::collections::VecDeque::new(),
             attach_config: crate::config::AttachConfig::default(),
+            on_child_suspend: crate::config::OnChildSuspendSetting::default(),
             poisoned: false,
         };
 
@@ -1460,6 +1883,7 @@ mod tests {
             winch_source: Some(WinchSource::new(rd, size_fn)),
             pending_frames: std::collections::VecDeque::new(),
             attach_config: crate::config::AttachConfig::default(),
+            on_child_suspend: crate::config::OnChildSuspendSetting::default(),
             poisoned: false,
         };
         // leader=false なので Ok(()) で何も送らない (panic しなければ成功)。
@@ -1493,6 +1917,7 @@ mod tests {
             winch_source: Some(WinchSource::new(rd, size_fn)),
             pending_frames: std::collections::VecDeque::new(),
             attach_config: crate::config::AttachConfig::default(),
+            on_child_suspend: crate::config::OnChildSuspendSetting::default(),
             poisoned: false,
         };
         conn.send_initial_resize().expect("send_initial_resize");
@@ -1548,6 +1973,7 @@ mod tests {
             winch_source: Some(WinchSource::new(notify_rd, size_fn)),
             pending_frames: std::collections::VecDeque::new(),
             attach_config: crate::config::AttachConfig::default(),
+            on_child_suspend: crate::config::OnChildSuspendSetting::default(),
             poisoned: false,
         };
 
@@ -1620,6 +2046,7 @@ mod tests {
             winch_source: Some(WinchSource::new(notify_rd, size_fn)),
             pending_frames: std::collections::VecDeque::new(),
             attach_config: crate::config::AttachConfig::default(),
+            on_child_suspend: crate::config::OnChildSuspendSetting::default(),
             poisoned: false,
         };
 
@@ -1696,6 +2123,7 @@ mod tests {
             winch_source: Some(WinchSource::new(notify_rd, size_fn)),
             pending_frames: std::collections::VecDeque::new(),
             attach_config: crate::config::AttachConfig::default(),
+            on_child_suspend: crate::config::OnChildSuspendSetting::default(),
             poisoned: false,
         };
 
@@ -1727,7 +2155,7 @@ mod tests {
             ctrlz_guard: true,
             ctrlz_guard_delay: Duration::from_millis(500),
             ctrlz_guard_overlay: true,
-            resume_stopped_child: true,
+            ctrlz_x1_action: crate::config::CtrlzX1Action::ClientSuspend,
         }
     }
 
@@ -2142,27 +2570,142 @@ mod tests {
         );
     }
 
-    // ---- DR-0030: 停止中の子を起こす判定 ----
+    // ---- DR-0030 / DR-0032 §1: 停止中の子に対する行動の判定 ----
 
-    /// rw attach が開いている間だけ子を起こす。ro / rw-no-leader は操作意思と
-    /// みなさないので、設定が有効でも起こさない。
+    /// DR-0032 §1 の写像表 (attach client 列) を全対応で埋める。
+    ///
+    /// 旧 test (`only_rw_attach_resumes_stopped_child` /
+    /// `resume_stopped_child_false_opts_out_even_for_rw`) は bool 2 個を前提にしていた
+    /// ので、enum 3 値 × mode 3 種の表に置き換える (DR-0032 §Consequences: 返り値が
+    /// bool から 3 値に変わる breaking change)。
     #[test]
-    fn only_rw_attach_resumes_stopped_child() {
-        let cfg = crate::config::AttachConfig::default();
-        assert!(cfg.resume_stopped_child, "default は起こす側 (DR-0030)");
-        assert!(should_resume_stopped_child(Mode::Rw, &cfg));
-        assert!(!should_resume_stopped_child(Mode::Ro, &cfg));
-        assert!(!should_resume_stopped_child(Mode::RwNoLeader, &cfg));
+    fn stopped_child_action_covers_enum_times_mode_matrix() {
+        use crate::config::OnChildSuspendSetting as Setting;
+        use StoppedChildAction::{Menu, Nothing, Resume};
+        let matrix = [
+            // (設定, mode, 期待)
+            (Setting::AutoResumeAlways, Mode::Rw, Resume),
+            (Setting::AutoResumeAlways, Mode::Ro, Nothing),
+            (Setting::AutoResumeAlways, Mode::RwNoLeader, Nothing),
+            (Setting::AutoResumeOnAttached, Mode::Rw, Resume),
+            (Setting::AutoResumeOnAttached, Mode::Ro, Nothing),
+            (Setting::AutoResumeOnAttached, Mode::RwNoLeader, Nothing),
+            (Setting::ShowChildActionMenu, Mode::Rw, Menu),
+            (Setting::ShowChildActionMenu, Mode::Ro, Nothing),
+            (Setting::ShowChildActionMenu, Mode::RwNoLeader, Nothing),
+        ];
+        for (setting, mode, expected) in matrix {
+            assert_eq!(
+                stopped_child_action(mode, setting),
+                expected,
+                "setting={setting:?} mode={mode:?}"
+            );
+        }
     }
 
-    /// `resume_stopped_child = false` は rw attach でも起こさない (= opt-out)。
+    /// default 設定は「rw attach 中は子を停止させたままにしない」側 (DR-0030 の原則)。
     #[test]
-    fn resume_stopped_child_false_opts_out_even_for_rw() {
-        let cfg = crate::config::AttachConfig {
-            resume_stopped_child: false,
-            ..crate::config::AttachConfig::default()
-        };
-        assert!(!should_resume_stopped_child(Mode::Rw, &cfg));
+    fn default_setting_resumes_for_rw_attach() {
+        let c = crate::config::Config::default();
+        assert_eq!(
+            stopped_child_action(Mode::Rw, c.session.on_child_suspend),
+            StoppedChildAction::Resume
+        );
+    }
+
+    // ---- DR-0032 §2: child action menu ----
+
+    /// menu のキー表: 項目キー / 閉じるキー / 表に無いキーの破棄。
+    #[test]
+    fn menu_keys_map_to_items_and_ignore_others() {
+        assert_eq!(menu_action_for_input(b"c"), Some(MenuAction::Resume));
+        assert_eq!(menu_action_for_input(b"z"), Some(MenuAction::ClientSuspend));
+        assert_eq!(menu_action_for_input(b"d"), Some(MenuAction::Detach));
+        assert_eq!(menu_action_for_input(b"i"), Some(MenuAction::Sigint));
+        assert_eq!(menu_action_for_input(b"h"), Some(MenuAction::Sighup));
+        assert_eq!(menu_action_for_input(b"k"), Some(MenuAction::Sigkill));
+        assert_eq!(menu_action_for_input(b"q"), Some(MenuAction::Close));
+        assert_eq!(menu_action_for_input(b"\x1b"), Some(MenuAction::Close));
+        // 大文字でも同じ項目 (= CapsLock 事故を弾かない)。
+        assert_eq!(menu_action_for_input(b"K"), Some(MenuAction::Sigkill));
+        // 表に無いキーは破棄 (= 子へも流れない)。
+        assert_eq!(menu_action_for_input(b"x"), None);
+        assert_eq!(menu_action_for_input(b"\r"), None);
+        // 矢印キー (= ESC 先頭の CSI sequence) を Close と誤読しない。
+        assert_eq!(menu_action_for_input(b"\x1b[A"), None);
+        // 複数 byte の chunk (= 貼り付け等) は、中に項目キーがあっても発火しない。
+        // 実測由来の regression: `MENU-SWALLOWED` の `D` で detach が起動した。
+        assert_eq!(menu_action_for_input(b"MENU-SWALLOWED\r"), None);
+        assert_eq!(menu_action_for_input(b"kill"), None);
+    }
+
+    /// 描画は DR-0029 §1 通知行の N 行拡張 (= DECSC/DECRC で囲み、下から N 行を上書き)。
+    #[test]
+    fn child_action_menu_draws_bottom_rows_with_cursor_save_restore() {
+        let s = child_action_menu(24);
+        assert!(s.starts_with("\x1b7"), "cursor 保存で始まる: {s:?}");
+        assert!(s.ends_with("\x1b8"), "cursor 復元で終わる: {s:?}");
+        let n = MENU_LINES.len() as u16;
+        // 24 行端末なら 15..=24 行目に描く (= 末尾 N 行)。
+        assert!(
+            s.contains(&format!("\x1b[{};1H", 24 - n + 1)),
+            "先頭行: {s:?}"
+        );
+        assert!(s.contains("\x1b[24;1H"), "最下行まで使う: {s:?}");
+        assert!(s.contains("子を起こす (SIGCONT)"), "継続系の項目: {s:?}");
+        assert!(s.contains("SIGKILL"), "終了系の項目: {s:?}");
+        for line in MENU_LINES {
+            assert!(s.contains(line), "全項目を描く: {line}");
+        }
+    }
+
+    /// 端末が menu 行数より短い場合は入り切る分だけ描く (= 上にはみ出さない)。
+    #[test]
+    fn child_action_menu_fits_short_terminal() {
+        let s = child_action_menu(3);
+        assert!(s.contains("\x1b[1;1H"), "1 行目から使う: {s:?}");
+        assert!(s.contains("\x1b[3;1H"), "最下行まで使う: {s:?}");
+        assert!(!s.contains("\x1b[4;1H"), "端末外に描かない: {s:?}");
+        assert!(
+            s.contains(MENU_LINES[MENU_LINES.len() - 1]),
+            "末尾側を優先して残す: {s:?}"
+        );
+    }
+
+    // ---- DR-0032 §3: ctrlz_x1_action の select_on_demand プロンプト ----
+
+    /// プロンプトのキー表は明示 3 キーのみ。他キーは無視して破棄する。
+    #[test]
+    fn x1_prompt_reacts_only_to_explicit_keys() {
+        assert_eq!(
+            x1_prompt_choice_for_input(&[CTRL_Z_BYTE]),
+            Some(X1PromptChoice::ClientSuspend)
+        );
+        assert_eq!(
+            x1_prompt_choice_for_input(&[0x03]),
+            Some(X1PromptChoice::ClientQuit)
+        );
+        assert_eq!(
+            x1_prompt_choice_for_input(b"\x1b"),
+            Some(X1PromptChoice::BackToAttach)
+        );
+        // 「その他のキーでキャンセル」にしない (= 放置後の無自覚な打鍵で状態を変えない)。
+        assert_eq!(x1_prompt_choice_for_input(b"a"), None);
+        assert_eq!(x1_prompt_choice_for_input(b" "), None);
+        assert_eq!(x1_prompt_choice_for_input(b"\r"), None);
+        assert_eq!(x1_prompt_choice_for_input(b"\x1b[A"), None);
+        // 複数 byte chunk は明示キーを含んでいても発火しない (= menu と同じ規律)。
+        assert_eq!(x1_prompt_choice_for_input(&[b'a', CTRL_Z_BYTE]), None);
+    }
+
+    /// プロンプトは最下行に 1 行、DR 記載の 3 択をそのまま出す。
+    #[test]
+    fn x1_prompt_line_shows_three_choices_on_last_row() {
+        let s = ctrlz_x1_prompt(24);
+        assert!(s.contains("\x1b[24;1H"), "最下行へ移動: {s:?}");
+        assert!(s.contains("^Z: client suspend"), "suspend の案内: {s:?}");
+        assert!(s.contains("^C: client 終了"), "終了の案内: {s:?}");
+        assert!(s.contains("Esc: attach に戻る"), "復帰の案内: {s:?}");
     }
 
     // ---- DR-0029 §1: 子 stopped の画面通知 ----
@@ -2527,6 +3070,7 @@ mod tests {
             winch_source: None,
             pending_frames: std::collections::VecDeque::new(),
             attach_config: hold_forever_config(),
+            on_child_suspend: crate::config::OnChildSuspendSetting::default(),
             poisoned: false,
         };
 
@@ -2590,6 +3134,7 @@ mod tests {
             winch_source: None,
             pending_frames: std::collections::VecDeque::new(),
             attach_config: hold_forever_config(),
+            on_child_suspend: crate::config::OnChildSuspendSetting::default(),
             poisoned: false,
         };
 
@@ -2656,6 +3201,7 @@ mod tests {
             winch_source: None,
             pending_frames: std::collections::VecDeque::new(),
             attach_config: crate::config::AttachConfig::default(),
+            on_child_suspend: crate::config::OnChildSuspendSetting::default(),
             poisoned: false,
         };
 
@@ -2710,6 +3256,7 @@ mod tests {
             winch_source: None,
             pending_frames: std::collections::VecDeque::new(),
             attach_config: crate::config::AttachConfig::default(),
+            on_child_suspend: crate::config::OnChildSuspendSetting::default(),
             poisoned: false,
         };
 
@@ -2765,6 +3312,7 @@ mod tests {
             winch_source: None,
             pending_frames: std::collections::VecDeque::new(),
             attach_config: crate::config::AttachConfig::default(),
+            on_child_suspend: crate::config::OnChildSuspendSetting::default(),
             poisoned: false,
         };
 
@@ -2820,6 +3368,7 @@ mod tests {
             winch_source: None,
             pending_frames: std::collections::VecDeque::new(),
             attach_config: crate::config::AttachConfig::default(),
+            on_child_suspend: crate::config::OnChildSuspendSetting::default(),
             poisoned: false,
         };
 
@@ -2865,6 +3414,7 @@ mod tests {
             winch_source: None,
             pending_frames: std::collections::VecDeque::new(),
             attach_config: crate::config::AttachConfig::default(),
+            on_child_suspend: crate::config::OnChildSuspendSetting::default(),
             poisoned: false,
         };
 
@@ -2937,6 +3487,7 @@ mod tests {
             winch_source: None,
             pending_frames: std::collections::VecDeque::new(),
             attach_config: crate::config::AttachConfig::default(),
+            on_child_suspend: crate::config::OnChildSuspendSetting::default(),
             poisoned: false,
         };
 
@@ -2985,6 +3536,7 @@ mod tests {
             winch_source: None,
             pending_frames: std::collections::VecDeque::new(),
             attach_config: crate::config::AttachConfig::default(),
+            on_child_suspend: crate::config::OnChildSuspendSetting::default(),
             poisoned: false,
         };
         (conn, daemon_sock)

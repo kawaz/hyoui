@@ -35,7 +35,8 @@ fn daemon_sigcont_wakes_stopped_child() {
     let runner = HyouiTestRunner::new();
     // DR-0030 の default では rw attach が stopped child を即 resume するため、外部
     // daemon SIGCONT を送る前に子が exit してしまう。この test が保証する daemon 側の
-    // SIGCONT 防衛策だけを観測するため、runner 固有 config で attach 側 resume を止める。
+    // SIGCONT 防衛策だけを観測するため、runner 固有 config を `show_child_action_menu`
+    // (= DR-0032 §1 で「client は起こさない」を意味する enum 値) にする。
     // rw leader 接続は維持するので、daemon/attach の構造自体は通常の `hyoui run` と同じ。
     let mut h = runner.spawn_hyoui_with_config(
         "jobcontrol-daemon-cont",
@@ -46,7 +47,7 @@ fn daemon_sigcont_wakes_stopped_child() {
             SELF_STOP_THEN_ECHO[1],
             SELF_STOP_THEN_ECHO[2],
         ],
-        "[attach]\nresume_stopped_child = false\n",
+        "[session]\non_child_suspend = \"show_child_action_menu\"\n",
     );
 
     // leader 接続が成立するまで待つ (= daemon が稼働し socket 確立)。
@@ -110,11 +111,12 @@ fn daemon_cont_wakes_child_stopped_during_daemon_stop() {
     let runner = HyouiTestRunner::new();
     // DR-0030 の attach 側 resume が後段の stopped notify で子を起こすと、daemon の
     // 同一 drain batch フォールバックが不発でも test が通る。この test が保証する
-    // daemon 経路だけを観測するため、rw leader を維持したまま attach resume を止める。
+    // daemon 経路だけを観測するため、rw leader を維持したまま attach 側 resume を止める
+    // (= DR-0032 §1 の `show_child_action_menu`)。
     let mut h = runner.spawn_hyoui_with_config(
         "jobcontrol-batch-cont",
         &["run", "--", ECHO_LOOP[0], ECHO_LOOP[1], ECHO_LOOP[2]],
-        "[attach]\nresume_stopped_child = false\n",
+        "[session]\non_child_suspend = \"show_child_action_menu\"\n",
     );
 
     assert!(

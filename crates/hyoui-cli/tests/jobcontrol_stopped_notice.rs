@@ -10,7 +10,10 @@
 //! ```
 //!
 //! DR-0030 の default では rw attach が stopped child を即 resume するため、この test
-//! だけ `resume_stopped_child = false` にして通知行の経路を観測する。
+//! だけ `on_child_suspend = "show_child_action_menu"` (= DR-0032 §1 の「起こさない」値)
+//! にして停止表示の経路を観測する。この設定では停止表示が child action menu になり、
+//! その第 1 行が DR-0029 §1 の通知と同じ「子プロセスが停止中」を含む (DR-0032 §4 第 1 段:
+//! menu は通知行の N 行拡張)。
 
 mod common;
 
@@ -23,7 +26,8 @@ use nix::sys::signal::Signal;
 ///
 /// DR-0029 §1 は子 stopped への client follow (`raise(SIGSTOP)`) を撤回し、attach を
 /// 覗き窓として開いたままにすると定める。DR-0030 の attach 側 resume を test 固有
-/// config で止め、子が実際に stopped の間も attach が running であることと通知行を確認する。
+/// config で止め、子が実際に stopped の間も attach が running であることと停止表示を
+/// 確認する。
 #[ignore = "PTY child + signal を使う、ローカルで --ignored 実行 (DR-0029 §1)"]
 #[test]
 fn stopped_child_keeps_attach_running_and_draws_notice() {
@@ -31,7 +35,7 @@ fn stopped_child_keeps_attach_running_and_draws_notice() {
     let mut h = runner.spawn_hyoui_with_config(
         "jobcontrol-stopped-notice",
         &["run", "--", "/bin/sleep", "30"],
-        "[attach]\nresume_stopped_child = false\n",
+        "[session]\non_child_suspend = \"show_child_action_menu\"\n",
     );
 
     assert!(
@@ -70,7 +74,7 @@ fn stopped_child_keeps_attach_running_and_draws_notice() {
     let child_state = process_state_of(child_pid).expect("child process state");
     assert!(
         child_state.is_state('T'),
-        "resume_stopped_child=false では child が stopped のままであるべき: {}",
+        "show_child_action_menu では child が stopped のままであるべき: {}",
         child_state.stat
     );
     let attach_state = process_state_of(attach_pid).expect("attach process state");

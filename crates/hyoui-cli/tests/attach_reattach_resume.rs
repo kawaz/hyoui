@@ -1,7 +1,11 @@
-//! DR-0029 §5: stopped child への再 attach auto-resume の CLI e2e。
+//! DR-0029 §5 / DR-0032 §1: stopped child への再 attach auto-resume の CLI e2e。
 //!
 //! mock daemon が handshake snapshot の `child_stopped` を制御し、attach process が
 //! 既存 `SessionChildResumeRequest` を送る条件を protocol frame 単位で検証する。
+//!
+//! DR-0032 で opt-out の書き方が bool から enum に変わったので、config は
+//! `[session] on_child_suspend` の値で与える (= `show_child_action_menu` が旧
+//! `resume_stopped_child = false` に相当)。
 
 use std::io;
 use std::os::unix::net::UnixListener;
@@ -16,7 +20,7 @@ fn hyoui_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_hyoui"))
 }
 
-fn run_case(mode: Mode, child_stopped: bool, on_reattach: Option<bool>) -> bool {
+fn run_case(mode: Mode, child_stopped: bool, on_child_suspend: Option<&str>) -> bool {
     let temp = TempDir::new().expect("tempdir");
     let socket = temp.path().join("daemon.sock");
     let listener = UnixListener::bind(&socket).expect("bind mock daemon");
@@ -83,12 +87,12 @@ fn run_case(mode: Mode, child_stopped: bool, on_reattach: Option<bool>) -> bool 
     });
 
     let xdg = temp.path().join("xdg");
-    if let Some(enabled) = on_reattach {
+    if let Some(setting) = on_child_suspend {
         let config_dir = xdg.join("hyoui");
         std::fs::create_dir_all(&config_dir).expect("create config dir");
         std::fs::write(
             config_dir.join("config.toml"),
-            format!("[attach]\nresume_stopped_child = {enabled}\n"),
+            format!("[session]\non_child_suspend = \"{setting}\"\n"),
         )
         .expect("write config");
     }
@@ -143,13 +147,21 @@ fn rw_no_leader_stopped_child_does_not_resume() {
 }
 
 #[test]
-fn config_off_suppresses_rw_reattach_resume() {
-    // 明示 opt-out は rw + stopped の組合せでも resume request を抑止する。
-    assert!(!run_case(Mode::Rw, true, Some(false)));
+fn show_child_action_menu_suppresses_rw_reattach_resume() {
+    // DR-0032 §1: menu を出す設定は rw + stopped でも resume request を送らない
+    // (= 起こす代わりに menu を描く。旧 `resume_stopped_child = false` の置換)。
+    assert!(!run_case(Mode::Rw, true, Some("show_child_action_menu")));
+}
+
+#[test]
+fn auto_resume_always_still_resumes_on_handshake_snapshot() {
+    // DR-0032 §1 の写像表: daemon が先に起こすので発動機会はほぼ無いが、handshake
+    // snapshot が stopped だった race では client 側も安全側で起こす。
+    assert!(run_case(Mode::Rw, true, Some("auto_resume_always")));
 }
 
 #[test]
 fn rw_running_child_does_not_send_resume() {
     // fresh/running attach は user action があっても不要な resume request を送らない。
-    assert!(!run_case(Mode::Rw, false, Some(true)));
+    assert!(!run_case(Mode::Rw, false, Some("auto_resume_on_attached")));
 }
