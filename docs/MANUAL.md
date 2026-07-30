@@ -355,12 +355,16 @@ they never reach the child (= no burst of stale input flooding in on resume).
 
 | Key | Action |
 |---|---|
-| `c` | Resume the child (SIGCONT) |
-| `z` | Suspend the client (`fg` resumes the child too) |
-| `d` | Detach (the child stays stopped) |
-| `i` / `h` | SIGINT / SIGHUP (SIGCONT is sent alongside so it reaches a stopped child) |
-| `k` | SIGKILL |
-| `Esc` / `q` | Close the menu (do nothing) |
+| `d` | Escape: detach (the client exits; the child stays stopped) |
+| `z` | Escape: suspend the client (`fg` resumes the child too) |
+| `c` / `Esc` | Child operation: resume it (SIGCONT). Esc acts as "undo this stop" |
+| `i` / `h` | Child operation: SIGINT / SIGHUP (SIGCONT is sent alongside so it reaches a stopped child) |
+| `k` | Child operation: SIGKILL |
+
+Any key outside the table is ignored and discarded (there is no plain "close" action:
+a stopped child cannot receive input, so leaving the menu has no meaning). The
+menu goes away when you pick an action, or when the child is resumed externally
+(e.g. `hyoui kill --signal=CONT` from another shell).
 
 If the child stops while nobody is attached there is nowhere to draw the menu,
 so it appears on the next `hyoui attach`. Pick `auto_resume_always` if you want

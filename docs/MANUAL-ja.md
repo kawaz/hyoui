@@ -342,12 +342,15 @@ attach client のふるまいの両方に写像される (= 設定は 1 箇所)�
 
 | キー | 動作 |
 |---|---|
-| `c` | 子を起こす (SIGCONT) |
-| `z` | client suspend (`fg` で復帰すると子も起こす) |
-| `d` | detach (子は停止したまま残る) |
-| `i` / `h` | SIGINT / SIGHUP (停止中の子にも効くよう SIGCONT を併送) |
-| `k` | SIGKILL |
-| `Esc` / `q` | 閉じる (何もしない) |
+| `d` | 脱出: detach (client 終了。子は停止したまま残る) |
+| `z` | 脱出: client suspend (`fg` で復帰すると子も起こす) |
+| `c` / `Esc` | 子への操作: 起こす (SIGCONT)。Esc はこの停止の「取り消し」として同じ動作 |
+| `i` / `h` | 子への操作: SIGINT / SIGHUP (停止中の子にも効くよう SIGCONT を併送) |
+| `k` | 子への操作: SIGKILL |
+
+操作キー以外の打鍵はすべて無視して捨てる (= 停止中の子に入力の受け手はいないため
+「閉じるだけ」の操作は無い)。メニューが消えるのは、操作を選んだ時か、子が外部要因
+(別 shell からの `hyoui kill --signal=CONT` 等) で動き出した時。
 
 無人時 (= attach していない時) に子が止まった場合はメニューを出す先が無いので、次に
 `hyoui attach` した時点で表示される。無人でも起こしたいなら `auto_resume_always` を選ぶ。

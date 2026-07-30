@@ -223,8 +223,6 @@ enum MenuAction {
     Sighup,
     /// `SIGKILL` (= 終了系)。
     Sigkill,
-    /// メニューを閉じる (= 明示キャンセル、何もしない)。
-    Close,
 }
 
 /// menu 表示中の入力 chunk を項目に解釈する (= 該当なしは `None` で **破棄**)。
@@ -238,8 +236,11 @@ fn menu_action_for_input(chunk: &[u8]) -> Option<MenuAction> {
     let [b] = chunk else {
         return None;
     };
+    // Esc は「子を起こして戻る」= Resume の alias (kawaz 裁定 2026-07-30 m42)。
+    // menu は子の停止をきっかけに出るので、Esc = その停止の取り消しが最も自然。
+    // resume は menu 内で一番安全な操作なので、反射キーに割り当てても事故にならない。
     if *b == 0x1b {
-        return Some(MenuAction::Close);
+        return Some(MenuAction::Resume);
     }
     match b.to_ascii_lowercase() {
         b'c' => Some(MenuAction::Resume),
@@ -248,7 +249,11 @@ fn menu_action_for_input(chunk: &[u8]) -> Option<MenuAction> {
         b'i' => Some(MenuAction::Sigint),
         b'h' => Some(MenuAction::Sighup),
         b'k' => Some(MenuAction::Sigkill),
-        b'q' => Some(MenuAction::Close),
+        // 「閉じるだけ」の項目は持たない (kawaz 裁定 2026-07-30 m41): 子が停止中で
+        // 入力の受け手がいない以上、menu を畳んで通常状態に戻すだけの操作に意味が
+        // ない。上記以外の打鍵はすべて無視して破棄する (= select_on_demand の
+        // プロンプトと同じ方針)。menu の解除は「項目を選ぶ」か「子が外部要因で
+        // resume する」(= raw_data 到着で自動的に畳む) のどちらか。
         _ => None,
     }
 }
@@ -256,17 +261,19 @@ fn menu_action_for_input(chunk: &[u8]) -> Option<MenuAction> {
 /// child action menu の表示行 (DR-0032 §2、上から順に描く)。
 ///
 /// 継続系 / 終了系の 2 グループを見出し付きで分ける (= 区分基準は「子を終わらせるか」)。
+// 分類と並びは kawaz 裁定 (2026-07-30 r92 m18/m42/m43) の UX 視点:
+// 「脱出 (client の操作) = child から離れる」と「子への操作」の 2 群。
+// 「子に何が起きるか (継続/終了)」では分類しない。
 const MENU_LINES: &[&str] = &[
     "\x1b[7m[hyoui] 子プロセスが停止中 — 操作を選んでください\x1b[m",
-    "  継続系 (= 子は終わらせない)",
-    "    c    子を起こす (SIGCONT)",
-    "    z    client suspend (= fg で復帰すると子も起こす)",
-    "    d    detach (= 子は停止したまま残る)",
-    "  終了系 (= 子を終わらせる)",
-    "    i    SIGINT  (= SIGCONT 併送)",
-    "    h    SIGHUP  (= SIGCONT 併送)",
-    "    k    SIGKILL",
-    "  Esc / q  閉じる (= 何もしない)",
+    "  脱出 (client の操作)",
+    "    d        detach (= client 終了。子は停止したまま残る)",
+    "    z        client suspend (= fg で復帰すると子も起こす)",
+    "  子への操作",
+    "    c / Esc  起こす (SIGCONT)",
+    "    i        SIGINT  (= SIGCONT 併送)",
+    "    h        SIGHUP  (= SIGCONT 併送)",
+    "    k        SIGKILL",
 ];
 
 /// 画面下部 N 行に child action menu を描く escape 列を組む (DR-0032 §4 第 1 段)。
@@ -1013,9 +1020,6 @@ impl ClientConnection {
             MenuAction::Sigkill => {
                 let _ = self.send_terminating_signal("SIGKILL");
             }
-            // 明示キャンセル: 表示を消す代わりに何もしない (= 子は停止のまま、次の
-            // 出力 / redraw で menu の描画跡は消える)。
-            MenuAction::Close => {}
             MenuAction::Detach => unreachable!("detach は上で早期 return 済み"),
         }
         None
@@ -2634,14 +2638,16 @@ mod tests {
         assert_eq!(menu_action_for_input(b"i"), Some(MenuAction::Sigint));
         assert_eq!(menu_action_for_input(b"h"), Some(MenuAction::Sighup));
         assert_eq!(menu_action_for_input(b"k"), Some(MenuAction::Sigkill));
-        assert_eq!(menu_action_for_input(b"q"), Some(MenuAction::Close));
-        assert_eq!(menu_action_for_input(b"\x1b"), Some(MenuAction::Close));
         // 大文字でも同じ項目 (= CapsLock 事故を弾かない)。
         assert_eq!(menu_action_for_input(b"K"), Some(MenuAction::Sigkill));
-        // 表に無いキーは破棄 (= 子へも流れない)。
+        // Esc は Resume の alias (= menu を招いた停止の取り消し、kawaz 裁定 m42)。
+        assert_eq!(menu_action_for_input(b"\x1b"), Some(MenuAction::Resume));
+        // 表に無いキーは破棄 (= 子へも流れない)。「閉じるだけ」の項目は無いので
+        // q も破棄側 (kawaz 裁定 m41)。
         assert_eq!(menu_action_for_input(b"x"), None);
         assert_eq!(menu_action_for_input(b"\r"), None);
-        // 矢印キー (= ESC 先頭の CSI sequence) を Close と誤読しない。
+        assert_eq!(menu_action_for_input(b"q"), None);
+        // 矢印キー (= ESC 先頭の CSI sequence、複数 byte) を Esc 単打と誤読しない。
         assert_eq!(menu_action_for_input(b"\x1b[A"), None);
         // 複数 byte の chunk (= 貼り付け等) は、中に項目キーがあっても発火しない。
         // 実測由来の regression: `MENU-SWALLOWED` の `D` で detach が起動した。
@@ -2662,8 +2668,9 @@ mod tests {
             "先頭行: {s:?}"
         );
         assert!(s.contains("\x1b[24;1H"), "最下行まで使う: {s:?}");
-        assert!(s.contains("子を起こす (SIGCONT)"), "継続系の項目: {s:?}");
-        assert!(s.contains("SIGKILL"), "終了系の項目: {s:?}");
+        assert!(s.contains("起こす (SIGCONT)"), "子への操作の項目: {s:?}");
+        assert!(s.contains("SIGKILL"), "子への操作の項目: {s:?}");
+        assert!(s.contains("脱出 (client の操作)"), "脱出グループ見出し: {s:?}");
         for line in MENU_LINES {
             assert!(s.contains(line), "全項目を描く: {line}");
         }

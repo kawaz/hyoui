@@ -132,23 +132,34 @@ handshake snapshot 経路により menu が表示される。
 
 #### メニュー項目
 
-2 グループに分けて表示する。グループの区分基準は**子プロセスを終わらせるか否か**:
+2 グループに分けて表示する。区分は **UX 視点** (kawaz 裁定 2026-07-30 m42/m43):
+「**脱出** = client の操作 (child から離れる)」と「**子への操作**」。
+「子に何が起きるか (継続/終了)」では分類しない。
 
-**継続系 (= 子を殺さない操作)**:
-
-| 項目 | 動作 | 説明 |
-|---|---|---|
-| 子を起こす | 子 pgrp へ `SIGCONT` | 停止した子を再開する。attach は継続し、そのまま操作に戻る |
-| client suspend | [[DR-0029]] §2 の client suspend 経路 (`raise(SIGTSTP)`) | 窓を閉じずに外側 shell へ戻る。`fg` で同じ窓に復帰し、**復帰と同時に子も起こす** (= menu からの suspend は「一旦どけて戻ったら続きをやる」意思表示なので、復帰時に `SessionChildResumeRequest` を送る。`show_child_action_menu` 下では通常送らない resume を、この明示操作に限り送る) |
-| detach | client 終了 (= 接続を畳む) | `fg` では戻れない。子は**停止したまま**残る (= 無人になるので停止維持可、[[DR-0030]] §3 と整合)。再開は `hyoui attach` (menu が再表示される) か `hyoui kill <s> --signal=CONT --no-terminate` |
-
-**終了系 (= 子を終わらせる操作)**:
+**脱出 (= client の操作、child から離れる)**:
 
 | 項目 | 動作 | 説明 |
 |---|---|---|
-| SIGINT | 子 pgrp へ `SIGCONT` + `SIGINT` | 割り込み (= 端末の Ctrl+C 相当)。多くのアプリが graceful に中断・終了する |
-| SIGHUP | 子 pgrp へ `SIGCONT` + `SIGHUP` | 端末切断の通知。default disposition は終了 (= handler を持つアプリは reload 等に使う場合がある) |
-| SIGKILL | 子 pgrp へ `SIGKILL` | 捕捉・無視できない即時強制終了 |
+| detach (`d`) | client 終了 (= 接続を畳む) | `fg` では戻れない。子は**停止したまま**残る (= 無人になるので停止維持可、[[DR-0030]] §3 と整合)。再開は `hyoui attach` (menu が再表示される) か `hyoui kill <s> --signal=CONT --no-terminate` |
+| client suspend (`z`) | [[DR-0029]] §2 の client suspend 経路 (`raise(SIGTSTP)`) | 窓を閉じずに外側 shell へ戻る。`fg` で同じ窓に復帰し、**復帰と同時に子も起こす** (= menu からの suspend は「一旦どけて戻ったら続きをやる」意思表示なので、復帰時に `SessionChildResumeRequest` を送る。`show_child_action_menu` 下では通常送らない resume を、この明示操作に限り送る) |
+
+**子への操作** (結果的に脱出になる場合もある):
+
+| 項目 | 動作 | 説明 |
+|---|---|---|
+| 起こす (`c` / `Esc`) | 子 pgrp へ `SIGCONT` | 停止した子を再開する。attach は継続し、そのまま操作に戻る |
+| SIGINT (`i`) | 子 pgrp へ `SIGCONT` + `SIGINT` | 割り込み (= 端末の Ctrl+C 相当)。多くのアプリが graceful に中断・終了する |
+| SIGHUP (`h`) | 子 pgrp へ `SIGCONT` + `SIGHUP` | 端末切断の通知。default disposition は終了 (= handler を持つアプリは reload 等に使う場合がある) |
+| SIGKILL (`k`) | 子 pgrp へ `SIGKILL` | 捕捉・無視できない即時強制終了 |
+
+**「閉じるだけ」の項目は持たない** (kawaz 裁定 2026-07-30 m41/m42): 子が停止中で
+入力の受け手がいない以上、menu を畳んで通常状態に戻すだけの操作に意味がない。
+`Esc` は「この停止の取り消し」として **起こす (SIGCONT) の alias** に割り当てる
+(= menu は停止をきっかけに出るので、Esc = 取り消し = resume が最も自然。resume は
+menu 内で最も安全な操作なので反射キーでも事故にならない)。それ以外の打鍵はすべて
+無視して破棄する (= select_on_demand プロンプトと同じ方針)。menu の解除は「項目を
+選ぶ」か「子が外部要因で resume する」(= 停止後の raw_data 到着を証拠に自動で畳む)
+のどちらかに限る。
 
 **SIGINT / SIGHUP に SIGCONT を併送する理由**: stopped なプロセスに送られた signal は
 pending になるだけで、SIGCONT されるまで処理されない (= SIGKILL と SIGCONT だけが
