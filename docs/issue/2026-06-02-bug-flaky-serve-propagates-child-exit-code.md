@@ -77,3 +77,9 @@ Phase 3 の single-writer 化で構造的に解消される対象のため、Pha
 - 失敗テスト: `child_exit_propagates_code` (crates/hyoui-cli/tests/daemon_death_exit.rs:92)
 - panic: `assertion \`left == right\` failed: 子の exit 7 が client に伝搬するはず (= ChildExited)`, `left: None`, `right: Some(7)`
 - 注: 本 issue の対象 test は `daemon::session::tests::serve_propagates_child_exit_code` (lib test) だが、今回の失敗は CLI e2e `child_exit_propagates_code` (daemon_death_exit.rs) — 同一の「child exit code 伝搬」flaky family として本 issue に記録。DR-0025 Phase 3 待ちの blocked 状況は変わらず
+
+## 発生記録 (2026-07-30)
+
+- v0.9.32 push の standalone CI (run 30521262689, ubuntu Test stable) で 1 回 fail
+  (session.rs:2873 の assert)。rerun で green。Release workflow 側の同一 gate は一発 green。
+  修正待ち状況 (DR-0025 Phase 3) は不変。
