@@ -46,6 +46,14 @@ DR 本体: [DR-0033](decisions/DR-0033-leader-request-takeover.md) (Draft)。承
 
 m41-43 の裁定 (閉じる廃止 / Esc=resume / UX 視点の 2 群) は v0.9.32 で反映済み。
 
+### 👺IP2-C1: 情報パネル Phase 2a + touch UX (v0.9.33) の確認
+
+- [ ] a: 情報タブから表示設定 (fontsize/ambw 等) をその場で変更でき、バッジが「embed 中に変更」になり、reload で元に戻る
+- [ ] b: **iOS/iPad 実機**: ターミナル再タップでソフトウェアキーボードがしまえる (フローティングキーボード含む)
+- [ ] c: フロート表示中にターミナルタップでフロートが閉じる / 「Terminal」ヘッダが消えてコンパクトになった
+
+b の実機キーボード格納だけ emulation 不可のため kawaz 確認が必須 (他は AI 実測済み)。
+
 ### 👺SV-C1: 自動起動の再起動実機確認 (kawaz にしか不可)
 
 - [ ] a: 次回 PC 再起動後に web (https://hyoui.kawaz-mbp16-20211217.kawaz.jp) が自動で生きていることを確認
