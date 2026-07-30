@@ -886,17 +886,20 @@ impl ClientConnection {
     /// child action menu を画面下部に描く (DR-0032 §4 第 1 段)。
     ///
     /// 前提は [`draw_child_stopped_notice`](Self::draw_child_stopped_notice) と同じ
-    /// (= 外側 stdout が raw mode の tty で行数が取れる)。満たさない場合は何も描かない
-    /// (= DR-0032 §2 発動条件 4)。
-    fn draw_child_action_menu<W: Write>(&self, stdout: &mut W, rows: Option<u16>) {
+    /// (= 外側 stdout が raw mode の tty で行数が取れる、DR-0032 §2 発動条件 4)。
+    /// **描けたかどうかを返す**: 描けない環境で menu 状態に入ると、画面に何も出ていない
+    /// のに入力を飲み続ける (= 操作不能に見える) ので、caller は false のとき menu を
+    /// 発動させず通常の停止通知に倒す。
+    fn draw_child_action_menu<W: Write>(&self, stdout: &mut W, rows: Option<u16>) -> bool {
         if !self.outer_tty_raw {
-            return;
+            return false;
         }
         let Some(rows) = rows else {
-            return;
+            return false;
         };
         let _ = stdout.write_all(child_action_menu(rows).as_bytes());
         let _ = stdout.flush();
+        true
     }
 
     /// 子 pgrp を起こしてから終了系 signal を送る (DR-0032 §2 終了系項目)。
@@ -1075,12 +1078,14 @@ impl ClientConnection {
             && stopped_child_action(self.response.mode, self.on_child_suspend)
                 == StoppedChildAction::Menu
         {
-            focus = InputFocus::ChildMenu;
-            let rows = crate::sys::tty_size(stdin.as_fd())
-                .ok()
-                .flatten()
-                .map(|ws| ws.rows);
-            self.draw_child_action_menu(stdout, rows);
+            let rows = outer_tty_rows(stdin.as_fd());
+            if self.draw_child_action_menu(stdout, rows) {
+                focus = InputFocus::ChildMenu;
+            } else {
+                // 描画前提を満たさない (= 非 tty / サイズ不明)。menu は出さず、停止中で
+                // あることだけ伝えて forward を続ける (= 入力を飲む状態に入らない)。
+                self.draw_child_stopped_notice(stdout, rows);
+            }
         }
         // DR-0019 §5: SendEof で stdin EOF 観測後、stdin はもう読まない (= EOT 送出
         // 済) が、子の出力 (= bc の計算結果) と SessionExitNotify を拾い切るため
@@ -1287,11 +1292,16 @@ impl ClientConnection {
                                             }
                                         }
                                         StoppedChildAction::Menu => {
-                                            // DR-0032 §2 発動条件 3 (後半)。保留 Ctrl+Z は
-                                            // 捨てて操作面に移る (= menu が入力を飲む)。
-                                            ctrlz = CtrlzGuard::default();
-                                            focus = InputFocus::ChildMenu;
-                                            self.draw_child_action_menu(stdout, rows);
+                                            // DR-0032 §2 発動条件 3 (後半) + 条件 4。
+                                            // 描けた時だけ操作面に移り、保留 Ctrl+Z は捨てる
+                                            // (= menu が入力を飲む)。描けない環境では停止
+                                            // 通知だけ出して forward を続ける。
+                                            if self.draw_child_action_menu(stdout, rows) {
+                                                ctrlz = CtrlzGuard::default();
+                                                focus = InputFocus::ChildMenu;
+                                            } else {
+                                                self.draw_child_stopped_notice(stdout, rows);
+                                            }
                                         }
                                         StoppedChildAction::Nothing => {
                                             // DR-0029 §1: 起こさない場合は attach を継続した
