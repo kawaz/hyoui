@@ -189,6 +189,14 @@ DR-0005 の思想「子プロセスへの入力は完全透過。in-band escape 
 
 ### 4. config (`~/.config/hyoui/config.toml`)
 
+> **📌 注記 ([[DR-0032]]、2026-07-30)**: 本節の 2 key は統合された。
+> `[attach] resume_stopped_child` と `[session] auto_resume` は
+> `[session] on_child_suspend` (enum 3 値) に置換され、旧 key は起動拒否 +
+> migration hint になった。本節の優先順位規則 (= flag > config > builtin) と
+> セクション配置の判断基準は不変で、flag が上書きするのは daemon policy だけ。
+> 単発 Ctrl+Z の action は `[attach] ctrlz_x1_action` で選べるようになった
+> (= 既定は本 DR §2 の client suspend)。
+
 ```toml
 [attach]
 ctrlz_guard = true            # false で完全 bypass (= Ctrl+Z 素通し)
@@ -237,6 +245,11 @@ config key 名だけ `[attach]` 配下に平坦化した。
 > 起こす主体が居らず、「attach しているのに操作が一切効かない」状態になっていた。
 > DR-0030 が trigger に「attach 中の `SessionChildStoppedNotify` 受信」を追加し、
 > config key を `resume_stopped_child` に改名した。本節の ro / rw-no-leader 除外は不変。
+>
+> **📌 注記 ([[DR-0032]]、2026-07-30)**: さらに config が enum
+> `[session] on_child_suspend` に統合され、判定は「起こす / child action menu を出す /
+> 何もしない」の 3 値になった (= `client::stopped_child_action`)。本節の
+> ro / rw-no-leader 除外は 3 値化後も不変 (= どちらも「何もしない」)。
 
 ## Rejected alternatives
 

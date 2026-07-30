@@ -59,6 +59,12 @@ daemon state は足さない**:
 
 ### 2. config key を `[attach] resume_stopped_child` に改名
 
+> **📌 注記 ([[DR-0032]]、2026-07-30)**: 本 key は `[session] auto_resume` と統合され、
+> `[session] on_child_suspend` (enum 3 値) に置換された。旧 `true` は
+> `auto_resume_on_attached` (= default)、旧 `false` は `show_child_action_menu` に対応する。
+> 旧 key が config に残っていると起動を拒否して移行先を案内する (= silent 無視しない)。
+> 本節の命名判断 (= 発火点ではなく保証を名前にする) は enum 値名にも引き継がれている。
+
 ```toml
 [attach]
 resume_stopped_child = true   # rw attach 中は子を停止させたままにしない

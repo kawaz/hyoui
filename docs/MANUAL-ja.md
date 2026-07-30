@@ -311,6 +311,50 @@ config パースエラー (= 不正 TOML / 型不一致) のときは hyoui の�
 (= 意図しない設定での起動は親 Internal Context 漏洩リスクがあるため)。一時的に
 迂回したい場合は `--no-scrub-env` を使う。
 
+### 11. 子が停止した時のふるまいと Ctrl+Z の action
+
+`~/.config/hyoui/config.toml` の `[session]` / `[attach]` で設定する
+([DR-0032](./decisions/DR-0032-child-suspend-unified-enum-and-action-menu.md))。
+
+```toml
+[session]
+# 子が suspend (stopped) した時のふるまい。default: auto_resume_on_attached
+on_child_suspend = "auto_resume_on_attached"
+#   auto_resume_always      — daemon が常に即 SIGCONT (attach の有無に関係なく)
+#   auto_resume_on_attached — rw attach client が居る間だけ起こす (無人時は停止を維持)
+#   show_child_action_menu  — 起こさず、attach client が child action menu を表示
+
+[attach]
+# 単発 Ctrl+Z が確定した後の action。default: client_suspend
+ctrlz_x1_action = "client_suspend"
+#   client_suspend   — client 自身を suspend (fg で同じ窓に復帰)
+#   client_detach    — 窓を畳む (子は走り続ける)
+#   select_on_demand — 選択プロンプトを出す (^Z: suspend / ^C: client 終了 / Esc: 戻る)
+```
+
+`on_child_suspend` は「子が止まったらどうなるか」の 1 つの選択で、daemon の policy と
+attach client のふるまいの両方に写像される (= 設定は 1 箇所)。`hyoui run
+--on-child-suspend=notify|auto-resume` は **daemon 側 policy だけ**を上書きする。
+
+**child action menu** (= `show_child_action_menu` を選んだ時): rw attach 中に子が
+止まると画面下部にメニューが出て、その場で操作できる。表示中の打鍵は hyoui が飲むので
+子には届かない (= 停止中に打った操作が resume 時にまとめて流れ込む事故を防ぐ)。
+
+| キー | 動作 |
+|---|---|
+| `c` | 子を起こす (SIGCONT) |
+| `z` | client suspend (`fg` で復帰すると子も起こす) |
+| `d` | detach (子は停止したまま残る) |
+| `i` / `h` | SIGINT / SIGHUP (停止中の子にも効くよう SIGCONT を併送) |
+| `k` | SIGKILL |
+| `Esc` / `q` | 閉じる (何もしない) |
+
+無人時 (= attach していない時) に子が止まった場合はメニューを出す先が無いので、次に
+`hyoui attach` した時点で表示される。無人でも起こしたいなら `auto_resume_always` を選ぶ。
+
+旧 key の `[session] auto_resume` / `[attach] resume_stopped_child` は削除された。
+残っていると起動を拒否して書き換え先を案内する (= 設定が黙って default に倒れるのを防ぐ)。
+
 どのファイルが読まれるか / 結局どう効いているかは以下で確認する:
 
 ```bash

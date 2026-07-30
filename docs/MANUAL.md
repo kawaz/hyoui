@@ -322,6 +322,54 @@ If the config has a parse error (= invalid TOML / type mismatch) hyoui refuses
 to start (= booting with an unintended config risks leaking the parent's
 Internal Context). Use `--no-scrub-env` if you need to bypass it temporarily.
 
+### 11. What happens when the child stops, and what Ctrl+Z does
+
+Configured under `[session]` / `[attach]` in `~/.config/hyoui/config.toml`
+([DR-0032](./decisions/DR-0032-child-suspend-unified-enum-and-action-menu.md)).
+
+```toml
+[session]
+# What happens when the child suspends (stops). default: auto_resume_on_attached
+on_child_suspend = "auto_resume_on_attached"
+#   auto_resume_always      — the daemon always sends SIGCONT immediately
+#   auto_resume_on_attached — resume only while an rw attach client is present
+#   show_child_action_menu  — do not resume; the attach client shows an action menu
+
+[attach]
+# What a settled single Ctrl+Z does. default: client_suspend
+ctrlz_x1_action = "client_suspend"
+#   client_suspend   — suspend the client itself (`fg` returns to the same window)
+#   client_detach    — tear down the window (the child keeps running)
+#   select_on_demand — show a prompt (^Z: suspend / ^C: quit client / Esc: back)
+```
+
+`on_child_suspend` is a single choice — "what happens when the child stops" —
+that hyoui maps onto both the daemon policy and the attach client's behaviour.
+`hyoui run --on-child-suspend=notify|auto-resume` overrides **only** the daemon
+side.
+
+**Child action menu** (when `show_child_action_menu` is selected): if the child
+stops while an rw attach is open, a menu appears at the bottom of the screen so
+you can act on the spot. Keystrokes are swallowed by hyoui while it is up, so
+they never reach the child (= no burst of stale input flooding in on resume).
+
+| Key | Action |
+|---|---|
+| `c` | Resume the child (SIGCONT) |
+| `z` | Suspend the client (`fg` resumes the child too) |
+| `d` | Detach (the child stays stopped) |
+| `i` / `h` | SIGINT / SIGHUP (SIGCONT is sent alongside so it reaches a stopped child) |
+| `k` | SIGKILL |
+| `Esc` / `q` | Close the menu (do nothing) |
+
+If the child stops while nobody is attached there is nowhere to draw the menu,
+so it appears on the next `hyoui attach`. Pick `auto_resume_always` if you want
+it resumed even with no client around.
+
+The old keys `[session] auto_resume` / `[attach] resume_stopped_child` are gone.
+Leaving them in place makes hyoui refuse to start and print what to write
+instead (= a configured intent must not silently fall back to the default).
+
 To see which file hyoui resolves and what it currently ends up with:
 
 ```bash

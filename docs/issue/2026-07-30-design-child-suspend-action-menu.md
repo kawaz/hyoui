@@ -46,6 +46,27 @@ origin: kawaz 提案 (2026-07-30 ccmsg r92 m18-20)。^Z 単発 = client suspend 
   ([[2026-07-21-screen-overlay-general-mechanism]]) を先に作るか
 - **語彙**: 既存 CLI `--on-child-suspend=notify|auto-resume` (daemon) / config `ctrlz_guard*` との整合
 
+## 実装済み (2026-07-30)
+
+DR-0032 (Active) の §1-§4 を実装。close 判定は統括に委ねる。
+
+- **config 統合**: `[session] on_child_suspend` (enum 3 値、default `auto_resume_on_attached`)。
+  旧 `[session] auto_resume` / `[attach] resume_stopped_child` は起動拒否 + migration hint
+  (`--no-scrub-env` でも迂回不可)。写像は `OnChildSuspendSetting::daemon_policy()` と
+  `client::stopped_child_action(mode, setting)` (= Resume / Menu / Nothing の 3 値)
+- **child action menu**: rw attach + `show_child_action_menu` + 子 stopped 検知 + raw tty で表示。
+  キーは 1 項目 1 mnemonic 文字 (`c` SIGCONT / `z` client suspend / `d` detach / `i` SIGINT /
+  `h` SIGHUP / `k` SIGKILL / `Esc`・`q` 閉じる)。**1 byte chunk のみ受理** (= 貼り付け中の
+  1 文字で SIGKILL 等が発火する事故を実測で踏んだため)。終了系は既存 `signal` message の
+  2 連送 (SIGCONT 併送)、起こすのは既存 `SessionChildResumeRequest` (= killpg + redraw)。
+  新 protocol message / cap flag なし
+- **`[attach] ctrlz_x1_action`**: `client_suspend` (default) / `client_detach` /
+  `select_on_demand` (= ^Z / ^C / Esc の明示キーのみ、他キーは破棄、timeout なし)
+- **検証**: unit (写像 3×3 マトリクス / キー表 / 描画) + e2e `child_action_menu.rs` 5 本、
+  `ctrlz_suspend_client.rs` に §3 4 本 + menu の `z` 1 本 (いずれも `--ignored` で実機 green)
+- **後続 issue 対象のまま**: menu のキーバインド確定 (今回は最小形)、web UI 側の同等機能、
+  `hyoui set` の enum 対応、screen-overlay 一般機構への描画移行
+
 ## 関連
 
 - DR-0029 (Revised 2026-07-30: 単発 ^Z = client suspend) / DR-0030 (resume_stopped_child) / DR-0019 (auto_resume)

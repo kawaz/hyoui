@@ -213,11 +213,22 @@ rejected because it cannot acquire a controlling terminal.
 - stdin → frame writer (`type=0x00` raw data)
 - frame reader → stdout
 - **Ctrl+Z guard state machine** ([[DR-0029]] §2): on tty stdin, every second
-  Ctrl+Z is forwarded to the child and a leftover odd press **suspends the
-  client itself** after `ctrlz_guard_delay` (= control returns to the outer
-  shell and `fg` resumes the very same connection; the attach is never torn
-  down). No prefix key exists; the child never sees an escape introduced by
-  hyoui
+  Ctrl+Z is forwarded to the child and a leftover odd press settles after
+  `ctrlz_guard_delay`. What that settled press does is chosen by
+  `[attach] ctrlz_x1_action` ([[DR-0032]] §3): **suspend the client itself**
+  (default — control returns to the outer shell and `fg` resumes the very same
+  connection; the attach is never torn down), **detach**, or a **selection
+  prompt** (leaves the alt screen, draws one line and reacts only to the
+  explicit ^Z / ^C / Esc keys). No prefix key exists; the child never sees an
+  escape introduced by hyoui
+- **Three-way branch when the child stops** ([[DR-0032]] §1):
+  `client::stopped_child_action(mode, setting)` maps the `[session]
+  on_child_suspend` setting onto "resume it / show the child action menu / do
+  nothing", and both firing points (handshake snapshot and the stopped notify)
+  share that single decision point. While the menu is up the client swallows
+  input instead of forwarding it to the PTY ([[DR-0032]] §2); the menu is drawn
+  as an N-line extension of the one-line stopped notice and never touches the
+  daemon's screen state
 - For one-shot CLIs (`input` / `screen dump` / `screen snapshot` / `tail` /
   `wait` / `lock` / `kill` / `list` / `status`) the connection exposes
   `recv_frame()` / `recv_control(buffer_raw_data)` / `send_raw_bytes()`

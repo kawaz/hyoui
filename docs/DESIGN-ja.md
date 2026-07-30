@@ -182,9 +182,16 @@ Control message body (type=0x01) = CBOR map { "kind": "<dotted.name>", ...payloa
 - stdin → frame writer (`type=0x00 raw data`)
 - frame reader → stdout
 - **Ctrl+Z ガード state machine** ([[DR-0029]] §2): tty stdin で 2 発ごとに子へ
-  Ctrl+Z を 1 発届け、余った 1 発が `ctrlz_guard_delay` 後に **client 自身を suspend**
-  する (= 外側 shell に戻り、`fg` で同じ接続に復帰。接続は畳まない)。prefix キーは
+  Ctrl+Z を 1 発届け、余った 1 発が `ctrlz_guard_delay` 後に確定する。確定後の action は
+  `[attach] ctrlz_x1_action` ([[DR-0032]] §3) で選ぶ: **client 自身を suspend** (default、
+  = 外側 shell に戻り `fg` で同じ接続に復帰) / **detach** / **選択プロンプト**
+  (= alt screen を抜けて 1 行出し、^Z / ^C / Esc の明示キーだけに反応)。prefix キーは
   持たず、子には hyoui 由来の escape を一切足さない
+- **子 stopped 時の 3 分岐** ([[DR-0032]] §1): `[session] on_child_suspend` の設定を
+  `client::stopped_child_action(mode, setting)` で「起こす / child action menu を出す /
+  何もしない」に写像する (= 判定点 1 箇所を handshake snapshot と停止通知の 2 発火点で共有)。
+  menu 表示中は入力を client が飲み PTY へ流さない ([[DR-0032]] §2)。描画は停止通知 1 行の
+  N 行拡張で、daemon の screen state は汚さない
 - 1-shot CLI (`input` / `screen dump` / `screen snapshot` / `tail` / `wait` /
   `lock` / `kill` / `list` / `status`) 用に `recv_frame()` / `recv_control(buffer_raw_data)` /
   `send_raw_bytes()` を提供
