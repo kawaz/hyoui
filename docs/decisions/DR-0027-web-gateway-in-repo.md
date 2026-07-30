@@ -78,11 +78,39 @@ config (`[web]`) に持たせると全閲覧者で共有されてしまうため
 | `scrollback` | 整数 0-100000 (行) | `2000` | xterm.js `scrollback` |
 | `fontfamily` | font family 名のカンマ区切り | (なし) | 既定チェーンの**先頭に挿入**。指定フォントが持たないグリフは HackGen Console NF → host monospace へ落ちる |
 | `bg` / `fg` | hex 3/4/6/8 桁、`#` 省略可 | `#111` / `#e0e0e0` | terminal の背景 / 前景 |
+| `unicode` | `6` \| `11` | `11` | 文字幅計算に使う Unicode 版 (`term.unicode.activeVersion`) |
+| `ambw` | `half` \| `full` | `half` | East Asian Ambiguous を幅 2 として扱うか |
 
 不正値・範囲外は既定に落として `console.warn` を出す (= ページ内 debug panel にも
 残る)。`#` を省略できるのは、URL に `%23` を書かずに済ませるため。`fontfamily` は
 font family 名に現れうる文字だけを通し、`;` `{` `(` 等を含む値は拒否する
 (= 値は xterm.js が inline style に直接入れるため)。
+
+#### 文字幅パラメータ (`unicode` / `ambw`)
+
+`unicode=6` は xterm.js 内蔵の UnicodeV6 テーブルに戻す。Unicode 6 当時に存在
+しなかった絵文字が幅 1 になるので、絵文字を半角で組む端末に合わせたい場合に使う。
+
+`ambw=full` は Ambiguous (EastAsianWidth の `A`) を幅 2 にする。CJK 文脈で全角、
+それ以外で半角に組まれてきた文字群で、どちらで数えるかは端末の設定に委ねられている
+(tmux の `utf8-ambiguous-width`、iTerm2 の "Treat ambiguous-width characters as
+double-width" と同じ選択)。
+
+**`ambw=full` は opt-in であり既定にしない。** daemon の vt100 と TUI アプリ本体は
+Ambiguous を幅 1 として数える (実測で三者一致を確認済み)。web だけ 2 にすると、
+screen dump が渡す行を xterm.js が自前の幅で組み直す際に対象文字より後ろが 1 文字
+あたり 1 桁ずつ右へずれる (行頭で再同期するのでずれは行内に閉じる)。screen state を
+正本とする設計 (DR-0013 / DR-0005) からの意図的な乖離になるため、明示指定した
+閲覧者だけが踏む経路にしている。
+
+影響は装飾記号に留まらない。**box drawing (U+2500-254B) と block elements
+(U+2580-258F) も Ambiguous** なので、`full` では罫線が 2 セル幅になり枠線を引く
+TUI の表示は大きく崩れる。日本語混在の文書を読む用途で幅を揃えたいときに使い、
+TUI を操作する用途では `half` のままにする想定。
+
+結合文字 (U+0300-036F)、variation selector、Nerd Font の PUA も Ambiguous に
+含まれるが、これらは基底幅が 0 なので `full` でも 0 のまま通す (2 に上げると
+カーソル位置と Powerline 記号が壊れる)。
 
 ## Rejected alternatives
 

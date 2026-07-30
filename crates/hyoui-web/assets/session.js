@@ -37,6 +37,8 @@
   //   scrollback=<0..100000> 行。既定 2000
   //   fontfamily=<names>    カンマ区切り。既定チェーンの先頭に挿入する
   //   bg=<hex> / fg=<hex>   背景 / 前景。`#` は省略可 (URL で %23 を書かずに済む)
+  //   unicode=<6|11>        文字幅計算の Unicode 版。既定 11
+  //   ambw=<half|full>      East Asian Ambiguous の幅。既定 half
   const params = new URLSearchParams(location.search);
   const warnParam = (name, raw, why) => {
     console.warn(`hyoui: ignoring ?${name}=${raw} (${why})`);
@@ -54,6 +56,16 @@
       return def;
     }
     return integer ? Math.round(v) : v;
+  };
+  const enumParam = (name, def, allowed) => {
+    const raw = params.get(name);
+    if (raw === null) return def;
+    const s = raw.trim();
+    if (!allowed.includes(s)) {
+      warnParam(name, raw, `expected one of ${allowed.join('|')}`);
+      return def;
+    }
+    return s;
   };
   const colorParam = (name, def) => {
     const raw = params.get(name);
@@ -99,6 +111,10 @@
   const fontFamily = fontFamilyParam();
   const background = colorParam('bg', '#111');
   const foreground = colorParam('fg', '#e0e0e0');
+  // unicode: 11 が既定。6 は xterm.js 内蔵の UnicodeV6 テーブルで、Unicode 6 当時に
+  // 存在しなかった絵文字が幅 1 になる (= v0.9.25 より前の hyoui web の挙動)。
+  const unicodeVersion = enumParam('unicode', '11', ['6', '11']);
+  const ambWidth = enumParam('ambw', 'half', ['half', 'full']);
   // #term は style.css で背景 #111 固定。padding 4px 分がターミナル本体の外側に
   // 覗くので、bg を変えたらコンテナ側も合わせる。
   const termEl = document.getElementById('term');
@@ -123,15 +139,34 @@
     fontSize,
     theme: { background, foreground },
   });
-  // Unicode 11 addon (絵文字を width=2 として扱う。daemon 側 vt100 emulator と一致)。
+  // 文字幅計算。既定は Unicode 11 (絵文字を width=2 として扱う。daemon 側 vt100
+  // emulator と一致)。?unicode=6 で xterm.js 内蔵の V6 テーブルに戻せる。
+  // ?ambw=full なら選んだ版の provider に委譲しつつ Ambiguous を 2 にする provider を
+  // 重ねる (トレードオフは unicode-ambiguous.js の冒頭コメント参照)。
   if (window.Unicode11Addon) {
     try {
-      const addon = new window.Unicode11Addon.Unicode11Addon();
-      term.loadAddon(addon);
-      term.unicode.activeVersion = '11';
-      if (window.__hyouiDebug) window.__hyouiDebug('info', 'unicode11 addon loaded, activeVersion=' + term.unicode.activeVersion);
+      term.loadAddon(new window.Unicode11Addon.Unicode11Addon());
+      term.unicode.activeVersion = unicodeVersion;
+      if (ambWidth === 'full') {
+        // wrap 対象の base provider を取る。V11 は addon の activate() 経由で公開 API
+        // だけで取れるが、V6 は UnicodeService が constructor で自前生成するため
+        // addon 経路が無く、内部の provider 表を見るしかない。vendor は in-repo で
+        // 固定なので許容し、形が変わっていたら ambw を諦める (= 幅計算が黙って
+        // 壊れるより、指定を無視して既定の挙動に戻るほうが安全)。
+        const base = unicodeVersion === '11'
+          ? window.HyouiAmbiguousWidth.captureUnicode11()
+          : (term._core.unicodeService._providers || {})[unicodeVersion];
+        if (base) {
+          const version = `${unicodeVersion}-ambw`;
+          term.unicode.register(window.HyouiAmbiguousWidth.wrapProvider(base, version));
+          term.unicode.activeVersion = version;
+        } else {
+          console.warn(`hyoui: ignoring ?ambw=full (no width provider for unicode=${unicodeVersion})`);
+        }
+      }
+      if (window.__hyouiDebug) window.__hyouiDebug('info', 'unicode activeVersion=' + term.unicode.activeVersion);
     } catch (e) {
-      if (window.__hyouiDebug) window.__hyouiDebug('warn', 'unicode11 addon load failed: ' + e.message);
+      if (window.__hyouiDebug) window.__hyouiDebug('warn', 'unicode width setup failed: ' + e.message);
     }
   } else if (window.__hyouiDebug) {
     window.__hyouiDebug('warn', 'Unicode11Addon global not found');
