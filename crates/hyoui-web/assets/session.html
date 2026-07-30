@@ -51,15 +51,15 @@
           title="Input パネルを開く (ドラッグで移動)"
           aria-label="Open input panel">⌨&#xFE0F;</button>
   <div id="inputPanel" class="input-panel" hidden role="dialog" aria-label="Terminal panel">
-    <div class="input-panel-head">
-      <span class="input-panel-title">Terminal</span>
-      <button type="button" id="inputPanelClose" class="input-panel-close" aria-label="close">×</button>
-    </div>
-    <div class="panel-tabs" role="tablist" aria-label="Terminal panel tabs">
-      <button type="button" id="inputTab" class="panel-tab active" role="tab"
-              aria-selected="true" aria-controls="inputTabPanel">入力</button>
-      <button type="button" id="infoTab" class="panel-tab" role="tab"
-              aria-selected="false" aria-controls="infoTabPanel">情報</button>
+    <div class="panel-tabs-row">
+      <div class="panel-tabs" role="tablist" aria-label="Terminal panel tabs">
+        <button type="button" id="inputTab" class="panel-tab active" role="tab"
+                aria-selected="true" aria-controls="inputTabPanel">入力</button>
+        <button type="button" id="infoTab" class="panel-tab" role="tab"
+                aria-selected="false" aria-controls="infoTabPanel">情報</button>
+      </div>
+      <button type="button" id="inputPanelClose" class="input-panel-close panel-tab-close"
+              aria-label="close">×</button>
     </div>
     <div id="inputTabPanel" class="panel-tab-content" role="tabpanel" aria-labelledby="inputTab">
       <textarea id="inputText" spellcheck="false" autocomplete="off" autocapitalize="off"

@@ -393,21 +393,17 @@ td.argv, td.cwd {
   gap: 0.45rem;
 }
 .input-panel[hidden] { display: none; }
-.input-panel-head {
+.panel-tabs-row {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  align-items: stretch;
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-  padding-bottom: 0.35rem;
-  /* ヘッダ全体を drag ハンドルにする (× ボタンだけ ignoreTarget で除外)。
-     touch-action:none で scroll に取られず drag が優先される。 */
+  /* タブ行を panel drag ハンドルとして兼用し、表示専用ヘッダを持たない。 */
   cursor: grab;
   touch-action: none;
   user-select: none;
   -webkit-user-select: none;
 }
-.input-panel.dragging .input-panel-head { cursor: grabbing; }
-.input-panel-title { font-size: 0.9rem; font-weight: bold; color: #e0e0e0; }
+.input-panel.dragging .panel-tabs-row { cursor: grabbing; }
 .input-panel-close {
   background: transparent;
   border: 1px solid rgba(255, 255, 255, 0.15);
@@ -470,8 +466,12 @@ td.argv, td.cwd {
 }
 .panel-tabs {
   display: flex;
+  flex: 1 1 auto;
   gap: 0.25rem;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+.panel-tab-close {
+  flex: 0 0 auto;
+  margin: 0 0 0.2rem 0.35rem;
 }
 .panel-tab {
   border: 0;

@@ -371,6 +371,71 @@
     }, true);
   }
 
+  // touch 端末では terminal がほぼ全画面を占め、helper textarea の focus を外す
+  // タップ先が無い。単一 touch の短い tap だけを focus toggle として扱う。
+  // mouse click はこの経路を通らないため、PC の「click で常に focus」は変えない。
+  const TOUCH_TAP_MOVE_PX = 10;
+  let terminalTouch = null;
+  const updateTerminalTouchDistance = (touch) => {
+    if (!terminalTouch || touch.identifier !== terminalTouch.identifier) return;
+    const distance = Math.hypot(
+      touch.clientX - terminalTouch.startX,
+      touch.clientY - terminalTouch.startY,
+    );
+    terminalTouch.maxDistance = Math.max(terminalTouch.maxDistance, distance);
+  };
+  const findTouch = (list, identifier) => {
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].identifier === identifier) return list[i];
+    }
+    return null;
+  };
+  termEl.addEventListener('touchstart', (event) => {
+    if (event.touches.length !== 1 || !term.textarea) {
+      terminalTouch = null;
+      return;
+    }
+    const touch = event.touches[0];
+    terminalTouch = {
+      identifier: touch.identifier,
+      startX: touch.clientX,
+      startY: touch.clientY,
+      maxDistance: 0,
+      wasFocused: document.activeElement === term.textarea,
+      panelWasOpen: !inputPanel.hidden,
+    };
+  }, { passive: true });
+  termEl.addEventListener('touchmove', (event) => {
+    if (!terminalTouch) return;
+    const touch = findTouch(event.touches, terminalTouch.identifier);
+    if (touch) updateTerminalTouchDistance(touch);
+  }, { passive: true });
+  termEl.addEventListener('touchend', (event) => {
+    if (!terminalTouch) return;
+    const state = terminalTouch;
+    const touch = findTouch(event.changedTouches, state.identifier);
+    if (touch) updateTerminalTouchDistance(touch);
+    terminalTouch = null;
+    if (!touch || state.maxDistance > TOUCH_TAP_MOVE_PX) return;
+    // panel 表示中は「terminal を選んで panel を閉じる」をこの tap の唯一の意味にする。
+    // closePanel が terminal focus を戻すため、focus toggle は走らせない。
+    if (state.panelWasOpen) {
+      closePanel();
+      return;
+    }
+    // focus 済み tap は後続 synthetic click が xterm を再 focus するため、この case
+    // だけ default を抑止する。移動 gesture と初回 focus は抑止せず既存動作を保つ。
+    if (state.wasFocused) event.preventDefault();
+    setTimeout(() => {
+      if (state.wasFocused) term.blur();
+      else term.focus();
+    }, 0);
+  }, { passive: false });
+  termEl.addEventListener('touchcancel', () => { terminalTouch = null; }, { passive: true });
+  termEl.addEventListener('click', () => {
+    if (!inputPanel.hidden) closePanel();
+  });
+
   const statusEl = document.getElementById('status');
   const sizeEl = document.getElementById('size');
   const autoEl = document.getElementById('auto');
@@ -1191,10 +1256,10 @@
   // FAB: 全体で drag、tap で open。
   attachDrag(inputFab, inputFab, { onTap: togglePanel });
 
-  // Panel: ヘッダ (× ボタン除く) で drag。tap は open/close トグルではない
-  // (= ヘッダを軽くタップしても閉じないほうが安全)。
-  const panelHead = inputPanel.querySelector('.input-panel-head');
-  attachDrag(panelHead, inputPanel, {
+  // Panel: タブ行 (× ボタン除く) で drag。短い tap は各 tab の click として扱い、
+  // pointer が閾値を超えて動いた時だけ panel drag に切り替わる。
+  const panelTabsRow = inputPanel.querySelector('.panel-tabs-row');
+  attachDrag(panelTabsRow, inputPanel, {
     ignoreTarget: (t) => t.closest('.input-panel-close'),
   });
 
