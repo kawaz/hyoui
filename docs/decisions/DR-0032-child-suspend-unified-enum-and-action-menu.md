@@ -1,6 +1,6 @@
 # DR-0032: 子 suspend 時動作の統合 enum (`on_child_suspend`) + child action menu
 
-- Status: Draft (= kawaz レビュー後に Active 化)
+- Status: Active (kawaz 承認 2026-07-30)
 - Date: 2026-07-30
 - Related: DR-0005 (思想 — 子から見た透過、DR-0029 で狭めた原則との整合), DR-0013 (screen state 正本 — menu 描画が正本を汚さない制約), DR-0014 (self-check — 本 DR の in-band 解釈拡張の justify), DR-0019 (daemon 側 auto-resume policy — 写像先、CLI flag / `hyoui set` の語彙は不変), DR-0024 (config ファイル機構 — CLI flag 最小化の思想を本 DR が踏襲), DR-0029 (attach は覗き窓 — §1 通知行を menu の第 1 段描画が拡張、§2 単発 action を `ctrlz_x1_action` で設定化, §4 config を本 DR が統合), DR-0030 (rw attach 中は子を停止させたままにしない — 本 DR の enum default が同原則を維持、menu は opt-out 側の UX 改善)
 - Origin: docs/issue/2026-07-30-design-child-suspend-action-menu.md (kawaz 骨子裁定 2026-07-30、ccmsg r92 m18-20)

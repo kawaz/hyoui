@@ -20,26 +20,9 @@
 
 ## 裁定待ち
 
-### 👺DR32-Q1: DR-0032 (子 suspend 動作の統合 enum + action menu) のレビュー
-
-- [ ] a: [DR-0032](decisions/DR-0032-child-suspend-unified-enum-and-action-menu.md) を承認 (Draft → Active 化して実装へ)
-- [ ] b: 修正指示あり (チャットで)
-
-kawaz 骨子 (r92 m18-24) を全部織り込み済み。起草 worker の判断による追加 4 点だけ注意して見てほしい:
-旧 bool 2 key は silent 無視でなく**起動エラー + migration hint** / 終了系 SIGINT・SIGHUP に
-**SIGCONT を併送** (stopped には pending になるだけで silent no-op になるため) / グループ名は
-「継続系・終了系」/ 統合 enum は config 層に閉じ CLI・protocol 不変。
-統括追補: `ctrlz_x1_action` 命名、select_on_demand のプロンプト状態 (timeout なし・他キーで
-キャンセルは提案値)。
+(現在なし)
 
 ## 確認待ち
-
-### 👺WP-C1: 文字幅パラメータ (v0.9.30) の確認 — 本命の要望分
-
-- [ ] a: `?ambw=full` で ambiguous 文字 (① ★ ⚠ 等) が全角幅になることを確認 (既定 half = 現状)
-- [ ] b: `?unicode=6` で旧 (v0.9.25 以前) の幅挙動に戻ることを確認 (既定 11)
-
-補足: 前回誤解して入れた `?fontsize= bg= fg= scrollback= lineheight= fontfamily=` もそのまま使えます。
 
 ### 👺RS-C1: embed リサイズ修正 (v0.9.30) の実機確認
 
