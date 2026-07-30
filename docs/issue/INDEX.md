@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-07-30 | bug | open | [web-terminal-font-load-fit-race](./2026-07-30-bug-web-terminal-font-load-fit-race.md) | webfont 読み込み前の fallback セル寸法で初回 fit が固定され、font load 完了だけでは再測定されない。最初の実寸 resize で初めて補正され、`resize=1` では誤った初回 PTY size も送信される。v0.9.25 と現行で同一再現し、最近の unicode-range / 表示パラメータ変更による新規 regression ではない |
 | 2026-07-29 | bug | wip | [ctrlz-guard-bypassed-by-keyboard-protocol](./2026-07-29-bug-ctrlz-guard-bypassed-by-keyboard-protocol.md) | DR-0029 §2 の Ctrl+Z ガードが keyboard protocol 有効端末 (Ghostty × claude) で完全不発。子が `\x1b[>1u` / `\x1b[>4;2m` を出すと外側端末が Ctrl+Z を CSI-u (`\x1b[122;5u`) で送るため、0x1a しか見ないガードを素通りしていた。**3 符号化対応に拡張して修正済 + ネスト実機でマトリクス再検証済**、残るは kawaz の実端末での最終確認 |
 | 2026-07-29 | request | open | [web-narrow-symbol-fallback-font](./2026-07-29-request-web-narrow-symbol-fallback-font.md) | 記号グリフ幅対策の unicode-range fallback が macOS/iOS でしか効かない (Linux は DejaVu が全角)。narrow symbol subset webfont 同梱が本筋。① U+2460 は macOS にも narrow グリフが無く未解決 |
 | 2026-07-26 | bug | open | [ignored-tests-job-permanently-red](./2026-07-26-bug-ignored-tests-job-permanently-red.md) | CI の ignored-tests job が continue-on-error で恒常 red を隠している (ubuntu は backpressure の 31s hang = 別 issue で blocked。macOS の notify_default_* は DR-0030 の test 置換で解消済みと 2026-07-29 調査で確定、現在の red は `daemon_sigcont_wakes_stopped_child` の leader 接続 timeout — 調査中) |
