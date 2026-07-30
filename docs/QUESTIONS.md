@@ -20,7 +20,22 @@
 
 ## 裁定待ち
 
-(現在なし)
+### 👺LR-Q1: DR-0033 (leader.request) — 実装 scope
+
+- [ ] a: protocol + web 配線のみ先行、CLI (`hyoui leader request` 等) は後続 — 推し (動機が web パネルで、CLI 表面は棚卸し直後に増やさない)
+- [ ] b: CLI も同時に
+
+### 👺LR-Q2: 既に自分が leader の時の応答
+
+- [ ] a: 要求者にのみ leader.notify を返す (同期確認できる) — 推し
+- [ ] b: 完全無応答 / broadcast
+
+### 👺LR-Q3: rw-no-leader からの leader.request
+
+- [ ] a: 拒否 (mode は handshake で確定、の現行意味論を維持) — 推し
+- [ ] b: 要求時点で昇格を許す
+
+DR 本体: [DR-0033](decisions/DR-0033-leader-request-takeover.md) (Draft)。承認と同時に a/a/a なら追加裁定不要で実装へ。
 
 ## 確認待ち
 
