@@ -107,3 +107,38 @@ font load 後の再 fit だけでは xterm.js の stale な内部セル寸法を
 - 1280x900 → 900x650 → 1440x1000 の複数 resize
 - 初回 resize POST が font load 後の cell metrics から算出されていること
 - font request failure 時に fallback font で terminal が起動すること
+
+## 追加観測: embed 縮小時の折り返し
+
+同一 origin の親ページに `embed=1` iframe を置き、幅 1200px → 500px に縮小して Playwright で DOM と xterm buffer を観測した。
+
+| 時点 | iframe | xterm grid | row 0 | #term client/scroll width | 表示 |
+| 初期 | 1200x700 | 171x45 | 171文字、1170px | 1185/1185px | 1行 |
+| 縮小 +50ms | 500x700 | 171x45 | 171文字、1170px | 485/1174px | はみ出し部分が clip |
+| 縮小 +450ms | 500x700 | 68x45 | 68文字、465px | 485/485px | xterm buffer が 68列へ reflow、複数行化 |
+
+`.xterm-rows` と各 row div の computed `white-space` は `pre`、`overflow-wrap` と `word-break` は normal。CSS の自然折り返しではない。`FitAddon.fit()` が `term.resize(68,45)` を呼び、xterm.js の normal-buffer reflow が 171文字の行を 68文字単位へ再構成する。
+
+縮小後 fit 前は `#term.scrollWidth=1174px` を既に持つが、`style.css:245-255` の `overflow:hidden` が横スクロールを隠して clip する。`body.embed #term { overflow-x:auto; overflow-y:hidden; }` の動的 PoC で clientWidth 485px / scrollWidth 1174px の横スクロール成立を確認した。`style.css:237-242` の `.xterm* { width:100%!important }` を外す必要はない。
+
+ただし CSS だけでは約150ms後の `fit()` による reflow を止められない。cols 不一致中に折り返さない要件には、`fitAddon.proposeDimensions()` で目標だけ計算し、PTY resize 成功前は `term.resize()` / `fitAddon.fit()` を呼ばず旧 grid を維持する JS 変更が必要。resize off または失敗時は旧 grid + 横スクロール、resize 成功後だけ `term.resize(cols,rows)` する。
+
+## 追加で判明した独立原因: resize endpoint の 204 偽成功
+
+`embed=1&resize=1` の iframe を 1200px → 500px に縮小すると browser grid は171x45→68x45になり、HTTP POST も両方発行された。しかし daemon window size は171x45のまま。後続POSTは204でも効いていなかった。
+
+原因:
+- persistent WS bridge は `crates/hyoui-web/src/ws_attach.rs:130-138` で `Mode::Rw` 接続し leader を保持する。
+- `post_resize` は毎回短命 `Mode::Rw` connection を作る (`crates/hyoui-web/src/lib.rs:518-535`)。既存 leader がいるため `HandshakeResponse.leader=false`。
+- daemon は resize を leader 限定で拒否 (`crates/hyoui/src/daemon/control.rs:645-667`)。
+- `resize_blocking` は返ってきた `ControlMessage::Error(mode.not-leader)` を `Ok(_) => continue` で読み飛ばし、後続 StatusResponse を受けて成功扱いする (`lib.rs:536-553`)。そのためHTTP 204になる。
+- browser 初回 resize は WS handshake より先に短命 connection が leader を取れる race があり効くことがあるが、WS確立後の resize は恒常的に無効。
+
+WS browser を閉じて leader 不在にした実測では、連続 POST 100x40 → 70x30 が両方 daemon snapshot に反映した。persistent WS leader が直接原因。
+
+修正案:
+1. WS bridge を `Mode::RwNoLeader` にする。WS は raw input を送るだけで Resize message を送らないため leader を持つ責務がない。これにより他の leader がいない通常 web 利用では短命 resize connection が leader になれる。
+2. `resize_blocking` は接続直後に `conn.response.leader` を確認し、false なら明示的な conflict を返す。また待機 loop で `ControlMessage::Error` を成功扱いせず error にする。別の CLI leader がいる場合に silent 204 を返さない。
+3. frontend は `proposeDimensions` → resize POST → 204確認 → `term.resize` の順に変更し、失敗時は旧 grid + 横スクロールを維持する。連続 resize は応答待ち中の最新寸法を coalesce し、古い応答で新しい寸法へ戻さない。
+
+font-load race と resize leader bug は別原因。font race は初回寸法を誤らせ、leader bug は2回目以降のPTY追従を止める。後者により xterm reflow だけが継続して、報告された「ずっと折り返されたまま」になる。
