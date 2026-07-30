@@ -1,11 +1,11 @@
 ---
 title: web ターミナルの初回 fit が webfont 読み込み前のセル寸法で固定される
-status: open
+status: wip
 category: bug
 created: 2026-07-30T11:17:33+09:00
 last_read: 2026-07-30T11:43:53+09:00
 open_entered: 2026-07-30T11:17:33+09:00
-wip_entered:
+wip_entered: 2026-07-30T11:50:00+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
