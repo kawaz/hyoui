@@ -31,13 +31,6 @@
 
 補足: 前回誤解して入れた `?fontsize= bg= fg= scrollback= lineheight= fontfamily=` もそのまま使えます。
 
-### 👺CZ2-C1: ^Z 単発 = client suspend (v0.9.30) の実機確認
-
-- [ ] a: attach 中に ^Z 単発 (1 秒待つ) → client が suspend して shell に戻り、`fg` で即復帰 + 再描画。子は走り続ける
-- [ ] b: 2 連打 → 子に 1 発だけ届く (従来どおり)
-
-親シェル消滅時の suspend client 自動消滅・suspend 中 kill の子無影響は AI 実機検証済み (e2e にも固定)。
-
 ### 👺RS-C1: embed リサイズ修正 (v0.9.30) の実機確認
 
 - [ ] a: ccmsg webui 等の iframe 縮小で表示が追従し、折り返しが出ない (追従前は横スクロール) ことを確認
