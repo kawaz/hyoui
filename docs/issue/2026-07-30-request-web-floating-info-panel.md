@@ -3,7 +3,7 @@ title: web ターミナルに attach/embed/session 情報のフローティン�
 status: wip
 category: request
 created: 2026-07-30T15:10:00+09:00
-last_read: 2026-07-30T15:40:39+09:00
+last_read: 2026-07-30T20:43:42+09:00
 open_entered: 2026-07-30T15:10:00+09:00
 wip_entered: 2026-07-30T15:40:39+09:00
 blocked_entered:
