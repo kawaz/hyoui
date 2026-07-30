@@ -3,7 +3,7 @@ title: web ターミナルの初回 fit が webfont 読み込み前のセル寸�
 status: open
 category: bug
 created: 2026-07-30T11:17:33+09:00
-last_read: 2026-07-30T11:17:33+09:00
+last_read: 2026-07-30T11:21:23+09:00
 open_entered: 2026-07-30T11:17:33+09:00
 wip_entered:
 blocked_entered:
