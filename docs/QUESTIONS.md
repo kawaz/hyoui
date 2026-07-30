@@ -24,12 +24,16 @@
 
 ## 確認待ち
 
-### 👺DR32-C1: DR-0032 実装 (v0.9.31) の実機確認
+### 👺DR32-C1: DR-0032 実装 (v0.9.32) の実機確認
 
-- [ ] a: `~/.config/hyoui/config.toml` に `[session]` `on_child_suspend = "show_child_action_menu"` を書き、attach 中に ^Z×2 等で子を止めると menu が出て各操作 (c/z/d/i/h/k/Esc) が効く
+- [ ] a: `~/.config/hyoui/config.toml` に `[session]` `on_child_suspend = "show_child_action_menu"` を書き、attach 中に ^Z×2 等で子を止めると menu (脱出: d/z、子への操作: c・Esc/i/h/k) が出て各操作が効く。Esc = 起こして戻る、それ以外のキーは無反応
 - [ ] b: `[attach]` `ctrlz_x1_action = "select_on_demand"` で、^Z 単発 → 1 行プロンプト → ^Z/^C/Esc の 3 択が効く (他キーは無反応)
 
-既知の調整候補 (チャット報告済み): menu を閉じた後の描画跡が redraw まで残る / 閉じた後の再表示手段が無い。使用感と合わせて感想ください。
+m41-43 の裁定 (閉じる廃止 / Esc=resume / UX 視点の 2 群) は v0.9.32 で反映済み。
+
+### 👺IP-C1: FAB 情報パネル Phase 1 (v0.9.32) の確認
+
+- [ ] a: web ターミナルの FAB → 「情報」タブで attach (mode/leader)・表示設定 (出自バッジ付き)・セッション情報が見える
 
 ### 👺SV-C1: 自動起動の再起動実機確認 (kawaz にしか不可)
 
