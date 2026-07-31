@@ -376,6 +376,7 @@
   // mouse click はこの経路を通らないため、PC の「click で常に focus」は変えない。
   const TOUCH_TAP_MOVE_PX = 10;
   let terminalTouch = null;
+  let terminalCloseOnlyClickPending = false;
   const updateTerminalTouchDistance = (touch) => {
     if (!terminalTouch || touch.identifier !== terminalTouch.identifier) return;
     const distance = Math.hypot(
@@ -391,6 +392,7 @@
     return null;
   };
   termEl.addEventListener('touchstart', (event) => {
+    if (inputPanel.hidden) terminalCloseOnlyClickPending = false;
     if (event.touches.length !== 1 || !term.textarea) {
       terminalTouch = null;
       return;
@@ -420,7 +422,7 @@
     // panel 表示中は panel close をこの tap の唯一の意味にする。入力欄が消えた後に
     // terminal へ暗黙 focus せず、software keyboard が一度閉じる状態を保証する。
     if (state.panelWasOpen) {
-      event.preventDefault();
+      terminalCloseOnlyClickPending = true;
       closePanel({ restoreTerminalFocus: false });
       setTimeout(() => term.blur(), 0);
       return;
@@ -434,9 +436,21 @@
     }, 0);
   }, { passive: false });
   termEl.addEventListener('touchcancel', () => { terminalTouch = null; }, { passive: true });
-  termEl.addEventListener('click', () => {
-    if (!inputPanel.hidden) closePanel({ restoreTerminalFocus: true });
-  });
+  termEl.addEventListener('pointerdown', () => {
+    if (inputPanel.hidden) terminalCloseOnlyClickPending = false;
+  }, true);
+  // panel open 中の terminal click は xterm の target handler より先に capture し、
+  // close-only として確定する。touchend で先に panel を閉じた場合も pending flag で
+  // 同じ synthetic click を捕まえ、terminal focus を絶対に通さない。
+  termEl.addEventListener('click', (event) => {
+    if (inputPanel.hidden && !terminalCloseOnlyClickPending) return;
+    terminalCloseOnlyClickPending = false;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (!inputPanel.hidden) closePanel({ restoreTerminalFocus: false });
+    term.blur();
+    setTimeout(() => term.blur(), 0);
+  }, true);
 
   const statusEl = document.getElementById('status');
   const sizeEl = document.getElementById('size');

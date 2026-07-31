@@ -34,7 +34,8 @@ terminal 領域への touch tap を focus toggle として扱う。
 - FAB panel 表示中の terminal tap / click は panel close を優先し、同じ touch で focus toggle しない
 - FAB panel の表示専用 `Terminal` ヘッダ行を削除し、× と drag 操作をタブ行へ統合する
 - touch で FAB panel を開く時は terminal を blur し、入力 textarea を自動 focus しない
-- 入力 textarea focus 中の terminal touch は panel を閉じ、terminal に focus を移さない
+- panel open 中の terminal tap/click は、入力 focus の有無と touch/mouse を問わず常に close のみ。
+  terminal に絶対 focus しない。terminal focus は panel closed 中の操作でのみ発生する
 
 ## 実装
 
@@ -46,25 +47,23 @@ synthetic click による再 focus を防ぎ、次 task で `term.blur()` を実
 
 start / move / cancel は passive listener で観測し、既存の選択・scroll gesture は維持する。
 
-panel 表示中の短い touch tap は `closePanel()` を実行して focus toggle 分岐を終了する。
-mouse click も `#term` の click listener から同じ close 経路を使う。panel の表示専用ヘッダは削除し、
-タブと × を 1 行に統合する。panel drag handle もタブ行へ移す。
-
-FAB の pointer type を open / close 処理へ渡す。touch open は terminal を blur した後、入力 textarea の
-auto-focus を行わない。panel 表示中の terminal touch は default を抑止し、panel 内の active element と
-terminal の両方を blur する。mouse open は入力 textarea auto-focus、mouse terminal click close は
-terminal focus restore を維持する。
+panel 表示中の `#term` touchend は `closePanel()` を実行し、panel 内の active element と terminal を
+両方 blur した上で pending flag を立てる。後続の synthetic click と mouse click は `#term` の
+capture-phase click listener が xterm 側の target handler より先に発火し、pending flag が立っていれば
+`preventDefault()` / `stopImmediatePropagation()` で xterm の focus 処理を止めつつ close + 全 blur を行う。
+panel closed 後の次の pointerdown で pending flag を解除し、通常の touch tap focus toggle / mouse click
+focus に戻す。panel の表示専用ヘッダは削除し、タブと × を 1 行に統合する。panel drag handle もタブ行へ移す。
 
 ## 検証
 
 - Chromium touch emulation: 未 focus → touch tap で focus、再 tap で blur
 - Chromium touch emulation: 10px を超える移動では focus 状態を変更しない
 - Chromium mouse: click 後は常に focus
-- Chromium touch / mouse: panel 表示中の terminal tap / click で panel が閉じる
+- panel open × {入力 textarea focus 有, 無} × {touch, mouse} の 4 ケース全てで terminal tap / click 後、
+  panel closed / `terminalFocused===false` / `document.activeElement===document.body` になる
 - × button とタブ行 drag はヘッダ削除後も機能する
 - panel 内に `.input-panel-head` / 表示専用 `Terminal` 行がなく、タブ行が先頭になる
 - Chromium touch: terminal focus 中の FAB open 後は terminal / input textarea とも未 focus
-- Chromium touch: input textarea focus 中の terminal tap 後は panel が閉じ、active element は body
-- 上記 close 後の次の terminal touch tap で通常どおり focus する
-- Chromium mouse: FAB open は input textarea focus、terminal click close は terminal focus
+- 上記 close 後の panel closed 状態での次の terminal touch tap は通常どおり focus toggle を維持する
+  (pending flag が正しく解除されている)
 - iOS / iPadOS 実機: 未検証。ソフトウェアキーボードの表示・格納は kawaz 実機確認待ち
