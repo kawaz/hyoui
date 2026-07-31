@@ -89,6 +89,11 @@ unicode / ambw / fontsize / lineheight / scrollback / fontfamily / bg / fg を�
 unicode / ambw は provider を再選択して daemon screen dump を再描画する。変更値は URL や storage
 へ保存せず、外側の reload で URL 指定または default にリセットされる。
 
+情報タブの「テキスト選択」は xterm.js active buffer の scrollback + viewport を開いた時点で
+素のテキストへ変換し、terminal 上の独立 DOM に静止 overlay として表示する。overlay は
+`user-select: text` で OS native の選択・コピーを使い、表示中は browser から子への入力送信を
+遮断する。閉じるボタンまたは Esc で通常の xterm 表示へ戻る。
+
 ### 4. 静的アセット
 
 xterm.js + 素の HTML/JS (bundler なし、vendored コピー)。リリースビルドは

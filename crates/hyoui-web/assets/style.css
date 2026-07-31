@@ -243,6 +243,7 @@ body.embed #term .xterm-screen {
 /* 旧 #inputForm ルールはフローティング化に伴い廃止。#inputFab / .input-panel は
    fixed 位置なので main flow に居ない (= embed でも共通に使える)。 */
 #term {
+  position: relative;
   border: 1px solid var(--border);
   padding: 4px;
   background: #111;
@@ -582,4 +583,64 @@ td.argv, td.cwd {
 .info-action .info-note {
   min-height: 1em;
   overflow-wrap: anywhere;
+}
+
+/* xterm.js は touch 端末の native selection を提供しないため、buffer snapshot を
+   独立 DOM として terminal 上へ重ねる。xterm の user-select:none を継承せず、
+   OS 標準の選択ハンドルとコピー操作を使えることがこの layer の責務。 */
+.text-selection-overlay {
+  position: absolute;
+  inset: 4px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  background: #111;
+  color: #e0e0e0;
+  overflow: auto;
+  outline: none;
+  user-select: text;
+  -webkit-user-select: text;
+  touch-action: pan-x pan-y;
+}
+.text-selection-overlay[hidden] { display: none; }
+.text-selection-head {
+  position: sticky;
+  top: 0;
+  left: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-width: 100%;
+  box-sizing: border-box;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(24, 24, 24, 0.98);
+  user-select: none;
+  -webkit-user-select: none;
+}
+.text-selection-title { font-weight: 600; }
+.text-selection-meta {
+  flex: 1 1 auto;
+  color: #aaa;
+  font-size: 0.75rem;
+}
+.text-selection-close {
+  flex: 0 0 auto;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  color: #e0e0e0;
+  border-color: rgba(255, 255, 255, 0.2);
+}
+.text-selection-content {
+  margin: 0;
+  padding: 0.5rem;
+  width: max-content;
+  min-width: 100%;
+  box-sizing: border-box;
+  white-space: pre;
+  tab-size: 8;
+  user-select: text;
+  -webkit-user-select: text;
 }

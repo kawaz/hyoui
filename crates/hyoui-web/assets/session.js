@@ -392,6 +392,10 @@
     return null;
   };
   termEl.addEventListener('touchstart', (event) => {
+    if (textSelectionOpen) {
+      terminalTouch = null;
+      return;
+    }
     if (inputPanel.hidden) terminalCloseOnlyClickPending = false;
     if (event.touches.length !== 1 || !term.textarea) {
       terminalTouch = null;
@@ -482,6 +486,7 @@
   const infoChildPid = document.getElementById('infoChildPid');
   const infoChildState = document.getElementById('infoChildState');
   const infoAttachClients = document.getElementById('infoAttachClients');
+  const textSelectionBtn = document.getElementById('textSelectionBtn');
 
   const displaySettingStatus = document.getElementById('displaySettingStatus');
   const sourceLabels = {
@@ -678,6 +683,92 @@
     infoDisplaySettings.appendChild(row);
   }
   infoSessionId.textContent = sid;
+
+  // xterm.js の選択は自前実装かつ touch 端末の native selection handle を提供しない。
+  // buffer 全体を開いた瞬間に素のテキストへ変換し、独立 DOM の静止 snapshot として
+  // terminal 上へ重ねる。overlay 表示中の入力は send 経路側でも遮断する。
+  let textSelectionOpen = false;
+  const textSelectionOverlay = document.createElement('div');
+  textSelectionOverlay.className = 'text-selection-overlay';
+  textSelectionOverlay.hidden = true;
+  textSelectionOverlay.tabIndex = -1;
+  textSelectionOverlay.setAttribute('role', 'region');
+  textSelectionOverlay.setAttribute('aria-label', 'ターミナルのテキスト選択');
+
+  const textSelectionHead = document.createElement('div');
+  textSelectionHead.className = 'text-selection-head';
+  const textSelectionTitle = document.createElement('span');
+  textSelectionTitle.className = 'text-selection-title';
+  textSelectionTitle.textContent = 'テキスト選択';
+  const textSelectionMeta = document.createElement('span');
+  textSelectionMeta.className = 'text-selection-meta';
+  const textSelectionClose = document.createElement('button');
+  textSelectionClose.type = 'button';
+  textSelectionClose.className = 'text-selection-close';
+  textSelectionClose.setAttribute('aria-label', 'テキスト選択を閉じる');
+  textSelectionClose.textContent = '×';
+  textSelectionHead.append(textSelectionTitle, textSelectionMeta, textSelectionClose);
+
+  const textSelectionContent = document.createElement('pre');
+  textSelectionContent.className = 'text-selection-content';
+  textSelectionOverlay.append(textSelectionHead, textSelectionContent);
+  termEl.appendChild(textSelectionOverlay);
+
+  function terminalBufferText() {
+    const buffer = term.buffer.active;
+    const lines = [];
+    for (let row = 0; row < buffer.length; row++) {
+      const line = buffer.getLine(row);
+      lines.push(line ? line.translateToString(true) : '');
+    }
+    return { text: lines.join('\n'), rows: buffer.length, scrollbackRows: buffer.baseY };
+  }
+
+  function openTextSelection() {
+    if (textSelectionOpen) return;
+    const snapshot = terminalBufferText();
+    textSelectionContent.textContent = snapshot.text;
+    textSelectionMeta.textContent = `${snapshot.rows} 行 (scrollback ${snapshot.scrollbackRows})`;
+    textSelectionContent.style.fontFamily = term.options.fontFamily;
+    textSelectionContent.style.fontSize = `${term.options.fontSize}px`;
+    textSelectionContent.style.lineHeight = String(term.options.lineHeight);
+    const theme = term.options.theme || {};
+    textSelectionOverlay.style.background = theme.background || background;
+    textSelectionOverlay.style.color = theme.foreground || foreground;
+    closePanel({ restoreTerminalFocus: false });
+    inputFab.hidden = true;
+    textSelectionOpen = true;
+    textSelectionOverlay.hidden = false;
+    textSelectionOverlay.scrollTop = textSelectionOverlay.scrollHeight;
+    textSelectionOverlay.focus({ preventScroll: true });
+  }
+
+  function closeTextSelection() {
+    if (!textSelectionOpen) return;
+    textSelectionOpen = false;
+    textSelectionOverlay.hidden = true;
+    textSelectionOverlay.blur();
+    inputFab.hidden = false;
+    term.blur();
+  }
+
+  textSelectionBtn.addEventListener('click', openTextSelection);
+  textSelectionClose.addEventListener('click', closeTextSelection);
+  document.addEventListener('keydown', (event) => {
+    if (!textSelectionOpen || event.key !== 'Escape') return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    closeTextSelection();
+  }, true);
+
+  // playwright / devtools で native selection と snapshot の静止性を検査する hook。
+  window.__hyouiTextSelection = {
+    get open() { return textSelectionOpen; },
+    overlay: textSelectionOverlay,
+    content: textSelectionContent,
+    openOverlay: openTextSelection,
+    closeOverlay: closeTextSelection,
+  };
 
   // HTML の `hidden` 属性に加え script 側でも明示的に hide しておく (belt-and-suspenders)。
   // 初回 fetch が成功して child_stopped=true と判明するまでは絶対に表示させない
@@ -887,6 +978,7 @@
   }
 
   async function sendSpecs(specs) {
+    if (textSelectionOpen) return;
     sendStatus.textContent = 'sending…';
     try {
       const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/input`, {
@@ -1475,6 +1567,7 @@
   }
 
   function sendBytesToWs(bytes) {
+    if (textSelectionOpen) return false;
     // WS text frame は gateway 制御 JSON 専用。PTY input は文字列も UTF-8 の
     // Uint8Array に変換し、常に binary frame として送る。
     const payload = typeof bytes === 'string' ? wsTextEncoder.encode(bytes) : bytes;

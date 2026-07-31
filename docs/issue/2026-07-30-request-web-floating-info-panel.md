@@ -52,7 +52,7 @@ embed されたターミナル内に、以下を表示するフローティン�
 
 ## 実装状況
 
-Phase 1 (表示) + Phase 2a (表示設定変更) + Phase 2b (leader 昇格) を実装済み。
+Phase 1 (表示) + Phase 2a (表示設定変更) + Phase 2b (leader 昇格) + Phase 3 (テキスト選択) を実装済み。
 
 - 既存キーボード FAB のフローティングを「入力」「情報」の 2 タブ化。入力機能は維持
 - gateway 内部の WS text frame `attach.info` で daemon handshake の mode / leader を表示し、
@@ -71,3 +71,8 @@ Phase 1 (表示) + Phase 2a (表示設定変更) + Phase 2b (leader 昇格) を�
   経由して daemon の `leader.request` (cap `leader-request-v1`) を呼び、成功時は
   `attach.info` で新旧 browser の leader 表示を更新する。takeover 直後は後発 browser の
   viewport に対する grid 提案へ PTY と xterm.js を揃える ([[DR-0033]])
+- **Phase 3 (テキスト選択、実装済み)**: 情報タブの「テキスト選択」で xterm.js の
+  active buffer 全行 (scrollback + viewport) を `line.translateToString(true)` から抽出し、
+  terminal 上の独立 `user-select: text` DOM に静止 snapshot として表示する。OS native の
+  選択・コピーを使い、閉じるボタンまたは Esc で通常表示へ戻る。表示中は FAB/panel を
+  隠し、WS binary input と HTTP input の両送信経路を遮断する
