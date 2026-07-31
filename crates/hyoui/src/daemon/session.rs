@@ -3168,6 +3168,104 @@ mod tests {
         let _ = handle.join().expect("daemon thread");
     }
 
+    /// RwNoLeader client が leader.request を送ると Rw に遷移して leader を奪取し、
+    /// 直後の status.response も変更後の mode / leader flag を返す。
+    #[test]
+    fn serve_leader_request_transitions_rw_no_leader_and_updates_status() {
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut s1 = client_connect_with_retry(&sock_path);
+        let r1 = do_client_handshake(&mut s1);
+        assert!(r1.leader);
+        let _ = Frame::decode_from(&mut s1).expect("s1 leader.notify");
+
+        let mut s2 = client_connect_with_retry(&sock_path);
+        let req = ControlMessage::HandshakeRequest(HandshakeRequest {
+            caps: MVP_CAPS.iter().map(|cap| cap.to_string()).collect(),
+            mode: Mode::RwNoLeader,
+            exclusive: false,
+            detach_others: false,
+            token: None,
+        });
+        Frame::cbor_control(req.encode_to_vec().expect("encode"))
+            .encode_to(&mut s2)
+            .expect("send handshake");
+        s2.flush().expect("flush handshake");
+        let response = next_control(&mut s2);
+        let r2 = match response {
+            ControlMessage::HandshakeResponse(response) => response,
+            other => panic!("expected HandshakeResponse, got {other:?}"),
+        };
+        assert_eq!(r2.mode, Mode::RwNoLeader);
+        assert!(!r2.leader);
+        discard_attach_redraw(&mut s2);
+
+        Frame::cbor_control(
+            ControlMessage::LeaderRequest(crate::protocol::messages::LeaderRequest::default())
+                .encode_to_vec()
+                .expect("encode leader.request"),
+        )
+        .encode_to(&mut s2)
+        .expect("send leader.request");
+        s2.flush().expect("flush leader.request");
+
+        match next_control(&mut s2) {
+            ControlMessage::ModeChange(change) => {
+                assert_eq!(change.client_mode, Some(Mode::Rw));
+            }
+            other => panic!("expected ModeChange(Rw), got {other:?}"),
+        }
+        for stream in [&mut s1, &mut s2] {
+            match next_control(stream) {
+                ControlMessage::LeaderNotify(notify) => {
+                    assert_eq!(notify.client_id, Some(r2.client_id));
+                }
+                other => panic!("expected LeaderNotify, got {other:?}"),
+            }
+        }
+
+        Frame::cbor_control(
+            ControlMessage::StatusQuery(crate::protocol::messages::StatusQuery {})
+                .encode_to_vec()
+                .expect("encode status.query"),
+        )
+        .encode_to(&mut s2)
+        .expect("send status.query");
+        s2.flush().expect("flush status.query");
+        match next_control(&mut s2) {
+            ControlMessage::StatusResponse(status) => {
+                let old = status
+                    .clients
+                    .iter()
+                    .find(|client| client.client_id == r1.client_id)
+                    .expect("old leader in status");
+                let requester = status
+                    .clients
+                    .iter()
+                    .find(|client| client.client_id == r2.client_id)
+                    .expect("requester in status");
+                assert_eq!(old.mode, Mode::Rw);
+                assert!(!old.leader);
+                assert_eq!(requester.mode, Mode::Rw);
+                assert!(requester.leader);
+            }
+            other => panic!("expected StatusResponse, got {other:?}"),
+        }
+
+        Frame::cbor_control(
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            })
+            .encode_to_vec()
+            .expect("encode kill"),
+        )
+        .encode_to(&mut s2)
+        .expect("send kill");
+        s2.flush().expect("flush kill");
+        let _ = handle.join().expect("daemon thread");
+    }
+
     /// Phase 10: lock acquire は token を返し、mode.change(Locked) を全 client に broadcast。
     #[test]
     fn serve_lock_acquire_grants_and_broadcasts_mode_change() {

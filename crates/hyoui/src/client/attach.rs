@@ -1262,7 +1262,8 @@ impl ClientConnection {
                             //   `session_exit_status` field を読む形)
                             // - SessionChildStoppedNotify: 子が止まったことを画面最下行に
                             //   知らせるだけ (= attach は継続、DR-0029 §1)
-                            // - 他 (= leader.notify / mode.change / error 等) は無視
+                            // - ModeChange / LeaderNotify: client 自身の mode / leader 自認を更新
+                            // - 他 (= error 等) は原則無視
                             match ControlMessage::decode_from(frame.body.as_slice()) {
                                 Ok(ControlMessage::SessionExitNotify(notify)) => {
                                     return Ok(RunOutcome::ChildExited {
@@ -1314,6 +1315,14 @@ impl ClientConnection {
                                             // 1 行出す。
                                             self.draw_child_stopped_notice(stdout, rows);
                                         }
+                                    }
+                                }
+                                Ok(ControlMessage::ModeChange(change)) => {
+                                    // 個別 mode 遷移通知を自認 state に反映する。leader.request
+                                    // で RwNoLeader → Rw に昇格した後、stopped-child の resume /
+                                    // menu 判定も変更後の mode を使うために必要。
+                                    if let Some(mode) = change.client_mode {
+                                        self.response.mode = mode;
                                     }
                                 }
                                 Ok(ControlMessage::LeaderNotify(n)) => {
@@ -2835,6 +2844,7 @@ mod tests {
                 "record-v1".into(),
                 "set-v1".into(),
                 "upgrade-v1".into(),
+                "leader-request-v1".into(),
             ]
         );
         assert!(conn.response.leader);

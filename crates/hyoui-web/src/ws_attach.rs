@@ -55,11 +55,27 @@ enum WsControlRequest {
         cols: u16,
         rows: u16,
     },
+    #[serde(rename = "leader.request")]
+    LeaderRequest {
+        #[serde(rename = "requestId")]
+        request_id: u64,
+    },
 }
 
 /// Gateway → browser の text frame。PTY output は binary frame のまま。
 #[derive(Debug, Serialize)]
 struct WsResizeResult {
+    kind: &'static str,
+    #[serde(rename = "requestId")]
+    request_id: u64,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Gateway → browser の leader 奪取結果。
+#[derive(Debug, Serialize)]
+struct WsLeaderResult {
     kind: &'static str,
     #[serde(rename = "requestId")]
     request_id: u64,
@@ -86,6 +102,8 @@ enum BridgeCmd {
         cols: u16,
         rows: u16,
     },
+    /// 当該 WS に対応する daemon client への leader 奪取要求。
+    LeaderRequest { request_id: u64 },
     /// WS close 相当。bridge を Ok で終わらせる。
     Shutdown,
 }
@@ -94,6 +112,18 @@ enum BridgeCmd {
 enum BridgeOutput {
     Bytes(Vec<u8>),
     Control(String),
+}
+
+/// 1 回の wake drain 内で受け取った制御操作。browser が送った順序を保存する。
+enum PendingControl {
+    Resize {
+        request_id: u64,
+        cols: u16,
+        rows: u16,
+    },
+    LeaderRequest {
+        request_id: u64,
+    },
 }
 
 /// WS handler の中身 (= `on_upgrade` 内で呼ぶ本体)。socket_path は事前解決済み。
@@ -126,6 +156,9 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf) -> Result<(), Str
                             cols,
                             rows,
                         },
+                        Ok(WsControlRequest::LeaderRequest { request_id }) => {
+                            BridgeCmd::LeaderRequest { request_id }
+                        }
                         Err(e) => {
                             eprintln!("hyoui-web: invalid WS control message: {e}");
                             continue;
@@ -226,6 +259,9 @@ fn bridge_loop(
     let mut conn = ClientConnection::connect(sock_path, opts)
         .map_err(|e| format!("connect/handshake: {e}"))?;
     send_attach_info(&conn.response, &output_tx)?;
+    // 非 leader の resize は daemon へ送れないが、browser の現在 grid 提案として保持する。
+    // takeover 成功後に同じ connection から再送し、新 leader の viewport に PTY を合わせる。
+    let mut latest_grid: Option<(u16, u16)> = None;
 
     loop {
         let reader_fd = conn.reader_fd();
@@ -290,7 +326,7 @@ fn bridge_loop(
             // frame 数削減、DR-0021 raw_ack 待ちも 1 回で済む)。Shutdown は途中で
             // 見つかれば残 bytes 送信後に return する。
             let mut batch = Vec::new();
-            let mut resizes = Vec::new();
+            let mut controls = Vec::new();
             let mut shutdown = false;
             loop {
                 match input_rx.try_recv() {
@@ -299,7 +335,14 @@ fn bridge_loop(
                         request_id,
                         cols,
                         rows,
-                    }) => resizes.push((request_id, cols, rows)),
+                    }) => controls.push(PendingControl::Resize {
+                        request_id,
+                        cols,
+                        rows,
+                    }),
+                    Ok(BridgeCmd::LeaderRequest { request_id }) => {
+                        controls.push(PendingControl::LeaderRequest { request_id });
+                    }
                     Ok(BridgeCmd::Shutdown) => {
                         shutdown = true;
                         break;
@@ -323,16 +366,37 @@ fn bridge_loop(
                     Err(e) => return Err(format!("send_raw_bytes: {e}")),
                 }
             }
-            for (request_id, cols, rows) in resizes {
-                let result = resize_on_connection(&mut conn, cols, rows, &output_tx);
-                let response = WsResizeResult {
-                    kind: "resize.result",
-                    request_id,
-                    ok: result.is_ok(),
-                    error: result.err(),
+            for control in controls {
+                let (text, encode_context) = match control {
+                    PendingControl::Resize {
+                        request_id,
+                        cols,
+                        rows,
+                    } => {
+                        if cols > 0 && rows > 0 {
+                            latest_grid = Some((cols, rows));
+                        }
+                        let result = resize_on_connection(&mut conn, cols, rows, &output_tx);
+                        let response = WsResizeResult {
+                            kind: "resize.result",
+                            request_id,
+                            ok: result.is_ok(),
+                            error: result.err(),
+                        };
+                        (serde_json::to_string(&response), "resize result")
+                    }
+                    PendingControl::LeaderRequest { request_id } => {
+                        let result = leader_on_connection(&mut conn, latest_grid, &output_tx);
+                        let response = WsLeaderResult {
+                            kind: "leader.result",
+                            request_id,
+                            ok: result.is_ok(),
+                            error: result.err(),
+                        };
+                        (serde_json::to_string(&response), "leader result")
+                    }
                 };
-                let text = serde_json::to_string(&response)
-                    .map_err(|e| format!("encode resize result: {e}"))?;
+                let text = text.map_err(|e| format!("encode {encode_context}: {e}"))?;
                 if output_tx.send(BridgeOutput::Control(text)).is_err() {
                     return Ok(());
                 }
@@ -342,6 +406,80 @@ fn bridge_loop(
             }
         }
     }
+}
+
+/// WS bridge の daemon connection から leader 奪取を要求し、`leader.notify` または
+/// `error` まで同期して結果を返す。成功後は最後に browser が提案した grid があれば
+/// 同じ connection から resize し、resize 責務者の移動を即座に PTY サイズへ反映する。
+fn leader_on_connection(
+    conn: &mut hyoui::client::ClientConnection,
+    latest_grid: Option<(u16, u16)>,
+    output_tx: &tokio::sync::mpsc::UnboundedSender<BridgeOutput>,
+) -> Result<(), String> {
+    use hyoui::protocol::ControlMessage;
+    use hyoui::protocol::messages::LeaderRequest;
+
+    if !conn
+        .response
+        .caps
+        .iter()
+        .any(|cap| cap == "leader-request-v1")
+    {
+        return Err(
+            "daemon does not support leader.request (`leader-request-v1` was not negotiated)"
+                .to_string(),
+        );
+    }
+
+    conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|e| format!("set leader request timeout: {e}"))?;
+    let result = (|| {
+        conn.send_control(&ControlMessage::LeaderRequest(LeaderRequest::default()))
+            .map_err(|e| format!("send leader.request: {e}"))?;
+
+        let mut raw = Vec::new();
+        loop {
+            let message = conn
+                .recv_control(Some(&mut raw))
+                .map_err(|e| format!("await leader.request completion: {e}"))?;
+            if !raw.is_empty() {
+                output_tx
+                    .send(BridgeOutput::Bytes(std::mem::take(&mut raw)))
+                    .map_err(|_| "WS writer closed".to_string())?;
+            }
+            match message {
+                ControlMessage::ModeChange(change) => {
+                    if let Some(mode) = change.client_mode {
+                        conn.response.mode = mode;
+                        send_attach_info(&conn.response, output_tx)?;
+                    }
+                }
+                ControlMessage::LeaderNotify(notify) => {
+                    conn.response.leader = notify.client_id == Some(conn.response.client_id);
+                    send_attach_info(&conn.response, output_tx)?;
+                    if conn.response.leader {
+                        return Ok(());
+                    }
+                }
+                ControlMessage::Error(error) => {
+                    return Err(format!(
+                        "leader.request rejected ({}): {}",
+                        error.code, error.message
+                    ));
+                }
+                _ => {}
+            }
+        }
+    })();
+    conn.set_read_timeout(None)
+        .map_err(|e| format!("clear leader request timeout: {e}"))?;
+    result?;
+
+    if let Some((cols, rows)) = latest_grid {
+        resize_on_connection(conn, cols, rows, output_tx)
+            .map_err(|e| format!("leader acquired but resize failed: {e}"))?;
+    }
+    Ok(())
 }
 
 /// WS bridge が保持する leader connection から resize を送り、StatusResponse を
@@ -415,6 +553,38 @@ pub fn on_upgrade(ws: WebSocketUpgrade, sock_path: PathBuf) -> axum::response::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// browser → gateway の leader.request は resize と同じ requestId 相関を使い、
+    /// daemon protocol の payload 無し仕様とは WS gateway 境界で分離する。
+    #[test]
+    fn leader_request_json_uses_browser_control_schema() {
+        let request: WsControlRequest = serde_json::from_value(serde_json::json!({
+            "kind": "leader.request",
+            "requestId": 17
+        }))
+        .expect("decode leader.request");
+        match request {
+            WsControlRequest::LeaderRequest { request_id } => assert_eq!(request_id, 17),
+            other => panic!("expected LeaderRequest, got {other:?}"),
+        }
+    }
+
+    /// gateway → browser の leader.result は成功時に error field を省略し、要求と同じ
+    /// requestId を返す。
+    #[test]
+    fn leader_result_json_uses_browser_control_schema() {
+        let result = WsLeaderResult {
+            kind: "leader.result",
+            request_id: 17,
+            ok: true,
+            error: None,
+        };
+        let json = serde_json::to_value(result).expect("serialize leader.result");
+        assert_eq!(json["kind"], "leader.result");
+        assert_eq!(json["requestId"], 17);
+        assert_eq!(json["ok"], true);
+        assert!(json.get("error").is_none());
+    }
 
     #[test]
     fn attach_info_json_uses_browser_control_schema() {

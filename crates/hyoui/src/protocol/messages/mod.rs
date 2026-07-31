@@ -53,7 +53,8 @@ pub use handshake::{
 };
 pub use lifecycle::{Detach, DetachAck, DetachTarget, Kill, KillAck};
 pub use lock::{
-    LeaderNotify, LockAcquire, LockRelease, LockResponse, LockResult, ModeChange, SessionMode,
+    LeaderNotify, LeaderRequest, LockAcquire, LockRelease, LockResponse, LockResult, ModeChange,
+    SessionMode,
 };
 pub use raw_ack::{
     CODE_CLIENT_LOCK_NOT_HELD, CODE_CLIENT_RO_REJECTED, CODE_MASTER_WRITE_ERROR,
@@ -117,6 +118,11 @@ pub enum ControlMessage {
     /// `kind = "lock.release"` — client → daemon、lock 解放。
     #[serde(rename = "lock.release")]
     LockRelease(LockRelease),
+
+    /// `kind = "leader.request"` — rw client → daemon、要求元への leader 奪取要求
+    /// (DR-0033、cap `leader-request-v1` 要)。
+    #[serde(rename = "leader.request")]
+    LeaderRequest(LeaderRequest),
 
     /// `kind = "leader.notify"` — daemon → all clients、leader 変更通知。
     #[serde(rename = "leader.notify")]
@@ -460,6 +466,28 @@ mod tests {
             token: "tok-xyz".into(),
         });
         assert_eq!(roundtrip(&msg), msg);
+    }
+
+    /// leader.request は要求元自身だけを対象にするため payload field を持たず、
+    /// wire 上は kind だけで round trip する。
+    #[test]
+    fn leader_request_roundtrip_without_payload() {
+        let msg = ControlMessage::LeaderRequest(LeaderRequest::default());
+        assert_eq!(roundtrip(&msg), msg);
+
+        let value: ciborium::Value =
+            ciborium::from_reader(msg.encode_to_vec().expect("encode").as_slice()).expect("decode");
+        let ciborium::Value::Map(fields) = value else {
+            panic!("leader.request must encode as a CBOR map");
+        };
+        assert_eq!(fields.len(), 1, "leader.request must contain only kind");
+        assert_eq!(
+            fields[0],
+            (
+                ciborium::Value::Text("kind".into()),
+                ciborium::Value::Text("leader.request".into())
+            )
+        );
     }
 
     #[test]

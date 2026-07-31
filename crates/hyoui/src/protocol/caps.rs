@@ -33,6 +33,8 @@ use std::collections::BTreeSet;
 ///   graceful self-exec upgrade)。旧 daemon (Phase 1/2 の SIGUSR1 隠し経路のみ) には
 ///   cap 無し → 新 client は「upgrade protocol 未対応」と判定して SIGUSR1 fallback
 ///   もしくは明示 error にする
+/// - `"leader-request-v1"`: `leader.request` message (DR-0033、rw client が接続を
+///   維持したまま resize leader を奪取する)
 pub const MVP_CAPS: &[&str] = &[
     "data",
     "lock",
@@ -44,6 +46,7 @@ pub const MVP_CAPS: &[&str] = &[
     "record-v1",
     "set-v1",
     "upgrade-v1",
+    "leader-request-v1",
 ];
 
 /// 2 つの cap 集合の intersect を取って `Vec<String>` で返す。
@@ -98,6 +101,7 @@ mod tests {
         assert!(MVP_CAPS.contains(&"record-v1"));
         assert!(MVP_CAPS.contains(&"set-v1"));
         assert!(MVP_CAPS.contains(&"upgrade-v1"));
+        assert!(MVP_CAPS.contains(&"leader-request-v1"));
     }
 
     /// wait-l0 cap は DR-0006 §9 改訂 (state-based wait 移行) に伴い削除済。

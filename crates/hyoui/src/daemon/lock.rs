@@ -565,6 +565,40 @@ pub(super) fn elevate_next_leader(clients: &mut [ClientHandle]) -> Option<u64> {
     None
 }
 
+/// 明示的な leader 奪取による client state の変化。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LeaderTakeover {
+    /// 要求元が既に leader で state 変化なし。
+    AlreadyLeader { client_id: u64 },
+    /// 要求元へ leader を移し、必要なら RwNoLeader から Rw へ遷移した。
+    Taken { client_id: u64, mode_changed: bool },
+}
+
+/// `requester_idx` の client へ leader を明示的に移す。
+///
+/// 権限 / cap 検査は protocol handler の責務。本 helper は leader flag の単一性と
+/// RwNoLeader → Rw 遷移だけを担い、socket 通知は行わない。
+pub(super) fn take_leader(clients: &mut [ClientHandle], requester_idx: usize) -> LeaderTakeover {
+    let requester_id = clients[requester_idx].id;
+    if clients[requester_idx].leader {
+        return LeaderTakeover::AlreadyLeader {
+            client_id: requester_id,
+        };
+    }
+
+    let mode_changed = matches!(clients[requester_idx].mode, Mode::RwNoLeader);
+    if mode_changed {
+        clients[requester_idx].mode = Mode::Rw;
+    }
+    for client in clients.iter_mut() {
+        client.leader = client.id == requester_id;
+    }
+    LeaderTakeover::Taken {
+        client_id: requester_id,
+        mode_changed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

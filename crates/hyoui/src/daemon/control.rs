@@ -39,19 +39,21 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
 use crate::protocol::messages::{
-    ClientInfo, ErrorCode, ErrorMessage, LockResponse, LockResult, RecordInfo, RecordListResponse,
-    RecordStartRequest, RecordStartResponse, RecordStopRequest, RecordStopResponse,
-    ScreenBufferKind, ScreenCursorSnap, ScreenDumpRequest, ScreenDumpResponse, ScreenModeSnap,
-    ScreenWindowSize, SnapshotComponent, StateSnapshotRequest, StateSnapshotResponse,
-    StatusResponse, TailRequest,
+    ClientInfo, ErrorCode, ErrorMessage, LeaderNotify, LockResponse, LockResult, ModeChange,
+    RecordInfo, RecordListResponse, RecordStartRequest, RecordStartResponse, RecordStopRequest,
+    RecordStopResponse, ScreenBufferKind, ScreenCursorSnap, ScreenDumpRequest, ScreenDumpResponse,
+    ScreenModeSnap, ScreenWindowSize, SnapshotComponent, StateSnapshotRequest,
+    StateSnapshotResponse, StatusResponse, TailRequest,
 };
 use crate::protocol::{ControlMessage, Frame, Mode, TYPE_CBOR_CONTROL, TYPE_RAW_DATA};
 use crate::scrollback::Scrollback;
 use crate::sys::Pty;
 use crate::sys::clock::now_unix_ms;
 
-use super::broadcast::{ClientHandle, send_control};
-use super::lock::{LockEvent, LockMsg, SessionState, generate_lock_token};
+use super::broadcast::{ClientHandle, broadcast_control, send_control};
+use super::lock::{
+    LeaderTakeover, LockEvent, LockMsg, SessionState, generate_lock_token, take_leader,
+};
 use super::record::{LifecycleEvent, RecordStartError, RecordStopError, SessionInfo};
 use super::reducer::{DaemonState, execute_with_feedback};
 use super::screen::{
@@ -210,6 +212,7 @@ pub(super) fn handle_control_message(
         ControlMessage::Kill(k) => handle_kill(child, idx, k, clients),
         ControlMessage::Signal(s) => handle_signal(child, idx, s, clients),
         ControlMessage::Resize(r) => handle_resize(pty, idx, r, clients, screen_state),
+        ControlMessage::LeaderRequest(_) => handle_leader_request(idx, clients, daemon_state),
         ControlMessage::LockAcquire(req) => {
             handle_lock_acquire(idx, req, clients, state, daemon_state)
         }
@@ -635,6 +638,68 @@ fn handle_signal(
         }
     };
     let _ = kill(child, sig);
+    ClientFrameOutcome::Continue
+}
+
+/// `ControlMessage::LeaderRequest` を処理する (DR-0033)。
+///
+/// Ro は観察専用なので拒否する。RwNoLeader は要求時点で Rw に遷移し、要求元へ
+/// 個別 `mode.change` を送る。既 leader の再要求は状態不変の冪等成功として要求元だけに
+/// `leader.notify`、奪取時は旧 leader を接続・Rw のまま降格して全 client へ broadcast する。
+fn handle_leader_request(
+    idx: usize,
+    clients: &mut [ClientHandle],
+    daemon_state: &DaemonState,
+) -> ClientFrameOutcome {
+    if ensure_cap(
+        &clients[idx],
+        "leader-request-v1",
+        "leader.request requires `leader-request-v1` cap",
+    )
+    .is_err()
+    {
+        return ClientFrameOutcome::Continue;
+    }
+    if ensure_not_ro(
+        &clients[idx],
+        "leader.request requires a writable mode (= rw / rw-no-leader)",
+    )
+    .is_err()
+    {
+        return ClientFrameOutcome::Continue;
+    }
+
+    match take_leader(clients, idx) {
+        LeaderTakeover::AlreadyLeader { client_id } => {
+            let _ = send_control(
+                &clients[idx],
+                ControlMessage::LeaderNotify(LeaderNotify {
+                    client_id: Some(client_id),
+                }),
+            );
+        }
+        LeaderTakeover::Taken {
+            client_id,
+            mode_changed,
+        } => {
+            if mode_changed {
+                let _ = send_control(
+                    &clients[idx],
+                    ControlMessage::ModeChange(ModeChange {
+                        session_mode: daemon_state.lock.session_mode(),
+                        lock_holder: daemon_state.lock.holder(),
+                        client_mode: Some(Mode::Rw),
+                    }),
+                );
+            }
+            let _ = broadcast_control(
+                clients,
+                &ControlMessage::LeaderNotify(LeaderNotify {
+                    client_id: Some(client_id),
+                }),
+            );
+        }
+    }
     ClientFrameOutcome::Continue
 }
 
@@ -2072,6 +2137,155 @@ mod tests {
         assert!(
             matches!(status, WaitStatus::Exited(_, 0)),
             "exit must be observable exactly once by the lifecycle path, got {status:?}"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // DR-0033: `leader.request` takeover
+    // ──────────────────────────────────────────────────────────────────────
+
+    fn leader_test_client(
+        id: u64,
+        mode: Mode,
+        leader: bool,
+        caps: Vec<String>,
+    ) -> (ClientHandle, Receiver<SharedBytes>) {
+        let (tx, rx) = std::sync::mpsc::channel::<SharedBytes>();
+        let (_a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let ch = ClientHandle {
+            id,
+            mode,
+            leader,
+            subscription: Subscription::Raw,
+            negotiated_caps: caps,
+            writer_tx: tx,
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            buffer_limit: 1 << 20,
+            writer_thread: None,
+            reader: b,
+            connected_at_unix_ms: 0,
+        };
+        (ch, rx)
+    }
+
+    /// cap negotiation で leader-request-v1 が落ちた client は新 kind を送れず、
+    /// unsupported-capability を明示応答する。旧 daemon / client 混在を無言失敗にしない。
+    #[test]
+    fn leader_request_without_cap_is_rejected() {
+        let daemon_state = DaemonState::default();
+        let (ch, rx) = leader_test_client(1, Mode::Rw, false, vec!["lock".into()]);
+        let mut clients = vec![ch];
+
+        handle_leader_request(0, &mut clients, &daemon_state);
+
+        assert!(!clients[0].leader, "cap 不足では leader state を変えない");
+        match recv_control_from_queue(&rx) {
+            ControlMessage::Error(error) => {
+                assert_eq!(error.code, ErrorCode::UnsupportedCapability)
+            }
+            other => panic!("expected UnsupportedCapability, got {other:?}"),
+        }
+    }
+
+    /// Ro は観察専用なので leader 奪取不可。cap を持っていても mode.not-allowed で
+    /// 拒否し、現 leader を維持する。
+    #[test]
+    fn leader_request_from_ro_is_rejected() {
+        let daemon_state = DaemonState::default();
+        let (leader, _leader_rx) =
+            leader_test_client(1, Mode::Rw, true, vec!["leader-request-v1".into()]);
+        let (observer, observer_rx) =
+            leader_test_client(2, Mode::Ro, false, vec!["leader-request-v1".into()]);
+        let mut clients = vec![leader, observer];
+
+        handle_leader_request(1, &mut clients, &daemon_state);
+
+        assert!(clients[0].leader);
+        assert!(!clients[1].leader);
+        match recv_control_from_queue(&observer_rx) {
+            ControlMessage::Error(error) => assert_eq!(error.code, ErrorCode::ModeNotAllowed),
+            other => panic!("expected ModeNotAllowed, got {other:?}"),
+        }
+    }
+
+    /// Rw 奪取では旧 leader の接続と Rw mode を維持したまま flag だけ降格し、
+    /// 新 leader id を全 client へ broadcast する。
+    #[test]
+    fn leader_request_from_rw_demotes_old_leader_and_broadcasts() {
+        let daemon_state = DaemonState::default();
+        let (old, old_rx) = leader_test_client(1, Mode::Rw, true, vec!["leader-request-v1".into()]);
+        let (requester, requester_rx) =
+            leader_test_client(2, Mode::Rw, false, vec!["leader-request-v1".into()]);
+        let mut clients = vec![old, requester];
+
+        handle_leader_request(1, &mut clients, &daemon_state);
+
+        assert_eq!(clients[0].mode, Mode::Rw, "旧 leader の mode は Rw のまま");
+        assert!(!clients[0].leader, "旧 leader は接続を維持して降格");
+        assert!(clients[1].leader, "要求元が新 leader");
+        for rx in [&old_rx, &requester_rx] {
+            match recv_control_from_queue(rx) {
+                ControlMessage::LeaderNotify(notify) => {
+                    assert_eq!(notify.client_id, Some(2));
+                }
+                other => panic!("expected LeaderNotify, got {other:?}"),
+            }
+        }
+    }
+
+    /// RwNoLeader は leader 意思表明と同時に Rw へ遷移する。要求元には個別
+    /// mode.change(Rw) が先に届き、その後 takeover の leader.notify が全 client に届く。
+    #[test]
+    fn leader_request_from_rw_no_leader_transitions_to_rw_and_broadcasts() {
+        let daemon_state = DaemonState::default();
+        let (old, old_rx) = leader_test_client(1, Mode::Rw, true, vec!["leader-request-v1".into()]);
+        let (requester, requester_rx) =
+            leader_test_client(2, Mode::RwNoLeader, false, vec!["leader-request-v1".into()]);
+        let mut clients = vec![old, requester];
+
+        handle_leader_request(1, &mut clients, &daemon_state);
+
+        assert_eq!(clients[1].mode, Mode::Rw);
+        assert!(clients[1].leader);
+        assert!(!clients[0].leader);
+        match recv_control_from_queue(&requester_rx) {
+            ControlMessage::ModeChange(change) => {
+                assert_eq!(change.client_mode, Some(Mode::Rw));
+            }
+            other => panic!("expected requester ModeChange first, got {other:?}"),
+        }
+        match recv_control_from_queue(&requester_rx) {
+            ControlMessage::LeaderNotify(notify) => assert_eq!(notify.client_id, Some(2)),
+            other => panic!("expected requester LeaderNotify, got {other:?}"),
+        }
+        match recv_control_from_queue(&old_rx) {
+            ControlMessage::LeaderNotify(notify) => assert_eq!(notify.client_id, Some(2)),
+            other => panic!("expected old leader LeaderNotify, got {other:?}"),
+        }
+    }
+
+    /// 既 leader の再要求は冪等成功。状態変化が無いので broadcast せず、要求元にだけ
+    /// leader.notify を返して完了を同期確認できる。
+    #[test]
+    fn leader_request_by_current_leader_notifies_only_requester() {
+        let daemon_state = DaemonState::default();
+        let (requester, requester_rx) =
+            leader_test_client(1, Mode::Rw, true, vec!["leader-request-v1".into()]);
+        let (other, other_rx) =
+            leader_test_client(2, Mode::Rw, false, vec!["leader-request-v1".into()]);
+        let mut clients = vec![requester, other];
+
+        handle_leader_request(0, &mut clients, &daemon_state);
+
+        assert!(clients[0].leader);
+        assert!(!clients[1].leader);
+        match recv_control_from_queue(&requester_rx) {
+            ControlMessage::LeaderNotify(notify) => assert_eq!(notify.client_id, Some(1)),
+            other => panic!("expected requester LeaderNotify, got {other:?}"),
+        }
+        assert!(
+            other_rx.try_recv().is_err(),
+            "状態不変の再要求を他 client へ broadcast しない"
         );
     }
 

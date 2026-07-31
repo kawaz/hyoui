@@ -90,6 +90,13 @@ impl fmt::Debug for LockRelease {
     }
 }
 
+/// `leader.request` payload (client → daemon)。
+///
+/// 対象は常に要求元 client 自身なので、payload field は持たない。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct LeaderRequest {}
+
 /// `leader.notify` payload (daemon → all clients broadcast)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
