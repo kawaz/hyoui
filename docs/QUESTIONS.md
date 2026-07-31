@@ -24,6 +24,11 @@
 
 ## 確認待ち
 
+### 👺LT-C1: leader 奪取 (v0.9.34) の実機確認 — iPad の件の本修正
+
+- [ ] a: iPad の web ターミナルで FAB → 情報タブ → ATTACH の「leader になる」ボタンで主導権を奪取でき、PTY サイズが iPad の画面に合う (PC 側の接続はそのまま leader=no に降格)
+- [ ] b: パネル開閉のフォーカス調整 (FAB を開くとキーボードが一度しまわれる / 入力欄フォーカス中にターミナルタップでパネルが閉じてキーボードもしまわれる) が意図どおり
+
 ### 👺DR32-C1: DR-0032 実装 (v0.9.32) の実機確認
 
 - [ ] a: `~/.config/hyoui/config.toml` に `[session]` `on_child_suspend = "show_child_action_menu"` を書き、attach 中に ^Z×2 等で子を止めると menu (脱出: d/z、子への操作: c・Esc/i/h/k) が出て各操作が効く。Esc = 起こして戻る、それ以外のキーは無反応
