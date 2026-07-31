@@ -1,6 +1,6 @@
 # DR-0033: `leader.request` — rw client による leader 奪取 (takeover)
 
-- Status: Draft (kawaz レビュー後 Active 化)
+- Status: Active (kawaz 承認 2026-07-31、LR-Q1=a / LR-Q2=a / LR-Q3=b)
 - Date: 2026-07-30
 - Related: DR-0008 (protocol、§2.2 で `leader.request` を v0.2.0+ 予約)、DR-0027 (web gateway、WS 制御チャネル)、DR-0019 §6 (SIGWINCH → Resize 配線)、DR-0025 (daemon reducer 化)、docs/issue/2026-07-30-request-web-floating-info-panel.md (Phase 2 の動機)
 
@@ -52,9 +52,13 @@ payload field は無し (= 「自分を leader にせよ」以外の情報が要
 
 daemon の処理:
 
-1. **mode 検査**: 要求者が `Mode::Rw` でなければ `error` (code = `mode.not-allowed`) を
-   返して終了。`ro` は観察専用、`rw-no-leader` は「leader を取らない」を handshake で
-   自己宣言した mode なので、どちらも拒否 (= mode を変えたいなら re-attach が筋)
+1. **mode 検査**: 要求者が `Mode::Ro` なら `error` (code = `mode.not-allowed`) を返して
+   終了 (= 観察専用)。**`Mode::Rw` と `Mode::RwNoLeader` はどちらも要求可** (kawaz 裁定
+   2026-07-31 LR-Q3=b)。`rw-no-leader` からの要求は「この接続で leader 意思を表明した」
+   とみなし、mode を `rw` に遷移させた上で leader を付与する。
+   Rationale (kawaz 実体験より): 人間が今触っているデバイス (例: iPad の後発接続) から
+   主導権を奪えないのは大問題で、「mode は handshake で確定」という形式的一貫性を
+   利用場面より優先してはならない。re-attach 要求は障害でしかない
 2. **既に自分が leader**: no-op 成功。要求者 **にのみ** `leader.notify`
    (`client_id = 自分`) を返す。broadcast はしない (= 状態変化が無いのに全 client へ
    通知を流さない。`leader.notify` は冪等なので要求者側の追従処理は既存のまま動く)
@@ -193,15 +197,16 @@ request/ack ペア (`set-v1` / `upgrade-v1` の流儀) も検討したが、成�
 
 - **LR-Q1: CLI 表面をどうするか**。protocol が入れば `hyoui leader request [session]`
   等の subcommand は後付け可能 (DR-0007 の v0.3.0 「leader CLI」枠)。本 DR の実装
+  (裁定済み 2026-07-31 = a: protocol + web 先行、CLI は後続 issue)
   scope を「protocol + web gateway 配線」に限定し CLI は後続 issue とするか、同時に
   出すか。同時に出す場合の命名 (`hyoui leader request` / `hyoui attach --take-leader` /
   その他) も未裁定
-- **LR-Q2: 既 leader no-op の応答形**。§1 は「要求者にのみ `leader.notify`」としたが、
+- LR-Q2 (裁定済み 2026-07-31 = a: 要求者にのみ notify)。§1 は「要求者にのみ `leader.notify`」としたが、
   「何も返さない (完全 no-op)」「broadcast する (冪等なので害は少ない)」の選択肢もある。
   同期確認可能性 (要求者が完了を検知できる) を優先して個別 notify を推奨
-- **LR-Q3: `rw-no-leader` からの要求の扱い**。§1 は拒否 (mode.not-allowed) としたが、
-  「leader.request を送った時点で leader 意思あり = rw に昇格して leader 付与」という
-  解釈もありうる。mode は handshake で確定する現行意味論を守る方 (= 拒否) を推奨
+- ~~LR-Q3~~ 裁定済み (2026-07-31 = b): `rw-no-leader` も要求可、要求時点で rw へ遷移して
+  leader 付与 (§1 に反映済み)。mode 遷移が入るため、mode を参照する箇所 (status 表示 /
+  DR-0029 §5 の resume 判定等) は「遷移後は rw として扱う」ことを実装で確認する
 
 ## 関連
 
