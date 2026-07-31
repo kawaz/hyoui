@@ -33,6 +33,8 @@ terminal 領域への touch tap を focus toggle として扱う。
 - FAB の入力タブにある textarea には影響させない
 - FAB panel 表示中の terminal tap / click は panel close を優先し、同じ touch で focus toggle しない
 - FAB panel の表示専用 `Terminal` ヘッダ行を削除し、× と drag 操作をタブ行へ統合する
+- touch で FAB panel を開く時は terminal を blur し、入力 textarea を自動 focus しない
+- 入力 textarea focus 中の terminal touch は panel を閉じ、terminal に focus を移さない
 
 ## 実装
 
@@ -48,6 +50,11 @@ panel 表示中の短い touch tap は `closePanel()` を実行して focus togg
 mouse click も `#term` の click listener から同じ close 経路を使う。panel の表示専用ヘッダは削除し、
 タブと × を 1 行に統合する。panel drag handle もタブ行へ移す。
 
+FAB の pointer type を open / close 処理へ渡す。touch open は terminal を blur した後、入力 textarea の
+auto-focus を行わない。panel 表示中の terminal touch は default を抑止し、panel 内の active element と
+terminal の両方を blur する。mouse open は入力 textarea auto-focus、mouse terminal click close は
+terminal focus restore を維持する。
+
 ## 検証
 
 - Chromium touch emulation: 未 focus → touch tap で focus、再 tap で blur
@@ -56,4 +63,8 @@ mouse click も `#term` の click listener から同じ close 経路を使う。
 - Chromium touch / mouse: panel 表示中の terminal tap / click で panel が閉じる
 - × button とタブ行 drag はヘッダ削除後も機能する
 - panel 内に `.input-panel-head` / 表示専用 `Terminal` 行がなく、タブ行が先頭になる
+- Chromium touch: terminal focus 中の FAB open 後は terminal / input textarea とも未 focus
+- Chromium touch: input textarea focus 中の terminal tap 後は panel が閉じ、active element は body
+- 上記 close 後の次の terminal touch tap で通常どおり focus する
+- Chromium mouse: FAB open は input textarea focus、terminal click close は terminal focus
 - iOS / iPadOS 実機: 未検証。ソフトウェアキーボードの表示・格納は kawaz 実機確認待ち

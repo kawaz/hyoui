@@ -417,10 +417,12 @@
     if (touch) updateTerminalTouchDistance(touch);
     terminalTouch = null;
     if (!touch || state.maxDistance > TOUCH_TAP_MOVE_PX) return;
-    // panel 表示中は「terminal を選んで panel を閉じる」をこの tap の唯一の意味にする。
-    // closePanel が terminal focus を戻すため、focus toggle は走らせない。
+    // panel 表示中は panel close をこの tap の唯一の意味にする。入力欄が消えた後に
+    // terminal へ暗黙 focus せず、software keyboard が一度閉じる状態を保証する。
     if (state.panelWasOpen) {
-      closePanel();
+      event.preventDefault();
+      closePanel({ restoreTerminalFocus: false });
+      setTimeout(() => term.blur(), 0);
       return;
     }
     // focus 済み tap は後続 synthetic click が xterm を再 focus するため、この case
@@ -433,7 +435,7 @@
   }, { passive: false });
   termEl.addEventListener('touchcancel', () => { terminalTouch = null; }, { passive: true });
   termEl.addEventListener('click', () => {
-    if (!inputPanel.hidden) closePanel();
+    if (!inputPanel.hidden) closePanel({ restoreTerminalFocus: true });
   });
 
   const statusEl = document.getElementById('status');
@@ -1159,6 +1161,7 @@
         offsetY: ev.clientY - r.top,
         moved: false,
         pointerId: ev.pointerId,
+        pointerType: ev.pointerType || 'mouse',
       };
       try { target.setPointerCapture(ev.pointerId); } catch (_e) {}
     });
@@ -1180,7 +1183,7 @@
       mover.classList.remove('dragging');
       try { target.releasePointerCapture(state.pointerId); } catch (_e) {}
       if (moved) suppressClick = true;
-      else if (opts?.onTap) opts.onTap();
+      else if (opts?.onTap) opts.onTap(state.pointerType);
       state = null;
     });
     target.addEventListener('pointercancel', (ev) => {
@@ -1198,11 +1201,11 @@
         return;
       }
       // keyboard 経由の click (detail=0) は FAB の場合のみ toggle 扱い (accessibility)
-      if (ev.detail === 0 && opts?.onTap) opts.onTap();
+      if (ev.detail === 0 && opts?.onTap) opts.onTap('keyboard');
     });
   }
 
-  function selectPanelTab(tab) {
+  function selectPanelTab(tab, { autoFocusInput = true } = {}) {
     const showInfo = tab === 'info';
     inputTab.classList.toggle('active', !showInfo);
     infoTab.classList.toggle('active', showInfo);
@@ -1212,45 +1215,49 @@
     infoTabPanel.hidden = !showInfo;
     requestAnimationFrame(() => {
       if (floatPos) applyEdgePos(inputPanel, floatPos);
-      if (!showInfo) inputText.focus();
+      if (!showInfo && autoFocusInput) inputText.focus();
     });
   }
-  inputTab.addEventListener('click', () => selectPanelTab('input'));
+  inputTab.addEventListener('click', (event) => {
+    selectPanelTab('input', { autoFocusInput: event.pointerType !== 'touch' });
+  });
   infoTab.addEventListener('click', () => selectPanelTab('info'));
 
-  function openPanel() {
+  function openPanel({ autoFocusInput = true } = {}) {
     // FAB と Panel は「同一浮遊物の折りたたみ/展開」なので、位置引き継ぎは
     // 左上座標でなく edge-relative pos (floatPos) を共有する。左上座標で
     // 引き継ぐと、幅の違う要素間でアンカー辺の判定 (中心点) が反転し、
     // 「右端で開いて閉じたら左端に飛ぶ」バグになる (kawaz 実機 2026-07-23)。
     const pos = floatPos || rectToEdgePos(inputFab.getBoundingClientRect());
+    if (document.activeElement === term.textarea) term.blur();
     inputFab.hidden = true;
     inputPanel.hidden = false;
     applyEdgePos(inputPanel, pos);
     savePos(pos);
     requestAnimationFrame(() => {
-      if (inputTabPanel.hidden) return;
+      if (inputTabPanel.hidden || !autoFocusInput) return;
       inputText.focus();
       const l = inputText.value.length;
       try { inputText.setSelectionRange(l, l); } catch (_e) {}
     });
   }
-  function closePanel() {
+  function closePanel({ restoreTerminalFocus = true } = {}) {
     // openPanel と対称: edge-relative pos を共有して FAB に適用する
     // (Panel を drag した場合は drag handler が floatPos を更新済み)。
     const pos = floatPos || rectToEdgePos(inputPanel.getBoundingClientRect());
+    const active = document.activeElement;
+    if (active && inputPanel.contains(active) && typeof active.blur === 'function') active.blur();
     inputPanel.hidden = true;
     inputFab.hidden = false;
     applyEdgePos(inputFab, pos);
     savePos(pos);
-    try {
-      const helper = document.querySelector('.xterm-helper-textarea');
-      if (helper) helper.focus();
-    } catch (_e) {}
+    if (restoreTerminalFocus) term.focus();
+    else term.blur();
   }
-  function togglePanel() {
-    if (inputPanel.hidden) openPanel();
-    else closePanel();
+  function togglePanel(pointerType = 'mouse') {
+    const isTouch = pointerType === 'touch';
+    if (inputPanel.hidden) openPanel({ autoFocusInput: !isTouch });
+    else closePanel({ restoreTerminalFocus: !isTouch });
   }
 
   // FAB: 全体で drag、tap で open。
@@ -1263,7 +1270,9 @@
     ignoreTarget: (t) => t.closest('.input-panel-close'),
   });
 
-  inputPanelClose.addEventListener('click', closePanel);
+  inputPanelClose.addEventListener('click', (event) => {
+    closePanel({ restoreTerminalFocus: event.pointerType !== 'touch' });
+  });
   // Esc で閉じても textarea 内容は残す (誤クローズ時の入力保護)。
   // ただしパネル外クリックでの誤クローズはさせない (kawaz 明示)。
   inputPanel.addEventListener('keydown', (ev) => {
