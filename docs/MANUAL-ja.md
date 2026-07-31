@@ -8,8 +8,8 @@
 - **内部設計・なぜそうなっているか** → [`DESIGN-ja.md`](./DESIGN-ja.md)
 - **このファイル**: 「○○ をやりたい」→ 「このコマンド列で実現」のレシピ
 
-> Status: v0.2.x をカバー。自動操作 API (`input` family / `wait` / `screen` /
-> `lock` / `record` / `tail`) は実装済。`serve` HTTP gateway と `tx` wrapper は未実装。
+> Status: v0.9.x をカバー。自動操作 API (`input` family / `wait` / `screen` /
+> `lock` / `record` / `tail`) と web gateway は実装済。`tx` wrapper は未実装。
 
 ## 目次
 
@@ -25,6 +25,7 @@
   - [8. tty I/O timeline を録画する (`record`)](#8-tty-io-timeline-を録画する-record)
   - [9. session を namespace でグループ分けする](#9-session-を-namespace-でグループ分けする)
   - [10. 子プロセスへの env 漏洩を防ぐ (env scrub)](#10-子プロセスへの-env-漏洩を防ぐ-env-scrub)
+  - [11. ブラウザから操作する (web)](#11-ブラウザから操作する-web)
 - [トラブルシューティング](#トラブルシューティング)
 - [関連リンク](#関連リンク)
 
@@ -368,6 +369,18 @@ hyoui config show   # 実効設定を TOML で表示 (= 未設定項目も defau
 `config show` は全 key を実効値で出すので、「何を書いたか」ではなく
 「今どう動いているか」が分かる。builtin の scrub default は config の key では
 ないので TOML コメントとして併記される。
+
+### 11. ブラウザから操作する (`web`)
+
+```sh
+hyoui web --listen=127.0.0.1:43690
+# ブラウザで http://127.0.0.1:43690/ を開く
+```
+
+セッション画面のキーボード FAB を開いて「情報」タブへ切り替えると、attach の mode / leader
+を確認できる。leader が別 browser にある場合は「leader になる」を押すと接続を切らずに
+主導権を移し、新しい browser の viewport に PTY サイズを合わせる。失敗理由は同じ Attach
+欄に表示される。
 
 ## トラブルシューティング
 

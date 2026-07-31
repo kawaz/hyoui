@@ -76,6 +76,13 @@ leader / mode の変化時に次の text frame を browser へ送る。daemon pr
 {"kind":"attach.info","mode":"rw","leader":true}
 ```
 
+leader でない browser は情報タブの「leader になる」から takeover を要求できる。WS 制御
+JSON は `{"kind":"leader.request","requestId":N}`、応答は
+`{"kind":"leader.result","requestId":N,"ok":true}` (失敗時は `error` 付き)。gateway は
+`leader-request-v1` を確認して daemon の `leader.request` を送り、成功後は browser の現在
+viewport に対する grid 提案で resize する。`leader.notify` による `attach.info` 再送で、新
+leader は `yes`、旧 leader は `no` に更新される ([[DR-0033]])。
+
 表示設定の出自は `URL 指定` / `default` / `embed 中に変更` の 3 区分とする。情報タブ上で
 unicode / ambw / fontsize / lineheight / scrollback / fontfamily / bg / fg を変更でき、変更した項目は
 第三の出自へ切り替える。font / lineheight は xterm.js option 更新後に既存 fit/resize 経路を通し、

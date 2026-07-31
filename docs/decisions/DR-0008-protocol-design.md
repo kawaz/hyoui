@@ -126,6 +126,7 @@ size = 1 (type byte) + body_len
 | `lock.acquire` | client → daemon | lock 取得要求 |
 | `lock.response` | daemon → client | lock 取得結果 |
 | `lock.release` | client → daemon | lock 解放 |
+| `leader.request` | client → daemon | 要求元 client への leader 奪取要求 (cap `leader-request-v1`、[[DR-0033]]) |
 | `leader.notify` | daemon → all clients | leader 変更通知 (broadcast) |
 | `mode.change` | daemon → all clients | rw/ro/locked 状態変化 (broadcast) |
 | `status.query` | client → daemon | session 状態問い合わせ |
@@ -140,7 +141,6 @@ size = 1 (type byte) + body_len
 
 v0.2.0+ 予約:
 - `snapshot.request` / `snapshot.response` (画面 dump)
-- `leader.request` (leader CLI 解放。実体化の設計は [[DR-0033]])
 - `record.start` / `record.stop` / `play.start` (record/play)
 - `sink.attach` / `sink.detach` (永続出力先)
 
@@ -218,6 +218,17 @@ error code は dotted text string で人間可読性優先 (= 数値 enum より
 ```
 
 leader 以外が送ると daemon は `error` で kind=`"mode.not-leader"` を返す。
+
+**`leader.request`**:
+```cbor
+{
+  "kind": "leader.request"
+}
+```
+
+要求元自身を leader にするため payload は無い。`Ro` は `mode.not-allowed`、`Rw` は
+旧 leader を接続したまま降格して奪取、`RwNoLeader` は `Rw` へ遷移してから奪取する。
+成功通知は既存 `leader.notify` を使う。cap は `leader-request-v1` ([[DR-0033]])。
 
 **`signal`**:
 ```cbor

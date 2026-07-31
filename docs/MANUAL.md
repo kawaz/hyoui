@@ -9,9 +9,9 @@ CLI).
 - **Internal design / why it's built this way** → [`DESIGN.md`](./DESIGN.md)
 - **This file**: "I want to do X" → "use this command sequence."
 
-> Status: covers v0.2.x. The automation API (`input` family / `wait` / `screen` /
-> `lock` / `record` / `tail`) is implemented. The `serve` HTTP gateway and `tx`
-> wrapper are not yet shipped.
+> Status: covers v0.9.x. The automation API (`input` family / `wait` / `screen` /
+> `lock` / `record` / `tail`) and the web gateway are implemented. The `tx`
+> wrapper is not yet shipped.
 
 ## Table of contents
 
@@ -27,6 +27,7 @@ CLI).
   - [8. Record the tty I/O timeline (`record`)](#8-record-the-tty-io-timeline-record)
   - [9. Group sessions with namespaces](#9-group-sessions-with-namespaces)
   - [10. Stop leaking parent env into the child (env scrub)](#10-stop-leaking-parent-env-into-the-child-env-scrub)
+  - [11. Operate from a browser (`web`)](#11-operate-from-a-browser-web)
 - [Troubleshooting](#troubleshooting)
 - [See also](#see-also)
 
@@ -384,6 +385,18 @@ hyoui config show   # print the effective configuration as TOML, defaults includ
 `config show` prints every key with its effective value, so it answers "how is
 hyoui behaving right now" rather than "what did I write". Builtin scrub
 defaults are appended as TOML comments (= they are not config keys).
+
+### 11. Operate from a browser (`web`)
+
+```sh
+hyoui web --listen=127.0.0.1:43690
+# Open http://127.0.0.1:43690/ in a browser.
+```
+
+Open the keyboard FAB on a session page and select the Information tab to see the
+attach mode and leader state. If another browser is leader, click “Become leader”
+to move control without disconnecting either client; the PTY is resized to the new
+browser's viewport. Failures are shown in the same Attach section.
 
 ## Troubleshooting
 

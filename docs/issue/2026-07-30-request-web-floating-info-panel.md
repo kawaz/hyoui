@@ -3,7 +3,7 @@ title: web ターミナルに attach/embed/session 情報のフローティン�
 status: wip
 category: request
 created: 2026-07-30T15:10:00+09:00
-last_read: 2026-07-30T20:43:42+09:00
+last_read: 2026-08-01T00:14:42+09:00
 open_entered: 2026-07-30T15:10:00+09:00
 wip_entered: 2026-07-30T15:40:39+09:00
 blocked_entered:
@@ -52,7 +52,7 @@ embed されたターミナル内に、以下を表示するフローティン�
 
 ## 実装状況
 
-Phase 1 (表示) + Phase 2a (表示設定変更) を実装済み。Phase 2b (leader 昇格) は未実装。
+Phase 1 (表示) + Phase 2a (表示設定変更) + Phase 2b (leader 昇格) を実装済み。
 
 - 既存キーボード FAB のフローティングを「入力」「情報」の 2 タブ化。入力機能は維持
 - gateway 内部の WS text frame `attach.info` で daemon handshake の mode / leader を表示し、
@@ -66,5 +66,8 @@ Phase 1 (表示) + Phase 2a (表示設定変更) を実装済み。Phase 2b (lea
   unicode / ambw は provider 再選択 + screen dump 再描画で反映。変更した項目の出自表示は
   「embed 中に変更」になる。URL / storage へは永続化せず、reload すると URL 指定 or
   default にリセットされる
-- **Phase 2b (leader 昇格、未実装、別 scope)**: `leader.request` (DR-0008 §2.2 で
-  v0.2.0+ 予約) の daemon protocol 実装が前提
+- **Phase 2b (leader 昇格、実装済み)**: 情報タブは leader でない接続にだけ
+  「leader になる」ボタンを表示する。WS `leader.request` / `leader.result` で gateway を
+  経由して daemon の `leader.request` (cap `leader-request-v1`) を呼び、成功時は
+  `attach.info` で新旧 browser の leader 表示を更新する。takeover 直後は後発 browser の
+  viewport に対する grid 提案へ PTY と xterm.js を揃える ([[DR-0033]])
