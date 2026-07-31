@@ -20,22 +20,7 @@
 
 ## 裁定待ち
 
-### 👺LR-Q1: DR-0033 (leader.request) — 実装 scope
-
-- [ ] a: protocol + web 配線のみ先行、CLI (`hyoui leader request` 等) は後続 — 推し (動機が web パネルで、CLI 表面は棚卸し直後に増やさない)
-- [ ] b: CLI も同時に
-
-### 👺LR-Q2: 既に自分が leader の時の応答
-
-- [ ] a: 要求者にのみ leader.notify を返す (同期確認できる) — 推し
-- [ ] b: 完全無応答 / broadcast
-
-### 👺LR-Q3: rw-no-leader からの leader.request
-
-- [ ] a: 拒否 (mode は handshake で確定、の現行意味論を維持) — 推し
-- [ ] b: 要求時点で昇格を許す
-
-DR 本体: [DR-0033](decisions/DR-0033-leader-request-takeover.md) (Draft)。承認と同時に a/a/a なら追加裁定不要で実装へ。
+(現在なし)
 
 ## 確認待ち
 
@@ -48,9 +33,9 @@ m41-43 の裁定 (閉じる廃止 / Esc=resume / UX 視点の 2 群) は v0.9.32
 
 ### 👺IP2-C1: 情報パネル Phase 2a + touch UX (v0.9.33) の確認
 
-- [ ] a: 情報タブから表示設定 (fontsize/ambw 等) をその場で変更でき、バッジが「embed 中に変更」になり、reload で元に戻る
-- [ ] b: **iOS/iPad 実機**: ターミナル再タップでソフトウェアキーボードがしまえる (フローティングキーボード含む)
-- [ ] c: フロート表示中にターミナルタップでフロートが閉じる / 「Terminal」ヘッダが消えてコンパクトになった
+- [x] a: 情報タブから表示設定 (fontsize/ambw 等) をその場で変更でき、バッジが「embed 中に変更」になり、reload で元に戻る
+- [x] b: **iOS/iPad 実機**: ターミナル再タップでソフトウェアキーボードがしまえる (フローティングキーボード含む)
+- [x] c: フロート表示中にターミナルタップでフロートが閉じる / 「Terminal」ヘッダが消えてコンパクトになった
 
 b の実機キーボード格納だけ emulation 不可のため kawaz 確認が必須 (他は AI 実測済み)。
 
