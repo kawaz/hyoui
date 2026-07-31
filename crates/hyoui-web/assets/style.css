@@ -573,3 +573,13 @@ td.argv, td.cwd {
   color: #999;
   font-size: 0.72rem;
 }
+.info-action {
+  margin-top: 0.4rem;
+}
+.info-action button {
+  width: 100%;
+}
+.info-action .info-note {
+  min-height: 1em;
+  overflow-wrap: anywhere;
+}

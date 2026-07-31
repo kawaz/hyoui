@@ -461,6 +461,9 @@
   const infoDisplaySettings = document.getElementById('infoDisplaySettings');
   const infoAttachMode = document.getElementById('infoAttachMode');
   const infoAttachLeader = document.getElementById('infoAttachLeader');
+  const infoLeaderAction = document.getElementById('infoLeaderAction');
+  const requestLeaderBtn = document.getElementById('requestLeaderBtn');
+  const requestLeaderStatus = document.getElementById('requestLeaderStatus');
   const infoSessionId = document.getElementById('infoSessionId');
   const infoChildPid = document.getElementById('infoChildPid');
   const infoChildState = document.getElementById('infoChildState');
@@ -1334,6 +1337,9 @@
   const wsResizePending = new Map();
   let nextWsResizeId = 1;
   const WS_RESIZE_TIMEOUT_MS = 5000;
+  const wsLeaderPending = new Map();
+  let nextWsLeaderId = 1;
+  const WS_LEADER_TIMEOUT_MS = 5000;
 
   // 接続状態バッジ (existing status 領域の右側に別 element を新設)。
   const wsStatusEl = document.createElement('span');
@@ -1351,6 +1357,10 @@
   function updateAttachInfo(message) {
     infoAttachMode.textContent = message.mode || 'unknown';
     infoAttachLeader.textContent = message.leader ? 'yes' : 'no';
+    // leader でない接続だけに takeover 操作を見せる。成功時は gateway が先に
+    // attach.info を再 push するため、この更新だけでボタンが消える。
+    infoLeaderAction.hidden = !!message.leader;
+    if (message.leader) requestLeaderStatus.textContent = '';
   }
 
   function wsIsOpen() { return ws && ws.readyState === WebSocket.OPEN; }
@@ -1381,6 +1391,65 @@
     for (const pending of wsResizePending.values()) pending.reject(new Error(reason));
     wsResizePending.clear();
   }
+
+  async function sendLeaderRequestOverWs() {
+    if (!wsIsOpen()) throw new Error('WS is not connected');
+    // leader.request 自体は payload を持たない。gateway が takeover 直後に browser の
+    // viewport に合う grid で resize できるよう、既存 resize 制御で FitAddon の現在提案値を
+    // 先に渡す。non-leader なので通常は reject されるが、gateway は提案値を保持する。
+    let cols = term.cols;
+    let rows = term.rows;
+    if (fitAddon) {
+      try {
+        const proposed = fitAddon.proposeDimensions();
+        if (proposed && Number.isFinite(proposed.cols) && Number.isFinite(proposed.rows)) {
+          cols = Math.max(MIN_RESIZE_COLS, Math.floor(proposed.cols));
+          rows = Math.max(MIN_RESIZE_ROWS, Math.floor(proposed.rows));
+        }
+      } catch (_e) { /* current grid fallback */ }
+    }
+    try { await sendResizeOverWs(cols, rows); } catch (_e) { /* expected before takeover */ }
+
+    const requestId = nextWsLeaderId++;
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        wsLeaderPending.delete(requestId);
+        reject(new Error('WS leader response timed out'));
+      }, WS_LEADER_TIMEOUT_MS);
+      wsLeaderPending.set(requestId, {
+        resolve: () => { clearTimeout(timeout); resolve(); },
+        reject: (error) => { clearTimeout(timeout); reject(error); },
+      });
+      try {
+        ws.send(JSON.stringify({ kind: 'leader.request', requestId }));
+      } catch (e) {
+        wsLeaderPending.delete(requestId);
+        clearTimeout(timeout);
+        reject(e);
+      }
+    });
+    return { cols, rows };
+  }
+
+  function rejectPendingWsLeaders(reason) {
+    for (const pending of wsLeaderPending.values()) pending.reject(new Error(reason));
+    wsLeaderPending.clear();
+  }
+
+  requestLeaderBtn.addEventListener('click', async () => {
+    requestLeaderBtn.disabled = true;
+    requestLeaderStatus.textContent = 'leader を要求中…';
+    try {
+      const grid = await sendLeaderRequestOverWs();
+      term.resize(grid.cols, grid.rows);
+      if (sizeEl) sizeEl.textContent = `${grid.cols}x${grid.rows}`;
+      requestLeaderStatus.textContent = '';
+    } catch (e) {
+      requestLeaderStatus.textContent = 'leader 取得失敗: ' + e.message;
+    } finally {
+      requestLeaderBtn.disabled = false;
+    }
+  });
 
   function flushPendingToWs() {
     if (!wsIsOpen() || wsPendingInput.length === 0) return;
@@ -1508,12 +1577,21 @@
             updateAttachInfo(message);
             return;
           }
-          if (message.kind !== 'resize.result') return;
-          const pending = wsResizePending.get(message.requestId);
-          if (!pending) return;
-          wsResizePending.delete(message.requestId);
-          if (message.ok) pending.resolve();
-          else pending.reject(new Error(message.error || 'resize rejected'));
+          if (message.kind === 'resize.result') {
+            const pending = wsResizePending.get(message.requestId);
+            if (!pending) return;
+            wsResizePending.delete(message.requestId);
+            if (message.ok) pending.resolve();
+            else pending.reject(new Error(message.error || 'resize rejected'));
+            return;
+          }
+          if (message.kind === 'leader.result') {
+            const pending = wsLeaderPending.get(message.requestId);
+            if (!pending) return;
+            wsLeaderPending.delete(message.requestId);
+            if (message.ok) pending.resolve();
+            else pending.reject(new Error(message.error || 'leader request rejected'));
+          }
         } catch (e) {
           if (window.__hyouiDebug) window.__hyouiDebug('warn', 'invalid WS control response: ' + e.message);
         }
@@ -1523,8 +1601,11 @@
       setWsStatus('disconnected (code=' + ev.code + ')');
       infoAttachMode.textContent = 'disconnected';
       infoAttachLeader.textContent = '—';
+      infoLeaderAction.hidden = true;
+      requestLeaderStatus.textContent = '';
       ws = null;
       rejectPendingWsResizes('WS disconnected before resize completed');
+      rejectPendingWsLeaders('WS disconnected before leader request completed');
       // WS 切断後は fallback ポーリング + auto refresh 再有効化。
       autoEl.disabled = false;
       autoEl.title = '';
