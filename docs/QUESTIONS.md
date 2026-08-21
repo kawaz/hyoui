@@ -45,3 +45,13 @@ m41-43 の裁定 (閉じる廃止 / Esc=resume / UX 視点の 2 群) は v0.9.32
 `hyoui web service register` (v0.9.29、DR-0031) で brew バイナリを launchd 登録済み。
 KeepAlive の kill→復帰と API 200 は AI 実機確認済み、RunAtLoad の実再起動だけが未検証。
 
+
+## 裁定待ち (追記)
+
+### 👺LR2-Q1: leader CLI の表面設計 (LR-Q1=a の後続、DR-0033)
+
+意味論: leader は「接続」に付く属性 (切断で cascade 移動)。standalone な `hyoui leader request <session>` は「一瞬 leader を取って切断 → 即 cascade」となり意味を成さない。他 client への leader 付与は DR-0033 で導入しないと決定済み。よって CLI 表面は「自分の attach 接続を leader にする」入り口に限られる:
+
+- [ ] a: `hyoui attach --take-leader` — attach 開始時に leader.request を自動送信 (統括推し。web の「leader になる」ボタンと同型の意味論で最小)
+- [ ] b: attach 中の in-attach 操作として追加 (DR-0032 child action menu 等に項目追加。既存 attach を後から leader 化できるが、menu は「子 suspend 時」文脈なので置き場が歪む懸念)
+- [ ] c: 保留 — 現状 web の「leader になる」で用が足りており、CLI 側の実需が出るまで作らない
