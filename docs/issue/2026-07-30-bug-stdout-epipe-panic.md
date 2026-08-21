@@ -1,11 +1,11 @@
 ---
 title: "BUG: stdout の早期 close (| head 等) で Broken pipe panic する"
-status: open
+status: wip
 category: bug
 created: 2026-07-30T12:40:00+09:00
 last_read: 2026-08-21T10:30:31+09:00
 open_entered: 2026-07-30T12:40:00+09:00
-wip_entered:
+wip_entered: 2026-08-21T10:32:33+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
@@ -36,3 +36,8 @@ SIGPIPE で即死) が許容できるかは検討が要る。
 ## 対象
 
 list / status / screen dump / tail など stdout に吐く全 subcommand。
+
+## 対応方針 (2026-08-21)
+
+opus5-medium worker (lightbugs) に修正実装を委譲。CLI stdout 経路限定の EPIPE
+正常終了化とし、daemon 経路への SIGPIPE 全域適用は避ける方針。
