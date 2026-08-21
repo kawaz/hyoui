@@ -1,19 +1,19 @@
 ---
 title: web terminal の touch 再タップで focus を解除する
-status: wip
+status: blocked
 category: request
 created: 2026-07-30T21:32:08+09:00
 last_read: 2026-08-21T10:25:05+09:00
 open_entered: 2026-07-30T21:32:08+09:00
 wip_entered: 2026-07-30T21:32:08+09:00
-blocked_entered:
+blocked_entered: 2026-08-21T10:27:44+09:00
 pending_entered:
 discarded_entered:
 resolved_entered:
 discard_reason:
 pending_reason:
 close_reason:
-blocked_by:
+blocked_by: ["docs/QUESTIONS.md LT-C1 b/c"]
 origin: kawaz 要望 (2026-07-30 ccmsg r92 m45)
 ---
 
@@ -66,4 +66,6 @@ focus に戻す。panel の表示専用ヘッダは削除し、タブと × を 
 - Chromium touch: terminal focus 中の FAB open 後は terminal / input textarea とも未 focus
 - 上記 close 後の panel closed 状態での次の terminal touch tap は通常どおり focus toggle を維持する
   (pending flag が正しく解除されている)
-- iOS / iPadOS 実機: 未検証。ソフトウェアキーボードの表示・格納は kawaz 実機確認待ち
+- iOS / iPadOS 実機: IP2-C1 (再タップ blur / panel close) は kawaz 確認済み。残りは
+  `docs/QUESTIONS.md` LT-C1 b/c (パネル開閉フォーカス調整 / open 中タップ常に close) の実機確認待ち。
+  LT-C1 全チェックで close 可

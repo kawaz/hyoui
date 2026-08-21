@@ -4,7 +4,6 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
-| 2026-07-30 | request | wip | [web-terminal-touch-focus-toggle](./2026-07-30-request-web-terminal-touch-focus-toggle.md) | touch terminal の tap を focus toggle にする。panel open 中は touch/mouse・入力 focus 有無を問わず close-only、terminal focus は panel closed 中の操作のみ。表示専用 Terminal ヘッダを削除し、× と drag をタブ行へ統合。Chromium touch emulation 済み、iOS/iPadOS 実機確認待ち |
 | 2026-07-30 | design | open | [child-suspend-action-menu](./2026-07-30-design-child-suspend-action-menu.md) | 子 suspend 時動作の enum 統合 (auto_resume 2 bool の置換) + resume_stopped_child=false 時の attach 内操作メニュー (kawaz 骨子裁定済み、DR 起草待ち) |
 | 2026-07-30 | bug | open | [zero-size-tty-daemon-panic](./2026-07-30-bug-zero-size-tty-daemon-panic.md) | winsize 未設定 (0x0) の PTY で `hyoui run` が vt100 grid の subtract overflow で panic し socket も作られない。初期サイズ経路に下限 clamp が無い疑い (DR-0032 実装の実機 probe 中に偶発発見) |
 | 2026-07-30 | bug | open | [stdout-epipe-panic](./2026-07-30-bug-stdout-epipe-panic.md) | `hyoui status \| head` 等で stdout が早期 close されると Broken pipe panic。EPIPE は正常終了に倒すべき (SIGPIPE 復元 vs BrokenPipe 握り分けの検討要) |
@@ -25,6 +24,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 | 2026-07-03 | bug | open | [bug-macos-ci-flaky-pty-tests](./2026-07-03-bug-macos-ci-flaky-pty-tests.md) | PTY 系 e2e の flaky (blocking failure の 57%) — 束ねた 2 test は別原因と判明。outer_token_* は WriterDead 起因で**修正済**、child_inherits_session_id_env は attach redraw が attach 前の子出力を落とす別問題で**未解決** |
 | 2026-07-03 | bug | open | [bug-main-unittest-hang-ubuntu-ci](./2026-07-03-bug-main-unittest-hang-ubuntu-ci.md) | hyoui-cli main.rs unit tests が ubuntu CI で hang (send_raw_bytes_partial_byte_race_regression / list_marks_stale_socket、flaky) |
 | 2026-07-30 | request | blocked | [web-floating-info-panel](./2026-07-30-request-web-floating-info-panel.md) | Phase 1 + Phase 2a + Phase 2b + Phase 3 実装済み: IP2-C1 (Phase 1+2a UI) は kawaz 実機確認済み。残りは QUESTIONS.md LT-C1 a (Phase 2b leader 奪取) / d (Phase 3 テキスト選択) の実機確認のみ |
+| 2026-07-30 | request | blocked | [web-terminal-touch-focus-toggle](./2026-07-30-request-web-terminal-touch-focus-toggle.md) | 実装済み: IP2-C1 (再タップ blur / panel close) は kawaz 実機確認済み。残りは QUESTIONS.md LT-C1 b/c (パネル開閉フォーカス調整 / open 中タップ常に close) の実機確認のみ |
 | 2026-06-22 | bug | blocked | [backpressure-writer-pump-drop-sequence-deadlock](./2026-06-22-backpressure-writer-pump-drop-sequence-deadlock.md) | serve_backpressure_disconnects_slow_client が CI で 30s deadline hang する (真因未観測・調査継続、ubuntu CI では 12/12 で恒常失敗 = [[2026-07-26-bug-ignored-tests-job-permanently-red]]) |
 | 2026-06-22 | bug | blocked | [wait-scrollback-snapshot-coverage](./2026-06-22-wait-scrollback-snapshot-coverage.md) | hyoui wait の StateSnapshotRequest が scrollback を含まず viewport 外の出力を見逃す (DR-0013 Phase B 未完) |
 | 2026-05-28 | design | idea | [feature-cli-restructure-discussion](./2026-05-28-feature-cli-restructure-discussion.md) | CLI 設計大改修議論 (screen view 改名 / dump top-level 化 / screen write overlay / format 整理) |
