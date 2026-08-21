@@ -1074,23 +1074,15 @@ impl ClientConnection {
         stdout: &mut W,
     ) -> Result<RunOutcome, Error> {
         let mut ctrlz = CtrlzGuard::default();
-        // DR-0032 §2 発動条件 3 (前半): attach 成立時の handshake snapshot が stopped
-        // だった場合。`show_child_action_menu` なら raw mode に入った直後の今ここで
-        // menu を出す (= resume する設定では CLI 層が既に resume 要求を送っている)。
         let mut focus = InputFocus::Child;
-        if self.response.child_stopped
+        // DR-0013 §4 Phase A: handshake response の直後に届く最初の RAW_DATA は
+        // attach 復元用 redraw であって、子が resume して生んだ出力ではない。
+        // handshake snapshot が stopped なら、この redraw を描画してから menu を重ねる。
+        // socket と stdin が同時に ready なら socket を先に処理する run loop の順序により、
+        // 同じ iteration の入力も描画済み menu の focus で解釈される。
+        let mut initial_redraw_then_menu = self.response.child_stopped
             && stopped_child_action(self.response.mode, self.on_child_suspend)
-                == StoppedChildAction::Menu
-        {
-            let rows = outer_tty_rows(stdin.as_fd());
-            if self.draw_child_action_menu(stdout, rows) {
-                focus = InputFocus::ChildMenu;
-            } else {
-                // 描画前提を満たさない (= 非 tty / サイズ不明)。menu は出さず、停止中で
-                // あることだけ伝えて forward を続ける (= 入力を飲む状態に入らない)。
-                self.draw_child_stopped_notice(stdout, rows);
-            }
-        }
+                == StoppedChildAction::Menu;
         // DR-0019 §5: SendEof で stdin EOF 観測後、stdin はもう読まない (= EOT 送出
         // 済) が、子の出力 (= bc の計算結果) と SessionExitNotify を拾い切るため
         // loop は継続する。
@@ -1252,6 +1244,19 @@ impl ClientConnection {
                                 return Ok(RunOutcome::StdoutWriteFailed);
                             }
                             let _ = stdout.flush();
+
+                            if initial_redraw_then_menu {
+                                initial_redraw_then_menu = false;
+                                let rows = outer_tty_rows(stdin.as_fd());
+                                if self.draw_child_action_menu(stdout, rows) {
+                                    ctrlz = CtrlzGuard::default();
+                                    focus = InputFocus::ChildMenu;
+                                } else {
+                                    // 描画前提を満たさない (= 非 tty / サイズ不明)。menu は
+                                    // 発動せず、停止中であることだけ伝えて forward を続ける。
+                                    self.draw_child_stopped_notice(stdout, rows);
+                                }
+                            }
                         }
                         TYPE_CBOR_CONTROL => {
                             // DR-0015: daemon → client 方向の control message を
@@ -2662,6 +2667,101 @@ mod tests {
         // 実測由来の regression: `MENU-SWALLOWED` の `D` で detach が起動した。
         assert_eq!(menu_action_for_input(b"MENU-SWALLOWED\r"), None);
         assert_eq!(menu_action_for_input(b"kill"), None);
+    }
+
+    /// handshake snapshot で子が停止中なら、直後の最初の RAW_DATA は attach 復元用
+    /// redraw であって子が resume した証拠ではない。redraw の後に menu を描いて focus を
+    /// 保ち、続く `d` を子へ forward せず client detach として解釈する
+    /// (DR-0013 §4 Phase A / DR-0032 §2)。
+    #[test]
+    fn initial_attach_redraw_preserves_stopped_child_menu_focus() {
+        use crate::protocol::messages::SessionExitNotify;
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+
+        let (client_sock, mut daemon_sock) = UnixStream::pair().expect("socketpair");
+        let transport = UnixStreamTransport::new(client_sock);
+        let (reader, writer) = transport.split().expect("split");
+        let conn = ClientConnection {
+            reader,
+            writer,
+            response: HandshakeResponse {
+                caps: vec![],
+                session_id: "t".into(),
+                client_id: 1,
+                leader: true,
+                mode: Mode::Rw,
+                child_stopped: true,
+            },
+            eof_action: StdinEofAction::Detach,
+            outer_tty_raw: true,
+            outer_tty_guard: None,
+            winch_source: None,
+            pending_frames: std::collections::VecDeque::new(),
+            attach_config: crate::config::AttachConfig::default(),
+            on_child_suspend: crate::config::OnChildSuspendSetting::ShowChildActionMenu,
+            poisoned: false,
+        };
+
+        // run の stdin は tty サイズを返し、menu input を 1 byte 単位で届ける必要がある。
+        // PTY slave を raw にして stdin とし、master 側から `d` を入力する。
+        let pty = crate::sys::pty::Pty::open(80, 24).expect("open pty");
+        let raw_fd = nix::unistd::dup(pty.slave_fd().expect("slave fd")).expect("dup raw fd");
+        let _raw_guard = crate::sys::tty::enter_raw(raw_fd).expect("enter raw");
+        let stdin_fd = nix::unistd::dup(pty.slave_fd().expect("slave fd")).expect("dup stdin");
+        let mut stdin_file = std::fs::File::from(stdin_fd);
+        let mut input_writer = std::fs::File::from(pty.into_master());
+
+        // handshake response 後の最初の frame は、通常の子出力と同じ TYPE_RAW_DATA だが
+        // attach 復元用 redraw である。socket と stdin を同時に ready にしても run は
+        // socket を先に処理するため、問題の順序を sleep 無しで固定できる。
+        Frame::raw_data(b"INITIAL-REDRAW".to_vec())
+            .encode_to(&mut daemon_sock)
+            .expect("send initial redraw");
+        input_writer.write_all(b"d").expect("write menu input");
+
+        let run_handle = std::thread::spawn(move || {
+            let mut stdout = Vec::new();
+            let result = conn.run(&mut stdin_file, &mut stdout);
+            (result, stdout)
+        });
+
+        let received = Frame::decode_from(&mut daemon_sock).expect("decode client frame");
+        let detached = received.ty == TYPE_CBOR_CONTROL
+            && matches!(
+                ControlMessage::decode_from(received.body.as_slice()),
+                Ok(ControlMessage::Detach(_))
+            );
+        if !detached {
+            // `d` が raw_data として子へ forward された場合も test thread を残さない。
+            // exit notify で thread を正規に畳み、観測した frame を assertion に運ぶ。
+            let exit = ControlMessage::SessionExitNotify(SessionExitNotify {
+                exit_status: 0,
+                signal: None,
+            });
+            Frame::cbor_control(exit.encode_to_vec().expect("encode exit notify"))
+                .encode_to(&mut daemon_sock)
+                .expect("send exit notify");
+        }
+        let (result, stdout) = run_handle.join().expect("join run thread");
+
+        assert!(
+            detached,
+            "initial attach redraw 後も `d` は menu detach であるべき: frame={received:?}"
+        );
+        assert!(
+            matches!(result, Ok(RunOutcome::Detached)),
+            "menu detach は Detached を返すべき: {result:?}"
+        );
+        let output = String::from_utf8_lossy(&stdout);
+        let redraw_at = output
+            .find("INITIAL-REDRAW")
+            .expect("initial redraw output");
+        let menu_at = output.rfind("操作を選んでください").expect("menu output");
+        assert!(
+            redraw_at < menu_at,
+            "attach redraw の後に menu が見える必要がある: {output:?}"
+        );
     }
 
     /// 描画は DR-0029 §1 通知行の N 行拡張 (= DECSC/DECRC で囲み、下から N 行を上書き)。
