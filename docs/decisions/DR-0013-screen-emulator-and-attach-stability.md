@@ -149,6 +149,13 @@ visible state が pristine な場合も **payload が空の frame を 1 つ**送
   直前に mode を再評価する (= redraw 到着までに `ModeChange` が先行し得るため、
   handshake 時の判定を使い回さない)
 
+この (a)-(c) は「handshake 直後の最初の 1 frame」という**順序**に依存する。`TYPE_RAW_DATA`
+には redraw であることを示す marker が無いため、判別は protocol 上のヒューリスティックで
+あり、送出契約を満たさない相手と対話した場合は成立しない (= 子の出力が初回 frame として
+消費され、overlay の解除が 1 frame 分遅れる。次の raw_data で解除されるので self-heal
+する)。marker を持たせるかは protocol を触る判断になるため、現時点では順序契約で足りると
+する。
+
 #### sync deferral (= 初回 redraw の到着は保証されない)
 
 DEC synchronized update (= `?2026h` … `?2026l`、§13-6) の最中は、中途半端な画面を送らない
