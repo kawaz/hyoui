@@ -55,13 +55,22 @@ fn run_with_dead_stdout(args: &[&str]) -> (Option<i32>, Option<i32>, String) {
 }
 
 /// 読み手が去った stdout に書いても panic しない (= exit 101 + "panicked" にならない)。
+///
+/// `expect_sigpipe` の使い分け: stdout に **必ず** 書く subcommand は
+/// 「EPIPE → SIGPIPE で静かに終わる」まで厳密に要求する (= SIG_DFL 復帰が効いている
+/// ことの検証はここが担う)。一方 `list` は出力がセッション数に依存し、0 件の環境
+/// (= CI、初回起動時) では案内を stderr に出して stdout に 1 byte も書かずに正常終了
+/// する。その場合 EPIPE 自体が起きないので SIGPIPE 死しないのが正しい挙動であり、
+/// 「必ず SIGPIPE」を要求すると環境依存の false failure になる (実測: CI の 0 件環境で
+/// `code=Some(0) signal=None`、開発機の 25 セッション環境では SIGPIPE 死)。
+/// したがって list には「panic しないこと」だけを要求する。
 #[test]
 fn print_and_exit_commands_do_not_panic_on_broken_pipe() {
-    for args in [
-        vec!["--version"],
-        vec!["--help"],
-        vec!["completion", "zsh"],
-        vec!["list"],
+    for (args, expect_sigpipe) in [
+        (vec!["--version"], true),
+        (vec!["--help"], true),
+        (vec!["completion", "zsh"], true),
+        (vec!["list"], false),
     ] {
         let (code, signal, stderr) = run_with_dead_stdout(&args);
         assert!(
@@ -73,12 +82,21 @@ fn print_and_exit_commands_do_not_panic_on_broken_pipe() {
             Some(101),
             "{args:?}: panic 由来の exit 101 になってはならない: stderr={stderr:?}"
         );
-        // 読み手が居ない stdout に書けば必ず SIGPIPE 死 (= signal 13、shell から
-        // 見ると 141)。他の UNIX CLI (`ls | head` 等) と同じ終わり方。
-        assert_eq!(
-            signal,
-            Some(nix::libc::SIGPIPE),
-            "{args:?}: SIGPIPE で終了すべき (code={code:?}) stderr={stderr:?}"
-        );
+        if expect_sigpipe {
+            // 読み手が居ない stdout に書けば必ず SIGPIPE 死 (= signal 13、shell から
+            // 見ると 141)。他の UNIX CLI (`ls | head` 等) と同じ終わり方。
+            assert_eq!(
+                signal,
+                Some(nix::libc::SIGPIPE),
+                "{args:?}: SIGPIPE で終了すべき (code={code:?}) stderr={stderr:?}"
+            );
+        } else {
+            // 書いたなら SIGPIPE 死、1 byte も書かなかったなら正常終了。どちらも正。
+            assert!(
+                signal == Some(nix::libc::SIGPIPE) || (signal.is_none() && code == Some(0)),
+                "{args:?}: SIGPIPE 死か正常終了のどちらかであるべき \
+                 (code={code:?} signal={signal:?}) stderr={stderr:?}"
+            );
+        }
     }
 }
