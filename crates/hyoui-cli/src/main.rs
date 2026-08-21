@@ -296,6 +296,36 @@ fn poll_recv_ready(
     }
 }
 
+/// この subcommand が「daemon / PTY session を保持せず、stdout に出力して終了する」
+/// 種類かどうか (= SIGPIPE を SIG_DFL に戻してよいか)。
+///
+/// `Run` / `Attach` は子 PTY と daemon socket を保持し、`Web` は HTTP server として
+/// client socket に write し続けるため除外する (= SIGPIPE 即死が許容できない)。
+fn is_print_and_exit_command(cmd: &Command) -> bool {
+    match cmd {
+        Command::Help { .. }
+        | Command::Version
+        | Command::List(_)
+        | Command::Kill(_)
+        | Command::Status(_)
+        | Command::Set(_)
+        | Command::Tail(_)
+        | Command::Wait(_)
+        | Command::Screen(_)
+        | Command::Input(_)
+        | Command::Lock(_)
+        | Command::Unlock(_)
+        | Command::Detach(_)
+        | Command::Record(_)
+        | Command::Config(_)
+        | Command::Upgrade(_)
+        | Command::Completion { .. }
+        | Command::Error(_) => true,
+        // Run / Attach / Web serve、および将来追加される subcommand は対象外。
+        _ => false,
+    }
+}
+
 fn main() -> ExitCode {
     // Skip argv[0]: parse_args expects the trailing arguments only.
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -321,6 +351,24 @@ fn main() -> ExitCode {
     }
 
     let cmd = parse_args(&argv);
+
+    // stdout の読み手が先に去った場合 (= `hyoui status | head -5`) の扱い。
+    // Rust runtime は起動時に SIGPIPE を SIG_IGN にするため、`println!` が EPIPE で
+    // panic する (= `failed printing to stdout: Broken pipe`、exit 101)。
+    //
+    // Design rationale: 「print して終了する」short-lived subcommand に**限って**
+    // SIGPIPE を SIG_DFL に戻し、他の UNIX CLI と同じ「読み手が去ったら 141 で静かに
+    // 終わる」挙動にする。プロセス全域に適用しないのは、daemon / attach session が
+    // client socket への write で SIGPIPE を受けて即死してしまうため
+    // (= client が 1 つ消えるたびに daemon が死ぬ)。それらの経路は EPIPE を
+    // 戻り値エラーとして扱う現行の設計を保つ。
+    //
+    // 判定は include-list (= 明示した subcommand だけ true)。将来 subcommand が
+    // 増えたときの default は「触らない = 現行挙動」で fail-safe に倒す。
+    if is_print_and_exit_command(&cmd) {
+        // 失敗しても致命的ではない (= 従来の panic 挙動に戻るだけ) ので無視する。
+        let _ = hyoui::sys::install_default(nix::sys::signal::Signal::SIGPIPE);
+    }
 
     match cmd {
         Command::Help { topic } => {
@@ -4758,6 +4806,48 @@ mod tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
             .expect("chmod 0700");
         dir
+    }
+
+    /// print して終了する subcommand は SIGPIPE を SIG_DFL に戻す対象
+    /// (= `hyoui status | head -5` で panic せず 141 で終わる)。
+    #[test]
+    fn print_and_exit_commands_are_sigpipe_default() {
+        for argv in [
+            vec!["list"],
+            vec!["--version"],
+            vec!["--help"],
+            vec!["status", "demo"],
+            vec!["tail", "demo"],
+            vec!["screen", "dump", "demo"],
+            vec!["completion", "zsh"],
+            vec!["config", "show"],
+        ] {
+            let owned: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+            let cmd = parse_args(&owned);
+            assert!(
+                is_print_and_exit_command(&cmd),
+                "{argv:?} は SIGPIPE SIG_DFL 対象であるべき"
+            );
+        }
+    }
+
+    /// 対極: daemon / PTY session / HTTP server を保持する subcommand は対象外
+    /// (= client socket への write で即死しては困る)。
+    #[test]
+    fn session_holding_commands_keep_sigpipe_ignored() {
+        for argv in [
+            vec!["run", "--", "/bin/cat"],
+            vec!["attach", "demo"],
+            // HTTP gateway 起動は `hyoui web` (= subcommand 無し)。
+            vec!["web"],
+        ] {
+            let owned: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+            let cmd = parse_args(&owned);
+            assert!(
+                !is_print_and_exit_command(&cmd),
+                "{argv:?} は SIGPIPE を触らない側であるべき"
+            );
+        }
     }
 
     /// `shorten_cwd`: `repos/github.com/...` 配下は `<owner>/<repo>/<sub>` に短縮。
