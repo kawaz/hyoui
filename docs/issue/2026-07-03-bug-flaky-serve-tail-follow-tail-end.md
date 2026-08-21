@@ -3,7 +3,7 @@ title: serve_tail_follow_receives_tail_end_on_child_exit が ubuntu CI で flaky
 status: wip
 category: bug
 created: 2026-07-03T19:50:00+09:00
-last_read: 2026-07-29T04:20:00+09:00
+last_read: 2026-08-21T10:28:50+09:00
 open_entered: 2026-07-03T19:50:00+09:00
 wip_entered: 2026-07-27T00:30:00+09:00
 blocked_entered:
