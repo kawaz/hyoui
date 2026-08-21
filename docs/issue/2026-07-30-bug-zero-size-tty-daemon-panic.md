@@ -3,7 +3,7 @@ title: 端末サイズ 0x0 の tty 上で hyoui run が vt100 grid の subtract 
 status: open
 category: bug
 created: 2026-07-30T15:20:00+09:00
-last_read: 2026-07-30T15:20:00+09:00
+last_read: 2026-08-21T10:31:00+09:00
 open_entered: 2026-07-30T15:20:00+09:00
 wip_entered:
 blocked_entered:
