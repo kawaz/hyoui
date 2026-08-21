@@ -162,7 +162,7 @@ fn session_entry_to_json(e: &hyoui::discovery::SessionEntry) -> serde_json::Valu
 async fn get_screen(Path(id): Path<String>, State(_state): State<AppState>) -> Response {
     let sock = match resolve_socket(&id).await {
         Ok(p) => p,
-        Err(resp) => return resp,
+        Err(e) => return e.into_response(),
     };
     let bytes = match tokio::task::spawn_blocking(move || dump_screen_blocking(&sock)).await {
         Ok(Ok(b)) => b,
@@ -298,7 +298,7 @@ async fn post_input(
     };
     let sock = match resolve_socket(&id).await {
         Ok(p) => p,
-        Err(resp) => return resp,
+        Err(e) => return e.into_response(),
     };
     let result = tokio::task::spawn_blocking(move || send_input_blocking(&sock, &parsed)).await;
     match result {
@@ -438,7 +438,7 @@ fn send_input_blocking(
 async fn post_resume(Path(id): Path<String>, State(_state): State<AppState>) -> Response {
     let sock = match resolve_socket(&id).await {
         Ok(p) => p,
-        Err(resp) => return resp,
+        Err(e) => return e.into_response(),
     };
     let result = tokio::task::spawn_blocking(move || resume_child_blocking(&sock)).await;
     match result {
@@ -499,7 +499,7 @@ async fn post_resize(
     }
     let sock = match resolve_socket(&id).await {
         Ok(p) => p,
-        Err(resp) => return resp,
+        Err(e) => return e.into_response(),
     };
     let (cols, rows) = (body.cols, body.rows);
     let result = tokio::task::spawn_blocking(move || resize_blocking(&sock, cols, rows)).await;
@@ -594,7 +594,7 @@ async fn get_ws_attach(
 ) -> Response {
     let sock = match resolve_socket(&id).await {
         Ok(p) => p,
-        Err(resp) => return resp,
+        Err(e) => return e.into_response(),
     };
     ws_attach::on_upgrade(ws, sock)
 }
@@ -603,16 +603,49 @@ async fn get_ws_attach(
 // Helpers
 // -----------------------------------------------------------------------------
 
+/// `resolve_socket` の失敗分類。HTTP status code へのマップに使う。
+///
+/// `Response` を直接 `Err` に載せず種別だけ保持する (= `InputError` / `ResizeError`
+/// と同じ形)。`Response` は `clippy::result_large_err` の閾値を超える大きさがあり、
+/// `Err` に載せると `Result` を返す全 caller の戻り値が膨らむ。
+#[derive(Debug)]
+enum ResolveSocketError {
+    /// session 列挙の blocking task が join に失敗。500。
+    Enumerate(String),
+    /// entry はあるが stale (= socket 残骸 / handshake 失敗)。404。
+    Stale {
+        /// 要求された session_id。
+        id: String,
+        /// discovery が stale と判定した理由。
+        reason: String,
+    },
+    /// その session_id の entry が存在しない。404。
+    NotFound {
+        /// 要求された session_id。
+        id: String,
+    },
+}
+
+impl ResolveSocketError {
+    fn into_response(self) -> Response {
+        match self {
+            ResolveSocketError::Enumerate(msg) => {
+                internal_error(format!("session enumeration join error: {msg}"))
+            }
+            ResolveSocketError::Stale { id, reason } => {
+                not_found(format!("session {id:?} is stale: {reason}"))
+            }
+            ResolveSocketError::NotFound { id } => not_found(format!("no session named {id:?}")),
+        }
+    }
+}
+
 /// session_id から live socket path を解決する。live entry のみ受理 (= stale は 404)。
-async fn resolve_socket(id: &str) -> Result<PathBuf, Response> {
+async fn resolve_socket(id: &str) -> Result<PathBuf, ResolveSocketError> {
     let id = id.to_string();
     let entries = match tokio::task::spawn_blocking(hyoui::discovery::list_sessions).await {
         Ok(v) => v,
-        Err(e) => {
-            return Err(internal_error(format!(
-                "session enumeration join error: {e}"
-            )));
-        }
+        Err(e) => return Err(ResolveSocketError::Enumerate(e.to_string())),
     };
     for e in entries {
         if e.session_id != id {
@@ -621,11 +654,11 @@ async fn resolve_socket(id: &str) -> Result<PathBuf, Response> {
         match e.status {
             hyoui::discovery::SessionStatus::Live(_) => return Ok(e.socket_path),
             hyoui::discovery::SessionStatus::Stale { reason } => {
-                return Err(not_found(format!("session {id:?} is stale: {reason}")));
+                return Err(ResolveSocketError::Stale { id, reason });
             }
         }
     }
-    Err(not_found(format!("no session named {id:?}")))
+    Err(ResolveSocketError::NotFound { id })
 }
 
 // -----------------------------------------------------------------------------

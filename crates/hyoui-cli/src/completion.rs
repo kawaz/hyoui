@@ -1348,7 +1348,7 @@ mod tests {
                 let (scope, leaf) = match sub.split_once(' ') {
                     Some((parent, child)) => {
                         let head = format!("_hyoui_{parent}() {{");
-                        let start = s.find(&head).map_or(0, |i| i);
+                        let start = s.find(&head).unwrap_or(0);
                         (&s[start..], child)
                     }
                     None => (s.as_str(), sub),
