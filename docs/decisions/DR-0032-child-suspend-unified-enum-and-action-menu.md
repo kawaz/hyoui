@@ -130,6 +130,21 @@ default へ倒れる」既知の廃止 key であり、[[DR-0014]] の silent no
 [[DR-0030]] §4 の規定のまま)。次に rw attach が来た時点で発火条件 3 の
 handshake snapshot 経路により menu が表示される。
 
+#### 初回 attach redraw との順序 (= [[DR-0013]] §4 Phase A)
+
+**発動条件 3 が handshake snapshot 側で成立した場合、menu と入力 focus は attach 復元
+redraw の到着を待たずに成立する**。発動条件 1-4 はいずれも handshake response と client
+自身の状態だけで判定でき、redraw の中身を必要としない。[[DR-0013]] §4 Phase A の初回
+redraw は sync update 中に保留され得る (= 到着が保証されない) ため、menu を redraw 到着に
+従属させると「子を起こす手段 (= menu) が子の動作に依存する」循環になる。redraw が届いた
+時は端末へ適用した上に menu を描き直す (= 描き直しの直前に mode を再評価する。
+[[DR-0013]] §4 Phase A 受信側の義務 (c))。
+
+**「停止後の raw_data 到着を証拠に menu を畳む」規則 (= 後述「メニュー表示中のキー入力」) から、attach 成立後に
+最初に届く RAW_DATA 1 つを除外する**。それは子が生んだ出力ではなく daemon が screen
+state から組んだ復元 bytes であり、resume の証拠にならない。除外はこの 1 frame に限り、
+以降の raw_data は従来どおり resume の証拠として扱う。
+
 #### メニュー項目
 
 2 グループに分けて表示する。区分は **UX 視点** (kawaz 裁定 2026-07-30 m42/m43):

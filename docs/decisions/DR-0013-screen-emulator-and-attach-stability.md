@@ -127,6 +127,44 @@ ScreenStateInit {
 
 client terminal は `redraw_bytes` を stdout に書くだけで detach 時の画面が復元される。
 
+#### 送出契約 (= 送信側 / 受信側の義務)
+
+**送信側 (daemon)**: handshake response の送信完了直後、当該 client にだけ attach 復元
+redraw を **`TYPE_RAW_DATA` frame 1 つ**として送る (= 他 client への broadcast ではない)。
+visible state が pristine な場合も **payload が空の frame を 1 つ**送る:
+
+- 契約の実体は「handshake 直後に RAW_DATA が 1 つ届くこと」であり、payload の中身とは独立
+- pristine で `state_formatted()` の clear sequence を送ると、attach した外側 shell の
+  画面 history を消してしまう。空 payload は client が stdout に書いても no-op になる
+
+**受信側 (client)** は、この最初の RAW_DATA を以下のとおり扱う:
+
+- (a) **子の新規出力でも、子が resume した証拠でもない**。daemon が screen state から
+  組んだ復元 bytes なので、停止検知に基づく client 側の状態 (= DR-0032 §2 の
+  child action menu 等) をこの frame の到着で解除してはならない
+- (b) **client 側 local overlay の成立条件にしてはならない**。overlay は handshake
+  response の snapshot だけで成立させ、redraw の到着を待つ形にしない (= 下記 sync
+  deferral により到着は保証されない)
+- (c) 到着したら **redraw を先に端末へ適用し、その上へ overlay を描き直す**。描き直しの
+  直前に mode を再評価する (= redraw 到着までに `ModeChange` が先行し得るため、
+  handshake 時の判定を使い回さない)
+
+#### sync deferral (= 初回 redraw の到着は保証されない)
+
+DEC synchronized update (= `?2026h` … `?2026l`、§13-6) の最中は、中途半端な画面を送らない
+ため上記 redraw を送らず保留し、sync 終了を観測した時点で保留分を flush する。
+
+flush を駆動するのは **子の出力 bytes のみ**で timeout 機構は無い。したがって子が
+sync 中に stopped になると初回 redraw は到着せず、到着時刻に上限が無い。受信側の義務
+(a)-(c) は、この非到着下でも client が機能するための要件でもある (= redraw に従属する
+実装は「子を起こす手段が子の動作に依存する」循環を作る)。
+
+deferral 自体の扱いは **未裁定** — 案 A (stopped 中は sync 中でも flush) / 案 B
+(deferral に timeout) / 案 C (現状維持) が
+`docs/issue/2026-08-21-handshake-redraw-deferred-no-timeout.md` に起票されている。
+案 A / B は partial state を送る判断を含むため、採用するなら DR-0014 の partial
+state 規律に従って判定基準を本節に明記する。
+
 #### Phase B (優先): pull 型 incremental sync
 
 reconnect / 高 RTT 環境での効率化のため、Phase B で wezterm 流 SequenceNo + pull

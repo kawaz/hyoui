@@ -481,8 +481,8 @@ pub(super) fn process_pending_handshakes(
                         // ため、client 側は通常 attach フローでそのまま stdout に
                         // 流せば detach 時の画面が復元される (§4 + §10)。
                         if screen_state.sync_in_progress() {
-                            // sync 中は中途半端な state を送らない (§6)。
-                            // sync 終了後に caller が flush する。
+                            // sync 中は中途半端な state を送らない (= §4 Phase A の
+                            // sync deferral)。sync 終了後に caller が flush する。
                             pending_redraws.push(new_id);
                         } else {
                             send_attach_redraw(&accepted.handle, screen_state, overflow_ids);
