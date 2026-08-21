@@ -371,3 +371,34 @@ cwd ではなく **build tree 側に依存する**ことまで確認済み:
 
 原因調査を継続中。
 
+## 追記 2026-08-21: 恒常 red の性質が変化した
+
+### 解消したもの
+
+1. `menu_client_suspend_item_wakes_child_on_fg` — 真因 (attach client が初回 redraw を
+   resume 証拠と誤認して menu focus を閉じる) を特定して v0.9.39 で修正。修正後の CI で
+   3 attempt 連続 pass、macOS の ignored job も 3 回とも success。
+2. `serve_backpressure_disconnects_slow_client` — 起票時 ubuntu 12/12 失敗だったが、
+   v0.9.37/38/39 の 3 run × 2 OS で全て ok。
+3. `notify_default_does_not_resume_self_stopped_child` (macOS 7 回失敗) も現在は macOS
+   job 全体が success なので解消。
+
+### 残っているもの (性質が変わった)
+
+ubuntu のみ、**同一 commit の 3 attempt で毎回違うテストが 1 本ずつ落ちる**:
+
+- attempt1 = `ctrlz_x1_select_on_demand_prompt_ctrl_c_quits_client` (`ctrlz_suspend_client.rs`)
+- attempt2 = `daemon_second_sigterm_during_shutdown_completes_unlink` (`daemon_sigterm_graceful.rs:142`)
+- attempt3 = `daemon_sigterm_terminates_child_and_unlinks_socket` (`daemon_sigterm_graceful.rs:51`)
+
+つまり起票時の「OS ごとに固定テストが 100% fail」= 決定的 bug ではなく、**負荷依存の
+flaky に移行した**。attempt2/3 が同一ファイル (SIGTERM graceful shutdown 系) に集中している
+点は傾向として記録しておく。ローカル macOS では該当テスト群 5/5 pass、ignored 全体も
+45 passed / 0 failed。
+
+### 次にやるとよいこと
+
+ubuntu runner の負荷特性 (並列実行時の CPU/IO 競合) と SIGTERM 系テストの timing 依存を
+調べる。決定的 bug が残っていないなら、`continue-on-error` を外して flaky retry に
+切り替える方針も検討できる (= 恒常 red を隠す構造自体の解消が本 issue の目的)。
+
