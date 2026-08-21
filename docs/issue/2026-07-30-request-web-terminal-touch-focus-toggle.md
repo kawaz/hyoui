@@ -3,7 +3,7 @@ title: web terminal の touch 再タップで focus を解除する
 status: wip
 category: request
 created: 2026-07-30T21:32:08+09:00
-last_read: 2026-07-30T21:32:08+09:00
+last_read: 2026-08-21T10:25:05+09:00
 open_entered: 2026-07-30T21:32:08+09:00
 wip_entered: 2026-07-30T21:32:08+09:00
 blocked_entered:
