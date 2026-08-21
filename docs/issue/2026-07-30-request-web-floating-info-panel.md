@@ -1,19 +1,19 @@
 ---
 title: web ターミナルに attach/embed/session 情報のフローティングパネル (表示 → 変更操作の 2 段階)
-status: wip
+status: blocked
 category: request
 created: 2026-07-30T15:10:00+09:00
 last_read: 2026-08-21T10:25:01+09:00
 open_entered: 2026-07-30T15:10:00+09:00
 wip_entered: 2026-07-30T15:40:39+09:00
-blocked_entered:
+blocked_entered: 2026-08-21T10:26:06+09:00
 pending_entered:
 discarded_entered:
 resolved_entered:
 discard_reason:
 pending_reason:
 close_reason:
-blocked_by:
+blocked_by: ["IP2-C1 (Phase 1+2a UI) は kawaz 実機確認済み。残りは QUESTIONS.md LT-C1 a (Phase 2b leader 奪取) / d (Phase 3 テキスト選択) の実機確認のみ。LT-C1 全チェックで close 可"]
 origin: kawaz 要望 (2026-07-30 ccmsg r92 m33)
 ---
 
