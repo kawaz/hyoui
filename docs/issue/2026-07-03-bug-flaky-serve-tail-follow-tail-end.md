@@ -5,7 +5,7 @@ category: bug
 created: 2026-07-03T19:50:00+09:00
 last_read: 2026-08-21T10:28:50+09:00
 open_entered: 2026-07-03T19:50:00+09:00
-wip_entered: 2026-07-27T00:30:00+09:00
+wip_entered: 2026-08-21T00:00:00+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
@@ -574,6 +574,17 @@ B の失敗 11 件中 10 件がマーカーを伴い、A では **100 回すべ�
 しており (同一 crate の `client/attach.rs` 等)、毎 iteration の `cargo test` が
 異なるソースからビルドしていた。汚染とみなして破棄し、`jj workspace add` で
 専有 workspace を作って取り直した。**この種の A/B は専有 workspace で回すこと**。
+
+## 第 4 の原因の修正候補・決定的再現テストを発見 (2026-08-21)
+
+`flaky4b` jj workspace に未コミットで存在していた成果を発見した。機構は
+**attach 前に daemon へ届いた子出力が redraw に畳み込まれ、stream に再送されない**
+のに対し、テストヘルパ `discard_attach_redraw` が redraw を丸ごと捨てるため
+marker を取りこぼす、というもの。既存の「handshake 成立 → 初回 raw_data 受信」
+区間の timeout 様式と一致する。
+
+修正候補 + 決定的再現テストは未コミットのまま。`codex-sol-worker` (エージェント名
+`flaky4-verify`) が main v0.9.35 へのリベースと決定的 A/B 検証を実施中。
 
 ## 受け入れ条件
 
