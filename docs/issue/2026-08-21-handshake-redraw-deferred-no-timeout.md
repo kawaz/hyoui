@@ -60,6 +60,40 @@ DR-0013 §4 Phase A (attach redraw の契約、なお accept.rs のコメント�
 DR-0013 §6 = alternate screen hook を指しており誤読を誘うので直すとよい) / DR-0014
 (partial state を扱う実装の規律) / DR-0032 §2 (child action menu)
 
+## 追記 (2026-08-21、fable5-high の独立 probe)
+
+前提を実測で補正。
+
+### 実挙動の補正
+
+起票時の前提「redraw が無期限保留される」は、**menu 発動条件を満たす attach (rw leader + tty) では成立しない**。
+attach client は `conn.run()` の前に `send_initial_resize()` を送り (`crates/hyoui-cli/src/main.rs:1088`)、
+`handle_resize` (`daemon/control.rs:711`) が同サイズでも無条件に `screen_state.resize()` を呼び、
+`resize()` (`daemon/screen/state.rs:243`) が Parser 再構築後に `sync_in_progress = false` を無条件代入する。
+次の serve_loop 周回で `flush_pending_redraws_if_sync_over` が deferred redraw を flush するため、
+**deferral は attach 自身の resize 副作用で数 ms 後に解除される**。
+
+実測: 子が `?2026h` → SIGSTOP した session に何も入力せず attach し、outer 画面を 200ms 刻みで観測すると
+t=200ms で既に SYNC-OPEN (= 保留されたはずの redraw) が可視。
+
+### ただし緩和は accidental かつ fragile
+
+この解除は設計された挙動ではなく副作用。しかも `resize()` の doc comment は「replay 中に `?2026h` を踏めば
+再度 detect される」と書いているが、**input_log の replay は vt100 の `process()` 直呼びで
+`update_sync_flag_with_carry` を通らないため未閉 `?2026h` は再検出されない** = doc と実装が矛盾している。
+doc どおりに実装を直した瞬間、deferral は本物の無期限保留に戻る。また resize が mid-sync state を黙って
+捨てること自体、DR-0014 の partial state 規律 (自動破棄するなら判定基準を DR に明示) と要整合。
+
+### 追加論点
+
+案 A/B/C に加えて「案 D: `resize()` の sync 扱いを doc と一致させる (= replay で再検出する)」を検討する場合、
+それ単独では無期限保留を復活させるだけなので案 A or B とセットで裁定する必要がある。
+
+### client 側への影響
+
+2026-08-21 の menu focus 修正 (attach.rs) は redraw ゼロでも menu が成立する構造で、この accidental 緩和に
+依存していないことをレビューで確認済み。**本 issue の裁定がどちらに転んでも client 側は成立する**。
+
 ## 受け入れ条件
 
 - [ ] 案 A/B/C のいずれかを裁定し、採用するなら DR に判定基準を明記
