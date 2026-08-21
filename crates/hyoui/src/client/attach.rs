@@ -1075,14 +1075,29 @@ impl ClientConnection {
     ) -> Result<RunOutcome, Error> {
         let mut ctrlz = CtrlzGuard::default();
         let mut focus = InputFocus::Child;
-        // DR-0013 §4 Phase A: handshake response の直後に届く最初の RAW_DATA は
-        // attach 復元用 redraw であって、子が resume して生んだ出力ではない。
-        // handshake snapshot が stopped なら、この redraw を描画してから menu を重ねる。
-        // socket と stdin が同時に ready なら socket を先に処理する run loop の順序により、
-        // 同じ iteration の入力も描画済み menu の focus で解釈される。
-        let mut initial_redraw_then_menu = self.response.child_stopped
+        // DR-0032 §2: handshake snapshot が stopped なら redraw を待たず menu と focus を
+        // 即座に成立させる。DEC synchronized update 中は daemon が attach redraw を sync
+        // 終了まで保留するため、redraw 待ちにすると停止中の子を起こす手段まで失う。
+        //
+        // DR-0013 §4 Phase A: handshake response 後の最初の RAW_DATA は attach 復元用
+        // redraw なので、子が resume した証拠にはしない。redraw は先に端末へ適用し、
+        // その上へ menu を描き直す。run 前に ack 待ちを追加すると redraw が
+        // `pending_frames` に移るため、この「最初の RAW_DATA」契約も同時に見直すこと。
+        let mut initial_attach_redraw_pending = false;
+        if self.response.child_stopped
             && stopped_child_action(self.response.mode, self.on_child_suspend)
-                == StoppedChildAction::Menu;
+                == StoppedChildAction::Menu
+        {
+            let rows = outer_tty_rows(stdin.as_fd());
+            if self.draw_child_action_menu(stdout, rows) {
+                focus = InputFocus::ChildMenu;
+                initial_attach_redraw_pending = true;
+            } else {
+                // 描画前提を満たさない (= 非 tty / サイズ不明)。menu は出さず、停止中で
+                // あることだけ伝えて forward を続ける (= 入力を飲む状態に入らない)。
+                self.draw_child_stopped_notice(stdout, rows);
+            }
+        }
         // DR-0019 §5: SendEof で stdin EOF 観測後、stdin はもう読まない (= EOT 送出
         // 済) が、子の出力 (= bc の計算結果) と SessionExitNotify を拾い切るため
         // loop は継続する。
@@ -1220,15 +1235,21 @@ impl ClientConnection {
                 match Frame::decode_from(&mut self.reader) {
                     Ok(frame) => match frame.ty {
                         TYPE_RAW_DATA => {
-                            // DR-0032 §2: menu 表示中に子の出力が届いたら「menu 以外の
-                            // 要因で子が resume した」証拠として menu を畳み、forward を
-                            // 再開する。socket は順序保証があり、stop 前の出力は
+                            // DR-0013 §4 Phase A: handshake 後に最初に届く RAW_DATA は attach
+                            // redraw であり、停止中の子が resume した証拠ではない。flag は
+                            // X1Prompt の continue より前に必ず消費し、後の通常出力へ持ち越さない。
+                            let is_initial_attach_redraw =
+                                std::mem::take(&mut initial_attach_redraw_pending);
+
+                            // DR-0032 §2: 初期 redraw 以外の子出力が menu 表示中に届いたら
+                            // 「menu 以外の要因で子が resume した」証拠として menu を畳み、
+                            // forward を再開する。socket は順序保証があり、stop 前の出力は
                             // StoppedNotify より先に処理済みなので、notify 後の raw_data は
-                            // 停止後に生まれた bytes = 子が動いている (or daemon の redraw)。
+                            // 停止後に生まれた bytes = 子が動いている。
                             // 残る race は daemon の PTY read が waitpid に遅れて stop 前の
                             // 出力を後から流す場合だけで、その時は menu を早く閉じる側に
                             // 倒れる (= 次の stop 通知で出し直せる、安全側)。
-                            if focus == InputFocus::ChildMenu {
+                            if focus == InputFocus::ChildMenu && !is_initial_attach_redraw {
                                 focus = InputFocus::Child;
                             }
                             // プロンプト表示中 (= alt screen を抜けた通常画面) の子の出力は
@@ -1245,15 +1266,17 @@ impl ClientConnection {
                             }
                             let _ = stdout.flush();
 
-                            if initial_redraw_then_menu {
-                                initial_redraw_then_menu = false;
+                            if is_initial_attach_redraw && focus == InputFocus::ChildMenu {
                                 let rows = outer_tty_rows(stdin.as_fd());
-                                if self.draw_child_action_menu(stdout, rows) {
+                                // redraw 到着までに ModeChange が先行し得るため、handshake
+                                // snapshot の判定を使い回さず、描画直前の mode で再評価する。
+                                if stopped_child_action(self.response.mode, self.on_child_suspend)
+                                    == StoppedChildAction::Menu
+                                    && self.draw_child_action_menu(stdout, rows)
+                                {
                                     ctrlz = CtrlzGuard::default();
-                                    focus = InputFocus::ChildMenu;
                                 } else {
-                                    // 描画前提を満たさない (= 非 tty / サイズ不明)。menu は
-                                    // 発動せず、停止中であることだけ伝えて forward を続ける。
+                                    focus = InputFocus::Child;
                                     self.draw_child_stopped_notice(stdout, rows);
                                 }
                             }
@@ -2669,12 +2692,12 @@ mod tests {
         assert_eq!(menu_action_for_input(b"kill"), None);
     }
 
-    /// handshake snapshot で子が停止中なら、直後の最初の RAW_DATA は attach 復元用
-    /// redraw であって子が resume した証拠ではない。redraw の後に menu を描いて focus を
-    /// 保ち、続く `d` を子へ forward せず client detach として解釈する
-    /// (DR-0013 §4 Phase A / DR-0032 §2)。
-    #[test]
-    fn initial_attach_redraw_preserves_stopped_child_menu_focus() {
+    /// handshake snapshot で stopped-child menu を発動した run に 1 byte 入力する。
+    /// `initial_redraw` があれば daemon の最初の RAW_DATA として入力と同時に ready にする。
+    /// 戻り値は client が daemon へ最初に送った frame、run outcome、端末出力。
+    fn run_stopped_handshake_menu(
+        initial_redraw: Option<&[u8]>,
+    ) -> (Frame, Result<RunOutcome, Error>, Vec<u8>) {
         use crate::protocol::messages::SessionExitNotify;
         use std::io::Write as _;
         use std::os::unix::net::UnixStream;
@@ -2704,7 +2727,7 @@ mod tests {
         };
 
         // run の stdin は tty サイズを返し、menu input を 1 byte 単位で届ける必要がある。
-        // PTY slave を raw にして stdin とし、master 側から `d` を入力する。
+        // PTY slave を raw にして stdin とし、master 側から detach 項目の `d` を入力する。
         let pty = crate::sys::pty::Pty::open(80, 24).expect("open pty");
         let raw_fd = nix::unistd::dup(pty.slave_fd().expect("slave fd")).expect("dup raw fd");
         let _raw_guard = crate::sys::tty::enter_raw(raw_fd).expect("enter raw");
@@ -2712,12 +2735,11 @@ mod tests {
         let mut stdin_file = std::fs::File::from(stdin_fd);
         let mut input_writer = std::fs::File::from(pty.into_master());
 
-        // handshake response 後の最初の frame は、通常の子出力と同じ TYPE_RAW_DATA だが
-        // attach 復元用 redraw である。socket と stdin を同時に ready にしても run は
-        // socket を先に処理するため、問題の順序を sleep 無しで固定できる。
-        Frame::raw_data(b"INITIAL-REDRAW".to_vec())
-            .encode_to(&mut daemon_sock)
-            .expect("send initial redraw");
+        if let Some(redraw) = initial_redraw {
+            Frame::raw_data(redraw.to_vec())
+                .encode_to(&mut daemon_sock)
+                .expect("send initial redraw");
+        }
         input_writer.write_all(b"d").expect("write menu input");
 
         let run_handle = std::thread::spawn(move || {
@@ -2744,9 +2766,49 @@ mod tests {
                 .expect("send exit notify");
         }
         let (result, stdout) = run_handle.join().expect("join run thread");
+        (received, result, stdout)
+    }
+
+    /// handshake snapshot が stopped なら、attach redraw が遅延または欠落しても menu を
+    /// 即表示して focus を成立させる。子が DEC synchronized update 中に停止すると daemon は
+    /// redraw を sync 終了まで defer するため、redraw を menu の発動条件にしてはならない。
+    /// 続く `d` は停止中の子へ forward せず client detach として解釈する (DR-0032 §2)。
+    #[test]
+    fn stopped_handshake_without_redraw_shows_menu_and_accepts_key() {
+        let (received, result, stdout) = run_stopped_handshake_menu(None);
 
         assert!(
-            detached,
+            received.ty == TYPE_CBOR_CONTROL
+                && matches!(
+                    ControlMessage::decode_from(received.body.as_slice()),
+                    Ok(ControlMessage::Detach(_))
+                ),
+            "redraw 不在でも `d` は menu detach であるべき: frame={received:?}"
+        );
+        assert!(
+            matches!(result, Ok(RunOutcome::Detached)),
+            "menu detach は Detached を返すべき: {result:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&stdout).contains("操作を選んでください"),
+            "redraw 不在でも stopped-child menu を表示するべき: {stdout:?}"
+        );
+    }
+
+    /// handshake response 直後の最初の RAW_DATA は attach 復元用 redraw であって子が
+    /// resume した証拠ではない。redraw を端末へ適用した後も menu focus を保ち、menu を
+    /// 上に描き直す。socket と stdin を同時に ready にして問題の順序を sleep 無しで固定する
+    /// (DR-0013 §4 Phase A / DR-0032 §2)。
+    #[test]
+    fn initial_attach_redraw_preserves_stopped_child_menu_focus() {
+        let (received, result, stdout) = run_stopped_handshake_menu(Some(b"INITIAL-REDRAW"));
+
+        assert!(
+            received.ty == TYPE_CBOR_CONTROL
+                && matches!(
+                    ControlMessage::decode_from(received.body.as_slice()),
+                    Ok(ControlMessage::Detach(_))
+                ),
             "initial attach redraw 後も `d` は menu detach であるべき: frame={received:?}"
         );
         assert!(

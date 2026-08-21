@@ -238,6 +238,69 @@ fn menu_appears_on_next_attach_when_child_stopped_while_unattended() {
         "menu を出す設定では attach しても子を起こさない"
     );
 
+    // 表示 bytes だけでなく内部 focus も menu にあることを、項目 `c` の実動作で固定する。
+    // focus が Child にずれていると `c` は停止中の子の PTY buffer へ流れ、子は起きない。
+    h.send_bytes(b"c").expect("menu key: c");
+    assert!(
+        wait_not_stopped(child_pid, Duration::from_secs(5)),
+        "handshake snapshot 由来の menu でも `c` で子が起きるはず: {}",
+        state_of(child_pid)
+    );
+    assert!(
+        wait_child_state(&h, "running", Duration::from_secs(5)),
+        "daemon 側の child-state も running に戻るはず: {:?}",
+        h.status_text()
+    );
+
+    let _ = h.kill();
+    let _ = boot.kill();
+}
+
+/// 子が DEC synchronized update を閉じる前に停止すると、daemon は attach redraw を
+/// sync 終了まで defer する。この循環状態でも handshake snapshot から menu を即表示し、
+/// `c` で子を起こせる必要がある。menu を redraw 到着待ちにすると、子を起こす UI が
+/// 出ないため sync を閉じる出力も永遠に生成されない (DR-0013 §6 / DR-0032 §2)。
+#[ignore = "PTY child + signal + deferred redraw を使う、ローカルで --ignored 実行 (DR-0013 §6 / DR-0032 §2)"]
+#[test]
+fn menu_remains_usable_when_initial_redraw_is_deferred_by_sync_update() {
+    let runner = HyouiTestRunner::new();
+    let mut boot = runner.spawn_hyoui_with_config(
+        "menu-sync-deferred",
+        &[
+            "run",
+            "--detached",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf '\\033[?2026hSYNC-OPEN'; kill -STOP $$; printf '\\033[?2026l'; exec /bin/cat",
+        ],
+        MENU_CONFIG,
+    );
+    let child_pid = wait_for_child_pid(&runner, "menu-sync-deferred");
+    assert!(
+        wait_stopped(child_pid, Duration::from_secs(5)),
+        "sync update 中に子が停止するはず: {}",
+        state_of(child_pid)
+    );
+
+    // handshake 時点で screen sync は未完了なので、daemon の initial attach redraw は
+    // pending_redraws に保留される。それでも client local overlay の menu は即表示する。
+    let mut h = runner.spawn_hyoui_with_config("menu-sync-deferred", &["attach"], MENU_CONFIG);
+    h.wait_for(MENU_HEADER, Duration::from_secs(10))
+        .expect("deferred redraw を待たず stopped-child menu が出るはず");
+
+    h.send_bytes(b"c").expect("menu key: c");
+    assert!(
+        wait_not_stopped(child_pid, Duration::from_secs(5)),
+        "deferred redraw 中の menu でも `c` で子が起きるはず: {}",
+        state_of(child_pid)
+    );
+    assert!(
+        wait_child_state(&h, "running", Duration::from_secs(5)),
+        "sync 終了後は daemon 側の child-state も running に戻るはず: {:?}",
+        h.status_text()
+    );
+
     let _ = h.kill();
     let _ = boot.kill();
 }
@@ -288,6 +351,20 @@ fn wait_child_state(h: &SpawnedHyoui, expected: &str, timeout: Duration) -> bool
             return false;
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// 子の `ps` STAT が停止 (`T`) になるまで待つ。
+fn wait_stopped(pid: i32, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if process_state_of(pid).is_ok_and(|st| st.is_state('T')) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
