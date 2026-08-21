@@ -161,10 +161,13 @@ visible state が pristine な場合も **payload が空の frame を 1 つ**送
 DEC synchronized update (= `?2026h` … `?2026l`、§13-6) の最中は、中途半端な画面を送らない
 ため上記 redraw を送らず保留し、sync 終了を観測した時点で保留分を flush する。
 
-flush を駆動するのは **子の出力 bytes のみ**で timeout 機構は無い。したがって子が
-sync 中に stopped になると初回 redraw は到着せず、到着時刻に上限が無い。受信側の義務
-(a)-(c) は、この非到着下でも client が機能するための要件でもある (= redraw に従属する
-実装は「子を起こす手段が子の動作に依存する」循環を作る)。
+flush は `sync_in_progress` の解除で駆動され、**timeout 機構は無い**。解除の契機は現行
+実装では 2 つある — 子出力中の `?2026l` と、leader の Resize に伴う parser 再構築の副作用
+(= 設計された解除ではなく accidental。`resize()` の doc comment と実装にも矛盾があり、
+扱いは下記のとおり未裁定)。したがって resize 契機が生じない構成では初回 redraw は到着せず、
+いずれの場合も **到着時刻に上限は無い**。受信側の義務 (a)-(c) は、この到着非保証の下でも
+client が機能するための要件でもある (= redraw に従属する実装は「子を起こす手段が子の動作に
+依存する」循環を作る)。
 
 deferral 自体の扱いは **未裁定** — 案 A (stopped 中は sync 中でも flush) / 案 B
 (deferral に timeout) / 案 C (現状維持) が
