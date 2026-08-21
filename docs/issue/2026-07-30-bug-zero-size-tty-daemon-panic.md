@@ -1,11 +1,11 @@
 ---
 title: 端末サイズ 0x0 の tty 上で hyoui run が vt100 grid の subtract overflow で panic
-status: open
+status: wip
 category: bug
 created: 2026-07-30T15:20:00+09:00
 last_read: 2026-08-21T10:31:00+09:00
 open_entered: 2026-07-30T15:20:00+09:00
-wip_entered:
+wip_entered: 2026-08-21T10:33:24+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
@@ -59,6 +59,13 @@ exec 前に入れると正常に起動する (= 同 probe で確認済み)。
 初期サイズ経路でも 0 を弾く (= 下限 1 clamp、または 0 は「取れなかった」扱いにして
 daemon default に倒す) のが素直に見える。panic を戻り値エラーに変えるだけでは
 「サイズ 0 で起動して画面が壊れる」に化けるので、値の正規化側で塞ぐ方が良さそう。
+
+## 進捗
+
+- opus5-medium worker (lightbugs) に修正実装を委譲 (2026-08-21)。初期サイズ経路の
+  0 正規化 (経路特定してから修正、`handle_resize` の clamp と整合させる方針)
+- 6 月の類似 issue (`2026-06-11-bug-vt100-zero-size-pty-panic`) との同根判定は
+  worker 報告待ち
 
 ## 関連
 
