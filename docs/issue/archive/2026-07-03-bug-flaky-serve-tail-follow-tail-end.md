@@ -1,6 +1,6 @@
 ---
 title: serve_tail_follow_receives_tail_end_on_child_exit が ubuntu CI で flaky fail する
-status: wip
+status: resolved
 category: bug
 created: 2026-07-03T19:50:00+09:00
 last_read: 2026-08-21T10:28:50+09:00
@@ -9,10 +9,10 @@ wip_entered: 2026-08-21T00:00:00+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-08-21T00:00:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done: 受け入れ条件を全て満たした。第4原因(attach 前の子出力が redraw に畳み込まれ discard_attach_redraw が marker を取りこぼす件)を v0.9.36 で修正・リリース済み。決定的 A/B (B 20/20 pass、A 3/3 timeout fail) で確認。CI 並列実行(v0.9.37/38/39、3 run x ubuntu+macOS)で対象テスト群全て安定 pass を確認。残る ignored-tests job の失敗は 2026-07-26-bug-ignored-tests-job-permanently-red が別追跡"]
 blocked_by:
 origin: Release run 28655240907 の ci gate fail 観測 (session a7761122)
 ---
@@ -626,4 +626,6 @@ CI watch で確認する)。
       main 直系列に統合済み・未 push
 - [x] ee43651b が回帰原因ではないことを確認 (= 高負荷 A/B で親 5/12 vs
       HEAD 6/12、有意差なし)
-- [ ] CI 並列実行で安定して pass する (= 修正 push 後の CI で確認)
+- [x] CI 並列実行で安定して pass する (= v0.9.37/38/39、3 run x ubuntu+macOS の
+      Test job で対象テスト群全て ok。ignored-tests job の別 flaky は
+      2026-07-26-bug-ignored-tests-job-permanently-red が追跡)
