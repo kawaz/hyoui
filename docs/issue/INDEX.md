@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-08-21 | bug | open | [handshake-redraw-deferred-no-timeout](./2026-08-21-handshake-redraw-deferred-no-timeout.md) | handshake 直後の attach redraw が sync update 中の子 stop で無期限 deferred される (timeout 機構なし)。案 A/B/C 未裁定、DR-0014 partial state 規律に従い判定基準明記が必要 |
 | 2026-07-30 | design | open | [child-suspend-action-menu](./2026-07-30-design-child-suspend-action-menu.md) | 子 suspend 時動作の enum 統合 (auto_resume 2 bool の置換) + resume_stopped_child=false 時の attach 内操作メニュー (kawaz 骨子裁定済み、DR 起草待ち) |
 | 2026-07-30 | bug | wip | [stdout-epipe-panic](./2026-07-30-bug-stdout-epipe-panic.md) | `hyoui status \| head` 等で stdout が早期 close されると Broken pipe panic。CLI stdout 経路限定の EPIPE 正常終了化を opus5-medium worker (lightbugs) に修正実装委譲中 (daemon 経路への SIGPIPE 全域適用は避ける方針) |
 | 2026-07-30 | bug | wip | [web-terminal-font-load-fit-race](./2026-07-30-bug-web-terminal-font-load-fit-race.md) | 3 独立原因を修正済み: webfont load 待ち後に xterm を open、fit は寸法提案だけ行い WS leader 接続から daemon resize が成功してから browser grid を変更、待機中/失敗/resize off は旧 grid + 横スクロールを維持。fallback POST は leader 衝突を 409 で返す。WS E2E と dev gateway + Playwright で daemon PTY 追従・横スクロール・409 を検証済み |
