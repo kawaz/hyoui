@@ -586,6 +586,23 @@ marker を取りこぼす、というもの。既存の「handshake 成立 → �
 修正候補 + 決定的再現テストは未コミットのまま。`codex-sol-worker` (エージェント名
 `flaky4-verify`) が main v0.9.35 へのリベースと決定的 A/B 検証を実施中。
 
+## 第 4 の原因の検証完了・main へ統合 (2026-08-21)
+
+決定的再現テスト `attach_after_child_output_still_observes_marker` で A/B を確認した:
+
+| 条件 | 結果 |
+|---|---|
+| B (修正あり) | 20/20 pass |
+| A (修正取り消し、`read_until_contains` の `seen` 初期値を捨てる一時変更) | 3/3 決定的 fail (timed out, 30.12s) |
+
+回帰確認: `daemon::session::tests` 65 passed、workspace 全体 green、Linux clippy green。
+
+修正 commit `0a2312bd` (test: attach 前の子出力を redraw から引き取り marker
+取りこぼしを解消) を main 直系列に統合済み。**未 push**。
+
+残る受け入れ条件は「CI 並列実行で安定して pass する」のみ (次リリース窓の push 後、
+CI watch で確認する)。
+
 ## 受け入れ条件
 
 - [x] 不安定さの軸が **部分的に** 特定されている (= lib suite 32s が強い増悪要因)
@@ -602,11 +619,11 @@ marker を取りこぼす、というもの。既存の「handshake 成立 → �
       書き込む**バグだった (2026-07-29)。`XXFOREIGN` probe で直接観測、専有
       workspace の 100 pair A/B で suite 失敗 2/100 vs 11/100 (p=0.018)、
       機構マーカー 0/100 vs 10/100 (p=0.0015)。anchor / legacy 両経路を修正
-- [ ] **第 4 の原因**: マーカーを伴わない残存失敗
-      (= `serve_attach_redraw_*` / `serve_screen_dump_*` の
-      `read_until_contains: timed out` (= handshake→初回 raw_data 区間)、および
-      マーカーなしの `UnexpectedEof` 1 件。100 pair 中 A 2 / B 1 なので
-      修正の有無に依らず残る軸)
+- [x] **第 4 の原因**: attach 前に届いた子出力が redraw に畳み込まれ stream に
+      再送されず marker を取りこぼす race。決定的再現テスト
+      `attach_after_child_output_still_observes_marker` で A/B 確認
+      (B(fix) 20/20 pass、A(修正なし) 3/3 決定的 fail)。修正 commit 0a2312bd を
+      main 直系列に統合済み・未 push
 - [x] ee43651b が回帰原因ではないことを確認 (= 高負荷 A/B で親 5/12 vs
       HEAD 6/12、有意差なし)
 - [ ] CI 並列実行で安定して pass する (= 修正 push 後の CI で確認)
