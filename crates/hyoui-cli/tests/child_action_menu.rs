@@ -256,13 +256,15 @@ fn menu_appears_on_next_attach_when_child_stopped_while_unattended() {
     let _ = boot.kill();
 }
 
-/// 子が DEC synchronized update を閉じる前に停止すると、daemon は attach redraw を
-/// sync 終了まで defer する。この循環状態でも handshake snapshot から menu を即表示し、
-/// `c` で子を起こせる必要がある。menu を redraw 到着待ちにすると、子を起こす UI が
-/// 出ないため sync を閉じる出力も永遠に生成されない (DR-0013 §6 / DR-0032 §2)。
-#[ignore = "PTY child + signal + deferred redraw を使う、ローカルで --ignored 実行 (DR-0013 §6 / DR-0032 §2)"]
+/// 子が DEC synchronized update を閉じる前に停止した状態へ attach する実 daemon 経路。
+/// handshake 時点では redraw が pending になるが、leader attach の initial Resize が
+/// screen parser を再構築して sync 状態を解除するため、redraw は client input より前に
+/// flush される。本 test は redraw に含まれる `SYNC-OPEN` の到着後も handshake snapshot
+/// 由来の menu focus が保たれ、`c` で子を起こせることを固定する
+/// (DR-0013 §4 Phase A / DR-0032 §2)。
+#[ignore = "PTY child + signal + initial Resize 後の redraw を使う、ローカルで --ignored 実行 (DR-0013 §4 Phase A / DR-0032 §2)"]
 #[test]
-fn menu_remains_usable_when_initial_redraw_is_deferred_by_sync_update() {
+fn handshake_snapshot_menu_remains_usable_after_initial_resize_flushes_redraw() {
     let runner = HyouiTestRunner::new();
     let mut boot = runner.spawn_hyoui_with_config(
         "menu-sync-deferred",
@@ -283,11 +285,14 @@ fn menu_remains_usable_when_initial_redraw_is_deferred_by_sync_update() {
         state_of(child_pid)
     );
 
-    // handshake 時点で screen sync は未完了なので、daemon の initial attach redraw は
-    // pending_redraws に保留される。それでも client local overlay の menu は即表示する。
+    // handshake 時点では redraw が pending_redraws に入るが、attach 自身の initial
+    // Resize が sync 状態を解除し、redraw を flush する。`c` 入力前に `SYNC-OPEN` が
+    // client PTY へ届くことを固定し、その redraw 後の menu focus を次の操作で検証する。
     let mut h = runner.spawn_hyoui_with_config("menu-sync-deferred", &["attach"], MENU_CONFIG);
     h.wait_for(MENU_HEADER, Duration::from_secs(10))
-        .expect("deferred redraw を待たず stopped-child menu が出るはず");
+        .expect("handshake snapshot が stopped なら menu が出るはず");
+    h.wait_for("SYNC-OPEN", Duration::from_secs(5))
+        .expect("initial Resize 後の redraw は menu 操作前に届くはず");
 
     h.send_bytes(b"c").expect("menu key: c");
     assert!(
