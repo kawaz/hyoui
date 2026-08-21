@@ -1,11 +1,11 @@
 ---
 title: "CI の ignored-tests job が continue-on-error で恒常 red を隠している (ubuntu/macOS それぞれ固定 test が 100% fail)"
-status: open
+status: wip
 category: bug
 created: 2026-07-26T09:40:00+09:00
 last_read: 2026-07-29T18:45:00+09:00
 open_entered: 2026-07-26T09:40:00+09:00
-wip_entered:
+wip_entered: 2026-08-21T11:50:50+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
@@ -343,4 +343,31 @@ cargo test --workspace -- --ignored
 
 `cargo fmt --all -- --check` も成功。test session 名で `pgrep -fl` を確認し、調査由来の
 残骸 process が無いことを確認した。
+
+## 追加観測 2026-08-21: 新たな恒常 red 対象と build tree 依存の再現
+
+恒常 red の対象に `menu_client_suspend_item_wakes_child_on_fg` (DR-0032、2026-07-30 追加) が
+加わっていることを確認した。
+
+裏取り: v0.9.35 の CI run 30666359346 (ubuntu) で同 test が FAILED (8 passed; 1 failed)、
+v0.9.36 の run 32438811356 では ubuntu / macOS 両方で FAILED。macOS は v0.9.34 / v0.9.35 では
+success だったため、macOS 側は今回の run で初めて顕在化した。**v0.9.36 の変更内容
+(size 正規化 / SIGPIPE) が原因ではない** — v0.9.35 時点で ubuntu は既に FAILED していたため。
+
+なお `ignored-tests` job は `continue-on-error` のため workflow 自体の red の原因ではない。
+v0.9.36 の workflow red は clippy `result_large_err` (rustc 1.98 の新規 lint) が真因で、
+別途修正中。
+
+### build tree 依存の再現 (原因調査継続中)
+
+ローカルでも main workspace で決定的に再現した。v0.9.35 の commit をチェックアウトしても
+FAILED し、`state=S+` のまま client 側が `T` にならない。一方 flaky4b workspace では
+同一 commit でも pass する。
+
+cwd ではなく **build tree 側に依存する**ことまで確認済み:
+
+- cwd=flaky4b × build=main → FAILED
+- cwd=main × build=flaky4b → ok
+
+原因調査を継続中。
 
