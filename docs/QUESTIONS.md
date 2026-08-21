@@ -41,8 +41,16 @@
 
 - [ ] a: `~/.config/hyoui/config.toml` に `[session]` `on_child_suspend = "show_child_action_menu"` を書き、attach 中に ^Z×2 等で子を止めると menu (脱出: d/z、子への操作: c・Esc/i/h/k) が出て各操作が効く。Esc = 起こして戻る、それ以外のキーは無反応
 - [ ] b: `[attach]` `ctrlz_x1_action = "select_on_demand"` で、^Z 単発 → 1 行プロンプト → ^Z/^C/Esc の 3 択が効く (他キーは無反応)
+- [ ] c (v0.9.39): **unattended 中に子が止まった後で attach** しても menu キーが効く
+  (= 子を止めた状態で detach → 再 attach、または attach していない間に子が止まる)
 
 m41-43 の裁定 (閉じる廃止 / Esc=resume / UX 視点の 2 群) は v0.9.32 で反映済み。
+
+**確認は v0.9.39 以降で** (`brew upgrade hyoui`)。v0.9.38 以前には「handshake 時点で子が
+停止していると、menu が画面に出ているのに menu キーが効かず子への入力になる」bug があった
+(= 初回 attach redraw を client が「子が resume した証拠」と誤認して menu の focus を
+閉じていた)。項目 c はその経路の確認。項目 a の「attach 中に ^Z×2 で止める」順序は
+別経路 (STOP_NOTIFY) なので v0.9.38 以前でも動いていた。
 
 ### 👺SV-C1: 自動起動の再起動実機確認 (kawaz にしか不可)
 
