@@ -3,7 +3,7 @@ title: "BUG: stdout の早期 close (| head 等) で Broken pipe panic する"
 status: open
 category: bug
 created: 2026-07-30T12:40:00+09:00
-last_read:
+last_read: 2026-08-21T10:30:31+09:00
 open_entered: 2026-07-30T12:40:00+09:00
 wip_entered:
 blocked_entered:
