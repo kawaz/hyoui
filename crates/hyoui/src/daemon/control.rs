@@ -717,14 +717,9 @@ fn handle_resize(
     if ensure_leader(&clients[idx], "resize requires leader role").is_err() {
         return ClientFrameOutcome::Continue;
     }
-    // sanitize: 0×0 や巨大値で curses 系子が壊れることがあるので clamp。
-    // 上限 4096 (= 一般 terminal で見ない値) で十分、下限 1 で 0 を排除。
-    const COLS_MIN: u16 = 1;
-    const COLS_MAX: u16 = 4096;
-    const ROWS_MIN: u16 = 1;
-    const ROWS_MAX: u16 = 4096;
-    let cols = r.cols.clamp(COLS_MIN, COLS_MAX);
-    let rows = r.rows.clamp(ROWS_MIN, ROWS_MAX);
+    // sanitize: 0×0 や巨大値で curses 系子が壊れることがあるので clamp
+    // (= 初期サイズ経路と共通の `normalize_size`)。
+    let (cols, rows) = crate::daemon::normalize_size(r.cols, r.rows);
     let _ = pty.resize(cols, rows);
     // DR-0013 Phase B §7: ScreenState 側も同サイズに揃え、input log を新 Parser に
     // replay する (primary buffer 中は cell が再構築、alt screen 中は子側 redraw を

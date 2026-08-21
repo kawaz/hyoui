@@ -86,6 +86,11 @@ impl ScreenState {
         scrollback_len: usize,
         input_log_capacity: usize,
     ) -> Self {
+        // ScreenState 自身の不変条件 (= viewport は 1x1 以上) をここで確定させる。
+        // vt100 の grid は `size - 1` を計算するため 0 を渡すと panic するので、
+        // Parser を保持する側が責任を持って 0 を排除する (= 呼び出し側の
+        // 正規化漏れが即 crash にならないための最終防壁)。
+        let (cols, rows) = crate::daemon::normalize_size(cols, rows);
         Self {
             parser: vt100::Parser::new(rows, cols, scrollback_len),
             scrollback_len,
@@ -236,6 +241,8 @@ impl ScreenState {
     ///   replay 中に `?2026h` を踏めば再度 detect される。
     /// - `current_seqno` は **保持** (= incremental sync の連続性、resize で乱さない)。
     pub(crate) fn resize(&mut self, rows: u16, cols: u16) {
+        // new() と同じ不変条件を resize でも保つ。
+        let (cols, rows) = crate::daemon::normalize_size(cols, rows);
         let was_alt = self.parser.screen().alternate_screen();
         // 新 Parser にも同じ scrollback_len を渡す (= resize 後も scrollback 機能を
         // 保つ。過去 cell は input_log 経由で primary 中なら replay されるため、
@@ -490,6 +497,7 @@ fn find_last_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::SIZE_MIN;
 
     /// PoC §1: 基本構築 + process / size getter。
     #[test]
@@ -498,6 +506,26 @@ mod tests {
         assert_eq!(s.size(), (24, 80));
         assert!(!s.alternate_screen());
         assert_eq!(s.cursor_position(), (0, 0));
+    }
+
+    /// issue 2026-06-11 / 2026-07-30: 0x0 の viewport で構築されても panic せず、
+    /// 1x1 以上に正規化される (= vt100 grid の subtract overflow を踏まない)。
+    #[test]
+    fn new_with_zero_size_is_normalized() {
+        let s = ScreenState::new(0, 0, 100);
+        assert_eq!(s.size(), (SIZE_MIN, SIZE_MIN));
+        let s = ScreenState::new(0, 80, 100);
+        assert_eq!(s.size(), (SIZE_MIN, 80));
+    }
+
+    /// resize 経路も同じ不変条件を保つ。
+    #[test]
+    fn resize_to_zero_is_normalized() {
+        let mut s = ScreenState::new(24, 80, 100);
+        s.resize(0, 0);
+        assert_eq!(s.size(), (SIZE_MIN, SIZE_MIN));
+        s.resize(10, 0);
+        assert_eq!(s.size(), (10, SIZE_MIN));
     }
 
     /// PoC §2: 簡易 process → screen content 反映。

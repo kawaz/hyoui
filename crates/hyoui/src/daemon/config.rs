@@ -2,6 +2,34 @@
 
 use std::path::PathBuf;
 
+/// viewport / PTY サイズの下限 (= 1 セル)。
+///
+/// vt100 の grid は `size - 1` 系の計算を持つため、0 を渡すと
+/// `attempt to subtract with overflow` で panic する (= issue 2026-06-11 /
+/// 2026-07-30)。0 を弾く責務は「値の正規化側」に置き、下流 (vt100 / ioctl) は
+/// 常に 1 以上を受け取る前提にする。
+pub const SIZE_MIN: u16 = 1;
+
+/// viewport / PTY サイズの上限 (= 一般的な端末で見ない値)。巨大値で curses 系の
+/// 子プロセスが壊れるのを防ぐ。
+pub const SIZE_MAX: u16 = 4096;
+
+/// `(cols, rows)` を `SIZE_MIN..=SIZE_MAX` に clamp する。
+///
+/// 初期サイズ経路 / resize 経路の双方でこれを通し、「PTY と screen emulator が
+/// 受け取るサイズは常に 1 以上」という不変条件を 1 箇所で保証する。
+///
+/// なお「winsize が取れなかった (= 0x0 PTY)」ケースは、この clamp に落とす前に
+/// [`crate::sys::tty_size`] が `None` を返して daemon default (80x24) に倒す。
+/// ここは残りの経路 (= 明示指定値 / upgrade 引き継ぎ値 / client の Resize) を
+/// 塞ぐ最終防壁。
+pub fn normalize_size(cols: u16, rows: u16) -> (u16, u16) {
+    (
+        cols.clamp(SIZE_MIN, SIZE_MAX),
+        rows.clamp(SIZE_MIN, SIZE_MAX),
+    )
+}
+
 /// 子 process が STOPPED に入ったときの daemon の挙動 (DR-0017 §柱2 / DR-0019)。
 ///
 /// CLI 層の `crate::cli::OnChildSuspend` と 1:1 対応するが、daemon 層が CLI 層に
@@ -243,6 +271,26 @@ impl DaemonConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_size_clamps_zero_to_one() {
+        // issue 2026-06-11 / 2026-07-30: 0 を vt100 grid に渡すと subtract overflow
+        // で panic するので、正規化側で必ず 1 以上に倒す。
+        assert_eq!(normalize_size(0, 0), (SIZE_MIN, SIZE_MIN));
+        assert_eq!(normalize_size(80, 0), (80, SIZE_MIN));
+        assert_eq!(normalize_size(0, 24), (SIZE_MIN, 24));
+    }
+
+    #[test]
+    fn normalize_size_clamps_huge_to_max() {
+        assert_eq!(normalize_size(u16::MAX, u16::MAX), (SIZE_MAX, SIZE_MAX));
+    }
+
+    #[test]
+    fn normalize_size_keeps_normal_values() {
+        assert_eq!(normalize_size(80, 24), (80, 24));
+        assert_eq!(normalize_size(SIZE_MAX, SIZE_MIN), (SIZE_MAX, SIZE_MIN));
+    }
 
     #[test]
     fn defaults_match_dr_0008() {

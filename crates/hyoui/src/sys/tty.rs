@@ -21,12 +21,24 @@ pub fn is_tty(fd: BorrowedFd<'_>) -> bool {
     nix::unistd::isatty(fd).unwrap_or(false)
 }
 
-/// `ioctl(fd, TIOCGWINSZ)`. Returns `None` if `fd` is not a terminal.
+/// `ioctl(fd, TIOCGWINSZ)`. Returns `None` if `fd` is not a terminal, or if the
+/// terminal reports a degenerate size (rows or cols == 0).
+///
+/// Design rationale: `TIOCSWINSZ` を一度も呼ばれていない PTY (= `pty.openpty()` /
+/// `script -q /dev/null` 経由) は 0x0 を報告する。これは「この端末のサイズは
+/// 0 行 0 列だ」ではなく「サイズが設定されていない = 取れなかった」の意味なので、
+/// 非 tty と同じ `None` に倒す。呼び出し側 (= `run` の初期サイズ解決 / attach の
+/// SIGWINCH 追従) は `None` を daemon default (80x24) / 送信スキップとして扱うため、
+/// これだけで 0 が下流 (vt100 grid) に流れる経路が閉じる (issue 2026-06-11 /
+/// 2026-07-30 の panic)。
 pub fn tty_size(fd: BorrowedFd<'_>) -> Result<Option<WinSize>> {
     if !is_tty(fd) {
         return Ok(None);
     }
     let ws = raw::ioctl_get_winsize(fd)?;
+    if ws.ws_row == 0 || ws.ws_col == 0 {
+        return Ok(None);
+    }
     Ok(Some(WinSize {
         rows: ws.ws_row,
         cols: ws.ws_col,
@@ -244,6 +256,24 @@ mod tests {
             b"\x01d",
             "raw 切替で入力 queue が破棄されてはならない"
         );
+    }
+
+    /// issue 2026-06-11 / 2026-07-30: `TIOCSWINSZ` されていない PTY は 0x0 を
+    /// 報告する。これは「サイズが取れなかった」であって「0 行 0 列の端末」ではない
+    /// ので `None` を返す (= 呼び出し側が daemon default 80x24 に倒せる)。
+    #[test]
+    fn tty_size_on_zero_sized_pty_returns_none() {
+        let pty = crate::sys::pty::Pty::open(0, 0).expect("openpty");
+        let s = tty_size(pty.master_fd()).expect("ok");
+        assert!(s.is_none(), "0x0 PTY は None であるべき、got {s:?}");
+    }
+
+    /// 逆側: サイズが設定されていれば Some でそのまま返る。
+    #[test]
+    fn tty_size_on_sized_pty_returns_size() {
+        let pty = crate::sys::pty::Pty::open(80, 24).expect("openpty");
+        let s = tty_size(pty.master_fd()).expect("ok").expect("some");
+        assert_eq!((s.cols, s.rows), (80, 24));
     }
 
     #[test]

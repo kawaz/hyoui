@@ -418,8 +418,11 @@ pub fn run_daemon_child() -> ExitCode {
 
     let socket = PathBuf::from(&init.socket);
     let session_id = init.session.clone();
-    let cols = init.cols.unwrap_or(80);
-    let rows = init.rows.unwrap_or(24);
+    // 0 は「サイズが取れなかった / 不正指定」なので未指定と同じ daemon default に
+    // 倒す (= 1x1 に clamp すると「起動はしたが画面が壊れている」に化けるため、
+    // 初期サイズ経路だけは clamp ではなく default fallback を選ぶ)。
+    let cols = init.cols.filter(|&c| c != 0).unwrap_or(80);
+    let rows = init.rows.filter(|&r| r != 0).unwrap_or(24);
     let ready_fd: Option<i32> = Some(init.ready_fd);
     let until = init.until.clone();
     let scrollback_rows = init.scrollback_rows;
@@ -621,8 +624,9 @@ pub fn run_upgrade_resume_child() -> ExitCode {
                 state.socket_path.clone(),
                 cmd,
             );
-            dcfg.cols = state.cols;
-            dcfg.rows = state.rows;
+            let (cols, rows) = hyoui::daemon::normalize_size(state.cols, state.rows);
+            dcfg.cols = cols;
+            dcfg.rows = rows;
             dcfg.scrollback_bytes = state.scrollback_bytes;
             dcfg.screen_input_log_bytes = state.screen_input_log_bytes;
             dcfg.screen_vt100_scrollback_rows = state.screen_vt100_scrollback_rows;
@@ -652,8 +656,9 @@ pub fn run_upgrade_resume_child() -> ExitCode {
                 env.socket.clone(),
                 vec!["<upgrade-resume>".to_string()],
             );
-            dcfg.cols = env.cols;
-            dcfg.rows = env.rows;
+            let (cols, rows) = hyoui::daemon::normalize_size(env.cols, env.rows);
+            dcfg.cols = cols;
+            dcfg.rows = rows;
             (dcfg, Vec::new(), env.child_pid)
         }
         None => {
@@ -665,8 +670,9 @@ pub fn run_upgrade_resume_child() -> ExitCode {
                 env.socket.clone(),
                 vec!["<upgrade-resume>".to_string()],
             );
-            dcfg.cols = env.cols;
-            dcfg.rows = env.rows;
+            let (cols, rows) = hyoui::daemon::normalize_size(env.cols, env.rows);
+            dcfg.cols = cols;
+            dcfg.rows = rows;
             (dcfg, Vec::new(), env.child_pid)
         }
     };

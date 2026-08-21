@@ -143,7 +143,17 @@ impl HyouiTestRunner {
     ///
     /// PTY size は 24x80 (= hyoui-cli の `--cols/--rows` default と一致)。
     pub fn spawn_hyoui(&self, session: &str, args: &[&str]) -> SpawnedHyoui {
-        self.spawn_hyoui_inner(session, args, None)
+        self.spawn_hyoui_inner(session, args, None, Some(Size::new(24, 80)))
+    }
+
+    /// PTY のサイズを指定せずに (= `openpty(3)` 直後の winsize 未設定 = 0x0 のまま)
+    /// hyoui-cli を spawn する。
+    ///
+    /// `TIOCSWINSZ` を一度も呼ばない PTY を再現するための harness (= CI harness /
+    /// `script -q /dev/null` / `pty.openpty()` 経由の起動、issue 2026-06-11 /
+    /// 2026-07-30)。通常の test は [`Self::spawn_hyoui`] を使う。
+    pub fn spawn_hyoui_unsized_pty(&self, session: &str, args: &[&str]) -> SpawnedHyoui {
+        self.spawn_hyoui_inner(session, args, None, None)
     }
 
     /// runner 固有の XDG config を適用して hyoui-cli を spawn する。
@@ -161,7 +171,7 @@ impl HyouiTestRunner {
         let config_dir = config_home.join("hyoui");
         std::fs::create_dir_all(&config_dir).expect("create runner config dir");
         std::fs::write(config_dir.join("config.toml"), config_toml).expect("write runner config");
-        self.spawn_hyoui_inner(session, args, Some(&config_home))
+        self.spawn_hyoui_inner(session, args, Some(&config_home), Some(Size::new(24, 80)))
     }
 
     fn spawn_hyoui_inner(
@@ -169,6 +179,7 @@ impl HyouiTestRunner {
         session: &str,
         args: &[&str],
         config_home: Option<&Path>,
+        pty_size: Option<Size>,
     ) -> SpawnedHyoui {
         let socket = self.socket_path(session);
         let socket_arg = format!("--socket={}", socket.display());
@@ -180,7 +191,11 @@ impl HyouiTestRunner {
 
         // 構築: <hyoui_bin> <subcommand> --socket=<sock> <rest...>
         let (pty, pts) = pty_open().expect("pty_open");
-        pty.resize(Size::new(24, 80)).expect("pty resize");
+        // `pty_size = None` は winsize 未設定 (= 0x0) のまま起動する意図
+        // (= `spawn_hyoui_unsized_pty`)。resize を呼ばないことが仕様。
+        if let Some(size) = pty_size {
+            pty.resize(size).expect("pty resize");
+        }
 
         // pty_process::blocking::Command は std::process::Command 互換 + spawn(pts) で
         // std::process::Child を返す。stdin/stdout/stderr は自動で pts に bind される。
@@ -520,6 +535,35 @@ impl SpawnedHyoui {
         if !out.status.success() {
             return Err(std::io::Error::other(format!(
                 "hyoui status failed (status={}): stderr={:?}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// `hyoui screen snapshot --socket=<sock> --include=WindowSize --format=json` の
+    /// stdout を取得する (= viewport サイズの実測用)。
+    pub fn screen_snapshot_text(&self) -> std::io::Result<String> {
+        let socket_arg = format!("--socket={}", self.socket.display());
+        // deadline 付き実行: status_text と同理由 (= issue 2026-06-11)。
+        let out = capture_with_deadline(
+            Command::new(hyoui_bin())
+                .args([
+                    "screen",
+                    "snapshot",
+                    &socket_arg,
+                    "--include=WindowSize",
+                    "--format=json",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+            Duration::from_secs(10),
+        )?;
+        if !out.status.success() {
+            return Err(std::io::Error::other(format!(
+                "hyoui screen snapshot failed (status={}): stderr={:?}",
                 out.status,
                 String::from_utf8_lossy(&out.stderr)
             )));
