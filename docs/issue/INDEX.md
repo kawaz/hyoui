@@ -5,6 +5,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
 | 2026-08-24 | bug | open | [attach-osc8-hyperlink-metadata-loss](./2026-08-24-attach-osc8-hyperlink-metadata-loss.md) | attach 前に出力された OSC 8 hyperlink は attach 後の画面復元でリンク機能を失う。vt100 が OSC 8 未対応で screen state に metadata が残らない (DR-0013 延長、案 A/B/C 未裁定) |
+| 2026-08-24 | bug | open | [web-screen-fetch-alt-mode-lost](./2026-08-24-web-screen-fetch-alt-mode-lost.md) | web UI の初期 /screen fetch が alternate screen mode を復元しない。daemon は alt を正しく認識しているが xterm 側は activeType が normal のまま |
 | 2026-08-21 | bug | open | [handshake-redraw-deferred-no-timeout](./2026-08-21-handshake-redraw-deferred-no-timeout.md) | handshake 直後の attach redraw が sync update 中の子 stop で無期限 deferred される (timeout 機構なし)。案 A/B/C 未裁定、DR-0014 partial state 規律に従い判定基準明記が必要 |
 | 2026-07-30 | design | open | [child-suspend-action-menu](./2026-07-30-design-child-suspend-action-menu.md) | 子 suspend 時動作の enum 統合 (auto_resume 2 bool の置換) + resume_stopped_child=false 時の attach 内操作メニュー (kawaz 骨子裁定済み、DR 起草待ち) |
 | 2026-07-30 | bug | wip | [stdout-epipe-panic](./2026-07-30-bug-stdout-epipe-panic.md) | `hyoui status \| head` 等で stdout が早期 close されると Broken pipe panic。CLI stdout 経路限定の EPIPE 正常終了化を opus5-medium worker (lightbugs) に修正実装委譲中 (daemon 経路への SIGPIPE 全域適用は避ける方針) |
