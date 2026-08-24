@@ -52,6 +52,29 @@ m41-43 の裁定 (閉じる廃止 / Esc=resume / UX 視点の 2 群) は v0.9.32
 閉じていた)。項目 c はその経路の確認。項目 a の「attach 中に ^Z×2 で止める」順序は
 別経路 (STOP_NOTIFY) なので v0.9.38 以前でも動いていた。
 
+### 👺LINK-C1: ターミナル内リンク (v0.9.40) の実機確認
+
+**ccmsg 経由で見る場合はブラウザのリロードが必要** (ccmsg v0.112.1 で iframe に
+`allow-popups` を追加済み。リロードしないと古い iframe 設定のままでリンクが開けない)。
+
+- [ ] a: デスクトップで Claude Code の応答内 markdown リンクをクリック → 新規タブで開く
+  (確認ダイアログは出ない。開いた先が正常に表示・動作する)
+- [ ] b: 素の URL テキスト (`https://...` と書かれただけの文字列) もクリックで開く
+- [ ] c: **iPad**: リンクを tap → 開く。その後ソフトウェアキーボードが閉じる
+- [ ] d: **iPad**: nvim 等 (mouse 有効な TUI) を開いた状態で focus 済み tap →
+  **カーソルがタップ位置へジャンプしない** (= 従来どおり閉じ操作だけ)
+- [ ] e: **iPad**: LT-C1 b/c の回帰確認 — focus 済み tap でキーボードが閉じる /
+  パネル open 中の tap は常に close のみ
+- [ ] f: popup がブロックされる環境 (iOS Safari のポップアップブロック on 等) で
+  リンクを開くと、URL とコピーボタンのパネルが出る (Esc / × で閉じられる)
+
+**今回開けるようにならないもの** (仕様、確認不要):
+- `file://` / `vscode://` (status line に出るもの) — xterm.js の公開 API が
+  「http/https のみ」か「`javascript:` 含む全 scheme」の二択しかなく、後者は危険なため
+  http/https に限定した。要望があれば別途対応する
+- 再接続前から画面にあったリンク — daemon が OSC 8 を保持しないため
+  ([docs/issue/2026-08-24-attach-osc8-hyperlink-metadata-loss.md](issue/2026-08-24-attach-osc8-hyperlink-metadata-loss.md))
+
 ### 👺SV-C1: 自動起動の再起動実機確認 (kawaz にしか不可)
 
 - [ ] a: 次回 PC 再起動後に web (https://hyoui.kawaz-mbp16-20211217.kawaz.jp) が自動で生きていることを確認
