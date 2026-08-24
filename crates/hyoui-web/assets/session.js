@@ -139,6 +139,7 @@
   const linkFallbackClose = document.getElementById('linkFallbackClose');
   const linkFallbackStatus = document.getElementById('linkFallbackStatus');
   const ALLOWED_LINK_PROTOCOLS = new Set(['http:', 'https:']);
+  let linkFallbackReturnFocus = null;
 
   function allowedLinkUrl(raw) {
     try {
@@ -150,10 +151,23 @@
   }
 
   function showLinkFallback(url, message) {
+    if (linkFallback.hidden) linkFallbackReturnFocus = document.activeElement;
     linkFallbackUrl.value = url;
     linkFallbackStatus.textContent = message || '';
     linkFallback.hidden = false;
     linkFallbackCopy.focus({ preventScroll: true });
+  }
+
+  function closeLinkFallback() {
+    linkFallback.hidden = true;
+    linkFallbackStatus.textContent = '';
+    const returnFocus = linkFallbackReturnFocus;
+    linkFallbackReturnFocus = null;
+    if (returnFocus && returnFocus.isConnected && typeof returnFocus.focus === 'function') {
+      returnFocus.focus({ preventScroll: true });
+    } else {
+      term.focus();
+    }
   }
 
   function openTerminalLink(_event, raw) {
@@ -176,9 +190,12 @@
       link.rel = 'noopener noreferrer';
       link.hidden = true;
       document.body.appendChild(link);
+      // rel=noopener は名前一致で再利用した既存 window の opener を切らないため、
+      // navigation 開始前の明示代入が opener 遮断の本体。代入を拒否する環境でも
+      // rel=noopener noreferrer による遷移自体は続ける。
+      try { popup.opener = null; } catch (_openerError) { /* no-op */ }
       link.click();
       link.remove();
-      popup.opener = null;
       linkFallback.hidden = true;
     } catch (e) {
       try { popup.close(); } catch (_closeError) { /* no-op */ }
@@ -186,9 +203,12 @@
     }
   }
 
-  linkFallbackClose.addEventListener('click', () => {
-    linkFallback.hidden = true;
-    linkFallbackStatus.textContent = '';
+  linkFallbackClose.addEventListener('click', closeLinkFallback);
+  linkFallback.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    event.stopPropagation();
+    closeLinkFallback();
   });
   linkFallbackCopy.addEventListener('click', async () => {
     const url = linkFallbackUrl.value;
@@ -516,20 +536,34 @@
     // panel 表示中は panel close をこの tap の唯一の意味にする。入力欄が消えた後に
     // terminal へ暗黙 focus せず、software keyboard が一度閉じる状態を保証する。
     if (state.panelWasOpen) {
+      // panel 表示中の tap は close だけを意味する。preventDefault で後続の
+      // compatibility mouse sequence も止め、link activate や子 PTY への mouse
+      // report が panel close と同時に発生しないようにする。
+      event.preventDefault();
       terminalCloseOnlyClickPending = true;
       closePanel({ restoreTerminalFocus: false });
       setTimeout(() => term.blur(), 0);
       return;
     }
     if (state.wasFocused) {
-      // preventDefault すると compatibility mouseup まで消え、xterm の public link
-      // provider が activate できない。mouseup は通し、その後の click capture で
-      // terminal を blur する。link / 通常 cell の座標判定は xterm に委ねる。
-      terminalCloseOnlyClickPending = true;
+      if (term.modes.mouseTrackingMode !== 'none') {
+        // Mouse tracking 中は compatibility mousedown/mouseup が子 PTY への mouse
+        // report になる。キーボードを閉じる tap で子を操作しない従来 invariant を
+        // 優先し、link activation を含む compatibility mouse sequence を止める。
+        event.preventDefault();
+        setTimeout(() => term.blur(), 0);
+      } else {
+        // xterm.js 5.3.0 Linkifier2 は compatibility mousemove で current link を同期確定し、
+        // mousedown でその link を記録し、同じ link/座標の mouseup で activate する。
+        // touchend の preventDefault はこの3連鎖を丸ごと消すため使わず、mouseup 後の
+        // click capture だけを抑止して terminal を blur する。xterm.js 更新時は touch
+        // link tap を実機で再検証すること。
+        terminalCloseOnlyClickPending = true;
+      }
     } else {
       setTimeout(() => term.focus(), 0);
     }
-  }, { passive: true });
+  }, { passive: false });
   termEl.addEventListener('touchcancel', () => { terminalTouch = null; }, { passive: true });
   termEl.addEventListener('pointerdown', () => {
     if (inputPanel.hidden) terminalCloseOnlyClickPending = false;

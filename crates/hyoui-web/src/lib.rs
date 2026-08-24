@@ -874,11 +874,11 @@ mod tests {
         let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let html = std::str::from_utf8(&body).unwrap();
         let addon = html
-            .find("/assets/vendor/addon-web-links.js")
-            .expect("body missing vendored WebLinksAddon reference");
+            .find(r#"<script src="/assets/vendor/addon-web-links.js"></script>"#)
+            .expect("body missing vendored WebLinksAddon script");
         let session = html
-            .find("/assets/session.js")
-            .expect("body missing session.js reference");
+            .find(r#"<script src="/assets/session.js"></script>"#)
+            .expect("body missing session.js script");
         assert!(addon < session, "WebLinksAddon must load before session.js");
     }
 

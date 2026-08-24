@@ -31,3 +31,5 @@
 
 Do not fetch from CDN at runtime (DR-0027 §4: bundler なし、vendored copy を
 crate に埋め込み)。バージョン更新時は上記 URL から取り直して同 file 名で上書き。
+`xterm.js` 更新時は Linkifier2 の compatibility mousemove → mousedown → mouseup
+activation 順序を確認し、iPad の touch link tap を実機で再検証する。
