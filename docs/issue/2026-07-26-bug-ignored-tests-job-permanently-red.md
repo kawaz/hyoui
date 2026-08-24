@@ -402,3 +402,37 @@ ubuntu runner の負荷特性 (並列実行時の CPU/IO 競合) と SIGTERM 系
 調べる。決定的 bug が残っていないなら、`continue-on-error` を外して flaky retry に
 切り替える方針も検討できる (= 恒常 red を隠す構造自体の解消が本 issue の目的)。
 
+## 追記 2026-08-24: flaky サンプルが 4 件に増加
+
+同一 commit の 3 attempt (v0.9.39) + 別 commit (v0.9.40) で毎回違うテストが 1 本落ちる傾向は
+変わらず継続中:
+
+1. `ctrlz_x1_select_on_demand_prompt_ctrl_c_quits_client`
+2. `daemon_second_sigterm_during_shutdown_completes_unlink`
+3. `daemon_sigterm_terminates_child_and_unlinks_socket`
+4. `handshake_snapshot_menu_remains_usable_after_initial_resize_flushes_redraw`
+   (v0.9.39 で新規追加した e2e)
+
+### (4) の詳細 (要調査、優先度中)
+
+失敗内容: `wait_for("子プロセスが停止中") timed out after 10s`。出力は attach バナー
+158 bytes のみで menu ヘッダが出ていない。
+
+テスト側の同期は取れている (`wait_stopped(child_pid, 5s)` で kernel の T 状態を確認して
+から attach している)。したがって単純な「停止前に attach した」race ではない。
+
+仮説 (未検証):
+
+- (a) kernel が T になってから **daemon が child_stopped を内部状態に反映するまでのラグ**
+  があり、handshake snapshot が `child_stopped=false` を返している。ただしその場合でも
+  後続の STOP_NOTIFY 経路で menu が出るはずだが 10s 待って出ていないので、これだけでは
+  説明が付かない
+- (b) ubuntu runner の負荷で単純に 10s を超えた
+- (c) sync update 中 (`?2026h` 送出後に SIGSTOP) という特殊状態が daemon 側の停止検知に
+  影響している
+
+macOS では success、ローカル macOS では 10/10 pass。自分たちが追加したテストなので放置
+しない。調査時は (a) を最初に潰す (daemon の status が stopped を返すまで待ってから
+attach する形にテストを直すか、それとも daemon 側の検知遅延そのものが実装課題か を
+切り分ける)。
+
