@@ -644,3 +644,79 @@ td.argv, td.cwd {
   user-select: text;
   -webkit-user-select: text;
 }
+
+/* Popup を許可しない iframe でも URL を失わないための link fallback。
+   terminal の上に固定し、失敗した時だけ表示する。 */
+.link-fallback {
+  position: fixed;
+  left: 50%;
+  bottom: 1rem;
+  z-index: 1100;
+  box-sizing: border-box;
+  width: min(calc(100vw - 2rem), 34rem);
+  transform: translateX(-50%);
+  padding: 0.7rem;
+  border: 1px solid rgba(255, 193, 7, 0.55);
+  border-radius: 7px;
+  background: rgba(28, 26, 20, 0.98);
+  color: #e8e2d2;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.65);
+}
+.link-fallback[hidden] { display: none; }
+.link-fallback-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.link-fallback-head strong { color: #ffd166; }
+.link-fallback-head button {
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border-color: rgba(255, 255, 255, 0.18);
+  background: transparent;
+  color: #e8e2d2;
+  font-size: 1.2rem;
+}
+.link-fallback > p {
+  margin: 0.35rem 0 0.55rem;
+  color: #c6beae;
+  font-size: 0.82rem;
+}
+.link-fallback-actions {
+  display: flex;
+  gap: 0.45rem;
+}
+.link-fallback-actions input {
+  min-width: 0;
+  flex: 1 1 auto;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.28);
+  color: #f1ede4;
+  font-family: "HackGen Console NF", Menlo, "DejaVu Sans Mono", Consolas, monospace;
+  font-size: 0.78rem;
+}
+.link-fallback-actions button {
+  flex: 0 0 auto;
+  border-color: #2a7dd7;
+  background: #1e5fb3;
+  color: #fff;
+}
+.link-fallback-actions button:hover { background: #2a7dd7; }
+.link-fallback button:focus-visible,
+.link-fallback input:focus-visible {
+  outline: 2px solid #6db4ff;
+  outline-offset: 2px;
+}
+.link-fallback .link-fallback-status {
+  min-height: 1em;
+  margin-bottom: 0;
+  color: #9dcaff;
+}
+@media (max-width: 32rem) {
+  .link-fallback-actions { flex-direction: column; }
+  .link-fallback-actions button { width: 100%; }
+}

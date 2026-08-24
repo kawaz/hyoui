@@ -133,6 +133,78 @@
   const termEl = document.getElementById('term');
   if (termEl) termEl.style.background = background;
 
+  const linkFallback = document.getElementById('linkFallback');
+  const linkFallbackUrl = document.getElementById('linkFallbackUrl');
+  const linkFallbackCopy = document.getElementById('linkFallbackCopy');
+  const linkFallbackClose = document.getElementById('linkFallbackClose');
+  const linkFallbackStatus = document.getElementById('linkFallbackStatus');
+  const ALLOWED_LINK_PROTOCOLS = new Set(['http:', 'https:']);
+
+  function allowedLinkUrl(raw) {
+    try {
+      const url = new URL(raw);
+      return ALLOWED_LINK_PROTOCOLS.has(url.protocol) ? url.href : null;
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  function showLinkFallback(url, message) {
+    linkFallbackUrl.value = url;
+    linkFallbackStatus.textContent = message || '';
+    linkFallback.hidden = false;
+    linkFallbackCopy.focus({ preventScroll: true });
+  }
+
+  function openTerminalLink(_event, raw) {
+    const url = allowedLinkUrl(raw);
+    if (!url) return;
+
+    // `noopener` を window.open の feature に渡すと、正常に開いても戻り値が null に
+    // なる browser があり popup block と区別できない。まず名前付きの空 tab を開いて
+    // 成否を判定し、rel=noopener noreferrer の link を同じ tab へ送る。
+    const popupName = `hyoui-link-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const popup = window.open('', popupName);
+    if (!popup) {
+      showLinkFallback(url, 'URL をコピーしてブラウザで開いてください。');
+      return;
+    }
+    try {
+      const link = document.createElement('a');
+      link.href = url;
+      link.target = popupName;
+      link.rel = 'noopener noreferrer';
+      link.hidden = true;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      popup.opener = null;
+      linkFallback.hidden = true;
+    } catch (e) {
+      try { popup.close(); } catch (_closeError) { /* no-op */ }
+      showLinkFallback(url, `新しいタブへ移動できませんでした: ${e.message}`);
+    }
+  }
+
+  linkFallbackClose.addEventListener('click', () => {
+    linkFallback.hidden = true;
+    linkFallbackStatus.textContent = '';
+  });
+  linkFallbackCopy.addEventListener('click', async () => {
+    const url = linkFallbackUrl.value;
+    try {
+      if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+        throw new Error('Clipboard API is unavailable');
+      }
+      await navigator.clipboard.writeText(url);
+      linkFallbackStatus.textContent = 'URL をコピーしました。';
+    } catch (_e) {
+      linkFallbackUrl.focus();
+      linkFallbackUrl.select();
+      linkFallbackStatus.textContent = 'URL を選択しました。ブラウザのコピー操作を使ってください。';
+    }
+  });
+
   const term = new Terminal({
     cols: COLS,
     rows: ROWS,
@@ -151,6 +223,12 @@
     fontFamily,
     fontSize,
     theme: { background, foreground },
+    // xterm.js 組み込み OSC 8 provider は、この false により http/https 以外を
+    // link 化しない。activate は WebLinksAddon と共有し、確認 dialog を挟まず開く。
+    linkHandler: {
+      activate: openTerminalLink,
+      allowNonHttpProtocols: false,
+    },
   });
   // 文字幅 provider は初期 URL 設定と情報パネル内の runtime 変更で同じ関数を使う。
   // ambw provider は Unicode 版ごとに 1 回だけ register し、以後は activeVersion の
@@ -201,6 +279,18 @@
     }
   } else if (window.__hyouiDebug) {
     window.__hyouiDebug('warn', 'FitAddon global not found');
+  }
+  // OSC 8 は xterm.js 組み込み provider、画面内の素の http/https URL は
+  // WebLinksAddon が担当する。双方の activate だけを共通化する。
+  if (window.WebLinksAddon) {
+    try {
+      term.loadAddon(new window.WebLinksAddon.WebLinksAddon(openTerminalLink));
+      if (window.__hyouiDebug) window.__hyouiDebug('info', 'web links addon loaded');
+    } catch (e) {
+      if (window.__hyouiDebug) window.__hyouiDebug('warn', 'web links addon load failed: ' + e.message);
+    }
+  } else if (window.__hyouiDebug) {
+    window.__hyouiDebug('warn', 'WebLinksAddon global not found');
   }
   // ---- webfont のロードを待ってから open する (font-load / fit race 対策) ----
   //
@@ -431,14 +521,15 @@
       setTimeout(() => term.blur(), 0);
       return;
     }
-    // focus 済み tap は後続 synthetic click が xterm を再 focus するため、この case
-    // だけ default を抑止する。移動 gesture と初回 focus は抑止せず既存動作を保つ。
-    if (state.wasFocused) event.preventDefault();
-    setTimeout(() => {
-      if (state.wasFocused) term.blur();
-      else term.focus();
-    }, 0);
-  }, { passive: false });
+    if (state.wasFocused) {
+      // preventDefault すると compatibility mouseup まで消え、xterm の public link
+      // provider が activate できない。mouseup は通し、その後の click capture で
+      // terminal を blur する。link / 通常 cell の座標判定は xterm に委ねる。
+      terminalCloseOnlyClickPending = true;
+    } else {
+      setTimeout(() => term.focus(), 0);
+    }
+  }, { passive: true });
   termEl.addEventListener('touchcancel', () => { terminalTouch = null; }, { passive: true });
   termEl.addEventListener('pointerdown', () => {
     if (inputPanel.hidden) terminalCloseOnlyClickPending = false;

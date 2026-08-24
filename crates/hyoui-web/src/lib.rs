@@ -857,6 +857,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_page_loads_web_links_addon_before_session_code() {
+        // 素の http/https URL は vendored WebLinksAddon が担当する。session.js の
+        // 初期化より先に addon の UMD global が存在し、runtime CDN に依存しない。
+        let app = router(hyoui::config::Config::default(), None);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/anything")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        let addon = html
+            .find("/assets/vendor/addon-web-links.js")
+            .expect("body missing vendored WebLinksAddon reference");
+        let session = html
+            .find("/assets/session.js")
+            .expect("body missing session.js reference");
+        assert!(addon < session, "WebLinksAddon must load before session.js");
+    }
+
+    #[tokio::test]
+    async fn embedded_asset_web_links_addon_served() {
+        // DR-0027 の runtime CDN 禁止を守り、素 URL provider の UMD build を
+        // release binary に埋め込んで JavaScript として配信する。
+        let app = router(hyoui::config::Config::default(), None);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/vendor/addon-web-links.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.starts_with("application/javascript"), "ct={ct}");
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        assert!(
+            body.len() > 1000,
+            "addon-web-links.js too small: {} B",
+            body.len()
+        );
+    }
+
+    #[tokio::test]
     async fn embedded_asset_xterm_js_served() {
         let app = router(hyoui::config::Config::default(), None);
         let resp = app

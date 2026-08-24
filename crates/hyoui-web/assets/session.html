@@ -38,6 +38,19 @@
     <button type="button" id="resumeBtn">▶ resume</button>
   </div>
   <div id="term"></div>
+  <aside id="linkFallback" class="link-fallback" hidden role="alertdialog" aria-modal="false"
+         aria-labelledby="linkFallbackTitle" aria-describedby="linkFallbackDescription">
+    <div class="link-fallback-head">
+      <strong id="linkFallbackTitle">リンクを開けませんでした</strong>
+      <button id="linkFallbackClose" type="button" aria-label="close">×</button>
+    </div>
+    <p id="linkFallbackDescription">ブラウザまたは埋め込み元が新しいタブをブロックしました。</p>
+    <div class="link-fallback-actions">
+      <input id="linkFallbackUrl" type="text" readonly aria-label="Blocked link URL">
+      <button id="linkFallbackCopy" type="button">URL をコピー</button>
+    </div>
+    <p id="linkFallbackStatus" class="link-fallback-status" aria-live="polite"></p>
+  </aside>
   <!--
     DR-0027 Phase3 続: 常設 input 欄は廃止し、フローティング呼び出しボタン (#inputFab)
     + 展開パネル (#inputPanel) に置き換え (kawaz 要望 2026-07-23)。WS attach でキーは
@@ -165,6 +178,7 @@
 <script src="/assets/vendor/xterm.js"></script>
 <script src="/assets/vendor/addon-unicode11.js"></script>
 <script src="/assets/vendor/addon-fit.js"></script>
+<script src="/assets/vendor/addon-web-links.js"></script>
 <script src="/assets/unicode-ambiguous.js"></script>
 <script src="/assets/session.js"></script>
 </body>

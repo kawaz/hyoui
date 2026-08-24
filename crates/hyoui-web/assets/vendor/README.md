@@ -22,6 +22,12 @@
   from https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js).
   MIT License. コンテナサイズから cols/rows を計算して xterm.js の grid を
   fit させるアドオン (= viewport 変化 / iframe 幅 に追従、DR-0027 UI 側)。
+- `addon-web-links.js` — xterm-addon-web-links v0.9.0 UMD build (obtained
+  2026-08-24 from
+  https://registry.npmjs.org/xterm-addon-web-links/-/xterm-addon-web-links-0.9.0.tgz).
+  MIT License. xterm.js v5 系と組み合わせ、画面内の素の `http://` / `https://`
+  URL を link provider として検出するアドオン。OSC 8 hyperlink は xterm.js
+  組み込み provider が担当し、本 addon は担当しない。
 
 Do not fetch from CDN at runtime (DR-0027 §4: bundler なし、vendored copy を
 crate に埋め込み)。バージョン更新時は上記 URL から取り直して同 file 名で上書き。
