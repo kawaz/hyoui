@@ -20,22 +20,10 @@
 
 ## 裁定待ち
 
-### 👺LR2-Q1: leader CLI の表面設計 (LR-Q1=a の後続、DR-0033)
+(現在なし)
 
-意味論: leader は「接続」に付く属性 (切断で cascade 移動)。standalone な `hyoui leader request <session>` は「一瞬 leader を取って切断 → 即 cascade」となり意味を成さない。他 client への leader 付与は DR-0033 で導入しないと決定済み。よって CLI 表面は「自分の attach 接続を leader にする」入り口に限られる:
-
-- [ ] a: `hyoui attach --take-leader` — attach 開始時に leader.request を自動送信 (統括推し。web の「leader になる」ボタンと同型の意味論で最小)
-- [ ] b: attach 中の in-attach 操作として追加 (DR-0032 child action menu 等に項目追加。既存 attach を後から leader 化できるが、menu は「子 suspend 時」文脈なので置き場が歪む懸念)
-- [ ] c: 保留 — 現状 web の「leader になる」で用が足りており、CLI 側の実需が出るまで作らない
 
 ## 確認待ち
-
-### 👺LT-C1: leader 奪取 (v0.9.34) の実機確認 — iPad の件の本修正
-
-- [ ] a: iPad の web ターミナルで FAB → 情報タブ → ATTACH の「leader になる」ボタンで主導権を奪取でき、PTY サイズが iPad の画面に合う (PC 側の接続はそのまま leader=no に降格)
-- [ ] b: パネル開閉のフォーカス調整 (FAB を開くとキーボードが一度しまわれる / 入力欄フォーカス中にターミナルタップでパネルが閉じてキーボードもしまわれる) が意図どおり
-- [ ] c (v0.9.35): パネル open 中のターミナルタップは**常に** close のみ (キーボードが出てこない。m54 の穴の修正)
-- [ ] d (v0.9.35): 「テキスト選択」モードで範囲選択・コピーが iPad でできる (静止オーバーレイ、Esc/× で復帰)
 
 ### 👺DR32-C1: DR-0032 実装 (v0.9.32) の実機確認
 
