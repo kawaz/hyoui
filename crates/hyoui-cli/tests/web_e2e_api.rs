@@ -208,8 +208,8 @@ fn e2e_screen_layer_query_selects_visible_scrollback_or_both() {
     let (mut web, port) = spawn_web(runtime.path());
     let panic_guard = ChildGuard(&mut web);
 
-    // query 省略時は visible layer。初期復元以外の refresh が scrollback 全量を
-    // 再送しないことと、既存 API の振る舞いを同時に固定する。
+    // query 省略時は既存 API と同じ visible layer。web UI は full reset 時に
+    // `layer=both` を明示し、他の API caller は必要な範囲を選べる。
     let deadline = Instant::now() + Duration::from_secs(5);
     let visible = loop {
         let response = http_request(port, "GET", &format!("/api/sessions/{sid}/screen"), None);

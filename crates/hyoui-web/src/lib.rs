@@ -952,9 +952,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_asset_requests_scrollback_for_initial_restore() {
-        // 初回 HTTP 復元と WS open 後の復元は daemon の履歴を含む `both` を選ぶ。
-        // refresh / timer は引数なしの `fetchScreen()` のままなので visible だけを返す。
+    async fn session_asset_requests_scrollback_for_every_full_restore() {
+        // fetchScreen は xterm を reset して全画面を書き直すため、初期表示だけでなく
+        // refresh / fallback polling / 文字幅設定変更でも daemon の履歴を含む `both` を選ぶ。
         let app = router(hyoui::config::Config::default(), None);
         let resp = app
             .oneshot(
@@ -969,13 +969,12 @@ mod tests {
         let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let script = std::str::from_utf8(&body).unwrap();
         assert!(
-            script.contains("includeScrollback ? '?layer=both' : ''"),
-            "initial restore must select the both layer"
+            script.contains("/screen?layer=both"),
+            "every full restore must select the both layer"
         );
-        assert_eq!(
-            script.matches("fetchScreen(true);").count(),
-            2,
-            "startup and WS-open restore paths must include scrollback"
+        assert!(
+            !script.contains("includeScrollback"),
+            "fetchScreen must not expose a visible-only restore path"
         );
     }
 

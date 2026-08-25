@@ -1064,25 +1064,19 @@
   }
   resumeBtn.addEventListener('click', sendResume);
 
-  // fetchScreen は「reset + 全 ANSI 書き直し」を行うため、実行するたびに
-  // scrollback 履歴と現行の選択範囲を破棄する。WS attach 中は raw stream の
-  // incremental append で状態が反映され続けるので、fetchScreen を呼ぶと
-  // scrollback / 選択 / コピー中の状態が壊れる (kawaz 受け入れ条件 2026-07-23)。
-  // よって wsIsOpen() 判定で reset 系呼び出しは全て抑止する:
-  // - refresh ボタン: WS 中は no-op に降格 (`refresh (ws active)` バッジで示す)
-  // - auto refresh checkbox: WS 中は無効化 (schedule() が timer を張らない)
-  // - sendSpecs 後の 300ms 後 fetchScreen: WS 中は skip (WS 側で描画される)
-  // WS onopen 直後の初回 fetchScreen だけは、bridge が接続時点以降の追記しか
-  // 出さない性質上、初期状態を xterm へ流し込む唯一の手段なので許容する
-  // (= 直後に選択操作は無いはず、以降は WS のみ)。
-  async function fetchScreen(includeScrollback = false) {
+  // fetchScreen は xterm を reset して全 ANSI を書き直す。reset で local の
+  // scrollback と選択範囲は失われるため、毎回 daemon の rows-based ring と viewport
+  // (`layer=both`) を取得して履歴を復元する。ring 自体の行数上限
+  // (`--scrollback-rows`, default 1000) を payload の正本上限とし、gateway 側で
+  // ANSI bytes を不正確に行分割する別上限は設けない。
+  //
+  // WS attach 中は incremental append が主経路なので、不要な reset による選択破棄と
+  // 全履歴再送を避けるため、timer / send 後の fetch は wsIsOpen() で抑止する。
+  // WS onopen 直後だけは、bridge が接続時点以降の追記しか出さないため全状態を復元する。
+  async function fetchScreen() {
     statusEl.textContent = 'fetching…';
     try {
-      // 初期復元だけ daemon の rows-based ring と viewport を取得する。ring 自体の
-      // 行数上限 (`--scrollback-rows`, default 1000) を payload の正本上限とし、
-      // gateway 側で ANSI bytes を不正確に行分割する別上限は設けない。
-      const layer = includeScrollback ? '?layer=both' : '';
-      const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/screen${layer}`, { cache: 'no-store' });
+      const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/screen?layer=both`, { cache: 'no-store' });
       if (r.status === 404) {
         statusEl.textContent = 'session not found (404)';
         return;
@@ -1786,18 +1780,18 @@
     ws.onopen = () => {
       setWsStatus('connected');
       wsReconnectMs = 1000;
-      // WS 接続中は screen ポーリング停止 (= 転送コスト削減 + reset で scrollback
-      // が消えるのを avoid)。auto refresh checkbox は disable にして UI 上も
+      // WS 接続中は screen ポーリング停止 (= 全履歴再送の回避 + reset による
+      // 選択破棄の防止)。auto refresh checkbox は disable にして UI 上も
       // 「今は WS が主」であることを示す。
       if (timer) { clearInterval(timer); timer = null; }
       autoEl.disabled = true;
-      autoEl.title = 'WS 接続中は auto refresh 無効 (scrollback / 選択保護)';
+      autoEl.title = 'WS 接続中は auto refresh 無効 (選択保護 / 全履歴再送回避)';
       flushPendingToWs();
       if (autoResizeEl.checked) scheduleFit(true);
       // 接続直後は daemon 側が redraw をまだ送っていない可能性がある。
       // 一度だけ screen dump を fetch して初期状態を xterm に流し込む
       // (= WS 経由の incremental だけだと画面が空のまま長時間になる懸念を潰す)。
-      fetchScreen(true);
+      fetchScreen();
     };
     ws.onmessage = (ev) => {
       if (ev.data instanceof ArrayBuffer) {
@@ -1872,12 +1866,12 @@
   });
 
   autoEl.addEventListener('change', schedule);
-  // refresh ボタン: WS 中に押すと reset が走って scrollback / 選択が消える。
+  // refresh ボタン: WS 中に押すと reset が走って現行の選択が消える。
   // 「明示押下は WS 中でも状態リセットの意図がある」ケース (= 画面が乱れた等) が
   // あり得るので nop にせず、確認ダイアログでガードする (誤タップ抑止)。
   refreshBtn.addEventListener('click', () => {
     if (wsIsOpen()) {
-      if (!confirm('WS 接続中です。refresh すると scrollback と選択が消えます。実行しますか?')) return;
+      if (!confirm('WS 接続中です。refresh すると現在の選択が消えます。実行しますか?')) return;
     }
     fetchScreen();
     refreshSessionStatus();
@@ -1885,7 +1879,7 @@
   // PWA (standalone) 用の全ページリロード。詳細は index.js の該当箇所参照。
   const reloadBtn = document.getElementById('reload');
   if (reloadBtn) reloadBtn.addEventListener('click', () => location.reload());
-  fetchScreen(true);
+  fetchScreen();
   refreshSessionStatus();
   schedule();
   // WS attach 開始 (= 成功すればポーリング停止、失敗しても指数バックオフで再試行)。
