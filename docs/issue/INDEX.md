@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-08-25 | request | open | [hyoui-attach-take-leader](./2026-08-25-hyoui-attach-take-leader.md) | hyoui attach --take-leader を実装する (LR2-Q1 裁定 a、DR-0033 leader.request 奪取の CLI 後続) |
 | 2026-08-25 | task | open | [web-gateway-restart-kill-not-reliable](./2026-08-25-web-gateway-restart-kill-not-reliable.md) | web gateway の再起動は kill だけでは復帰しないことがある (KeepAlive 頼みにせず register を使う) |
 | 2026-08-24 | bug | open | [attach-osc8-hyperlink-metadata-loss](./2026-08-24-attach-osc8-hyperlink-metadata-loss.md) | attach 前に出力された OSC 8 hyperlink は attach 後の画面復元でリンク機能を失う。vt100 が OSC 8 未対応で screen state に metadata が残らない (DR-0013 延長、案 A/B/C 未裁定) |
 | 2026-08-24 | bug | open | [web-screen-fetch-alt-mode-lost](./2026-08-24-web-screen-fetch-alt-mode-lost.md) | web UI の初期 /screen fetch が alternate screen mode を復元しない。daemon は alt を正しく認識しているが xterm 側は activeType が normal のまま |
