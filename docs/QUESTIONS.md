@@ -54,8 +54,18 @@ m41-43 の裁定 (閉じる廃止 / Esc=resume / UX 視点の 2 群) は v0.9.32
 
 ### 👺LINK-C1: ターミナル内リンク (v0.9.40) の実機確認
 
-**ccmsg 経由で見る場合はブラウザのリロードが必要** (ccmsg v0.112.1 で iframe に
-`allow-popups` を追加済み。リロードしないと古い iframe 設定のままでリンクが開けない)。
+**前提** (どちらか欠けるとリンクは開けない。2026-08-25 に統括が実施済み):
+1. `brew upgrade kawaz/tap/hyoui` で hyoui 本体を v0.9.40 以降にする。**web の assets は
+   バイナリに埋め込まれている**ため、古いバイナリのままだと古い session.js が配信される
+   (実際に v0.9.35 のままで `linkHandler` が無く、xterm 既定の `confirm()` が呼ばれて
+   `Ignored call to 'confirm()'. The document is sandboxed` になった)
+2. web gateway を再起動する (launchd 管理なので pid を kill すれば KeepAlive が復帰させる。
+   `hyoui web service status` で新 pid を確認)
+3. ブラウザをリロードする (ccmsg 経由なら iframe の `allow-popups` を読み込むためにも必要。
+   ccmsg v0.112.1 以降)
+
+検証コマンド: `curl -s http://127.0.0.1:43690/assets/session.js | grep -c 'linkHandler'`
+が 1 以上なら新しい assets が配信されている。
 
 - [ ] a: デスクトップで Claude Code の応答内 markdown リンクをクリック → 新規タブで開く
   (確認ダイアログは出ない。開いた先が正常に表示・動作する)
