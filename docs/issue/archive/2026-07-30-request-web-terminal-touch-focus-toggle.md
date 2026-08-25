@@ -1,6 +1,6 @@
 ---
 title: web terminal の touch 再タップで focus を解除する
-status: blocked
+status: resolved
 category: request
 created: 2026-07-30T21:32:08+09:00
 last_read: 2026-08-21T10:25:05+09:00
@@ -9,11 +9,11 @@ wip_entered: 2026-07-30T21:32:08+09:00
 blocked_entered: 2026-08-21T10:27:44+09:00
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-08-25T16:00:49+09:00
 discard_reason:
 pending_reason:
-close_reason:
-blocked_by: ["docs/QUESTIONS.md LT-C1 b/c"]
+close_reason: ["done: LT-C1 b/c を kawaz が iPad 実機で確認済み (2026-08-25)"]
+blocked_by: []
 origin: kawaz 要望 (2026-07-30 ccmsg r92 m45)
 ---
 
