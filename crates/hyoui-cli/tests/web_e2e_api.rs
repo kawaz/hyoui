@@ -37,17 +37,27 @@ fn runtime_dir() -> tempfile::TempDir {
 }
 
 fn spawn_detached(runtime: &Path, sid: &str) {
+    spawn_detached_command(
+        runtime,
+        sid,
+        &[],
+        // stdin を line 単位で echo back。POST /input の text が visible に反映される。
+        "while IFS= read -r line; do echo \"$line\"; done",
+    );
+}
+
+fn spawn_detached_command(runtime: &Path, sid: &str, run_options: &[&str], command: &str) {
+    let mut args = vec![
+        "run".to_string(),
+        "--detached".to_string(),
+        format!("--session={sid}"),
+    ];
+    args.extend(run_options.iter().map(|arg| (*arg).to_string()));
+    args.extend(["--", "sh", "-c"].map(str::to_string));
+    args.push(command.to_string());
+
     let status = Command::new(hyoui_bin())
-        .args([
-            "run",
-            "--detached",
-            &format!("--session={sid}"),
-            "--",
-            "sh",
-            "-c",
-            // stdin を line 単位で echo back。POST /input の text が visible に反映される。
-            "while IFS= read -r line; do echo \"$line\"; done",
-        ])
+        .args(args)
         .env("XDG_RUNTIME_DIR", runtime)
         .env_remove("XDG_STATE_HOME")
         .env_remove("HYOUI_SESSION_ID")
@@ -183,6 +193,76 @@ fn http_request(port: u16, method: &str, path: &str, body: Option<(&str, &[u8])>
         content_type,
         body,
     }
+}
+
+#[test]
+fn e2e_screen_layer_query_selects_visible_scrollback_or_both() {
+    let runtime = runtime_dir();
+    let sid = "web-e2e-screen-layer";
+    spawn_detached_command(
+        runtime.path(),
+        sid,
+        &["--size=80x10", "--scrollback-rows=100"],
+        "i=1; while [ $i -le 40 ]; do printf 'WEB-HISTORY-%03d\\n' $i; i=$((i+1)); done; printf 'WEB-VISIBLE-END\\n'; exec sleep 60",
+    );
+    let (mut web, port) = spawn_web(runtime.path());
+    let panic_guard = ChildGuard(&mut web);
+
+    // query 省略時は visible layer。初期復元以外の refresh が scrollback 全量を
+    // 再送しないことと、既存 API の振る舞いを同時に固定する。
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let visible = loop {
+        let response = http_request(port, "GET", &format!("/api/sessions/{sid}/screen"), None);
+        if response.status == 200 && response.body.windows(15).any(|w| w == b"WEB-VISIBLE-END") {
+            break response;
+        }
+        assert!(Instant::now() < deadline, "visible marker did not arrive");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        !visible.body.windows(15).any(|w| w == b"WEB-HISTORY-001"),
+        "default visible layer must not contain old scrollback"
+    );
+
+    // both は daemon の rows-based ring と現 viewport を連結する。web 初期表示は
+    // この layer を選び、xterm.js が古い行を scrollback として復元できる。
+    let both = http_request(
+        port,
+        "GET",
+        &format!("/api/sessions/{sid}/screen?layer=both"),
+        None,
+    );
+    assert_eq!(both.status, 200);
+    assert!(both.body.windows(15).any(|w| w == b"WEB-HISTORY-001"));
+    assert!(both.body.windows(15).any(|w| w == b"WEB-VISIBLE-END"));
+    assert!(both.body.len() > visible.body.len());
+
+    // scrollback layer は過去行だけを返し、現在の viewport は混ぜない。
+    let scrollback = http_request(
+        port,
+        "GET",
+        &format!("/api/sessions/{sid}/screen?layer=scrollback"),
+        None,
+    );
+    assert_eq!(scrollback.status, 200);
+    assert!(scrollback.body.windows(15).any(|w| w == b"WEB-HISTORY-001"));
+    assert!(
+        !scrollback.body.windows(15).any(|w| w == b"WEB-VISIBLE-END"),
+        "scrollback-only response must exclude the visible viewport"
+    );
+
+    // 未知の layer は visible へ黙って fallback せず 400 にする。typo で初期履歴を
+    // 欠落させても成功扱いになる状態を避けるため。
+    let invalid = http_request(
+        port,
+        "GET",
+        &format!("/api/sessions/{sid}/screen?layer=unknown"),
+        None,
+    );
+    assert_eq!(invalid.status, 400);
+
+    drop(panic_guard);
+    cleanup(runtime.path(), sid);
 }
 
 #[test]

@@ -460,10 +460,7 @@ fn build_plain_text_from_rows(rows: &[Vec<RowCellSnap>], trim_trailing: bool) ->
 
 /// `build_screen_dump` の error。
 ///
-/// 注: `LayerNotImplemented` variant は Phase B 時代に scrollback/both を未実装で
-/// 返すために存在したが、Phase C で配線完了して不要になったため削除済 (= 全 layer
-/// が dispatch されるため layer 起因の error は発生しない、format 起因の error と
-/// encode 失敗のみが残る)。
+/// 全 layer は dispatch 済みで、error は format と encode の失敗だけを表す。
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ScreenDumpError {
     /// 未実装の format (= `Json`)。

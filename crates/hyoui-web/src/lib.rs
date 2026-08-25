@@ -8,7 +8,8 @@
 //!
 //! - `GET  /api/sessions` — 全 namespace 横断で live/stale session を JSON list で返す
 //! - `GET  /api/sessions/:id/screen` — `screen.dump.request` の ANSI payload を
-//!   `text/plain; charset=utf-8` で返す
+//!   `text/plain; charset=utf-8` で返す。`?layer=visible|scrollback|both` (default:
+//!   `visible`) で取得範囲を選択する
 //! - `POST /api/sessions/:id/input` — body `{"specs": ["text:...", "key:Enter"]}`
 //!   を hyoui input と同じ流儀で送信 (= `parse_input_spec` → `input_bytes` → raw_data frame)
 //!
@@ -26,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Path, State, WebSocketUpgrade};
+use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -158,13 +159,26 @@ fn session_entry_to_json(e: &hyoui::discovery::SessionEntry) -> serde_json::Valu
 // GET /api/sessions/:id/screen
 // -----------------------------------------------------------------------------
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct ScreenQuery {
+    layer: Option<hyoui::protocol::messages::ScreenDumpLayer>,
+}
+
 /// `screen.dump.request` の ANSI payload を `text/plain; charset=utf-8` で返す。
-async fn get_screen(Path(id): Path<String>, State(_state): State<AppState>) -> Response {
+async fn get_screen(
+    Path(id): Path<String>,
+    Query(query): Query<ScreenQuery>,
+    State(_state): State<AppState>,
+) -> Response {
     let sock = match resolve_socket(&id).await {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    let bytes = match tokio::task::spawn_blocking(move || dump_screen_blocking(&sock)).await {
+    let layer = query
+        .layer
+        .unwrap_or(hyoui::protocol::messages::ScreenDumpLayer::Visible);
+    let bytes = match tokio::task::spawn_blocking(move || dump_screen_blocking(&sock, layer)).await
+    {
         Ok(Ok(b)) => b,
         Ok(Err(msg)) => return internal_error(format!("screen dump failed: {msg}")),
         Err(e) => return internal_error(format!("screen dump join error: {e}")),
@@ -177,9 +191,12 @@ async fn get_screen(Path(id): Path<String>, State(_state): State<AppState>) -> R
         .into_response()
 }
 
-fn dump_screen_blocking(socket_path: &std::path::Path) -> Result<Vec<u8>, String> {
+fn dump_screen_blocking(
+    socket_path: &std::path::Path,
+    layer: hyoui::protocol::messages::ScreenDumpLayer,
+) -> Result<Vec<u8>, String> {
     use hyoui::client::{AttachOptions, ClientConnection};
-    use hyoui::protocol::messages::{ScreenDumpFormat, ScreenDumpLayer, ScreenDumpRequest};
+    use hyoui::protocol::messages::{ScreenDumpFormat, ScreenDumpRequest};
     use hyoui::protocol::{ControlMessage, MVP_CAPS, Mode};
 
     let opts = AttachOptions {
@@ -193,7 +210,7 @@ fn dump_screen_blocking(socket_path: &std::path::Path) -> Result<Vec<u8>, String
         .map_err(|e| format!("connect/handshake: {e}"))?;
     let req = ScreenDumpRequest {
         format: ScreenDumpFormat::Ansi,
-        layer: ScreenDumpLayer::Visible,
+        layer,
         rect: None,
         serial: Some(1),
     };
@@ -932,6 +949,34 @@ mod tests {
         assert!(ct.starts_with("application/javascript"), "ct={ct}");
         let body = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
         assert!(body.len() > 1000, "xterm.js too small: {} B", body.len());
+    }
+
+    #[tokio::test]
+    async fn session_asset_requests_scrollback_for_initial_restore() {
+        // 初回 HTTP 復元と WS open 後の復元は daemon の履歴を含む `both` を選ぶ。
+        // refresh / timer は引数なしの `fetchScreen()` のままなので visible だけを返す。
+        let app = router(hyoui::config::Config::default(), None);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/session.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let script = std::str::from_utf8(&body).unwrap();
+        assert!(
+            script.contains("includeScrollback ? '?layer=both' : ''"),
+            "initial restore must select the both layer"
+        );
+        assert_eq!(
+            script.matches("fetchScreen(true);").count(),
+            2,
+            "startup and WS-open restore paths must include scrollback"
+        );
     }
 
     #[tokio::test]

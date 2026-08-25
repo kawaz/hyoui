@@ -1075,10 +1075,14 @@
   // WS onopen 直後の初回 fetchScreen だけは、bridge が接続時点以降の追記しか
   // 出さない性質上、初期状態を xterm へ流し込む唯一の手段なので許容する
   // (= 直後に選択操作は無いはず、以降は WS のみ)。
-  async function fetchScreen() {
+  async function fetchScreen(includeScrollback = false) {
     statusEl.textContent = 'fetching…';
     try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/screen`, { cache: 'no-store' });
+      // 初期復元だけ daemon の rows-based ring と viewport を取得する。ring 自体の
+      // 行数上限 (`--scrollback-rows`, default 1000) を payload の正本上限とし、
+      // gateway 側で ANSI bytes を不正確に行分割する別上限は設けない。
+      const layer = includeScrollback ? '?layer=both' : '';
+      const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/screen${layer}`, { cache: 'no-store' });
       if (r.status === 404) {
         statusEl.textContent = 'session not found (404)';
         return;
@@ -1793,7 +1797,7 @@
       // 接続直後は daemon 側が redraw をまだ送っていない可能性がある。
       // 一度だけ screen dump を fetch して初期状態を xterm に流し込む
       // (= WS 経由の incremental だけだと画面が空のまま長時間になる懸念を潰す)。
-      fetchScreen();
+      fetchScreen(true);
     };
     ws.onmessage = (ev) => {
       if (ev.data instanceof ArrayBuffer) {
@@ -1881,7 +1885,7 @@
   // PWA (standalone) 用の全ページリロード。詳細は index.js の該当箇所参照。
   const reloadBtn = document.getElementById('reload');
   if (reloadBtn) reloadBtn.addEventListener('click', () => location.reload());
-  fetchScreen();
+  fetchScreen(true);
   refreshSessionStatus();
   schedule();
   // WS attach 開始 (= 成功すればポーリング停止、失敗しても指数バックオフで再試行)。

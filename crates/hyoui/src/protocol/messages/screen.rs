@@ -42,10 +42,9 @@ pub enum ScreenDumpFormat {
 pub enum ScreenDumpLayer {
     /// 現在 visible な viewport のみ。
     Visible,
-    /// scrollback (= 過去) のみ。**Phase B では未実装** (= vt100 0.16 内蔵 ring が
-    /// 統合途中、Phase C で配線)。
+    /// scrollback (= 過去) のみ。vt100 内蔵 ring の保存行数上限に従う。
     Scrollback,
-    /// scrollback + visible 連結。**Phase B では未実装**。
+    /// scrollback + visible viewport を連結。
     Both,
 }
 
@@ -57,8 +56,8 @@ pub struct ScreenDumpRequest {
     pub format: ScreenDumpFormat,
     /// 対象 layer (= visible / scrollback / both)。
     pub layer: ScreenDumpLayer,
-    /// 矩形指定 (= 未指定なら full viewport)。Phase B は実装するが、現状 layer 含めて
-    /// 全画面のみ対応 (= rect は受信したら無視する仕様)。
+    /// 矩形指定 (= 未指定なら full viewport)。現在は全画面のみ対応し、指定値は
+    /// 受信側で無視する。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rect: Option<DumpRect>,
     /// PDU serial 番号 (DR-0013 §10 PDU serial 土台)。client が応答対応付け用に
