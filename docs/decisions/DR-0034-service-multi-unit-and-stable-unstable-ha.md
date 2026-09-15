@@ -259,9 +259,11 @@ port の割り当て (決定 3) と既存 1 台の移行手順 (決定 8) は本
 
 判断軸は kawaz 提示のとおり「web 以外に OS 常駐させる unit の種類が出てくるか」。Context の洗い出しでは **現時点で web gateway 以外に無い** (record / redaction / screen watch はいずれも daemon 内、PTY session daemon は `run` が unit を決めるので OS から起こせない、graceful upgrade は走っているプロセスの self-exec)。将来候補として「login 時に決まった PTY session を起こす」が 1 つ挙がるが、issue も DR も無い。
 
-**統括推し: `hyoui service` (= 決定 1 の形)。** kind が 1 種類のうちは階層を 1 段減らす。kind が増えたら `add --kind` を足せばよく、label には `hyoui-web` が入るので判別は label 側で付く。v1.0 未満なので後から階層を動かせる。
+**統括推し: `hyoui web service`。** 決め手は option 集合が kind と一緒に動くこと (下記)。kind が 1 種類の今は階層が 1 段余るが、`add` の option が `hyoui web` の引数の写しである以上、その階層は「何の unit を足すか」を名前で示す働きを既に持っている。採る場合は決定 1 の verb 表と決定 4 の label を `hyoui web service <verb>` / `jp.kawaz.hyoui-web.<name>` (label は変わらない) に読み替える。
 
-**対案 `hyoui web service` の利点**: `add` の引数が `hyoui web` の引数の写し (`--listen` / `--web-assets-dir`) になるため、何の unit を足しているのかがコマンドの名前で分かる。加えて、option 集合が kind と一緒に動く点が効く — session を起こす kind が来れば必要になるのは `-- cmd args...` と namespace で、`--port` / `--assets-dir` とは共有できない。共通の `hyoui service add` に両方を載せると `--kind` に応じて有効な option が分岐する形になり、help と completion で説明しづらくなる。階層で割れば各階層の option 集合が閉じる。
+**対案 `hyoui service` (= 決定 1 の現行記述) の利点**: kind が 1 種類のうちは階層を 1 段減らせる。kind が増えたら `add --kind` を足す形になるが、その時点で `--kind` に応じて有効な option が分岐し、help と completion で説明しづらくなる (表示都合ではなく、モデル自体が kind ごとに違う option 集合を持つ)。
+
+**`hyoui web service` を推す根拠**: `add` の引数が `hyoui web` の引数の写し (`--listen` / `--web-assets-dir`) になるため、何の unit を足しているのかがコマンドの名前で分かる。加えて、option 集合が kind と一緒に動く点が効く — session を起こす kind が来れば必要になるのは `-- cmd args...` と namespace で、`--port` / `--assets-dir` とは共有できない。階層で割れば各階層の option 集合が閉じる。
 
 実装コストはどちらもほぼ同じ (verb 群は 1 kind 分で変わらない)。違うのは、後から動かす時に runbook と label 名を書き直すかどうか。「session を起こす kind」に手を付ける見込みがあるかは kawaz にしか判断材料が無い。
 
