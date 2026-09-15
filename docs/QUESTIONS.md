@@ -29,6 +29,21 @@
 - [ ] c: 外さないが、ubuntu job だけ retry (`nick-fields/retry` 等) を入れて 1 回の負荷依存 fail を吸収する
 
 
+### 👺SVC-Q1: service verb 群の階層 (DR-0034 OQ-A)
+
+[DR-0034](decisions/DR-0034-service-multi-unit-and-stable-unstable-ha.md) OQ-A。常駐 unit の kind は現時点で web gateway のみ (record / redaction / screen watch は daemon 内、PTY session は `run` が unit を決める。将来候補は「login 時に決まった session を起こす」だが issue も DR も無い)。
+
+- [ ] a: `hyoui web service <verb>` (統括推し)。`add` の option が `hyoui web` の引数の写しなので、階層が「何の unit を足すか」を名前で示す。kind ごとに option 集合が閉じる
+- [ ] b: `hyoui service <verb>`。kind が 1 種類のうちは階層を 1 段減らす。kind が増えたら `--kind` で分岐 (option 集合が flag の値で変わるので help / completion で説明しづらい)
+- [ ] c: `hyoui service <kind> add <name>` / `service add <kind> <name>`。kind を階層に出しつつ top-level は `service` 1 つ
+
+### 👺SVC-Q2: reference 体系からの乖離を認めるか (DR-0034 OQ-B)
+
+原指示は「reference `cli-daemon-subcommands` に沿った作り」だが、DR-0034 は **監督者 (`supervise`) を置かない**判断をしている。launchd / systemd が「落ちたら上げる / login で上げる」を担うので、監督者は OS 機能の再発明になるため。帰結として reference の `daemon` / `service` 2 系統が `service` 1 系統に畳まれ、`register` / `unregister` は `add` / `remove` に吸収される。
+
+- [ ] a: 乖離を認める (統括推し)。unit 1 つ = launchd job 1 つ、定義ファイルが正本
+- [ ] b: reference どおり llm-gateway 型にする。`daemon supervise` 1 つを OS に載せ、`daemon add` は登録簿に書くだけ、`service register` が監督者を載せる 2 段。監督者用の socket / protocol / backoff / ログ集約が hyoui 側に必要になる
+
 ## 確認待ち
 
 ### 👺DR32-C1: DR-0032 実装 (v0.9.32) の実機確認
