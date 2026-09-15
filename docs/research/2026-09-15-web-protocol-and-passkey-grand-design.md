@@ -37,13 +37,15 @@ kawaz 依頼 (2026-09-15) の 2 点に対して、DR を起こす前の**全体�
  未知の要素  query 未知 key = 無視、WS 未知 kind = 黙殺      未知 field = 無視、未知 kind = 無視 (cap で交渉)
 ```
 
-到達経路は 3 本ある (本調査で canddy の `Caddyfile` を確認):
+到達経路は 3 本ある。現行の canddy `Caddyfile` (本調査で確認) は `hyoui.<host>.kawaz.jp` → 43690 の 1 endpoint だけだが、kawaz の方針 (2026-09-15) では **endpoint は 3 つ並ぶ**: unit ごとの個別 endpoint 2 つと、優先順付き HA の endpoint 1 つ。以下はその前提で書く。
 
 ```text
- [1] tailnet の人 ─► https://hyoui.<host>.kawaz.jp ─► canddy ─► 127.0.0.1:43690 (stable)
-                                                            └─► 127.0.0.1:43691 (unstable、DR-0034 P5 以降)
+ [1] tailnet の人
+       https://hyoui-stable.<host>.kawaz.jp   ─► canddy ─► 127.0.0.1:43690 (stable)     … 個別 endpoint
+       https://hyoui-unstable.<host>.kawaz.jp ─► canddy ─► 127.0.0.1:43691 (unstable)   … 個別 endpoint
+       https://hyoui.<host>.kawaz.jp          ─► canddy ─► 43691 → 43690 (lb_policy first) … HA endpoint (DR-0034 §7)
  [2] ccmsg webui (https://ccmsg.<host>.kawaz.jp) の Terminal タブ
-        └─ <iframe src="https://hyoui.<host>.kawaz.jp/sessions/<id>?embed=1&resize=1"
+        └─ <iframe src="<terminal_gateway>/sessions/<id>?embed=1&resize=1"   ← terminal_gateway は上 3 つのどれか (ccmsg daemon config)
                    sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
                    allow="clipboard-read; clipboard-write">      ── 認証情報は一切渡らない
  [3] 同一ホストの curl / test / `hyoui service status` ─► http://127.0.0.1:4369x 直結
@@ -52,8 +54,8 @@ kawaz 依頼 (2026-09-15) の 2 点に対して、DR を起こす前の**全体�
 ここで効く事実を 3 つ挙げる。
 
 - **[1] と [2] は gateway から見ると全部 127.0.0.1 発**。canddy が reverse proxy なので、tailnet からの接続も iframe からの接続も、gateway の accept 時点では loopback から来る。「127.0.0.1 直結は認証免除」を採ると canddy 経由も免除になり、認証を入れた意味が消える (§4.4)
-- **ccmsg webui と hyoui gateway は別 origin だが同一 site** (`ccmsg.<host>.kawaz.jp` と `hyoui.<host>.kawaz.jp`、registrable domain は `kawaz.jp`)。同一 site なら `SameSite=Strict` の cookie でも iframe 内のリクエストに乗る (仕様上の帰結。実機ブラウザでの確認は未実施 = 推測)。これが iframe 認証経路の推し (§4.3) を支える
-- **stable / unstable の 2 port は canddy の下では同一 origin** (`hyoui.<host>.kawaz.jp` 1 つ、`lb_policy first` で振り分け)。「2 port が同一 origin でない問題」は 127.0.0.1 直結 [3] にしか存在せず、[3] は §4.4 のとおり passkey の対象外にするので、問題自体が消える
+- **1 つの gateway プロセスは複数 endpoint から到達される**。stable の unit は `hyoui-stable.<host>` と `hyoui.<host>` (HA が stable に落ちた時) の 2 つ、unstable も同様に 2 つ。どの endpoint で来たかは `Host` / `Origin` ヘッダでしか判らない。passkey の RP ID と origin 照合は endpoint 単位なので、gateway は「自分が答える endpoint のリスト」を持つ必要がある (§4.4)
+- **ccmsg webui と hyoui の各 endpoint は別 origin だが同一 site** (どれも `kawaz.jp` 配下)。ccmsg の iframe に載る hyoui の RP は、ccmsg daemon config の `terminal_gateway` がどの endpoint を指すかで決まる (§4.3)
 
 ### 2026-09-15: web 境界の契約の整理案 (§2)
 
@@ -74,7 +76,7 @@ query パラメータ (DR-0027 §5) は契約文書に含めるが、未知 key 
 web 境界の「不一致」は、**gateway が配った assets (= browser 上の JS) と、今応答している gateway が同じ契約を話しているか**である。assets は gateway binary に埋め込まれる (DR-0027 §4) ので、平常時は必ず一致する。ずれるのは次の 2 場面だけ:
 
 1. browser がページを開いたまま gateway が入れ替わった (`hyoui service restart`、brew upgrade、unstable の再ビルド)
-2. canddy の fallback で、同じ origin の裏で unstable (43691) から stable (43690) に切り替わった、またはその逆 (DR-0034 §7)。**2 unit は常に別版**なので、ここは平常運用で起きる
+2. canddy の fallback で、HA endpoint (`hyoui.<host>`) の裏で unstable (43691) から stable (43690) に切り替わった、またはその逆 (DR-0034 §7)。**2 unit は常に別版**なので、ここは平常運用で起きる
 
 場面 2 が hyoui 固有の事情で、ccmsg には無い。つまり不一致は「たまの事故」ではなく「fallback のたびに起きうる状態」で、検出と誘導が無いと WS 再接続で黙って壊れる。
 
@@ -134,7 +136,7 @@ HTML を無認証で配る帰結として、ログイン状態の判定は JS �
 
 | 案 | 中身 | 評価 |
 |---|---|---|
-| (A) CLI 発行の招待 URL (ccmsg と同型) | `hyoui web passkey add [--label <名前>]` が `<public_url>/#register=<jwt>` と 6 桁コードを出す。jwt は登録 1 本ごとの乱数 secret の HMAC、10 分、fragment で運ぶ | 登録の起点がホスト上の CLI に閉じる。reference と ccmsg で実証済み。gateway が 2 unit (stable / unstable) ある場合、URL を発行した unit と登録 POST を受ける unit が canddy の振り分けで違いうる (下記 4.6) |
+| (A) CLI 発行の招待 URL (ccmsg と同型) | `hyoui web passkey add --endpoint <url> [--label <名前>]` が `<endpoint>/#register=<jwt>` と 6 桁コードを出す。jwt は登録 1 本ごとの乱数 secret の HMAC、10 分、fragment で運ぶ | 登録の起点がホスト上の CLI に閉じる。reference と ccmsg で実証済み。gateway が 2 unit (stable / unstable) ある場合、HA endpoint 宛の登録では URL を発行した unit と登録 POST を受ける unit が canddy の振り分けで違いうる (下記 4.6) |
 | (B) localhost 限定の無認証登録ページ | `http://127.0.0.1:4369x/register` を開けば登録できる | **不成立**。canddy 経由も 127.0.0.1 発なので「localhost 限定」が判定できない (§1)。`X-Forwarded-For` を信じる形にすると、前段が付けない構成で穴になる |
 | (C) 初回は無認証、1 つ登録されたら閉じる (TOFU) | 最初の登録だけ誰でもできる | tailnet 前提の今は実害が薄いが、gateway を再インストールするたびに窓が開く。(A) より簡単でもない (CLI を 1 本足すだけの差) |
 
@@ -146,18 +148,25 @@ ccmsg の検証コードは `topOrigin` が存在するだけで拒否し (棚�
 
 | 案 | 中身 | 長所 | 短所 |
 |---|---|---|---|
-| (P) **top-level で一度 hyoui に login し、cookie を持たせる** | iframe 内の hyoui ページは 401 を受けると「hyoui にログイン」ボタンを出す。押すと `window.open("<hyoui origin>/?login=1")` で hyoui origin の top-level window を開き、そこで passkey 認証 → session cookie が hyoui origin に置かれる。popup は同一 origin の `BroadcastChannel` で iframe に「ログインした」を伝え、iframe は API を叩き直す。**同一 site なので cookie は iframe 内のリクエストにも乗る** (§1、推測含む) | ccmsg 側に変更が要らない (sandbox に `allow-popups` は既にある、棚卸し Part 1-C)。iframe 内で WebAuthn を走らせないので ccmsg と同じ判断 (`topOrigin` 拒否) を hyoui でも採れる。hyoui 単体で開く経路 [1] と全く同じ認証 UI になる | ログインのたびに popup が 1 つ開く。1 度 cookie が乗れば以後は出ない (寿命は 4.5)。Safari 等の ITP が同一 site の iframe cookie をどう扱うかは**未検証** |
+| (P) **top-level で一度 hyoui に login し、cookie を持たせる** | iframe 内の hyoui ページは 401 を受けると「hyoui にログイン」ボタンを出す。押すと `window.open("<hyoui origin>/?login=1")` で hyoui origin の top-level window を開き、そこで passkey 認証 → refresh cookie が hyoui の endpoint origin に置かれる。popup は同一 origin の `BroadcastChannel` で iframe に「ログインした」を伝え、iframe は API を叩き直す。**同一 site なので cookie は iframe 内のリクエストにも乗る** (§1、推測含む) | ccmsg 側に変更が要らない (sandbox に `allow-popups` は既にある、棚卸し Part 1-C)。iframe 内で WebAuthn を走らせないので ccmsg と同じ判断 (`topOrigin` 拒否) を hyoui でも採れる。hyoui 単体で開く経路 [1] と全く同じ認証 UI になる | ログインのたびに popup が 1 つ開く。1 度 cookie が乗れば以後は出ない (寿命は 4.5)。Safari 等の ITP が同一 site の iframe cookie をどう扱うかは**未検証** |
 | (Q) 親 (ccmsg) が短命 token を発行し、iframe URL か postMessage で渡す | ccmsg daemon が hyoui 用の token を mint、hyoui が検証 | ログイン 1 回で両方に入れる | hyoui が ccmsg を IdP として信頼することになり、ccmsg-protocol / ccmsg daemon / ccmsg-webui の 3 リポに hyoui 専用の契約 (token の形、鍵の共有か公開鍵の配布) が増える。hyoui 単体の経路 [1] には別途 passkey が要るので、認証経路が 2 本になる。「hyoui の認証は hyoui が判定する」から外れる |
 | (R) iframe 内で WebAuthn を走らせる | 親が `allow="publickey-credentials-get"` を付け、hyoui の RP が `topOrigin` を許容 | popup が要らない | ccmsg-webui の変更 + hyoui 側で「どの topOrigin を許すか」の allowlist 設計が要る。ccmsg が明示的に拒否した判断の逆を張る根拠が「popup が煩わしい」だけ。`create()` (登録) の iframe 対応はブラウザ差が大きい (推測、未検証) |
 
 **統括推し: (R)** (初版は (P) を推したが、kawaz の指摘「ccmsg の `topOrigin` 拒否は ccmsg 自身が iframe に入らない判断で hyoui の RP には無関係」を受けて改めた)。ccmsg-webui 側の変更は iframe の `allow="publickey-credentials-get"` 1 属性で、登録は CLI の招待 URL を top-level で開く経路なので `create` を iframe で走らせない。hyoui 側は `[web].frame_ancestors` に ccmsg の origin を置いて `clientDataJSON.topOrigin` を照合し、同じ値で CSP `frame-ancestors` を出す (無条件許可にすると他所のサイトに埋め込まれて passkey を求められる形が開く)。(P) は popup が要る分 UX が落ちるだけで、(R) が崩れた時の退路として残す。(Q) は ccmsg と hyoui を結合する判断で、kawaz の「ccmsg の認証と hyoui の認証は別途」と合わないので採らない。
 
-(P) が成立しない場合 (= 同一 site の iframe cookie をブラウザが落とす場合) の退路は (R) で、その時は hyoui 側の `topOrigin` allowlist を config `[web].frame_ancestors` に置き、同じ値で CSP `frame-ancestors` も出す形になる。**(P) の成立は実装前に実機で確認する** (Chrome / Safari / iOS Safari の 3 category、`empirical-verification` の 3 サンプル原則)。
+**iframe 内の RP は、ccmsg が埋め込む URL の endpoint で決まる。** ccmsg daemon config の `terminal_gateway` が `https://hyoui.<host>` (HA) なら HA endpoint に登録した credential が、`https://hyoui-unstable.<host>` なら unstable の個別 endpoint に登録した credential が iframe 内で使われる (§4.4)。ccmsg 側は URL を差し替えるだけで、hyoui 側の設定は変わらない。
 
-#### 4.4 RP ID / origin と 127.0.0.1 直結
+**(R) の成立は実装前に実機で確認する** (Chrome / Safari / iOS Safari の 3 category、`empirical-verification` の 3 サンプル原則): iframe 内 `navigator.credentials.get()` が `allow` 属性付きで通ること、`clientDataJSON.topOrigin` に親 origin が入ること、refresh cookie (§4.5) が同一 site の iframe 内リクエストに乗ること (仕様上の帰結だが未検証)。
 
-- **RP ID = config `[web].public_url` (例 `https://hyoui.<host>.kawaz.jp`) の hostname に固定。** ccmsg と同じく Host ヘッダから決めない (棚卸し「RP ID / origin」)。`public_url` は新しい config 項目で、無い場合は passkey の CLI が「`[web].public_url` を設定してください」で止まる。`clientDataJSON.origin` は `public_url` の origin と完全一致
-- **`/auth/*` の POST と WS upgrade は `Origin` ヘッダを `public_url` の origin と照合**する (無い POST は 403)。cookie が `SameSite=Strict` でも、WS の cross-site hijack と CSRF に対する 2 層目
+#### 4.4 endpoint ごとの RP ID / origin と、gateway が答える endpoint のリスト
+
+**passkey は endpoint ごとに個別登録する** (kawaz 方針 2026-09-15、reference `passkey-registration-local-first` の jwt claim `endpoint` がそのまま効く)。§1 の 3 endpoint (`hyoui-stable.<host>` / `hyoui-unstable.<host>` / `hyoui.<host>`) はそれぞれ別の RP ID を持ち、credential は登録した endpoint でだけ使える。
+
+- **RP ID = endpoint の hostname、`clientDataJSON.origin` は endpoint の origin と完全一致。** ccmsg と同じく Host ヘッダから RP を「決める」ことはしない。ただし hyoui では 1 プロセスが複数 endpoint から到達される (§1) ので、**Host ヘッダは「リストのどれか」を選ぶ鍵**になる: `/auth/*` と WS upgrade は `Host` (と POST の `Origin`) をリストと照合し、一致した endpoint の RP ID / origin で検証する。リストに無い Host は 403
+- **HA endpoint に登録した credential は、裏の unit がどちらでも通る。** RP ID は `hyoui.<host>` で、stable / unstable のどちらの unit も同じ endpoint をリストに持ち、同じ record file (§4.6) を読むため。個別 endpoint の credential は HA endpoint では使えない (origin が違う)。**HA endpoint の登録 1 本があれば日常の閲覧は足り、個別 endpoint の登録は unstable を狙って開く時 (dogfooding) にだけ要る**
+- **リストは unit の属性として argv に焼く**: `hyoui web --endpoint <url>` (repeatable) を foreground 起動に足し、`hyoui web service add <name> --endpoint <url>...` は `--endpoint` → config `[web].endpoints` の順に解決して argv に焼く (DR-0034 決定 3 が `--listen` に採った形と同じ)。config だけに置くと、`[web].endpoints` の書き換えで登録済み unit の RP 集合が黙って変わり、`list` / `status` が「この unit はどの endpoint を答えるか」を argv から復元できなくなる。実機の期待値は stable = `[hyoui-stable.<host>, hyoui.<host>]`、unstable = `[hyoui-unstable.<host>, hyoui.<host>]`
+- **`hyoui web passkey add --endpoint <url> [--label <名前>] [--ro]`**: `--endpoint` は必須で、登録 URL `<endpoint>/#register=<jwt>` はその endpoint で開く。CLI は endpoint がどの unit のリストにも無ければ warning を出す (拒否はしない: canddy に endpoint を足す前に登録 URL を発行する順序を禁じない)
+- endpoint が 1 つも無い gateway (`--endpoint` 未指定) は `auth = "passkey"` で起動できない (エラー文言は「`--endpoint` か `[web].endpoints` を設定してください」)。`auth = "none"` なら endpoint 無しで動く (下記)
 - **127.0.0.1 直結 (経路 [3]) は passkey の対象外。** WebAuthn の RP ID は domain であり IP アドレスは使えない (仕様上。`localhost` は可)。かつ §1 のとおり loopback 発を免除にはできない。したがって経路 [3] は「認証を切った gateway」でしか使えない: config `[web].auth = "none" | "passkey"` を持ち、test と手元の dev は `none` で動かす。stable / unstable の常駐 unit は `passkey`
 - 非 browser client (curl / script) 向けの bearer token (`hyoui web token add`) は**初版で持たない**。hyoui の自動操作 CLI (`hyoui input` / `wait` / `tail`) は daemon の UDS を直接叩き、gateway を経由しない (DR-0005)。gateway の `/api/*` を script から叩く需要が出た時に足す。`hyoui service status` が叩く `/version` は無認証なので影響しない
 
@@ -165,23 +174,24 @@ ccmsg の検証コードは `topOrigin` が存在するだけで拒否し (棚�
 
 | 案 | 中身 | 評価 |
 |---|---|---|
-| (S1) **httpOnly cookie 1 本** | opaque 乱数 32 byte、`__Secure-hyoui-<sha256(public_url origin) 先頭 16 hex>`、`HttpOnly; Secure; SameSite=Strict; Path=/`。gateway は lookup で検証。寿命 30 日の sliding (使うたび `Max-Age` を伸ばす、値は据え置き)。WS upgrade も cookie で認証 (upgrade request には cookie が乗る) | 素の JS で完結。複数タブの refresh 調停 (reference `multi-tab-token-refresh`) が丸ごと不要。fallback で unit が変わっても、record が file 共有 (4.6) なら session が続く |
+| (S1) **httpOnly cookie 1 本** | opaque 乱数 32 byte、`__Secure-hyoui-<sha256(endpoint) 先頭 16 hex>`、`HttpOnly; Secure; SameSite=Strict; Path=/`。gateway は lookup で検証。寿命 30 日の sliding (使うたび `Max-Age` を伸ばす、値は据え置き)。WS upgrade も cookie で認証 (upgrade request には cookie が乗る) | 素の JS で完結。複数タブの refresh 調停 (reference `multi-tab-token-refresh`) が丸ごと不要。fallback で unit が変わっても、record が file 共有 (4.6) なら session が続く |
 | (S2) ccmsg 型 (access = メモリ + WS subprotocol、refresh = cookie、rotate + 再利用検知) | 棚卸しのとおり | refresh の再利用検知で cookie 盗難を検出できる。代償は tab-share (Web Locks + BroadcastChannel) と rotate の実装で、ccmsg でも tab-share のテストは未整備 (棚卸し) |
 
 **統括推し: (S2) reference どおり** (初版は (S1) を推したが、reference `passkey-registration-local-first` が規定する形から乖離する理由が「実装量」で、パターン統一 (kawaz 2026-09-15) より弱い。tab-share は `multi-tab-token-refresh` を素の JS で書く)。(S1) を推していた理由は 2 つで、乖離の代償として残す。hyoui の assets は bundler 無しの素の JS で、ccmsg webui (Preact + signal) の tab-share を移植する土台が無い。もう 1 つは利用者が kawaz 1 人で、再利用検知が守る「盗まれた refresh を誰かが使い回す」場面より、fallback や複数タブでの安定性の方が日常の価値が大きい。cookie が `HttpOnly` なので XSS で読めない点は (S2) と同じ。失効は CLI (`hyoui web passkey remove <sub>` で credential と session を両方消す) と、`hyoui web session list|remove` で個別に落とせる形にする。
 
-`Path=/` にするのは、hyoui は ccmsg と違って同一 host に複数 endpoint を置く構成 (`/` と `/personal/`) を持たないため。ccmsg-protocol の fixture には `https://mba.example.ts.net/hyoui` の path prefix 構成が現れるが (棚卸し Part 1-C)、実機の canddy は host で分けている。**path prefix 配置は初版で非対応**とし、必要になったら `public_url` の path を Path に写す。
+refresh cookie の名前は reference どおり `__Secure-hyoui-<sha256(endpoint + "\n" + sub) 先頭 16 hex>` で、**endpoint ごとに別 cookie**になる (host が違うのでブラウザ側でも自然に分かれる)。`Path=/` にするのは、hyoui は endpoint を host で分けており、ccmsg のように同一 host に複数 endpoint (`/` と `/personal/`) を置かないため。ccmsg-protocol の fixture には `https://mba.example.ts.net/hyoui` の path prefix 構成が現れるが (棚卸し Part 1-C)、実機の canddy は host で分けている。**path prefix 配置は初版で非対応**とし、必要になったら endpoint の path を Path に写す。access token の提示は WS が subprotocol `hyoui.token.<値>`、HTTP `/api/*` が `Authorization: Bearer` で、どちらも endpoint の token family でしか通らない。
 
 #### 4.6 認可の軸と record の置き場
 
 - **認可は credential 単位の `access = "rw" | "ro"`**。passkey を登録する時に `hyoui web passkey add --ro` で決め、gateway は `ro` の session からの `input` / `resize` / `leader.request` / WS の binary 上りを 403 で落とし、WS attach を daemon に `Ro` mode で張る。既定は `rw`。ccmsg の role (`user` 1 種) では表せない「観測だけ許す端末」(例: スマホ) を、hyoui が daemon に既に持つ mode に写して実現する。`rw-no-leader` は web の認可軸には出さない (leader は取り合いの結果であって権限ではない)
 - **sub は `<label>` (人が付けた名前)、user handle は sub ごとに 1 度だけ決めた 16 byte 乱数** (reference)。利用者 1 人前提でも、端末ごとに credential が分かれる (macOS / iPhone / 別 PC) ので `sub` は「端末を持つ人」ではなく「登録 1 本」に近い運用になる。ccmsg の `sub = <unit>-<連番>` と同じ
-- **record は `$XDG_STATE_HOME/hyoui/web/auth.json`** (mode 0600、tmp + rename、書き込みは `flock`)。credential と session の両方を持つ。**stable / unstable の 2 unit がこの 1 file を共有する**: 同じ origin の裏で振り分けられるので、どちらで登録・ログインしても他方で通る必要がある。DR-0034 の「gateway 間の状態共有をしない」(やらないこと表) は「gateway 自身が状態を持たない」の意味で、file を正本にして各 unit が読むだけの形はこれに反しない (DR-0006 §1 の socket dir が正本と同じ形)。読み込みは要求ごと (mtime で cache)。ccmsg の instance 間複製 (`auth.records` topic、LWW + tombstone) は不要
-- 登録 jwt の HMAC secret と challenge の在庫は **発行した unit のメモリにだけ**ある。`hyoui web passkey add` は 1 つの unit に対して発行するので、canddy の振り分けで別 unit に登録 POST が届くと検証できない。ccmsg は「発行者へ転送」で解いているが (棚卸し)、hyoui では **secret と challenge も `auth.json` の隣の `pending.json` に書く** (10 分で消す)。「CLI が前段の今選ぶ unit を当てて発行する」形は fallback の瞬間に崩れるので採らない。file 共有で 2 unit の区別を消す方が、転送 protocol を持つより hyoui の形に合う
+- **record は `$XDG_STATE_HOME/hyoui/web/auth.json`** (mode 0600、tmp + rename、書き込みは `flock`) で、**endpoint を key に持つ**: credential は `credential/<endpoint>/<sub>/<credential_id>`、token family は `family/<endpoint>/<id>` (ccmsg の key に endpoint を 1 段足した形。ccmsg は record の属性として `endpoint` を持つが、hyoui では引く単位そのものにする)。**stable / unstable の 2 unit がこの 1 file を共有する**: HA endpoint (`hyoui.<host>`) の credential と family は、裏の unit がどちらに切り替わっても同じ file から引けなければならない。個別 endpoint の record も同じ file に入るが、その endpoint をリストに持たない unit は Host 照合 (§4.4) で先に弾くので、引かれることは無い。DR-0034 の「gateway 間の状態共有をしない」(やらないこと表) は「gateway 自身が状態を持たない」の意味で、file を正本にして各 unit が読むだけの形はこれに反しない (DR-0006 §1 の socket dir が正本と同じ形)。読み込みは要求ごと (mtime で cache)。ccmsg の instance 間複製 (`auth.records` topic、LWW + tombstone) は不要
+- 登録 jwt の HMAC secret と challenge の在庫は、ccmsg では発行した instance のメモリにだけある。hyoui で HA endpoint 宛の登録 URL を発行すると、登録 POST を受ける unit は canddy の振り分け次第で発行時とは別になりうる。ccmsg は「発行者へ転送」で解いているが (棚卸し)、hyoui では **secret と challenge も `auth.json` の隣の `pending.json` に書く** (10 分で消す、endpoint と jti を key に持つ)。「CLI が前段の今選ぶ unit を当てて発行する」形は fallback の瞬間に崩れるので採らない。file 共有で unit の区別を消す方が、転送 protocol を持つより hyoui の形に合う。個別 endpoint 宛の登録なら受ける unit は 1 つに決まるが、経路を分けずに同じ file に書く
+- **token family の rotate の単一 writer** (reference) も、HA endpoint では unit を跨ぐ。file の `flock` を writer の直列化に使い、rotate は「lock → 読む → 書く → unlock」を 1 単位にする。ccmsg の `iss` (発行 instance) への転送は不要になるが、rotate の直後に他 unit が古い mtime cache で判定する窓が出るので、**family の検証は cache を使わず毎回 file を読む** (credential と違って書き換わる頻度が高い)
 
 #### 4.7 `X-Frame-Options` / CSP との関係
 
-現行は `X-Frame-Options` も `frame-ancestors` も付けず、test で固定している (棚卸し Part 1-C)。**これは変えない**: 埋め込みが hyoui の用途そのもので、(P) 経路は iframe 内の cookie 送信が前提。clickjacking の面は、cookie が `SameSite=Strict` である限り同一 site (`kawaz.jp` 配下) の親にしか乗らないので、外部サイトの iframe からは 401 になる。`[web].frame_ancestors` を足すのは (R) に倒れた時だけ。
+現行は `X-Frame-Options` も `frame-ancestors` も付けず、test で固定している (棚卸し Part 1-C)。(R) 経路では hyoui の RP が `clientDataJSON.topOrigin` を allowlist と照合するので、その allowlist を **config `[web].frame_ancestors`** (origin の配列、既定は空) に置き、**空でない時だけ** CSP `frame-ancestors <list>` を出す。空の時は現行どおりヘッダ無し (= どこにでも埋め込めるが、`topOrigin` 付きの WebAuthn は全部拒否 = ccmsg と同じ挙動)。`X-Frame-Options` は出さない (CSP と二重になり、`frame-ancestors` があれば無視される)。既存の「付けない」test は「`frame_ancestors` が空なら付けない」に読み替える。allowlist は endpoint ごとに分けない: どの endpoint も同じ ccmsg 群 (`ccmsg.<host>` / `ccmsg-personal.<host>` / ...) から埋め込まれる。
 
 #### 4.8 WebAuthn の実装をどう持つか
 
@@ -197,10 +207,12 @@ ccmsg の検証コードは `topOrigin` が存在するだけで拒否し (棚�
 | 項目 | 借りる | 借りない | 理由 |
 |---|---|---|---|
 | 登録の起点を CLI に閉じる、fragment jwt、6 桁コード、試行 5 回で焼く | ○ | | 安全性の根。reference と一致 |
-| RP ID = endpoint の host 固定、origin 完全一致、`topOrigin` 拒否 | ○ | | hyoui でも iframe 内 WebAuthn を走らせない (4.3 の (P)) |
+| RP ID = endpoint の host 固定、origin 完全一致、credential を endpoint に束縛 (ccmsg DR-0022) | ○ | | 4.4。hyoui は 1 プロセスが複数 endpoint を答えるので、Host でリストから選ぶ 1 段が加わる |
+| `topOrigin` が在れば拒否 | | ○ | 4.3 (R)。allowlist (`[web].frame_ancestors`) にある `topOrigin` は通す。無条件拒否は ccmsg 自身が iframe に入らない判断で、埋め込まれる側の hyoui には当てはまらない |
 | 検証順序 (検証を通してから jti / challenge を消費) | ○ | | 一時失敗で URL が焼けない |
 | 登録完了 = 即サインイン | ○ | | |
-| access (メモリ + subprotocol) / refresh (cookie) の分離、rotate、再利用検知、tab-share | | ○ | 4.5 (S1)。素の JS に移植する土台が無く、利用者 1 人では価値より実装量が勝る |
+| access (メモリ + subprotocol) / refresh (cookie) の分離、rotate、再利用検知、tab-share | ○ | | 4.5 (S2)。tab-share は Web Locks + BroadcastChannel の素の API なので framework 無しで書ける |
+| rotate の単一 writer を `iss` への転送で担保 | | ○ | 4.6。unit 間は file の `flock` で直列化する |
 | 世代 version、不一致でリロード誘導、自動リロードしない、互換経路なし | ○ | | §3 (a)。ただし gateway は拒否せず browser が判断する点が違う |
 | 未知 ErrorCode / 未知 frame を世代不一致の検出に使う | | ○ | hello の `protocol` が 1 次検出で足りる。未知 kind は `error` を返す (§2) が、それを不一致の推定には使わない |
 | role だけの認可 | | ○ | 4.6。credential 単位 `rw` / `ro` を daemon mode に写す |
@@ -221,17 +233,17 @@ kawaz の運用 (tailnet からの閲覧、ccmsg 経由の Terminal タブ) を�
             │
           W2 認証実装 ([web].auth 既定 none、CLI passkey add/list/remove、auth.json)
             │
-          W3 kawaz が stable に passkey を登録、config で auth = "passkey" に切替、restart
-            │  (P5 完了後なら unstable も同じ auth.json を読むので追加作業なし)
+          W3 canddy に 3 endpoint (hyoui-stable / hyoui-unstable / hyoui = HA) を issue 起票 (P5 の 2 upstream 依頼と 1 つの issue にまとめる)
+            │  kawaz が各 unit を --endpoint 付きで add し直し、HA endpoint に passkey を登録、auth = "passkey" で restart
             │
-          W4 auth の既定を "passkey" に変更 (= major bump)、canddy の Caddyfile コメント修正を issue 起票
+          W4 auth の既定を "passkey" に変更 (= major bump)、ccmsg-webui の iframe に allow 属性を足す issue、canddy の Caddyfile コメント修正
 ```
 
 - **W1 は認証と独立**で先に出せる。契約の破壊 (エラー形の JSON 化、未知 kind への `error` 応答、hello の追加) を含むので、この時点で `WEB_PROTOCOL_VERSION = 1` を置き、以降の破壊で上げる
-- **W2 は既定 `none` で出す**ので、入れた時点では何も変わらない。test は `none` で走る
-- **W3 は kawaz の手作業** (`hyoui web passkey add` → URL を iPhone / Mac で開いて登録 → `config.toml` に `auth = "passkey"` と `public_url` → `hyoui web service restart`)。P5 より前に W3 をやる場合、対象は stable 1 unit だけ。P5 の後なら 2 unit が同じ file を読む
-- **W4 で既定を変える**のは W3 で実運用を通してから。`none` を残すのは test と dev のためで、常駐 unit で `none` を選ぶには config に明示が要る形にする
-- (P) 経路の実機確認 (同一 site iframe の cookie、popup → BroadcastChannel) は **W2 の実装前**に、現行 gateway に仮の cookie を返す test 用ハンドラを立てて確認する。ここが崩れると 4.3 の推しが (R) に変わり、ccmsg-webui の変更が要るようになる
+- **W2 は既定 `none` で出す**ので、入れた時点では何も変わらない。test は `none` で走る。`--endpoint` (foreground と `service add` の両方) もここで足す
+- **W3 は kawaz の手作業と canddy への依頼**。順序は canddy の 3 endpoint が先 (endpoint が引けないと登録 URL を開けない)、次に `hyoui web service add stable --port=43690 --endpoint https://hyoui-stable.<host> --endpoint https://hyoui.<host>` (unstable も同様)、`hyoui web passkey add --endpoint https://hyoui.<host>` → URL を iPhone / Mac で開いて登録 → `config.toml` に `auth = "passkey"` → `restart --all`。個別 endpoint の登録は必要になった時に追加する。P5 (2 upstream) と W3 の canddy 依頼は同じ `Caddyfile` の hyoui ブロックを触るので 1 つの issue にする
+- **W4 で既定を変える**のは W3 で実運用を通してから。`none` を残すのは test と dev のためで、常駐 unit で `none` を選ぶには config に明示が要る形にする。ccmsg-webui の `allow="publickey-credentials-get"` は W3 で HA endpoint に登録した後、iframe 内で初めて必要になるので W3 の直後 (それまで iframe 内は 401 の overlay に「別タブで開く」リンクを出しておく)
+- (R) 経路の実機確認 (iframe 内 `get()`、`topOrigin` の値、同一 site iframe の refresh cookie) は **W2 の実装前**に、現行 gateway に test 用ハンドラを立てて確認する。ここが崩れると 4.3 の推しが (P) に戻る
 
 ### 2026-09-15: kawaz に決めてほしい点 (§7)
 
@@ -246,13 +258,16 @@ kawaz の運用 (tailnet からの閲覧、ccmsg 経由の Terminal タブ) を�
 | Q6 | WebAuthn 実装 | (L) `webauthn-rs` | (M) ccmsg 移植 | 依存は hyoui-web に閉じる。crate 設定で `none` / `required` が表せるかは実装前に確認 (§4.8) |
 | Q7 | 認証の既定を `passkey` に変える時期 | W3 (kawaz の実運用) を通してから W4 で major bump | W2 の時点で既定 `passkey` | 常駐 unit が config 無しで上がらなくなる事故を避ける (§6) |
 
-裁定でないもの (本文で決めた): 契約の正本を Rust 型に置き JSON Schema を持たない (§2)、エラー形の JSON 統一と未知 kind への `error` 応答 (§2)、gateway は世代不一致を拒否せず browser が判断する (§3)、`/healthz` `/version` `/assets` `HTML` は無認証のまま (§4.1)、127.0.0.1 直結は `auth = "none"` の gateway でだけ使う、bearer token は初版に無い (§4.4)、record は `auth.json` を 2 unit で file 共有し pending も file に置く (§4.6)、`X-Frame-Options` は付けないまま (§4.7)、path prefix 配置は非対応 (§4.5)。
+裁定済み (kawaz 2026-09-15): Q3 bootstrap は (A) CLI 発行の招待 URL で確定 (§4.2)。passkey は endpoint ごとに個別登録し、canddy には個別 2 endpoint + HA 1 endpoint を並べる (§4.4)。
+
+裁定でないもの (本文で決めた): 契約の正本を Rust 型に置き JSON Schema を持たない (§2)、エラー形の JSON 統一と未知 kind への `error` 応答 (§2)、gateway は世代不一致を拒否せず browser が判断する (§3)、`/healthz` `/version` `/assets` `HTML` は無認証のまま (§4.1)、endpoint リストは unit の argv (`--endpoint`) に焼き config は `add` 時の既定値に留める (§4.4)、127.0.0.1 直結は `auth = "none"` の gateway でだけ使う、script 向け token は初版に無い (§4.4)、record は endpoint を key に `auth.json` を 2 unit で file 共有し pending と family の rotate も file + `flock` で扱う (§4.6)、`[web].frame_ancestors` が空なら現行どおりヘッダ無し (§4.7)、path prefix 配置は非対応 (§4.5)。
 
 ## 暫定的な結論
 
 - web 境界には version が無く、認証も無い。daemon 境界の cap 方式をそのまま持ち込む理由は無く、**世代番号 1 つ + hello frame + 応答ヘッダ**で「stale なページ」を検出し、帯で reload を促す形が hyoui の事情 (stable / unstable の fallback で版が動く) に合う
-- 認証は **passkey (ccmsg 型の登録) + cookie 1 本 (ccmsg 型ではない session)** の組合せ。iframe 問題は「hyoui と ccmsg が同一 site」という配置の事実で解け、ccmsg 側を触らずに済む見込み。**この見込みは実機確認が前提**
-- 次の一手は §7 の裁定と、(P) 経路の実機確認。裁定後に契約 DR (仮 DR-0035) と認証 DR (仮 DR-0036) を分けて起票する
+- 認証は **reference `passkey-registration-local-first` をそのまま当てる** (CLI 発行の登録、endpoint ごとの credential、access + refresh の token family)。hyoui 固有なのは「1 プロセスが複数 endpoint を答える」点と「2 unit が record file を共有する」点の 2 つで、前者は unit の `--endpoint` リストと Host 照合、後者は endpoint を key にした file + `flock` で吸収する。ccmsg の instance 間複製と発行者転送は要らない
+- iframe 内の認証は (R) iframe 内 WebAuthn を推し、ccmsg-webui の変更は `allow` 属性 1 つ。RP は ccmsg が埋め込む URL の endpoint で決まる。**(R) の成立は実機確認が前提**で、崩れれば (P) top-level ログインに戻す
+- 次の一手は §7 の残り裁定 (Q1 / Q2 / Q4 / Q5 / Q6 / Q7) と (R) の実機確認。裁定後に契約 DR (仮 DR-0035) と認証 DR (仮 DR-0036) を分けて起票する
 
 ## 関連
 
