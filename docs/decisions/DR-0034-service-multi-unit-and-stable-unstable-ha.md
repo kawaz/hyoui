@@ -114,6 +114,14 @@ unit 1 つにつき launchd job / systemd user unit を 1 つ載せる。`add` �
 | `start` | `enable gui/$UID/<label>` → `bootstrap gui/$UID <plist>` (既に載っていれば `kickstart`) | `systemctl --user start <unit>` |
 | `stop` | `bootout gui/$UID/<label>` → `disable gui/$UID/<label>` | `systemctl --user stop <unit>` |
 | `restart` | `kickstart -k gui/$UID/<label>` | `systemctl --user restart <unit>` |
+| `log` | `~/Library/Logs/hyoui-web/<name>.log` を読む | `journalctl --user -u hyoui-web-<name>` |
+
+**`stop` 済みの unit への `restart` は、対象の指定方法で分ける。**
+
+- `restart <name>` (名前を明示) は `start` と同義。その unit を上げてほしいと言われているので、`enabled` を立てて起動する。error + hint にする理由が無い
+- `restart --all` は `enabled` な unit だけを対象にし、停止中の unit は**触らない** (出力にはスキップした旨を載せる)
+
+`--all` で停止中の unit まで上げると、`stop` が書いた desired state を `restart --all` が黙って覆すことになる。意図的に降ろしてある unit が、無関係な再起動のついでに復活するのは事故。名前を明示した時だけ desired state を書き換える。
 
 `disable` を併せて叩くのは、これが再 bootstrap / 再 login を跨いで残る「上げない」指示だからで、`bootout` 単体だと次の login で `RunAtLoad` によって復活する。`start` の `enable` はその対。
 
@@ -122,7 +130,7 @@ unit 1 つにつき launchd job / systemd user unit を 1 つ載せる。`add` �
 | field | 意味 | 取得元 |
 |---|---|---|
 | `enabled` | 上げたいかどうか (desired state) | launchd: `print-disabled gui/$UID` に label が載っていないこと / systemd: `is-enabled` |
-| `loaded` | 定義が OS に載っているか | launchd: `print gui/$UID/<label>` が成功する / systemd: `is-active` 以前の load 状態 |
+| `loaded` | 定義が OS に載っているか | launchd: `print gui/$UID/<label>` が成功する / systemd: `show -p LoadState --value` |
 | `running` | プロセスが居るか (+ `pid`) | launchd: `print` の pid 行 / systemd: `show -p MainPID` |
 
 llm-gateway (DR-0028 §3) が監督者を置いたのは、監督者 1 つを launchd に載せて子を複数抱える形を採ったため。hyoui でそれを真似ると、launchd が既に提供している「落ちたら上げる」「login で上げる」を hyoui 内に作り直すことになり、CLAUDE.md の self-check (`kernel / OS の標準機能を再発明していないか`) に反する。gateway は互いに独立で、順序依存も共有状態も無いため、束ねる理由が無い。
@@ -139,7 +147,7 @@ llm-gateway (DR-0028 §3) が監督者を置いたのは、監督者 1 つを la
 |---|---|---|
 | `--port=<n>` | `--listen=127.0.0.1:<n>` の短縮 | — |
 | `--listen=<host:port>` | bind 先 | config `[web].listen`、無ければ `127.0.0.1:43690` |
-| `--binary=<path>` | この unit が起動する実行ファイル | DR-0031 と同じ `resolve_stable_path(current_exe, SameBinary)`。安定な path が無ければ現在の path を焼き、stderr と出力の `warning` に理由を添える |
+| `--binary=<path>` | この unit が起動する実行ファイル | 下記のとおり `current_exe` が PATH 上にあるかで分ける |
 | `--web-assets-dir=<path>` | 静的 assets の差し替え (dev) | 未指定なら焼かない (embedded assets) |
 
 option 名は `hyoui web` 側 (`--listen` / `--web-assets-dir`) と一字一句揃える。`add` が組み立てるのは `hyoui web` の argv なので、同じものを 2 通りに呼ばない。
@@ -154,11 +162,22 @@ option 名は `hyoui web` 側 (`--listen` / `--web-assets-dir`) と一字一句�
 
 **`--web-assets-dir` も同じ扱いにする。** `add` の時点で `--web-assets-dir` → config `[web].assets_dir` の順に解決し、値があれば argv に焼く。どちらも無ければ焼かず、その unit は embedded assets で固定される (起動時に config を読んで assets_dir が生えることは無い)。config を後から書き換えても既存 unit の見る assets が変わらないので、`list` の `web_assets_dir` は「この unit が実際に使う値」として読める。
 
-**`add` は listen の衝突を拒否する。** 既存 unit と同じ `host:port` を持つ `add` はエラーにし、どの unit が既にその port を持っているかを示す。host が異なる場合 (`0.0.0.0:43690` と `127.0.0.1:43690` のような包含関係) は判定しきれないので拒否せず、warning に留める。
+**`add` は listen の衝突を拒否する。** 比較は文字列ではなく `SocketAddr` に解決してから行う (`localhost:43690` と `127.0.0.1:43690` は同じ)。解決できない listen 値 (名前解決に失敗する host 等) は文字列で比較し、`add` を止めずに warning を出す — 解決できないことを理由に登録を断ると、後から名前が引けるようになる環境で登録できなくなる。
+
+完全一致した場合はエラーにし、どの unit が既にその宛先を持っているかを示す。`0.0.0.0:43690` と `127.0.0.1:43690` のような包含関係は一致ではないので拒否せず、warning に留める。
 
 **`stable` = 43690 据え置き、`unstable` = 43691 で確定。** stable を既存の port から動かさないのは、canddy の hyoui ブロックが現在 43690 単体を指しているため。ここを動かさなければ、canddy 側の設定を入れ替える前に unit の移行を終えられ、移行中に到達が切れない。連番を取るのは llm-gateway の 11301 / 11302 と同じ形。
 
 `--binary` を unit ごとに持つのは、stable (brew の `/opt/homebrew/bin/hyoui`) と unstable (repo の `target/release/hyoui`) を同時に走らせることが本 DR の動機そのものだからで、1 系統に統一するとその前提が消える。
+
+**`--binary` の既定は `resolve_stable_path` に丸投げしない。** DR-0031 は `resolve_stable_path(current_exe, SameBinary)` で「同じ binary を指す安定な PATH 上の場所」を選ぶが、これは 1 unit しか無い前提での最適化で、本 DR では罠になる。`target/release/hyoui` が brew 版と同一内容だった瞬間 (= tag を打った直後にビルドした場合) に `/opt/homebrew/bin/hyoui` が選ばれ、**unstable unit が stable の binary を指す**。以降 unstable をビルドし直しても、その unit は brew 版を起動し続ける。
+
+そこで `add` の既定はこうする:
+
+- `current_exe` が PATH 上の安定な場所そのものなら、それを焼く (brew 版から `add` した場合 = stable の期待どおり)
+- PATH 外なら **`current_exe` の絶対パスをそのまま焼く** (repo build から `add` した場合 = unstable の期待どおり)。安定な場所を探して差し替えない
+
+`resolve_stable_path` を通さないので「その path は rebuild で壊れ得る」警告は出さない。unstable unit では壊れ得ることが仕様であり、警告は毎回出て意味を失う。`--binary` を明示した場合は常にその値を焼く。
 
 **`--binary` が指す先は消えうる。** unstable が指す `target/release/hyoui` は `cargo clean` や失敗したビルドで消え、その状態だと launchd は起動に失敗して KeepAlive で再試行を続ける。`status` は `binary_path` と併せて **その path が今存在するか** (`binary_exists`) を出す。これが false なら `running: false` の原因が読める。`add` の時点でも存在を確認し、無ければ拒否せず warning を出す (ビルド前に登録する順序を禁じない)。
 
@@ -201,7 +220,17 @@ renderer は DR-0031 の `render_launchd_plist` / `render_systemd_unit` を unit
 
 **`version` だけでは走っているビルドを識別できない。** stable (brew の `/opt/homebrew/bin/hyoui`) と unstable (repo の `target/release/hyoui`) は実測でどちらも `hyoui 0.9.42` を答える。crate version は tag を打つまで動かないので、unstable に変更を入れても version は変わらず、「今 unstable で走っているのは自分がビルドしたあれか」を version では判定できない。本 DR の運用ではこれが判定の中心になるので、`build_id` を併せて返す。
 
-`build_id` はコンパイル時に注入する文字列で、実装は `option_env!("HYOUI_BUILD_ID")` (未設定なら `null`)。何を入れるかはビルド側の裁量に残す (git commit の短縮 hash、あるいはビルド時刻)。null を異常扱いしないのは、brew のようにビルド環境を自分で制御できない経路があるため。
+**`build_id` の既定値は build script が git から導出する。** 環境変数の明示だけに頼ると、通常の unstable ビルド経路 (`just build` = `cargo build --release --workspace`、justfile に env の注入は無く、build script も現状存在しない) で `null` になり、まさに区別したい stable / unstable が両方 `null` で並ぶ。
+
+実装は build script (`build.rs`) で次の順に決める:
+
+1. `HYOUI_BUILD_ID` が環境に与えられていればその値を使う (CI / 配布ビルドが明示する経路)
+2. 無ければ `git rev-parse --short HEAD` を実行し、作業ツリーに変更があれば dirty を示す接尾を付ける
+3. git が使えない / リポジトリでない場合 (brew の tarball ビルド等) は注入せず、実行時は `null`
+
+build script は `cargo:rustc-env=HYOUI_BUILD_ID=<値>` で値を渡し、`cargo:rerun-if-changed=.git/HEAD` と `cargo:rerun-if-env-changed=HYOUI_BUILD_ID` を宣言して、commit を移った時と env を変えた時に再ビルドされるようにする。実行側は `option_env!("HYOUI_BUILD_ID")` を読むだけ。
+
+`null` を異常扱いしないのは、3 の経路 (ビルド環境を自分で制御できない配布) が正常にありうるため。逆に言えば、`null` は「brew 等の配布ビルド」の印として読める。
 
 `status` はこの `/version` を各 unit の listen に聞き、`version` と `build_id` を載せる。答えない版が走っていることはあるので、答えられなければ両方 `null` (異常ではない)。
 
@@ -213,7 +242,7 @@ renderer は DR-0031 の `render_launchd_plist` / `render_systemd_unit` を unit
 
 ### 6. `restart --all` は 1 台ずつ
 
-**順序は unit 名の昇順**で、1 台ずつ `restart` → その unit の `/healthz` が 200 を返してから次へ進む。登録簿を持たない (決定 4) ので「登録の逆順」は定義できず、定義ディレクトリの走査順も OS 任せになる。名前の昇順なら、どの環境でも同じ順序になり、`list` の並びと一致する。
+**順序は unit 名の昇順**で、`enabled` な unit を 1 台ずつ `restart` → その unit の `/healthz` が 200 を返してから次へ進む (停止中の unit を対象にしない理由は決定 2)。登録簿を持たない (決定 4) ので「登録の逆順」は定義できず、定義ディレクトリの走査順も OS 任せになる。名前の昇順なら、どの環境でも同じ順序になり、`list` の並びと一致する。
 
 `/healthz` 待ちには上限を置く。**1 unit あたり 10 秒**で、超えたら次の unit へ進まずに止まり、どの unit で待ちが尽きたかを出して非 0 で終わる。上限が無いと、上がらない unit で無限に待つか、待たずに次を落として全台を落とすかのどちらかになる。10 秒は gateway の起動 (bind + assets 準備) に対して十分で、KeepAlive による再起動ループに入っている unit を待ち続けない長さ。
 
@@ -265,7 +294,7 @@ handle @hyoui {
 
 `/healthz` がプロセスの生存だけを意味する (決定 5) のは、この線引きをそのまま反映したもの。gateway 側の応答内容を健全性の条件にすると、不健全の定義が business ロジックに侵食し、復旧の入口 (Web UI) ごと切り離す事故を招く。
 
-同じ理由で、**TCP は生きているのに応答が返らない (hang) 場合の窓**も残る。active health check が落とすまで最大 `health_interval` + `health_timeout` = 7 秒、その間に来たリクエストは unstable に渡って `lb_try_duration` (5 秒) の内側で待つ。ここを詰めるのは前段の設定の話なので、hyoui 側の決定には含めない。
+同じ理由で、**TCP は生きているのに応答が返らない (hang) 場合の窓**も残る。active health check が unhealthy と判定するまで最大 `health_interval` + `health_timeout` = 7 秒あり、その間に来たリクエストは unstable に渡る。`lb_try_duration` は **dial に失敗した時に次の upstream を試す猶予**なので、dial が成功してから応答が来ない場合には効かない。渡ったリクエストは前段の response timeout (未設定ならクライアント側の timeout) まで待たされる。ここを詰めるのは前段の設定の話なので、hyoui 側の決定には含めない。
 
 **WebSocket attach (`/api/sessions/{id}/attach`) は fallback の対象外**。確立済みの WS は選ばれた upstream に固定され、その unit が落ちれば切れる。回るのは新規接続だけで、これは reverse proxy の性質であって hyoui 側で埋められるものではない。client 側の再接続の要否は本 DR の範囲外とし、必要なら別 issue で扱う。
 
@@ -290,6 +319,7 @@ label の名前空間が `com.github.kawaz.hyoui-web` から `jp.kawaz.hyoui-web
 | 監督者プロセス (`supervise`) | 決定 2。OS service manager が担う |
 | gateway 間の状態共有・session の引き継ぎ | 各 gateway は daemon socket を走査するだけで自前の状態を持たないので、共有すべき状態が無い |
 | ログ回転 | 追記のみ。回転は OS の仕組み (newsyslog / logrotate) に任せる |
+| 再起動時の graceful drain (処理中リクエストの待ち合わせ) | `restart` は前段が新規接続を他の unit に回す構成の下で打つので、落ちる unit が処理中の分を待つ必要が無い。`kickstart -k` の SIGTERM で即座に降りる前提で組む。WS attach は決定 7 のとおり切れる (前段の fallback 対象外) ので、drain を足しても救われる範囲は増えない |
 | `on_disk` 版と `restart_needed` (llm-gateway DR-0028 §9) | 「置いてある版」と「走っている版」の比較は、`binary_path` の実行ファイルに `--version` を聞く経路を足すことで成り立つが、本 DR の `build_id` は tag を跨がないビルドを識別するためのもので、再起動が必要かの判定には使っていない。`status` が出すのは走っている側の実測値だけにする。必要になったら別 DR で足す |
 
 ## Alternatives Considered
@@ -297,7 +327,6 @@ label の名前空間が `com.github.kawaz.hyoui-web` から `jp.kawaz.hyoui-web
 | 案 | 不採用理由 |
 |---|---|
 | 旧 `web service register/unregister/status` を alias として温存する | 同じことをする口が 2 つ増え、help と completion にも 2 つ載る。利用者は kawaz だけで、互換のために語彙を濁す相手が居ない |
-| verb 群を `hyoui web service` 配下に置く (階層を 1 段深くする) | 常駐 kind が web gateway 1 種類しかない現時点では階層が余る (OQ-A、裁定待ち)。利点は `add` の引数が `hyoui web` の引数の写しになり、何の unit を足すかが名前で分かること。kind が増えたら階層に割り直す |
 | `hyoui daemon` 群を新設して gateway のプロセス操作を置く | 決定 1。同じ語が PTY session と gateway の 2 つを指すことになり、既存の `run` / `list` / `status` / `kill` / `tail` が扱う対象と読み分けられなくなる |
 | unit を port で識別する (`service add --port` だけで名前なし) | port は「今どこで待つか」であって unit の同一性ではない。port を変えた瞬間に別 unit になり、`stable` の設定を 43690 → 43695 に移す操作が表現できない。stable / unstable という運用上の役割も名前でしか書けない |
 | hyoui 自身が front で受けて背後の 2 台に振る | 常駐プロセスが 1 種類増え、その front 自体が単一障害点になる。HA を足したつもりで可用性が下がる |
