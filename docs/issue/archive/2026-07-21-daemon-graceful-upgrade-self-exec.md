@@ -1,6 +1,6 @@
 ---
 title: daemon の graceful upgrade (self-exec による fd/pid 引き継ぎ)
-status: open
+status: resolved
 category: request
 created: 2026-07-21T02:46:19+09:00
 last_read: 2026-07-21T02:50:53+09:00
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-15T13:20:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: DR-0028 起草 + Phase 1〜3 実装 land (2026-07-21) で受け入れ条件 4 件すべて充足 — self-exec 方式を DR-0028 として起草、state は「シリアライズ最小 + scrollback 再 feed」で確定 (`UpgradeStateV1` CBOR)、exec 失敗時 2 段 fail-safe を DR §5 に明記、トリガーは `upgrade.request`/`upgrade.ack` + cap `upgrade-v1` + `hyoui upgrade` CLI (自動検知不採用)。DR-0014 検証マトリクスと e2e テストは未整備のため docs/issue/2026-09-15-upgrade-e2e-test.md に切り出し
 blocked_by:
 origin: 自リポ TODO
 ---
@@ -58,8 +58,8 @@ kawaz 個人ツールの中に同種の graceful な fd/pid 引き継ぎを実�
 
 ## 受け入れ条件
 
-- [ ] self-exec 方式での upgrade 設計を DR として起草する (DR-0025 message 駆動原則に従い、
+- [x] self-exec 方式での upgrade 設計を DR として起草する (DR-0025 message 駆動原則に従い、
       upgrade を protocol message として形式化してから実装に入る)
-- [ ] state のシリアライズ/復元方式 (完全 vs scrollback 再 feed) を実機検証で決定する
-- [ ] exec 失敗時のフォールバック挙動を明記する
-- [ ] トリガー方式 (subcommand か自動検知か) を決定する
+- [x] state のシリアライズ/復元方式 (完全 vs scrollback 再 feed) を実機検証で決定する
+- [x] exec 失敗時のフォールバック挙動を明記する
+- [x] トリガー方式 (subcommand か自動検知か) を決定する

@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-09-15 | task | open | [upgrade-e2e-test](./2026-09-15-upgrade-e2e-test.md) | daemon graceful upgrade (DR-0028 Phase 1〜3) の検証マトリクスと e2e テストが未整備 (unit test 5 本のみ、Phase gate 未達) |
 | 2026-09-10 | task | open | [ecosystem-review-2026-09](./2026-09-10-ecosystem-review-2026-09.md) | エコシステム外部レビュー (2026-09) の指摘への対応検討 |
 | 2026-08-25 | request | open | [hyoui-attach-take-leader](./2026-08-25-hyoui-attach-take-leader.md) | hyoui attach --take-leader を実装する (LR2-Q1 裁定 a、DR-0033 leader.request 奪取の CLI 後続) |
 | 2026-08-25 | task | open | [web-gateway-restart-kill-not-reliable](./2026-08-25-web-gateway-restart-kill-not-reliable.md) | web gateway の再起動は kill だけでは復帰しないことがある (KeepAlive 頼みにせず register を使う) |
@@ -20,7 +21,6 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 | 2026-07-26 | task | open | [web-ime-safari-ios-unverified](./2026-07-26-web-ime-safari-ios-unverified.md) | IME 変換位置ズレの原因 2 件 (textarea 溢れ / resize 後のズレ) を特定し session.js で修正済み、検証は Chromium のみ — 実機 macOS/iOS Safari が未検証 |
 | 2026-07-25 | bug | open | [flaky-serve-ro-lock-acquire-rejected](./2026-07-25-bug-flaky-serve-ro-lock-acquire-rejected.md) | 高負荷時の flaky 2 系統: `serve_ro_client_lock_acquire_rejected` (= 32s 回に SessionExitNotify(143) を拾う、元凶は `/bin/sleep 30` を待つ token test) と `input_auto_lock_cli` の deadline fail (= 変更前 revision でも再現、DR-0029 起因でないことを確認済)。根に PTY 枯渇 (123/128 使用、`start: Errno(ENXIO)`) |
 | 2026-07-25 | request | open | [request-attach-overlay-progress](./2026-07-25-request-attach-overlay-progress.md) | attach 画面最下行に detach 遅延の progress overlay (DR-0029 §5、`ctrlz_guard_overlay` は現在 no-op) |
-| 2026-07-21 | request | open | [daemon-graceful-upgrade-self-exec](./2026-07-21-daemon-graceful-upgrade-self-exec.md) | daemon の graceful upgrade (self-exec で fd/pid 引き継ぎ、DR 起草必須) |
 | 2026-07-21 | bug | open | [sigcont-alive-child-session-vanish](./2026-07-21-sigcont-alive-child-session-vanish.md) | SIGCONT を送るとセッションが消滅する疑い — 根本原因候補特定 (`hyoui kill --no-terminate` が `detach_others: true` で全 client を蹴る、2026-07-25 実測) |
 | 2026-07-21 | request | idea | [screen-region-watch-api](./2026-07-21-screen-region-watch-api.md) | screen 仮想スクリーンの部分切り出し API + 監視エリアのマッチング検出インターフェース (DR-0025 母体、web ターミナル完了後着手) |
 | 2026-07-21 | design | open | [screen-overlay-general-mechanism](./2026-07-21-screen-overlay-general-mechanism.md) | screen state への動的仮想オーバーレイ一般機構 (DR-0013 延長、DR-0029 detach 案内 / web ターミナル ダイアログ用、web ターミナル完了後着手) |
