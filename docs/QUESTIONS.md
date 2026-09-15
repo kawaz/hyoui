@@ -28,13 +28,6 @@
 - [ ] b: 外す。red を見えるようにして、落ちる各テストを `#[ignore = "<理由 + issue>"]` で明示 skip に倒しながら潰す
 - [ ] c: 外さないが、ubuntu job だけ retry (`nick-fields/retry` 等) を入れて 1 回の負荷依存 fail を吸収する
 
-### 👺ECO-Q2: `hyoui web service` を `hyoui service` に改名するか
-
-外部レビュー H-3。個人 reference `cli-daemon-subcommands` は `<tool> service` の形で、常駐 unit が web gateway 1 つだけの hyoui なら `web` の階層は不要という指摘。v1.0 未満なので breaking は可。
-
-- [ ] a: 改名する (`hyoui service register|unregister|status`。help / completion / DR-0031 も同時更新)
-- [ ] b: 現状維持 (`web` 配下に `serve` 等の兄弟があり、gateway 専用であることが名前で分かる)
-
 
 ## 確認待ち
 
@@ -85,21 +78,3 @@ m41-43 の裁定 (閉じる廃止 / Esc=resume / UX 視点の 2 群) は v0.9.32
   http/https に限定した。要望があれば別途対応する
 - 再接続前から画面にあったリンク — daemon が OSC 8 を保持しないため
   ([docs/issue/2026-08-24-attach-osc8-hyperlink-metadata-loss.md](issue/2026-08-24-attach-osc8-hyperlink-metadata-loss.md))
-
-### 👺CZ-C1: Ghostty × Claude Code の実キーボードで Ctrl+Z ガードが効くか (kawaz にしか不可)
-
-issue [2026-07-29-bug-ctrlz-guard-bypassed-by-keyboard-protocol](issue/2026-07-29-bug-ctrlz-guard-bypassed-by-keyboard-protocol.md) の唯一の残作業。実装 (3 符号化対応 / decode 層分離 / 単発 = client suspend 1000ms 窓) と nested hyoui での 15 case マトリクスは land 済みだが、実キーボードの byte 列は byte 注入で代替できない。
-
-- [ ] a: Ghostty で Claude Code を `hyoui attach` して Ctrl+Z 単発 → attach client が suspend (`fg` で戻れる)、子は止まらない
-- [ ] b: Ctrl+Z ×2 (1000ms 以内) → 子が suspend し、DR-0032 の child action menu が出る
-
-両方 OK なら issue を close、外れたら `CTRLZ_ENCODINGS` に Ghostty の符号化を 1 行足す。
-
-### 👺SV-C1: 自動起動の再起動実機確認 (kawaz にしか不可)
-
-- [ ] a: 次回 PC 再起動後に web (https://hyoui.kawaz-mbp16-20211217.kawaz.jp) が自動で生きていることを確認
-
-`hyoui web service register` (v0.9.29、DR-0031) で brew バイナリを launchd 登録済み。
-KeepAlive の kill→復帰と API 200 は AI 実機確認済み、RunAtLoad の実再起動だけが未検証。
-
-
