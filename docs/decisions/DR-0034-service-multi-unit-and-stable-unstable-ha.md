@@ -31,6 +31,21 @@ gateway インスタンスを **複数前提**で扱えるようにし、片方�
 | 前段に優先順と fallback を書ける reverse proxy が居る (実機は canddy) | HA は成立しない。本 DR の unit 複数化だけが残り、切り替えは人が行う |
 | stable / unstable が **別ビルドの同一 CLI** である | unit ごとの `binary_path` は不要になり、決定 3 の `--binary` が過剰になる |
 
+### OS 常駐にすべき unit の kind は、現時点では web gateway だけ
+
+階層 (`hyoui service` か `hyoui web service` か) の判断軸は「web 以外に OS 常駐させる unit の種類が出てくるか」である (kawaz 提示、2026-09-15)。現行コードと DR 群を洗った結果:
+
+| 候補 | 常駐 unit になるか | 根拠 |
+|---|---|---|
+| web gateway (`hyoui web`) | **なる** | login 時に上がっていて欲しく、落ちたら上がって欲しい。DR-0031 が既に launchd に載せている |
+| PTY session daemon (`hyoui run` が fork するもの) | ならない | 子コマンドと 1:1 で、`run` の呼び出しが unit を決める (DR-0015)。login 時に「何を起こすか」を OS に教える手段が無く、registry を持たない設計 (DR-0006 §1、socket dir が正本) と衝突する |
+| tty I/O record (DR-0016) | ならない | daemon 内の bounded queue + writer thread (DR-0016 §8/§8a)。別プロセスではない |
+| record の secret redaction (DR-0016 §6 / Phase 5) | ならない | 同じく daemon の hot path 内 (`crates/hyoui/src/daemon/record.rs`) |
+| screen region watch + 検出通知 (`docs/issue/2026-07-21-screen-region-watch-api.md`) | ならない | 母体は DR-0025 Screen domain の `WatchRegistration` で daemon 内。外部への通知経路は CLI と web gateway が兼ねる |
+| daemon graceful upgrade (DR-0028) | ならない | 走っているプロセスの self-exec。起動させる対象ではない |
+
+**将来 kind が増える見込みが 1 つある。** 「login 時に決まった PTY session を起こす」(常用 session の自動復元) は reference の `daemon add <unit>` / `supervise` がそのまま当てはまる形で、hyoui の実際の使い方 (常時走らせている session がある) からすると現実的である。ただし現時点で issue も DR も無く、本 DR はこれを実装しない。この見込みが階層の判断に効くため、Q3 として裁定に出す。
+
 ### 参照した先行実装
 
 llm-gateway は同じ reference 体系を先に当てている (DR-0028)。unit = 設定ファイル 1 つ、登録簿は `~/.local/state/llm-gateway/daemon/units/<name>.toml`、unit ごとに `binary_path` を持ち (stable = brew / unstable = repo build)、`daemon supervise` 1 つだけを launchd に載せる形。本 DR は **unit と binary を分ける判断は踏襲し、監督者を置く判断は踏襲しない** (理由は決定 2)。
@@ -44,7 +59,9 @@ llm-gateway は同じ reference 体系を先に当てている (DR-0028)。unit 
 
 ## Decision
 
-### 1. `hyoui service` を multi-unit の唯一の入口にする
+### 1. verb 群は `service` 側だけを採る
+
+本 DR が決めるのは **verb 群と unit モデル**で、その前に付く階層 (`hyoui service` か `hyoui web service` か) は Q3 の裁定で決まる。以下の表記は `hyoui service` を仮に置いたもので、`hyoui web service` に決まれば prefix が 1 語増えるだけで中身は変わらない。
 
 ```text
 hyoui service add <name> [--port=<n> | --listen=<host:port>] [--binary=<path>] [--assets-dir=<path>]
@@ -57,10 +74,22 @@ hyoui service status  [<name>] | --all
 hyoui service log     [<name>] | --all [--follow]
 ```
 
-reference (`cli-daemon-subcommands.md`) の `daemon` / `service` 2 系統を、hyoui では **`service` 1 系統に畳む**。理由は 2 つある。
+reference (`cli-daemon-subcommands.md`) の `daemon` / `service` 2 系統のうち、**本 DR が採るのは `service` 側だけ**。`daemon` 群 (= instance のプロセス操作) を新設しない理由は 2 つある。
 
-- reference の `daemon` は「instance のプロセス操作」だが、hyoui の instance は OS service manager が持つ。ツール側に「プロセスを起こす口」は無く、あるのは「OS への希望を伝える口」だけなので、2 系統に割る対象が存在しない
-- `hyoui daemon` を作ると、既存の `hyoui list` / `status` / `kill` が扱う PTY session daemon と語が衝突する。同じ語に 2 つの意味を与えない (Context の「増やしたくないもの」)
+**1. `daemon` 群は hyoui に既にある。unit が PTY session なだけ。**
+
+| reference の `daemon` verb | hyoui の既存コマンド (unit = PTY session) |
+|---|---|
+| `run [unit]` | `hyoui run [--name X] -- cmd` (`--detached` で初期 detach) |
+| `list` | `hyoui list` (socket dir 走査) |
+| `status [<unit>]` | `hyoui status <session>` |
+| `stop <unit>` | `hyoui kill <session>` |
+| `log [<unit>]` | `hyoui tail <session> [--follow]` |
+| `add` / `remove` / `start` / `restart` / `supervise` | 無い。session は `run` の呼び出しが unit を決めるので、登録して後から起こす概念が存在しない (DR-0006 §1) |
+
+つまり hyoui の `daemon` 群は subcommand 階層を持たず top-level に平置きされている形で、意味としては既に埋まっている。ここに `hyoui daemon` を新設すると、同じ語が PTY session と gateway の 2 つを指すことになる (Context の「増やしたくないもの」に反する)。
+
+**2. gateway 側の instance を起こすのは OS で、ツールではない。** 決定 2 のとおり監督者を置かないので、ツール側に「プロセスを起こす口」は無く、あるのは「OS への希望を伝える口」だけ。2 系統に割る対象が存在しない。
 
 reference の verb のうち採らないものと理由:
 
@@ -108,6 +137,8 @@ llm-gateway (DR-0028 §3) が監督者を置いたのは、監督者 1 つを la
 | 継続起動 | `KeepAlive=true` | `Restart=always` |
 | 環境 | 最小 `PATH` のみ | 最小 `PATH` のみ |
 | log | `~/Library/Logs/hyoui-web/<name>.log` | journald |
+
+label に kind (`hyoui-web`) が入り、`<name>` はその中での識別子になる。unit 名に kind を含めないので、Q3 がどちらに決まっても label 規約は変わらず、kind が増えた時は prefix が別 (`jp.kawaz.hyoui-<kind>.<name>`) になるだけで既存 unit を踏まない。
 
 `list` は定義ディレクトリを label prefix (`jp.kawaz.hyoui-web.` / `hyoui-web-`) で走査して unit を数える。unit の属性 (listen / binary / assets_dir) は定義の argv から復元する。
 
@@ -164,7 +195,9 @@ canddy 側の変更は **canddy リポの issue として依頼する**。設定
 
 ### 8. 既存 `hyoui web service register|unregister|status` は廃止する
 
-alias を残さない。v1.0 未満で互換層を作らない方針に従う。移行は既存 1 台 (`com.github.kawaz.hyoui-web`) だけが対象で、`launchctl bootout gui/$UID/com.github.kawaz.hyoui-web` → plist 削除 → `hyoui service add stable --port=43690` の 3 手。手順は runbook に置く。
+alias も移行期間も設計に入れない。この CLI の利用者は kawaz だけで、破壊的変更を受ける第三者が存在しない (kawaz 明言、2026-09-15)。
+
+移行は既存 1 台 (`com.github.kawaz.hyoui-web`) だけが対象で、`launchctl bootout gui/$UID/com.github.kawaz.hyoui-web` → plist 削除 → `hyoui service add stable --port=43690` の 3 手。手順は runbook に置く。
 
 label の名前空間が `com.github.kawaz.hyoui-web` から `jp.kawaz.hyoui-web.<name>` に変わるので、移行の途中で両方が載っても互いを踏まない。
 
@@ -184,7 +217,8 @@ label の名前空間が `com.github.kawaz.hyoui-web` から `jp.kawaz.hyoui-web
 
 | 案 | 不採用理由 |
 |---|---|
-| `web service` を残し `service` を alias にする | 同じことをする口が 2 つ増える。移行対象は自分の 1 台だけで、互換のために語彙を濁す理由が無い |
+| 旧 `web service register/unregister/status` を alias として温存する | 同じことをする口が 2 つ増え、help と completion にも 2 つ載る。利用者は kawaz だけで、互換のために語彙を濁す相手が居ない |
+| `hyoui daemon` 群を新設して gateway のプロセス操作を置く | 決定 1。同じ語が PTY session と gateway の 2 つを指すことになり、既存の `run` / `list` / `status` / `kill` / `tail` が扱う対象と読み分けられなくなる |
 | unit を port で識別する (`service add --port` だけで名前なし) | port は「今どこで待つか」であって unit の同一性ではない。port を変えた瞬間に別 unit になり、`stable` の設定を 43690 → 43695 に移す操作が表現できない。stable / unstable という運用上の役割も名前でしか書けない |
 | hyoui 自身が front で受けて背後の 2 台に振る | 常駐プロセスが 1 種類増え、その front 自体が単一障害点になる。HA を足したつもりで可用性が下がる |
 | llm-gateway と同じく監督者 1 つを OS に載せる | 決定 2。launchd / systemd が持つ機能を作り直すことになる。llm-gateway が採ったのは「1 監督者が別ビルドの子を複数抱える」形を先に決めたためで、hyoui にその前提は無い |
@@ -216,6 +250,14 @@ P3 の「断が出ないこと」の検証は、DR-0014 の検証主義に従い
 
 - **Q1: unstable の port をいくつにするか。** 統括推し: stable を既存の `43690` のまま据え置き、unstable を `43691` にする。canddy の hyoui ブロックは現在 43690 単体を指しており、stable を動かさなければ移行中も到達が切れない。llm-gateway が 11301/11302 と連番を取っているのと同じ形。
 - **Q2: 既存 1 台の移行を `add` が引き取るか、runbook の手作業にするか。** 統括推し: 手作業 (`launchctl bootout` + plist 削除) にする。`add` に「旧 label を探して降ろす」経路を入れると、二度と通らないコードが製品に残る。対象は 1 台だけで、runbook 3 行で足りる。
+
+- **Q3: verb 群を `hyoui service` に置くか、`hyoui web service` に置くか。** 判断軸は「web 以外に OS 常駐させる kind が出てくるか」(kawaz 提示)。Context の洗い出しでは現行の kind は web gateway のみで、将来候補として「login 時に決まった PTY session を起こす」が 1 つ挙がる。
+
+  この DR の推し: **`hyoui web service` を維持する。** 理由は option 集合が kind と一緒に動くこと。`--port` / `--assets-dir` は gateway 固有で、session を起こす kind が来れば必要なのは `-- cmd args...` と namespace になる。共通の `hyoui service add` に両方を載せると、kind に応じて有効な option が分岐する形 (`--kind` で枝分かれする option 集合) になり、これは help でも completion でも説明しづらい。kind ごとに `hyoui web service` / `hyoui <kind> service` と階層で割れば、各階層の option 集合が閉じる。`hyoui web` 配下に web の運用が全部あるのも素直。
+
+  対立する見方 (統括の暫定推し): 常駐 kind が 1 種類しかない今の時点で階層を 1 段深くするのは、将来の仮定的要件のために複雑さを先に払う形になる。`hyoui service` で始めて、kind が実際に増えた時に `hyoui web service` へ動かせばよい (v1.0 未満なので動かせる)。
+
+  どちらもコストはほぼ同じ (verb 群の実装は 1 kind 分で変わらない)。違うのは、後から動かす時に runbook と plist の label 名を書き直すかどうかだけ。上記の「session を起こす kind」に手を付ける見込みがあるかは kawaz にしか判断材料が無いので、裁定に出す。
 
 ## 参照した素材
 
