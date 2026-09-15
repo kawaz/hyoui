@@ -63,6 +63,23 @@ gateway インスタンスを **複数前提**で扱えるようにし、片方�
 
 llm-gateway が同じ reference 体系を先に当てている (DR-0028)。unit = 設定ファイル 1 つ、登録簿は `~/.local/state/llm-gateway/daemon/units/<name>.toml`、unit ごとに `binary_path` を持ち (stable = brew / unstable = repo build)、`daemon supervise` 1 つだけを launchd に載せる。本 DR は **この形をそのまま hyoui に持ち込む** (裁定 SVC-Q2=b)。
 
+踏襲する点と、hyoui で変える点:
+
+| 項目 | llm-gateway | hyoui (本 DR) |
+|---|---|---|
+| 監督者を 1 つだけ OS に載せる | そう | 踏襲 (決定 6) |
+| 制御経路 | unix socket 1 本、JSON 1 行、監督者不在は `supervisor_not_running` + hint | 踏襲 (決定 4) |
+| backoff / grace | 初回 1 秒から倍々・上限 60 秒、SIGTERM → grace → SIGKILL | 踏襲、値も同じ (決定 3) |
+| 監督者を止めた時の子 | 道連れ (行儀よく降りる限り全部止める) | 踏襲 (決定 6) |
+| 監督者死亡後の残り子 | 引き取らない。次の監督者は起こし直して port 衝突 | 踏襲 (決定 10) |
+| ログ | 監督者が `logs/<unit>.log` に集約、回転は OS | 踏襲 (決定 9) |
+| unit の中身 | 設定ファイルの path + `binary_path` + `enabled` | **変更**: 設定ファイルを持たず `listen` / `binary` / `web_assets_dir` / `enabled` を解決して書く (決定 2)。gateway に設定ファイルの概念が無い |
+| 子の argv | `<binary> daemon run <unit>` (子が設定を解釈) | **変更**: `<binary> web --listen=... [--web-assets-dir=...]`。unit が 3 値しか持たないので argv に収まり、古い配布版でも通る (決定 3) |
+| `binary` の既定 | 設定の `binary_path`、無ければ登録時の自分自身 | **変更**: `current_exe` が PATH 上ならそれ、PATH 外ならそのまま焼く。`resolve_stable_path` を通さない (決定 2) |
+| `restart --all` の順序 | 登録の逆順 (`supervisor.rs:286-288`、前段が手前を優先しているため) | **変更**: unit 名の昇順 (決定 5)。順序の根拠を前段の設定に置かない — 前段の優先順は canddy が持つ知識で、監督者は知らない |
+| 停止中 unit への `restart` | 無条件に `set_enabled(name, true)` (`supervisor.rs:318`) | **変更**: 名前指定なら同じ (enable して起こす)、`--all` は `enabled` な unit だけ (決定 5)。`stop` の意思を `--all` が覆さない |
+| 版の表示 | `version` が `on_disk` / `running` / `restart_needed` を並記 (DR-0028 §9) | **採らない**。`/version` に `build_id` を足し、走っている側の実測値だけを出す (「やらないこと」に理由) |
+
 ## 介入判断 self-check (CLAUDE.md / DR-0014)
 
 - PTY / child / signal / protocol への介入は無い。DR-0031 と同じく OS service manager に起動を依頼する運用層で、透過原則を変更しない
@@ -79,11 +96,11 @@ hyoui web daemon run [unit]                この unit を foreground で起動�
 hyoui web daemon supervise                 foreground の監督者。登録簿の unit を子として抱え、落ちたら上げる
 hyoui web daemon add <name> [options]      unit を登録簿に足す
 hyoui web daemon remove <name>             登録簿から外す
-hyoui web daemon list                      → [{id, unit, running, pid}]
+hyoui web daemon list                      → [{name, enabled, running, pid}] (監督者が居なくても動く)
 hyoui web daemon start   <name> | --all    監督者に起動を要求する
 hyoui web daemon stop    <name> | --all    監督者に停止を要求する
 hyoui web daemon restart <name> | --all    stop → start (--all は 1 台ずつ)
-hyoui web daemon status  [<name>] | --all  → [{id, unit, enabled, running, pid, listen, binary, ...}]
+hyoui web daemon status  [<name>] | --all  → [{name, enabled, running, pid, listen, binary, ...}]
 hyoui web daemon log     [<name>] | --all [--follow]
 
 hyoui web service register | unregister    監督者 (`hyoui web daemon supervise`) を launchd / systemd に載せる / 外す
@@ -101,15 +118,23 @@ hyoui web service log [--follow]           監督者と OS 側のログ
 | `--binary=<path>` | この unit が起動する実行ファイル | 決定 2 のとおり `current_exe` が PATH 上かで分ける |
 | `--web-assets-dir=<path>` | 静的 assets の差し替え (dev) | config `[web].assets_dir`、無ければ embedded |
 
-option 名は `hyoui web` 側 (`--listen` / `--web-assets-dir`) と一字一句揃える。`add` が組み立てるのは `hyoui web daemon run` が読む値なので、同じものを 2 通りに呼ばない。
+option 名は `hyoui web` 側 (`--listen` / `--web-assets-dir`) と一字一句揃える。`add` が書くのは監督者が `hyoui web` に渡す argv の材料そのもの (決定 3) なので、同じものを 2 通りに呼ばない。
+
+`daemon run [unit]` は登録簿の値で foreground 起動する糖衣。監督者が子を exec する経路はこれを通らない (決定 3)。
 
 `hyoui web` の引数なし実行は gateway の foreground 起動 (`daemon run` と同義) のまま維持する。`hyoui web daemon` / `hyoui web service` の引数なし実行と、必須引数を欠く verb は help を出す。help 以外の出力は JSON、`log --follow` は JSONL、エラーは JSON を stderr に出して exit を非 0 にする (reference の出力規約)。
 
 ### 2. unit = 登録簿の 1 ファイル。listen も binary も解決して書く
 
-`$XDG_STATE_HOME/hyoui/web/units/<name>.toml` に 1 unit 1 ファイル (`XDG_STATE_HOME` 未設定時は `~/.local/state`)。`<name>` は `[A-Za-z0-9_-]{1,32}` に限り、path separator を含む名前は拒否する (ファイル名に使うため)。
+`${XDG_STATE_HOME:-~/.local/state}/hyoui-web/units/<name>.toml` に 1 unit 1 ファイル。`<name>` は `[A-Za-z0-9_-]{1,32}` に限り、path separator を含む名前は拒否する (ファイル名に使うため)。
+
+**root は `hyoui/` ではなく `hyoui-web/` にする。** `${XDG_STATE_HOME}/hyoui/` と `$XDG_RUNTIME_DIR/hyoui/` は session discovery の走査 base で、その**サブ dir 名が namespace、中の `*.sock` が session** として扱われる (`crates/hyoui/src/discovery.rs:9-13` / `:167-190`、DR-0018 の socket 配置と対称)。監督者の socket をここに置くと `hyoui list` に namespace `web` の session として現れ、hyoui protocol を話さないので stale 扱いで並ぶ。session の名前空間と gateway の運用状態を同じ木に置かない。
+
+この root に `units/` (登録簿)、`logs/` (決定 9)、`supervisor.sock` (決定 4) をまとめる。
 
 unit が持つのは `listen` / `binary` / `web_assets_dir` / `enabled` (desired state) / `added_at`。
+
+**書き込みは tmp ファイル + rename で差し替える。** 同じ dir に書いて rename すれば、読み手は古い内容か新しい内容のどちらかを見る (途中の半端な内容を読まない)。`enabled` を書き換えるのは監督者、`add` / `remove` は CLI で、書き手が 2 者いるのでこれは要件。
 
 **listen は `add` の時点で解決し切って書く。** 解決順は `--listen` → `--port` → config `[web].listen` → `127.0.0.1:43690`。`web_assets_dir` も同様に `--web-assets-dir` → config `[web].assets_dir` の順で解決し、どちらも無ければ書かない (= その unit は embedded assets で固定)。config を後から書き換えても既存 unit の待ち先と assets が動かないので、`list` / `status` の値は「この unit が実際に使う値」として読める。解決せずに実行時の config 読みに委ねると、`[web].listen` を 1 つ書き換えた瞬間に全 unit の待ち先が変わり、前段が指している先が人の知らないうちに動く。
 
@@ -130,7 +155,13 @@ unit が持つのは `listen` / `binary` / `web_assets_dir` / `enabled` (desired
 
 ### 3. `supervise` は exec するだけの監督者
 
-登録簿の `enabled` な unit ごとに `<binary> web daemon run <name>` を子プロセスとして起動し、落ちたら backoff を置いて上げ直す。SIGTERM / SIGINT を受けたら子を順に止めて終わる (SIGTERM → grace 待ち → SIGKILL)。
+登録簿の `enabled` な unit ごとに **`<binary> web --listen=<listen> [--web-assets-dir=<path>]`** を子プロセスとして起動し、落ちたら backoff を置いて上げ直す。
+
+**exec する argv に `web daemon run <name>` を使わない。** stable unit が指すのは brew 配布版で、それは本 DR の実装より古い版でありうる。古い版は `web daemon run` という subcommand を知らないので即座に死に、監督者が backoff で叩き続けるだけになる。一方 `web --listen=...` は DR-0027 以降のどの版でも通る。unit の属性は `add` の時点で解決済み (決定 2) なので、子に登録簿を読ませる必然性が無い — 監督者が読んで argv に渡せば足りる。
+
+これは llm-gateway (子に `daemon run <unit>` を exec させ、子が設定ファイルを解釈する) と違う点。llm-gateway の unit は設定ファイル 1 つで、子が読むべき内容が argv に収まらないのに対し、hyoui の unit は 3 値しか持たない。
+
+`daemon run [unit]` は CLI の糖衣として残す (登録簿の値で foreground 起動する = 手元で 1 台だけ動かして確かめる用)。監督者の exec 経路には使わない。SIGTERM / SIGINT を受けたら子を順に止めて終わる (SIGTERM → grace 待ち → SIGKILL)。
 
 監督者自身は HTTP を持たず、gateway の設定も解釈しない。解釈するのは子の `daemon run` である。
 
@@ -149,17 +180,34 @@ backoff は llm-gateway と同じ形 (初回 1 秒から倍々、上限 60 秒)�
 
 **`service register` を再実行するのは、監督者自身を更新する時だけ。** 具体的には (a) `hyoui` を brew で上げて監督者の argv / path を新しい版に向け直す時、(b) 監督者の定義そのもの (label / 環境 / log path) を変えた時。どちらも普段の gateway 更新では起きない。
 
+ただし `register` は同じ label を降ろして載せ直すので、**監督者の再起動を伴い、子も道連れで一度落ちる** (決定 6)。つまり `service register` の再実行は全断を含む操作で、この点でも「gateway の更新では打たない」が正しい。
+
 ### 4. 制御は監督者への unix socket 1 本。監督者が居なければ断る
 
-`start` / `stop` / `restart` / `status` / `log` は子を直接叩かず、監督者へ要求する。socket は `$XDG_STATE_HOME/hyoui/web/supervisor.sock`、要求は JSON 1 行、答えも JSON 1 行 (`log --follow` だけ JSONL が続く)。
+`start` / `stop` / `restart` / `status` / `log` は子を直接叩かず、監督者へ要求する。socket は ``${XDG_STATE_HOME:-~/.local/state}/hyoui-web/supervisor.sock``、要求は JSON 1 行、答えも JSON 1 行 (`log --follow` だけ JSONL が続く)。
 
 `start` / `stop` は登録簿の `enabled` を監督者が書き換えて子へ反映する。**`stop` された unit は登録簿に残る** (`enabled = false`)。unit の停止は launchd の `bootout` ではなく監督者が子を止める操作なので、launchd 側の `disable` は関与しない (launchd の停止意味論が効くのは監督者の plist だけ = 決定 6)。
 
 監督者が起動していなければ、CLI は `supervisor_not_running` エラーと、`hyoui web daemon supervise` または `hyoui web service start` を実行するための hint を返す。**監督者不在時に CLI が子を直接起こす経路は持たない** — 子の所有者が CLI と監督者の 2 つになり、停止・再起動・状態確認の経路が分岐する。
 
-登録簿の変化を定期的に舐めて差分を見つける作りにもしない。`reload` 要求で読み直す。ポーリングは間隔に根拠が無く、間隔の内側で起きた往復 (stop → start) を取りこぼす。
+登録簿の変化を定期的に舐めて差分を見つける作りにはしない。ポーリングは間隔に根拠が無く、間隔の内側で起きた往復 (stop → start) を取りこぼす。代わりに `add` / `remove` が監督者へ要求を送る (下記)。`reload` (登録簿を読み直して望みとの差を埋める) は **socket の内部 op として持つが、CLI の verb としては出さない** — 人が打つ必要のある場面が無く、出すと「`add` の後に `reload` を打つべきか」という迷いを生む。
 
-`status` が返すのは unit の配列で、1 行に `{id, unit, enabled, running, pid, since_ms, listen, binary, binary_exists, version, build_id, restarts, last_exit}`。`enabled` と `running` を分けるのは、停止指示のまま降りているのか、上げたいのに上がらないのかを区別するため。
+#### `add` / `remove` は走行中の監督者に即反映する
+
+| 操作 | 登録簿 | 監督者が走っている | 監督者が居ない |
+|---|---|---|---|
+| `add <name>` | `enabled = true` で書く | `start <name>` 相当を送り、その場で子が上がる | 次に監督者が上がった時に起きる。出力に「監督者が停止中なので未起動」と添える |
+| `remove <name>` | ファイルを消す | 先に `stop <name>` を送り、子が降りてから消す | そのまま消す |
+
+`add` の `enabled` 初期値を `true` にするのは、`add` が「この gateway を動かしたい」という意思表示だから。`add` してから `start` を打たせるのは、2 手を要求する理由が無い。動かさずに登録だけしたい場面は今のところ無いので、`--no-start` のような option も持たない (必要になったら足す)。
+
+`remove` が `stop` を先に送るのは、登録簿から消えた子を監督者が抱えたままになるのを避けるため。消してから `reload` に任せる形にすると、「登録簿に居ないが走っている子」を監督者が畳む経路が必要になり、決定 10 で作らないと決めた引き取り判断に近い曖昧さが入る。
+
+`status` が返すのは unit の配列で、1 行に `{name, enabled, running, pid, since_ms, listen, binary, binary_exists, version, build_id, restarts, last_exit}`。unit の識別子は `name` 1 本にする (reference の例は `{id, unit}` だが、`id` は登録簿を持たない実装での連番で、名前がある本 DR では同じものを 2 通りに呼ぶだけになる)。`enabled` と `running` を分けるのは、停止指示のまま降りているのか、上げたいのに上がらないのかを区別するため。
+
+**`list` は監督者が居なくても動く。** 登録簿を読むだけで答えられる範囲 (`name` / `enabled` / `listen` / `binary`) を出し、`running` / `pid` は監督者に聞けないので `false` / `null` にして「監督者が停止中」と添える。障害時に最初に打つコマンドが監督者の生死に依存すると、目的節の「サクッと状態を見る」が成り立たない。`status` も同じ扱いで、監督者不在時は登録簿由来の列だけが埋まる。
+
+**`start --all` は停止中の unit も上げる** (`enabled` を立てる)。`restart --all` が `enabled` な unit だけを対象にするのと対照的だが、`start` は「上げてほしい」という意思表示そのもので、`restart` は「走っているものを入れ替える」操作だから — 前者が desired state を書き換えるのは意図どおり、後者が書き換えるのは事故 (決定 5)。
 
 ### 5. `restart --all` は 1 台ずつ
 
@@ -288,7 +336,7 @@ canddy 側の変更は **canddy リポの issue として依頼する**。設定
 
 ### 9. ログは監督者が unit 名で分けて書き、回転は OS に任せる
 
-子は stdout / stderr に書くだけで、置き場を知らない。監督者がそれを受けて `$XDG_STATE_HOME/hyoui/web/logs/<name>.log` へ追記する。同じ行は追従している client へも配るので、`daemon log --follow` は書かれた先を読み直さずに済む。子に置き場を教えないのは、置き場が変わるたびに全 unit の登録を書き直すことになり、「監督者が抱える」という決定 3 の形が崩れるため。
+子は stdout / stderr に書くだけで、置き場を知らない。監督者がそれを受けて ``${XDG_STATE_HOME:-~/.local/state}/hyoui-web/logs/<name>.log`` へ追記する。同じ行は追従している client へも配るので、`daemon log --follow` は書かれた先を読み直さずに済む。子に置き場を教えないのは、置き場が変わるたびに全 unit の登録を書き直すことになり、「監督者が抱える」という決定 3 の形が崩れるため。
 
 **回転は hyoui が持たない。** OS の仕組み (macOS は newsyslog、Linux は logrotate) に任せ、hyoui 側は追記しかしない。自前で持つと、大きさの上限・世代数・圧縮の有無という運用ごとに違う判断を hyoui が代わりに決めることになり、しかも OS の仕組みと二重になる。
 
@@ -300,7 +348,9 @@ canddy 側の変更は **canddy リポの issue として依頼する**。設定
 
 **引き取りは作らない。** 走っているプロセスが誰の子かは、pid を書き留めても再起動を跨いで確かめられない (pid は使い回される)。確かめられないものを頼りに「これは自分の子だ」と決めると、無関係のプロセスを畳む経路ができる。
 
-次に上がった監督者は登録簿どおりに子を起こし直すので、残った子と待ち受けポートが衝突し、新しい子は bind に失敗して backoff に入る。**この状態は `status` から読める** — `running: false` + `restarts` の増加 + `last_exit` に bind 失敗が出る。残った子は人が畳む。
+次に上がった監督者は登録簿どおりに子を起こし直すので、残った子と待ち受けポートが衝突し、新しい子は bind に失敗して backoff に入る。**この状態は `status` から読める** — `running: false` + `restarts` の増加 + `last_exit` に bind failure が出る。残った子は人が畳む。
+
+**孤児が port を握っている間、前段からは健全に見える。** 孤児も gateway なので `/healthz` に 200 を返し、canddy は普通に振り分ける。外から見た可用性は保たれるが、`daemon status` は `running: false` を出し続けるので、CLI の見え方と実際の応答者が食い違う。この食い違いは `status` の `restarts` / `last_exit` から気づける形にしておく (孤児が居ることの唯一の手がかりになる)。
 
 ### 11. 既存 `hyoui web service register|unregister|status` は置き換える
 
@@ -336,7 +386,7 @@ verb 名は残るが、載せる対象が gateway 1 台から監督者に変わ�
 
 | 案 | 不採用理由 |
 |---|---|
-| **監督者を置かず、unit 1 つ = OS service 1 つにする** | 目的が達成できない。台数ぶんの plist / systemd unit が並ぶので、状態を見る・再起動する時に「どの label が何台あるか」を先に思い出す作業が残る (目的節の第一の目的)。unit の binary を差し替えるたびに OS 側の定義を書き直すことになり、「監督者より上は触らない」契約も立たない。`service` と `daemon` の status / log のスコープも分かれない。kawaz 製 CLI 共通の reference 体系から外れる点も同じ方向 (kawaz 裁定 2026-09-15、SVC-Q2=b) |
+| **監督者を置かず、unit 1 つ = OS service 1 つにする** | 目的が達成できない。台数ぶんの plist / systemd unit が並ぶので、状態を見る・再起動する時に「どの label が何台あるか」を先に思い出す作業が残り、操作も `launchctl` / `systemctl` の使い方に戻る (目的節の第一の目的)。`service` と `daemon` で status / log のスコープも分かれず、OS 登録の話と子の生死の話が 1 つの出力に混ざる。kawaz 製 CLI 共通の reference 体系から外れる点も同じ方向 (kawaz 裁定 2026-09-15、SVC-Q2=b) |
 | verb 群を `hyoui service` / `hyoui daemon` (top-level) に置く | kawaz 裁定 (SVC-Q1=a) で不採用。`hyoui daemon` は PTY session の daemon と語が衝突し、kind が増えた時に `--kind` で option 集合が分岐する。`hyoui web` 配下なら `add` の option が `hyoui web` の引数の写しになり、将来の kind は `hyoui session daemon` として並べられる |
 | 旧 `web service` を alias として温存する | 同じことをする口が 2 つ増え、help と completion にも 2 つ載る。利用者は kawaz だけで、互換のために語彙を濁す相手が居ない |
 | unit を port で識別する (名前を持たない) | port は「今どこで待つか」であって unit の同一性ではない。port を変えた瞬間に別 unit になり、`stable` の設定を 43690 → 43695 に移す操作が表現できない。stable / unstable という役割も名前でしか書けない |
@@ -351,8 +401,8 @@ verb 名は残るが、載せる対象が gateway 1 台から監督者に変わ�
 | Phase | 内容 | gate |
 |---|---|---|
 | P1 | `GET /healthz` / `GET /version` (`build_id` 込み)、`build.rs` の git 由来既定 | 単体 test で 200 / JSON 形 / `build_id` 未設定時の `null`。repo build と brew 版で `build_id` が異なることを実機で確認 |
-| P2 | 登録簿 (`units/<name>.toml`) と `add` / `remove` / `list`、`daemon run <unit>` | parser test (各 leaf、`--port` と `--listen` の排他、不正な unit 名、必須引数欠落時の help)。listen / assets_dir の解決と衝突拒否の test。登録簿の round-trip test。`daemon run <unit>` が登録簿の listen で上がることを実機確認 |
-| P3 | `supervise` + 制御 socket + `start` / `stop` / `restart` / `status` / `log` | 監督者不在時に `supervisor_not_running` + hint を返す test。子が落ちたら上がる / backoff 上限に達する test。`restart --all` を 127.0.0.1 直叩きで観測 (前段経由は P6)。`stop` した unit が復活しないことを観測 |
+| P2 | 登録簿 (`units/<name>.toml`) と `add` / `remove` / `list`、`daemon run <unit>` | parser test (各 leaf、`--port` と `--listen` の排他、不正な unit 名、必須引数欠落時の help)。listen / assets_dir の解決と衝突拒否の test。登録簿の round-trip test と tmp + rename の atomic write test。**`hyoui list` に `hyoui-web` root の中身が現れないことを確認** (決定 2、discovery の走査 base と分かれているか)。`daemon run <unit>` が登録簿の listen で上がることを実機確認 |
+| P3 | `supervise` + 制御 socket + `start` / `stop` / `restart` / `status` / `log` | 監督者不在時に `supervisor_not_running` + hint を返す test。子が落ちたら上がる / backoff 上限に達する test (backoff の定数は注入可能にして test では短い値を使う。実時間で 60 秒を待つ test は書かない)。`add` / `remove` が走行中の監督者に即反映される test と、監督者不在時に登録簿だけが変わる test。`restart --all` を 127.0.0.1 直叩きで観測 (前段経由は P6)。`stop` した unit が復活しないことを観測 |
 | P4 | `service register` / `unregister` / `start` / `stop` / `status` / `log` を監督者向けに置き換え | plist / systemd unit の golden test。隔離 HOME での未登録 status と全 help topic。`service stop` 後に監督者が KeepAlive で復活しないことを実機で観測。`service stop` で子 gateway も落ちることを観測 (決定 6 の明文化どおりか) |
 | P5 | 旧 `web service` の意味の切り替え完了、help / completion / 実装の 3 者同期、移行 runbook、既存 1 台の移行 | `hyoui web daemon --help` / `hyoui web service --help` と completion 定義の突き合わせ test。実機で stable + unstable の 2 台が監督者の下に常駐し、`status` が両方の `build_id` を別々に出す。**目的節の契約を実機で確認**: unstable を再ビルド → `daemon restart unstable` だけで新しい `build_id` に入れ替わり、`service register` も plist の確認も要らないこと |
 | P6 | canddy リポへ upstream 設定の issue 起票、前段経由の HA 実機検証 | unstable を `stop` した状態で新規リクエストが stable に回る。stable のみ停止でも同様。`restart --all` 実行中に前段経由の断が出ない。3 つが揃って完了 |
@@ -379,7 +429,8 @@ P6 の検証は DR-0014 の検証主義に従い 1 回の観察で結論しな�
 - `~/.local/share/repos/github.com/kawaz/llm-gateway/main/docs/decisions/DR-0028-daemon-service-subcommands.md` (§3 監督者、§9 版の並記、§10 ログ、§11 監督者死亡時)
 - `~/.local/share/repos/github.com/kawaz/llm-gateway/main/crates/llm-gateway/src/daemon/` の `registry.rs` / `protocol.rs` / `supervisor.rs` (`Unit` / `Request` / `Which` / `UnitStatus`、backoff と grace の定数)、`crates/llm-gateway-cli/src/service.rs` / `service/platform.rs`
 - `~/.local/share/repos/github.com/kawaz/canddy-app-proxy/main/README.md` / `Caddyfile` (hyoui ブロック 127-133、llm-gateway ブロック 144-194)
-- 本リポ: `docs/decisions/DR-0031-web-service-subcommand.md`、`DR-0006-cli-ground-rules.md`、`crates/hyoui-cli/src/web_service.rs`、`crates/hyoui-cli/src/completion.rs`、`crates/hyoui-cli/tests/web_service_e2e.rs`、`crates/hyoui-web/src/lib.rs`、`crates/hyoui/src/protocol/caps.rs`、`crates/hyoui/src/config/mod.rs`、`justfile`
+- 本リポ: `docs/decisions/DR-0031-web-service-subcommand.md`、`DR-0006-cli-ground-rules.md`、`crates/hyoui/src/discovery.rs:9-13` / `:167-190` (走査 base とサブ dir = namespace の扱い)、`crates/hyoui-cli/src/web_service.rs`、`crates/hyoui-cli/src/completion.rs`、`crates/hyoui-cli/tests/web_service_e2e.rs`、`crates/hyoui-web/src/lib.rs`、`crates/hyoui/src/protocol/caps.rs`、`crates/hyoui/src/config/mod.rs`、`justfile`
+- llm-gateway `crates/llm-gateway/src/daemon/supervisor.rs:280-295` (`restart --all` の逆順) / `:314-325` (停止中 unit を無条件 enable)
 - 実機出力: `hyoui --help` / `hyoui web --help` / `hyoui web service --help` / `hyoui web service status` (`/opt/homebrew/bin/hyoui` 0.9.42)、現行 plist の全文 (`ProgramArguments` は `hyoui web` の 2 語、`KeepAlive=true`)、`target/release/hyoui --version` (= 0.9.42、brew 版と同一で build 識別不能)
 
 ## 関連
