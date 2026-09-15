@@ -162,6 +162,8 @@ unit が持つのは `listen` / `binary` / `web_assets_dir` / `enabled` (desired
 
 **OS 側の定義は監督者 1 つ分だけ。** unit ごとの plist / systemd unit は作らないので、定義ファイルを読み返して属性を復元する経路も要らない (登録簿は serde で読み書きする)。plist renderer は監督者 1 本のために残り、DR-0031 §5 の純関数 renderer + golden test をそのまま使える。台数を増やしても renderer の出力は 1 種類のままで、XML / ini の parser を足す必要も生じない。
 
+ただし **監督者に焼かれた実行ファイルの path だけは定義から読む** (決定 7a が要求する `on_disk`)。監督者が止まっている間、次に上がる版を知る手がかりはこれしか無い。読むのは `ProgramArguments` / `ExecStart` の先頭 1 語だけで、属性を復元する汎用 parser ではない。
+
 ### 3. `supervise` は exec するだけの監督者
 
 登録簿の `enabled` な unit ごとに **`<binary> web daemon run <name>`** を子プロセスとして起動し、落ちたら backoff を置いて上げ直す。
@@ -260,11 +262,13 @@ backoff は llm-gateway と同じ形 (初回 1 秒から倍々、上限 60 秒)�
 | login 時起動 | `RunAtLoad=true` | `WantedBy=default.target` + enable |
 | 継続起動 | `KeepAlive=true` | `Restart=always` |
 | 環境 | 最小 `PATH` のみ | 最小 `PATH` のみ |
-| log | `~/Library/Logs/hyoui-web/supervise.log` | journald |
+| log | `~/Library/Logs/hyoui-web/<label>.log` | journald |
 
 逆引き domain を `com.github.kawaz` から `jp.kawaz` に変えるのは、kawaz 製ツールの label を 1 つの名前空間に揃えるため (llm-gateway は既に `jp.kawaz.llm-gateway.supervise` を使っている)。副産物として、移行の途中で旧 label (`com.github.kawaz.hyoui-web`) と同時に載っても互いを踏まない。
 
 監督者に焼く binary の path は決定 3 のとおり安定な場所を選ぶ (`resolve_stable_path`、`--binary` で明示可)。安定な場所が無くても登録は止めず、warning を出す。
+
+**label は `HYOUI_WEB_SERVICE_LABEL` で差し替えられる。** launchd の job は `gui/$UID/<label>` に属し、隔離 HOME を渡しても domain は共有されるので、label を変える口が無いと `register` / `stop` を実機で確かめる操作が必ず本番の常駐と同じ job を触ることになる (= 確かめるために止めることになる)。値はファイル名に使うので `[A-Za-z0-9._-]` に限り、外れた値は無視して組み込みの label に戻る。
 
 **監督者を止めると子も止まる。** 監督者は SIGTERM / SIGINT で抱えている子を全部止めてから終わる (決定 3)。したがって `service stop` は全 gateway の停止、`service stop` → `service start` は**全断を伴う入れ替え**になる。子を生かしたまま監督者だけを入れ替える経路は持たない — 残ったプロセスが自分の子かどうかは pid では確かめられないので、引き取りを作らない判断 (決定 10) と同じ理由でできない。
 
@@ -275,13 +279,15 @@ backoff は llm-gateway と同じ形 (初回 1 秒から倍々、上限 60 秒)�
 | verb | macOS (launchd) | Linux (systemd --user) |
 |---|---|---|
 | `register` | `bootout gui/$UID/<label>` (既存を外す) → plist 置換 → `enable` → `bootstrap gui/$UID <plist>` | unit 書き込み → `daemon-reload` → `enable` → `restart` |
-| `unregister` | `bootout` → `disable` → plist 削除 | `disable --now` → unit 削除 → `daemon-reload` |
+| `unregister` | `bootout` → plist 削除 → `enable` | `disable --now` → unit 削除 → `daemon-reload` |
 | `start` | `enable` → `bootstrap` (既に載っていれば `kickstart`) | `systemctl --user start <unit>` |
 | `stop` | `bootout gui/$UID/<label>` → `disable gui/$UID/<label>` | `systemctl --user stop <unit>` |
 | `status` | `print gui/$UID/<label>` + `print-disabled gui/$UID` | `is-enabled` / `show -p LoadState --value` / `show -p MainPID --value` |
-| `log` | `~/Library/Logs/hyoui-web/supervise.log` を読む | `journalctl --user -u hyoui-web-supervise` |
+| `log` | `~/Library/Logs/hyoui-web/<label>.log` を読む | `journalctl --user -u hyoui-web-supervise` |
 
 `disable` を対で叩くのは、これが再 bootstrap / 再 login を跨いで残る「上げない」指示だからで、`bootout` 単体だと次の login で `RunAtLoad` により復活する。`start` の `enable` はその対。
+
+**`unregister` では `disable` ではなく `enable` を打つ。** 定義を消した後に「上げない」指示だけが label に残ると、人が plist を手で戻した時に戻したのに上がらない状態になる。launchd は一度触った label を `print-disabled` に `=> enabled` / `=> disabled` として残し続けるので消すことはできず、解除するだけ (実測)。
 
 `register` は冪等。描いた定義が既にそのまま置かれ OS 側にも載っていれば何もせず `changed: false`、違えば同じ label を降ろして置き換え載せ直して `changed: true`。「既に登録されている」を理由に断ると、中身を直したいだけの操作に `unregister` を挟ませることになる。
 
