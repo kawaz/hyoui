@@ -174,6 +174,8 @@ unit が持つのは `listen` / `binary` / `web_assets_dir` / `enabled` (desired
 
 SIGTERM / SIGINT を受けたら子を順に止めて終わる (SIGTERM → grace 待ち → SIGKILL)。
 
+**降りる時に、何を受けて降りたのかを 1 行だけ stderr に書く** (`got signal <n>; stopping <N> unit(s)`)。監督者を止めれば子も止まるので、`service log` を見た人が「落ちた」のか「止められた」のかを区別できる必要がある。監督者自身の出力はこの経路 (決定 6 の log) に入り、子のログ (決定 9) とは混ざらない。
+
 監督者自身は HTTP を持たず、gateway の設定も解釈しない。解釈するのは子の `daemon run` である。
 
 backoff は llm-gateway と同じ形 (初回 1 秒から倍々、上限 60 秒)。bind に失敗し続ける unit (= 同 port が既に埋まっている) を無限に叩かないための上限で、この状態は `status` の `restarts` と `last_exit` に出る。
@@ -202,6 +204,8 @@ backoff は llm-gateway と同じ形 (初回 1 秒から倍々、上限 60 秒)�
 監督者が起動していなければ、CLI は `supervisor_not_running` エラーと、`hyoui web daemon supervise` または `hyoui web service start` を実行するための hint を返す。**監督者不在時に CLI が子を直接起こす経路は持たない** — 子の所有者が CLI と監督者の 2 つになり、停止・再起動・状態確認の経路が分岐する。
 
 登録簿の変化を定期的に舐めて差分を見つける作りにはしない。ポーリングは間隔に根拠が無く、間隔の内側で起きた往復 (stop → start) を取りこぼす。代わりに `add` / `remove` が監督者へ要求を送る (下記)。`reload` (登録簿を読み直して望みとの差を埋める) は **socket の内部 op として持つが、CLI の verb としては出さない** — 人が打つ必要のある場面が無く、出すと「`add` の後に `reload` を打つべきか」という迷いを生む。
+
+**`list` も socket の op として `status` と分けて持つ。** `status` は unit ごとに実行ファイルへ `--version` を聞くので短命のプロセスが 1 つずつ走る (決定 7a)。`list` は障害時に最初に打つ口なので、版を聞かず生死と登録内容だけを返して軽く保つ。CLI の verb は両方出す (`list` = 登録の面、`status` = 版まで含む全部) で、違いは help に書く。
 
 #### `add` / `remove` は走行中の監督者に即反映する
 
@@ -433,7 +437,9 @@ canddy 側の変更は **canddy リポの issue として依頼する**。設定
 
 ### 9. ログは監督者が unit 名で分けて書き、回転は OS に任せる
 
-子は stdout / stderr に書くだけで、置き場を知らない。監督者がそれを受けて ``${XDG_STATE_HOME:-~/.local/state}/hyoui-web/logs/<name>.log`` へ追記する。同じ行は追従している client へも配るので、`daemon log --follow` は書かれた先を読み直さずに済む。子に置き場を教えないのは、置き場が変わるたびに全 unit の登録を書き直すことになり、「監督者が抱える」という決定 3 の形が崩れるため。
+子は stdout / stderr に書くだけで、置き場を知らない。監督者がそれを受けて ``${XDG_STATE_HOME:-~/.local/state}/hyoui-web/logs/<name>.log`` へ追記する。同じ行は追従している client へも配るので、`daemon log --follow` は書かれた先を読み直さずに済む。
+
+**`log` が返す既存分は末尾 200 行まで。** 回転前のファイル 1 つで応答が膨れるのを避ける。それより前を読みたい場面はログファイルを直接見る話で、続きが要るなら `--follow` で受ける (= 追従は監督者が配る行なので、ファイルの大きさに依らない)。子に置き場を教えないのは、置き場が変わるたびに全 unit の登録を書き直すことになり、「監督者が抱える」という決定 3 の形が崩れるため。
 
 **回転は hyoui が持たない。** OS の仕組み (macOS は newsyslog、Linux は logrotate) に任せ、hyoui 側は追記しかしない。自前で持つと、大きさの上限・世代数・圧縮の有無という運用ごとに違う判断を hyoui が代わりに決めることになり、しかも OS の仕組みと二重になる。
 
