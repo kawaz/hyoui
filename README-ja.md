@@ -286,6 +286,8 @@ screen state 正本化と attach 復元の仕組みは
 
 ## Status
 
+当初の目的「claude を TUI から解放する」は、TTY 分離 / detach・attach の安定化 / web UI / embed モードまで到達して達成済み。現在の主用途は [ccmsg](https://github.com/kawaz/claude-ccmsg) (Claude Code セッション間メッセージング) のセッション実行基盤で、ccmsg の launcher が `hyoui run --detached -- claude …` でセッションを起動し、`hyoui input` がメッセージの配送経路、embed モードが ccmsg の webui に載る。単品 CLI としての改善は優先度低。
+
 v0.1.x = **外側 API 確立期**。
 
 - `run` / `attach` / `list` / `kill` + multi-attach + protocol cap negotiation:

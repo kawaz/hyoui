@@ -305,6 +305,8 @@ with it, and from the outside becomes a control handle
 
 ## Status
 
+The original goal — freeing `claude` from the TUI — is met: TTY separation, stable detach/attach, a web UI, and embed mode all landed. hyoui's main use today is as the session runtime for [ccmsg](https://github.com/kawaz/claude-ccmsg) (inter-session messaging for Claude Code): ccmsg's launcher starts sessions with `hyoui run --detached -- claude …`, `hyoui input` is the message delivery path, and embed mode is what ccmsg's web UI renders. Improving hyoui as a standalone CLI is low priority.
+
 v0.1.x = **external API stabilization phase**.
 
 - `run` / `attach` / `list` / `kill` + multi-attach + protocol cap
