@@ -9,7 +9,7 @@
 
 ### 現状
 
-`hyoui web service register|unregister|status` (DR-0031) は web gateway を **1 unit 固定**で OS に登録する。label は `com.github.kawaz.hyoui-web` 1 つ、listen は `register --listen` で与えた 1 つ、binary は `stable-which` が選んだ 1 つ。実機はこの形で 1 台だけ常駐している (`~/Library/LaunchAgents/com.github.kawaz.hyoui-web.plist`、pid 実在、canddy が `127.0.0.1:43690` へ向けている)。
+`hyoui web service register|unregister|status` (DR-0031) は web gateway を **1 unit 固定**で OS に登録する。label は `com.github.kawaz.hyoui-web` 1 つ、binary は `stable-which` が選んだ 1 つ。実機はこの形で 1 台だけ常駐しており、plist の `ProgramArguments` は `/opt/homebrew/bin/hyoui web` の 2 語 — **`--listen` は焼かれていない**ので、待ち先は起動時に config (無ければ既定の `127.0.0.1:43690`) から決まる。canddy はその 43690 を指している。
 
 2 台目を足す手段が CLI に無い。足すなら plist を人が手で書くことになり、「今どの gateway が何番で何のバイナリで動いているか」を CLI が答えられない状態になる。
 
@@ -152,6 +152,8 @@ option 名は `hyoui web` 側 (`--listen` / `--web-assets-dir`) と一字一句�
 - **同 port の衝突を検出できない**。listen が定義に無いと、2 unit が同じ port を取ろうとしていることを `add` の時点で判定できない。実際に起きるのは 2 台目の bind 失敗と KeepAlive による再起動ループで、原因が log にしか出ない
 - **`list` / `status` が listen を答えられない**。決定 4 の「属性は argv から復元する」が成立しない
 
+**`--web-assets-dir` も同じ扱いにする。** `add` の時点で `--web-assets-dir` → config `[web].assets_dir` の順に解決し、値があれば argv に焼く。どちらも無ければ焼かず、その unit は embedded assets で固定される (起動時に config を読んで assets_dir が生えることは無い)。config を後から書き換えても既存 unit の見る assets が変わらないので、`list` の `web_assets_dir` は「この unit が実際に使う値」として読める。
+
 **`add` は listen の衝突を拒否する。** 既存 unit と同じ `host:port` を持つ `add` はエラーにし、どの unit が既にその port を持っているかを示す。host が異なる場合 (`0.0.0.0:43690` と `127.0.0.1:43690` のような包含関係) は判定しきれないので拒否せず、warning に留める。
 
 **`stable` = 43690 据え置き、`unstable` = 43691 で確定。** stable を既存の port から動かさないのは、canddy の hyoui ブロックが現在 43690 単体を指しているため。ここを動かさなければ、canddy 側の設定を入れ替える前に unit の移行を終えられ、移行中に到達が切れない。連番を取るのは llm-gateway の 11301 / 11302 と同じ形。
@@ -183,6 +185,10 @@ label に kind (`hyoui-web`) が入り、`<name>` はその中での識別子に
 別に登録簿ファイルを置かないのは、置けば OS 側の定義と二重になり、片方だけ人手で触られた時にどちらが正かを決められなくなるため。DR-0006 §1 が `hyoui list` に対して採った判断 (registry を持たず socket dir を正本にする) と同じ形を service にも適用する。
 
 renderer は DR-0031 の `render_launchd_plist` / `render_systemd_unit` を unit 名でパラメタ化して再利用する。plist / unit は固定の小さな形なので、純関数 renderer + golden test を維持する (DR-0031 §5)。
+
+**復元には renderer の逆関数が要る。XML / ini の crate は足さない。** 現行にあるのは renderer と `systemd_quote` だけで、逆方向が無い (`crates/hyoui-cli/src/web_service.rs:127-141`)。読む対象は自分が書いた形に限るので、`ProgramArguments` の `<string>` 列と `ExecStart=` の quoted value を取り出す逆関数を書き、**renderer と round-trip する test で固定する** (書いて読んで同じ unit に戻る)。汎用 parser を入れるより、書ける形と読める形が同じ 1 組であることを test で担保する方が、DR-0031 §5 が renderer で採った判断と揃う。
+
+**人が手で足した要素は落とさない。** 未知の key / 未知の argv 要素 / 読めない値があっても unit を `list` から消さず、その unit に `error` を添えて載せる。消すと「CLI から見えないが OS には載っている unit」が生まれ、決定 4 の「定義ファイルが正本」が破れる。
 
 ### 5. gateway に `/healthz` と `/version` を足す
 
@@ -249,6 +255,14 @@ handle @hyoui {
 - screen dump が壊れた内容を 200 で返す
 - WS の handshake が通った後で attach が機能しない
 
+### cap 差は gateway 側で吸収する。前段は関与しない
+
+2 つの gateway は同じ socket dir を走査して各 daemon と handshake する。gateway は現在 `MVP_CAPS` 全部を要求して接続し、handshake の失敗は 500 になる (`crates/hyoui-web/src/lib.rs:200-204` ほか、失敗は `INTERNAL_SERVER_ERROR`)。cap は intersect で落ちる仕様なので (`crates/hyoui/src/protocol/caps.rs:30-38`)、新しい gateway が新 cap を必要とする機能を旧 daemon に対して呼ぶと、その機能だけが成立しない。
+
+**この差は gateway 側で機能単位に落とす。** daemon と intersect した結果に無い cap を要する操作は、その操作だけを「未対応」として返し (501 相当)、gateway 全体を 5xx にしない。逆方向 (新しい daemon + 古い stable gateway) も同じで、古い gateway が知らない message は使わないだけになる。
+
+**新しい message を要する DR は、2 版の gateway が同居する前提で互換を書く。** 本 DR 以降、stable と unstable は常に別版なので、「gateway と daemon の版が揃っている」前提を置ける場面が無くなる。
+
 `/healthz` がプロセスの生存だけを意味する (決定 5) のは、この線引きをそのまま反映したもの。gateway 側の応答内容を健全性の条件にすると、不健全の定義が business ロジックに侵食し、復旧の入口 (Web UI) ごと切り離す事故を招く。
 
 同じ理由で、**TCP は生きているのに応答が返らない (hang) 場合の窓**も残る。active health check が落とすまで最大 `health_interval` + `health_timeout` = 7 秒、その間に来たリクエストは unstable に渡って `lb_try_duration` (5 秒) の内側で待つ。ここを詰めるのは前段の設定の話なので、hyoui 側の決定には含めない。
@@ -276,6 +290,7 @@ label の名前空間が `com.github.kawaz.hyoui-web` から `jp.kawaz.hyoui-web
 | 監督者プロセス (`supervise`) | 決定 2。OS service manager が担う |
 | gateway 間の状態共有・session の引き継ぎ | 各 gateway は daemon socket を走査するだけで自前の状態を持たないので、共有すべき状態が無い |
 | ログ回転 | 追記のみ。回転は OS の仕組み (newsyslog / logrotate) に任せる |
+| `on_disk` 版と `restart_needed` (llm-gateway DR-0028 §9) | 「置いてある版」と「走っている版」の比較は、`binary_path` の実行ファイルに `--version` を聞く経路を足すことで成り立つが、本 DR の `build_id` は tag を跨がないビルドを識別するためのもので、再起動が必要かの判定には使っていない。`status` が出すのは走っている側の実測値だけにする。必要になったら別 DR で足す |
 
 ## Alternatives Considered
 
@@ -301,7 +316,7 @@ label の名前空間が `com.github.kawaz.hyoui-web` から `jp.kawaz.hyoui-web
 | P4 | 旧 `web service register/unregister/status` 撤去、help / completion / 実装の 3 者同期、移行 runbook | `hyoui service --help` と completion 定義の突き合わせ test。既存 1 台の移行を実機で完了 |
 | P5 | canddy リポへ upstream 設定の issue 起票、前段経由の HA 実機検証 | unstable を `stop` (= bootout + disable) した状態で新規リクエストが stable に回ることを観測。stable のみ停止でも同様。`restart --all` 実行中に前段経由の断が出ないことを観測。3 つが揃って初めて完了 |
 
-P5 の「断が出ないこと」の検証は、DR-0014 の検証主義に従い 1 回の観察で結論しない。停止させる側 (unstable / stable)、停止のさせ方 (`stop` / `kill -9` / bind 失敗させて再起動ループに入れる)、リクエストの種類 (HTML / `GET /api/sessions`) の組合せでマトリクスを埋める。
+P5 の「断が出ないこと」の検証は、DR-0014 の検証主義に従い 1 回の観察で結論しない。停止させる側 (unstable / stable)、止め方 (`stop` / `kill -9` / `kill -STOP` で TCP は受けるが応答しない状態 / bind 失敗させて再起動ループに入れる)、リクエストの種類 (HTML / `GET /api/sessions`) の組合せでマトリクスを埋める。`kill -STOP` の列は決定 7 の「窓」の実測値になる (前段が落とすまで最大 7 秒、その間のリクエストは待たされる) ので、「断が出ない」と書ける範囲をこの列の結果で限定する。
 
 決定 7 の「救えない範囲」も観測して記録する。WS attach は fallback 対象外なので「切れることを確認した」と書く (「該当なし」ではない)。応答するが誤る壊れ方 (5xx を返す gateway) を 1 ケース作り、**stable に回らないこと**を観測する — これは期待どおりの挙動であり、後から「HA があるのに救われなかった」と読まれないために記録側に残す。
 
@@ -326,7 +341,9 @@ port の割り当て (決定 3) と既存 1 台の移行手順 (決定 8) は本
 
 **対案 `hyoui service` (= 決定 1 の現行記述) の利点**: kind が 1 種類のうちは階層を 1 段減らせる。kind が増えたら `add --kind` を足す形になるが、その時点で `--kind` に応じて有効な option が分岐する。これは表示都合の問題ではなく、モデル自体が kind ごとに違う option 集合を持つという話なので、help と completion の両方で説明しづらくなる。
 
-**第 3 の形: `hyoui service add <kind> <name>`** (kind を階層ではなく `add` の位置引数にする)。verb 群は 1 箇所に集まったまま kind ごとの option 集合を分けられる (`service add web stable --port=...` / `service add session claude -- claude`)。`remove` 以降は `<name>` だけで引ける (kind は label から判る)。help は `service add` の下に kind ごとの節が並ぶ形になる。今の kind が 1 種類なので `add web stable` の `web` が冗長に見えるのが弱点。
+**第 3 の形: kind を `hyoui service` の内側に置く。** `hyoui service add <kind> <name> ...` (kind を `add` の位置引数) か `hyoui service <kind> add <name> ...` (kind を verb の手前) のどちらか。どちらも verb 群を 1 箇所に集めたまま kind ごとに option 集合を閉じられる (`service add web stable --port=...` / `service add session claude -- claude`)。`remove` 以降は `<name>` だけで引ける (kind は label から判る)。この形が成り立つなら、`hyoui web service` の優位は「kind 名が階層のどこに出るか」だけに縮む。弱点は、kind が 1 種類の今は `add web stable` の `web` が冗長に見えること。
+
+対案の `add --kind` は 3 形の中で最も弱い (option 集合が flag の値で分岐する)。裁定は上の 3 形から選ぶ形にしたい。
 
 実装コストは 3 形ともほぼ同じ (verb 群は 1 kind 分で変わらない)。違うのは、後から形を動かす時に runbook と label 名を書き直すかどうか。「session を起こす kind」に手を付ける見込みがあるかは kawaz にしか判断材料が無い。
 
@@ -355,7 +372,7 @@ kawaz の原指示は「個人 reference `cli-daemon-subcommands` の daemon/ser
 - `~/.local/share/repos/github.com/kawaz/llm-gateway/main/crates/llm-gateway/src/daemon/registry.rs` / `protocol.rs`、`crates/llm-gateway-cli/src/service.rs` / `service/platform.rs`
 - `~/.local/share/repos/github.com/kawaz/canddy-app-proxy/main/README.md` / `Caddyfile` (hyoui ブロック 127-133、llm-gateway ブロック 144-194)
 - 本リポ: `docs/decisions/DR-0031-web-service-subcommand.md`、`docs/decisions/DR-0006-cli-ground-rules.md`、`crates/hyoui-cli/src/web_service.rs`、`crates/hyoui-web/src/lib.rs`、`crates/hyoui/src/config/mod.rs`
-- 本リポの現行実装の該当箇所: `crates/hyoui-cli/src/web_service.rs:27-33` (listen が `None` なら `--listen` を argv に足さない)、`crates/hyoui-cli/src/completion.rs` (bash/zsh の `web service` leaf)、`crates/hyoui-cli/tests/web_service_e2e.rs`
+- 本リポの現行実装の該当箇所: `crates/hyoui-cli/src/web_service.rs:27-33` (listen が `None` なら `--listen` を argv に足さない) と `:127-141` (renderer 側の quote のみ、逆関数なし)、`crates/hyoui/src/protocol/caps.rs:30-38` (`MVP_CAPS` と intersect の説明)、`crates/hyoui-cli/src/main.rs` の `hyoui web` の listen 解決順 (flag > config > 既定)、`crates/hyoui-cli/src/completion.rs` (bash/zsh の `web service` leaf)、`crates/hyoui-cli/tests/web_service_e2e.rs`
 - 実機出力: `hyoui --help` / `hyoui web --help` / `hyoui web service --help` / `hyoui web service status` (`/opt/homebrew/bin/hyoui` 0.9.42)、`~/Library/LaunchAgents/com.github.kawaz.hyoui-web.plist` の全文 (`ProgramArguments` は `hyoui web` の 2 語のみ、`KeepAlive=true`)、`target/release/hyoui --version` (= 0.9.42、brew 版と同一で build 識別不能)
 
 ## 関連
