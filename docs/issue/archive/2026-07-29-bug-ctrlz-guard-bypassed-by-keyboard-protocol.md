@@ -1,18 +1,18 @@
 ---
 title: "Ctrl+Z ガードが keyboard protocol 有効端末で完全に不発 (= 0x1a 単一 byte でなく CSI-u で届く)"
-status: wip
+status: resolved
 category: bug
 created: 2026-07-29T00:00:00+09:00
-last_read: 2026-07-30T00:00:00+09:00
+last_read: 2026-09-15T15:50:00+09:00
 open_entered: 2026-07-29T00:00:00+09:00
 wip_entered: 2026-07-29T00:00:00+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-15T15:50:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: 実装 (3 符号化対応 / decode 層分離 / 単発 = client suspend 1000ms 窓) は land 済み。残っていた Ghostty × Claude Code 実キーボード確認を kawaz が 2026-09-15 に実施し、単発 (client suspend) / ×2 (子 suspend + child action menu) とも OK (QUESTIONS CZ-C1 a/b)
 blocked_by:
 origin: docs/QUESTIONS.md RC-C1 (DR-0030 auto-resume の実機確認) から派生。kawaz 実機観測 2026-07-29 (brew 0.9.25、config 不在 = 全 default)
 ---

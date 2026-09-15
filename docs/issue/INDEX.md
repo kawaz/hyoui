@@ -4,13 +4,13 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-09-15 | task | open | [service-subcommand-multi-unit-ha](./2026-09-15-service-subcommand-multi-unit-ha.md) | hyoui service を reference の daemon/service 体系 (multi-unit) にし、stable/unstable 2 インスタンスの HA を組む (kawaz 裁定 2026-09-15) |
 | 2026-09-15 | task | open | [upgrade-e2e-test](./2026-09-15-upgrade-e2e-test.md) | daemon graceful upgrade (DR-0028 Phase 1〜3) の検証マトリクスと e2e テストが未整備 (unit test 5 本のみ、Phase gate 未達) |
 | 2026-08-25 | request | open | [hyoui-attach-take-leader](./2026-08-25-hyoui-attach-take-leader.md) | hyoui attach --take-leader を実装する (LR2-Q1 裁定 a、DR-0033 leader.request 奪取の CLI 後続) |
 | 2026-08-25 | task | open | [web-gateway-restart-kill-not-reliable](./2026-08-25-web-gateway-restart-kill-not-reliable.md) | web gateway の再起動は kill だけでは復帰しないことがある (KeepAlive 頼みにせず register を使う) |
 | 2026-08-24 | bug | open | [attach-osc8-hyperlink-metadata-loss](./2026-08-24-attach-osc8-hyperlink-metadata-loss.md) | attach 前に出力された OSC 8 hyperlink は attach 後の画面復元でリンク機能を失う。vt100 が OSC 8 未対応で screen state に metadata が残らない (DR-0013 延長、案 A/B/C 未裁定) |
 | 2026-08-21 | bug | open | [handshake-redraw-deferred-no-timeout](./2026-08-21-handshake-redraw-deferred-no-timeout.md) | handshake 直後の attach redraw が sync update 中の子 stop で無期限 deferred される (timeout 機構なし)。案 A/B/C 未裁定、DR-0014 partial state 規律に従い判定基準明記が必要 |
 | 2026-07-30 | design | open | [child-suspend-action-menu](./2026-07-30-design-child-suspend-action-menu.md) | 子 suspend 時動作の enum 統合 (auto_resume 2 bool の置換) + resume_stopped_child=false 時の attach 内操作メニュー (kawaz 骨子裁定済み、DR 起草待ち) |
-| 2026-07-29 | bug | wip | [ctrlz-guard-bypassed-by-keyboard-protocol](./2026-07-29-bug-ctrlz-guard-bypassed-by-keyboard-protocol.md) | DR-0029 §2 の Ctrl+Z ガードが keyboard protocol 有効端末 (Ghostty × claude) で完全不発。子が `\x1b[>1u` / `\x1b[>4;2m` を出すと外側端末が Ctrl+Z を CSI-u (`\x1b[122;5u`) で送るため、0x1a しか見ないガードを素通りしていた。**3 符号化対応に拡張して修正済 + ネスト実機でマトリクス再検証済**。2026-07-30 の kawaz 裁定で単発アクションを detach → **client suspend** に変更 (`fg` で同接続復帰 / 窓 default 1000ms / 親シェル消滅時の自滅も実機確認) 。残るは kawaz の実端末での最終確認 |
 | 2026-07-26 | bug | wip | [ignored-tests-job-permanently-red](./2026-07-26-bug-ignored-tests-job-permanently-red.md) | CI の ignored-tests job が continue-on-error で恒常 red を隠している。新たに menu_client_suspend_item_wakes_child_on_fg (DR-0032) も恒常 red 対象と判明、build tree 依存で再現するが原因未特定 — 調査中 |
 | 2026-07-29 | request | open | [web-narrow-symbol-fallback-font](./2026-07-29-request-web-narrow-symbol-fallback-font.md) | 記号グリフ幅対策の unicode-range fallback が macOS/iOS でしか効かない (Linux は DejaVu が全角)。narrow symbol subset webfont 同梱が本筋。① U+2460 は macOS にも narrow グリフが無く未解決 |
 | 2026-07-26 | task | open | [web-ime-safari-ios-unverified](./2026-07-26-web-ime-safari-ios-unverified.md) | IME 変換位置ズレの原因 2 件 (textarea 溢れ / resize 後のズレ) を特定し session.js で修正済み、検証は Chromium のみ — 実機 macOS/iOS Safari が未検証 |
