@@ -69,7 +69,7 @@ kawaz 依頼 (2026-09-15) の 2 点に対して、DR を起こす前の**全体�
 
 query パラメータ (DR-0027 §5) は契約文書に含めるが、未知 key を無視する前方互換方針は変えない。表示設定は閲覧者ごとの値であって protocol ではない。
 
-**path prefix の下で動くように、絶対パス前提を全部相対にする。** endpoint は `https://example.jp/hyoui` のように path を持ちうる (§4.4) が、現行の assets は root 前提で書かれている (本調査で確認):
+**path prefix の下で動くように、絶対パス前提を全部相対にする (必須項目)。** gateway がマウント先を知らない設計 (§4.4) はこれが無いと成立しない。 endpoint は `https://example.jp/hyoui` のように path を持ちうる (§4.4) が、現行の assets は root 前提で書かれている (本調査で確認):
 
 | 箇所 | 現行 | 直し方 |
 |---|---|---|
@@ -174,12 +174,13 @@ ccmsg の検証コードは `topOrigin` が存在するだけで拒否し (棚�
 
 **passkey は endpoint ごとに個別登録する** (kawaz 方針 2026-09-15、reference `passkey-registration-local-first` の jwt claim `endpoint` がそのまま効く)。endpoint は `https://hyoui.<host>` のような host だけのものでも、`https://example.jp/hyoui` のような path 付きでもよく、どんな endpoint を前段で切るかは利用者の責務。§1 の 3 endpoint はそれぞれ別の RP ID を持ち、credential は登録した endpoint でだけ使える。
 
-**gateway には config 項目も endpoint リストも足さない。** RP は登録時の jwt / record が持つ `endpoint` から決まり、認証時は「提示された credential の record が言う endpoint」に対して検証する (reference と ccmsg の形そのまま。本調査で ccmsg `src/auth/auth.ts` の `#rpIdFor` / `#servedHere` / `servesPath` と `src/auth/http.ts` の `endpointPath` を確認):
+**gateway はマウント先 (host も path も) を知らない。config 項目も endpoint リストも足さない。** `https://hyoui.example.jp/` と `https://hyoui.example.jp/hyoui2/` が並び、`/hyoui2` の裏が別サーバの hyoui である構成でも、各 gateway は表向きどの URL にマウントされているかを知らずに動く (kawaz 2026-09-15、reference / ccmsg の「endpoint URL ベース」の意図)。endpoint URL を知っているのは **CLI (登録 URL を発行する時の `--endpoint`) とブラウザ (`location` から作る)** の 2 者だけで、gateway はその値を受け取って record を引くだけ。RP は登録時の jwt / record が持つ `endpoint` から決まり、認証時は「提示された credential の record が言う endpoint」に対して検証する (reference と ccmsg の形そのまま。本調査で ccmsg `src/auth/auth.ts` の `#rpIdFor` / `#servedHere` / `servesPath` と `src/auth/http.ts` の `endpointPath` を確認):
 
 - **登録**: `hyoui web passkey add --endpoint <url> [--label <名前>] [--ro]` が jwt (claims に `endpoint` / `rp_id` = その hostname) を含む登録 URL `<endpoint>#register=<jwt>` を出す。利用者はその URL をその endpoint で開く。gateway は jwt の `endpoint` を record に保存する
-- **認証**: assertion の `rawId` で record を引き、record の `endpoint` から `rp_id` (= hostname) と origin を取って、`authData.rpIdHash` と `clientDataJSON.origin` を照合する。加えて **リクエストが到達した path が endpoint の path と一致する**ことを確認する (ccmsg の `servesPath`: 前段が prefix を strip する構成では strip 後の path、しない構成ではそのまま)。同じ host の `/` と `/hyoui/` は別 endpoint = 別登録。**HTTP の `Host` / `Origin` ヘッダで RP を選ぶことはしない**。origin の真正性は WebAuthn 自身が `clientDataJSON` に書く値で担保される
+- **ブラウザが endpoint URL を作って要求に載せる**: index ページは `new URL(".", location.href)`、session ページは `location.href` から末尾の `sessions/<id>` (と query) を落とした URL。これを `/auth/challenge` `/auth/assert` `/auth/refresh` の body に `endpoint` として送る。相対パス化 (§2) が前提で、ページがどの prefix 下で配られていてもこの計算が成立する
+- **認証**: 要求の `endpoint` で record 集合を絞り、assertion の `rawId` で record を引く。record の `endpoint` から `rp_id` (= hostname) と origin を取って、`authData.rpIdHash` と `clientDataJSON.origin` を照合する。要求の `endpoint` と record の `endpoint` は当然一致する (違えば引けない) が、`clientDataJSON.origin` が record の endpoint の origin と一致することが本体の検証で、ブラウザが名乗った `endpoint` を信じているわけではない (ccmsg の `servesPath` は到達 path で同じことを見るが、hyoui はマウント先を知らないので path を観測できず、代わりにブラウザが `endpoint` を明示する)。同じ host の `/` と `/hyoui/` は別 endpoint = 別登録。**HTTP の `Host` / `Origin` ヘッダで RP を選ぶことはしない**。origin の真正性は WebAuthn 自身が `clientDataJSON` に書く値で担保される
 - **challenge にも endpoint を埋める** (reference「challenge には発行者の id を埋める」と同型)。`/auth/challenge` の応答に `endpoint` を載せ、assert / register の検証で record の endpoint と一致することを見る。これで challenge を取った endpoint と使う endpoint のすり替えが効かない
-- **refresh**: cookie の値で token family を引き、family が持つ `endpoint` に対して到達 path の一致を見る (ccmsg と同じ)。cookie 名が endpoint ごとに違う (§4.5) ので、同じブラウザに複数 endpoint の cookie が並んでも混ざらない
+- **refresh**: 要求の `endpoint` と cookie の値で token family を引き、family の `endpoint` と一致することを見る。cookie 名が endpoint ごとに違う (§4.5) ので、同じブラウザに複数 endpoint の cookie が並んでも混ざらない
 - **HA endpoint に登録した credential は、裏の unit がどちらでも通る。** record は unit を跨いで同じ file から引け (§4.6)、検証に使うのは record の endpoint だけで、どの unit が受けたかは関係しない。個別 endpoint の credential は HA endpoint では使えない (origin が違う)。**HA endpoint の登録 1 本があれば日常の閲覧は足り、個別 endpoint の登録は unstable を狙って開く時 (dogfooding) にだけ要る**
 - CSRF / cross-site WS hijack への備えは「提示された token / cookie の family が言う endpoint と、到達 path・`clientDataJSON.origin` の一致」で足りる。`SameSite=Strict` の cookie と、access token が subprotocol / Bearer で明示提示される (§4.5) ことが 2 層目
 - **127.0.0.1 直結 (経路 [3]) は passkey の対象外。** WebAuthn の RP ID は domain であり IP アドレスは使えない (仕様上。`localhost` は可)。かつ §1 のとおり loopback 発を免除にはできない。したがって経路 [3] は「認証を切った gateway」でしか使えない: config `[web].auth = "none" | "passkey"` を持ち、test と手元の dev は `none` で動かす。stable / unstable の常駐 unit は `passkey`
