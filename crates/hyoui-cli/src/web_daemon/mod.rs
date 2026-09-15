@@ -1,13 +1,17 @@
-//! `hyoui web daemon run|add|remove|list` (= DR-0034 P2)。
+//! `hyoui web daemon` の各 verb (= DR-0034 P2 / P3)。
 //!
-//! unit の属性は [`registry`] が正本で、プロセスの生死は監督者が持つ。本 module は
-//! 登録簿の読み書きと、登録簿の値で gateway を foreground 起動する経路を持つ。
-//! 監督者への要求 (`start` / `stop` / `restart` / `status` / `log`) は DR-0034 P3。
+//! unit の属性は [`registry`] が正本で、プロセスの生死は [`supervisor`] が持つ。
+//! `start` / `stop` / `restart` / `status` / `log` は子を直接叩かず監督者へ要求する
+//! (決定 4) — 子の所有者が CLI と監督者の 2 つになると、停止・再起動・状態確認の
+//! 経路が分岐するため。
 //!
 //! 出力は help 以外すべて JSON、エラーは JSON を stderr に出して非 0 で終わる
 //! (= reference `cli-daemon-subcommands` の出力規約)。
 
+pub mod probe;
+pub mod protocol;
 pub mod registry;
+pub mod supervisor;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -15,9 +19,10 @@ use std::process::ExitCode;
 use hyoui::cli::WebDaemonAddConfig;
 use serde_json::{Value, json};
 
+use protocol::{ErrorBody, Request, Response, Target};
 use registry::{ListenConflict, Registry, Unit};
 
-/// 監督者の生死。要求の送信自体は DR-0034 P3。
+/// 監督者の生死。
 ///
 /// `enabled` (= 登録簿の desired state) と分けて持つのは、停止指示のまま降りて
 /// いるのか、上げたいのに上がらないのかを区別するため (決定 4)。
@@ -45,22 +50,13 @@ impl Supervisor {
         self == Self::Running
     }
 
-    /// 監督者に unit の起動 / 停止を要求する (= DR-0034 P3 で実装)。
+    /// 監督者に unit の起動 / 停止を要求する。
     ///
-    /// 呼び出し口だけを先に置く。P2 では要求を送れないので、送れなかった理由を
-    /// 返して呼び出し側が出力に添える。監督者が不在でも登録簿の変更は成立する
-    /// (決定 4 の表: 次に監督者が上がった時に起きる)。
-    fn request(self, verb: &str, name: &str) -> std::result::Result<(), String> {
-        match self {
-            Self::NotRunning => Err(format!(
-                "the supervisor is not running, so `{name}` was only recorded in the registry; \
-                 start it with `hyoui web service start` or run `hyoui web daemon supervise`"
-            )),
-            Self::Running => Err(format!(
-                "the supervisor is running but `{verb} {name}` could not be requested: \
-                 the control socket protocol is not implemented yet (DR-0034 P3)"
-            )),
-        }
+    /// 監督者が不在でも登録簿の変更は成立するので、送れなかった理由を返して
+    /// 呼び出し側が出力に添える (決定 4 の表: 次に監督者が上がった時に起きる)。
+    fn request(self, request: &Request) -> std::result::Result<Response, ErrorBody> {
+        protocol::request(&registry::supervisor_socket_path(), request)
+            .map(|(response, _)| response)
     }
 }
 
@@ -68,21 +64,62 @@ impl Supervisor {
 ///
 /// 登録簿を読むだけで答えられるので、監督者が停止していても断らない (決定 4)。
 pub fn list_command() -> ExitCode {
-    let registry = Registry::open();
-    let units = match registry.list() {
-        Ok(units) => units,
-        Err(error) => return fail("web daemon list", &error.to_string(), None),
-    };
-    let supervisor = Supervisor::probe();
+    // 監督者に聞けた時だけ `running` / `pid` を足す。聞けていない台に「動いて
+    // いる」とは書かない (決定 4)。
+    match Supervisor::probe().request(&Request::List(Target::all())) {
+        Ok(Response::Units { units, .. }) => emit(&json!({
+            "units": units
+                .into_iter()
+                .map(|unit| json!({
+                    "name": unit.name,
+                    "enabled": unit.enabled,
+                    "running": unit.running,
+                    "pid": unit.pid,
+                    "listen": unit.listen,
+                    "binary": unit.binary,
+                    "binary_exists": unit.binary_exists,
+                }))
+                .collect::<Vec<_>>(),
+            "supervisor": {"running": true},
+            "registry_dir": Registry::open().dir(),
+        })),
+        Ok(Response::Error(error)) => fail_with("web daemon list", &error),
+        Ok(_) | Err(_) => {
+            let mut output = match registry_view(None) {
+                Ok(output) => output,
+                Err(code) => return code,
+            };
+            output["note"] = json!(
+                "the supervisor is not running, so `running` and `pid` are not known for any unit"
+            );
+            emit(&output)
+        }
+    }
+}
 
-    let rows: Vec<Value> = units
-        .iter()
-        .map(|(name, unit)| {
-            json!({
+/// 登録簿から答えられる範囲だけを組み立てる (= 監督者に聞けない時の答え)。
+///
+/// 障害時に最初に打つコマンドが監督者の生死に依存すると、状態を見る入口ごと
+/// 失われる (決定 4)。
+fn registry_view(name: Option<&str>) -> std::result::Result<Value, ExitCode> {
+    let registry = Registry::open();
+    let units = match name {
+        Some(name) => match registry.get(name) {
+            Ok(unit) => vec![(name.to_owned(), unit)],
+            Err(error) => return Err(fail("web daemon status", &error.to_string(), None)),
+        },
+        None => match registry.list() {
+            Ok(units) => units,
+            Err(error) => return Err(fail("web daemon status", &error.to_string(), None)),
+        },
+    };
+
+    Ok(json!({
+        "units": units
+            .into_iter()
+            .map(|(name, unit)| json!({
                 "name": name,
                 "enabled": unit.enabled,
-                // 監督者に聞けないものは推し量らない (= 聞けていない台に「動いて
-                // いる」と書かない)。P3 で監督者に聞いた値が入る。
                 "running": false,
                 "pid": Value::Null,
                 "listen": unit.listen,
@@ -90,21 +127,11 @@ pub fn list_command() -> ExitCode {
                 "binary_exists": unit.binary.exists(),
                 "web_assets_dir": unit.web_assets_dir,
                 "added_at": unit.added_at,
-            })
-        })
-        .collect();
-
-    let mut output = json!({
-        "units": rows,
-        "supervisor": {"running": supervisor.is_running()},
+            }))
+            .collect::<Vec<_>>(),
+        "supervisor": {"running": false},
         "registry_dir": registry.dir(),
-    });
-    if !supervisor.is_running() {
-        output["note"] = json!(
-            "the supervisor is not running, so `running` and `pid` are not known for any unit"
-        );
-    }
-    emit(&output)
+    }))
 }
 
 /// `hyoui web daemon add <name> [options]`。
@@ -174,8 +201,12 @@ pub fn add_command(cfg: WebDaemonAddConfig) -> ExitCode {
         return fail(context, &error.to_string(), None);
     }
 
+    // 走行中の監督者には即反映する (決定 4)。送るのは `reload` で、監督者が登録簿を
+    // 読み直して望みとの差を埋める — 足したばかりの unit は監督者がまだ名前を
+    // 知らないので、`start <name>` を送っても「そんな unit は無い」になる。
+    // `add` は `enabled = true` で書くので、読み直した監督者がその場で起こす。
     let supervisor = Supervisor::probe();
-    let started = supervisor.request("start", &cfg.name);
+    let started = supervisor.request(&Request::Reload);
     let mut output = json!({
         "name": cfg.name,
         "listen": unit.listen,
@@ -186,8 +217,11 @@ pub fn add_command(cfg: WebDaemonAddConfig) -> ExitCode {
         "added_at": unit.added_at,
         "supervisor": {"running": supervisor.is_running(), "notified": started.is_ok()},
     });
-    if let Err(note) = started {
-        output["note"] = json!(note);
+    if let Err(error) = &started {
+        output["note"] = json!(format!(
+            "{}: `{}` was recorded in the registry and will start when the supervisor next runs",
+            error.message, cfg.name
+        ));
     }
     if !warnings.is_empty() {
         output["warnings"] = json!(warnings);
@@ -207,7 +241,10 @@ pub fn remove_command(name: &str) -> ExitCode {
     }
 
     let supervisor = Supervisor::probe();
-    let stopped = supervisor.request("stop", name);
+    // 監督者がその名前を知らない (= まだ読み直していない) 場合の応答も `Ok` で
+    // 返る。抱えていない unit を止める相手は居ないので、そのまま先へ進んでよい。
+    // `Err` になるのは監督者に届かなかった時だけ。
+    let stopped = supervisor.request(&Request::Stop(Target::named(name.to_owned())));
     if supervisor.is_running()
         && let Err(error) = &stopped
     {
@@ -215,7 +252,7 @@ pub fn remove_command(name: &str) -> ExitCode {
         // 登録簿から読めなくなる。消す前に止まる。
         return fail(
             context,
-            error,
+            &error.message,
             Some(json!({"name": name, "supervisor": {"running": true, "notified": false}})),
         );
     }
@@ -223,14 +260,188 @@ pub fn remove_command(name: &str) -> ExitCode {
     if let Err(error) = registry.remove(name) {
         return fail(context, &error.to_string(), None);
     }
+    // 子が降りて登録も消えたことを監督者に読み直させる (= 抱えたままにしない)。
+    if stopped.is_ok() {
+        let _ = supervisor.request(&Request::Reload);
+    }
 
     let mut output = json!({
         "name": name,
         "removed": true,
-        "supervisor": {"running": supervisor.is_running(), "notified": false},
+        "supervisor": {"running": supervisor.is_running(), "notified": stopped.is_ok()},
     });
-    if let Err(note) = stopped {
-        output["note"] = json!(note);
+    if let Err(error) = &stopped {
+        output["note"] = json!(error.message);
+    }
+    emit(&output)
+}
+
+/// `hyoui web daemon supervise` — foreground の監督者 (= 決定 3)。
+///
+/// OS の service manager に載るのはこれ 1 つで、unit ごとの plist は作らない
+/// (決定 6)。
+pub fn supervise_command() -> ExitCode {
+    let context = "web daemon supervise";
+    let root = registry::default_root();
+    let mut supervisor = supervisor::Supervisor::new(
+        Registry::open(),
+        root,
+        supervisor::Timings::default(),
+        Box::new(probe::SystemProbe),
+    );
+    match supervisor.run(&registry::supervisor_socket_path()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => fail(context, &error.to_string(), None),
+    }
+}
+
+/// `start` / `stop` / `restart` / `status` を監督者へ要求する。
+///
+/// `status` だけは監督者不在でも登録簿由来の列を返す (決定 4) — 障害時に最初に
+/// 打つコマンドが監督者の生死に依存すると、状態を見る入口が無くなる。
+pub fn control_command(verb: ControlVerb, name: Option<&str>) -> ExitCode {
+    let context = verb.context();
+    let target = name.map_or_else(Target::all, |name| Target::named(name.to_owned()));
+    let request = match verb {
+        ControlVerb::Start => Request::Start(target),
+        ControlVerb::Stop => Request::Stop(target),
+        ControlVerb::Restart => Request::Restart(target),
+        ControlVerb::Status => Request::Status(target),
+    };
+
+    match Supervisor::probe().request(&request) {
+        Ok(Response::Error(error)) => fail_with(context, &error),
+        Ok(response) => emit(&json!(response)),
+        Err(error) if verb == ControlVerb::Status => {
+            // 監督者に聞けないので、登録簿から答えられる範囲を返す。
+            let mut output = match registry_view(name) {
+                Ok(output) => output,
+                Err(code) => return code,
+            };
+            output["note"] = json!(error.message);
+            emit(&output)
+        }
+        Err(error) => fail_with(context, &error),
+    }
+}
+
+/// 監督者への要求を伴う verb。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlVerb {
+    /// 起こす。
+    Start,
+    /// 止める。
+    Stop,
+    /// 入れ替える。
+    Restart,
+    /// 状態を聞く。
+    Status,
+}
+
+impl ControlVerb {
+    fn context(self) -> &'static str {
+        match self {
+            Self::Start => "web daemon start",
+            Self::Stop => "web daemon stop",
+            Self::Restart => "web daemon restart",
+            Self::Status => "web daemon status",
+        }
+    }
+}
+
+/// `hyoui web daemon log [name] [--follow]`。
+pub fn log_command(name: Option<&str>, follow: bool) -> ExitCode {
+    let context = "web daemon log";
+    let target = name.map_or_else(Target::all, |name| Target::named(name.to_owned()));
+    let request = Request::Log { target, follow };
+
+    let (response, mut reader) =
+        match protocol::request(&registry::supervisor_socket_path(), &request) {
+            Ok(pair) => pair,
+            Err(error) => return fail_with(context, &error),
+        };
+    match response {
+        Response::Error(error) => return fail_with(context, &error),
+        Response::Log { lines, follow } => {
+            for line in lines {
+                if emit_jsonl(&line).is_err() {
+                    return ExitCode::SUCCESS;
+                }
+            }
+            if follow {
+                // 監督者が書いた行をそのまま流す。書かれた先を読み直さない (決定 9)。
+                while let Ok(Some(line)) = protocol::read_line::<protocol::LogLine>(&mut reader) {
+                    if emit_jsonl(&line).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        other => return fail(context, &format!("unexpected reply: {other:?}"), None),
+    }
+    ExitCode::SUCCESS
+}
+
+/// `hyoui version` — CLI 自身・監督者・全 unit の版を 1 回で並べる (= 決定 7a)。
+///
+/// `hyoui --version` (テキスト 1 行) はこの CLI 自身の版を言う口として残る。
+pub fn version_command() -> ExitCode {
+    use probe::VersionProbe;
+
+    let cli = hyoui::version::VersionInfo::current();
+    let system = probe::SystemProbe;
+
+    let mut output = json!({"cli": cli});
+    match Supervisor::probe().request(&Request::Status(Target::all())) {
+        Ok(Response::Units {
+            units, supervisor, ..
+        }) => {
+            let on_disk = system.on_disk(&supervisor.binary);
+            let pair = protocol::VersionPair::new(Some(supervisor.version), on_disk);
+            output["supervisor"] = json!({
+                "running": pair.running,
+                "on_disk": pair.on_disk,
+                "binary": supervisor.binary,
+                "restart_needed": pair.restart_needed,
+            });
+            output["units"] = json!(
+                units
+                    .into_iter()
+                    .map(|unit| json!({
+                        "name": unit.name,
+                        "running": unit.version.running,
+                        "on_disk": unit.version.on_disk,
+                        "binary": unit.binary,
+                        "restart_needed": unit.version.restart_needed,
+                    }))
+                    .collect::<Vec<_>>()
+            );
+        }
+        _ => {
+            // 監督者に聞けないので、走っている版は誰にも言えない。登録簿の binary
+            // から「次に上がる版」だけを並べる。
+            output["supervisor"] = Value::Null;
+            let units = match Registry::open().list() {
+                Ok(units) => units,
+                Err(error) => return fail("version", &error.to_string(), None),
+            };
+            output["units"] = json!(
+                units
+                    .into_iter()
+                    .map(|(name, unit)| {
+                        let on_disk = system.on_disk(&unit.binary);
+                        json!({
+                            "name": name,
+                            "running": Value::Null,
+                            "on_disk": on_disk,
+                            "binary": unit.binary,
+                            "restart_needed": false,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            );
+            output["note"] = json!(ErrorBody::supervisor_not_running().message);
+        }
     }
     emit(&output)
 }
@@ -314,6 +525,30 @@ fn emit(value: &Value) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// JSONL を 1 行書く。相手が読むのをやめたら `Err` (= `log --follow` の終わり)。
+fn emit_jsonl<T: serde::Serialize>(value: &T) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    let line = serde_json::to_vec(value)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    stdout.write_all(&line)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()
+}
+
+/// 監督者が返したエラーをそのまま stderr に流す (= kind と hint を保つ)。
+fn fail_with(context: &str, error: &ErrorBody) -> ExitCode {
+    let mut body = json!({"command": context, "error": error.message, "kind": error.kind});
+    if let Some(hint) = &error.hint {
+        body["hint"] = json!(hint);
+    }
+    match serde_json::to_string_pretty(&body) {
+        Ok(text) => eprintln!("{text}"),
+        Err(_) => eprintln!("hyoui: {context}: {}", error.message),
+    }
+    ExitCode::from(1)
 }
 
 /// エラーを JSON で stderr に書いて非 0 で終わる。
@@ -426,27 +661,40 @@ mod tests {
         );
     }
 
-    /// 監督者が居ない間も登録簿の変更は成立し、理由が出力に残る (決定 4)。
-    #[test]
-    fn an_absent_supervisor_explains_why_nothing_started() {
-        let note = Supervisor::NotRunning
-            .request("start", "unstable")
-            .unwrap_err();
-        assert!(note.contains("not running"), "{note}");
-        assert!(note.contains("hyoui web service start"), "{note}");
-        assert!(!Supervisor::NotRunning.is_running());
-    }
-
-    /// 走っている監督者への要求は P3 まで送れない。panic ではなく理由を返す。
-    #[test]
-    fn a_running_supervisor_reports_the_unimplemented_request_path() {
-        let note = Supervisor::Running.request("stop", "unstable").unwrap_err();
-        assert!(note.contains("not implemented"), "{note}");
-        assert!(Supervisor::Running.is_running());
-    }
-
     #[test]
     fn the_default_binary_is_this_executable() {
         assert_eq!(default_binary().unwrap(), std::env::current_exe().unwrap());
+    }
+
+    /// `enabled` と `running` を分けて持つのは、止めてあるのか上がらないのかを
+    /// 区別するため (決定 4)。probe の 2 状態はその `running` 側を答える。
+    #[test]
+    fn the_supervisor_probe_has_two_states() {
+        assert!(Supervisor::Running.is_running());
+        assert!(!Supervisor::NotRunning.is_running());
+    }
+
+    /// 監督者が居ない時、`status` は登録簿から答えられる範囲を返す (決定 4)。
+    #[test]
+    fn the_registry_answers_when_the_supervisor_cannot() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = Registry::at(directory.path().join("units"));
+        registry.add("stable", &unit("127.0.0.1:43690")).unwrap();
+
+        // `registry_view` は既定の登録簿を読むので、ここでは組み立ての形だけを
+        // 固定する (= 隔離 `XDG_STATE_HOME` 越しの経路は e2e が見る)。
+        let listed = registry.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        let (name, unit) = &listed[0];
+        let row = json!({
+            "name": name,
+            "enabled": unit.enabled,
+            "running": false,
+            "pid": Value::Null,
+            "listen": unit.listen,
+        });
+        assert_eq!(row["running"], json!(false));
+        assert_eq!(row["pid"], Value::Null);
+        assert_eq!(row["listen"], json!("127.0.0.1:43690"));
     }
 }

@@ -392,6 +392,8 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
 
+        Command::VersionReport => web_daemon::version_command(),
+
         Command::Run(cfg) => run_command(cfg),
 
         Command::Attach(cfg) => attach_command(cfg),
@@ -477,6 +479,23 @@ fn main() -> ExitCode {
                 web_daemon::remove_command(&name)
             }
             WebCommand::Daemon(WebDaemonCommand::List) => web_daemon::list_command(),
+            WebCommand::Daemon(WebDaemonCommand::Supervise) => web_daemon::supervise_command(),
+            WebCommand::Daemon(WebDaemonCommand::Start(target)) => {
+                web_daemon::control_command(web_daemon::ControlVerb::Start, target.name.as_deref())
+            }
+            WebCommand::Daemon(WebDaemonCommand::Stop(target)) => {
+                web_daemon::control_command(web_daemon::ControlVerb::Stop, target.name.as_deref())
+            }
+            WebCommand::Daemon(WebDaemonCommand::Restart(target)) => web_daemon::control_command(
+                web_daemon::ControlVerb::Restart,
+                target.name.as_deref(),
+            ),
+            WebCommand::Daemon(WebDaemonCommand::Status(target)) => {
+                web_daemon::control_command(web_daemon::ControlVerb::Status, target.name.as_deref())
+            }
+            WebCommand::Daemon(WebDaemonCommand::Log { target, follow }) => {
+                web_daemon::log_command(target.name.as_deref(), follow)
+            }
             WebCommand::Service(WebServiceCommand::Register(cfg)) => {
                 web_service_register_command(cfg)
             }

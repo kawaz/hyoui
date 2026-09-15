@@ -58,7 +58,7 @@ _hyoui() {
     if [[ -z "$sub" ]]; then
         # Top-level: implemented subcommands + global flags.
         # (reserved-but-unimplemented subcommands are intentionally omitted.)
-        COMPREPLY=( $(compgen -W "run attach list kill status set tail wait screen input lock unlock detach record web upgrade config completion --help -h --version -V" -- "$cur") )
+        COMPREPLY=( $(compgen -W "run attach list kill status set tail wait screen input lock unlock detach record web upgrade config version completion --help -h --version -V" -- "$cur") )
         return 0
     fi
 
@@ -203,7 +203,7 @@ _hyoui() {
             local daemon_sub
             daemon_sub="$(_hyoui_child_of daemon)"
             if [[ -z "$daemon_sub" ]]; then
-                COMPREPLY=( $(compgen -W "run add remove list --help -h" -- "$cur") )
+                COMPREPLY=( $(compgen -W "run supervise add remove list start stop restart status log --help -h" -- "$cur") )
                 return 0
             fi
             case "$daemon_sub" in
@@ -215,7 +215,13 @@ _hyoui() {
                     esac
                     COMPREPLY=( $(compgen -W "--port --listen --binary --web-assets-dir --help -h" -- "$cur") )
                     return 0 ;;
-                run|remove|list)
+                start|stop|restart|status)
+                    COMPREPLY=( $(compgen -W "--all --help -h" -- "$cur") )
+                    return 0 ;;
+                log)
+                    COMPREPLY=( $(compgen -W "--all --follow --help -h" -- "$cur") )
+                    return 0 ;;
+                run|supervise|remove|list)
                     COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
                     return 0 ;;
             esac
@@ -560,6 +566,7 @@ _hyoui_subcommands() {
         'web:Start the HTTP gateway (REST + HTML UI, DR-0027)'
         'upgrade:Trigger daemon graceful self-exec upgrade (DR-0028)'
         'config:Inspect the user config file (path, show)'
+        'version:Print the versions in place and the versions running (DR-0034)'
         'completion:Print a shell completion script'
     )
     _describe -t commands 'hyoui subcommand' subs
@@ -720,7 +727,7 @@ _hyoui_daemon() {
     local word
     for word in $words; do
         case $word in
-            run|add|remove|list) leaf=$word; break ;;
+            run|supervise|add|remove|list|start|stop|restart|status|log) leaf=$word; break ;;
         esac
     done
     case $leaf in
@@ -733,17 +740,30 @@ _hyoui_daemon() {
                 '(-h --help)'{-h,--help}'[Show help]' \
                 '1:unit name:'
             ;;
+        start|stop|restart|status)
+            _arguments \
+                '--all[Act on every registered unit]' \
+                '(-h --help)'{-h,--help}'[Show help]' \
+                '1:unit name:'
+            ;;
+        log)
+            _arguments \
+                '--all[Read every unit log]' \
+                '--follow[Keep printing lines as they are written]' \
+                '(-h --help)'{-h,--help}'[Show help]' \
+                '1:unit name:'
+            ;;
         run|remove)
             _arguments \
                 '(-h --help)'{-h,--help}'[Show help]' \
                 '1:unit name:'
             ;;
-        list)
+        supervise|list)
             _arguments '(-h --help)'{-h,--help}'[Show help]'
             ;;
         *)
             _arguments \
-                '1:daemon subcommand:(run add remove list)' \
+                '1:daemon subcommand:(run supervise add remove list start stop restart status log)' \
                 '(-h --help)'{-h,--help}'[Show help]'
             ;;
     esac
@@ -875,7 +895,7 @@ function __hyoui_using_subcommand
     set -e cmd[1]
     for arg in $cmd
         switch $arg
-            case run attach list kill status set tail wait screen input lock unlock detach record web upgrade config completion
+            case run attach list kill status set tail wait screen input lock unlock detach record web upgrade config version completion
                 if test "$arg" = "$argv[1]"
                     return 0
                 end
@@ -890,7 +910,7 @@ function __hyoui_no_subcommand
     set -e cmd[1]
     for arg in $cmd
         switch $arg
-            case run attach list kill status set tail wait screen input lock unlock detach record web upgrade config completion
+            case run attach list kill status set tail wait screen input lock unlock detach record web upgrade config version completion
                 return 1
         end
     end
@@ -988,6 +1008,7 @@ complete -c hyoui -n __hyoui_no_subcommand -f -a unlock     -d 'Release a sessio
 complete -c hyoui -n __hyoui_no_subcommand -f -a detach     -d 'Detach all attached clients from a session'
 complete -c hyoui -n __hyoui_no_subcommand -f -a record     -d 'Record tty I/O timeline'
 complete -c hyoui -n __hyoui_no_subcommand -f -a web        -d 'Start the HTTP gateway (REST + HTML UI, DR-0027)'
+complete -c hyoui -n __hyoui_no_subcommand -f -a version    -d 'Print the versions in place and the versions running (DR-0034)'
 complete -c hyoui -n __hyoui_no_subcommand -f -a upgrade    -d 'Trigger daemon graceful self-exec upgrade (DR-0028)'
 complete -c hyoui -n __hyoui_no_subcommand -f -a config     -d 'Inspect the user config file (path, show)'
 complete -c hyoui -n __hyoui_no_subcommand -f -a completion -d 'Print a shell completion script'
@@ -1161,9 +1182,27 @@ complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' 
 complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -f -a service -d 'Manage OS startup integration'
 complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n __hyoui_daemon_no_sub -f -a run -d 'Start one unit in the foreground'
+complete -c hyoui -n __hyoui_daemon_no_sub -f -a supervise -d 'Run the supervisor in the foreground'
 complete -c hyoui -n __hyoui_daemon_no_sub -f -a add -d 'Register a unit and start it'
 complete -c hyoui -n __hyoui_daemon_no_sub -f -a remove -d 'Stop the unit and drop its registration'
 complete -c hyoui -n __hyoui_daemon_no_sub -f -a list -d 'Print registered units'
+complete -c hyoui -n __hyoui_daemon_no_sub -f -a start -d 'Ask the supervisor to start units'
+complete -c hyoui -n __hyoui_daemon_no_sub -f -a stop -d 'Ask the supervisor to stop units'
+complete -c hyoui -n __hyoui_daemon_no_sub -f -a restart -d 'Replace running units'
+complete -c hyoui -n __hyoui_daemon_no_sub -f -a status -d 'Print the full state, including versions'
+complete -c hyoui -n __hyoui_daemon_no_sub -f -a log -d 'Print unit logs'
+complete -c hyoui -n '__hyoui_daemon_using_sub start' -l all -d 'Act on every registered unit'
+complete -c hyoui -n '__hyoui_daemon_using_sub start' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_daemon_using_sub stop' -l all -d 'Act on every registered unit'
+complete -c hyoui -n '__hyoui_daemon_using_sub stop' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_daemon_using_sub restart' -l all -d 'Act on every registered unit'
+complete -c hyoui -n '__hyoui_daemon_using_sub restart' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_daemon_using_sub status' -l all -d 'Act on every registered unit'
+complete -c hyoui -n '__hyoui_daemon_using_sub status' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_daemon_using_sub log' -l all -d 'Read every unit log'
+complete -c hyoui -n '__hyoui_daemon_using_sub log' -l follow -d 'Keep printing lines as they are written'
+complete -c hyoui -n '__hyoui_daemon_using_sub log' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_daemon_using_sub supervise' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_daemon_using_sub add' -l port -x -d 'Short form of --listen=127.0.0.1:<n>'
 complete -c hyoui -n '__hyoui_daemon_using_sub add' -l listen -x -d 'Bind address host:port'
 complete -c hyoui -n '__hyoui_daemon_using_sub add' -l binary -r -F -d 'Executable this unit starts'
@@ -1683,21 +1722,11 @@ mod tests {
                     "shell {sh:?} missing `web daemon add --{option}`"
                 );
             }
-        }
-    }
-
-    /// 監督者への要求 (= DR-0034 P3) は実装前なので候補に出さない。
-    ///
-    /// `parse_web_daemon` が unknown subcommand で断る値を補完すると、選んだ先で
-    /// 必ず error になる (= `SNAPSHOT_INCLUDE_VALUES` と同じ方針)。
-    #[test]
-    fn completion_omits_web_daemon_verbs_that_are_not_implemented_yet() {
-        for sh in ALL_SHELLS {
-            let script = script(sh);
-            for absent in ["supervise", "restart"] {
+            // 監督者へ要求する verb は対象の指定を取る。
+            for option in ["all", "follow"] {
                 assert!(
-                    !contains_token(&script, absent),
-                    "shell {sh:?} offers `web daemon {absent}` before it exists"
+                    offers_long_opt(&script, option),
+                    "shell {sh:?} missing `web daemon --{option}`"
                 );
             }
         }

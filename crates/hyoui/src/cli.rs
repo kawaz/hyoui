@@ -151,12 +151,26 @@ pub enum HelpTopic {
     WebDaemon,
     /// Help for `web daemon run` (= DR-0034)。
     WebDaemonRun,
+    /// Help for `web daemon supervise` (= DR-0034 決定 3)。
+    WebDaemonSupervise,
     /// Help for `web daemon add` (= DR-0034)。
     WebDaemonAdd,
     /// Help for `web daemon remove` (= DR-0034)。
     WebDaemonRemove,
     /// Help for `web daemon list` (= DR-0034)。
     WebDaemonList,
+    /// Help for `web daemon start` (= DR-0034 決定 4)。
+    WebDaemonStart,
+    /// Help for `web daemon stop` (= DR-0034 決定 4)。
+    WebDaemonStop,
+    /// Help for `web daemon restart` (= DR-0034 決定 5)。
+    WebDaemonRestart,
+    /// Help for `web daemon status` (= DR-0034 決定 4)。
+    WebDaemonStatus,
+    /// Help for `web daemon log` (= DR-0034 決定 9)。
+    WebDaemonLog,
+    /// Help for the top-level `version` subcommand (= DR-0034 決定 7a)。
+    Version,
     /// Help for the `web service` parent subcommand (= DR-0031)。
     WebService,
     /// Help for `web service register` (= DR-0031)。
@@ -221,7 +235,7 @@ pub struct WebDaemonAddConfig {
     pub assets_dir: Option<std::path::PathBuf>,
 }
 
-/// `web daemon` の leaf command (= DR-0034 決定 1、P2 の範囲)。
+/// `web daemon` の leaf command (= DR-0034 決定 1)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WebDaemonCommand {
@@ -231,6 +245,8 @@ pub enum WebDaemonCommand {
         /// 起動する unit 名。
         name: Option<String>,
     },
+    /// `hyoui web daemon supervise` — foreground の監督者 (= 決定 3)。
+    Supervise,
     /// `hyoui web daemon add <name> [options]` — 登録簿に足す。
     Add(WebDaemonAddConfig),
     /// `hyoui web daemon remove <name>` — 登録簿から外す。
@@ -240,6 +256,28 @@ pub enum WebDaemonCommand {
     },
     /// `hyoui web daemon list` — 登録簿を読む (監督者不在でも動く)。
     List,
+    /// `hyoui web daemon start <name> | --all` — 監督者に起動を要求する。
+    Start(WebDaemonTarget),
+    /// `hyoui web daemon stop <name> | --all` — 監督者に停止を要求する。
+    Stop(WebDaemonTarget),
+    /// `hyoui web daemon restart <name> | --all` — stop → start (`--all` は 1 台ずつ)。
+    Restart(WebDaemonTarget),
+    /// `hyoui web daemon status [<name>] | --all` — 状態を聞く。
+    Status(WebDaemonTarget),
+    /// `hyoui web daemon log [<name>] | --all [--follow]` — ログを読む。
+    Log {
+        /// 対象 unit。
+        target: WebDaemonTarget,
+        /// 追従するか。
+        follow: bool,
+    },
+}
+
+/// `web daemon` の操作対象 (= `<name>` か `--all`)。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WebDaemonTarget {
+    /// 対象の unit 名。`None` は `--all` (= 全 unit)。
+    pub name: Option<String>,
 }
 
 /// `web` の gateway 起動と unit / service 管理を同じ family に束ねる dispatch。
@@ -1021,8 +1059,10 @@ pub enum Command {
         /// What help to show.
         topic: HelpTopic,
     },
-    /// Display the library version and exit 0.
+    /// Display the library version and exit 0 (= `--version`, テキスト 1 行)。
     Version,
+    /// Print this CLI / 監督者 / 全 unit の版を JSON で並べる (= `version`、DR-0034 決定 7a)。
+    VersionReport,
     /// Execute `run` with the given configuration.
     Run(RunConfig),
     /// Attach to an existing daemon session.
@@ -1133,6 +1173,7 @@ pub fn parse_args(args: &[String]) -> Command {
         "config" => parse_config(rest),
         "web" => parse_web(rest),
         "upgrade" => parse_upgrade(rest),
+        "version" => parse_version(rest),
         "completion" => parse_completion(rest),
         // Reserved for future stages.
         //
@@ -2536,9 +2577,16 @@ pub fn usage(topic: &HelpTopic) -> String {
         HelpTopic::Web => usage_web(),
         HelpTopic::WebDaemon => usage_web_daemon(),
         HelpTopic::WebDaemonRun => usage_web_daemon_run(),
+        HelpTopic::WebDaemonSupervise => usage_web_daemon_supervise(),
         HelpTopic::WebDaemonAdd => usage_web_daemon_add(),
         HelpTopic::WebDaemonRemove => usage_web_daemon_remove(),
         HelpTopic::WebDaemonList => usage_web_daemon_list(),
+        HelpTopic::WebDaemonStart => usage_web_daemon_start(),
+        HelpTopic::WebDaemonStop => usage_web_daemon_stop(),
+        HelpTopic::WebDaemonRestart => usage_web_daemon_restart(),
+        HelpTopic::WebDaemonStatus => usage_web_daemon_status(),
+        HelpTopic::WebDaemonLog => usage_web_daemon_log(),
+        HelpTopic::Version => usage_version(),
         HelpTopic::WebService => usage_web_service(),
         HelpTopic::WebServiceRegister => usage_web_service_register(),
         HelpTopic::WebServiceUnregister => usage_web_service_unregister(),
@@ -2689,15 +2737,167 @@ the executable to start, and whether it should be running. No arguments prints
 this help.
 
 SUBCOMMANDS:
-  run [<name>]        Start one unit in the foreground.
-  add <name>          Register a unit and ask the supervisor to start it.
-  remove <name>       Stop the unit and drop its registration.
-  list                Print registered units (works without the supervisor).
+  run [<name>]                   Start one unit in the foreground.
+  supervise                      Run the supervisor in the foreground.
+  add <name>                     Register a unit and start it.
+  remove <name>                  Stop the unit and drop its registration.
+  list                           Print registered units (works without the
+                                 supervisor).
+  start <name> | --all           Ask the supervisor to start units.
+  stop <name> | --all            Ask the supervisor to stop units.
+  restart <name> | --all         Replace running units (--all goes one at a
+                                 time).
+  status [<name>] | --all        Print the full state, including versions.
+  log [<name>] | --all           Print unit logs.
 
 OPTIONS:
   --help, -h    Show this help.
 
+start, stop, restart, and log go through the supervisor and fail when it is
+not running. list and status answer from the registry in that case.
+
 Output is JSON; errors are JSON on stderr with a non-zero exit.
+"
+    .to_string()
+}
+
+fn usage_web_daemon_supervise() -> String {
+    "\
+hyoui web daemon supervise
+
+Run the supervisor in the foreground: start every enabled unit as
+`<binary> web daemon run <name>`, restart it when it exits, and serve the
+control socket that start, stop, restart, status, and log talk to.
+
+This is the one command the OS service manager loads (see
+`hyoui web service register`); units themselves are never registered with the
+OS. A failing unit is retried with a widening delay, from 1 second up to 60
+seconds, so a unit whose address is already taken is not hammered.
+
+On SIGTERM or SIGINT the supervisor stops every child it holds and then exits,
+so stopping it stops all gateways.
+
+OPTIONS:
+  --help, -h    Show this help.
+"
+    .to_string()
+}
+
+fn usage_web_daemon_start() -> String {
+    "\
+hyoui web daemon start <name> | --all
+
+Ask the supervisor to start units, recording that they should be running. A
+unit stopped earlier is started again: start is the statement that a gateway
+should be up.
+
+OPTIONS:
+  --all         Start every registered unit.
+  --help, -h    Show this help.
+"
+    .to_string()
+}
+
+fn usage_web_daemon_stop() -> String {
+    "\
+hyoui web daemon stop <name> | --all
+
+Ask the supervisor to stop units, recording that they should stay down. The
+unit keeps its registration, so `list` and `status` still show it with
+`enabled: false`.
+
+Children are asked to exit first and killed only if they do not, after a grace
+period.
+
+OPTIONS:
+  --all         Stop every registered unit.
+  --help, -h    Show this help.
+"
+    .to_string()
+}
+
+fn usage_web_daemon_restart() -> String {
+    "\
+hyoui web daemon restart <name> | --all
+
+Replace running units with freshly started ones. This is how a rebuilt gateway
+is put in place; the OS service registration does not need to change.
+
+With a name, this is the same as start: the unit is marked as wanted and
+started, even if it was stopped.
+
+With --all, only units that should be running are touched, in name order, one
+at a time: each is stopped, started, and waited for until it answers /healthz
+before moving on. Units that are stopped stay stopped, so an unrelated restart
+does not revive them. If a unit does not come back within 30 seconds, the walk
+stops there and the exit is non-zero rather than taking the rest down.
+
+OPTIONS:
+  --all         Restart every unit that should be running.
+  --help, -h    Show this help.
+"
+    .to_string()
+}
+
+fn usage_web_daemon_status() -> String {
+    "\
+hyoui web daemon status [<name>] | --all
+
+Print the full state of each unit: whether it should be running, whether it is,
+its pid and start time, its bind address, its executable and whether that file
+exists, how many times it has been restarted, and how it last exited.
+
+Versions come as a pair: `running` is what the live process answers over HTTP,
+`on_disk` is what its executable answers to `--version`, and `restart_needed`
+is true only when both are known and differ. Asking runs the executable once
+per unit.
+
+Without the supervisor, the registry still answers: `running` and `pid` are
+left unknown and a note says why.
+
+OPTIONS:
+  --all         Report every registered unit (the default).
+  --help, -h    Show this help.
+"
+    .to_string()
+}
+
+fn usage_web_daemon_log() -> String {
+    "\
+hyoui web daemon log [<name>] | --all [--follow]
+
+Print what units have written. The supervisor collects each child's output into
+`${XDG_STATE_HOME:-~/.local/state}/hyoui-web/logs/<name>.log` and hands the
+same lines to anyone following, so --follow does not re-read the file.
+
+Rotation is left to the system (newsyslog or logrotate); hyoui only appends.
+
+OPTIONS:
+  --all         Read every unit's log (the default).
+  --follow      Keep printing lines as they are written.
+  --help, -h    Show this help.
+
+Output is JSONL: one object per line, each naming the unit it came from.
+"
+    .to_string()
+}
+
+fn usage_version() -> String {
+    "\
+hyoui version
+
+Print the version of this CLI, of the supervisor, and of every unit, as JSON.
+
+Each entry pairs the version of the running process with the version of the
+executable on disk, so \"rebuilt but not restarted\" is visible: when the two
+differ, `restart_needed` is true and `hyoui web daemon restart <name>` puts the
+new build in place. The executable's path is printed alongside, since the same
+name often exists in several places.
+
+`hyoui --version` stays the one-line way to ask this CLI its own version.
+
+OPTIONS:
+  --help, -h    Show this help.
 "
     .to_string()
 }
@@ -4164,17 +4364,26 @@ fn parse_web_daemon(args: &[String]) -> Command {
         "run" => parse_web_daemon_run(rest),
         "add" => parse_web_daemon_add(rest),
         "remove" => parse_web_daemon_remove(rest),
-        "list" => {
+        "supervise" | "list" => {
+            let topic = if head == "supervise" {
+                HelpTopic::WebDaemonSupervise
+            } else {
+                HelpTopic::WebDaemonList
+            };
             if rest.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
-                return Command::Help {
-                    topic: HelpTopic::WebDaemonList,
-                };
+                return Command::Help { topic };
             }
             if let Some(arg) = rest.first() {
-                return Command::Error(format!("web daemon list: unexpected argument: {arg}"));
+                return Command::Error(format!("web daemon {head}: unexpected argument: {arg}"));
             }
-            Command::Web(WebCommand::Daemon(WebDaemonCommand::List))
+            let command = if head == "supervise" {
+                WebDaemonCommand::Supervise
+            } else {
+                WebDaemonCommand::List
+            };
+            Command::Web(WebCommand::Daemon(command))
         }
+        "start" | "stop" | "restart" | "status" | "log" => parse_web_daemon_target(head, rest),
         other if other.starts_with('-') => {
             Command::Error(format!("web daemon: unknown option: {other}"))
         }
@@ -4183,6 +4392,61 @@ fn parse_web_daemon(args: &[String]) -> Command {
             WEB_DAEMON_SUBCOMMANDS.join(", ")
         )),
     }
+}
+
+/// `<name> | --all` を取る leaf (= `start` / `stop` / `restart` / `status` / `log`)。
+///
+/// `start` / `stop` / `restart` は対象の指定が必須 (= 引数なしは help)。
+/// `status` / `log` は省略できて、省略時は全 unit (決定 4 の `[<name>] | --all`)。
+fn parse_web_daemon_target(verb: &str, args: &[String]) -> Command {
+    let topic = match verb {
+        "start" => HelpTopic::WebDaemonStart,
+        "stop" => HelpTopic::WebDaemonStop,
+        "restart" => HelpTopic::WebDaemonRestart,
+        "status" => HelpTopic::WebDaemonStatus,
+        _ => HelpTopic::WebDaemonLog,
+    };
+    let target_may_be_omitted = matches!(verb, "status" | "log");
+    let follow_allowed = verb == "log";
+
+    let mut name: Option<String> = None;
+    let mut all = false;
+    let mut follow = false;
+
+    for arg in args {
+        match arg.as_str() {
+            "--help" | "-h" => return Command::Help { topic },
+            "--all" => all = true,
+            "--follow" if follow_allowed => follow = true,
+            other if other.starts_with('-') => {
+                return Command::Error(format!("web daemon {verb}: unknown option: {other}"));
+            }
+            other if name.is_none() => name = Some(other.to_string()),
+            other => {
+                return Command::Error(format!("web daemon {verb}: unexpected argument: {other}"));
+            }
+        }
+    }
+
+    if all && name.is_some() {
+        return Command::Error(format!(
+            "web daemon {verb}: a unit name and --all cannot be combined"
+        ));
+    }
+    if name.is_none() && !all && !target_may_be_omitted {
+        // 必須引数を欠く verb は help (= reference の出力規約)。
+        return Command::Help { topic };
+    }
+
+    let target = WebDaemonTarget { name };
+    let command = match verb {
+        "start" => WebDaemonCommand::Start(target),
+        "stop" => WebDaemonCommand::Stop(target),
+        "restart" => WebDaemonCommand::Restart(target),
+        "status" => WebDaemonCommand::Status(target),
+        _ => WebDaemonCommand::Log { target, follow },
+    };
+    Command::Web(WebCommand::Daemon(command))
 }
 
 fn parse_web_daemon_run(args: &[String]) -> Command {
@@ -4442,6 +4706,21 @@ fn parse_web_service_register(args: &[String]) -> Command {
     )))
 }
 
+/// `hyoui version` (= DR-0034 決定 7a、JSON で版を並べる)。
+///
+/// `hyoui --version` は 1 行テキストで自分の版を言う口として別に残る。
+fn parse_version(args: &[String]) -> Command {
+    if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        return Command::Help {
+            topic: HelpTopic::Version,
+        };
+    }
+    if let Some(arg) = args.first() {
+        return Command::Error(format!("version: unexpected argument: {arg}"));
+    }
+    Command::VersionReport
+}
+
 fn parse_completion(args: &[String]) -> Command {
     if args.is_empty() {
         return Command::Error("completion requires a shell name (bash|zsh|fish)".into());
@@ -4507,6 +4786,7 @@ fn usage_top(unknown: Option<&str>) -> String {
             config      Inspect the user config file (path/show)\n    \
             web         Start the HTTP gateway (REST + HTML UI, DR-0027)\n    \
             upgrade     Trigger daemon graceful self-exec upgrade (DR-0028)\n    \
+            version     Print the versions in place and the versions running (DR-0034)\n    \
             completion  Print a shell completion script (bash|zsh|fish)\n\
         \n\
         RESERVED (not yet implemented):\n    \
@@ -6353,6 +6633,7 @@ pub const IMPLEMENTED_TOP_LEVEL_SUBCOMMANDS: &[&str] = &[
     "web",
     "upgrade",
     "config",
+    "version",
     "completion",
 ];
 
@@ -6379,11 +6660,18 @@ pub const CONFIG_SUBCOMMANDS: &[&str] = &["path", "show"];
 pub const WEB_SERVICE_SUBCOMMANDS: &[&str] = &["register", "unregister", "status"];
 
 /// `hyoui web daemon` の子 subcommand 一覧 (= `parse_web_daemon` が dispatch する値)。
-///
-/// `start` / `stop` / `restart` / `status` / `log` / `supervise` は監督者への要求で、
-/// DR-0034 P3 で実装される。実装されるまで help / completion にも出さない
-/// (= 選んでも error になる値を補完しない)。
-pub const WEB_DAEMON_SUBCOMMANDS: &[&str] = &["run", "add", "remove", "list"];
+pub const WEB_DAEMON_SUBCOMMANDS: &[&str] = &[
+    "run",
+    "supervise",
+    "add",
+    "remove",
+    "list",
+    "start",
+    "stop",
+    "restart",
+    "status",
+    "log",
+];
 
 /// `hyoui screen snapshot --include` の help / completion に出す component 名一覧。
 ///
@@ -11036,10 +11324,10 @@ mod tests {
         }
     }
 
-    /// 未実装 verb (= P3 の監督者要求) は unknown subcommand として断る。
+    /// 知らない verb は unknown subcommand として断る。
     #[test]
     fn parse_web_daemon_rejects_unknown_subcommands() {
-        for unsupported in ["supervise", "start", "stop", "restart", "status", "log"] {
+        for unsupported in ["reload", "kick", "supervisor"] {
             assert!(
                 matches!(
                     parse_args(&args(&["web", "daemon", unsupported])),
@@ -11052,6 +11340,98 @@ mod tests {
             parse_args(&args(&["web", "daemon", "--nope"])),
             Command::Error(message) if message.contains("unknown option")
         ));
+    }
+
+    /// 対象が必須の verb は引数なしで help、`status` / `log` は省略できる (= 決定 4)。
+    #[test]
+    fn parse_web_daemon_target_verbs() {
+        assert_eq!(
+            parse_args(&args(&["web", "daemon", "supervise"])),
+            Command::Web(WebCommand::Daemon(WebDaemonCommand::Supervise))
+        );
+        assert_eq!(
+            parse_args(&args(&["web", "daemon", "start", "unstable"])),
+            Command::Web(WebCommand::Daemon(WebDaemonCommand::Start(
+                WebDaemonTarget {
+                    name: Some("unstable".into())
+                }
+            )))
+        );
+        assert_eq!(
+            parse_args(&args(&["web", "daemon", "stop", "--all"])),
+            Command::Web(WebCommand::Daemon(WebDaemonCommand::Stop(
+                WebDaemonTarget { name: None }
+            )))
+        );
+        assert_eq!(
+            parse_args(&args(&["web", "daemon", "restart", "--all"])),
+            Command::Web(WebCommand::Daemon(WebDaemonCommand::Restart(
+                WebDaemonTarget { name: None }
+            )))
+        );
+        // `status` / `log` は対象を省略できて、省略時は全 unit。
+        assert_eq!(
+            parse_args(&args(&["web", "daemon", "status"])),
+            Command::Web(WebCommand::Daemon(WebDaemonCommand::Status(
+                WebDaemonTarget { name: None }
+            )))
+        );
+        assert_eq!(
+            parse_args(&args(&["web", "daemon", "log", "stable", "--follow"])),
+            Command::Web(WebCommand::Daemon(WebDaemonCommand::Log {
+                target: WebDaemonTarget {
+                    name: Some("stable".into())
+                },
+                follow: true,
+            }))
+        );
+
+        // 対象が必須の verb は引数なしで help を出す。
+        for (verb, topic) in [
+            ("start", HelpTopic::WebDaemonStart),
+            ("stop", HelpTopic::WebDaemonStop),
+            ("restart", HelpTopic::WebDaemonRestart),
+        ] {
+            assert_eq!(
+                parse_args(&args(&["web", "daemon", verb])),
+                Command::Help { topic },
+                "{verb}"
+            );
+        }
+
+        // 名前と `--all` は同時に指定できない。
+        assert!(matches!(
+            parse_args(&args(&["web", "daemon", "start", "x", "--all"])),
+            Command::Error(message) if message.contains("cannot be combined")
+        ));
+        // `--follow` は log だけの option。
+        assert!(matches!(
+            parse_args(&args(&["web", "daemon", "status", "--follow"])),
+            Command::Error(message) if message.contains("unknown option")
+        ));
+        assert!(matches!(
+            parse_args(&args(&["web", "daemon", "supervise", "extra"])),
+            Command::Error(message) if message.contains("unexpected argument")
+        ));
+    }
+
+    /// `hyoui version` は JSON を出す口、`--version` は 1 行テキストの口 (= 決定 7a)。
+    #[test]
+    fn parse_version_subcommand_is_separate_from_the_version_flag() {
+        assert_eq!(parse_args(&args(&["version"])), Command::VersionReport);
+        assert_eq!(parse_args(&args(&["--version"])), Command::Version);
+        assert_eq!(parse_args(&args(&["-V"])), Command::Version);
+        assert_eq!(
+            parse_args(&args(&["version", "--help"])),
+            Command::Help {
+                topic: HelpTopic::Version
+            }
+        );
+        assert!(matches!(
+            parse_args(&args(&["version", "extra"])),
+            Command::Error(message) if message.contains("unexpected argument")
+        ));
+        assert!(usage(&HelpTopic::Version).contains("restart_needed"));
     }
 
     /// daemon help は親と各 leaf の操作面を別々に説明する。
@@ -11069,5 +11449,11 @@ mod tests {
         assert!(usage(&HelpTopic::WebDaemonAdd).contains("--binary"));
         assert!(usage(&HelpTopic::WebDaemonRemove).contains("registration"));
         assert!(usage(&HelpTopic::WebDaemonList).contains("supervisor"));
+        assert!(usage(&HelpTopic::WebDaemonSupervise).contains("control socket"));
+        assert!(usage(&HelpTopic::WebDaemonStart).contains("--all"));
+        assert!(usage(&HelpTopic::WebDaemonStop).contains("grace"));
+        assert!(usage(&HelpTopic::WebDaemonRestart).contains("one\nat a time"));
+        assert!(usage(&HelpTopic::WebDaemonStatus).contains("restart_needed"));
+        assert!(usage(&HelpTopic::WebDaemonLog).contains("--follow"));
     }
 }

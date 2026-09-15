@@ -149,6 +149,19 @@ impl Registry {
         Ok(units)
     }
 
+    /// 他の属性を保ったまま desired state を書き換える。
+    ///
+    /// これを書くのは監督者で、`add` / `remove` は CLI が書く。書き手が 2 者いる
+    /// ことが tmp + rename の要件になっている (DR-0034 決定 2 / 4)。
+    pub fn set_enabled(&self, name: &str, enabled: bool) -> Result<Unit> {
+        let mut unit = self.get(name)?;
+        if unit.enabled != enabled {
+            unit.enabled = enabled;
+            self.write_atomic(&self.path_of(name), &unit)?;
+        }
+        Ok(unit)
+    }
+
     fn path_of(&self, name: &str) -> PathBuf {
         self.dir.join(format!("{name}.toml"))
     }
@@ -457,10 +470,37 @@ mod tests {
             .collect();
         assert_eq!(entries, [std::ffi::OsString::from("stable.toml")]);
 
-        // 消して同じ名前で入れ直しても残骸は増えない。
+        // 上書き (= 監督者による desired state の書き換え) でも残骸は増えない。
+        registry.set_enabled("stable", false).unwrap();
+        assert_eq!(std::fs::read_dir(registry.dir()).unwrap().count(), 1);
+
+        // 消して同じ名前で入れ直しても増えない。
         registry.remove("stable").unwrap();
         registry.add("stable", &unit("127.0.0.1:43690")).unwrap();
         assert_eq!(std::fs::read_dir(registry.dir()).unwrap().count(), 1);
+    }
+
+    /// desired state だけが変わり、他の属性は保たれる。
+    #[test]
+    fn changing_the_desired_state_preserves_every_other_property() {
+        let (_directory, registry) = registry();
+        let original = unit("127.0.0.1:43690");
+        registry.add("stable", &original).unwrap();
+
+        let changed = registry.set_enabled("stable", false).unwrap();
+        assert!(!changed.enabled);
+        assert_eq!(changed.listen, original.listen);
+        assert_eq!(changed.binary, original.binary);
+        assert_eq!(changed.web_assets_dir, original.web_assets_dir);
+        assert_eq!(changed.added_at, original.added_at);
+        assert_eq!(registry.get("stable").unwrap(), changed);
+
+        // 同じ値の書き込みは no-op で、読み戻しても変わらない。
+        assert_eq!(registry.set_enabled("stable", false).unwrap(), changed);
+        assert!(matches!(
+            registry.set_enabled("ghost", true),
+            Err(Error::UnknownUnit { .. })
+        ));
     }
 
     #[test]

@@ -1,9 +1,12 @@
 //! Build version identity shared by CLI and HTTP surfaces.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A hyoui build identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+///
+/// `Deserialize` も持つのは、読み手が居るため: gateway の `GET /version` の応答と、
+/// 監督者の制御 socket に載る版を CLI が読み返す (DR-0034 決定 4 / 7a)。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct VersionInfo {
     /// Crate version from `Cargo.toml`.
     pub version: String,
