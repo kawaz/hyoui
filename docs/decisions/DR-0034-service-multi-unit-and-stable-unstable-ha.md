@@ -325,17 +325,20 @@ backoff は llm-gateway と同じ形 (初回 1 秒から倍々、上限 60 秒)�
 
 **`version` だけでは走っているビルドを識別できない。** stable (brew の `/opt/homebrew/bin/hyoui`) と unstable (repo の `target/release/hyoui`) は実測でどちらも `hyoui 0.9.42` を答える。crate version は tag を打つまで動かないので、unstable に変更を入れても version は変わらない。本 DR の運用ではこの判別が中心になるので `build_id` を併せて返す。
 
-**`build_id` の既定値は build script が git から導出する。** 環境変数の明示だけに頼ると、通常の unstable ビルド経路 (`just build` = `cargo build --release --workspace`、justfile に env の注入は無く、build script も現状存在しない) で `null` になり、まさに区別したい stable / unstable が両方 `null` で並ぶ。build script (`build.rs`) で次の順に決める:
+**`build_id` の既定値は build script が VCS から導出する。** 環境変数の明示だけに頼ると、通常の unstable ビルド経路 (`just build` = `cargo build --release --workspace`、justfile に env の注入は無い) で `null` になり、まさに区別したい stable / unstable が両方 `null` で並ぶ。build script (`build.rs`) で次の順に決める:
 
 1. `HYOUI_BUILD_ID` が環境に与えられていればその値を使う (CI / 配布ビルドが明示する経路)
-2. 無ければ `git rev-parse --short HEAD` を実行し、作業ツリーに変更があれば dirty を示す接尾を付ける
-3. git が使えない / リポジトリでない場合 (brew の tarball ビルド等) は注入せず、実行時は `null`
+2. jj workspace なら (= `jj --ignore-working-copy root` が成功する) `jj --ignore-working-copy log -r @- --no-graph -T 'commit_id.short(8)'`。dirty は `jj --ignore-working-copy diff --summary` の出力有無
+3. jj が無ければ `git rev-parse --short HEAD`。dirty は `git status --porcelain --untracked-files=no` の出力有無
+4. どちらも使えない場合 (brew の tarball ビルド等) は注入せず、実行時は `null`
 
-**dirty の判定は git に聞いて、失敗したら jj に聞く。** 本リポは jj workspace で、git dir は作業ツリーを持たない bare repository として外に在る。そこでは `git status --porcelain` が `fatal: this operation must be run in a work tree` で失敗し、`--work-tree` を与えても git index が最後の jj commit 時点で止まっているため実態と食い違う (実測: git は無関係な 2 ファイルを挙げ、`jj diff --name-only` が実際の 8 ファイルを挙げた)。つまり **git だけに聞くと、まさに unstable を建てる環境で dirty が常に付かない**。git を先に試し、失敗した時だけ jj に聞くことで、jj を他の環境の要件にせずこの環境を救う。
+**jj 環境では git の `HEAD` を見てはいけない。** 本リポは jj workspace で、git dir は作業ツリーを持たない bare repository として外に在る。そこでは `HEAD` が `refs/jj/root` を指したまま動かず、`git rev-parse --short HEAD` は jj 側の commit と無関係な値を返し続ける (実測: git は `8ddbea57`、`jj log -r @-` は `7882149c`)。つまり **git だけに聞くと、まさに unstable を建てる環境で build_id が動かず、決定 7a の `restart_needed` が成立しない**。jj を先に試すことで、jj を他の環境の要件にせずこの環境を救う。
 
-build script は `cargo:rustc-env=HYOUI_BUILD_ID=<値>` で値を渡し、`cargo:rerun-if-changed=<HEAD の実体 path>` と `cargo:rerun-if-env-changed=HYOUI_BUILD_ID` を宣言する。path は `git rev-parse --git-path HEAD` で解決したものを使う — bare repo では `.git/HEAD` というリテラルが存在せず、存在しない path を宣言すると cargo が build script を毎回再実行する。実行側は `option_env!("HYOUI_BUILD_ID")` を読むだけ。`null` は異常ではなく「配布ビルド」の印として読める。
+**導出元は `@-` (working copy の親) であって `@` ではない。** jj の `@` は working copy それ自体の change なので、ビルドしたコードの同一性を指す識別子としては `@-` を使う。`--ignore-working-copy` を付けるのは、build script が jj に snapshot を取らせて `@` を書き換えないため (ビルドが VCS 状態を動かすのは透過原則に反する)。
 
-**`-dirty` は「その時ビルドされた版」の印であって、今の作業ツリーの状態ではない。** working copy を編集しても HEAD は動かないので、cargo は build script を再実行せず `build_id` は据え置かれる。毎回再実行させると常時再ビルドになるため、この取りこぼしは受け入れる。`restart_needed` の判断 (決定 7a) は `daemon restart` の前にビルドし直す運用が前提で、ビルドを跨がない編集を検出する仕組みは持たない。
+build script は `cargo:rustc-env=HYOUI_BUILD_ID=<値>` で値を渡し、`cargo:rerun-if-env-changed=HYOUI_BUILD_ID` と、VCS ごとの再実行条件を宣言する。jj 環境は **op head** (`<jj root>/.jj/repo` が file ならその中身を辿った repo dir の `op_heads/heads/`) を宣言する — jj の commit / new / undo と working copy の snapshot はすべて operation を作るので、ここを見れば足りる。git 環境は `git rev-parse --git-path HEAD` で解決した path と、`symbolic-ref` が指す ref の実体 path を宣言する (bare repo では `.git/HEAD` というリテラルが無く、存在しない path を宣言すると cargo が毎回再実行する)。実行側は `option_env!("HYOUI_BUILD_ID")` を読むだけ。`null` は異常ではなく「配布ビルド」の印として読める。
+
+**`-dirty` は「その時ビルドされた版」の印であって、今の作業ツリーの状態ではない。** jj 環境では `--ignore-working-copy` を使うので、dirty は **jj が最後に snapshot した working copy** 基準になる。ファイルを編集しただけでは op head が動かず、cargo は build script を再実行しないので `build_id` は据え置かれる (何らかの jj コマンドが走って snapshot されれば op head が進み、次のビルドで `-dirty` が付く。実測でこの経路を確認済み)。毎回再実行させると常時再ビルドになるため、この取りこぼしは受け入れる。`restart_needed` の判断 (決定 7a) は `daemon restart` の前にビルドし直す運用が前提で、ビルドを跨がない編集を検出する仕組みは持たない。
 
 監督者はこの `/version` を各 unit の listen に聞き、**走っている版** (`running`) として持つ。答えない版が走っていることはあるので、答えられなければ `null`。**listen が wildcard の unit への問い合わせ先**は loopback に読み替える (`0.0.0.0:<port>` → `127.0.0.1:<port>`、`[::]:<port>` → `[::1]:<port>`)。
 
