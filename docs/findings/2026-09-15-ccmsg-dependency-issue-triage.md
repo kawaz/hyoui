@@ -15,7 +15,7 @@ hyoui の現在の主用途は ccmsg のセッション実行基盤 (README Stat
 
 ## 仕分け (2026-09-15 時点の active issue 41 件)
 
-### 該当 (12 件) — ccmsg の run / input / web embed 経路に効く
+### 該当 (11 件) — ccmsg の run / input / web embed 経路に効く
 
 | slug | status | 経路 |
 |---|---|---|
@@ -23,28 +23,18 @@ hyoui の現在の主用途は ccmsg のセッション実行基盤 (README Stat
 | attach-osc8-hyperlink-metadata-loss | open | web (CLI attach と共通の復元経路) |
 | web-screen-fetch-alt-mode-lost | open | web `/screen` |
 | handshake-redraw-deferred-no-timeout | open | web の attach 復元 (DR-0013 §4) |
-| web-terminal-font-load-fit-race | wip | web |
 | web-narrow-symbol-fallback-font | open | web |
 | web-ime-safari-ios-unverified | open | web |
-| zero-size-tty-daemon-panic | wip | `hyoui run` 起動時 panic |
-| bug-vt100-zero-size-pty-panic | open | 同上 (同根) |
 | child-spawn-sigttou-stop-race | open | `hyoui run` の fork〜exec race |
 | feature-icanon-large-input-chunking | open | `hyoui input` |
 | feature-ack-test-coverage-expansion | open | `hyoui input` の ack (DR-0021) |
+| socket-dir-tmp-fallback-macos-cleanup | open | socket 消失で run / input / web すべての接続が不能 |
+| bug-anchor-startup-sigttin-transient | blocked | `hyoui run` の fork〜exec 起動経路 (DR-0017 session anchor) |
 
-### 不明 (4 件) — 接続点が未検証
+### 非該当 (27 件)
 
-| slug | 未検証の点 |
-|---|---|
-| ctrlz-guard-bypassed-by-keyboard-protocol | web gateway 経由の入力でも attach client の ^Z ガードが効くか |
-| socket-dir-tmp-fallback-macos-cleanup | socket 消失は全機能に効くが ccmsg 固有の面ではない |
-| bug-anchor-startup-sigttin-transient | 「anchor」が daemon/子起動シーケンスのどこを指すか |
-| bug-flaky-serve-propagates-child-exit-code | ccmsg の exit 検知は `claude agents` poll なので影響有無が不明 |
-
-### 非該当 (25 件)
-
-CLI attach 専用 (take-leader / child-suspend-action-menu / attach-overlay-progress / tcsaflush-input-discard / ctrlz 系以外)、`hyoui wait` / `dump` / `record` / `tx` 系、`hyoui kill` の挙動 (sigcont-alive-child-session-vanish、feature-signal-ack)、CI flaky 系 4 件、内部リファクタ・アイデア・README 整備、upgrade-e2e-test。
+CLI attach 専用 (take-leader / child-suspend-action-menu / attach-overlay-progress / tcsaflush-input-discard / ctrlz-guard: attach client の stdin 経路で web 入力には接続しない)、`hyoui wait` / `dump` / `record` / `tx` 系、`hyoui kill` の挙動 (sigcont-alive-child-session-vanish、feature-signal-ack)、CI flaky 系 5 件 (flaky-serve-propagates-child-exit-code 含む: ccmsg の exit 検知は `claude agents` poll で serve の exit code を使わない)、内部リファクタ・アイデア・README 整備、upgrade-e2e-test。
 
 ## 使い方
 
-次の作業単位を選ぶときは「該当」12 件から取る。「不明」4 件は着手前に接続点を 1 コマンドで確認してから分類し直す。
+次の作業単位を選ぶときは「該当」から取る。同日の棚卸しで、該当のうち修正 land 済みで issue が残っていたもの (zero-size 2 件 / font-load-fit-race) は close 済み。残りは全て未着手または実機検証待ち。
