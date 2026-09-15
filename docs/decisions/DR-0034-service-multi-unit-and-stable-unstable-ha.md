@@ -74,7 +74,7 @@ llm-gateway が同じ reference 体系を先に当てている (DR-0028)。unit 
 | 監督者死亡後の残り子 | 引き取らない。次の監督者は起こし直して port 衝突 | 踏襲 (決定 10) |
 | ログ | 監督者が `logs/<unit>.log` に集約、回転は OS | 踏襲 (決定 9) |
 | unit の中身 | 設定ファイルの path + `binary_path` + `enabled` | **変更**: 設定ファイルを持たず `listen` / `binary` / `web_assets_dir` / `enabled` を解決して書く (決定 2)。gateway に設定ファイルの概念が無い |
-| 子の argv | `<binary> daemon run <unit>` (子が設定を解釈) | **変更**: `<binary> web --listen=... [--web-assets-dir=...]`。unit が 3 値しか持たないので argv に収まり、古い配布版でも通る (決定 3) |
+| 子の argv | `<binary> daemon run <unit>` (子が unit の中身を解釈) | 踏襲: `<binary> web daemon run <name>` (決定 3)。監督者は unit の中身を解釈しない |
 | `binary` の既定 | 設定の `binary_path`、無ければ登録時の自分自身 | **変更**: `current_exe` が PATH 上ならそれ、PATH 外ならそのまま焼く。`resolve_stable_path` を通さない (決定 2) |
 | `restart --all` の順序 | 登録の逆順 (`supervisor.rs:286-288`、前段が手前を優先しているため) | **変更**: unit 名の昇順 (決定 5)。順序の根拠を前段の設定に置かない — 前段の優先順は canddy が持つ知識で、監督者は知らない |
 | 停止中 unit への `restart` | 無条件に `set_enabled(name, true)` (`supervisor.rs:318`) | **変更**: 名前指定なら同じ (enable して起こす)、`--all` は `enabled` な unit だけ (決定 5)。`stop` の意思を `--all` が覆さない |
@@ -118,9 +118,9 @@ hyoui web service log [--follow]           監督者と OS 側のログ
 | `--binary=<path>` | この unit が起動する実行ファイル | 決定 2 のとおり `current_exe` が PATH 上かで分ける |
 | `--web-assets-dir=<path>` | 静的 assets の差し替え (dev) | config `[web].assets_dir`、無ければ embedded |
 
-option 名は `hyoui web` 側 (`--listen` / `--web-assets-dir`) と一字一句揃える。`add` が書くのは監督者が `hyoui web` に渡す argv の材料そのもの (決定 3) なので、同じものを 2 通りに呼ばない。
+option 名は `hyoui web` 側 (`--listen` / `--web-assets-dir`) と一字一句揃える。`add` が書く値は `daemon run` がそのまま使うものなので、同じものを 2 通りに呼ばない。
 
-`daemon run [unit]` は登録簿の値で foreground 起動する糖衣。監督者が子を exec する経路はこれを通らない (決定 3)。
+`daemon run <name>` は登録簿の値で gateway を foreground 起動する。監督者が子を exec するのと同じ経路で、CLI から手元で 1 台だけ確かめる時にも使う (決定 3)。
 
 `hyoui web` の引数なし実行は gateway の foreground 起動 (`daemon run` と同義) のまま維持する。`hyoui web daemon` / `hyoui web service` の引数なし実行と、必須引数を欠く verb は help を出す。help 以外の出力は JSON、`log --follow` は JSONL、エラーは JSON を stderr に出して exit を非 0 にする (reference の出力規約)。
 
@@ -155,13 +155,13 @@ unit が持つのは `listen` / `binary` / `web_assets_dir` / `enabled` (desired
 
 ### 3. `supervise` は exec するだけの監督者
 
-登録簿の `enabled` な unit ごとに **`<binary> web --listen=<listen> [--web-assets-dir=<path>]`** を子プロセスとして起動し、落ちたら backoff を置いて上げ直す。
+登録簿の `enabled` な unit ごとに **`<binary> web daemon run <name>`** を子プロセスとして起動し、落ちたら backoff を置いて上げ直す。
 
-**exec する argv に `web daemon run <name>` を使わない。** stable unit が指すのは brew 配布版で、それは本 DR の実装より古い版でありうる。古い版は `web daemon run` という subcommand を知らないので即座に死に、監督者が backoff で叩き続けるだけになる。一方 `web --listen=...` は DR-0027 以降のどの版でも通る。unit の属性は `add` の時点で解決済み (決定 2) なので、子に登録簿を読ませる必然性が無い — 監督者が読んで argv に渡せば足りる。
+**unit の値を読むのは子。監督者は argv に展開しない。** 監督者が渡すのは unit 名だけで、`listen` / `web_assets_dir` は子が登録簿から読む。監督者は「登録簿の `enabled` を見て起こし、落ちたら上げ直す」だけの役に閉じ、unit の中身を解釈しない (llm-gateway が採った線引きと同じ = 解釈するのは子)。展開する形にすると、監督者が読んだ値と子が使う値の 2 系統ができ、`add` 直後のような書き換えの前後で食い違う余地が生まれる。登録簿を唯一の正本にする。
 
-これは llm-gateway (子に `daemon run <unit>` を exec させ、子が設定ファイルを解釈する) と違う点。llm-gateway の unit は設定ファイル 1 つで、子が読むべき内容が argv に収まらないのに対し、hyoui の unit は 3 値しか持たない。
+`hyoui web daemon run <name>` は CLI からも打てる (手元で 1 台だけ foreground で動かして確かめる用)。監督者が exec するのと同じ経路。
 
-`daemon run [unit]` は CLI の糖衣として残す (登録簿の値で foreground 起動する = 手元で 1 台だけ動かして確かめる用)。監督者の exec 経路には使わない。SIGTERM / SIGINT を受けたら子を順に止めて終わる (SIGTERM → grace 待ち → SIGKILL)。
+SIGTERM / SIGINT を受けたら子を順に止めて終わる (SIGTERM → grace 待ち → SIGKILL)。
 
 監督者自身は HTTP を持たず、gateway の設定も解釈しない。解釈するのは子の `daemon run` である。
 
@@ -356,11 +356,12 @@ canddy 側の変更は **canddy リポの issue として依頼する**。設定
 
 verb 名は残るが、載せる対象が gateway 1 台から監督者に変わる。alias も移行期間も設計に入れない (この CLI の利用者は kawaz だけで、破壊的変更を受ける第三者が存在しない — kawaz 明言、2026-09-15)。
 
-移行は既存 1 台 (`com.github.kawaz.hyoui-web`) だけが対象で、手順は:
+**移行の前に brew リリースを出す。** `stable` unit が指すのは brew 配布版で、その版が `web daemon run` を持っていなければ監督者は子を起こせない。旧版でも通る argv を用意する形は採らない (Alternatives) ので、順序で解く:
 
-1. `launchctl bootout gui/$UID/com.github.kawaz.hyoui-web` → plist 削除
-2. `hyoui web daemon add stable --port=43690` / `hyoui web daemon add unstable --port=43691 --binary=<repo>/target/release/hyoui`
-3. `hyoui web service register` (監督者が載り、2 unit が上がる)
+1. 本 DR の P2〜P4 を含む版をリリースし、`brew upgrade` で `/opt/homebrew/bin/hyoui` を入れ替える
+2. `launchctl bootout gui/$UID/com.github.kawaz.hyoui-web` → plist 削除
+3. `hyoui web daemon add stable --port=43690` / `hyoui web daemon add unstable --port=43691 --binary=<repo>/target/release/hyoui`
+4. `hyoui web service register` (監督者が載り、2 unit が上がる)
 
 **この手順は runbook の手作業とし、`register` に旧 label を引き取る経路は作らない。** 対象が 1 台しか無いものを CLI に持たせると、一度通ったら二度と通らないコードが製品に残る。
 
@@ -388,6 +389,7 @@ verb 名は残るが、載せる対象が gateway 1 台から監督者に変わ�
 |---|---|
 | **監督者を置かず、unit 1 つ = OS service 1 つにする** | 目的が達成できない。台数ぶんの plist / systemd unit が並ぶので、状態を見る・再起動する時に「どの label が何台あるか」を先に思い出す作業が残り、操作も `launchctl` / `systemctl` の使い方に戻る (目的節の第一の目的)。`service` と `daemon` で status / log のスコープも分かれず、OS 登録の話と子の生死の話が 1 つの出力に混ざる。kawaz 製 CLI 共通の reference 体系から外れる点も同じ方向 (kawaz 裁定 2026-09-15、SVC-Q2=b) |
 | verb 群を `hyoui service` / `hyoui daemon` (top-level) に置く | kawaz 裁定 (SVC-Q1=a) で不採用。`hyoui daemon` は PTY session の daemon と語が衝突し、kind が増えた時に `--kind` で option 集合が分岐する。`hyoui web` 配下なら `add` の option が `hyoui web` の引数の写しになり、将来の kind は `hyoui session daemon` として並べられる |
+| 監督者が旧版 binary でも通る argv (`web --listen=...`) を exec する | 旧版との互換を設計判断に入れない方針。`web daemon run <name>` を選ぶ理由は「監督者が unit の中身を解釈しない」という責務の線引き (決定 3) であり、どの版で通るかは判断材料にしない。配布版が新しい subcommand を知らない問題は、リリースを先に出す順序で解く (決定 11) |
 | 旧 `web service` を alias として温存する | 同じことをする口が 2 つ増え、help と completion にも 2 つ載る。利用者は kawaz だけで、互換のために語彙を濁す相手が居ない |
 | unit を port で識別する (名前を持たない) | port は「今どこで待つか」であって unit の同一性ではない。port を変えた瞬間に別 unit になり、`stable` の設定を 43690 → 43695 に移す操作が表現できない。stable / unstable という役割も名前でしか書けない |
 | unit 定義を `~/.config/hyoui/config.toml` に `[[web.unit]]` として書く | config.toml は人が編集する設定 (DR-0024)、登録簿は CLI が書き換える状態。`enabled` のような desired state を人の設定ファイルに書き込むと、人の編集と CLI の書き込みが同じファイルで競合する |
@@ -404,7 +406,7 @@ verb 名は残るが、載せる対象が gateway 1 台から監督者に変わ�
 | P2 | 登録簿 (`units/<name>.toml`) と `add` / `remove` / `list`、`daemon run <unit>` | parser test (各 leaf、`--port` と `--listen` の排他、不正な unit 名、必須引数欠落時の help)。listen / assets_dir の解決と衝突拒否の test。登録簿の round-trip test と tmp + rename の atomic write test。**`hyoui list` に `hyoui-web` root の中身が現れないことを確認** (決定 2、discovery の走査 base と分かれているか)。`daemon run <unit>` が登録簿の listen で上がることを実機確認 |
 | P3 | `supervise` + 制御 socket + `start` / `stop` / `restart` / `status` / `log` | 監督者不在時に `supervisor_not_running` + hint を返す test。子が落ちたら上がる / backoff 上限に達する test (backoff の定数は注入可能にして test では短い値を使う。実時間で 60 秒を待つ test は書かない)。`add` / `remove` が走行中の監督者に即反映される test と、監督者不在時に登録簿だけが変わる test。`restart --all` を 127.0.0.1 直叩きで観測 (前段経由は P6)。`stop` した unit が復活しないことを観測 |
 | P4 | `service register` / `unregister` / `start` / `stop` / `status` / `log` を監督者向けに置き換え | plist / systemd unit の golden test。隔離 HOME での未登録 status と全 help topic。`service stop` 後に監督者が KeepAlive で復活しないことを実機で観測。`service stop` で子 gateway も落ちることを観測 (決定 6 の明文化どおりか) |
-| P5 | 旧 `web service` の意味の切り替え完了、help / completion / 実装の 3 者同期、移行 runbook、既存 1 台の移行 | `hyoui web daemon --help` / `hyoui web service --help` と completion 定義の突き合わせ test。実機で stable + unstable の 2 台が監督者の下に常駐し、`status` が両方の `build_id` を別々に出す。**目的節の契約を実機で確認**: unstable を再ビルド → `daemon restart unstable` だけで新しい `build_id` に入れ替わり、`service register` も plist の確認も要らないこと |
+| P5 | brew リリース (P2〜P4 を含む版) → 旧 `web service` の意味の切り替え完了、help / completion / 実装の 3 者同期、移行 runbook、既存 1 台の移行 | `hyoui web daemon --help` / `hyoui web service --help` と completion 定義の突き合わせ test。実機で stable + unstable の 2 台が監督者の下に常駐し、`status` が両方の `build_id` を別々に出す。**目的節の契約を実機で確認**: unstable を再ビルド → `daemon restart unstable` だけで新しい `build_id` に入れ替わり、`service register` も plist の確認も要らないこと |
 | P6 | canddy リポへ upstream 設定の issue 起票、前段経由の HA 実機検証 | unstable を `stop` した状態で新規リクエストが stable に回る。stable のみ停止でも同様。`restart --all` 実行中に前段経由の断が出ない。3 つが揃って完了 |
 
 P6 の検証は DR-0014 の検証主義に従い 1 回の観察で結論しない。停止させる側 (unstable / stable)、止め方 (`daemon stop` / `kill -9` / `kill -STOP` で TCP は受けるが応答しない状態 / bind 失敗させて backoff に入れる)、リクエストの種類 (HTML / `GET /api/sessions`) の組合せでマトリクスを埋める。`kill -STOP` の列は決定 8 の「窓」の実測値になるので、「断が出ない」と書ける範囲をこの列の結果で限定する。
