@@ -39,11 +39,11 @@
 
 ### 👺WEB-Q2: ccmsg webui の iframe 内での認証経路
 
-同 §4.3。ccmsg の WebAuthn 検証は iframe 内 (`topOrigin` あり) を拒否する。ccmsg と hyoui は別 origin だが同一 site (`*.kawaz.jp`)。
+同 §4.3。ccmsg の `topOrigin` 拒否は「ccmsg 自身が iframe に入らない」判断で hyoui の RP には無関係 (kawaz 2026-09-15)。ccmsg と hyoui は別 origin だが同一 site (`*.kawaz.jp`)。**cookie が iframe 内のリクエストに乗るか (同一 site) は a / c どちらでも同じ前提で実機未検証。**
 
-- [ ] a: top-level で hyoui にログイン (popup) → 同一 site cookie が iframe 内にも乗る → popup から BroadcastChannel で通知 (統括推し。ccmsg 側変更ゼロ。**同一 site iframe の cookie 送信は実機未検証**、崩れたら c へ)
-- [ ] b: ccmsg が短命 token を発行して iframe に渡す (hyoui が ccmsg を IdP として信頼、3 リポに契約が増える)
-- [ ] c: iframe 内で WebAuthn を走らせる (ccmsg-webui に `allow="publickey-credentials-get"`、hyoui に topOrigin allowlist)
+- [ ] a: top-level で hyoui にログイン (popup) → cookie が iframe 内にも乗る → BroadcastChannel で通知 (ccmsg 側変更ゼロ)
+- [ ] b: ccmsg が短命 token を発行して iframe に渡す (hyoui が ccmsg を IdP として信頼)
+- [ ] c: iframe 内で WebAuthn を走らせる (統括推し)。ccmsg-webui の iframe に `allow="publickey-credentials-get"` (登録は CLI 招待 URL を top-level で開くので `create` は不要)、hyoui は `[web].frame_ancestors` に ccmsg の origin を allowlist して `topOrigin` を照合し、同じ値で CSP `frame-ancestors` を出す
 
 ### 👺WEB-Q3: passkey 登録の bootstrap
 

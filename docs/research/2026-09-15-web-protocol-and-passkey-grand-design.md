@@ -150,7 +150,7 @@ ccmsg の検証コードは `topOrigin` が存在するだけで拒否し (棚�
 | (Q) 親 (ccmsg) が短命 token を発行し、iframe URL か postMessage で渡す | ccmsg daemon が hyoui 用の token を mint、hyoui が検証 | ログイン 1 回で両方に入れる | hyoui が ccmsg を IdP として信頼することになり、ccmsg-protocol / ccmsg daemon / ccmsg-webui の 3 リポに hyoui 専用の契約 (token の形、鍵の共有か公開鍵の配布) が増える。hyoui 単体の経路 [1] には別途 passkey が要るので、認証経路が 2 本になる。「hyoui の認証は hyoui が判定する」から外れる |
 | (R) iframe 内で WebAuthn を走らせる | 親が `allow="publickey-credentials-get"` を付け、hyoui の RP が `topOrigin` を許容 | popup が要らない | ccmsg-webui の変更 + hyoui 側で「どの topOrigin を許すか」の allowlist 設計が要る。ccmsg が明示的に拒否した判断の逆を張る根拠が「popup が煩わしい」だけ。`create()` (登録) の iframe 対応はブラウザ差が大きい (推測、未検証) |
 
-**統括推し: (P)。** 決め手は「ccmsg 側の変更ゼロ」と「hyoui 単体の経路と同じ認証」の 2 点で、hyoui が ccmsg の一部ではなく独立した gateway である (契約上は `terminal_gateway` の URL を知っているだけ、棚卸し) という現状の関係をそのまま保つ。(Q) は ccmsg と hyoui を結合する判断で、必要になったら (P) の上に足せる (排他ではない) ので、初版では採らない。
+**統括推し: (R)** (初版は (P) を推したが、kawaz の指摘「ccmsg の `topOrigin` 拒否は ccmsg 自身が iframe に入らない判断で hyoui の RP には無関係」を受けて改めた)。ccmsg-webui 側の変更は iframe の `allow="publickey-credentials-get"` 1 属性で、登録は CLI の招待 URL を top-level で開く経路なので `create` を iframe で走らせない。hyoui 側は `[web].frame_ancestors` に ccmsg の origin を置いて `clientDataJSON.topOrigin` を照合し、同じ値で CSP `frame-ancestors` を出す (無条件許可にすると他所のサイトに埋め込まれて passkey を求められる形が開く)。(P) は popup が要る分 UX が落ちるだけで、(R) が崩れた時の退路として残す。(Q) は ccmsg と hyoui を結合する判断で、kawaz の「ccmsg の認証と hyoui の認証は別途」と合わないので採らない。
 
 (P) が成立しない場合 (= 同一 site の iframe cookie をブラウザが落とす場合) の退路は (R) で、その時は hyoui 側の `topOrigin` allowlist を config `[web].frame_ancestors` に置き、同じ値で CSP `frame-ancestors` も出す形になる。**(P) の成立は実装前に実機で確認する** (Chrome / Safari / iOS Safari の 3 category、`empirical-verification` の 3 サンプル原則)。
 
@@ -240,7 +240,7 @@ kawaz の運用 (tailnet からの閲覧、ccmsg 経由の Terminal タブ) を�
 | # | 論点 | 統括推し | 対案 | 推しの根拠 (要約) |
 |---|---|---|---|---|
 | Q1 | web 境界の version 方式 | (a) 世代番号 1 つ、build_id は表示のみ | (b) cap 方式 / (c) 併用 | assets を配るのが gateway 自身なので交渉相手は常に同ビルド。stale ページは reload で収束する (§3) |
-| Q2 | iframe 内の認証経路 | (P) top-level で hyoui にログイン + 同一 site cookie、popup → BroadcastChannel | (Q) ccmsg 発行 token / (R) iframe 内 WebAuthn | ccmsg 側変更ゼロ、hyoui 単体経路と同一 UI。**実機確認で崩れたら (R)** (§4.3) |
+| Q2 | iframe 内の認証経路 | (R) iframe 内 WebAuthn (`allow="publickey-credentials-get"` + hyoui 側 topOrigin allowlist) | (P) top-level ログイン + cookie / (Q) ccmsg 発行 token | ccmsg 側は属性 1 つ、popup 不要。cookie が iframe 内で乗るかの実機確認は (P) と共通 (§4.3) |
 | Q3 | bootstrap | (A) CLI 発行の招待 URL + 6 桁コード | (C) TOFU | localhost 限定 (B) は canddy 経由が 127.0.0.1 発なので不成立 (§4.2) |
 | Q4 | 認証セッション | (S1) httpOnly cookie 1 本、sliding 30 日、CLI で失効 | (S2) ccmsg 型 access / refresh + rotate | 素の JS で tab-share を持てない、利用者 1 人 (§4.5) |
 | Q5 | 認可の軸 | credential 単位 `rw` / `ro` を daemon mode に写す (既定 rw) | 認可を持たない (全員 rw) | 「観測だけの端末」を hyoui 既存の mode で表せる (§4.6) |
