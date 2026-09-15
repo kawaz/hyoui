@@ -31,16 +31,17 @@ pub(crate) fn build_attach_redraw(state: &ScreenState) -> Vec<u8> {
         return Vec::new();
     }
     let mut out = Vec::new();
-    // alt screen フラグの prepend (PoC §2 で発覚した state_formatted の欠落補完)。
-    // primary 側でも `?1049l` を明示し、client が detach 前と別 buffer に居ても
-    // 強制的に正しい buffer に揃える。
-    if state.alternate_screen() {
-        out.extend_from_slice(b"\x1b[?1049h");
-    } else {
-        out.extend_from_slice(b"\x1b[?1049l");
-    }
+    out.extend_from_slice(buffer_mode_sequence(state));
     out.extend_from_slice(&state.state_formatted());
     out
+}
+
+pub(crate) fn buffer_mode_sequence(state: &ScreenState) -> &'static [u8] {
+    if state.alternate_screen() {
+        b"\x1b[?1049h"
+    } else {
+        b"\x1b[?1049l"
+    }
 }
 
 #[cfg(test)]

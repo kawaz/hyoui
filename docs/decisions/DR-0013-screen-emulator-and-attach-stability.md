@@ -355,7 +355,11 @@ ScreenDumpRequest {
     rect: Option<{ x: u16, y: u16, w: u16, h: u16 }>,
 }
 ScreenDumpResponse { payload: Vec<u8> }
+```
 
+`format: Ansi` の `Visible` / `Both` payload は、active buffer に応じた `\x1b[?1049h` / `\x1b[?1049l` を先頭に含み、端末へ流すだけで buffer mode を含む画面状態を復元できる。`Scrollback` は過去行の履歴であり画面状態ではないため、buffer mode sequence を含めない。
+
+```rust
 // 2. 構造化 state snapshot
 StateSnapshotRequest {
     include: Set<enum { Cells, Cursor, Mode, Style, Scrollback, WindowSize, Buffer }>,

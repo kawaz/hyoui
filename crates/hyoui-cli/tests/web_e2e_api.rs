@@ -196,6 +196,52 @@ fn http_request(port: u16, method: &str, path: &str, body: Option<(&str, &[u8])>
 }
 
 #[test]
+fn e2e_screen_both_preserves_alternate_screen_mode() {
+    let runtime = runtime_dir();
+    let sid = "web-e2e-alt-screen";
+    spawn_detached_command(
+        runtime.path(),
+        sid,
+        &["--size=80x24"],
+        "printf '\\033[?1049h\\033[2J\\033[HWEB-ALT-PROBE'; exec sleep 60",
+    );
+    let (mut web, port) = spawn_web(runtime.path());
+    let panic_guard = ChildGuard(&mut web);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let response = loop {
+        let response = http_request(
+            port,
+            "GET",
+            &format!("/api/sessions/{sid}/screen?layer=both"),
+            None,
+        );
+        if response.status == 200
+            && response
+                .body
+                .windows(b"WEB-ALT-PROBE".len())
+                .any(|window| window == b"WEB-ALT-PROBE")
+        {
+            break response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "alt screen marker did not arrive"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        response.body.starts_with(b"\x1b[?1049h"),
+        "both-layer response must restore alternate screen mode, got prefix: {:?}",
+        &response.body[..response.body.len().min(16)]
+    );
+
+    drop(panic_guard);
+    cleanup(runtime.path(), sid);
+}
+
+#[test]
 fn e2e_screen_layer_query_selects_visible_scrollback_or_both() {
     let runtime = runtime_dir();
     let sid = "web-e2e-screen-layer";

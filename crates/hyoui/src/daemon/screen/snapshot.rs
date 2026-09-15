@@ -33,13 +33,14 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::redraw::buffer_mode_sequence;
 use super::state::{RowCellSnap, ScreenState};
 
 /// `ScreenDumpRequest.format` の選択肢 (DR-0013 §9)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ScreenDumpFormat {
-    /// `state_formatted()` の raw bytes (= ANSI sequence) をそのまま返す。
+    /// active buffer mode sequence + 画面の ANSI sequence を返す。
     /// client は stdout に書けば画面を復元可能。
     Ansi,
     /// 空白除去 + 属性無視で plaintext 化した bytes を返す (= grep 用)。
@@ -224,7 +225,7 @@ fn is_default_cell(cell: &RowCellSnap) -> bool {
 ///
 /// | format | Visible | Scrollback | Both |
 /// |--------|---------|------------|------|
-/// | Ansi | `state_formatted()` | scrollback rows を ANSI escape で再構築 | scrollback + visible 連結 |
+/// | Ansi | active buffer mode + `state_formatted()` | scrollback rows を ANSI escape で再構築 | active buffer mode + scrollback + visible 連結 |
 /// | Binary | 空白除去 plaintext | scrollback の空白除去 plaintext | 連結 |
 /// | TextPlain | cell 空白 + 行末空白保持 | scrollback の cell 空白 + 行末空白保持 | 連結 |
 /// | Cbor | `ScreenSnapshot` (cells = visible) | `ScreenSnapshot` (cells = scrollback) | `ScreenSnapshot` (cells = scrollback + visible) |
@@ -259,7 +260,12 @@ pub(crate) fn build_screen_dump(
     // text 系 (Ansi / Binary / TextPlain) の layer 別 dispatch。
     match layer {
         ScreenDumpLayer::Visible => match format {
-            ScreenDumpFormat::Ansi => Ok(state.state_formatted()),
+            ScreenDumpFormat::Ansi => {
+                let mut out = Vec::new();
+                out.extend_from_slice(buffer_mode_sequence(state));
+                out.extend_from_slice(&state.state_formatted());
+                Ok(out)
+            }
             ScreenDumpFormat::Binary => Ok(build_plain_text_from_rows(
                 &state.snapshot_visible_rows(),
                 /* trim_trailing = */ true,
@@ -286,7 +292,12 @@ pub(crate) fn build_screen_dump(
             let mut combined = sb_rows;
             combined.extend(visible_rows);
             match format {
-                ScreenDumpFormat::Ansi => Ok(rows_to_ansi(&combined)),
+                ScreenDumpFormat::Ansi => {
+                    let mut out = Vec::new();
+                    out.extend_from_slice(buffer_mode_sequence(state));
+                    out.extend_from_slice(&rows_to_ansi(&combined));
+                    Ok(out)
+                }
                 ScreenDumpFormat::Binary => Ok(build_plain_text_from_rows(&combined, true)),
                 ScreenDumpFormat::TextPlain => Ok(build_plain_text_from_rows(&combined, false)),
                 ScreenDumpFormat::Cbor | ScreenDumpFormat::Json => unreachable!(),
@@ -525,13 +536,34 @@ mod tests {
     }
 
     #[test]
-    fn dump_ansi_returns_state_formatted() {
-        let mut s = ScreenState::new(5, 40, 0);
-        s.process(b"hi");
-        let out = build_screen_dump(&mut s, ScreenDumpFormat::Ansi, ScreenDumpLayer::Visible)
-            .expect("ok");
-        // ANSI dump は state_formatted の raw bytes (= ESC で始まる)
-        assert!(out.starts_with(b"\x1b"));
+    fn dump_visible_ansi_includes_active_buffer_mode() {
+        let mut primary = ScreenState::new(5, 40, 0);
+        primary.process(b"hi");
+        let primary_formatted = primary.state_formatted();
+        let primary_out = build_screen_dump(
+            &mut primary,
+            ScreenDumpFormat::Ansi,
+            ScreenDumpLayer::Visible,
+        )
+        .expect("primary dump");
+        assert_eq!(
+            primary_out,
+            [b"\x1b[?1049l".as_slice(), primary_formatted.as_slice()].concat()
+        );
+
+        let mut alternate = ScreenState::new(5, 40, 0);
+        alternate.process(b"\x1b[?1049h\x1b[2J\x1b[Halt");
+        let alternate_formatted = alternate.state_formatted();
+        let alternate_out = build_screen_dump(
+            &mut alternate,
+            ScreenDumpFormat::Ansi,
+            ScreenDumpLayer::Visible,
+        )
+        .expect("alternate dump");
+        assert_eq!(
+            alternate_out,
+            [b"\x1b[?1049h".as_slice(), alternate_formatted.as_slice()].concat()
+        );
     }
 
     #[test]
@@ -729,6 +761,30 @@ mod tests {
             out.windows(b"L3".len()).any(|w| w == b"L3"),
             "ANSI scrollback should contain L3 marker"
         );
+    }
+
+    #[test]
+    fn dump_both_ansi_preserves_active_buffer_mode() {
+        let mut primary = ScreenState::new(3, 10, 10);
+        primary.process(b"primary");
+        let primary_out =
+            build_screen_dump(&mut primary, ScreenDumpFormat::Ansi, ScreenDumpLayer::Both)
+                .expect("primary dump");
+        assert!(primary_out.starts_with(b"\x1b[?1049l"));
+
+        let mut alternate = ScreenState::new(3, 10, 10);
+        alternate.process(b"\x1b[?1049h\x1b[2J\x1b[Halternate");
+        let alternate_out = build_screen_dump(
+            &mut alternate,
+            ScreenDumpFormat::Ansi,
+            ScreenDumpLayer::Both,
+        )
+        .expect("alternate dump");
+        assert!(alternate_out.starts_with(b"\x1b[?1049h"));
+
+        let mut restored = ScreenState::new(3, 10, 10);
+        restored.process(&alternate_out);
+        assert!(restored.alternate_screen());
     }
 
     /// `--layer=both` は scrollback + visible を連結する。古い scrollback rows が先、
