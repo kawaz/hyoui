@@ -1,6 +1,6 @@
 # DR-0010: v0.2.0 scope re-scope + serve gateway 配置判断
 
-- Status: Active
+- Status: Active (= scope 記述は ROADMAP.md に移譲)。**§2 (serve gateway を別 repo に置く判断) は [[DR-0027]] で Superseded** (= 同 repo `crates/hyoui-web` に確定、2026-07-20)
 - Date: 2026-05-27
 - Related: [[DR-0005]] (思想), [[DR-0006]] (CLI ground rules), [[DR-0007]] (MVP scope), R5-H4, R5-H5
 

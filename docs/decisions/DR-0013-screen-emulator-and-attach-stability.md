@@ -1,6 +1,6 @@
 # DR-0013: screen emulator + attach/detach 安定化 + データモデル統一
 
-- Status: Accepted
+- Status: Accepted — 🟡 部分実装。Phase A / Phase B + scrollback layer は実装済、Phase C (= observe mode / multi-client resize モード config 化 / scrollback reflow / zstd 圧縮、下記「Phase C (優先度低)」) は未着手
 - Date: 2026-05-27
 - Related: [[DR-0005]] (思想), [[DR-0006]] (CLI ground rules, §8/§9 は本 DR と整合性 annotate 必要), [[DR-0008]] (protocol、structured state access message 追加), [[DR-0009]] (session 分割、emulator 統合先), [[DR-0010]] (input family 整理), [[DR-0011]] (observability), [[DR-0012]] (signal wire name)
 

@@ -1,6 +1,6 @@
 # DR-0006: CLI 設計の地盤ルール — 動作モデル、自動操作 API、排他制御
 
-- Status: Active
+- Status: Active — 🟡 部分実装。`input` family (text/hex/file/paste/key/wait/wait-idle spec) / `wait` / `lock` / `unlock` は実装済 (= 旧構想の send/keys/paste は独立 subcommand 化せず input family に統合)。§7 の `tx` (= lock + 子 process wrapper) は未実装 ([docs/issue/2026-05-27-tx-lock-unlock-cli-subcommands.md](../issue/2026-05-27-tx-lock-unlock-cli-subcommands.md) で追跡)
 - Date: 2026-05-26 (初版) / 2026-05-27 (§8 input family / §9 wait / §10 snapshot / §11 tail を state-based に改訂)
 - Related: [[DR-0001]] (jobcontrol 2 軸), [[DR-0004]] (CLI subcommand 採用), [[DR-0005]] (外側自動操作主軸), [[DR-0007]] (MVP scope), [[DR-0010]] (input family 整理 = 本 DR §8 で確定), [[DR-0013]] (screen emulator、本 DR §8-§11 の state-based 基盤)
 

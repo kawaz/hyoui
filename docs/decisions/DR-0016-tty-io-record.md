@@ -1,6 +1,6 @@
 # DR-0016: `hyoui record` — tty I/O timeline の永続録画 subcommand
 
-- Status: Active — 🟡 record core 実装済 (v0.2.x 出荷、Phase 4 daemon hot path 配線完了)
+- Status: Active — 🟡 record core 実装済 (v0.2.x 出荷、Phase 4 daemon hot path 配線完了)。§6 の secret redaction state machine (= Phase 5) は未配線、§6a の interim 正直化で運用中
 - Date: 2026-06-01
 
 > **⚠ 実装状況の注意 (2026-07-03 更新)**: 本 DR の record 本体 (start/stop/list、jsonl/raw sink、
