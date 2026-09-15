@@ -93,15 +93,15 @@ llm-gateway が同じ reference 体系を先に当てている (DR-0028)。unit 
 ### 1. `hyoui web` の下に reference の 2 系統を置く
 
 ```text
-hyoui web daemon run [unit]                この unit を foreground で起動する (未指定なら既定)
+hyoui web daemon run [name]                この unit を foreground で起動する (未指定なら config の listen)
 hyoui web daemon supervise                 foreground の監督者。登録簿の unit を子として抱え、落ちたら上げる
 hyoui web daemon add <name> [options]      unit を登録簿に足す
 hyoui web daemon remove <name>             登録簿から外す
-hyoui web daemon list                      → [{name, enabled, running, pid}] (監督者が居なくても動く)
+hyoui web daemon list                      → {units: [{name, enabled, running, pid, listen, binary, binary_exists}], supervisor, note} (監督者が居なくても動く)
 hyoui web daemon start   <name> | --all    監督者に起動を要求する
 hyoui web daemon stop    <name> | --all    監督者に停止を要求する
 hyoui web daemon restart <name> | --all    stop → start (--all は 1 台ずつ)
-hyoui web daemon status  [<name>] | --all  → [{name, enabled, running, pid, listen, binary, version: {...}, ...}]
+hyoui web daemon status  [<name>] | --all  → {units: [{name, enabled, running, pid, listen, binary, version: {...}, ...}], supervisor, notes}
 hyoui web daemon log     [<name>] | --all [--follow]
 
 hyoui web service register | unregister    監督者 (`hyoui web daemon supervise`) を launchd / systemd に載せる / 外す
@@ -126,6 +126,10 @@ hyoui version                              → {cli, supervisor: {running, on_di
 option 名は `hyoui web` 側 (`--listen` / `--web-assets-dir`) と一字一句揃える。`add` が書く値は `daemon run` がそのまま使うものなので、同じものを 2 通りに呼ばない。
 
 `daemon run <name>` は登録簿の値で gateway を foreground 起動する。監督者が子を exec するのと同じ経路で、CLI から手元で 1 台だけ確かめる時にも使う (決定 3)。
+
+**`daemon run` の名前を省いた時は登録簿を見ず、`hyoui web` と同じ解決 (config `[web].listen`、無ければ `127.0.0.1:43690`) で起動する。** 「既定の unit」は持たない — 登録簿に 1 つしかない時それを選ぶような推測を入れると、2 つ目を足した瞬間に同じコマンドの意味が変わる。
+
+**`list` と `status` は配列ではなく `{units, supervisor, ...}` を返す。** 監督者が居ない時に「なぜ `running` が分からないのか」を添える必要があり (下記)、配列にはその置き場が無い。行ごとに `supervisor_running` を重ねるより、答えた相手を 1 箇所に置く。
 
 `hyoui web` の引数なし実行は gateway の foreground 起動 (`daemon run` と同義) のまま維持する。`hyoui web daemon` / `hyoui web service` の引数なし実行と、必須引数を欠く verb は help を出す。help 以外の出力は JSON、`log --follow` は JSONL、エラーは JSON を stderr に出して exit を非 0 にする (reference の出力規約)。
 
@@ -201,14 +205,18 @@ backoff は llm-gateway と同じ形 (初回 1 秒から倍々、上限 60 秒)�
 
 | 操作 | 登録簿 | 監督者が走っている | 監督者が居ない |
 |---|---|---|---|
-| `add <name>` | `enabled = true` で書く | `start <name>` 相当を送り、その場で子が上がる | 次に監督者が上がった時に起きる。出力に「監督者が停止中なので未起動」と添える |
-| `remove <name>` | ファイルを消す | 先に `stop <name>` を送り、子が降りてから消す | そのまま消す |
+| `add <name>` | `enabled = true` で書く | `reload` を送り、読み直した監督者がその場で起こす | 次に監督者が上がった時に起きる。出力に「監督者が停止中なので未起動」と添える |
+| `remove <name>` | ファイルを消す | 先に `stop <name>` を送り、子が降りてから消して `reload` を送る | そのまま消す |
 
 `add` の `enabled` 初期値を `true` にするのは、`add` が「この gateway を動かしたい」という意思表示だから。`add` してから `start` を打たせるのは、2 手を要求する理由が無い。動かさずに登録だけしたい場面は今のところ無いので、`--no-start` のような option も持たない (必要になったら足す)。
 
 `remove` が `stop` を先に送るのは、登録簿から消えた子を監督者が抱えたままになるのを避けるため。消してから `reload` に任せる形にすると、「登録簿に居ないが走っている子」を監督者が畳む経路が必要になり、決定 10 で作らないと決めた引き取り判断に近い曖昧さが入る。
 
-`status` が返すのは unit の配列で、1 行はこの形:
+**`add` が送るのは `start <name>` ではなく `reload` である。** 足したばかりの unit は監督者がまだ名前を知らないので、`start <name>` は「そんな unit は無い」で断られる (実装時に観測)。監督者が知らない名前を受けたら登録簿を読み直す、という含みを `start` に持たせる手もあるが、それは `reload` が既に担っている仕事で、`start` の意味 (= desired state を立てる) に別の役を足すことになる。`add` は `enabled = true` を書いてから読み直させ、起こすのは監督者の判断に委ねる。
+
+`remove` が最後に `reload` を送るのは、子が降りて登録も消えたことを監督者に読み直させるため (= 抱えている unit の一覧から外す)。`stop` の相手が既に監督者の知らない unit だった場合は止める相手が居ないだけなので、そのまま消して進む。
+
+`status` が返すのは `{units: [...], supervisor: {...}}` で、`units` の 1 行はこの形:
 
 ```json
 {"name": "unstable", "enabled": true, "running": true, "pid": 4242,
