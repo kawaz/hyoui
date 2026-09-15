@@ -1,6 +1,6 @@
 ---
 title: hyoui のセッションが起動したハーネス本体 (claude/codex) の pid を answer できるようにする
-status: open
+status: discarded
 category: request
 created: 2026-09-15T10:58:19+09:00
 last_read:
@@ -8,9 +8,9 @@ open_entered: 2026-09-15T10:58:19+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
-discarded_entered:
+discarded_entered: 2026-09-15T13:07:53+09:00
 resolved_entered:
-discard_reason:
+discard_reason: ["不要 (取り下げ)。hyoui status --format=json <session_id> が既に child_pid (ハーネス本体の pid、シェルを挟まない) を返し、hyoui list の PID 列も同じ。ccmsg 側の思い違いだった"]
 pending_reason:
 close_reason:
 blocked_by:
