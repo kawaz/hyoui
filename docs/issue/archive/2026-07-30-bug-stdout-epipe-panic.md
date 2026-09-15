@@ -1,18 +1,18 @@
 ---
 title: "BUG: stdout の早期 close (| head 等) で Broken pipe panic する"
-status: wip
+status: resolved
 category: bug
 created: 2026-07-30T12:40:00+09:00
-last_read: 2026-08-21T10:30:31+09:00
+last_read: 2026-09-15T14:20:00+09:00
 open_entered: 2026-07-30T12:40:00+09:00
 wip_entered: 2026-08-21T10:32:33+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-15T14:20:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: v0.9.36 の fix(cli) (stdout 早期 close で panic せず SIGPIPE 終了) で修正済み。2026-09-15 に v0.9.41 release build で `hyoui list | head -1` を実行し exit 141 (SIGPIPE)・panic 出力なしを実測
 blocked_by:
 origin: ^Z suspend 実装 worker が実験中に観測 (2026-07-30)
 ---

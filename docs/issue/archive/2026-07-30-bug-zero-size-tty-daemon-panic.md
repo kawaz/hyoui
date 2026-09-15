@@ -1,18 +1,18 @@
 ---
 title: 端末サイズ 0x0 の tty 上で hyoui run が vt100 grid の subtract overflow で panic
-status: wip
+status: resolved
 category: bug
 created: 2026-07-30T15:20:00+09:00
-last_read: 2026-08-21T10:31:00+09:00
+last_read: 2026-09-15T14:20:00+09:00
 open_entered: 2026-07-30T15:20:00+09:00
 wip_entered: 2026-08-21T10:33:24+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-15T14:20:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: v0.9.36 の fix(size) (初期サイズ 0 を 80x24 へフォールバック + normalize_size で 1..=4096 に clamp) で修正済み。2026-09-15 に v0.9.41 release build で issue の再現手順 (openpty 0x0 / script -q /dev/null / pipeline) を実行し panic なし・child running・snapshot 24x80 を実測。e2e run_on_unsized_pty_starts_with_default_size も pass
 blocked_by:
 origin: DR-0032 実装の実機 probe 中に偶発発見 (= python `pty.fork()` で winsize を設定せず起動した場合)
 ---

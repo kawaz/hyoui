@@ -1,18 +1,18 @@
 ---
 title: "bug: PTY サイズ 0 のとき vt100 grid が subtract overflow で panic する"
-status: open
+status: resolved
 category: bug
 created: 2026-06-11T00:00:00+09:00
-last_read:
+last_read: 2026-09-15T14:20:00+09:00
 open_entered: 2026-06-11T00:00:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-15T14:20:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: v0.9.36 の fix(size) で修正済み (ScreenState::new / resize が共通正規化を通り、vt100 grid 直前に 1x1 下限の防壁)。2026-09-15 に v0.9.41 release build で本 issue の再現手順 (script 経由 / 「再現手順の発見」の pipeline) と起動後 TIOCSWINSZ 0x0 + SIGWINCH を実測し panic なし。unit test resize_to_zero_is_normalized 等 5 本 pass
 blocked_by:
 origin: jobcontrol_follow ハング調査 (2026-06-11) 中に script(1) 経由の再現を試みた際に副産物として観測
 ---
