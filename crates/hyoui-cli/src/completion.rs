@@ -190,12 +190,35 @@ _hyoui() {
         return 0
     fi
 
-    # `web service` の nested leaf を補完。`hyoui web` 自体は従来の gateway options。
+    # `web daemon` / `web service` の nested leaf を補完。`hyoui web` 自体は
+    # 従来の gateway options。
     if [[ "$sub" == "web" ]]; then
         local web_sub
         web_sub="$(_hyoui_child_of web)"
         if [[ -z "$web_sub" ]]; then
-            COMPREPLY=( $(compgen -W "service --listen --web-assets-dir --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "daemon service --listen --web-assets-dir --help -h" -- "$cur") )
+            return 0
+        fi
+        if [[ "$web_sub" == "daemon" ]]; then
+            local daemon_sub
+            daemon_sub="$(_hyoui_child_of daemon)"
+            if [[ -z "$daemon_sub" ]]; then
+                COMPREPLY=( $(compgen -W "run add remove list --help -h" -- "$cur") )
+                return 0
+            fi
+            case "$daemon_sub" in
+                add)
+                    case "$prev" in
+                        --binary) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                        --web-assets-dir) _filedir -d 2>/dev/null || COMPREPLY=( $(compgen -d -- "$cur") ); return 0 ;;
+                        --listen|--port) return 0 ;;
+                    esac
+                    COMPREPLY=( $(compgen -W "--port --listen --binary --web-assets-dir --help -h" -- "$cur") )
+                    return 0 ;;
+                run|remove|list)
+                    COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
+                    return 0 ;;
+            esac
             return 0
         fi
         if [[ "$web_sub" == "service" ]]; then
@@ -692,8 +715,44 @@ _hyoui_record_subcommands() {
     _describe -t commands 'hyoui record subcommand' subs
 }
 
+_hyoui_daemon() {
+    local leaf=""
+    local word
+    for word in $words; do
+        case $word in
+            run|add|remove|list) leaf=$word; break ;;
+        esac
+    done
+    case $leaf in
+        add)
+            _arguments \
+                '--port=[Short form of --listen=127.0.0.1:<n>]:port:' \
+                '--listen=[Bind address host:port]:address:' \
+                '--binary=[Executable this unit starts]:binary:_files' \
+                '--web-assets-dir=[Serve static assets from a local directory]:dir:_files -/' \
+                '(-h --help)'{-h,--help}'[Show help]' \
+                '1:unit name:'
+            ;;
+        run|remove)
+            _arguments \
+                '(-h --help)'{-h,--help}'[Show help]' \
+                '1:unit name:'
+            ;;
+        list)
+            _arguments '(-h --help)'{-h,--help}'[Show help]'
+            ;;
+        *)
+            _arguments \
+                '1:daemon subcommand:(run add remove list)' \
+                '(-h --help)'{-h,--help}'[Show help]'
+            ;;
+    esac
+}
+
 _hyoui_web() {
-    if (( ${words[(I)service]} )); then
+    if (( ${words[(I)daemon]} )); then
+        _hyoui_daemon
+    elif (( ${words[(I)service]} )); then
         if (( ${words[(I)register]} )); then
             _arguments \
                 '--listen=[Bake bind address into the service command]:address:' \
@@ -895,6 +954,15 @@ function __hyoui_web_service_no_sub
     __hyoui_child_none service
 end
 
+# `web daemon` leaf 検出。
+function __hyoui_daemon_using_sub
+    __hyoui_child_using daemon $argv[1]
+end
+
+function __hyoui_daemon_no_sub
+    __hyoui_child_none daemon
+end
+
 # screen 子 subcommand 検出 (= `screen dump` / `screen snapshot`)。
 function __hyoui_screen_using_sub
     __hyoui_child_using screen $argv[1]
@@ -1089,8 +1157,21 @@ complete -c hyoui -n '__hyoui_using_subcommand detach' -s h -l help    -d 'Show 
 # `hyoui web` gateway options + `web service` family (DR-0027 / DR-0031)
 complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -l listen          -x    -d 'Bind address host:port (default 127.0.0.1:43690)'
 complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -l web-assets-dir  -r -F -d 'Serve static assets from a local directory'
+complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -f -a daemon -d 'Manage gateway instances (units)'
 complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -f -a service -d 'Manage OS startup integration'
 complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n __hyoui_daemon_no_sub -f -a run -d 'Start one unit in the foreground'
+complete -c hyoui -n __hyoui_daemon_no_sub -f -a add -d 'Register a unit and start it'
+complete -c hyoui -n __hyoui_daemon_no_sub -f -a remove -d 'Stop the unit and drop its registration'
+complete -c hyoui -n __hyoui_daemon_no_sub -f -a list -d 'Print registered units'
+complete -c hyoui -n '__hyoui_daemon_using_sub add' -l port -x -d 'Short form of --listen=127.0.0.1:<n>'
+complete -c hyoui -n '__hyoui_daemon_using_sub add' -l listen -x -d 'Bind address host:port'
+complete -c hyoui -n '__hyoui_daemon_using_sub add' -l binary -r -F -d 'Executable this unit starts'
+complete -c hyoui -n '__hyoui_daemon_using_sub add' -l web-assets-dir -r -F -d 'Serve static assets from a local directory'
+complete -c hyoui -n '__hyoui_daemon_using_sub add' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_daemon_using_sub run' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_daemon_using_sub remove' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_daemon_using_sub list' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n __hyoui_web_service_no_sub -f -a register -d 'Install or replace and start the service'
 complete -c hyoui -n __hyoui_web_service_no_sub -f -a unregister -d 'Stop and remove the service'
 complete -c hyoui -n __hyoui_web_service_no_sub -f -a status -d 'Print registration and running state'
@@ -1170,7 +1251,8 @@ mod tests {
         LOCK_SUBCOMMANDS, RECORD_INPUT_SECRECY_VALUES, RECORD_LIST_FORMAT_VALUES,
         RECORD_START_FORMAT_VALUES, RECORD_SUBCOMMANDS, RESERVED_TOP_LEVEL_SUBCOMMANDS,
         SCREEN_DUMP_FORMAT_VALUES, SCREEN_DUMP_LAYER_VALUES, SCREEN_SNAPSHOT_FORMAT_VALUES,
-        SCREEN_SUBCOMMANDS, SNAPSHOT_INCLUDE_VALUES, STATUS_FORMAT_VALUES, WEB_SERVICE_SUBCOMMANDS,
+        SCREEN_SUBCOMMANDS, SNAPSHOT_INCLUDE_VALUES, STATUS_FORMAT_VALUES, WEB_DAEMON_SUBCOMMANDS,
+        WEB_SERVICE_SUBCOMMANDS,
     };
 
     const ALL_SHELLS: [Shell; 3] = [Shell::Bash, Shell::Zsh, Shell::Fish];
@@ -1220,9 +1302,11 @@ mod tests {
                 lines.len(),
             ),
             Some(p) => {
+                // 親の dispatch 変数は階層で変わる (`$sub` / `$web_sub` / ...) ので、
+                // 比較の右辺だけで親ブロックを見つける。
                 let start = lines
                     .iter()
-                    .position(|l| l.contains(&format!("\"$sub\" == \"{p}\"")))
+                    .position(|l| l.contains(&format!("== \"{p}\"")))
                     .unwrap_or(0);
                 let base = indent(lines[start]);
                 let end = lines[start + 1..]
@@ -1254,9 +1338,23 @@ mod tests {
         let is_if = lines[start].contains(&if_head);
         let mut out = Vec::new();
         let end = hi.max(start + 1);
+        // 内側の dispatch (= `if [[ "$web_sub" == "daemon" ]]` のような子階層) は
+        // この subcommand 自身の候補ではない。子の flag を親の候補として数えると、
+        // 親が受理しない flag を「親が出している」と読んでしまう。
+        let mut nested_indent: Option<usize> = None;
         for &line in &lines[start + 1..end] {
             let t = line.trim();
             let ind = indent(line);
+            if let Some(nested) = nested_indent {
+                if ind > nested {
+                    continue;
+                }
+                nested_indent = None;
+            }
+            if t.starts_with("if [[") && t.contains("_sub\" == \"") {
+                nested_indent = Some(ind);
+                continue;
+            }
             let ends = if is_if {
                 t == "fi" && ind == base
             } else {
@@ -1394,6 +1492,7 @@ mod tests {
             ("detach", &["detach"]),
             ("upgrade", &["upgrade"]),
             ("web", &["web"]),
+            ("daemon add", &["web", "daemon", "add"]),
             ("screen dump", &["screen", "dump"]),
             ("screen snapshot", &["screen", "snapshot"]),
             ("lock acquire", &["lock", "acquire"]),
@@ -1560,6 +1659,47 @@ mod tests {
                 offers_long_opt(&script, "listen"),
                 "shell {sh:?} missing `web service register --listen`"
             );
+        }
+    }
+
+    /// `web daemon` の全 leaf と `add` 固有 option を 3 shell で同期する。
+    #[test]
+    fn completion_all_shells_cover_web_daemon_surface() {
+        for sh in ALL_SHELLS {
+            let script = script(sh);
+            assert!(
+                contains_token(&script, "daemon"),
+                "shell {sh:?} missing `web daemon`"
+            );
+            for sub in WEB_DAEMON_SUBCOMMANDS {
+                assert!(
+                    contains_token(&script, sub),
+                    "shell {sh:?} missing `web daemon {sub}`"
+                );
+            }
+            for option in ["port", "binary", "web-assets-dir"] {
+                assert!(
+                    offers_long_opt(&script, option),
+                    "shell {sh:?} missing `web daemon add --{option}`"
+                );
+            }
+        }
+    }
+
+    /// 監督者への要求 (= DR-0034 P3) は実装前なので候補に出さない。
+    ///
+    /// `parse_web_daemon` が unknown subcommand で断る値を補完すると、選んだ先で
+    /// 必ず error になる (= `SNAPSHOT_INCLUDE_VALUES` と同じ方針)。
+    #[test]
+    fn completion_omits_web_daemon_verbs_that_are_not_implemented_yet() {
+        for sh in ALL_SHELLS {
+            let script = script(sh);
+            for absent in ["supervise", "restart"] {
+                assert!(
+                    !contains_token(&script, absent),
+                    "shell {sh:?} offers `web daemon {absent}` before it exists"
+                );
+            }
         }
     }
 

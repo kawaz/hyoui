@@ -18,7 +18,7 @@ fn jj_has_changes() -> Option<bool> {
         .args(["diff", "--summary"])
         .output()
         .ok()?;
-    output.status.success().then(|| !output.stdout.is_empty())
+    output.status.success().then_some(!output.stdout.is_empty())
 }
 
 fn main() {

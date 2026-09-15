@@ -147,6 +147,16 @@ pub enum HelpTopic {
     ConfigShow,
     /// Help for the `web` subcommand (= HTTP gateway 起動 + service 管理)。
     Web,
+    /// Help for the `web daemon` parent subcommand (= DR-0034)。
+    WebDaemon,
+    /// Help for `web daemon run` (= DR-0034)。
+    WebDaemonRun,
+    /// Help for `web daemon add` (= DR-0034)。
+    WebDaemonAdd,
+    /// Help for `web daemon remove` (= DR-0034)。
+    WebDaemonRemove,
+    /// Help for `web daemon list` (= DR-0034)。
+    WebDaemonList,
     /// Help for the `web service` parent subcommand (= DR-0031)。
     WebService,
     /// Help for `web service register` (= DR-0031)。
@@ -193,12 +203,53 @@ pub enum WebServiceCommand {
     Status,
 }
 
-/// `web` の gateway 起動と service 管理を同じ family に束ねる dispatch。
+/// `web daemon add` configuration (= DR-0034 決定 2 / 3)。
+///
+/// 各値は `add` の時点で解決して登録簿に書かれる (= 後から config を書き換えても
+/// 既存 unit の待ち先と assets は動かない)。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WebDaemonAddConfig {
+    /// 登録する unit 名 (`[A-Za-z0-9_-]{1,32}`)。
+    pub name: String,
+    /// `--listen=<host:port>`。`--port` と排他。
+    pub listen: Option<String>,
+    /// `--port=<n>` (= `--listen=127.0.0.1:<n>` の短縮)。`--listen` と排他。
+    pub port: Option<u16>,
+    /// `--binary=<path>`。未指定なら `current_exe` をそのまま書く。
+    pub binary: Option<std::path::PathBuf>,
+    /// `--web-assets-dir=<path>`。未指定なら config `[web].assets_dir`。
+    pub assets_dir: Option<std::path::PathBuf>,
+}
+
+/// `web daemon` の leaf command (= DR-0034 決定 1、P2 の範囲)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WebDaemonCommand {
+    /// `hyoui web daemon run [name]` — この unit を foreground 起動する。
+    /// name 省略時は `hyoui web` と同じ解決 (= config `[web].listen`)。
+    Run {
+        /// 起動する unit 名。
+        name: Option<String>,
+    },
+    /// `hyoui web daemon add <name> [options]` — 登録簿に足す。
+    Add(WebDaemonAddConfig),
+    /// `hyoui web daemon remove <name>` — 登録簿から外す。
+    Remove {
+        /// 外す unit 名。
+        name: String,
+    },
+    /// `hyoui web daemon list` — 登録簿を読む (監督者不在でも動く)。
+    List,
+}
+
+/// `web` の gateway 起動と unit / service 管理を同じ family に束ねる dispatch。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WebCommand {
     /// `hyoui web [options]` — HTTP gateway を foreground 起動する。
     Serve(WebConfig),
+    /// `hyoui web daemon ...` — gateway instance (= unit) を管理する。
+    Daemon(WebDaemonCommand),
     /// `hyoui web service ...` — OS の per-user service を管理する。
     Service(WebServiceCommand),
 }
@@ -2483,6 +2534,11 @@ pub fn usage(topic: &HelpTopic) -> String {
         HelpTopic::ConfigPath => usage_config_path(),
         HelpTopic::ConfigShow => usage_config_show(),
         HelpTopic::Web => usage_web(),
+        HelpTopic::WebDaemon => usage_web_daemon(),
+        HelpTopic::WebDaemonRun => usage_web_daemon_run(),
+        HelpTopic::WebDaemonAdd => usage_web_daemon_add(),
+        HelpTopic::WebDaemonRemove => usage_web_daemon_remove(),
+        HelpTopic::WebDaemonList => usage_web_daemon_list(),
         HelpTopic::WebService => usage_web_service(),
         HelpTopic::WebServiceRegister => usage_web_service_register(),
         HelpTopic::WebServiceUnregister => usage_web_service_unregister(),
@@ -2595,11 +2651,13 @@ Exit codes:
 fn usage_web() -> String {
     "\
 hyoui web [--listen=<host:port>] [--web-assets-dir=<path>]
+hyoui web daemon <subcommand>
 hyoui web service <subcommand>
 
-Start the HTTP gateway, or manage its per-user OS service.
+Start the HTTP gateway, or manage its instances and per-user OS service.
 
 SUBCOMMANDS:
+  daemon     Register, inspect, and run gateway instances (units).
   service    Register, unregister, or inspect OS startup integration.
 
 OPTIONS:
@@ -2617,6 +2675,107 @@ Endpoints:
   GET  /api/sessions               List live sessions as JSON.
   GET  /api/sessions/:id/screen    ANSI screen dump.
   POST /api/sessions/:id/input     Send input specs.
+"
+    .to_string()
+}
+
+fn usage_web_daemon() -> String {
+    "\
+hyoui web daemon <subcommand>
+
+Manage gateway instances (units). Each unit is one file under
+`${XDG_STATE_HOME:-~/.local/state}/hyoui-web/units/`, holding the bind address,
+the executable to start, and whether it should be running. No arguments prints
+this help.
+
+SUBCOMMANDS:
+  run [<name>]        Start one unit in the foreground.
+  add <name>          Register a unit and ask the supervisor to start it.
+  remove <name>       Stop the unit and drop its registration.
+  list                Print registered units (works without the supervisor).
+
+OPTIONS:
+  --help, -h    Show this help.
+
+Output is JSON; errors are JSON on stderr with a non-zero exit.
+"
+    .to_string()
+}
+
+fn usage_web_daemon_run() -> String {
+    "\
+hyoui web daemon run [<name>]
+
+Start one gateway in the foreground, reading the unit's bind address and assets
+directory from the registry. This is the same path the supervisor uses to start
+a child, so it is also how to try a single unit by hand.
+
+Without a name, this behaves like plain `hyoui web`: the bind address comes from
+config `[web].listen`, or `127.0.0.1:43690` when that is unset.
+
+OPTIONS:
+  --help, -h    Show this help.
+"
+    .to_string()
+}
+
+fn usage_web_daemon_add() -> String {
+    "\
+hyoui web daemon add <name> [--port=<n> | --listen=<host:port>]
+                           [--binary=<path>] [--web-assets-dir=<path>]
+
+Register a gateway unit and ask the supervisor to start it. The name may hold
+1-32 characters from A-Z, a-z, 0-9, `_`, and `-`.
+
+Every value is resolved now and written to the registry, so later config edits
+do not move an existing unit's bind address or assets.
+
+OPTIONS:
+  --port=<n>                 Short form of --listen=127.0.0.1:<n>. Cannot be
+                             combined with --listen.
+  --listen=<host:port>       Bind address. Defaults to config `[web].listen`,
+                             or `127.0.0.1:43690`. Rejected when another unit
+                             already holds the same address.
+  --binary=<path>            Executable this unit starts. Defaults to the
+                             running executable's own path, which is what makes
+                             a unit added from a repo build stay on that build.
+  --web-assets-dir=<path>    Serve static assets from a local directory (dev
+                             mode). Defaults to config `[web].assets_dir`; when
+                             both are unset, embedded assets are used.
+  --help, -h                 Show this help.
+
+A unit starts out enabled. A missing --binary target is a warning, not an
+error, so a unit may be registered before its build exists.
+"
+    .to_string()
+}
+
+fn usage_web_daemon_remove() -> String {
+    "\
+hyoui web daemon remove <name>
+
+Stop the unit and remove its registration. When the supervisor is running it is
+asked to stop the child first, so it does not keep holding a child that is no
+longer registered.
+
+OPTIONS:
+  --help, -h    Show this help.
+"
+    .to_string()
+}
+
+fn usage_web_daemon_list() -> String {
+    "\
+hyoui web daemon list
+
+Print the registered units: name, whether each should be running, its bind
+address, its executable, and whether that executable exists.
+
+This reads the registry, so it answers even when the supervisor is stopped. In
+that case `running` is false and the output says the supervisor is not running.
+
+OPTIONS:
+  --help, -h    Show this help.
 "
     .to_string()
 }
@@ -3932,6 +4091,9 @@ fn parse_web(args: &[String]) -> Command {
     if args.first().map(String::as_str) == Some("service") {
         return parse_web_service(&args[1..]);
     }
+    if args.first().map(String::as_str) == Some("daemon") {
+        return parse_web_daemon(&args[1..]);
+    }
 
     let mut listen: Option<String> = None;
     let mut assets_dir: Option<std::path::PathBuf> = None;
@@ -3979,6 +4141,218 @@ fn parse_web(args: &[String]) -> Command {
         i += 1;
     }
     Command::Web(WebCommand::Serve(WebConfig { listen, assets_dir }))
+}
+
+/// `hyoui web daemon <subcommand>` (= DR-0034 決定 1、P2 の範囲)。
+///
+/// unit 名の文法は登録簿のファイル名制約に由来するので、ここでは受理して
+/// 実行層 (`web_daemon::registry::validate_name`) が判定する (= 正本を 1 箇所)。
+fn parse_web_daemon(args: &[String]) -> Command {
+    let Some(head) = args.first().map(String::as_str) else {
+        return Command::Help {
+            topic: HelpTopic::WebDaemon,
+        };
+    };
+    if matches!(head, "--help" | "-h") {
+        return Command::Help {
+            topic: HelpTopic::WebDaemon,
+        };
+    }
+
+    let rest = &args[1..];
+    match head {
+        "run" => parse_web_daemon_run(rest),
+        "add" => parse_web_daemon_add(rest),
+        "remove" => parse_web_daemon_remove(rest),
+        "list" => {
+            if rest.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+                return Command::Help {
+                    topic: HelpTopic::WebDaemonList,
+                };
+            }
+            if let Some(arg) = rest.first() {
+                return Command::Error(format!("web daemon list: unexpected argument: {arg}"));
+            }
+            Command::Web(WebCommand::Daemon(WebDaemonCommand::List))
+        }
+        other if other.starts_with('-') => {
+            Command::Error(format!("web daemon: unknown option: {other}"))
+        }
+        other => Command::Error(format!(
+            "web daemon: unknown subcommand `{other}` (supported: {})",
+            WEB_DAEMON_SUBCOMMANDS.join(", ")
+        )),
+    }
+}
+
+fn parse_web_daemon_run(args: &[String]) -> Command {
+    let mut name: Option<String> = None;
+    for arg in args {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                return Command::Help {
+                    topic: HelpTopic::WebDaemonRun,
+                };
+            }
+            other if other.starts_with('-') => {
+                return Command::Error(format!("web daemon run: unknown option: {other}"));
+            }
+            other if name.is_none() => name = Some(other.to_string()),
+            other => {
+                return Command::Error(format!("web daemon run: unexpected argument: {other}"));
+            }
+        }
+    }
+    Command::Web(WebCommand::Daemon(WebDaemonCommand::Run { name }))
+}
+
+fn parse_web_daemon_remove(args: &[String]) -> Command {
+    let mut name: Option<String> = None;
+    for arg in args {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                return Command::Help {
+                    topic: HelpTopic::WebDaemonRemove,
+                };
+            }
+            other if other.starts_with('-') => {
+                return Command::Error(format!("web daemon remove: unknown option: {other}"));
+            }
+            other if name.is_none() => name = Some(other.to_string()),
+            other => {
+                return Command::Error(format!("web daemon remove: unexpected argument: {other}"));
+            }
+        }
+    }
+    match name {
+        Some(name) => Command::Web(WebCommand::Daemon(WebDaemonCommand::Remove { name })),
+        // 必須引数を欠く verb は help (= reference の出力規約)。
+        None => Command::Help {
+            topic: HelpTopic::WebDaemonRemove,
+        },
+    }
+}
+
+fn parse_web_daemon_add(args: &[String]) -> Command {
+    let mut cfg = WebDaemonAddConfig::default();
+    let mut name: Option<String> = None;
+    let mut i = 0usize;
+
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "--help" | "-h" => {
+                return Command::Help {
+                    topic: HelpTopic::WebDaemonAdd,
+                };
+            }
+            _ if arg.starts_with("--listen=") => {
+                let value = &arg["--listen=".len()..];
+                if value.is_empty() {
+                    return Command::Error("web daemon add: --listen requires a value".into());
+                }
+                cfg.listen = Some(value.to_string());
+            }
+            "--listen" => {
+                i += 1;
+                match args.get(i) {
+                    Some(value) if !value.is_empty() => cfg.listen = Some(value.clone()),
+                    _ => return Command::Error("web daemon add: --listen requires a value".into()),
+                }
+            }
+            _ if arg.starts_with("--port=") => {
+                match parse_web_daemon_port(&arg["--port=".len()..]) {
+                    Ok(port) => cfg.port = Some(port),
+                    Err(error) => return Command::Error(error),
+                }
+            }
+            "--port" => {
+                i += 1;
+                match args.get(i).map(String::as_str) {
+                    Some(value) => match parse_web_daemon_port(value) {
+                        Ok(port) => cfg.port = Some(port),
+                        Err(error) => return Command::Error(error),
+                    },
+                    None => {
+                        return Command::Error("web daemon add: --port requires a value".into());
+                    }
+                }
+            }
+            _ if arg.starts_with("--binary=") => {
+                let value = &arg["--binary=".len()..];
+                if value.is_empty() {
+                    return Command::Error("web daemon add: --binary requires a path".into());
+                }
+                cfg.binary = Some(std::path::PathBuf::from(value));
+            }
+            "--binary" => {
+                i += 1;
+                match args.get(i) {
+                    Some(value) if !value.is_empty() => {
+                        cfg.binary = Some(std::path::PathBuf::from(value));
+                    }
+                    _ => return Command::Error("web daemon add: --binary requires a path".into()),
+                }
+            }
+            _ if arg.starts_with("--web-assets-dir=") => {
+                let value = &arg["--web-assets-dir=".len()..];
+                if value.is_empty() {
+                    return Command::Error(
+                        "web daemon add: --web-assets-dir requires a path".into(),
+                    );
+                }
+                cfg.assets_dir = Some(std::path::PathBuf::from(value));
+            }
+            "--web-assets-dir" => {
+                i += 1;
+                match args.get(i) {
+                    Some(value) if !value.is_empty() => {
+                        cfg.assets_dir = Some(std::path::PathBuf::from(value));
+                    }
+                    _ => {
+                        return Command::Error(
+                            "web daemon add: --web-assets-dir requires a path".into(),
+                        );
+                    }
+                }
+            }
+            other if other.starts_with('-') => {
+                return Command::Error(format!("web daemon add: unknown option: {other}"));
+            }
+            other if name.is_none() => name = Some(other.to_string()),
+            other => {
+                return Command::Error(format!("web daemon add: unexpected argument: {other}"));
+            }
+        }
+        i += 1;
+    }
+
+    if cfg.listen.is_some() && cfg.port.is_some() {
+        return Command::Error(
+            "web daemon add: --port and --listen cannot be combined (--port is the short form of --listen=127.0.0.1:<n>)"
+                .into(),
+        );
+    }
+
+    match name {
+        Some(name) => {
+            cfg.name = name;
+            Command::Web(WebCommand::Daemon(WebDaemonCommand::Add(cfg)))
+        }
+        None => Command::Help {
+            topic: HelpTopic::WebDaemonAdd,
+        },
+    }
+}
+
+/// `--port` は前段が指す宛先になるので、任意の空きポートを意味する 0 は受けない。
+fn parse_web_daemon_port(value: &str) -> std::result::Result<u16, String> {
+    match value.parse::<u16>() {
+        Ok(0) | Err(_) => Err(format!(
+            "web daemon add: --port requires a number from 1 to 65535 (got: {value:?})"
+        )),
+        Ok(port) => Ok(port),
+    }
 }
 
 fn parse_web_service(args: &[String]) -> Command {
@@ -6003,6 +6377,13 @@ pub const CONFIG_SUBCOMMANDS: &[&str] = &["path", "show"];
 
 /// `hyoui web service` の子 subcommand 一覧 (= DR-0031)。
 pub const WEB_SERVICE_SUBCOMMANDS: &[&str] = &["register", "unregister", "status"];
+
+/// `hyoui web daemon` の子 subcommand 一覧 (= `parse_web_daemon` が dispatch する値)。
+///
+/// `start` / `stop` / `restart` / `status` / `log` / `supervise` は監督者への要求で、
+/// DR-0034 P3 で実装される。実装されるまで help / completion にも出さない
+/// (= 選んでも error になる値を補完しない)。
+pub const WEB_DAEMON_SUBCOMMANDS: &[&str] = &["run", "add", "remove", "list"];
 
 /// `hyoui screen snapshot --include` の help / completion に出す component 名一覧。
 ///
@@ -10523,5 +10904,170 @@ mod tests {
         assert!(usage(&HelpTopic::WebServiceRegister).contains("--listen"));
         assert!(usage(&HelpTopic::WebServiceUnregister).contains("remove"));
         assert!(usage(&HelpTopic::WebServiceStatus).contains("running state"));
+    }
+
+    /// 子を持つレベルと、必須引数を欠く verb は help を出す (= DR-0034 決定 1)。
+    #[test]
+    fn parse_web_daemon_shows_help_where_arguments_are_required() {
+        for command in [
+            vec!["web", "daemon"],
+            vec!["web", "daemon", "--help"],
+            vec!["web", "daemon", "-h"],
+        ] {
+            assert_eq!(
+                parse_args(&args(&command)),
+                Command::Help {
+                    topic: HelpTopic::WebDaemon
+                },
+                "{command:?}"
+            );
+        }
+        assert_eq!(
+            parse_args(&args(&["web", "daemon", "add"])),
+            Command::Help {
+                topic: HelpTopic::WebDaemonAdd
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&["web", "daemon", "remove"])),
+            Command::Help {
+                topic: HelpTopic::WebDaemonRemove
+            }
+        );
+    }
+
+    /// `run` の name は省略でき、省略時は `hyoui web` と同じ解決になる。
+    #[test]
+    fn parse_web_daemon_run_takes_an_optional_name() {
+        assert_eq!(
+            parse_args(&args(&["web", "daemon", "run"])),
+            Command::Web(WebCommand::Daemon(WebDaemonCommand::Run { name: None }))
+        );
+        assert_eq!(
+            parse_args(&args(&["web", "daemon", "run", "unstable"])),
+            Command::Web(WebCommand::Daemon(WebDaemonCommand::Run {
+                name: Some("unstable".into())
+            }))
+        );
+        assert!(matches!(
+            parse_args(&args(&["web", "daemon", "run", "a", "b"])),
+            Command::Error(message) if message.contains("unexpected argument")
+        ));
+    }
+
+    #[test]
+    fn parse_web_daemon_remove_and_list() {
+        assert_eq!(
+            parse_args(&args(&["web", "daemon", "remove", "unstable"])),
+            Command::Web(WebCommand::Daemon(WebDaemonCommand::Remove {
+                name: "unstable".into()
+            }))
+        );
+        assert_eq!(
+            parse_args(&args(&["web", "daemon", "list"])),
+            Command::Web(WebCommand::Daemon(WebDaemonCommand::List))
+        );
+        assert!(matches!(
+            parse_args(&args(&["web", "daemon", "list", "extra"])),
+            Command::Error(message) if message.contains("unexpected argument")
+        ));
+    }
+
+    /// `add` は unit 名と 4 option を取り、`--port` と `--listen` は排他。
+    #[test]
+    fn parse_web_daemon_add_options() {
+        assert_eq!(
+            parse_args(&args(&["web", "daemon", "add", "unstable", "--port=43691"])),
+            Command::Web(WebCommand::Daemon(WebDaemonCommand::Add(
+                WebDaemonAddConfig {
+                    name: "unstable".into(),
+                    port: Some(43691),
+                    ..WebDaemonAddConfig::default()
+                }
+            )))
+        );
+        // 値は separate 形でも `=` 形でも同じ、positional の位置は option の前後を問わない。
+        assert_eq!(
+            parse_args(&args(&[
+                "web",
+                "daemon",
+                "add",
+                "--listen",
+                "0.0.0.0:43690",
+                "stable",
+                "--binary",
+                "/opt/homebrew/bin/hyoui",
+                "--web-assets-dir=/tmp/assets",
+            ])),
+            Command::Web(WebCommand::Daemon(WebDaemonCommand::Add(
+                WebDaemonAddConfig {
+                    name: "stable".into(),
+                    listen: Some("0.0.0.0:43690".into()),
+                    binary: Some(std::path::PathBuf::from("/opt/homebrew/bin/hyoui")),
+                    assets_dir: Some(std::path::PathBuf::from("/tmp/assets")),
+                    port: None,
+                }
+            )))
+        );
+
+        assert!(matches!(
+            parse_args(&args(&[
+                "web", "daemon", "add", "x", "--port=1", "--listen=127.0.0.1:2"
+            ])),
+            Command::Error(message) if message.contains("cannot be combined")
+        ));
+        for bad in ["--port=0", "--port=70000", "--port=http"] {
+            assert!(
+                matches!(
+                    parse_args(&args(&["web", "daemon", "add", "x", bad])),
+                    Command::Error(message) if message.contains("1 to 65535")
+                ),
+                "{bad}"
+            );
+        }
+        for missing in ["--listen", "--binary", "--web-assets-dir", "--port"] {
+            assert!(
+                matches!(
+                    parse_args(&args(&["web", "daemon", "add", "x", missing])),
+                    Command::Error(message) if message.contains("requires")
+                ),
+                "{missing}"
+            );
+        }
+    }
+
+    /// 未実装 verb (= P3 の監督者要求) は unknown subcommand として断る。
+    #[test]
+    fn parse_web_daemon_rejects_unknown_subcommands() {
+        for unsupported in ["supervise", "start", "stop", "restart", "status", "log"] {
+            assert!(
+                matches!(
+                    parse_args(&args(&["web", "daemon", unsupported])),
+                    Command::Error(message) if message.contains("unknown subcommand")
+                ),
+                "{unsupported}"
+            );
+        }
+        assert!(matches!(
+            parse_args(&args(&["web", "daemon", "--nope"])),
+            Command::Error(message) if message.contains("unknown option")
+        ));
+    }
+
+    /// daemon help は親と各 leaf の操作面を別々に説明する。
+    #[test]
+    fn usage_web_daemon_topics_are_specific() {
+        assert!(usage(&HelpTopic::Web).contains("daemon"));
+        for subcommand in WEB_DAEMON_SUBCOMMANDS {
+            assert!(
+                usage(&HelpTopic::WebDaemon).contains(subcommand),
+                "{subcommand}"
+            );
+        }
+        assert!(usage(&HelpTopic::WebDaemonRun).contains("foreground"));
+        assert!(usage(&HelpTopic::WebDaemonAdd).contains("--port"));
+        assert!(usage(&HelpTopic::WebDaemonAdd).contains("--binary"));
+        assert!(usage(&HelpTopic::WebDaemonRemove).contains("registration"));
+        assert!(usage(&HelpTopic::WebDaemonList).contains("supervisor"));
     }
 }

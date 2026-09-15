@@ -36,11 +36,13 @@ serde_json = { workspace = true }
 # `web service register` が current_exe から Homebrew upgrade を跨ぐ安定 PATH
 # symlink を選び、plist / unit に焼き込む (= DR-0031)。
 stable-which = { workspace = true }
+# DR-0034 決定 2: web gateway unit 登録簿 (`hyoui-web/units/<name>.toml`) の
+# 読み書きと、tmp + rename による差し替え、登録簿エラーの型付け。
+toml = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
-# `hyoui config show` の出力が valid TOML として読み直せることを e2e で検証する。
-toml = { workspace = true }
 # integration tests (tests/lock_cli.rs) で nix::sys::signal::kill を使う
 nix = { workspace = true }
 # DR-0014 マトリクス検証用 PTY harness (tests/common/pty.rs)。
