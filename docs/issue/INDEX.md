@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-09-15 | request | open | [report-harness-pid-of-session](./2026-09-15-report-harness-pid-of-session.md) | hyoui のセッションが起動したハーネス本体 (claude/codex) の pid を answer できるようにする |
 | 2026-09-10 | task | open | [ecosystem-review-2026-09](./2026-09-10-ecosystem-review-2026-09.md) | エコシステム外部レビュー (2026-09) の指摘への対応検討 |
 | 2026-08-25 | request | open | [hyoui-attach-take-leader](./2026-08-25-hyoui-attach-take-leader.md) | hyoui attach --take-leader を実装する (LR2-Q1 裁定 a、DR-0033 leader.request 奪取の CLI 後続) |
 | 2026-08-25 | task | open | [web-gateway-restart-kill-not-reliable](./2026-08-25-web-gateway-restart-kill-not-reliable.md) | web gateway の再起動は kill だけでは復帰しないことがある (KeepAlive 頼みにせず register を使う) |
