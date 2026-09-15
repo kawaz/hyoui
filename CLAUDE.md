@@ -9,6 +9,8 @@ PTY ラップした long-running process (claude code / vim 等) を **外側か
 Rust 製ツール。daemon が screen state を正本として持ち、CLI / 将来の HTTP gateway 経由で操作する。
 Terminal multiplexer ではない (= tmux/screen の代替ではない)。
 
+リポ構成は git bare + jj workspace。push は `just push` (deps で lint + test + build + 翻訳ペア鮮度検証 + version bump 漏れ検出が走る)。
+
 ## 必読 DR (= 順番通り、設計判断前に毎回参照)
 
 | DR | 内容 |
@@ -38,9 +40,8 @@ Terminal multiplexer ではない (= tmux/screen の代替ではない)。
 
 ## 検証主義 (= DR-0014 §検証主義)
 
-### 推測で実装しない
+### 検証 category とマトリクス
 
-- サンプル 1 (= 例: claude TUI 1 つ) で結論を出さない
 - **最低 3 種類の category で検証**: TUI alt screen 系 (vim/claude) / line-oriented 系 (cat/less) /
   interactive REPL 系 (python/bash)
 - マトリクス検証: 関連する全組合せ (= app × mode × signal × 送信元) で「期待 vs 実態」を埋める
@@ -89,18 +90,3 @@ DR-0013 完了で screen dump / snapshot / tail / wait 等の観測道具が揃�
 - bug 報告時: 報告者の cast / ログを Read で精読し、出力 bytes 単位で追う
 - 修正実装後: 必ず実機で動作確認 + マトリクスの該当セル再検証
 - 観測道具自体に bug があった場合: 道具を最優先で直す (= 道具が信用できないと判断が崩れる)
-
-## jj-workflow
-
-このリポは `.jj` あり、git bare + jj workspace 方式。`jj commit -m "msg"` 一発で確定 + 空 @ 前進。
-`jj describe` 単体は過去 change の `-r <change>` 修正にだけ使う (= "commit したつもり"事故防止)。
-詳細は `~/.claude-personal/rules/jj-workflow.md` / `jj-tips.md` を参照。
-
-## push
-
-`just push` を使う。直接 `git push` / `jj git push` 禁止 (= deps で check + test + 翻訳ペア
-検証 + version bump 漏れ検出が走る)。
-
-## 言語
-
-日本語で応答 (= サブエージェントの指示応答・思考も)。kawaz の判断・指示も日本語。
