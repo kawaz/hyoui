@@ -68,3 +68,33 @@ screen state を正本にしている以上、CLI と web で復元結果が食�
       を web 経路にも用意する
 
 ## TODO
+
+## 修正 (2026-09-15)
+
+### 原因
+
+Observed:
+
+- release build (`hyoui 0.9.41`) と mode 0700 の専用 `XDG_RUNTIME_DIR`、専用 port `127.0.0.1:43701` で alt screen 中の session を起動した。
+- daemon の `screen snapshot --include=Mode --format=json` は `alternate-screen: true` を返した。
+- 修正前の `GET /api/sessions/:id/screen?layer=both` は HTTP 200 と画面 marker を返したが、payload 先頭は `ESC[H` で `ESC[?1049h` を含まなかった。
+- CLI attach は `build_attach_redraw()` で active buffer に応じた `ESC[?1049h` / `ESC[?1049l` を prepend していたが、`ScreenDumpLayer::Both + ScreenDumpFormat::Ansi` は rows を ANSI 化するだけだった。
+
+Inferred:
+
+- web handler 自体は daemon の screen dump payload をそのまま返すため、alt mode の欠落箇所は HTTP 層ではなく `Both + Ansi` の復元 bytes 生成だった。
+
+### 修正箇所
+
+- `crates/hyoui/src/daemon/screen/redraw.rs`: active buffer の mode sequence 生成を `buffer_mode_sequence()` に抽出し、CLI attach と screen dump で共有した。
+- `crates/hyoui/src/daemon/screen/snapshot.rs`: `Both + Ansi` payload の先頭へ共有 mode sequence を prepend した。scrollback + visible の連結順は維持した。
+- 新 protocol message / cap flag は追加していない。
+
+### テスト
+
+- unit: `dump_both_ansi_preserves_active_buffer_mode`
+- e2e: `e2e_screen_both_preserves_alternate_screen_mode`
+
+### 実機観測
+
+修正後の同条件では daemon が `alternate-screen: true`、HTTP status が 200、payload 先頭 8 bytes が `1b5b3f3130343968` (`ESC[?1049h`)、画面 marker も保持された。検証用 web gateway と session を停止し、専用 runtime directory と対象 process が残っていないことを確認した。
