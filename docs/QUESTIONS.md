@@ -44,6 +44,57 @@
 - [ ] a: 乖離を認める (統括推し)。unit 1 つ = launchd job 1 つ、定義ファイルが正本
 - [ ] b: reference どおり llm-gateway 型にする。`daemon supervise` 1 つを OS に載せ、`daemon add` は登録簿に書くだけ、`service register` が監督者を載せる 2 段。監督者用の socket / protocol / backoff / ログ集約が hyoui 側に必要になる
 
+### 👺WEB-Q1: web 境界の version 方式
+
+グランドデザイン [research/2026-09-15-web-protocol-and-passkey-grand-design.md](research/2026-09-15-web-protocol-and-passkey-grand-design.md) §3。assets は gateway 自身が配るので browser と gateway は平常時同ビルド、ずれるのは restart / brew upgrade / canddy fallback で裏の unit が変わった時。
+
+- [ ] a: 世代番号 1 つ (`WEB_PROTOCOL_VERSION`、統括推し)。WS の hello frame + `X-Hyoui-Web-Protocol` ヘッダ + `/version` で伝え、不一致なら画面端に帯 + 再読み込みボタン (自動リロードなし、既存 WS は切らない)。build_id は情報表示のみ
+- [ ] b: daemon 境界と同型の cap 方式
+- [ ] c: 併用
+
+### 👺WEB-Q2: ccmsg webui の iframe 内での認証経路
+
+同 §4.3。ccmsg の WebAuthn 検証は iframe 内 (`topOrigin` あり) を拒否する。ccmsg と hyoui は別 origin だが同一 site (`*.kawaz.jp`)。
+
+- [ ] a: top-level で hyoui にログイン (popup) → 同一 site cookie が iframe 内にも乗る → popup から BroadcastChannel で通知 (統括推し。ccmsg 側変更ゼロ。**同一 site iframe の cookie 送信は実機未検証**、崩れたら c へ)
+- [ ] b: ccmsg が短命 token を発行して iframe に渡す (hyoui が ccmsg を IdP として信頼、3 リポに契約が増える)
+- [ ] c: iframe 内で WebAuthn を走らせる (ccmsg-webui に `allow="publickey-credentials-get"`、hyoui に topOrigin allowlist)
+
+### 👺WEB-Q3: passkey 登録の bootstrap
+
+同 §4.2。localhost 限定は canddy 経由も 127.0.0.1 発なので不成立。
+
+- [ ] a: CLI 発行の招待 URL (`#register=<jwt>`、10 分) + 6 桁コード (ccmsg 同型、統括推し)
+- [ ] b: 初回だけ無認証で登録できる (TOFU)
+
+### 👺WEB-Q4: 認証セッションの形
+
+同 §4.5。
+
+- [ ] a: httpOnly cookie 1 本 (`Secure; SameSite=Strict`、sliding 30 日、CLI で失効。統括推し: 素の JS に tab-share を持ち込まない)
+- [ ] b: ccmsg 型 (access = メモリ + WS subprotocol、refresh = cookie、rotate + 再利用検知)
+
+### 👺WEB-Q5: 認可の軸
+
+同 §4.6。
+
+- [ ] a: credential 単位 `rw` / `ro` (`hyoui web passkey add --ro`) を daemon の attach mode に写す。既定 rw (統括推し。スマホ等「観測だけの端末」を既存 mode で表す)
+- [ ] b: 認可を持たない (登録済みは全員 rw)
+
+### 👺WEB-Q6: WebAuthn の実装
+
+同 §4.8。
+
+- [ ] a: `webauthn-rs` crate (依存は hyoui-web に閉じる。統括推し。attestation none / UV required が crate 設定で表せなければ b)
+- [ ] b: ccmsg の自前実装 (TS 550 行) を Rust に移植 (ccmsg 側のテスト負債も引き継ぐ)
+
+### 👺WEB-Q7: 認証の既定を `passkey` に切り替える時期
+
+同 §6。W2 (実装) は `[web].auth = "none"` 既定で出し、W3 で kawaz が stable に登録して config で切替。
+
+- [ ] a: W3 の実運用を通してから W4 で既定を `passkey` に (= major bump、統括推し)
+- [ ] b: W2 の時点で既定 `passkey`
+
 ## 確認待ち
 
 ### 👺DR32-C1: DR-0032 実装 (v0.9.32) の実機確認
