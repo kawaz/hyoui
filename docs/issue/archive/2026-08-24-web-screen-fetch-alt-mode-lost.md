@@ -1,18 +1,18 @@
 ---
 title: web UI の初期 /screen fetch が alternate screen mode を復元しない
-status: open
+status: resolved
 category: bug
 created: 2026-08-24T09:11:44+09:00
-last_read:
+last_read: 2026-09-15T15:30:00+09:00
 open_entered: 2026-08-24T09:11:44+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-15T15:30:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: fix(web) 3b8de5e4cc86 (2026-09-15) で修正。daemon の ScreenDump Ansi (Visible / Both) に active buffer の mode sequence (?1049h / ?1049l) を前置し、web の初期復元が CLI attach と同じ契約になった (DR-0013 §9 に契約を明記)。unit dump_both/visible_ansi_* と e2e e2e_screen_both_preserves_alternate_screen_mode で固定、v0.9.41 build の実機で payload 先頭 ESC[H → ESC[?1049h を観測
 blocked_by:
 origin: 自リポ TODO
 ---
