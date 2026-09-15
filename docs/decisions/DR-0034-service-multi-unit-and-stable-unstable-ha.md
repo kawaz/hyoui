@@ -64,7 +64,7 @@ llm-gateway は同じ reference 体系を先に当てている (DR-0028)。unit 
 本 DR が決めるのは **verb 群と unit モデル**で、その前に付く階層 (`hyoui service` か `hyoui web service` か) は OQ-A の裁定で決まる。以下の表記は `hyoui service` を仮に置いたもので、`hyoui web service` に決まれば prefix が 1 語増えるだけで中身は変わらない。
 
 ```text
-hyoui service add <name> [--port=<n> | --listen=<host:port>] [--binary=<path>] [--assets-dir=<path>]
+hyoui service add <name> [--port=<n> | --listen=<host:port>] [--binary=<path>] [--web-assets-dir=<path>]
 hyoui service remove <name>
 hyoui service list
 hyoui service start   <name> | --all
@@ -178,7 +178,7 @@ label に kind (`hyoui-web`) が入り、`<name>` はその中での識別子に
 
 逆引き domain を `com.github.kawaz` から `jp.kawaz` に変えるのは、kawaz 製ツールの label を 1 つの名前空間に揃えるため (llm-gateway は既に `jp.kawaz.llm-gateway.supervise` を使っている)。この変更の副産物として、移行の途中で旧 label (`com.github.kawaz.hyoui-web`) と新 label が同時に載っても互いを踏まない (決定 8)。
 
-`list` は定義ディレクトリを label prefix (`jp.kawaz.hyoui-web.` / `hyoui-web-`) で走査して unit を数える。unit の属性 (listen / binary / assets_dir) は定義の argv から復元する。**この復元が成立するのは、`add` が listen を解決し切って argv に焼くから** (決定 3)。argv に無い属性は復元対象にしない — 「定義に書かれていない値は起動時に config から読まれる」という経路を残すと、`list` の出力が実際の待ち先と食い違う。
+`list` は定義ディレクトリを label prefix (`jp.kawaz.hyoui-web.` / `hyoui-web-`) で走査して unit を数える。unit の属性 (listen / binary / web-assets-dir) は定義の argv から復元する。**この復元が成立するのは、`add` が listen を解決し切って argv に焼くから** (決定 3)。argv に無い属性は復元対象にしない — 「定義に書かれていない値は起動時に config から読まれる」という経路を残すと、`list` の出力が実際の待ち先と食い違う。
 
 別に登録簿ファイルを置かないのは、置けば OS 側の定義と二重になり、片方だけ人手で触られた時にどちらが正かを決められなくなるため。DR-0006 §1 が `hyoui list` に対して採った判断 (registry を持たず socket dir を正本にする) と同じ形を service にも適用する。
 
@@ -322,11 +322,9 @@ port の割り当て (決定 3) と既存 1 台の移行手順 (決定 8) は本
 
 判断軸は kawaz 提示のとおり「web 以外に OS 常駐させる unit の種類が出てくるか」。Context の洗い出しでは **現時点で web gateway 以外に無い** (record / redaction / screen watch はいずれも daemon 内、PTY session daemon は `run` が unit を決めるので OS から起こせない、graceful upgrade は走っているプロセスの self-exec)。将来候補として「login 時に決まった PTY session を起こす」が 1 つ挙がるが、issue も DR も無い。
 
-**統括推し: `hyoui web service`。** 決め手は option 集合が kind と一緒に動くこと (下記)。kind が 1 種類の今は階層が 1 段余るが、`add` の option が `hyoui web` の引数の写しである以上、その階層は「何の unit を足すか」を名前で示す働きを既に持っている。採る場合は決定 1 の verb 表と決定 4 の label を `hyoui web service <verb>` / `jp.kawaz.hyoui-web.<name>` (label は変わらない) に読み替える。
+**統括推し: `hyoui web service`。** 決め手は option 集合が kind と一緒に動くこと。`add` の option は `hyoui web` の引数の写し (`--listen` / `--web-assets-dir`) で、session を起こす kind が来れば必要になるのは `-- cmd args...` と namespace になり、両者は共有できない。階層で割れば各階層の option 集合が閉じ、`add` の引数がそのまま「何の unit を足すか」を示す。kind が 1 種類の今は階層が 1 段余るのが弱点。採る場合は決定 1 の verb 表を `hyoui web service <verb>` に読み替える (決定 4 の label は変わらない)。
 
-**対案 `hyoui service` (= 決定 1 の現行記述) の利点**: kind が 1 種類のうちは階層を 1 段減らせる。kind が増えたら `add --kind` を足す形になるが、その時点で `--kind` に応じて有効な option が分岐し、help と completion で説明しづらくなる (表示都合ではなく、モデル自体が kind ごとに違う option 集合を持つ)。
-
-**`hyoui web service` を推す根拠**: `add` の引数が `hyoui web` の引数の写し (`--listen` / `--web-assets-dir`) になるため、何の unit を足しているのかがコマンドの名前で分かる。加えて、option 集合が kind と一緒に動く点が効く — session を起こす kind が来れば必要になるのは `-- cmd args...` と namespace で、`--port` / `--assets-dir` とは共有できない。階層で割れば各階層の option 集合が閉じる。
+**対案 `hyoui service` (= 決定 1 の現行記述) の利点**: kind が 1 種類のうちは階層を 1 段減らせる。kind が増えたら `add --kind` を足す形になるが、その時点で `--kind` に応じて有効な option が分岐する。これは表示都合の問題ではなく、モデル自体が kind ごとに違う option 集合を持つという話なので、help と completion の両方で説明しづらくなる。
 
 **第 3 の形: `hyoui service add <kind> <name>`** (kind を階層ではなく `add` の位置引数にする)。verb 群は 1 箇所に集まったまま kind ごとの option 集合を分けられる (`service add web stable --port=...` / `service add session claude -- claude`)。`remove` 以降は `<name>` だけで引ける (kind は label から判る)。help は `service add` の下に kind ごとの節が並ぶ形になる。今の kind が 1 種類なので `add web stable` の `web` が冗長に見えるのが弱点。
 
