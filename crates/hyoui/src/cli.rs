@@ -173,8 +173,14 @@ pub enum HelpTopic {
     Version,
     /// Help for the `web service` parent subcommand (= DR-0031)。
     WebService,
-    /// Help for `web service register` (= DR-0031)。
+    /// Help for `web service register` (= DR-0034 決定 6)。
     WebServiceRegister,
+    /// Help for `web service start` (= DR-0034 決定 6)。
+    WebServiceStart,
+    /// Help for `web service stop` (= DR-0034 決定 6)。
+    WebServiceStop,
+    /// Help for `web service log` (= DR-0034 決定 6)。
+    WebServiceLog,
     /// Help for `web service unregister` (= DR-0031)。
     WebServiceUnregister,
     /// Help for `web service status` (= DR-0031)。
@@ -197,24 +203,36 @@ pub struct WebConfig {
     pub assets_dir: Option<std::path::PathBuf>,
 }
 
-/// `web service register` configuration (= DR-0031)。
+/// `web service register` configuration (= DR-0034 決定 6)。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WebServiceRegisterConfig {
-    /// サービス定義へ焼き込む listen address。未指定なら `hyoui web` と同じく
-    /// config `[web].listen` / built-in default を実行時に解決する。
-    pub listen: Option<String>,
+    /// 監督者として焼き込む実行ファイル。未指定なら安定な PATH 上の場所を選ぶ
+    /// (= `resolve_stable_path`)。unit 側が `current_exe` をそのまま焼くのと逆で、
+    /// 監督者はどの版でも同じ仕事をするため (決定 3)。
+    pub binary: Option<std::path::PathBuf>,
 }
 
-/// `web service` の leaf command (= DR-0031)。
+/// `web service` の leaf command (= DR-0034 決定 6)。
+///
+/// 載せる対象は監督者 1 つだけ。unit ごとの plist / systemd unit は作らない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WebServiceCommand {
-    /// サービス定義を書き、登録して即起動する。
+    /// 定義を書き、登録して即起動する (冪等)。
     Register(WebServiceRegisterConfig),
-    /// サービスを停止し、登録定義を削除する。
+    /// 登録を外して定義を削除する。
     Unregister,
-    /// 登録有無・稼働状態・pid・定義パスを表示する。
+    /// 監督者を起動する。
+    Start,
+    /// 監督者を停止する (= 抱えている子も止まる)。
+    Stop,
+    /// 登録有無・OS 側の状態・版・抱えている unit を表示する。
     Status,
+    /// 監督者と OS 側のログ。
+    Log {
+        /// 追従するか。
+        follow: bool,
+    },
 }
 
 /// `web daemon add` configuration (= DR-0034 決定 2 / 3)。
@@ -2589,6 +2607,9 @@ pub fn usage(topic: &HelpTopic) -> String {
         HelpTopic::Version => usage_version(),
         HelpTopic::WebService => usage_web_service(),
         HelpTopic::WebServiceRegister => usage_web_service_register(),
+        HelpTopic::WebServiceStart => usage_web_service_start(),
+        HelpTopic::WebServiceStop => usage_web_service_stop(),
+        HelpTopic::WebServiceLog => usage_web_service_log(),
         HelpTopic::WebServiceUnregister => usage_web_service_unregister(),
         HelpTopic::WebServiceStatus => usage_web_service_status(),
         HelpTopic::Upgrade => usage_upgrade(),
@@ -2984,31 +3005,47 @@ fn usage_web_service() -> String {
     "\
 hyoui web service <subcommand>
 
-Manage the HTTP gateway as a per-user LaunchAgent (macOS) or systemd user
-service (Linux). No arguments prints this help.
+Load the supervisor as a per-user LaunchAgent (macOS) or systemd user service
+(Linux). What the OS starts is `hyoui web daemon supervise`, one process that
+holds every gateway; the gateways themselves are never registered with the OS.
+No arguments prints this help.
 
 SUBCOMMANDS:
-  register      Install or replace the definition, enable it, and start now.
-  unregister    Stop the service and remove its definition.
-  status        Print registration and running state.
+  register      Install or replace the definition and start it now.
+  unregister    Stop the supervisor and remove its definition.
+  start         Start the supervisor.
+  stop          Stop the supervisor, and with it every gateway it holds.
+  status        Print registration, OS state, versions, and the units held.
+  log           Print the supervisor's own log.
 
 OPTIONS:
   --help, -h    Show this help.
+
+Day-to-day gateway updates use `hyoui web daemon restart`, which replaces units
+one at a time without a gap. Reach for this command group only to change the
+supervisor itself: stopping it takes every gateway down with it.
 "
     .to_string()
 }
 
 fn usage_web_service_register() -> String {
     "\
-hyoui web service register [--listen=<host:port>]
+hyoui web service register [--binary=<path>]
 
-Install or idempotently replace the web gateway service and start it now.
-The installed command is `<stable hyoui path> web`; an explicit --listen is
-baked into the definition.
+Install or replace the supervisor's definition and start it now. The installed
+command is `<path> web daemon supervise`, which holds every registered unit.
+
+Running this again is safe: when the definition already matches and is loaded,
+nothing changes and `changed` is false. Because it reloads the definition, a
+change does restart the supervisor, and every gateway it holds goes down and
+comes back with it. Re-register only to update the supervisor itself, not to
+pick up a rebuilt gateway.
 
 OPTIONS:
-  --listen=<host:port>    Bake this listen address into the service command.
-  --help, -h              Show this help.
+  --binary=<path>    Executable to bake in. Defaults to a durable path for the
+                     running executable, so a Homebrew upgrade keeps working
+                     without re-registering.
+  --help, -h         Show this help.
 "
     .to_string()
 }
@@ -3017,8 +3054,11 @@ fn usage_web_service_unregister() -> String {
     "\
 hyoui web service unregister
 
-Stop the web gateway service and remove its definition. If it is not
-registered, this command succeeds without changing anything.
+Stop the supervisor, remove its definition, and lift the \"do not start\" mark
+that `stop` leaves on the label. Registered units stay in the registry, so
+registering again brings them back.
+
+If it is not registered, this command succeeds without changing anything.
 
 OPTIONS:
   --help, -h    Show this help.
@@ -3030,10 +3070,70 @@ fn usage_web_service_status() -> String {
     "\
 hyoui web service status
 
-Print the service label, registration state, running state, pid, and definition
-path. The command succeeds even when the service is not registered.
+Print the supervisor's label and definition path, whether that definition
+exists, what the OS says about it, the versions in place and running, and the
+units it currently holds.
+
+`running` at the top means the supervisor answered its control socket, since
+that is what decides whether anything can be asked of it. The `service` block
+holds what the OS reports, which can differ: a definition may exist without
+being loaded, and the OS may call it alive while its socket is closed.
+
+The command succeeds even when nothing is registered.
 
 OPTIONS:
+  --help, -h    Show this help.
+"
+    .to_string()
+}
+
+fn usage_web_service_start() -> String {
+    "\
+hyoui web service start
+
+Start the supervisor, which in turn starts every unit that should be running.
+Also clears the \"do not start\" marker left by `stop`, so a later login brings
+it up again.
+
+OPTIONS:
+  --help, -h    Show this help.
+"
+    .to_string()
+}
+
+fn usage_web_service_stop() -> String {
+    "\
+hyoui web service stop
+
+Stop the supervisor. **Every gateway it holds stops with it**, so this is a
+full outage, not a way to restart one unit.
+
+The marker that keeps it from starting again survives logging out and back in,
+until `start` or `register` clears it. On macOS the job is booted out rather
+than sent a stop signal, because KeepAlive would otherwise bring it straight
+back.
+
+To replace a rebuilt gateway without an outage, use
+`hyoui web daemon restart <name>` instead.
+
+OPTIONS:
+  --help, -h    Show this help.
+"
+    .to_string()
+}
+
+fn usage_web_service_log() -> String {
+    "\
+hyoui web service log [--follow]
+
+Print what the supervisor itself wrote: on macOS the file the OS captures its
+output into, on Linux its journal.
+
+Each gateway's own output goes to its own file instead; read those with
+`hyoui web daemon log <name>`.
+
+OPTIONS:
+  --follow      Keep printing lines as they are written.
   --help, -h    Show this help.
 "
     .to_string()
@@ -4634,11 +4734,31 @@ fn parse_web_service(args: &[String]) -> Command {
     let rest = &args[1..];
     match head {
         "register" => parse_web_service_register(rest),
-        "unregister" | "status" => {
-            let topic = if head == "unregister" {
-                HelpTopic::WebServiceUnregister
-            } else {
-                HelpTopic::WebServiceStatus
+        "log" => {
+            let mut follow = false;
+            for arg in rest {
+                match arg.as_str() {
+                    "--help" | "-h" => {
+                        return Command::Help {
+                            topic: HelpTopic::WebServiceLog,
+                        };
+                    }
+                    "--follow" => follow = true,
+                    other => {
+                        return Command::Error(format!(
+                            "web service log: unexpected argument: {other}"
+                        ));
+                    }
+                }
+            }
+            Command::Web(WebCommand::Service(WebServiceCommand::Log { follow }))
+        }
+        "unregister" | "start" | "stop" | "status" => {
+            let topic = match head {
+                "unregister" => HelpTopic::WebServiceUnregister,
+                "start" => HelpTopic::WebServiceStart,
+                "stop" => HelpTopic::WebServiceStop,
+                _ => HelpTopic::WebServiceStatus,
             };
             if rest.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
                 return Command::Help { topic };
@@ -4646,10 +4766,11 @@ fn parse_web_service(args: &[String]) -> Command {
             if let Some(arg) = rest.first() {
                 return Command::Error(format!("web service {head}: unexpected argument: {arg}"));
             }
-            let command = if head == "unregister" {
-                WebServiceCommand::Unregister
-            } else {
-                WebServiceCommand::Status
+            let command = match head {
+                "unregister" => WebServiceCommand::Unregister,
+                "start" => WebServiceCommand::Start,
+                "stop" => WebServiceCommand::Stop,
+                _ => WebServiceCommand::Status,
             };
             Command::Web(WebCommand::Service(command))
         }
@@ -4657,13 +4778,14 @@ fn parse_web_service(args: &[String]) -> Command {
             Command::Error(format!("web service: unknown option: {other}"))
         }
         other => Command::Error(format!(
-            "web service: unknown subcommand `{other}` (supported: register, unregister, status)"
+            "web service: unknown subcommand `{other}` (supported: {})",
+            WEB_SERVICE_SUBCOMMANDS.join(", ")
         )),
     }
 }
 
 fn parse_web_service_register(args: &[String]) -> Command {
-    let mut listen = None;
+    let mut binary = None;
     let mut i = 0usize;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -4673,22 +4795,22 @@ fn parse_web_service_register(args: &[String]) -> Command {
                     topic: HelpTopic::WebServiceRegister,
                 };
             }
-            _ if arg.starts_with("--listen=") => {
-                let value = &arg["--listen=".len()..];
+            _ if arg.starts_with("--binary=") => {
+                let value = &arg["--binary=".len()..];
                 if value.is_empty() {
-                    return Command::Error(
-                        "web service register: --listen requires a value".into(),
-                    );
+                    return Command::Error("web service register: --binary requires a path".into());
                 }
-                listen = Some(value.to_string());
+                binary = Some(std::path::PathBuf::from(value));
             }
-            "--listen" => {
+            "--binary" => {
                 i += 1;
                 match args.get(i) {
-                    Some(value) if !value.is_empty() => listen = Some(value.clone()),
+                    Some(value) if !value.is_empty() => {
+                        binary = Some(std::path::PathBuf::from(value));
+                    }
                     _ => {
                         return Command::Error(
-                            "web service register: --listen requires a value".into(),
+                            "web service register: --binary requires a path".into(),
                         );
                     }
                 }
@@ -4702,7 +4824,7 @@ fn parse_web_service_register(args: &[String]) -> Command {
         i += 1;
     }
     Command::Web(WebCommand::Service(WebServiceCommand::Register(
-        WebServiceRegisterConfig { listen },
+        WebServiceRegisterConfig { binary },
     )))
 }
 
@@ -6657,7 +6779,8 @@ pub const RECORD_SUBCOMMANDS: &[&str] = &["start", "stop", "list"];
 pub const CONFIG_SUBCOMMANDS: &[&str] = &["path", "show"];
 
 /// `hyoui web service` の子 subcommand 一覧 (= DR-0031)。
-pub const WEB_SERVICE_SUBCOMMANDS: &[&str] = &["register", "unregister", "status"];
+pub const WEB_SERVICE_SUBCOMMANDS: &[&str] =
+    &["register", "unregister", "start", "stop", "status", "log"];
 
 /// `hyoui web daemon` の子 subcommand 一覧 (= `parse_web_daemon` が dispatch する値)。
 pub const WEB_DAEMON_SUBCOMMANDS: &[&str] = &[
@@ -11145,25 +11268,79 @@ mod tests {
         );
     }
 
-    /// register は listen の空値を拒否し、明示値だけをサービス定義へ渡す。
+    /// register は監督者に焼く実行ファイルだけを取る (= 決定 6、listen は unit 側)。
     #[test]
-    fn parse_web_service_register_listen() {
+    fn parse_web_service_register_binary() {
         assert_eq!(
             parse_args(&args(&[
                 "web",
                 "service",
                 "register",
-                "--listen=127.0.0.1:54321"
+                "--binary=/opt/homebrew/bin/hyoui"
             ])),
             Command::Web(WebCommand::Service(WebServiceCommand::Register(
                 WebServiceRegisterConfig {
-                    listen: Some("127.0.0.1:54321".into())
+                    binary: Some(std::path::PathBuf::from("/opt/homebrew/bin/hyoui"))
                 }
             )))
         );
+        assert_eq!(
+            parse_args(&args(&["web", "service", "register"])),
+            Command::Web(WebCommand::Service(WebServiceCommand::Register(
+                WebServiceRegisterConfig { binary: None }
+            )))
+        );
         assert!(matches!(
-            parse_args(&args(&["web", "service", "register", "--listen="])),
-            Command::Error(message) if message.contains("requires a value")
+            parse_args(&args(&["web", "service", "register", "--binary="])),
+            Command::Error(message) if message.contains("requires a path")
+        ));
+        // listen は unit の属性になったので、service 側では受けない。
+        assert!(matches!(
+            parse_args(&args(&["web", "service", "register", "--listen=127.0.0.1:1"])),
+            Command::Error(message) if message.contains("unexpected argument")
+        ));
+    }
+
+    /// 監督者の起動 / 停止 / ログも service 層の leaf として並ぶ (= 決定 6)。
+    #[test]
+    fn parse_web_service_supervisor_verbs() {
+        assert_eq!(
+            parse_args(&args(&["web", "service", "start"])),
+            Command::Web(WebCommand::Service(WebServiceCommand::Start))
+        );
+        assert_eq!(
+            parse_args(&args(&["web", "service", "stop"])),
+            Command::Web(WebCommand::Service(WebServiceCommand::Stop))
+        );
+        assert_eq!(
+            parse_args(&args(&["web", "service", "log"])),
+            Command::Web(WebCommand::Service(WebServiceCommand::Log {
+                follow: false
+            }))
+        );
+        assert_eq!(
+            parse_args(&args(&["web", "service", "log", "--follow"])),
+            Command::Web(WebCommand::Service(WebServiceCommand::Log { follow: true }))
+        );
+        for (verb, topic) in [
+            ("start", HelpTopic::WebServiceStart),
+            ("stop", HelpTopic::WebServiceStop),
+            ("log", HelpTopic::WebServiceLog),
+        ] {
+            assert_eq!(
+                parse_args(&args(&["web", "service", verb, "--help"])),
+                Command::Help { topic },
+                "{verb}"
+            );
+        }
+        assert!(matches!(
+            parse_args(&args(&["web", "service", "start", "extra"])),
+            Command::Error(message) if message.contains("unexpected argument")
+        ));
+        // 旧 verb 以外の綴りは候補を並べて断る。
+        assert!(matches!(
+            parse_args(&args(&["web", "service", "reload"])),
+            Command::Error(message) if message.contains("unknown subcommand")
         ));
     }
 
@@ -11189,9 +11366,18 @@ mod tests {
     fn usage_web_service_topics_are_specific() {
         assert!(usage(&HelpTopic::Web).contains("service"));
         assert!(usage(&HelpTopic::WebService).contains("register"));
-        assert!(usage(&HelpTopic::WebServiceRegister).contains("--listen"));
+        for subcommand in WEB_SERVICE_SUBCOMMANDS {
+            assert!(
+                usage(&HelpTopic::WebService).contains(subcommand),
+                "{subcommand}"
+            );
+        }
+        assert!(usage(&HelpTopic::WebServiceRegister).contains("--binary"));
         assert!(usage(&HelpTopic::WebServiceUnregister).contains("remove"));
-        assert!(usage(&HelpTopic::WebServiceStatus).contains("running state"));
+        assert!(usage(&HelpTopic::WebServiceStatus).contains("control socket"));
+        assert!(usage(&HelpTopic::WebServiceStart).contains("supervisor"));
+        assert!(usage(&HelpTopic::WebServiceStop).contains("full outage"));
+        assert!(usage(&HelpTopic::WebServiceLog).contains("--follow"));
     }
 
     /// 子を持つレベルと、必須引数を欠く verb は help を出す (= DR-0034 決定 1)。

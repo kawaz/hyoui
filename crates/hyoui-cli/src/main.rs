@@ -22,8 +22,7 @@ use hyoui::cli::{
     RecordCommand, RecordDirectionArg, RecordFormatArg, RecordInputSecrecyArg, RecordListConfig,
     RecordListFormatArg, RecordStartConfig, RecordStopConfig, ScreenCommand, ScreenDumpCliFormat,
     ScreenDumpCliLayer, ScreenDumpConfig, ScreenSnapshotConfig, SnapshotCliComponent, StatusConfig,
-    TailConfig, WaitConfig, WebCommand, WebDaemonCommand, WebServiceCommand,
-    WebServiceRegisterConfig, parse_args, usage,
+    TailConfig, WaitConfig, WebCommand, WebDaemonCommand, WebServiceCommand, parse_args, usage,
 };
 use hyoui::client::{AttachOptions, ClientConnection, RunOutcome};
 use hyoui::protocol::messages::{
@@ -497,10 +496,15 @@ fn main() -> ExitCode {
                 web_daemon::log_command(target.name.as_deref(), follow)
             }
             WebCommand::Service(WebServiceCommand::Register(cfg)) => {
-                web_service_register_command(cfg)
+                web_service::register_command(cfg.binary)
             }
-            WebCommand::Service(WebServiceCommand::Unregister) => web_service_unregister_command(),
-            WebCommand::Service(WebServiceCommand::Status) => web_service_status_command(),
+            WebCommand::Service(WebServiceCommand::Unregister) => web_service::unregister_command(),
+            WebCommand::Service(WebServiceCommand::Start) => web_service::start_command(true),
+            WebCommand::Service(WebServiceCommand::Stop) => web_service::start_command(false),
+            WebCommand::Service(WebServiceCommand::Status) => web_service::status_command(),
+            WebCommand::Service(WebServiceCommand::Log { follow }) => {
+                web_service::log_command(follow)
+            }
             _ => {
                 eprintln!(
                     "hyoui: web: unsupported web subcommand variant (binary/library version skew)"
@@ -2389,89 +2393,6 @@ fn socket_path_is_self(p: &std::path::Path) -> bool {
 /// tokio multi-thread runtime を新規に起こし、`hyoui_web::serve` を回す。
 /// listen アドレスの解決順は CLI flag `--listen` > config.toml `[web].listen` >
 /// hardcoded default (`127.0.0.1:43690` = 0xAAAA)。
-fn web_service_register_command(cfg: WebServiceRegisterConfig) -> ExitCode {
-    let current_exe = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("hyoui: web service register: cannot resolve own binary path: {error}");
-            return ExitCode::from(1);
-        }
-    };
-    let resolved = match web_service::resolve_program(&current_exe) {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            eprintln!("hyoui: web service register: {error}");
-            return ExitCode::from(1);
-        }
-    };
-    if let Some(warning) = resolved.warning {
-        eprintln!("{warning}");
-    }
-    let definition = web_service::ServiceDefinition::for_web(
-        &resolved.path.to_string_lossy(),
-        cfg.listen.as_deref(),
-        web_service::default_log_path(),
-    );
-    let backend = match web_service::backend() {
-        Ok(backend) => backend,
-        Err(error) => {
-            eprintln!("hyoui: web service register: {error}");
-            return ExitCode::from(1);
-        }
-    };
-    if let Err(error) = backend.register(&definition) {
-        eprintln!("hyoui: web service register: {error}");
-        return ExitCode::from(1);
-    }
-    let path = match backend.definition_path(&definition.label) {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("hyoui: web service register: {error}");
-            return ExitCode::from(1);
-        }
-    };
-    println!("registered {} ({})", definition.label, path.display());
-    ExitCode::SUCCESS
-}
-
-fn web_service_unregister_command() -> ExitCode {
-    let backend = match web_service::backend() {
-        Ok(backend) => backend,
-        Err(error) => {
-            eprintln!("hyoui: web service unregister: {error}");
-            return ExitCode::from(1);
-        }
-    };
-    let label = web_service::default_label();
-    if let Err(error) = backend.unregister(label) {
-        eprintln!("hyoui: web service unregister: {error}");
-        return ExitCode::from(1);
-    }
-    println!("unregistered {label}");
-    ExitCode::SUCCESS
-}
-
-fn web_service_status_command() -> ExitCode {
-    let backend = match web_service::backend() {
-        Ok(backend) => backend,
-        Err(error) => {
-            eprintln!("hyoui: web service status: {error}");
-            return ExitCode::from(1);
-        }
-    };
-    let label = web_service::default_label();
-    match backend.status(label) {
-        Ok(status) => {
-            print!("{}", status.render(label));
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("hyoui: web service status: {error}");
-            ExitCode::from(1)
-        }
-    }
-}
-
 fn web_command(cfg: hyoui::cli::WebConfig) -> ExitCode {
     let config = match hyoui::config::load() {
         Ok(c) => c,

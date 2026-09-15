@@ -392,16 +392,24 @@ pub fn version_command() -> ExitCode {
     let system = probe::SystemProbe;
 
     let mut output = json!({"cli": cli});
+    // 監督者の版は OS 側の定義に焼かれた binary を正として組む (= 決定 7a)。登録が
+    // 無ければ `supervisor` は `null` — 対象自体が存在しない。監督者が止まっていても
+    // 定義は読めるので、`on_disk` (= 次に上がる版) だけは答えられる。
+    let registered = crate::web_service::supervisor_version();
     match Supervisor::probe().request(&Request::Status(Target::all())) {
         Ok(Response::Units {
             units, supervisor, ..
         }) => {
-            let on_disk = system.on_disk(&supervisor.binary);
+            let binary = registered
+                .as_ref()
+                .map(|(_, binary)| binary.clone())
+                .unwrap_or(supervisor.binary);
+            let on_disk = system.on_disk(&binary);
             let pair = protocol::VersionPair::new(Some(supervisor.version), on_disk);
             output["supervisor"] = json!({
                 "running": pair.running,
                 "on_disk": pair.on_disk,
-                "binary": supervisor.binary,
+                "binary": binary,
                 "restart_needed": pair.restart_needed,
             });
             output["units"] = json!(
@@ -418,9 +426,18 @@ pub fn version_command() -> ExitCode {
             );
         }
         _ => {
-            // 監督者に聞けないので、走っている版は誰にも言えない。登録簿の binary
-            // から「次に上がる版」だけを並べる。
-            output["supervisor"] = Value::Null;
+            // 監督者に聞けないので、走っている版は誰にも言えない。登録簿と OS 側の
+            // 定義から「次に上がる版」だけを並べる。
+            output["supervisor"] = match &registered {
+                Some((pair, binary)) => json!({
+                    "running": Value::Null,
+                    "on_disk": pair.on_disk,
+                    "binary": binary,
+                    "restart_needed": false,
+                }),
+                // OS への登録が無ければ「監督者」という対象自体が無い。
+                None => Value::Null,
+            };
             let units = match Registry::open().list() {
                 Ok(units) => units,
                 Err(error) => return fail("version", &error.to_string(), None),

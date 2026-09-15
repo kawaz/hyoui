@@ -231,15 +231,20 @@ _hyoui() {
             local service_sub
             service_sub="$(_hyoui_child_of service)"
             if [[ -z "$service_sub" ]]; then
-                COMPREPLY=( $(compgen -W "register unregister status --help -h" -- "$cur") )
+                COMPREPLY=( $(compgen -W "register unregister start stop status log --help -h" -- "$cur") )
                 return 0
             fi
             case "$service_sub" in
                 register)
-                    case "$prev" in --listen) return 0 ;; esac
-                    COMPREPLY=( $(compgen -W "--listen --help -h" -- "$cur") )
+                    case "$prev" in
+                        --binary) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
+                    esac
+                    COMPREPLY=( $(compgen -W "--binary --help -h" -- "$cur") )
                     return 0 ;;
-                unregister|status)
+                log)
+                    COMPREPLY=( $(compgen -W "--follow --help -h" -- "$cur") )
+                    return 0 ;;
+                unregister|start|stop|status)
                     COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
                     return 0 ;;
             esac
@@ -722,6 +727,36 @@ _hyoui_record_subcommands() {
     _describe -t commands 'hyoui record subcommand' subs
 }
 
+_hyoui_service() {
+    local leaf=""
+    local word
+    for word in $words; do
+        case $word in
+            register|unregister|start|stop|status|log) leaf=$word; break ;;
+        esac
+    done
+    case $leaf in
+        register)
+            _arguments \
+                '--binary=[Executable to bake in as the supervisor]:binary:_files' \
+                '(-h --help)'{-h,--help}'[Show help]'
+            ;;
+        log)
+            _arguments \
+                '--follow[Keep printing lines as they are written]' \
+                '(-h --help)'{-h,--help}'[Show help]'
+            ;;
+        unregister|start|stop|status)
+            _arguments '(-h --help)'{-h,--help}'[Show help]'
+            ;;
+        *)
+            _arguments \
+                '1:service subcommand:(register unregister start stop status log)' \
+                '(-h --help)'{-h,--help}'[Show help]'
+            ;;
+    esac
+}
+
 _hyoui_daemon() {
     local leaf=""
     local word
@@ -773,17 +808,7 @@ _hyoui_web() {
     if (( ${words[(I)daemon]} )); then
         _hyoui_daemon
     elif (( ${words[(I)service]} )); then
-        if (( ${words[(I)register]} )); then
-            _arguments \
-                '--listen=[Bake bind address into the service command]:address:' \
-                '(-h --help)'{-h,--help}'[Show help]'
-        elif (( ${words[(I)unregister]} || ${words[(I)status]} )); then
-            _arguments '(-h --help)'{-h,--help}'[Show help]'
-        else
-            _arguments \
-                '1:service subcommand:(register unregister status)' \
-                '(-h --help)'{-h,--help}'[Show help]'
-        fi
+        _hyoui_service
     else
         _arguments \
             '--listen=[Bind address host:port (default 127.0.0.1:43690)]:address:' \
@@ -1211,13 +1236,20 @@ complete -c hyoui -n '__hyoui_daemon_using_sub add' -s h -l help -d 'Show help a
 complete -c hyoui -n '__hyoui_daemon_using_sub run' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_daemon_using_sub remove' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_daemon_using_sub list' -s h -l help -d 'Show help and exit'
-complete -c hyoui -n __hyoui_web_service_no_sub -f -a register -d 'Install or replace and start the service'
-complete -c hyoui -n __hyoui_web_service_no_sub -f -a unregister -d 'Stop and remove the service'
-complete -c hyoui -n __hyoui_web_service_no_sub -f -a status -d 'Print registration and running state'
-complete -c hyoui -n '__hyoui_web_service_using_sub register' -l listen -x -d 'Bake bind address into the service command'
+complete -c hyoui -n __hyoui_web_service_no_sub -f -a register -d 'Install or replace the supervisor definition and start it'
+complete -c hyoui -n __hyoui_web_service_no_sub -f -a unregister -d 'Stop the supervisor and remove its definition'
+complete -c hyoui -n __hyoui_web_service_no_sub -f -a start -d 'Start the supervisor'
+complete -c hyoui -n __hyoui_web_service_no_sub -f -a stop -d 'Stop the supervisor and every gateway it holds'
+complete -c hyoui -n __hyoui_web_service_no_sub -f -a status -d 'Print registration, OS state, versions, and units held'
+complete -c hyoui -n __hyoui_web_service_no_sub -f -a log -d "Print the supervisor's own log"
+complete -c hyoui -n '__hyoui_web_service_using_sub register' -l binary -r -F -d 'Executable to bake in as the supervisor'
 complete -c hyoui -n '__hyoui_web_service_using_sub register' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_web_service_using_sub unregister' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_web_service_using_sub start' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_web_service_using_sub stop' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_web_service_using_sub status' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_web_service_using_sub log' -l follow -d 'Keep printing lines as they are written'
+complete -c hyoui -n '__hyoui_web_service_using_sub log' -s h -l help -d 'Show help and exit'
 
 # `hyoui upgrade` options (DR-0028)
 complete -c hyoui -n '__hyoui_using_subcommand upgrade' -l socket -r -F -d 'Explicit socket path'
@@ -1695,8 +1727,8 @@ mod tests {
                 );
             }
             assert!(
-                offers_long_opt(&script, "listen"),
-                "shell {sh:?} missing `web service register --listen`"
+                offers_long_opt(&script, "binary"),
+                "shell {sh:?} missing `web service register --binary`"
             );
         }
     }
