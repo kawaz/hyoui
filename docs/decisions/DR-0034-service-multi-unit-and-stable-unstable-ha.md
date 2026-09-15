@@ -18,6 +18,18 @@
 
 gateway インスタンスを **複数前提**で扱えるようにし、片方が壊れてももう片方が受ける構成を、CLI と reverse proxy の設定だけで再現できるようにする。
 
+**第一の目的は、障害時に「まず plist を探す」作業を無くすこと** (kawaz、2026-09-15)。gateway を複数 launchd に登録すると、状態を見たい / 再起動したいと思った時に、まず**どの label の plist が何台あるか**を思い出す必要が出る。この操作は普段から頻繁にやるものではないので、そのたびに launchd の使い方から確認し直すことになる。障害が起きた瞬間に見たいのは状態とログで、探したいのは plist ではない。
+
+そこで **`hyoui web daemon list | status | log | restart` だけで全 gateway が見え、操作できる**状態にする。台数が増えても入口は 1 つのまま。
+
+監督者 (`supervise`) を置くのは、この入口を成立させるためであり、次の 3 つがその内訳:
+
+- **単一入口**: 複数の gateway の一覧・start / stop / restart / status / log が 1 つのコマンド体系に集まる。OS 側に散らばった定義を人が突き合わせる作業が消える
+- **binary 更新をまたいで安定する契約**: unit の binary を差し替えても、監督者より上のレイヤ (OS への登録) は触らなくてよい。gateway を更新するたびに `service register` をやり直す必要が無い (決定 3)
+- **status / log のスコープ分離**: `service` は OS 登録の話 (監督者 1 つが載っているか、その log) だけを扱い、`daemon` は子 gateway の話 (生きているか、再起動、その log) だけを扱う。見たい層を選んで見られる
+
+**launchd / systemd と監督者は見る対象が違うので、責務は重複しない。** launchd は監督者 1 つだけを見て、監督者は子 gateway だけを見る。同じプロセスを 2 人が監視する構造にはならない。
+
 ここで増やしたくないもの (目的と同格):
 
 - **人が触る OS 側の定義**。台数を増やしても、launchd / systemd に載るものは増やさない
@@ -55,7 +67,7 @@ llm-gateway が同じ reference 体系を先に当てている (DR-0028)。unit 
 
 - PTY / child / signal / protocol への介入は無い。DR-0031 と同じく OS service manager に起動を依頼する運用層で、透過原則を変更しない
 - hyoui の既存 protocol (CBOR / cap flags) には触らない。監督者の制御は独立した unix socket + JSON 1 行で、daemon socket とは別物 (決定 4)
-- **OS 標準機能との重複を認める。** 監督者の「落ちたら上げ直す」は launchd の `KeepAlive` / systemd の `Restart=always` と機能が重なる。unit ごとに OS へ登録すればこの重複は消えるが、**kawaz 裁定で reference 体系との統一を優先した** (Alternatives 参照)。重複を承知の上で採る判断であり、必然性から導いたものではない
+- **OS 機能の再発明ではない。** launchd / systemd は監督者 1 つの生存だけを見て、監督者は子 gateway の生存だけを見る。監視対象が重ならないので、同じ仕事を 2 箇所で持つ構造にならない。監督者が担うのは、OS 側が持っていない「複数の子を 1 つの入口から一覧・操作できること」と「子の binary を差し替えても OS 登録を触らなくてよい契約」(目的節)
 - 既存 DR の実装漏れではない。DR-0031 は実装済で、本 DR はその適用範囲を広げる
 
 ## Decision
@@ -126,6 +138,17 @@ backoff は llm-gateway と同じ形 (初回 1 秒から倍々、上限 60 秒)�
 
 **gateway は状態を持たない。** 各 gateway は socket dir を走査して daemon に繋ぐだけで、自前の永続状態を持たない。だから監督者は子を任意の順序で起こしてよく、起動順の依存も引き継ぎも無い。llm-gateway から踏襲するのは「設定の解釈は子」という線引きだけ。
 
+#### 監督者の binary は unit の binary と独立に決まる
+
+監督者に焼く path は **安定な場所** (`resolve_stable_path(current_exe, SameBinary)`、通常は `/opt/homebrew/bin/hyoui`) を選ぶ。`service register --binary=<path>` で明示もできる。unit 側 (決定 2) が `current_exe` をそのまま焼くのと逆なのは、役割が違うため:
+
+- 監督者は「登録簿を読んで子を exec し、落ちたら上げ直す」だけの役で、gateway の機能を持たない。どの版でも同じ仕事をする
+- unit は gateway 本体で、stable / unstable の違いがまさに試したいもの
+
+**この分離が「binary 更新をまたいで安定する契約」を成立させる** (目的節)。unstable の gateway を何度ビルドし直しても、変わるのは登録簿が指す `target/release/hyoui` の中身だけで、監督者の定義は 1 文字も変わらない。だから `service register` をやり直す必要が無く、`hyoui web daemon restart unstable` で足りる。
+
+**`service register` を再実行するのは、監督者自身を更新する時だけ。** 具体的には (a) `hyoui` を brew で上げて監督者の argv / path を新しい版に向け直す時、(b) 監督者の定義そのもの (label / 環境 / log path) を変えた時。どちらも普段の gateway 更新では起きない。
+
 ### 4. 制御は監督者への unix socket 1 本。監督者が居なければ断る
 
 `start` / `stop` / `restart` / `status` / `log` は子を直接叩かず、監督者へ要求する。socket は `$XDG_STATE_HOME/hyoui/web/supervisor.sock`、要求は JSON 1 行、答えも JSON 1 行 (`log --follow` だけ JSONL が続く)。
@@ -165,7 +188,11 @@ backoff は llm-gateway と同じ形 (初回 1 秒から倍々、上限 60 秒)�
 
 逆引き domain を `com.github.kawaz` から `jp.kawaz` に変えるのは、kawaz 製ツールの label を 1 つの名前空間に揃えるため (llm-gateway は既に `jp.kawaz.llm-gateway.supervise` を使っている)。副産物として、移行の途中で旧 label (`com.github.kawaz.hyoui-web`) と同時に載っても互いを踏まない。
 
-監督者に焼く binary の path は DR-0031 と同じ `resolve_stable_path(current_exe, SameBinary)` で選ぶ。監督者は「どの版でも同じことをする exec 役」なので、unit 側 (決定 2) と違って安定な path を指すのが正しい。安定な場所が無くても登録は止めず、warning を出す。
+監督者に焼く binary の path は決定 3 のとおり安定な場所を選ぶ (`resolve_stable_path`、`--binary` で明示可)。安定な場所が無くても登録は止めず、warning を出す。
+
+**監督者を止めると子も止まる。** 監督者は SIGTERM / SIGINT で抱えている子を全部止めてから終わる (決定 3)。したがって `service stop` は全 gateway の停止、`service stop` → `service start` は**全断を伴う入れ替え**になる。子を生かしたまま監督者だけを入れ替える経路は持たない — 残ったプロセスが自分の子かどうかは pid では確かめられないので、引き取りを作らない判断 (決定 10) と同じ理由でできない。
+
+この帰結として、**日常の更新は `daemon restart --all` (1 台ずつ、断なし) を使い、`service` 層の操作は監督者自身を入れ替える時だけに限る**。llm-gateway も同じ形 (DR-0028 §11: 行儀よく降りる限り子は道連れ) で、hyoui で変える理由は無い。gateway は状態を持たないので、道連れにされても失われるのは確立済みの WS 接続だけ (決定 8 のとおり、これは前段でも救えない)。
 
 **`service stop` を `launchctl stop` で実装してはいけない。** `KeepAlive=true` なので `launchctl stop` が送る SIGTERM の後 launchd が即座に上げ直す。systemd は逆で、`Restart=always` でも明示 `stop` は尊重する。この非対称を verb ごとに吸収する:
 
@@ -299,6 +326,7 @@ verb 名は残るが、載せる対象が gateway 1 台から監督者に変わ�
 | 監督者不在時に CLI が子を起こす | 決定 4。子の所有者が 2 つになる |
 | 監督者が登録簿を定期的に舐めて差分を取る | 間隔に根拠が無く、間隔の内側で起きた往復を取りこぼす |
 | 残った子の引き取り | 決定 10。pid は再起動を跨いで同一性を保証しない |
+| 子を生かしたまま監督者だけを入れ替える | 決定 6。引き取りができないのと同じ理由。日常の更新は `daemon restart --all` が担うので、この経路が無くても断なしの入れ替えは成立する |
 | 再起動時の graceful drain | 前段が新規接続を他 unit に回すので待ち合わせ不要。SIGTERM で即座に降りる前提。WS は fallback 対象外 (決定 8) なので drain を足しても救われる範囲は増えない |
 | ログ回転 | 決定 9。追記のみ、回転は OS の仕組みに任せる |
 | `on_disk` 版と `restart_needed` (llm-gateway DR-0028 §9) | `build_id` は tag を跨がないビルドを識別するためのもので、再起動が必要かの判定には使わない。`status` が出すのは走っている側の実測値だけにする。必要になったら別 DR で足す |
@@ -308,7 +336,7 @@ verb 名は残るが、載せる対象が gateway 1 台から監督者に変わ�
 
 | 案 | 不採用理由 |
 |---|---|
-| **監督者を置かず、unit 1 つ = OS service 1 つにする** | **kawaz 裁定 (2026-09-15、SVC-Q2=b) で不採用。** launchd / systemd が持つ「落ちたら上げる」と機能が重ならない利点はあるが、kawaz 製 CLI 共通の reference 体系 (`daemon` / `service` の 2 系統) から外れる。体系を揃えることの価値 (どのツールでも同じ verb で status / restart に到達できる、管理しやすさ) を、重複を避けることより上に置く |
+| **監督者を置かず、unit 1 つ = OS service 1 つにする** | 目的が達成できない。台数ぶんの plist / systemd unit が並ぶので、状態を見る・再起動する時に「どの label が何台あるか」を先に思い出す作業が残る (目的節の第一の目的)。unit の binary を差し替えるたびに OS 側の定義を書き直すことになり、「監督者より上は触らない」契約も立たない。`service` と `daemon` の status / log のスコープも分かれない。kawaz 製 CLI 共通の reference 体系から外れる点も同じ方向 (kawaz 裁定 2026-09-15、SVC-Q2=b) |
 | verb 群を `hyoui service` / `hyoui daemon` (top-level) に置く | kawaz 裁定 (SVC-Q1=a) で不採用。`hyoui daemon` は PTY session の daemon と語が衝突し、kind が増えた時に `--kind` で option 集合が分岐する。`hyoui web` 配下なら `add` の option が `hyoui web` の引数の写しになり、将来の kind は `hyoui session daemon` として並べられる |
 | 旧 `web service` を alias として温存する | 同じことをする口が 2 つ増え、help と completion にも 2 つ載る。利用者は kawaz だけで、互換のために語彙を濁す相手が居ない |
 | unit を port で識別する (名前を持たない) | port は「今どこで待つか」であって unit の同一性ではない。port を変えた瞬間に別 unit になり、`stable` の設定を 43690 → 43695 に移す操作が表現できない。stable / unstable という役割も名前でしか書けない |
@@ -325,8 +353,8 @@ verb 名は残るが、載せる対象が gateway 1 台から監督者に変わ�
 | P1 | `GET /healthz` / `GET /version` (`build_id` 込み)、`build.rs` の git 由来既定 | 単体 test で 200 / JSON 形 / `build_id` 未設定時の `null`。repo build と brew 版で `build_id` が異なることを実機で確認 |
 | P2 | 登録簿 (`units/<name>.toml`) と `add` / `remove` / `list`、`daemon run <unit>` | parser test (各 leaf、`--port` と `--listen` の排他、不正な unit 名、必須引数欠落時の help)。listen / assets_dir の解決と衝突拒否の test。登録簿の round-trip test。`daemon run <unit>` が登録簿の listen で上がることを実機確認 |
 | P3 | `supervise` + 制御 socket + `start` / `stop` / `restart` / `status` / `log` | 監督者不在時に `supervisor_not_running` + hint を返す test。子が落ちたら上がる / backoff 上限に達する test。`restart --all` を 127.0.0.1 直叩きで観測 (前段経由は P6)。`stop` した unit が復活しないことを観測 |
-| P4 | `service register` / `unregister` / `start` / `stop` / `status` / `log` を監督者向けに置き換え | plist / systemd unit の golden test。隔離 HOME での未登録 status と全 help topic。`service stop` 後に監督者が KeepAlive で復活しないことを実機で観測 |
-| P5 | 旧 `web service` の意味の切り替え完了、help / completion / 実装の 3 者同期、移行 runbook、既存 1 台の移行 | `hyoui web daemon --help` / `hyoui web service --help` と completion 定義の突き合わせ test。実機で stable + unstable の 2 台が監督者の下に常駐し、`status` が両方の `build_id` を別々に出す |
+| P4 | `service register` / `unregister` / `start` / `stop` / `status` / `log` を監督者向けに置き換え | plist / systemd unit の golden test。隔離 HOME での未登録 status と全 help topic。`service stop` 後に監督者が KeepAlive で復活しないことを実機で観測。`service stop` で子 gateway も落ちることを観測 (決定 6 の明文化どおりか) |
+| P5 | 旧 `web service` の意味の切り替え完了、help / completion / 実装の 3 者同期、移行 runbook、既存 1 台の移行 | `hyoui web daemon --help` / `hyoui web service --help` と completion 定義の突き合わせ test。実機で stable + unstable の 2 台が監督者の下に常駐し、`status` が両方の `build_id` を別々に出す。**目的節の契約を実機で確認**: unstable を再ビルド → `daemon restart unstable` だけで新しい `build_id` に入れ替わり、`service register` も plist の確認も要らないこと |
 | P6 | canddy リポへ upstream 設定の issue 起票、前段経由の HA 実機検証 | unstable を `stop` した状態で新規リクエストが stable に回る。stable のみ停止でも同様。`restart --all` 実行中に前段経由の断が出ない。3 つが揃って完了 |
 
 P6 の検証は DR-0014 の検証主義に従い 1 回の観察で結論しない。停止させる側 (unstable / stable)、止め方 (`daemon stop` / `kill -9` / `kill -STOP` で TCP は受けるが応答しない状態 / bind 失敗させて backoff に入れる)、リクエストの種類 (HTML / `GET /api/sessions`) の組合せでマトリクスを埋める。`kill -STOP` の列は決定 8 の「窓」の実測値になるので、「断が出ない」と書ける範囲をこの列の結果で限定する。
