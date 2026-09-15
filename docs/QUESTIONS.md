@@ -20,7 +20,20 @@
 
 ## 裁定待ち
 
-(現在なし)
+### 👺ECO-Q1: `ignored-tests` job の `continue-on-error: true` を外すか
+
+外部レビュー H-1 の提案。実測 (直近 15 run) では macOS は 08-21 以降 8 run 連続 green、ubuntu は毎回違う 1〜2 本 (daemon shutdown 系 / attach 系) が落ちる = 負荷依存の不安定で、レビューが言う「固定 2 本の恒常 fail」は現状と合わない。
+
+- [ ] a: 外さない (統括推し)。外すと ubuntu の負荷依存 fail で main が常時 red になり、それ自体が別のノイズになる。代わりに issue `2026-07-26-bug-ignored-tests-job-permanently-red` の集計を現状 (macOS green / ubuntu は毎回違うテスト) に更新し、ubuntu 側の真因調査を継続する
+- [ ] b: 外す。red を見えるようにして、落ちる各テストを `#[ignore = "<理由 + issue>"]` で明示 skip に倒しながら潰す
+- [ ] c: 外さないが、ubuntu job だけ retry (`nick-fields/retry` 等) を入れて 1 回の負荷依存 fail を吸収する
+
+### 👺ECO-Q2: `hyoui web service` を `hyoui service` に改名するか
+
+外部レビュー H-3。個人 reference `cli-daemon-subcommands` は `<tool> service` の形で、常駐 unit が web gateway 1 つだけの hyoui なら `web` の階層は不要という指摘。v1.0 未満なので breaking は可。
+
+- [ ] a: 改名する (`hyoui service register|unregister|status`。help / completion / DR-0031 も同時更新)
+- [ ] b: 現状維持 (`web` 配下に `serve` 等の兄弟があり、gateway 専用であることが名前で分かる)
 
 
 ## 確認待ち
