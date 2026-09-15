@@ -1,6 +1,6 @@
 # DR-0028: daemon graceful upgrade — self-exec による fd/PID 引き継ぎ
 
-- Status: Active (2026-07-21 全裁定確定、実装は Phase 1 から未着手)
+- Status: Active — Phase 1〜3 実装済 (2026-07-21)、下記「検証要件」のマトリクスと e2e テストは未整備 (docs/issue/2026-09-15-upgrade-e2e-test.md)
 - Date: 2026-07-21
 - Related: DR-0025 (message 駆動原則 — upgrade も protocol message として形式化、state の message 形式化が進むほど handoff は単純化), DR-0008 (protocol — 新 kind 追加規約 / cap flag), DR-0013 (screen state 正本 — scrollback bytes 再 feed による再構築の根拠), DR-0017 (session anchor — daemon = session leader + controlling tty、PID 温存の必然の根拠), DR-0016 (record — scrollback/record bytes が再構築の材料), DR-0014 (検証主義 — マトリクス検証要件)
 - Origin: kawaz 要望 2026-07-20「再起動したくない。fd も pid も引き継いで新バイナリに exec する感じ」、docs/issue/2026-07-21-daemon-graceful-upgrade-self-exec.md
