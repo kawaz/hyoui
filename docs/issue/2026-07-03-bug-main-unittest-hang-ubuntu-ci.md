@@ -73,3 +73,7 @@ hyoui-cli `src/main.rs` unit test binary の実行中に無出力のまま hang 
 
 - [ ] hang の真因が観測データで特定されている (推測での close 不可)
 - [ ] 該当 2 test が CI 並列実行で安定して完走する
+
+## 観測 (2026-09-15)
+
+- CI run 34937543710 (commit d41ec3f0、docs のみの差分) の `Test (ubuntu-latest / stable)` で `daemon::session::tests::serve_attach_redraw_includes_pre_attach_output` が `read_until_contains: timed out waiting for "ATTACH_TEST_OK"` (5 秒) で FAILED。同一コードの直前 2 run (aca7bb1 / aae765b) は pass、ローカル macOS では 3/3 pass。runner 負荷依存の timeout で、本 issue と同じ軸のサンプル
