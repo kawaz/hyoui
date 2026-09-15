@@ -58,7 +58,12 @@ pub mod discovery;
 // 引き上げ、hyoui-web からも同じ変換を使う)。
 pub mod input_bytes;
 
+pub mod version;
+
 /// Library version (matches `Cargo.toml`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Build identifier derived by the build script, when available.
+pub const BUILD_ID: Option<&str> = option_env!("HYOUI_BUILD_ID");
 
 pub use sys::error::{Error, Result};

@@ -70,6 +70,8 @@ pub fn router(config: hyoui::config::Config, assets_dir: Option<PathBuf>) -> Rou
     };
     Router::new()
         .route("/", get(get_index_page))
+        .route("/healthz", get(get_healthz))
+        .route("/version", get(get_version))
         .route("/sessions/{id}", get(get_session_page))
         .route("/assets/{*path}", get(get_asset))
         .route("/api/sessions", get(get_sessions))
@@ -106,6 +108,14 @@ pub async fn serve(
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+async fn get_healthz() -> &'static str {
+    "ok"
+}
+
+async fn get_version() -> axum::Json<hyoui::version::VersionInfo> {
+    axum::Json(hyoui::version::VersionInfo::current())
 }
 
 // -----------------------------------------------------------------------------
@@ -779,6 +789,40 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn healthz_returns_ok() {
+        let response = router(hyoui::config::Config::default(), None)
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16).await.unwrap();
+        assert_eq!(&body[..], b"ok");
+    }
+
+    #[tokio::test]
+    async fn version_returns_build_identity() {
+        let response = router(hyoui::config::Config::default(), None)
+            .oneshot(
+                Request::builder()
+                    .uri("/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["version"], serde_json::json!(hyoui::VERSION));
+        assert_eq!(json["build_id"], serde_json::json!(hyoui::BUILD_ID));
+    }
 
     #[tokio::test]
     async fn parse_specs_rejects_file_and_wait() {

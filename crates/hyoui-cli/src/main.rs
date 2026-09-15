@@ -22,8 +22,8 @@ use hyoui::cli::{
     RecordCommand, RecordDirectionArg, RecordFormatArg, RecordInputSecrecyArg, RecordListConfig,
     RecordListFormatArg, RecordStartConfig, RecordStopConfig, ScreenCommand, ScreenDumpCliFormat,
     ScreenDumpCliLayer, ScreenDumpConfig, ScreenSnapshotConfig, SnapshotCliComponent, StatusConfig,
-    TailConfig, WaitConfig, WebCommand, WebServiceCommand, WebServiceRegisterConfig, parse_args,
-    usage,
+    TailConfig, WaitConfig, WebCommand, WebDaemonCommand, WebServiceCommand,
+    WebServiceRegisterConfig, parse_args, usage,
 };
 use hyoui::client::{AttachOptions, ClientConnection, RunOutcome};
 use hyoui::protocol::messages::{
@@ -39,6 +39,7 @@ mod daemonize;
 use hyoui::input_bytes as input_handlers;
 mod socket_path;
 mod wait_core;
+mod web_daemon;
 mod web_service;
 
 /// `hyoui attach` / `hyoui run` が daemon との接続を予期せず失った
@@ -387,7 +388,7 @@ fn main() -> ExitCode {
         }
 
         Command::Version => {
-            println!("hyoui {}", hyoui::VERSION);
+            println!("{}", hyoui::version::VersionInfo::current().display_line());
             ExitCode::SUCCESS
         }
 
@@ -468,6 +469,14 @@ fn main() -> ExitCode {
 
         Command::Web(sub) => match sub {
             WebCommand::Serve(cfg) => web_command(cfg),
+            WebCommand::Daemon(WebDaemonCommand::Run { name }) => {
+                web_daemon::run_command(name.as_deref())
+            }
+            WebCommand::Daemon(WebDaemonCommand::Add(cfg)) => web_daemon::add_command(cfg),
+            WebCommand::Daemon(WebDaemonCommand::Remove { name }) => {
+                web_daemon::remove_command(&name)
+            }
+            WebCommand::Daemon(WebDaemonCommand::List) => web_daemon::list_command(),
             WebCommand::Service(WebServiceCommand::Register(cfg)) => {
                 web_service_register_command(cfg)
             }
@@ -2870,11 +2879,9 @@ fn preflight_version_check(bin: &str) -> Result<String, String> {
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let first_line = stdout.lines().next().unwrap_or("").trim();
-    if !first_line.starts_with("hyoui ") {
-        return Err(format!(
-            "`{bin} --version` did not start with `hyoui ` (got: {first_line:?})"
-        ));
-    }
+    hyoui::version::parse_version_line(first_line).ok_or_else(|| {
+        format!("`{bin} --version` did not report a valid hyoui version (got: {first_line:?})")
+    })?;
     Ok(first_line.to_string())
 }
 
