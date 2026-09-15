@@ -50,7 +50,7 @@ Status 列は **ラベル + 最終判定日** だけを載せる。実装範囲�
 | [DR-0031](./DR-0031-web-service-subcommand.md) | ✅ 実装済 (2026-07-29) | `hyoui web service register\|unregister\|status` で HTTP gateway の OS 自動起動を製品機能化 |
 | [DR-0032](./DR-0032-child-suspend-unified-enum-and-action-menu.md) | ✅ 実装済 (2026-07-30) | 子 suspend 時動作の統合 enum (`[session] on_child_suspend`) + child action menu |
 | [DR-0033](./DR-0033-leader-request-takeover.md) | ✅ 実装済 (2026-08-01) | `leader.request` — rw client による leader 奪取 (takeover) |
-| [DR-0034](./DR-0034-service-multi-unit-and-stable-unstable-ha.md) | ⬜ 未実装 (2026-09-15) | `hyoui service` の multi-unit 化 (= unit = OS service 1 つ、監督者なし) と stable / unstable 2 インスタンスの HA |
+| [DR-0034](./DR-0034-service-multi-unit-and-stable-unstable-ha.md) | ⬜ 未実装 (2026-09-15) | `hyoui web daemon` / `hyoui web service` の 2 系統化 (= unit = 登録簿 1 ファイル + 監督者 1 つを OS に載せる) と stable / unstable 2 インスタンスの HA |
 
 ## Archived
 
