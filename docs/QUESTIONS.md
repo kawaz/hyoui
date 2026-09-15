@@ -45,19 +45,12 @@
 - [ ] b: ccmsg が短命 token を発行して iframe に渡す (hyoui が ccmsg を IdP として信頼)
 - [ ] c: iframe 内で WebAuthn を走らせる (統括推し)。ccmsg-webui の iframe に `allow="publickey-credentials-get"` (登録は CLI 招待 URL を top-level で開くので `create` は不要)、hyoui は `[web].frame_ancestors` に ccmsg の origin を allowlist して `topOrigin` を照合し、同じ値で CSP `frame-ancestors` を出す
 
-### 👺WEB-Q3: passkey 登録の bootstrap
-
-同 §4.2。localhost 限定は canddy 経由も 127.0.0.1 発なので不成立。
-
-- [ ] a: CLI 発行の招待 URL (`#register=<jwt>`、10 分) + 6 桁コード (ccmsg 同型、統括推し)
-- [ ] b: 初回だけ無認証で登録できる (TOFU)
-
 ### 👺WEB-Q4: 認証セッションの形
 
-同 §4.5。
+同 §4.5。reference `passkey-registration-local-first` は access (opaque、メモリ) + refresh (httpOnly cookie、rotate + 再利用検知) を規定している。
 
-- [ ] a: httpOnly cookie 1 本 (`Secure; SameSite=Strict`、sliding 30 日、CLI で失効。統括推し: 素の JS に tab-share を持ち込まない)
-- [ ] b: ccmsg 型 (access = メモリ + WS subprotocol、refresh = cookie、rotate + 再利用検知)
+- [ ] a: reference どおり (統括推し)。tab 間の refresh 調停は `multi-tab-token-refresh` を素の JS (Web Locks + BroadcastChannel) で実装する
+- [ ] b: httpOnly cookie 1 本 (sliding 30 日、CLI で失効)。reference から乖離する (素の JS に tab-share を持ち込まない、利用者 1 人)
 
 ### 👺WEB-Q5: 認可の軸
 

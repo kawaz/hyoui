@@ -138,7 +138,7 @@ HTML を無認証で配る帰結として、ログイン状態の判定は JS �
 | (B) localhost 限定の無認証登録ページ | `http://127.0.0.1:4369x/register` を開けば登録できる | **不成立**。canddy 経由も 127.0.0.1 発なので「localhost 限定」が判定できない (§1)。`X-Forwarded-For` を信じる形にすると、前段が付けない構成で穴になる |
 | (C) 初回は無認証、1 つ登録されたら閉じる (TOFU) | 最初の登録だけ誰でもできる | tailnet 前提の今は実害が薄いが、gateway を再インストールするたびに窓が開く。(A) より簡単でもない (CLI を 1 本足すだけの差) |
 
-**統括推し: (A)。** 6 桁コードの第 2 経路も ccmsg と同じく持つ (URL が漏れただけでは登録にならない)。reference の任意ゲート (b) (ホスト PC の生体認証承認) は hyoui でも後続とし、初版に入れない。
+**(A) で確定** (reference `passkey-registration-local-first` の規定そのもので、裁定は要らない)。6 桁コードの第 2 経路も ccmsg と同じく持つ (URL が漏れただけでは登録にならない)。reference の任意ゲート (b) (ホスト PC の生体認証承認) は hyoui でも後続とし、初版に入れない。
 
 #### 4.3 iframe 問題 (ccmsg webui に埋め込まれた hyoui をどう認証するか)
 
@@ -168,7 +168,7 @@ ccmsg の検証コードは `topOrigin` が存在するだけで拒否し (棚�
 | (S1) **httpOnly cookie 1 本** | opaque 乱数 32 byte、`__Secure-hyoui-<sha256(public_url origin) 先頭 16 hex>`、`HttpOnly; Secure; SameSite=Strict; Path=/`。gateway は lookup で検証。寿命 30 日の sliding (使うたび `Max-Age` を伸ばす、値は据え置き)。WS upgrade も cookie で認証 (upgrade request には cookie が乗る) | 素の JS で完結。複数タブの refresh 調停 (reference `multi-tab-token-refresh`) が丸ごと不要。fallback で unit が変わっても、record が file 共有 (4.6) なら session が続く |
 | (S2) ccmsg 型 (access = メモリ + WS subprotocol、refresh = cookie、rotate + 再利用検知) | 棚卸しのとおり | refresh の再利用検知で cookie 盗難を検出できる。代償は tab-share (Web Locks + BroadcastChannel) と rotate の実装で、ccmsg でも tab-share のテストは未整備 (棚卸し) |
 
-**統括推し: (S1)。** 理由は 2 つ。hyoui の assets は bundler 無しの素の JS で、ccmsg webui (Preact + signal) の tab-share を移植する土台が無い。もう 1 つは利用者が kawaz 1 人で、再利用検知が守る「盗まれた refresh を誰かが使い回す」場面より、fallback や複数タブでの安定性の方が日常の価値が大きい。cookie が `HttpOnly` なので XSS で読めない点は (S2) と同じ。失効は CLI (`hyoui web passkey remove <sub>` で credential と session を両方消す) と、`hyoui web session list|remove` で個別に落とせる形にする。
+**統括推し: (S2) reference どおり** (初版は (S1) を推したが、reference `passkey-registration-local-first` が規定する形から乖離する理由が「実装量」で、パターン統一 (kawaz 2026-09-15) より弱い。tab-share は `multi-tab-token-refresh` を素の JS で書く)。(S1) を推していた理由は 2 つで、乖離の代償として残す。hyoui の assets は bundler 無しの素の JS で、ccmsg webui (Preact + signal) の tab-share を移植する土台が無い。もう 1 つは利用者が kawaz 1 人で、再利用検知が守る「盗まれた refresh を誰かが使い回す」場面より、fallback や複数タブでの安定性の方が日常の価値が大きい。cookie が `HttpOnly` なので XSS で読めない点は (S2) と同じ。失効は CLI (`hyoui web passkey remove <sub>` で credential と session を両方消す) と、`hyoui web session list|remove` で個別に落とせる形にする。
 
 `Path=/` にするのは、hyoui は ccmsg と違って同一 host に複数 endpoint を置く構成 (`/` と `/personal/`) を持たないため。ccmsg-protocol の fixture には `https://mba.example.ts.net/hyoui` の path prefix 構成が現れるが (棚卸し Part 1-C)、実機の canddy は host で分けている。**path prefix 配置は初版で非対応**とし、必要になったら `public_url` の path を Path に写す。
 
@@ -241,8 +241,7 @@ kawaz の運用 (tailnet からの閲覧、ccmsg 経由の Terminal タブ) を�
 |---|---|---|---|---|
 | Q1 | web 境界の version 方式 | (a) 世代番号 1 つ、build_id は表示のみ | (b) cap 方式 / (c) 併用 | assets を配るのが gateway 自身なので交渉相手は常に同ビルド。stale ページは reload で収束する (§3) |
 | Q2 | iframe 内の認証経路 | (R) iframe 内 WebAuthn (`allow="publickey-credentials-get"` + hyoui 側 topOrigin allowlist) | (P) top-level ログイン + cookie / (Q) ccmsg 発行 token | ccmsg 側は属性 1 つ、popup 不要。cookie が iframe 内で乗るかの実機確認は (P) と共通 (§4.3) |
-| Q3 | bootstrap | (A) CLI 発行の招待 URL + 6 桁コード | (C) TOFU | localhost 限定 (B) は canddy 経由が 127.0.0.1 発なので不成立 (§4.2) |
-| Q4 | 認証セッション | (S1) httpOnly cookie 1 本、sliding 30 日、CLI で失効 | (S2) ccmsg 型 access / refresh + rotate | 素の JS で tab-share を持てない、利用者 1 人 (§4.5) |
+| Q4 | 認証セッション | (S2) reference どおり access + refresh cookie、rotate + 再利用検知 | (S1) httpOnly cookie 1 本 | パターン統一。tab-share は `multi-tab-token-refresh` を素の JS で (§4.5) |
 | Q5 | 認可の軸 | credential 単位 `rw` / `ro` を daemon mode に写す (既定 rw) | 認可を持たない (全員 rw) | 「観測だけの端末」を hyoui 既存の mode で表せる (§4.6) |
 | Q6 | WebAuthn 実装 | (L) `webauthn-rs` | (M) ccmsg 移植 | 依存は hyoui-web に閉じる。crate 設定で `none` / `required` が表せるかは実装前に確認 (§4.8) |
 | Q7 | 認証の既定を `passkey` に変える時期 | W3 (kawaz の実運用) を通してから W4 で major bump | W2 の時点で既定 `passkey` | 常駐 unit が config 無しで上がらなくなる事故を避ける (§6) |
