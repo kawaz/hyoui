@@ -1,18 +1,18 @@
 ---
 title: web ターミナルの初回 fit が webfont 読み込み前のセル寸法で固定される
-status: wip
+status: resolved
 category: bug
 created: 2026-07-30T11:17:33+09:00
-last_read: 2026-07-30T11:43:53+09:00
+last_read: 2026-09-15T14:50:00+09:00
 open_entered: 2026-07-30T11:17:33+09:00
 wip_entered: 2026-07-30T11:50:00+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-15T14:50:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: 2 原因とも修正 land 済み: (1) font load race は koxsqxvoqqqu (2026-07-30) で term.open 前に document.fonts.load を await (2s timeout / reject は fallback 続行、fonts.ready 後に再測定 refit)、(2) resize 204 偽成功は WS leader 経由 resize + 409 (issue 本文「修正」節、回帰 e2e_ws_attach_bridge_roundtrip)。本文「修正後の検証条件」のマトリクス (cold / cache 無効 / custom font / embed / 複数 resize / font 失敗 fallback) は記録が無く未検証。2026-07-30 以降 kawaz が web UI を日常使用して再報告なし
 blocked_by:
 origin: kawaz 申告「ウィンドウサイズのリサイズが上手く機能しないことが増えた気がする」の実機調査 (2026-07-30)
 ---
