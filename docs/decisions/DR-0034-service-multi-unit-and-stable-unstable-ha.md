@@ -79,6 +79,7 @@ llm-gateway が同じ reference 体系を先に当てている (DR-0028)。unit 
 | `restart --all` の順序 | 登録の逆順 (`supervisor.rs:286-288`、前段が手前を優先しているため) | **変更**: unit 名の昇順 (決定 5)。順序の根拠を前段の設定に置かない — 前段の優先順は canddy が持つ知識で、監督者は知らない |
 | 停止中 unit への `restart` | 無条件に `set_enabled(name, true)` (`supervisor.rs:318`) | **変更**: 名前指定なら同じ (enable して起こす)、`--all` は `enabled` な unit だけ (決定 5)。`stop` の意思を `--all` が覆さない |
 | 版の表示 | `version` が `on_disk` / `running` / `restart_needed` を並記 (DR-0028 §9)。`on_disk` は実行ファイルに `--version` を聞いて取る | 踏襲 (決定 7a)。**加えて** `build_id` を並べ、比較を `(version, build_id)` の組で行う — hyoui は crate version が tag まで動かないので、版だけでは入れ替えを検出できない |
+| 出力の field 名 | `unit` / `since_ms` など | **命名は独自**。借りるのは考え方だけで綴りは揃えない。識別子は `name`、時刻は ISO 8601 の絶対時刻 (`started_at`)、単位を名前に埋めない (決定 4) |
 
 ## 介入判断 self-check (CLAUDE.md / DR-0014)
 
@@ -210,7 +211,8 @@ backoff は llm-gateway と同じ形 (初回 1 秒から倍々、上限 60 秒)�
 `status` が返すのは unit の配列で、1 行はこの形:
 
 ```json
-{"name": "unstable", "enabled": true, "running": true, "pid": 4242, "since_ms": 81234,
+{"name": "unstable", "enabled": true, "running": true, "pid": 4242,
+ "started_at": "2026-09-15T16:02:31+09:00",
  "listen": "127.0.0.1:43691",
  "binary": "/Users/…/target/release/hyoui", "binary_exists": true,
  "version": {"running": {"version": "0.9.44", "build_id": "9f0e1d2"},
@@ -219,7 +221,9 @@ backoff は llm-gateway と同じ形 (初回 1 秒から倍々、上限 60 秒)�
  "restarts": 0, "last_exit": null}
 ```
 
-`version` の 3 つ組は決定 7a のとおり。`hyoui version` が出すのと同じ値で、`status` は「今どうなっているか」を見る口、`version` は「版だけを並べて見る」口として同じ事実を返す。unit の識別子は `name` 1 本にする (reference の例は `{id, unit}` だが、`id` は登録簿を持たない実装での連番で、名前がある本 DR では同じものを 2 通りに呼ぶだけになる)。`enabled` と `running` を分けるのは、停止指示のまま降りているのか、上げたいのに上がらないのかを区別するため。
+`version` の 3 つ組は決定 7a のとおり。`hyoui version` が出すのと同じ値で、`status` は「今どうなっているか」を見る口、`version` は「版だけを並べて見る」口として同じ事実を返す。
+
+**field 名は llm-gateway から引き写さず、hyoui として決める。** 借りるのは考え方 (版を 2 つ並べる、監督者不在時の答え方、`enabled` と `running` を分ける) で、綴りは揃えない。時刻は単位を名前に埋めず **ISO 8601 の絶対時刻** (`started_at`) で出す — 経過ミリ秒のような相対値は、出力を保存した後に読むと意味が変わる。継続時間を出す必要が生じたら秒の整数にする。unit の識別子は `name` 1 本にする (reference の例は `{id, unit}` だが、`id` は登録簿を持たない実装での連番で、名前がある本 DR では同じものを 2 通りに呼ぶだけになる)。`enabled` と `running` を分けるのは、停止指示のまま降りているのか、上げたいのに上がらないのかを区別するため。
 
 **`list` は監督者が居なくても動く。** 登録簿を読むだけで答えられる範囲 (`name` / `enabled` / `listen` / `binary`) を出し、`running` / `pid` は監督者に聞けないので `false` / `null` にして「監督者が停止中」と添える。障害時に最初に打つコマンドが監督者の生死に依存すると、目的節の「サクッと状態を見る」が成り立たない。`status` も同じ扱いで、監督者不在時は登録簿由来の列だけが埋まる。
 
