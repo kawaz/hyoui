@@ -3,28 +3,9 @@
 ラウンド毎の指摘を集約。各ラウンドの先頭で読み込み、dedup の対象に含める。
 対応済の項目は `[done]` を付ける。
 
-## 保管位置と参照
+## 保管位置
 
-- **canonical**: 本ファイル `docs/REVIEW-BACKLOG.md` (= リポ内、永続化)
-- **互換 symlink**: `/tmp/itumono-backlog-hyoui.md` → 本ファイル (= `itumono-full-review`
-  / `itumono-nonstop` スキルが `/tmp/itumono-backlog-{repo}.md` 規約で参照するため)
-- スキル本体 (`claude-rules-personal/itumono-skills`) の規約改修は別 PR 推奨
-  (他リポへ波及する変更のため、本リポ単独で先行)
-
-## 来歴
-
-- **Round 4** は前セッション (b368f29e、2026-05-27 01:40〜02:09 JST) で
-  8 personas + Codex + Gemini Pro 並列レビューとして実施。集約結果を `/tmp`
-  に書き戻そうとした際に `Prompt is too long` で Write が落ち、backlog が
-  空のままセッション終了。本セッション (c7988b6b) で csa の thinking ログから
-  集約内容を抽出し、再構築した。Codex は jj リポを git として認識できず失敗、
-  Gemini Pro は RATE_LIMIT_EXCEEDED で結果取れず。
-- **Round 5** は本セッションで 8 ペルソナ (SRE / Kernel / Formal / Audit / Perf
-  / POSIX / Sales / Classic) 並列レビュー → dedup 後 95 件集約 → CRITICAL/HIGH
-  をバッチで消化。R5-FRM-C1 (Session::into_parts ManuallyDrop) は誤指摘
-  (= v0.1.6 で Option<SessionInner> 化済) として除外。
-- **2026-05-27**: 本ファイルを `/tmp/itumono-backlog-hyoui.md` から `docs/REVIEW-BACKLOG.md`
-  に移管 (= リポ内永続化)。`/tmp` 側は symlink で互換維持。
+本ファイル `docs/REVIEW-BACKLOG.md` が正本 (= リポ内、永続化)。
 
 ## Round 4 (2026-05-27 全体レビュー — 8 personas)
 
