@@ -264,12 +264,66 @@ fn a_stopped_unit_is_not_revived_by_restart_all() {
     assert_eq!(unit["enabled"], false);
     assert_eq!(unit["running"], false);
 
-    // 名前を明示した restart は start と同義で、desired state を立て直す。
+    // 名前を明示した restart は desired state を立て直し、止まっている子を起こす。
     let named = json(&supervisor.run(&["web", "daemon", "restart", "keeper"]));
     assert_eq!(
         unit_row(&named, "keeper").expect("the unit is listed")["enabled"],
         true
     );
+    supervisor.await_status("the stopped unit to be woken by restart", |status| {
+        unit_row(status, "keeper").is_some_and(|unit| unit["running"] == true)
+    });
+}
+
+/// `restart <name>` は走っている子を入れ替える (= 決定 5)。
+#[test]
+fn restart_by_name_replaces_a_running_unit() {
+    let home = tempfile::tempdir().expect("isolated HOME");
+    let port = PORT_BASE + 8;
+    assert!(
+        hyoui(
+            &["web", "daemon", "add", "swap", &format!("--port={port}")],
+            home.path()
+        )
+        .status
+        .success()
+    );
+    let supervisor = Supervised::start(home);
+    let before = supervisor.await_status("the unit to come up", |status| {
+        unit_row(status, "swap").is_some_and(|unit| unit["running"] == true)
+    });
+    let first_pid = unit_row(&before, "swap").unwrap()["pid"].as_u64().unwrap();
+
+    let output = supervisor.run(&["web", "daemon", "restart", "swap"]);
+    assert!(
+        output.status.success(),
+        "restart swap failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let restarted = json(&output);
+    let unit = unit_row(&restarted, "swap").expect("the unit is listed");
+
+    // 応答そのものが入れ替わった後の行 (= 新しい pid) を載せている。
+    assert_eq!(unit["enabled"], true, "{unit}");
+    assert_eq!(unit["running"], true, "{unit}");
+    assert_ne!(unit["pid"].as_u64(), Some(first_pid), "{unit}");
+    // 人が頼んだ入れ替えは「監督者が起こし直した回数」に混ぜない (= 決定 4)。
+    assert_eq!(unit["restarts"], 0, "{unit}");
+    assert!(!is_alive(first_pid as i32), "the old child is still alive");
+
+    // 入れ替わった先が同じ port で応答する。
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut answered = false;
+    while Instant::now() < deadline {
+        if http_get(&format!("127.0.0.1:{port}"), "/healthz")
+            .is_some_and(|body| body.trim_end().ends_with("ok"))
+        {
+            answered = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(answered, "the replaced gateway never answered /healthz");
 }
 
 /// `restart --all` は 1 台ずつ入れ替え、入れ替わった先が応答する (= 決定 5)。

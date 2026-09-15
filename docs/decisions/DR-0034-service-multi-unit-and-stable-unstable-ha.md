@@ -251,7 +251,7 @@ backoff は llm-gateway と同じ形 (初回 1 秒から倍々、上限 60 秒)�
 
 **`stop` 済みの unit への `restart` は、対象の指定方法で分ける。**
 
-- `restart <name>` (名前を明示) は `start` と同義。`enabled` を立てて起動する
+- `restart <name>` (名前を明示) は `enabled` を立て、走っていれば止めてから起こし、止まっていれば起こす (= 停止中の unit に対してだけ `start` と同じ結果になる)
 - `restart --all` は `enabled` な unit だけを対象にし、停止中の unit は触らない (出力にスキップした旨を載せる)
 
 `--all` で停止中の unit まで上げると、`stop` が書いた desired state を `restart --all` が黙って覆す。意図的に降ろしてある unit が無関係な再起動のついでに復活するのは事故なので、名前を明示した時だけ desired state を書き換える。

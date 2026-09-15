@@ -90,7 +90,9 @@ pub struct UnitStatus {
     pub binary_exists: bool,
     /// 走っている版と置いてある版。
     pub version: VersionPair,
-    /// 監督者が起こし直した回数。
+    /// 監督者が自分の判断で起こし直した回数 (= 落ちた子を上げ直した数)。
+    /// `stop` / `restart` で人が入れ替えた分は数えない — この値は「勝手に落ちて
+    /// いる」ことの手がかりなので、頼まれて止めた分を混ぜると読めなくなる。
     pub restarts: u32,
     /// 最後に終わった時の様子。
     pub last_exit: Option<String>,

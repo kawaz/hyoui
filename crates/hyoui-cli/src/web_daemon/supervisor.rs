@@ -555,7 +555,7 @@ impl Supervisor {
         self.status_response(target, notes)
     }
 
-    /// `restart <name>` は start と同義、`--all` は enabled のみ 1 台ずつ (決定 5)。
+    /// `restart <name>` は enabled を立てて入れ替え、`--all` は enabled のみ 1 台ずつ (決定 5)。
     fn apply_restart(&mut self, target: &Target) -> Response {
         let names = match self.resolve(target) {
             Ok(names) => names,
@@ -563,9 +563,33 @@ impl Supervisor {
         };
         let mut notes = Vec::new();
 
-        if target.name.is_some() {
-            // 名前を明示した時だけ desired state を書き換える。
-            return self.apply_start(target);
+        // 名前を明示した時だけ desired state を書き換える。走っている子は
+        // 止めてから起こす (= restart は「走っているものを入れ替える」操作)。
+        if let Some(name) = target.name.clone() {
+            if let Err(error) = self.set_enabled(&name, true) {
+                notes.push(error);
+                return self.status_response(target, notes);
+            }
+            if self.units.get(&name).is_some_and(Runtime::is_running) {
+                self.stop(&name);
+                if !self.pump_until(self.timings.grace * 2, |this| {
+                    this.units
+                        .get(&name)
+                        .is_some_and(|runtime| matches!(runtime.state, State::Down))
+                }) {
+                    notes.push(format!("`{name}` did not stop; left it running"));
+                    return self.status_response(target, notes);
+                }
+            }
+            if let Some(runtime) = self.units.get_mut(&name) {
+                // 人が明示的に入れ替える時は backoff を待たせない。
+                runtime.backoff = self.timings.initial_backoff;
+                if !runtime.is_running() {
+                    runtime.next_start = Some(Instant::now());
+                }
+            }
+            self.tick();
+            return self.status_response(target, notes);
         }
 
         // 名前の昇順で 1 台ずつ。前段が優先順で振り分けるので、順に上げ直せば
@@ -1289,9 +1313,9 @@ mod tests {
         assert!(!registry.get("off").unwrap().enabled);
     }
 
-    /// `restart <name>` は名前を明示した時だけ desired state を立て直す (= 決定 5)。
+    /// 止まっている unit への `restart <name>` は enabled を立てて起こす (= 決定 5)。
     #[test]
-    fn restart_by_name_is_the_same_as_start() {
+    fn restart_by_name_enables_a_stopped_unit() {
         let home = tempfile::tempdir().unwrap();
         let registry = Registry::at(home.path().join("units"));
         let binary = home.path().join("hyoui");
