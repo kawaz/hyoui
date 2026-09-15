@@ -182,7 +182,7 @@ ccmsg の検証コードは `topOrigin` が存在するだけで拒否し (棚�
 - **challenge にも endpoint を埋める** (reference「challenge には発行者の id を埋める」と同型)。`/auth/challenge` の応答に `endpoint` を載せ、assert / register の検証で record の endpoint と一致することを見る。これで challenge を取った endpoint と使う endpoint のすり替えが効かない
 - **refresh**: 要求の `endpoint` と cookie の値で token family を引き、family の `endpoint` と一致することを見る。cookie 名が endpoint ごとに違う (§4.5) ので、同じブラウザに複数 endpoint の cookie が並んでも混ざらない
 - **HA endpoint に登録した credential は、裏の unit がどちらでも通る。** record は unit を跨いで同じ file から引け (§4.6)、検証に使うのは record の endpoint だけで、どの unit が受けたかは関係しない。個別 endpoint の credential は HA endpoint では使えない (origin が違う)。**HA endpoint の登録 1 本があれば日常の閲覧は足り、個別 endpoint の登録は unstable を狙って開く時 (dogfooding) にだけ要る**
-- CSRF / cross-site WS hijack への備えは「提示された token / cookie の family が言う endpoint と、到達 path・`clientDataJSON.origin` の一致」で足りる。`SameSite=Strict` の cookie と、access token が subprotocol / Bearer で明示提示される (§4.5) ことが 2 層目
+- CSRF / cross-site WS hijack への備えは「提示された token / cookie の family が言う endpoint と、要求の `endpoint`・`clientDataJSON.origin` の一致」で足りる。`SameSite=Strict` の cookie と、access token が subprotocol / Bearer で明示提示される (§4.5) ことが 2 層目
 - **127.0.0.1 直結 (経路 [3]) は passkey の対象外。** WebAuthn の RP ID は domain であり IP アドレスは使えない (仕様上。`localhost` は可)。かつ §1 のとおり loopback 発を免除にはできない。したがって経路 [3] は「認証を切った gateway」でしか使えない: config `[web].auth = "none" | "passkey"` を持ち、test と手元の dev は `none` で動かす。stable / unstable の常駐 unit は `passkey`
 - 非 browser client (curl / script) 向けの bearer token (`hyoui web token add`) は**初版で持たない**。hyoui の自動操作 CLI (`hyoui input` / `wait` / `tail`) は daemon の UDS を直接叩き、gateway を経由しない (DR-0005)。gateway の `/api/*` を script から叩く需要が出た時に足す。`hyoui service status` が叩く `/version` は無認証なので影響しない
 
@@ -223,7 +223,7 @@ refresh cookie の名前は reference どおり `__Secure-hyoui-<sha256(endpoint
 | 項目 | 借りる | 借りない | 理由 |
 |---|---|---|---|
 | 登録の起点を CLI に閉じる、fragment jwt、6 桁コード、試行 5 回で焼く | ○ | | 安全性の根。reference と一致 |
-| RP ID = record の endpoint の host、origin 完全一致、到達 path == endpoint の path、credential を endpoint に束縛 (ccmsg DR-0022) | ○ | | 4.4。gateway は endpoint を知らず、record が言う endpoint に対して検証する。そのまま |
+| RP ID = record の endpoint の host、origin 完全一致、credential を endpoint に束縛 (ccmsg DR-0022) | ○ | | 4.4。gateway は endpoint を知らず、record が言う endpoint に対して検証する。ccmsg の「到達 path == endpoint の path」だけは、マウント先を知らない hyoui では観測できないのでブラウザが `endpoint` を明示する形に置き換える |
 | `topOrigin` が在れば拒否 | | ○ | 4.3 (R)。allowlist (`[web].frame_ancestors`) にある `topOrigin` は通す。無条件拒否は ccmsg 自身が iframe に入らない判断で、埋め込まれる側の hyoui には当てはまらない |
 | 検証順序 (検証を通してから jti / challenge を消費) | ○ | | 一時失敗で URL が焼けない |
 | 登録完了 = 即サインイン | ○ | | |
