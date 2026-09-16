@@ -13,6 +13,78 @@
 use serde::{Deserialize, Serialize};
 
 // -----------------------------------------------------------------------------
+// エラー (DR-0035 決定 2)
+// -----------------------------------------------------------------------------
+
+/// エラー 1 型。HTTP body も WS frame も同じ形を使う。
+///
+/// `code` は kebab-case。daemon 由来の失敗では daemon の
+/// [`hyoui::protocol::messages::ErrorCode`] をそのまま通す (= `unsupported-capability`
+/// / `mode.not-leader` 等)。gateway 自身が起こした失敗には gateway の語彙を使う。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorInfo {
+    /// 機械可読な失敗種別 (kebab-case、または daemon の dotted code)。
+    pub code: String,
+    /// 人向けの説明。
+    pub message: String,
+}
+
+impl ErrorInfo {
+    /// `code` と `message` から作る。
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    /// gateway 内部の予期しない失敗 (= HTTP 500 相当)。
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(code::INTERNAL_ERROR, message)
+    }
+}
+
+/// gateway 自身が起こす失敗の `code` 語彙。
+///
+/// daemon 由来の失敗は daemon の code をそのまま通すので、ここには並べない
+/// (= 写しを作らない、DR-0035「増やしたくないもの」)。
+pub mod code {
+    /// request の形が不正 (= body / query / 寸法)。
+    pub const INVALID_REQUEST: &str = "invalid-request";
+    /// `specs[]` の要素が parse 不能、または web gateway では受け付けない種別。
+    pub const INVALID_INPUT_SPEC: &str = "invalid-input-spec";
+    /// その名前の session が無い。
+    pub const SESSION_NOT_FOUND: &str = "session-not-found";
+    /// entry はあるが stale (= socket 残骸 / handshake 失敗)。
+    pub const SESSION_STALE: &str = "session-stale";
+    /// asset が無い。
+    pub const ASSET_NOT_FOUND: &str = "asset-not-found";
+    /// asset path に `..` / 空 component が含まれる。
+    pub const INVALID_ASSET_PATH: &str = "invalid-asset-path";
+    /// DR-0022 auto-lock を他 client が保持中で取得できなかった。
+    pub const LOCK_CONTENTION: &str = "lock-contention";
+    /// DR-0022 auto-lock 取得が daemon 応答異常 / I/O で失敗した。
+    pub const LOCK_UNAVAILABLE: &str = "lock-unavailable";
+    /// gateway 内部の予期しない失敗。
+    pub const INTERNAL_ERROR: &str = "internal-error";
+    /// 受け取った WS text frame の `kind` が未知、または JSON が不正。
+    pub const UNKNOWN_KIND: &str = "unknown-kind";
+}
+
+/// HTTP エラー body の外枠 — `{"error": {"code": ..., "message": ...}}`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorEnvelope {
+    /// 失敗の内容。
+    pub error: ErrorInfo,
+}
+
+impl From<ErrorInfo> for ErrorEnvelope {
+    fn from(error: ErrorInfo) -> Self {
+        Self { error }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // HTTP body (DR-0035 決定 1 の routes 表)
 // -----------------------------------------------------------------------------
 
@@ -124,7 +196,7 @@ pub enum ServerFrame {
         ok: bool,
         /// 失敗の内容 (成功時は省略)。
         #[serde(skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
+        error: Option<ErrorInfo>,
     },
     /// `leader.request` への応答。
     #[serde(rename = "leader.result")]
@@ -136,7 +208,20 @@ pub enum ServerFrame {
         ok: bool,
         /// 失敗の内容 (成功時は省略)。
         #[serde(skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
+        error: Option<ErrorInfo>,
+    },
+    /// 未知 `kind` / 不正 JSON を受けた時 (DR-0035 決定 2)。
+    ///
+    /// **世代不一致の推定には使わない。** 検出は `hello.protocol` 1 本で、
+    /// `error` は「その要求が通らなかった」だけを扱う (決定 2)。2 経路で推定すると、
+    /// cap 不足と世代不一致が同じ帯に化ける。
+    #[serde(rename = "error")]
+    Error {
+        /// 相関できる要求があればその番号、無ければ `null`。
+        #[serde(rename = "requestId")]
+        request_id: Option<u64>,
+        /// 失敗の内容。
+        error: ErrorInfo,
     },
 }
 
@@ -222,13 +307,13 @@ mod tests {
             &ServerFrame::ResizeResult {
                 request_id: 8,
                 ok: false,
-                error: Some("not the resize leader".to_string()),
+                error: Some(ErrorInfo::new("mode.not-leader", "not the resize leader")),
             },
             json!({
                 "kind": "resize.result",
                 "requestId": 8,
                 "ok": false,
-                "error": "not the resize leader",
+                "error": {"code": "mode.not-leader", "message": "not the resize leader"},
             }),
         );
     }
@@ -247,19 +332,47 @@ mod tests {
             &ServerFrame::LeaderResult {
                 request_id: 18,
                 ok: false,
-                error: Some("daemon does not support leader.request".to_string()),
+                error: Some(ErrorInfo::new(
+                    "unsupported-capability",
+                    "daemon does not support leader-request-v1",
+                )),
             },
             json!({
                 "kind": "leader.result",
                 "requestId": 18,
                 "ok": false,
-                "error": "daemon does not support leader.request",
+                "error": {
+                    "code": "unsupported-capability",
+                    "message": "daemon does not support leader-request-v1",
+                },
+            }),
+        );
+    }
+
+    #[test]
+    fn server_frame_error_golden() {
+        golden(
+            &ServerFrame::Error {
+                request_id: None,
+                error: ErrorInfo::new(code::UNKNOWN_KIND, "unknown WS frame kind"),
+            },
+            json!({
+                "kind": "error",
+                "requestId": null,
+                "error": {"code": "unknown-kind", "message": "unknown WS frame kind"},
             }),
         );
     }
 
     #[test]
     fn http_bodies_golden() {
+        golden(
+            &ErrorEnvelope::from(ErrorInfo::new(
+                code::SESSION_NOT_FOUND,
+                "no session named \"x\"",
+            )),
+            json!({"error": {"code": "session-not-found", "message": "no session named \"x\""}}),
+        );
         golden(
             &InputResponse {
                 sent_bytes: 12,

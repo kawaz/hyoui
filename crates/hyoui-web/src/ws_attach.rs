@@ -43,7 +43,7 @@ use std::sync::Arc;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use futures_util::{SinkExt, StreamExt};
 
-use crate::contract::{AttachMode, ClientFrame, ServerFrame};
+use crate::contract::{AttachMode, ClientFrame, ErrorInfo, ServerFrame, code};
 
 /// bridge thread への入力コマンド。
 enum BridgeCmd {
@@ -92,8 +92,13 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf) -> Result<(), Str
     let wake_w = Arc::new(wake_w);
 
     // Task A: WS → input queue + wake pipe。
+    //
+    // 未知 `kind` / 不正 JSON の応答 (DR-0035 決定 2) は bridge thread を経由させず、
+    // writer queue へ直接積む。bridge は daemon との往復を担っており、browser の
+    // 形式違反はそこへ持ち込む理由が無い。
     let wake_w_a = wake_w.clone();
     let input_tx_a = input_tx;
+    let reject_tx = output_tx.clone();
     let reader_task = tokio::spawn(async move {
         while let Some(msg) = ws_rx.next().await {
             let cmd = match msg {
@@ -112,7 +117,26 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf) -> Result<(), Str
                         BridgeCmd::LeaderRequest { request_id }
                     }
                     Err(e) => {
-                        eprintln!("hyoui-web: invalid WS control message: {e}");
+                        // 黙殺すると「新しい browser + 古い gateway」が検出不能に
+                        // なる (DR-0035 決定 2)。requestId は JSON が壊れている
+                        // 可能性があるので相関させず null で返す。
+                        let frame = ServerFrame::Error {
+                            request_id: None,
+                            error: ErrorInfo::new(
+                                code::UNKNOWN_KIND,
+                                format!("unrecognized WS text frame: {e}"),
+                            ),
+                        };
+                        match encode_server_frame(&frame) {
+                            Ok(text) => {
+                                if reject_tx.send(BridgeOutput::Control(text)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(encode_err) => {
+                                eprintln!("hyoui-web: encode error frame: {encode_err}");
+                            }
+                        }
                         continue;
                     }
                 },
@@ -369,7 +393,7 @@ fn leader_on_connection(
     conn: &mut hyoui::client::ClientConnection,
     latest_grid: Option<(u16, u16)>,
     output_tx: &tokio::sync::mpsc::UnboundedSender<BridgeOutput>,
-) -> Result<(), String> {
+) -> Result<(), ErrorInfo> {
     use hyoui::protocol::ControlMessage;
     use hyoui::protocol::messages::LeaderRequest;
 
@@ -379,59 +403,61 @@ fn leader_on_connection(
         .iter()
         .any(|cap| cap == "leader-request-v1")
     {
-        return Err(
-            "daemon does not support leader.request (`leader-request-v1` was not negotiated)"
-                .to_string(),
-        );
+        return Err(ErrorInfo::new(
+            hyoui::protocol::messages::ErrorCode::UnsupportedCapability.as_str(),
+            "daemon does not support leader.request (`leader-request-v1` was not negotiated)",
+        ));
     }
 
     conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))
-        .map_err(|e| format!("set leader request timeout: {e}"))?;
+        .map_err(|e| ErrorInfo::internal(format!("set leader request timeout: {e}")))?;
     let result = (|| {
         conn.send_control(&ControlMessage::LeaderRequest(LeaderRequest::default()))
-            .map_err(|e| format!("send leader.request: {e}"))?;
+            .map_err(|e| ErrorInfo::internal(format!("send leader.request: {e}")))?;
 
         let mut raw = Vec::new();
         loop {
-            let message = conn
-                .recv_control(Some(&mut raw))
-                .map_err(|e| format!("await leader.request completion: {e}"))?;
+            let message = conn.recv_control(Some(&mut raw)).map_err(|e| {
+                ErrorInfo::internal(format!("await leader.request completion: {e}"))
+            })?;
             if !raw.is_empty() {
                 output_tx
                     .send(BridgeOutput::Bytes(std::mem::take(&mut raw)))
-                    .map_err(|_| "WS writer closed".to_string())?;
+                    .map_err(|_| ErrorInfo::internal("WS writer closed"))?;
             }
             match message {
                 ControlMessage::ModeChange(change) => {
                     if let Some(mode) = change.client_mode {
                         conn.response.mode = mode;
-                        send_attach_info(&conn.response, output_tx)?;
+                        send_attach_info(&conn.response, output_tx).map_err(ErrorInfo::internal)?;
                     }
                 }
                 ControlMessage::LeaderNotify(notify) => {
                     conn.response.leader = notify.client_id == Some(conn.response.client_id);
-                    send_attach_info(&conn.response, output_tx)?;
+                    send_attach_info(&conn.response, output_tx).map_err(ErrorInfo::internal)?;
                     if conn.response.leader {
                         return Ok(());
                     }
                 }
+                // daemon 由来の失敗は daemon の code をそのまま通す (DR-0035 決定 2)。
                 ControlMessage::Error(error) => {
-                    return Err(format!(
-                        "leader.request rejected ({}): {}",
-                        error.code, error.message
-                    ));
+                    return Err(ErrorInfo::new(error.code.as_str(), error.message));
                 }
                 _ => {}
             }
         }
     })();
     conn.set_read_timeout(None)
-        .map_err(|e| format!("clear leader request timeout: {e}"))?;
+        .map_err(|e| ErrorInfo::internal(format!("clear leader request timeout: {e}")))?;
     result?;
 
     if let Some((cols, rows)) = latest_grid {
-        resize_on_connection(conn, cols, rows, output_tx)
-            .map_err(|e| format!("leader acquired but resize failed: {e}"))?;
+        resize_on_connection(conn, cols, rows, output_tx).map_err(|e| {
+            ErrorInfo::new(
+                e.code,
+                format!("leader acquired but resize failed: {}", e.message),
+            )
+        })?;
     }
     Ok(())
 }
@@ -443,55 +469,54 @@ fn resize_on_connection(
     cols: u16,
     rows: u16,
     output_tx: &tokio::sync::mpsc::UnboundedSender<BridgeOutput>,
-) -> Result<(), String> {
+) -> Result<(), ErrorInfo> {
     use hyoui::protocol::ControlMessage;
     use hyoui::protocol::messages::{ErrorCode, Resize, StatusQuery};
 
     if cols == 0 || rows == 0 {
-        return Err(format!(
-            "cols/rows must be > 0 (got cols={cols}, rows={rows})"
+        return Err(ErrorInfo::new(
+            code::INVALID_REQUEST,
+            format!("cols/rows must be > 0 (got cols={cols}, rows={rows})"),
         ));
     }
     if !conn.response.leader {
-        return Err("WS attach connection is not the resize leader".to_string());
+        return Err(ErrorInfo::new(
+            ErrorCode::ModeNotLeader.as_str(),
+            "WS attach connection is not the resize leader",
+        ));
     }
 
     conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))
-        .map_err(|e| format!("set resize timeout: {e}"))?;
+        .map_err(|e| ErrorInfo::internal(format!("set resize timeout: {e}")))?;
     let result = (|| {
         conn.send_control(&ControlMessage::Resize(Resize { cols, rows }))
-            .map_err(|e| format!("send resize: {e}"))?;
+            .map_err(|e| ErrorInfo::internal(format!("send resize: {e}")))?;
         conn.send_control(&ControlMessage::StatusQuery(StatusQuery {}))
-            .map_err(|e| format!("send status query: {e}"))?;
+            .map_err(|e| ErrorInfo::internal(format!("send status query: {e}")))?;
 
         let mut raw = Vec::new();
         loop {
             let message = conn
                 .recv_control(Some(&mut raw))
-                .map_err(|e| format!("await resize completion: {e}"))?;
+                .map_err(|e| ErrorInfo::internal(format!("await resize completion: {e}")))?;
             if !raw.is_empty() {
                 let bytes = std::mem::take(&mut raw);
                 output_tx
                     .send(BridgeOutput::Bytes(bytes))
-                    .map_err(|_| "WS writer closed".to_string())?;
+                    .map_err(|_| ErrorInfo::internal("WS writer closed"))?;
             }
             match message {
                 ControlMessage::StatusResponse(_) => return Ok(()),
+                // daemon 由来の失敗は daemon の code をそのまま通す (DR-0035 決定 2)。
                 ControlMessage::Error(error) => {
-                    let code = error.code.as_str();
-                    let prefix = if error.code == ErrorCode::ModeNotLeader {
-                        "resize leader conflict"
-                    } else {
-                        "resize rejected"
-                    };
-                    return Err(format!("{prefix} ({code}): {}", error.message));
+                    return Err(ErrorInfo::new(error.code.as_str(), error.message));
                 }
                 _ => {}
             }
         }
     })();
     conn.set_read_timeout(None)
-        .map_err(|e| format!("clear resize timeout: {e}"))?;
+        .map_err(|e| ErrorInfo::internal(format!("clear resize timeout: {e}")))?;
     result
 }
 

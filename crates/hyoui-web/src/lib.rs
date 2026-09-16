@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -38,7 +39,7 @@ pub use axum;
 pub mod contract;
 mod ws_attach;
 
-use contract::{InputRequest, InputResponse, ResizeRequest};
+use contract::{ErrorEnvelope, ErrorInfo, InputRequest, InputResponse, ResizeRequest, code};
 
 /// リリースビルドに埋め込む静的アセット (= `crates/hyoui-web/assets/`)。
 ///
@@ -180,9 +181,13 @@ struct ScreenQuery {
 /// `screen.dump.request` の ANSI payload を `text/plain; charset=utf-8` で返す。
 async fn get_screen(
     Path(id): Path<String>,
-    Query(query): Query<ScreenQuery>,
+    query: Result<Query<ScreenQuery>, QueryRejection>,
     State(_state): State<AppState>,
 ) -> Response {
+    let Query(query) = match query {
+        Ok(q) => q,
+        Err(rejection) => return invalid_request(rejection.status(), rejection.body_text()),
+    };
     let sock = match resolve_socket(&id).await {
         Ok(p) => p,
         Err(e) => return e.into_response(),
@@ -281,16 +286,17 @@ impl InputError {
     fn into_response(self) -> Response {
         match self {
             InputError::Connect(msg) => internal_error(format!("input send failed: {msg}")),
-            InputError::LockContention { message } => (
-                StatusCode::CONFLICT,
+            InputError::LockContention { message } => conflict(
+                code::LOCK_CONTENTION,
                 format!("他 client が入力中のため lock を取得できません: {message}"),
-            )
-                .into_response(),
-            InputError::LockUnavailable { message } => (
+            ),
+            InputError::LockUnavailable { message } => error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("auto-lock 取得に失敗しました: {message}"),
-            )
-                .into_response(),
+                ErrorInfo::new(
+                    code::LOCK_UNAVAILABLE,
+                    format!("auto-lock 取得に失敗しました: {message}"),
+                ),
+            ),
             InputError::SpecSend {
                 spec_index,
                 message,
@@ -304,14 +310,18 @@ impl InputError {
 async fn post_input(
     Path(id): Path<String>,
     State(_state): State<AppState>,
-    axum::Json(body): axum::Json<InputRequest>,
+    body: Result<axum::Json<InputRequest>, JsonRejection>,
 ) -> Response {
+    let axum::Json(body) = match body {
+        Ok(b) => b,
+        Err(rejection) => return invalid_request(rejection.status(), rejection.body_text()),
+    };
     // Phase 1: file: / wait: / wait-idle: は非サポート (network 経由で server 側の file を
     // 読む経路 = セキュリティ懸念、wait 系は long-poll になり client の HTTP timeout と
     // 相性が悪い)。text: / hex: / key: / paste: のみ受理。
     let parsed = match parse_specs(&body.specs) {
         Ok(v) => v,
-        Err(msg) => return bad_request(msg),
+        Err(msg) => return bad_request(code::INVALID_INPUT_SPEC, msg),
     };
     let sock = match resolve_socket(&id).await {
         Ok(p) => p,
@@ -499,13 +509,20 @@ fn resume_child_blocking(socket_path: &std::path::Path) -> Result<(), String> {
 async fn post_resize(
     Path(id): Path<String>,
     State(_state): State<AppState>,
-    axum::Json(body): axum::Json<ResizeRequest>,
+    body: Result<axum::Json<ResizeRequest>, JsonRejection>,
 ) -> Response {
+    let axum::Json(body) = match body {
+        Ok(b) => b,
+        Err(rejection) => return invalid_request(rejection.status(), rejection.body_text()),
+    };
     if body.cols == 0 || body.rows == 0 {
-        return bad_request(format!(
-            "cols/rows must be > 0 (got cols={}, rows={})",
-            body.cols, body.rows
-        ));
+        return bad_request(
+            code::INVALID_REQUEST,
+            format!(
+                "cols/rows must be > 0 (got cols={}, rows={})",
+                body.cols, body.rows
+            ),
+        );
     }
     let sock = match resolve_socket(&id).await {
         Ok(p) => p,
@@ -515,7 +532,9 @@ async fn post_resize(
     let result = tokio::task::spawn_blocking(move || resize_blocking(&sock, cols, rows)).await;
     match result {
         Ok(Ok(())) => (StatusCode::NO_CONTENT, "").into_response(),
-        Ok(Err(ResizeError::Conflict(msg))) => conflict(format!("resize failed: {msg}")),
+        Ok(Err(ResizeError::Conflict { code: c, message })) => {
+            conflict(&c, format!("resize failed: {message}"))
+        }
         Ok(Err(ResizeError::Internal(msg))) => internal_error(format!("resize failed: {msg}")),
         Err(e) => internal_error(format!("resize join error: {e}")),
     }
@@ -523,7 +542,11 @@ async fn post_resize(
 
 #[derive(Debug)]
 enum ResizeError {
-    Conflict(String),
+    /// leader 競合。`code` は daemon 由来なら daemon の code をそのまま持つ。
+    Conflict {
+        code: String,
+        message: String,
+    },
     Internal(String),
 }
 
@@ -542,9 +565,10 @@ fn resize_blocking(socket_path: &std::path::Path, cols: u16, rows: u16) -> Resul
     let mut conn = ClientConnection::connect(socket_path, opts)
         .map_err(|e| ResizeError::Internal(format!("connect/handshake: {e}")))?;
     if !conn.response.leader {
-        return Err(ResizeError::Conflict(
-            "another client owns the resize leader role".to_string(),
-        ));
+        return Err(ResizeError::Conflict {
+            code: ErrorCode::ModeNotLeader.as_str().to_string(),
+            message: "another client owns the resize leader role".to_string(),
+        });
     }
     conn.send_control(&ControlMessage::Resize(hyoui::protocol::messages::Resize {
         cols,
@@ -566,11 +590,10 @@ fn resize_blocking(socket_path: &std::path::Path, cols: u16, rows: u16) -> Resul
         match conn.recv_control(None) {
             Ok(ControlMessage::StatusResponse(_)) => return Ok(()),
             Ok(ControlMessage::Error(error)) if error.code == ErrorCode::ModeNotLeader => {
-                return Err(ResizeError::Conflict(format!(
-                    "{}: {}",
-                    error.code.as_str(),
-                    error.message
-                )));
+                return Err(ResizeError::Conflict {
+                    code: error.code.as_str().to_string(),
+                    message: error.message,
+                });
             }
             Ok(ControlMessage::Error(error)) => {
                 return Err(ResizeError::Internal(format!(
@@ -642,10 +665,13 @@ impl ResolveSocketError {
             ResolveSocketError::Enumerate(msg) => {
                 internal_error(format!("session enumeration join error: {msg}"))
             }
-            ResolveSocketError::Stale { id, reason } => {
-                not_found(format!("session {id:?} is stale: {reason}"))
+            ResolveSocketError::Stale { id, reason } => not_found(
+                code::SESSION_STALE,
+                format!("session {id:?} is stale: {reason}"),
+            ),
+            ResolveSocketError::NotFound { id } => {
+                not_found(code::SESSION_NOT_FOUND, format!("no session named {id:?}"))
             }
-            ResolveSocketError::NotFound { id } => not_found(format!("no session named {id:?}")),
         }
     }
 }
@@ -695,7 +721,10 @@ async fn get_session_page(Path(_id): Path<String>, State(state): State<AppState>
 async fn get_asset(Path(path): Path<String>, State(state): State<AppState>) -> Response {
     // Reject any traversal component. `axum::extract::Path` decodes %2E etc.
     if path.split('/').any(|c| c == ".." || c.is_empty()) {
-        return not_found(format!("invalid asset path: {path:?}"));
+        return not_found(
+            code::INVALID_ASSET_PATH,
+            format!("invalid asset path: {path:?}"),
+        );
     }
     serve_asset(&state, &path).await
 }
@@ -709,7 +738,7 @@ async fn serve_asset(state: &AppState, rel: &str) -> Response {
         match tokio::fs::read(&full).await {
             Ok(bytes) => (StatusCode::OK, [(header::CONTENT_TYPE, ct)], bytes).into_response(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                not_found(format!("asset not found: {rel}"))
+                not_found(code::ASSET_NOT_FOUND, format!("asset not found: {rel}"))
             }
             Err(e) => internal_error(format!("asset read error: {e}")),
         }
@@ -721,7 +750,7 @@ async fn serve_asset(state: &AppState, rel: &str) -> Response {
                 f.contents().to_vec(),
             )
                 .into_response(),
-            None => not_found(format!("asset not found: {rel}")),
+            None => not_found(code::ASSET_NOT_FOUND, format!("asset not found: {rel}")),
         }
     }
 }
@@ -744,20 +773,35 @@ fn content_type_for(path: &str) -> &'static str {
     }
 }
 
-fn bad_request(msg: impl Into<String>) -> Response {
-    (StatusCode::BAD_REQUEST, msg.into()).into_response()
+/// エラー応答を 1 形に揃える (DR-0035 決定 2)。
+///
+/// body は `{"error": {"code": ..., "message": ...}}` で、plain text は返さない。
+fn error_response(status: StatusCode, error: ErrorInfo) -> Response {
+    (status, axum::Json(ErrorEnvelope::from(error))).into_response()
 }
 
-fn not_found(msg: impl Into<String>) -> Response {
-    (StatusCode::NOT_FOUND, msg.into()).into_response()
+/// axum の extractor が弾いた request を決定 2 のエラー形に載せ替える。
+///
+/// axum 既定の rejection 応答は plain text なので、そのまま返すと `/api/*` の
+/// body が 2 系統になる。status は rejection の判断 (= 400 / 415 / 422) を尊重する。
+fn invalid_request(status: StatusCode, message: String) -> Response {
+    error_response(status, ErrorInfo::new(code::INVALID_REQUEST, message))
 }
 
-fn conflict(msg: impl Into<String>) -> Response {
-    (StatusCode::CONFLICT, msg.into()).into_response()
+fn bad_request(code: &str, msg: impl Into<String>) -> Response {
+    error_response(StatusCode::BAD_REQUEST, ErrorInfo::new(code, msg))
+}
+
+fn not_found(code: &str, msg: impl Into<String>) -> Response {
+    error_response(StatusCode::NOT_FOUND, ErrorInfo::new(code, msg))
+}
+
+fn conflict(code: &str, msg: impl Into<String>) -> Response {
+    error_response(StatusCode::CONFLICT, ErrorInfo::new(code, msg))
 }
 
 fn internal_error(msg: impl Into<String>) -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, msg.into()).into_response()
+    error_response(StatusCode::INTERNAL_SERVER_ERROR, ErrorInfo::internal(msg))
 }
 
 #[cfg(test)]
@@ -823,6 +867,27 @@ mod tests {
         assert!(err.contains("wait"), "err={err}");
     }
 
+    /// エラー body を `{error: {code, message}}` として読む (DR-0035 決定 2)。
+    async fn error_body(response: Response) -> ErrorEnvelope {
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("application/json"),
+            "エラー body は JSON でなければならない: content-type={ct}"
+        );
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice(&body).unwrap_or_else(|e| {
+            panic!(
+                "エラー body が契約形ではない ({e}): {}",
+                String::from_utf8_lossy(&body)
+            )
+        })
+    }
+
     #[tokio::test]
     async fn missing_session_returns_404() {
         // daemon が居ない状態でも router は動く。unknown session_id は 404。
@@ -837,6 +902,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = error_body(resp).await;
+        assert_eq!(body.error.code, code::SESSION_NOT_FOUND);
+        assert!(
+            body.error.message.contains("no-such-session-xyz"),
+            "message に session 名が要る: {}",
+            body.error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn every_api_error_path_uses_the_contract_error_shape() {
+        // plain text body の経路を残さない (DR-0035 決定 2)。extractor が弾く
+        // 経路 (不正 JSON / 不正 query) も、handler が弾く経路も同じ形にする。
+        let app = router(hyoui::config::Config::default(), None);
+        let cases: Vec<(&str, &str, Option<&[u8]>, StatusCode)> = vec![
+            (
+                "GET",
+                "/api/sessions/anything/screen?layer=nope",
+                None,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "POST",
+                "/api/sessions/anything/input",
+                Some(b"not a json"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "POST",
+                "/api/sessions/anything/input",
+                Some(br#"{"specs":["notaknownprefix:x"]}"#),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "POST",
+                "/api/sessions/anything/resize",
+                Some(br#"{"cols":0,"rows":24}"#),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "POST",
+                "/api/sessions/anything/resume",
+                None,
+                StatusCode::NOT_FOUND,
+            ),
+        ];
+        for (method, uri, body, expected) in cases {
+            let request = Request::builder().method(method).uri(uri);
+            let request = match body {
+                Some(b) => request
+                    .header("content-type", "application/json")
+                    .body(Body::from(b.to_vec()))
+                    .unwrap(),
+                None => request.body(Body::empty()).unwrap(),
+            };
+            let resp = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(resp.status(), expected, "{method} {uri}");
+            let parsed = error_body(resp).await;
+            assert!(!parsed.error.code.is_empty(), "{method} {uri}: code が空");
+            assert!(
+                !parsed.error.message.is_empty(),
+                "{method} {uri}: message が空"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1187,5 +1316,6 @@ mod tests {
             .unwrap();
         // axum の JSON extractor は 400 を返す。
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_body(resp).await.error.code, code::INVALID_REQUEST);
     }
 }

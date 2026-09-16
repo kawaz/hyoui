@@ -2,6 +2,9 @@
 // Fetches /api/sessions/:id/screen (ANSI) every few seconds, writes bytes into
 // an xterm.js instance. Input form POSTs to /api/sessions/:id/input.
 (async () => {
+  // 契約の読み取りは contract.js に寄せる (DR-0035 決定 2)。
+  const { httpError, frameErrorText } = window.hyouiContract;
+
   const REFRESH_MS = 2000;
   const COLS = 80;
   const ROWS = 24;
@@ -936,10 +939,7 @@
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ cols, rows }),
     });
-    if (!r.ok) {
-      const text = await r.text();
-      throw new Error(`HTTP ${r.status}: ${text}`);
-    }
+    if (!r.ok) throw await httpError(r);
   }
 
   async function requestResize(cols, rows) {
@@ -1049,10 +1049,7 @@
     resumeBtn.textContent = 'resuming…';
     try {
       const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/resume`, { method: 'POST' });
-      if (!r.ok) {
-        const txt = await r.text();
-        throw new Error(`HTTP ${r.status}: ${txt}`);
-      }
+      if (!r.ok) throw await httpError(r);
       // 復帰後 daemon が redraw を送るので、screen と status の両方を fetch し直す。
       setTimeout(() => { fetchScreen(); refreshSessionStatus(); }, 300);
     } catch (e) {
@@ -1109,9 +1106,9 @@
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ specs }),
       });
-      const txt = await r.text();
-      if (!r.ok) throw new Error(`HTTP ${r.status}: ${txt}`);
-      sendStatus.textContent = `sent (${txt})`;
+      if (!r.ok) throw await httpError(r);
+      const sent = await r.json();
+      sendStatus.textContent = `sent (${sent.sent_bytes} B / ${sent.specs} specs)`;
       // Refresh screen soon after sending — WS 中は bridge が echo を stream で
       // 返すので fetchScreen を呼ばない (reset で scrollback / 選択が消えるため)。
       if (!wsIsOpen()) setTimeout(fetchScreen, 300);
@@ -1812,7 +1809,7 @@
             if (!pending) return;
             wsResizePending.delete(message.requestId);
             if (message.ok) pending.resolve();
-            else pending.reject(new Error(message.error || 'resize rejected'));
+            else pending.reject(new Error(frameErrorText(message, 'resize rejected')));
             return;
           }
           if (message.kind === 'leader.result') {
@@ -1820,7 +1817,21 @@
             if (!pending) return;
             wsLeaderPending.delete(message.requestId);
             if (message.ok) pending.resolve();
-            else pending.reject(new Error(message.error || 'leader request rejected'));
+            else pending.reject(new Error(frameErrorText(message, 'leader request rejected')));
+            return;
+          }
+          if (message.kind === 'error') {
+            // 「その要求が通らなかった」だけを扱う。世代不一致の推定には使わない
+            // (DR-0035 決定 2 — 検出は hello.protocol 1 本)。
+            const text = frameErrorText(message, 'request rejected');
+            const pending = wsResizePending.get(message.requestId)
+              || wsLeaderPending.get(message.requestId);
+            if (pending) {
+              wsResizePending.delete(message.requestId);
+              wsLeaderPending.delete(message.requestId);
+              pending.reject(new Error(text));
+            }
+            if (window.__hyouiDebug) window.__hyouiDebug('warn', 'gateway rejected frame: ' + text);
           }
         } catch (e) {
           if (window.__hyouiDebug) window.__hyouiDebug('warn', 'invalid WS control response: ' + e.message);

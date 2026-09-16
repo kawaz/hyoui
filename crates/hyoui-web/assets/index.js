@@ -90,7 +90,7 @@
     statusEl.textContent = 'fetching…';
     try {
       const r = await fetch('/api/sessions', { cache: 'no-store' });
-      if (!r.ok) throw new Error('HTTP ' + r.status);
+      if (!r.ok) throw await window.hyouiContract.httpError(r);
       const list = await r.json();
       render(list);
       statusEl.textContent = 'updated ' + new Date().toLocaleTimeString();
