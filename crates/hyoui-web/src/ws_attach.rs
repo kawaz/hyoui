@@ -42,55 +42,8 @@ use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
 
-/// Browser → gateway の text frame。binary frame は従来どおり PTY input 専用。
-#[derive(Debug, Deserialize)]
-#[serde(tag = "kind")]
-enum WsControlRequest {
-    #[serde(rename = "resize")]
-    Resize {
-        #[serde(rename = "requestId")]
-        request_id: u64,
-        cols: u16,
-        rows: u16,
-    },
-    #[serde(rename = "leader.request")]
-    LeaderRequest {
-        #[serde(rename = "requestId")]
-        request_id: u64,
-    },
-}
-
-/// Gateway → browser の text frame。PTY output は binary frame のまま。
-#[derive(Debug, Serialize)]
-struct WsResizeResult {
-    kind: &'static str,
-    #[serde(rename = "requestId")]
-    request_id: u64,
-    ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-/// Gateway → browser の leader 奪取結果。
-#[derive(Debug, Serialize)]
-struct WsLeaderResult {
-    kind: &'static str,
-    #[serde(rename = "requestId")]
-    request_id: u64,
-    ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-/// Gateway が保持する daemon attach の実効 mode / leader 状態。
-#[derive(Debug, Serialize)]
-struct WsAttachInfo {
-    kind: &'static str,
-    mode: &'static str,
-    leader: bool,
-}
+use crate::contract::{AttachMode, ClientFrame, ServerFrame};
 
 /// bridge thread への入力コマンド。
 enum BridgeCmd {
@@ -145,26 +98,24 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf) -> Result<(), Str
         while let Some(msg) = ws_rx.next().await {
             let cmd = match msg {
                 Ok(Message::Binary(b)) => BridgeCmd::Bytes(b.to_vec()),
-                Ok(Message::Text(s)) => {
-                    match serde_json::from_str::<WsControlRequest>(s.as_str()) {
-                        Ok(WsControlRequest::Resize {
-                            request_id,
-                            cols,
-                            rows,
-                        }) => BridgeCmd::Resize {
-                            request_id,
-                            cols,
-                            rows,
-                        },
-                        Ok(WsControlRequest::LeaderRequest { request_id }) => {
-                            BridgeCmd::LeaderRequest { request_id }
-                        }
-                        Err(e) => {
-                            eprintln!("hyoui-web: invalid WS control message: {e}");
-                            continue;
-                        }
+                Ok(Message::Text(s)) => match serde_json::from_str::<ClientFrame>(s.as_str()) {
+                    Ok(ClientFrame::Resize {
+                        request_id,
+                        cols,
+                        rows,
+                    }) => BridgeCmd::Resize {
+                        request_id,
+                        cols,
+                        rows,
+                    },
+                    Ok(ClientFrame::LeaderRequest { request_id }) => {
+                        BridgeCmd::LeaderRequest { request_id }
                     }
-                }
+                    Err(e) => {
+                        eprintln!("hyoui-web: invalid WS control message: {e}");
+                        continue;
+                    }
+                },
                 Ok(Message::Ping(_) | Message::Pong(_)) => continue, // axum が自動応答
                 Ok(Message::Close(_)) => break,
                 Err(_) => break,
@@ -212,28 +163,35 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf) -> Result<(), Str
     }
 }
 
-fn mode_label(mode: hyoui::protocol::Mode) -> &'static str {
-    match mode {
-        hyoui::protocol::Mode::Rw => "rw",
-        hyoui::protocol::Mode::Ro => "ro",
-        hyoui::protocol::Mode::RwNoLeader => "rw-no-leader",
-        _ => "unknown",
-    }
+/// gateway → browser の text frame を JSON にする。
+///
+/// encode 失敗は契約型の不整合 (= bug) なので bridge を畳む fatal として扱い、
+/// WS writer の閉塞とは区別する (= 後者は client 離脱で正常終了)。
+fn encode_server_frame(frame: &ServerFrame) -> Result<String, String> {
+    serde_json::to_string(frame).map_err(|e| format!("encode gateway → browser frame: {e}"))
+}
+
+/// gateway → browser の text frame を 1 つ WS へ流す。
+fn send_server_frame(
+    frame: &ServerFrame,
+    output_tx: &tokio::sync::mpsc::UnboundedSender<BridgeOutput>,
+) -> Result<(), String> {
+    output_tx
+        .send(BridgeOutput::Control(encode_server_frame(frame)?))
+        .map_err(|_| "WS writer closed".to_string())
 }
 
 fn send_attach_info(
     response: &hyoui::protocol::messages::HandshakeResponse,
     output_tx: &tokio::sync::mpsc::UnboundedSender<BridgeOutput>,
 ) -> Result<(), String> {
-    let info = WsAttachInfo {
-        kind: "attach.info",
-        mode: mode_label(response.mode),
-        leader: response.leader,
-    };
-    let text = serde_json::to_string(&info).map_err(|e| format!("encode attach info: {e}"))?;
-    output_tx
-        .send(BridgeOutput::Control(text))
-        .map_err(|_| "WS writer closed".to_string())
+    send_server_frame(
+        &ServerFrame::AttachInfo {
+            mode: AttachMode::from(response.mode),
+            leader: response.leader,
+        },
+        output_tx,
+    )
 }
 
 /// blocking bridge の本体。`ClientConnection` を Rw で connect し、
@@ -367,7 +325,7 @@ fn bridge_loop(
                 }
             }
             for control in controls {
-                let (text, encode_context) = match control {
+                let frame = match control {
                     PendingControl::Resize {
                         request_id,
                         cols,
@@ -377,26 +335,22 @@ fn bridge_loop(
                             latest_grid = Some((cols, rows));
                         }
                         let result = resize_on_connection(&mut conn, cols, rows, &output_tx);
-                        let response = WsResizeResult {
-                            kind: "resize.result",
+                        ServerFrame::ResizeResult {
                             request_id,
                             ok: result.is_ok(),
                             error: result.err(),
-                        };
-                        (serde_json::to_string(&response), "resize result")
+                        }
                     }
                     PendingControl::LeaderRequest { request_id } => {
                         let result = leader_on_connection(&mut conn, latest_grid, &output_tx);
-                        let response = WsLeaderResult {
-                            kind: "leader.result",
+                        ServerFrame::LeaderResult {
                             request_id,
                             ok: result.is_ok(),
                             error: result.err(),
-                        };
-                        (serde_json::to_string(&response), "leader result")
+                        }
                     }
                 };
-                let text = text.map_err(|e| format!("encode {encode_context}: {e}"))?;
+                let text = encode_server_frame(&frame)?;
                 if output_tx.send(BridgeOutput::Control(text)).is_err() {
                     return Ok(());
                 }
@@ -552,48 +506,27 @@ pub fn on_upgrade(ws: WebSocketUpgrade, sock_path: PathBuf) -> axum::response::R
 
 #[cfg(test)]
 mod tests {
+    //! frame の JSON 表現そのものは `contract.rs` の golden test が固定する。
+    //! ここでは bridge が frame を組み立てる側の振る舞いを見る。
+
     use super::*;
 
-    /// browser → gateway の leader.request は resize と同じ requestId 相関を使い、
-    /// daemon protocol の payload 無し仕様とは WS gateway 境界で分離する。
     #[test]
-    fn leader_request_json_uses_browser_control_schema() {
-        let request: WsControlRequest = serde_json::from_value(serde_json::json!({
-            "kind": "leader.request",
-            "requestId": 17
-        }))
-        .expect("decode leader.request");
-        match request {
-            WsControlRequest::LeaderRequest { request_id } => assert_eq!(request_id, 17),
-            other => panic!("expected LeaderRequest, got {other:?}"),
-        }
-    }
-
-    /// gateway → browser の leader.result は成功時に error field を省略し、要求と同じ
-    /// requestId を返す。
-    #[test]
-    fn leader_result_json_uses_browser_control_schema() {
-        let result = WsLeaderResult {
-            kind: "leader.result",
-            request_id: 17,
-            ok: true,
-            error: None,
-        };
-        let json = serde_json::to_value(result).expect("serialize leader.result");
-        assert_eq!(json["kind"], "leader.result");
-        assert_eq!(json["requestId"], 17);
-        assert_eq!(json["ok"], true);
-        assert!(json.get("error").is_none());
-    }
-
-    #[test]
-    fn attach_info_json_uses_browser_control_schema() {
-        let info = WsAttachInfo {
-            kind: "attach.info",
-            mode: mode_label(hyoui::protocol::Mode::Ro),
+    fn attach_info_carries_daemon_mode_and_leader_flag() {
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<BridgeOutput>();
+        let response = hyoui::protocol::messages::HandshakeResponse {
+            caps: vec!["data".to_string()],
+            session_id: "s".to_string(),
+            client_id: 1,
             leader: false,
+            mode: hyoui::protocol::Mode::Ro,
+            child_stopped: false,
         };
-        let json = serde_json::to_value(info).expect("serialize attach info");
+        send_attach_info(&response, &output_tx).expect("send attach.info");
+        let BridgeOutput::Control(text) = output_rx.try_recv().expect("frame queued") else {
+            panic!("attach.info must be a text frame");
+        };
+        let json: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         assert_eq!(json["kind"], "attach.info");
         assert_eq!(json["mode"], "ro");
         assert_eq!(json["leader"], serde_json::Value::Bool(false));

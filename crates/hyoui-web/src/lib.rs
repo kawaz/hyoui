@@ -35,7 +35,10 @@ use include_dir::{Dir, include_dir};
 
 pub use axum;
 
+pub mod contract;
 mod ws_attach;
+
+use contract::{InputRequest, InputResponse, ResizeRequest};
 
 /// リリースビルドに埋め込む静的アセット (= `crates/hyoui-web/assets/`)。
 ///
@@ -246,19 +249,6 @@ fn dump_screen_blocking(
 // -----------------------------------------------------------------------------
 // POST /api/sessions/:id/input
 // -----------------------------------------------------------------------------
-
-/// input request body: `{"specs": ["text:hello", "key:Enter"]}`。
-#[derive(Debug, serde::Deserialize)]
-struct InputRequest {
-    specs: Vec<String>,
-}
-
-/// input 送信結果 (= 成功時: 送った bytes 総数、失敗時: どの spec が失敗したか)。
-#[derive(Debug, serde::Serialize)]
-struct InputResponse {
-    sent_bytes: usize,
-    specs: usize,
-}
 
 /// `send_input_blocking` の失敗分類。HTTP status code へのマップに使う。
 ///
@@ -497,18 +487,11 @@ fn resume_child_blocking(socket_path: &std::path::Path) -> Result<(), String> {
 // POST /api/sessions/:id/resize
 // -----------------------------------------------------------------------------
 
-/// resize request body: `{"cols": 120, "rows": 40}`。
-///
-/// 既存 `ControlMessage::Resize` (DR-0008 §2.3) を再利用する (= 新 protocol
-/// message は追加しない、`CLAUDE.md` self-check「新 protocol message 追加なら
-/// 必然性を DR に書けるか?」の観点)。
-#[derive(Debug, serde::Deserialize)]
-struct ResizeRequest {
-    cols: u16,
-    rows: u16,
-}
-
 /// `POST /api/sessions/:id/resize` — PTY と ScreenState を同期 resize させる。
+///
+/// body は `contract::ResizeRequest`。既存 `ControlMessage::Resize` (DR-0008 §2.3)
+/// を再利用する (= 新 protocol message は追加しない、`CLAUDE.md` self-check
+/// 「新 protocol message 追加なら必然性を DR に書けるか?」の観点)。
 ///
 /// 本 endpoint は WS 未接続時の fallback。短命 Rw connection が leader を取得できた
 /// 場合だけ resize を受理し、既存 leader と競合した場合は 409 を返す。通常の browser
