@@ -197,6 +197,20 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf) -> Result<(), Str
     }
 }
 
+/// intersect 済みの cap 集合が `cap` を含むか確かめる (DR-0035 決定 4)。
+///
+/// 渡すのは `conn.response.caps` = daemon が handshake 応答で返した **intersect
+/// 済み** の集合。cap 名ごとに手で書くのをやめ、全 cap を同じ形で判定する。
+/// browser は `hello.caps` から同じ事実を先に知れるので、操作を灰色に落とせる。
+fn require_cap(caps: &[String], cap: &str) -> Result<(), ErrorInfo> {
+    hyoui::protocol::require_cap(caps, cap).map_err(|missing| {
+        ErrorInfo::new(
+            hyoui::protocol::messages::ErrorCode::UnsupportedCapability.as_str(),
+            format!("daemon does not support {}", missing.cap),
+        )
+    })
+}
+
 /// reader task から error frame を 1 つ返す。送れなくなったら `false`。
 ///
 /// encode 失敗は契約型の不整合 (= bug) で、この経路では bridge を畳む手段が
@@ -438,17 +452,7 @@ fn leader_on_connection(
     use hyoui::protocol::ControlMessage;
     use hyoui::protocol::messages::LeaderRequest;
 
-    if !conn
-        .response
-        .caps
-        .iter()
-        .any(|cap| cap == "leader-request-v1")
-    {
-        return Err(ErrorInfo::new(
-            hyoui::protocol::messages::ErrorCode::UnsupportedCapability.as_str(),
-            "daemon does not support leader.request (`leader-request-v1` was not negotiated)",
-        ));
-    }
+    require_cap(&conn.response.caps, "leader-request-v1")?;
 
     conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .map_err(|e| ErrorInfo::internal(format!("set leader request timeout: {e}")))?;
@@ -576,6 +580,18 @@ mod tests {
     //! ここでは bridge が frame を組み立てる側の振る舞いを見る。
 
     use super::*;
+
+    /// leader.request の cap 判定は共有ヘルパを通り、daemon の code をそのまま返す。
+    #[test]
+    fn leader_request_requires_the_negotiated_capability() {
+        let poor: Vec<String> = vec!["data".to_string(), "lock".to_string()];
+        let err = require_cap(&poor, "leader-request-v1").expect_err("cap が無いので Err");
+        assert_eq!(err.code, "unsupported-capability");
+        assert!(err.message.contains("leader-request-v1"), "{}", err.message);
+
+        let rich: Vec<String> = vec!["leader-request-v1".to_string()];
+        assert!(require_cap(&rich, "leader-request-v1").is_ok());
+    }
 
     #[test]
     fn attach_info_carries_daemon_mode_and_leader_flag() {

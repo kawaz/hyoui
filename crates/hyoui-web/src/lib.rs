@@ -198,7 +198,7 @@ async fn get_screen(
     let bytes = match tokio::task::spawn_blocking(move || dump_screen_blocking(&sock, layer)).await
     {
         Ok(Ok(b)) => b,
-        Ok(Err(msg)) => return internal_error(format!("screen dump failed: {msg}")),
+        Ok(Err(e)) => return e.into_response("screen dump"),
         Err(e) => return internal_error(format!("screen dump join error: {e}")),
     };
     (
@@ -212,7 +212,7 @@ async fn get_screen(
 fn dump_screen_blocking(
     socket_path: &std::path::Path,
     layer: hyoui::protocol::messages::ScreenDumpLayer,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, DaemonCallError> {
     use hyoui::client::{AttachOptions, ClientConnection};
     use hyoui::protocol::messages::{ScreenDumpFormat, ScreenDumpRequest};
     use hyoui::protocol::{ControlMessage, MVP_CAPS, Mode};
@@ -225,7 +225,8 @@ fn dump_screen_blocking(
         detach_others: false,
     };
     let mut conn = ClientConnection::connect(socket_path, opts)
-        .map_err(|e| format!("connect/handshake: {e}"))?;
+        .map_err(|e| DaemonCallError::Internal(format!("connect/handshake: {e}")))?;
+    require_cap(&conn.response.caps, "screen-dump-v1")?;
     let req = ScreenDumpRequest {
         format: ScreenDumpFormat::Ansi,
         layer,
@@ -233,19 +234,25 @@ fn dump_screen_blocking(
         serial: Some(1),
     };
     conn.send_control(&ControlMessage::ScreenDumpRequest(req))
-        .map_err(|e| format!("send screen.dump.request: {e}"))?;
+        .map_err(|e| DaemonCallError::Internal(format!("send screen.dump.request: {e}")))?;
     loop {
-        match conn.recv_control(None).map_err(|e| format!("recv: {e}"))? {
+        match conn
+            .recv_control(None)
+            .map_err(|e| DaemonCallError::Internal(format!("recv: {e}")))?
+        {
             ControlMessage::ScreenDumpResponse(resp) => return Ok(resp.payload),
             ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
             ControlMessage::Error(e) => {
-                return Err(format!("daemon error: {:?} ({})", e.code, e.message));
+                return Err(DaemonCallError::Internal(format!(
+                    "daemon error: {:?} ({})",
+                    e.code, e.message
+                )));
             }
             other => {
-                return Err(format!(
+                return Err(DaemonCallError::Internal(format!(
                     "unexpected response kind: {:?}",
                     std::mem::discriminant(&other)
-                ));
+                )));
             }
         }
     }
@@ -262,6 +269,8 @@ fn dump_screen_blocking(
 enum InputError {
     /// daemon socket 接続 / handshake 失敗。500。
     Connect(String),
+    /// intersect に無い cap を要する操作 (DR-0035 決定 4)。501。
+    UnsupportedCapability(hyoui::protocol::MissingCapability),
     /// DR-0022 auto-lock 取得失敗 (= 他 client が保持中で timeout)。409 Conflict。
     LockContention {
         /// message: どの timeout で失敗したかを含む。
@@ -286,6 +295,7 @@ impl InputError {
     fn into_response(self) -> Response {
         match self {
             InputError::Connect(msg) => internal_error(format!("input send failed: {msg}")),
+            InputError::UnsupportedCapability(missing) => unsupported_capability(&missing.cap),
             InputError::LockContention { message } => conflict(
                 code::LOCK_CONTENTION,
                 format!("他 client が入力中のため lock を取得できません: {message}"),
@@ -401,6 +411,14 @@ fn send_input_blocking(
     };
     let mut conn = ClientConnection::connect(socket_path, opts)
         .map_err(|e| InputError::Connect(format!("connect/handshake: {e}")))?;
+    // PTY へ bytes を流すのは `data` cap の機能。持たない daemon では 501 を返し、
+    // 「送ったのに届かない」を作らない (DR-0035 決定 4)。
+    require_cap(&conn.response.caps, "data").map_err(|e| match e {
+        DaemonCallError::UnsupportedCapability(missing) => {
+            InputError::UnsupportedCapability(missing)
+        }
+        DaemonCallError::Internal(msg) => InputError::Connect(msg),
+    })?;
 
     // DR-0022: invocation 全体で auto-lock を 1 本 acquire (= web POST 1 回 = 1
     // invocation 相当)。CLI `input_command` と同じ意味論。外側 token を継承していれば
@@ -470,12 +488,12 @@ async fn post_resume(Path(id): Path<String>, State(_state): State<AppState>) -> 
     let result = tokio::task::spawn_blocking(move || resume_child_blocking(&sock)).await;
     match result {
         Ok(Ok(())) => (StatusCode::NO_CONTENT, "").into_response(),
-        Ok(Err(msg)) => internal_error(format!("resume failed: {msg}")),
+        Ok(Err(e)) => e.into_response("resume"),
         Err(e) => internal_error(format!("resume join error: {e}")),
     }
 }
 
-fn resume_child_blocking(socket_path: &std::path::Path) -> Result<(), String> {
+fn resume_child_blocking(socket_path: &std::path::Path) -> Result<(), DaemonCallError> {
     use hyoui::client::{AttachOptions, ClientConnection};
     use hyoui::protocol::{MVP_CAPS, Mode};
 
@@ -487,9 +505,10 @@ fn resume_child_blocking(socket_path: &std::path::Path) -> Result<(), String> {
         detach_others: false,
     };
     let mut conn = ClientConnection::connect(socket_path, opts)
-        .map_err(|e| format!("connect/handshake: {e}"))?;
+        .map_err(|e| DaemonCallError::Internal(format!("connect/handshake: {e}")))?;
+    require_cap(&conn.response.caps, "child-state-v1")?;
     conn.send_child_resume()
-        .map_err(|e| format!("send resume.request: {e}"))?;
+        .map_err(|e| DaemonCallError::Internal(format!("send resume.request: {e}")))?;
     Ok(())
 }
 
@@ -635,6 +654,37 @@ async fn get_ws_attach(
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+/// daemon と intersect した cap に無い操作を要求された時の失敗と、それ以外を
+/// 区別する必要がある経路の型 (DR-0035 決定 4)。
+///
+/// cap 不足は 501 で、browser 側は `hello.caps` から同じ事実を先に知れるので
+/// 「操作を灰色にする」に落とせる。500 と混ぜると区別が付かない。
+#[derive(Debug)]
+enum DaemonCallError {
+    /// intersect に無い cap を要する操作。501。
+    UnsupportedCapability(hyoui::protocol::MissingCapability),
+    /// それ以外の daemon 呼び出し失敗。500。
+    Internal(String),
+}
+
+impl DaemonCallError {
+    fn into_response(self, what: &str) -> Response {
+        match self {
+            DaemonCallError::UnsupportedCapability(missing) => unsupported_capability(&missing.cap),
+            DaemonCallError::Internal(msg) => internal_error(format!("{what} failed: {msg}")),
+        }
+    }
+}
+
+/// intersect 済みの cap 集合が `cap` を含むか確かめる (DR-0035 決定 4)。
+///
+/// 渡すのは `conn.response.caps` = daemon が handshake 応答で返した **intersect
+/// 済み** の集合。既に決まっている事実を確認するだけで、daemon 側に新しい cap も
+/// message も足さない。cap 名ごとに手で書くのをやめ、全 cap を同じ形で判定する。
+fn require_cap(caps: &[String], cap: &str) -> Result<(), DaemonCallError> {
+    hyoui::protocol::require_cap(caps, cap).map_err(DaemonCallError::UnsupportedCapability)
+}
 
 /// `resolve_socket` の失敗分類。HTTP status code へのマップに使う。
 ///
@@ -788,6 +838,17 @@ fn invalid_request(status: StatusCode, message: String) -> Response {
     error_response(status, ErrorInfo::new(code::INVALID_REQUEST, message))
 }
 
+/// daemon が当該 cap を持たない (DR-0035 決定 4)。code は daemon の語彙のまま。
+fn unsupported_capability(cap: &str) -> Response {
+    error_response(
+        StatusCode::NOT_IMPLEMENTED,
+        ErrorInfo::new(
+            hyoui::protocol::messages::ErrorCode::UnsupportedCapability.as_str(),
+            format!("daemon does not support {cap}"),
+        ),
+    )
+}
+
 fn bad_request(code: &str, msg: impl Into<String>) -> Response {
     error_response(StatusCode::BAD_REQUEST, ErrorInfo::new(code, msg))
 }
@@ -912,6 +973,30 @@ mod tests {
                 "{uri} の応答ヘッダが version/protocol を名乗っている: {offending:?}"
             );
         }
+    }
+
+    /// DR-0035 決定 4: intersect に無い cap を要する操作は 501 で、code は daemon の
+    /// 語彙 (`unsupported-capability`) をそのまま通す。
+    ///
+    /// 判定は cap 名ごとの手作りをやめて 1 箇所に寄せたので、HTTP 3 経路と WS の
+    /// leader.request は同じ関数を通る。
+    #[tokio::test]
+    async fn absent_capability_maps_to_501_with_the_daemon_code() {
+        let poor: Vec<String> = vec!["data".to_string(), "lock".to_string()];
+        for cap in ["screen-dump-v1", "child-state-v1", "leader-request-v1"] {
+            let err = require_cap(&poor, cap).expect_err("cap が無いので Err");
+            let resp = err.into_response("op");
+            assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "cap={cap}");
+            let body = error_body(resp).await;
+            assert_eq!(body.error.code, "unsupported-capability", "cap={cap}");
+            assert!(
+                body.error.message.contains(cap),
+                "message にどの cap が要るか書く: {}",
+                body.error.message
+            );
+        }
+        // 持っている cap は通す (= 一律 501 にしていないこと)。
+        assert!(require_cap(&poor, "data").is_ok());
     }
 
     #[tokio::test]

@@ -1595,6 +1595,25 @@
     if (message.leader) requestLeaderStatus.textContent = '';
   }
 
+  // hello が載せてくる intersect 済み cap 集合 (DR-0035 決定 4)。gateway ↔ daemon の
+  // 機能有無であって、契約の世代 (= 決定 3) とは直交する。
+  // 一覧を JS 側に写さず、「この操作に要る cap があるか」だけを見る。
+  let daemonCaps = null;
+
+  function daemonSupports(cap) {
+    // hello 未受信 (= 接続前) は不明なので止めない。届いた時点で反映する。
+    return daemonCaps === null || daemonCaps.includes(cap);
+  }
+
+  // 持てない操作を灰色にする。理由を title に出す (= 押せない理由が読める)。
+  function syncCapabilityAffordances() {
+    const canTakeover = daemonSupports('leader-request-v1');
+    requestLeaderBtn.disabled = !canTakeover;
+    requestLeaderBtn.title = canTakeover
+      ? ''
+      : 'この daemon は leader 奪取に対応していません (leader-request-v1 が無い)';
+  }
+
   function wsIsOpen() { return ws && ws.readyState === WebSocket.OPEN; }
 
   function sendResizeOverWs(cols, rows) {
@@ -1815,6 +1834,8 @@
             if (reportGatewayProtocol(message.protocol)) {
               setWsStatus('stale page (protocol ' + message.protocol + ')');
             }
+            daemonCaps = Array.isArray(message.caps) ? message.caps : [];
+            syncCapabilityAffordances();
             return;
           }
           if (message.kind === 'attach.info') {
@@ -1862,6 +1883,9 @@
       infoLeaderAction.hidden = true;
       requestLeaderStatus.textContent = '';
       ws = null;
+      // 再接続先の daemon が同じとは限らないので、cap は不明に戻す。
+      daemonCaps = null;
+      syncCapabilityAffordances();
       rejectPendingWsResizes('WS disconnected before resize completed');
       rejectPendingWsLeaders('WS disconnected before leader request completed');
       // WS 切断後は fallback ポーリング + auto refresh 再有効化。
