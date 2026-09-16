@@ -103,6 +103,7 @@ hyoui web session remove <id>
 | 6 桁コード | URL には含めず CLI にだけ表示する。登録要求の必須引数。**5 回の誤入力でその URL (jti) を焼く** |
 | ブラウザ側 `create()` | `residentKey: "preferred"`、`userVerification: "required"`、`attestation: "none"`、`user.id` = claims の `user_id`、`rp.id` = claims の `rp_id` |
 | 検証順序 | client data → WebAuthn 登録検証 → 公開鍵の import 可否 → **通ってから jti と challenge を消費**。逆順だと一時的な失敗 1 回で URL が焼ける |
+| `userHandle` の扱い | `residentKey: "preferred"` なので assertion に handle が載らないことがある。**提示された時だけ record の `user_id` と照合**する。`webauthn-rs` がこの判定を内側で持つならその挙動に従い、hyoui 側で二重に判定しない (gate 4 で crate の挙動を確認する) |
 | 登録完了時 | そのまま session を mint して返す (登録が即サインイン) |
 
 **attestation は `none` で足りる。** 「この credential を作ってよい人か」は jwt と 6 桁コードが既に担保しており、authenticator の出自証明は要件に無い。要求すると証明書チェーンの検証と信頼リストという管理対象が増える。
@@ -130,6 +131,7 @@ hyoui web session remove <id>
 - **ブラウザが endpoint URL を計算して要求に載せる。** DR-0035 決定 6 と同じ計算 (index は `new URL(".", location.href)`、session ページは `location.href` から `sessions/<id>` と query を落としたもの) で、`/auth/challenge` `/auth/assert` `/auth/refresh` の body に `endpoint` として送る
 - **認証の検証**: 要求の `endpoint` で record 集合を絞り、assertion の `rawId` で record を引く。record の `endpoint` から `rp_id` (= hostname) と origin を取り、`authData.rpIdHash` == `sha256(rp_id)` と `clientDataJSON.origin` == record の endpoint の origin (完全一致) を照合する
 - **ブラウザが名乗った `endpoint` を信じているわけではない。** 本体の検証は `clientDataJSON.origin` と `rpIdHash` で、これはブラウザが WebAuthn の仕様として書く値である。要求の `endpoint` は record を引く索引にすぎない (違えば引けないだけ)
+- **例外は、同一 origin の `/` と `/hyoui/` を同じ gateway が serve する場合である。** `clientDataJSON.origin` に path は含まれないので、この 2 つを区別するのはブラウザ申告の `endpoint` と cookie の `Path` だけになり、**同一 origin 内の path 分離は認可境界にならない** (決定 5 の `Path` と同じ理由)。別の gateway が serve するなら `auth.json` が別 file なので実害は無い。同一 origin に信頼の異なるものを並べるなら、分けるべきは path ではなく host である
 - **challenge にも endpoint を埋める。** `/auth/challenge` の応答に `endpoint` を載せ、assert / register の検証で record の endpoint と一致することを見る。これで「challenge を取った endpoint」と「使う endpoint」のすり替えが効かない
 - **HTTP の `Host` / `Origin` ヘッダで RP を選ばない。** 前段が何を書くかは gateway の知識の外で、origin の真正性は `clientDataJSON` が担保する。`/auth/*` に `Origin` ヘッダを要求する ccmsg の形も採らない (front assets が endpoint と同一 origin から配られるので CORS 自体が要らない)
 - **registrable suffix を許さない。** suffix を名乗れると、その配下の全ホストでその credential が使えることになる
@@ -187,10 +189,12 @@ credential は mtime で cache してよいが、**family の検証は cache を
 
 | 値 | 置き場 | 属性 / 寿命 | 提示方法 |
 |---|---|---|---|
-| access token | **ブラウザのメモリのみ** (署名しない opaque 乱数)。localStorage には置かない | 4 時間 | HTTP は `Authorization: Bearer`、WS は subprotocol `hyoui.token.<値>` (server は選んだ subprotocol を echo) |
+| access token | **ブラウザのメモリのみ** (署名しない opaque 乱数、**base64url で表す**)。localStorage には置かない | 4 時間 | HTTP は `Authorization: Bearer`、WS は subprotocol `hyoui.token.<値>` (server は選んだ subprotocol を echo) |
 | refresh token | **httpOnly cookie** | `HttpOnly; Secure; SameSite=Strict`、名前 `__Secure-hyoui-<sha256(endpoint) 先頭 16 hex>`、**`Path` = 正規形 endpoint の path から末尾 `/` を落とした値** (root の endpoint は `/`、`https://example.jp/hyoui/` なら `Path=/hyoui`)、7 日 | cookie のみ (body に token を載せない) |
 
-token は署名せず、**token family の record を lookup して検証する**。署名鍵を持つと保管・rotate・配布という管理対象が増えるが、record を引く形なら鍵なしで同じことが済む。
+**access を base64url で表すのは、WS subprotocol に載せるためである。** `Sec-WebSocket-Protocol` の値は RFC 6455 の token (RFC 7230 の `token` 文字) でなければならず、`+` `/` `=` を含む素の base64 は使えない。
+
+token は署名せず、**token family の record を lookup して検証する**。`/auth/refresh` は cookie の値で family を引き、**その family の `endpoint` が要求 body の `endpoint` と一致することを確認する** (決定 3 の照合と同型。cookie が endpoint ごとに分かれていても、確認は値の側で行う)。署名鍵を持つと保管・rotate・配布という管理対象が増えるが、record を引く形なら鍵なしで同じことが済む。
 
 **cookie 名に `sub` を混ぜない。** reference と ccmsg は `sha256(発行者 id + "\n" + sub)` を使うが、`/auth/refresh` を受けた時点で server は **まだ誰の要求か知らない** (refresh token 自体が身元を答える値である)。ccmsg はこれを「`__Secure-ccmsg-` prefix の全 cookie を試す」ことで解いているが、hyoui は名前を **endpoint のハッシュだけ**にして 1 つに決める。endpoint ごとに別 cookie になる要件 (下記) はこれで満たされ、試行の必要が消える。
 
