@@ -436,3 +436,50 @@ macOS では success、ローカル macOS では 10/10 pass。自分たちが追
 attach する形にテストを直すか、それとも daemon 側の検知遅延そのものが実装課題か を
 切り分ける)。
 
+## 観測 (2026-09-16)
+
+kawaz 裁定 (ECO-Q1 = a、2026-09-16): `continue-on-error: true` は外さない。代わりに
+集計を現状に更新し、ubuntu 側の真因調査を継続する。`gh run list --workflow=ci.yml -L 20`
+で直近 20 run (2026-08-24〜2026-09-16) の `ignored-tests` job を集計した。
+
+### (1) OS 別 fail 率
+
+| OS | fail | success | fail 率 |
+|---|---:|---:|---:|
+| ubuntu-latest | 19 | 1 | 95% |
+| macos-latest | 4 | 16 | 20% |
+
+### (2) 落ちたテスト名の頻度 (直近 20 run 中、失敗した 19 run の `--log-failed` 集計、ubuntu/macOS 合算)
+
+| テスト | 件数 |
+|---|---:|
+| `daemon_sigterm_terminates_child_and_unlinks_socket` | 9 |
+| `daemon_second_sigterm_during_shutdown_completes_unlink` | 8 |
+| `handshake_snapshot_menu_remains_usable_after_initial_resize_flushes_redraw` | 3 |
+| `restore_snapshot_normalized` | 3 |
+| `run_resumes_child_that_is_already_stopped_at_attach` | 2 |
+| `daemon::session::tests::serve_attach_redraw_includes_pre_attach_output` | 1 |
+| `ctrlz_x1_client_detach_closes_window_and_child_keeps_running` | 1 |
+
+### (3) 要旨
+
+ubuntu は 20 run 中 19 run (95%) で落ちており、依然として毎回違う 1〜2 本が落ちる
+負荷依存の不安定さが継続している (固定 fail は無い、2026-08-21 の追記と同傾向)。
+`daemon_sigterm_terminates_child_and_unlinks_socket` /
+`daemon_second_sigterm_during_shutdown_completes_unlink` (SIGTERM graceful shutdown 系)
+が依然として頻度上位を占める。
+
+macOS は「2026-08-21 以降 green」という前回追記時点の見立てとは異なり、直近 20 run では
+**4 run (20%) で失敗している** (2026-09-15〜16 に集中、`daemon_sigterm_*` 系 2 件、
+`restore_snapshot_normalized` 2 件、`handshake_snapshot_menu_remains_usable_*` 1 件)。
+macOS 側も ubuntu と同じ SIGTERM graceful shutdown 系テストで落ちている点が新たな観測で、
+OS 固有の問題というより負荷依存の性質が macOS にも及んでいる可能性がある。実機マトリクス
+未確認のため断定はしない。
+
+### (4) kawaz 裁定 (ECO-Q1 = a、2026-09-16)
+
+`continue-on-error: true` は維持する (= 現時点で外さない)。ubuntu 側 (今回の観測では
+macOS 側も含む) の真因調査を継続する。次に見るべきは `daemon_sigterm_terminates_child_and_unlinks_socket`
+/ `daemon_second_sigterm_during_shutdown_completes_unlink` の 2 test が SIGTERM graceful
+shutdown 系ファイルに集中している点 (2026-08-21 追記時点の傾向と一致、継続して優勢)。
+
