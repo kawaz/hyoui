@@ -5,7 +5,19 @@
 version = 2
 # RUSTSEC advisories: deny by default. yanked crates also denied.
 yanked = "deny"
-ignore = []
+ignore = [
+  # RUSTSEC-2023-0071 — rsa 0.9.x の Marvin attack (timing sidechannel で
+  # **RSA 秘密鍵**が復元されうる)。修正版は出ていない (RustCrypto/RSA#626)。
+  #
+  # **hyoui は RSA 秘密鍵を持たない。** rsa が入るのは webauthn-rs-core →
+  # crypto-glue の無条件依存で (crypto-glue の Cargo.toml に optional 指定は 1 つも
+  # 無く、feature で外す口も無い)、hyoui が RSA を使うのは authenticator が RS256 で
+  # 作った credential の**署名検証**だけである (= 公開鍵演算)。脆弱な経路は秘密鍵
+  # 演算なので、この依存では踏めない。判断の正本は DR-0036 決定 8。
+  #
+  # cargo-audit 側の同じ判断は `.cargo/audit.toml` にある (別ツール・別 config)。
+  "RUSTSEC-2023-0071",
+]
 
 [bans]
 multiple-versions = "warn"

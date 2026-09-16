@@ -254,6 +254,12 @@ credential の claim に `access = "rw" | "ro"` を**定義する**。record と
 
 `-dev` は prerelease だが、**crates.io 上のその版は不変で `Cargo.lock` が固定する**ので「勝手に変わる」性質は無い。残る代償は「その版に patch が来ない」「0.6.2 で API が変わりうる」の 2 点で、v1.0 未満の本リポが breaking change を許容する方針と釣り合う。
 
+**この依存は RUSTSEC-2023-0071 (rsa 0.9 の Marvin attack) を連れてくる。** 経路は `webauthn-rs-core` → `crypto-glue` → `rsa` で、**`crypto-glue` は `rsa` を無条件に依存する** (その `Cargo.toml` に `optional` 指定は 1 つも無く、`crypto-glue` / `webauthn-rs-core` のどちらにも RSA を落とす feature が無い、実測 2026-09-16)。したがって「feature で外す」は選べない。
+
+**踏まない理由は、hyoui が RSA 秘密鍵を持たないことである。** advisory の脆弱な経路は秘密鍵演算の timing sidechannel であり、hyoui が RSA を使うのは authenticator が RS256 で作った credential の**署名検証** (= 公開鍵演算) だけである。登録時に許す algorithm から RS256 を外しても依存は消えない (コンパイル時に入る) ので、対処として意味を持たない — 外すと RS256 しか作れない authenticator を拒むだけで、安全性は変わらない。
+
+そこで **advisory を ignore する。** 置き場は `deny.toml` の `[advisories] ignore` (cargo-deny) と `.cargo/audit.toml` (cargo-audit) の 2 つで、どちらにも上の理由を書いた。**workflow の `ignore` 入力は使わない** — `rustsec/audit-check` は repo root で `cargo audit` を呼ぶだけで config を無効化しないので (action が渡すのは `--json` と `--file` だけ、実測)、`.cargo/audit.toml` が local と CI の両方に効く。workflow にも id を書くと一覧が 2 つになり、片方だけ直す事故が生まれる。上流が `rsa` を差し替えるか 0.10 が出たら ignore を外す。
+
 `passkey-auth` (pure Rust、`residentKey: preferred` を含め決定 2 の 3 設定すべてを表せる) も評価したが採らない。**2,536 行に test 27 個という比率は、本 DR が ccmsg の自前実装を却下した理由と同じ状態**であり、library を選ぶ動機 (= 検証手順を実績のあるコードに委ねる) を満たさない。`webauthn-rs` は 9,270 行に test 50 個で、実機 authenticator の fixture を持つ。
 
 reference は「library は要らない」と書くが、その根拠は「attestation の固定や challenge の転送のような制御が効かなくなる」で、**hyoui は challenge の転送 (instance 間) をしない** (決定 4 が file 共有で解く) ので当てはまらない。
@@ -348,7 +354,7 @@ reference は「library は要らない」と書くが、その根拠は「attes
 - **認証を入れた瞬間から、loopback 直結で `/api/*` は使えなくなる。** 使えるのは `/healthz` と `/version` だけ。`hyoui web daemon status` / `restart` はこれで足りるが、`curl http://127.0.0.1:43690/api/sessions` のような手元の確認手段は失われる。代わりに `hyoui list` (daemon の UDS 直結) を使う
 - **endpoint ごとに登録が要る。** HA endpoint 1 本で日常は足りるが、unstable を狙って開く時は個別 endpoint の登録が別に要る。endpoint を増やすたびに `passkey add` が 1 回増える
 - **2 unit が 1 file を共有する依存が生まれる。** `auth.json` が壊れれば両方の unit の認証が止まる。逆に片方の unit だけを入れ替えても session は続く (fallback で再認証を求められない) のが、この共有の目的である
-- **`webauthn-rs` の依存が入る。** hyoui-web に閉じるので core の依存は変わらない。版は `=0.6.1-dev` の exact pin で、prerelease を踏む代償 (patch が来ない / 0.6.2 で API が変わりうる) を受けている (決定 8)。crate の設計に合わなかったのは `residentKey` 1 点で、そこは `required` に倒して吸収した
+- **`webauthn-rs` の依存が入る。** hyoui-web に閉じるので core の依存は変わらない。版は `=0.6.1-dev` の exact pin で、prerelease を踏む代償 (patch が来ない / 0.6.2 で API が変わりうる) を受けている (決定 8)。crate の設計に合わなかったのは `residentKey` 1 点で、そこは `required` に倒して吸収した。**併せて RUSTSEC-2023-0071 (rsa) の ignore を 2 つの config に抱える** — feature で外す口が上流に無く、hyoui は RSA 秘密鍵を持たないので踏まない (決定 8)。上流が差し替えたら外す
 - **`residentKey: required` にした帰結として、登録には resident key の枠を持つ authenticator が要る。** Mac / iPhone の passkey はどちらも該当するので現運用では拒まれないが、枠を持たない security key を足したくなった時は登録できない (その時は決定 2 を見直す)
 - **ccmsg-webui と canddy に依頼が 2 本出る。** どちらも別リポの責務で、hyoui 側から設定を書き換えない。W3 が済むまで iframe 内は別タブ送りになる
 - **CSP を保留した帰結として、任意のサイトが hyoui を iframe に埋め込み `allow="publickey-credentials-get"` を付けて passkey のプロンプトを出せる。** 認証が通るのは `clientDataJSON.origin` が record の endpoint と一致する場合だけなので、そのサイトが session の内容や token を得ることはない (取れるのは「利用者が生体認証を求められた」という体験だけ) が、埋め込み元を絞る手段は今の設計には無い。clickjacking の面は `X-Frame-Options` / `frame-ancestors` を付けない現行 (findings Part 1-C) と同等で、認証を足すことで悪化はしない。絞る必要が出た時に別 DR で `frame_ancestors` を決める (決定 6)

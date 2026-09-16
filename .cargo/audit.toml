@@ -1,0 +1,26 @@
+# cargo-audit の設定 (RUSTSEC advisories)。
+#
+# **ここが local と CI の唯一の ignore 一覧である。** CI の
+# `rustsec/audit-check` は repo root を cwd にして `cargo audit` を呼ぶだけで
+# config を無効化しないので (action の src/main.ts が渡すのは `--json` と
+# `--file` だけ)、この file が両方に効く。workflow 側の `ignore` 入力に同じ id を
+# 書くと一覧が 2 つになって片方だけ直す事故が起きるため、そちらは使わない。
+#
+# cargo-deny 側の同じ判断は `deny.toml` の `[advisories] ignore` にある
+# (別ツール・別 config なので id の記載は 2 箇所になる)。
+
+[advisories]
+ignore = [
+  # RUSTSEC-2023-0071 — rsa 0.9.x の Marvin attack (timing sidechannel で
+  # **RSA 秘密鍵**が復元されうる)。修正版は出ていない (RustCrypto/RSA#626)。
+  #
+  # **hyoui は RSA 秘密鍵を持たない。** rsa が入るのは
+  # webauthn-rs-core → crypto-glue の無条件依存で (crypto-glue の Cargo.toml に
+  # optional 指定は 1 つも無く、feature で外す口も無い)、hyoui が RSA を使うのは
+  # authenticator が RS256 で作った credential の**署名検証**だけである
+  # (= 公開鍵演算)。脆弱な経路は秘密鍵演算なので、この依存では踏めない。
+  #
+  # 外す手段が上流に無いので、上流が rsa を差し替えるか 0.10 が出るまで ignore
+  # する。判断の正本は DR-0036 決定 8。
+  "RUSTSEC-2023-0071",
+]

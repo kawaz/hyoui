@@ -82,6 +82,10 @@ jobs:
       checks: write
     steps:
       - uses: actions/checkout@v5
+      # ignore する advisory は `.cargo/audit.toml` に書く (= local の
+      # `cargo audit` と同じ 1 箇所)。この action は repo root で `cargo audit` を
+      # 呼ぶだけで config を無効化しないので、ここに `ignore` 入力を足す必要は無い
+      # (足すと一覧が 2 つになり、片方だけ直す事故が起きる)。
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
