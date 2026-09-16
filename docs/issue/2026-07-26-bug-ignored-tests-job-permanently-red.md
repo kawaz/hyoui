@@ -3,7 +3,7 @@ title: "CI の ignored-tests job が continue-on-error で恒常 red を隠し�
 status: wip
 category: bug
 created: 2026-07-26T09:40:00+09:00
-last_read: 2026-07-29T18:45:00+09:00
+last_read: 2026-09-16T17:41:08+09:00
 open_entered: 2026-07-26T09:40:00+09:00
 wip_entered: 2026-08-21T11:50:50+09:00
 blocked_entered:
