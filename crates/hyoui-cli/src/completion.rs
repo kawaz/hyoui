@@ -190,13 +190,13 @@ _hyoui() {
         return 0
     fi
 
-    # `web daemon` / `web service` の nested leaf を補完。`hyoui web` 自体は
-    # 従来の gateway options。
+    # `web daemon` / `web service` / `web passkey` / `web session` の nested leaf を
+    # 補完。`hyoui web` 自体は従来の gateway options。
     if [[ "$sub" == "web" ]]; then
         local web_sub
         web_sub="$(_hyoui_child_of web)"
         if [[ -z "$web_sub" ]]; then
-            COMPREPLY=( $(compgen -W "daemon service --listen --web-assets-dir --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "daemon service passkey session --listen --web-assets-dir --help -h" -- "$cur") )
             return 0
         fi
         if [[ "$web_sub" == "daemon" ]]; then
@@ -225,6 +225,36 @@ _hyoui() {
                     COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
                     return 0 ;;
             esac
+            return 0
+        fi
+        if [[ "$web_sub" == "passkey" ]]; then
+            local passkey_sub
+            passkey_sub="$(_hyoui_child_of passkey)"
+            if [[ -z "$passkey_sub" ]]; then
+                COMPREPLY=( $(compgen -W "add list remove --help -h" -- "$cur") )
+                return 0
+            fi
+            case "$passkey_sub" in
+                add)
+                    case "$prev" in
+                        --endpoint|--label) return 0 ;;
+                    esac
+                    COMPREPLY=( $(compgen -W "--endpoint --label --help -h" -- "$cur") )
+                    return 0 ;;
+                list|remove)
+                    COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
+                    return 0 ;;
+            esac
+            return 0
+        fi
+        if [[ "$web_sub" == "session" ]]; then
+            local session_sub
+            session_sub="$(_hyoui_child_of session)"
+            if [[ -z "$session_sub" ]]; then
+                COMPREPLY=( $(compgen -W "list remove --help -h" -- "$cur") )
+                return 0
+            fi
+            COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
             return 0
         fi
         if [[ "$web_sub" == "service" ]]; then
@@ -809,13 +839,87 @@ _hyoui_web() {
         _hyoui_daemon
     elif (( ${words[(I)service]} )); then
         _hyoui_service
+    elif (( ${words[(I)passkey]} )); then
+        _hyoui_passkey
+    elif (( ${words[(I)session]} )); then
+        _hyoui_web_session
     else
         _arguments \
             '--listen=[Bind address host:port (default 127.0.0.1:43690)]:address:' \
             '--web-assets-dir=[Serve static assets from a local directory]:dir:_files -/' \
-            '1:subcommand:(service)' \
+            '1:subcommand:(daemon service passkey session)' \
             '(-h --help)'{-h,--help}'[Show help]'
     fi
+}
+
+# `web passkey` (= DR-0036 決定 2)。`add` の `--endpoint` は必須。
+_hyoui_passkey() {
+    local context state state_descr line
+    typeset -A opt_args
+    _arguments -C \
+        '1: :_hyoui_passkey_subcommands' \
+        '*::arg:->passkey_args'
+    case $state in
+        passkey_args)
+            case $line[1] in
+                add)
+                    _arguments \
+                        '--endpoint=[Endpoint the passkey will be used on (required)]:url:' \
+                        '--label=[Note kept with the record]:label:' \
+                        '(-h --help)'{-h,--help}'[Show help]'
+                    ;;
+                remove)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '*:sub:'
+                    ;;
+                *)
+                    _arguments '(-h --help)'{-h,--help}'[Show help]'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_hyoui_passkey_subcommands() {
+    local -a subs
+    subs=(
+        'add:Issue an invite URL and a 6-digit code'
+        'list:Print registered passkeys'
+        'remove:Revoke a passkey and its sessions'
+    )
+    _describe -t commands 'hyoui web passkey subcommand' subs
+}
+
+# `web session` (= 認証セッション、DR-0036 決定 5)。PTY の session とは別物。
+_hyoui_web_session() {
+    local context state state_descr line
+    typeset -A opt_args
+    _arguments -C \
+        '1: :_hyoui_web_session_subcommands' \
+        '*::arg:->web_session_args'
+    case $state in
+        web_session_args)
+            case $line[1] in
+                remove)
+                    _arguments \
+                        '(-h --help)'{-h,--help}'[Show help]' \
+                        '*:session id:'
+                    ;;
+                *)
+                    _arguments '(-h --help)'{-h,--help}'[Show help]'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_hyoui_web_session_subcommands() {
+    local -a subs=(
+        'list:Print authenticated sessions'
+        'remove:Revoke one authenticated session'
+    )
+    _describe -t commands 'hyoui web session subcommand' subs
 }
 
 _hyoui_config() {
@@ -997,6 +1101,23 @@ end
 
 function __hyoui_web_service_no_sub
     __hyoui_child_none service
+end
+
+# `web passkey` / `web session` leaf 検出 (= DR-0036)。
+function __hyoui_passkey_using_sub
+    __hyoui_child_using passkey $argv[1]
+end
+
+function __hyoui_passkey_no_sub
+    __hyoui_child_none passkey
+end
+
+function __hyoui_web_session_using_sub
+    __hyoui_child_using session $argv[1]
+end
+
+function __hyoui_web_session_no_sub
+    __hyoui_child_none session
 end
 
 # `web daemon` leaf 検出。
@@ -1200,12 +1321,27 @@ complete -c hyoui -n '__hyoui_using_subcommand detach' -l index  -x    -d 'Sessi
 complete -c hyoui -n '__hyoui_using_subcommand detach' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand detach' -s h -l help    -d 'Show help and exit'
 
-# `hyoui web` gateway options + `web service` family (DR-0027 / DR-0031)
+# `hyoui web` gateway options + `web service` / `web passkey` / `web session`
+# family (DR-0027 / DR-0031 / DR-0036)
 complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -l listen          -x    -d 'Bind address host:port (default 127.0.0.1:43690)'
 complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -l web-assets-dir  -r -F -d 'Serve static assets from a local directory'
 complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -f -a daemon -d 'Manage gateway instances (units)'
 complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -f -a service -d 'Manage OS startup integration'
+complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -f -a passkey -d 'Manage the passkeys that may open an endpoint'
+complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -f -a session -d 'Inspect and revoke authenticated sessions'
 complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n __hyoui_passkey_no_sub -f -a add -d 'Issue an invite URL and a 6-digit code'
+complete -c hyoui -n __hyoui_passkey_no_sub -f -a list -d 'Print registered passkeys'
+complete -c hyoui -n __hyoui_passkey_no_sub -f -a remove -d 'Revoke a passkey and its sessions'
+complete -c hyoui -n '__hyoui_passkey_using_sub add' -l endpoint -x -d 'Endpoint the passkey will be used on (required)'
+complete -c hyoui -n '__hyoui_passkey_using_sub add' -l label -x -d 'Note kept with the record'
+complete -c hyoui -n '__hyoui_passkey_using_sub add' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_passkey_using_sub list' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_passkey_using_sub remove' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n __hyoui_web_session_no_sub -f -a list -d 'Print authenticated sessions'
+complete -c hyoui -n __hyoui_web_session_no_sub -f -a remove -d 'Revoke one authenticated session'
+complete -c hyoui -n '__hyoui_web_session_using_sub list' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_web_session_using_sub remove' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n __hyoui_daemon_no_sub -f -a run -d 'Start one unit in the foreground'
 complete -c hyoui -n __hyoui_daemon_no_sub -f -a supervise -d 'Run the supervisor in the foreground'
 complete -c hyoui -n __hyoui_daemon_no_sub -f -a add -d 'Register a unit and start it'
@@ -1323,7 +1459,7 @@ mod tests {
         RECORD_START_FORMAT_VALUES, RECORD_SUBCOMMANDS, RESERVED_TOP_LEVEL_SUBCOMMANDS,
         SCREEN_DUMP_FORMAT_VALUES, SCREEN_DUMP_LAYER_VALUES, SCREEN_SNAPSHOT_FORMAT_VALUES,
         SCREEN_SUBCOMMANDS, SNAPSHOT_INCLUDE_VALUES, STATUS_FORMAT_VALUES, WEB_DAEMON_SUBCOMMANDS,
-        WEB_SERVICE_SUBCOMMANDS,
+        WEB_PASSKEY_SUBCOMMANDS, WEB_SERVICE_SUBCOMMANDS, WEB_SESSION_SUBCOMMANDS,
     };
 
     const ALL_SHELLS: [Shell; 3] = [Shell::Bash, Shell::Zsh, Shell::Fish];
@@ -1730,6 +1866,42 @@ mod tests {
                 offers_long_opt(&script, "binary"),
                 "shell {sh:?} missing `web service register --binary`"
             );
+        }
+    }
+
+    /// `web passkey` / `web session` の全 leaf と `add` 固有 option を 3 shell で
+    /// 同期する (= DR-0036 決定 2 / 決定 5)。
+    ///
+    /// 実装 ↔ `--help` ↔ completion の 3 者は同時に追従させる。片方向だけ直す
+    /// のがこの family で最も踏みやすい抜けである。
+    #[test]
+    fn completion_all_shells_cover_web_passkey_and_session_surface() {
+        for sh in ALL_SHELLS {
+            let script = script(sh);
+            for parent in ["passkey", "session"] {
+                assert!(
+                    contains_token(&script, parent),
+                    "shell {sh:?} missing `web {parent}`"
+                );
+            }
+            for sub in WEB_PASSKEY_SUBCOMMANDS {
+                assert!(
+                    contains_token(&script, sub),
+                    "shell {sh:?} missing `web passkey {sub}`"
+                );
+            }
+            for sub in WEB_SESSION_SUBCOMMANDS {
+                assert!(
+                    contains_token(&script, sub),
+                    "shell {sh:?} missing `web session {sub}`"
+                );
+            }
+            for option in ["endpoint", "label"] {
+                assert!(
+                    offers_long_opt(&script, option),
+                    "shell {sh:?} missing `web passkey add --{option}`"
+                );
+            }
         }
     }
 

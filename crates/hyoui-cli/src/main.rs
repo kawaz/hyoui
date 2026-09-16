@@ -39,6 +39,7 @@ use hyoui::input_bytes as input_handlers;
 mod socket_path;
 mod wait_core;
 mod web_daemon;
+mod web_passkey;
 mod web_service;
 
 /// `hyoui attach` / `hyoui run` が daemon との接続を予期せず失った
@@ -495,6 +496,10 @@ fn main() -> ExitCode {
             WebCommand::Daemon(WebDaemonCommand::Log { target, follow }) => {
                 web_daemon::log_command(target.name.as_deref(), follow)
             }
+            // 認証の管理は gateway に触らず state file を直に読み書きする
+            // (DR-0036 決定 2 / 決定 4)。
+            WebCommand::Passkey(command) => web_passkey::passkey_command(command),
+            WebCommand::Session(command) => web_passkey::session_command(command),
             WebCommand::Service(WebServiceCommand::Register(cfg)) => {
                 web_service::register_command(cfg.binary)
             }

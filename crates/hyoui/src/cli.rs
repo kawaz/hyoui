@@ -169,6 +169,20 @@ pub enum HelpTopic {
     WebDaemonStatus,
     /// Help for `web daemon log` (= DR-0034 決定 9)。
     WebDaemonLog,
+    /// Help for the `web passkey` parent subcommand (= DR-0036 決定 2)。
+    WebPasskey,
+    /// Help for `web passkey add` (= DR-0036 決定 2)。
+    WebPasskeyAdd,
+    /// Help for `web passkey list` (= DR-0036 決定 3)。
+    WebPasskeyList,
+    /// Help for `web passkey remove` (= DR-0036 決定 4)。
+    WebPasskeyRemove,
+    /// Help for the `web session` parent subcommand (= DR-0036 決定 5)。
+    WebSession,
+    /// Help for `web session list` (= DR-0036 決定 5)。
+    WebSessionList,
+    /// Help for `web session remove` (= DR-0036 決定 4)。
+    WebSessionRemove,
     /// Help for the top-level `version` subcommand (= DR-0034 決定 7a)。
     Version,
     /// Help for the `web service` parent subcommand (= DR-0031)。
@@ -298,6 +312,53 @@ pub struct WebDaemonTarget {
     pub name: Option<String>,
 }
 
+/// `web passkey add` configuration (= DR-0036 決定 2)。
+///
+/// **endpoint は CLI が受け取る唯一の場所である。** gateway は自分の endpoint を
+/// 知らないので (決定 3)、どの endpoint に登録するかを知っているのは打つ人だけ。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WebPasskeyAddConfig {
+    /// `--endpoint=<url>`。正規形 (`scheme://host[:port]/<path>/`) に直して使う。
+    pub endpoint: String,
+    /// `--label=<名前>`。record に残る発行時のラベルで、**認証の材料ではない**。
+    pub label: Option<String>,
+}
+
+/// `web passkey` の leaf command (= DR-0036 決定 2)。
+///
+/// **どれも gateway に要求を送らない。** CLI が state file を直に読み書きし、
+/// gateway は読むだけである (決定 2 / 決定 4) — `hyoui web daemon` が全て停止して
+/// いても `add` が打てる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WebPasskeyCommand {
+    /// `hyoui web passkey add --endpoint <url> [--label <名前>]` — 招待 URL と
+    /// 6 桁コードを発行する。
+    Add(WebPasskeyAddConfig),
+    /// `hyoui web passkey list` — 登録済み credential を表示する。
+    List,
+    /// `hyoui web passkey remove <sub>` — その sub の credential と family を畳む。
+    Remove {
+        /// 畳む対象の `sub`。
+        sub: String,
+    },
+}
+
+/// `web session` の leaf command (= DR-0036 決定 5)。
+///
+/// 扱うのは **認証セッション (token family)** で、PTY の session とは別物である。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WebSessionCommand {
+    /// `hyoui web session list` — 認証セッションを表示する。
+    List,
+    /// `hyoui web session remove <id>` — family 1 本を畳む。
+    Remove {
+        /// 畳む family の id。
+        id: String,
+    },
+}
+
 /// `web` の gateway 起動と unit / service 管理を同じ family に束ねる dispatch。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -308,6 +369,10 @@ pub enum WebCommand {
     Daemon(WebDaemonCommand),
     /// `hyoui web service ...` — OS の per-user service を管理する。
     Service(WebServiceCommand),
+    /// `hyoui web passkey ...` — endpoint ごとの passkey 登録を管理する。
+    Passkey(WebPasskeyCommand),
+    /// `hyoui web session ...` — 認証セッション (token family) を管理する。
+    Session(WebSessionCommand),
 }
 
 /// Fully parsed `run` subcommand configuration.
@@ -2594,6 +2659,13 @@ pub fn usage(topic: &HelpTopic) -> String {
         HelpTopic::ConfigShow => usage_config_show(),
         HelpTopic::Web => usage_web(),
         HelpTopic::WebDaemon => usage_web_daemon(),
+        HelpTopic::WebPasskey => usage_web_passkey(),
+        HelpTopic::WebPasskeyAdd => usage_web_passkey_add(),
+        HelpTopic::WebPasskeyList => usage_web_passkey_list(),
+        HelpTopic::WebPasskeyRemove => usage_web_passkey_remove(),
+        HelpTopic::WebSession => usage_web_session(),
+        HelpTopic::WebSessionList => usage_web_session_list(),
+        HelpTopic::WebSessionRemove => usage_web_session_remove(),
         HelpTopic::WebDaemonRun => usage_web_daemon_run(),
         HelpTopic::WebDaemonSupervise => usage_web_daemon_supervise(),
         HelpTopic::WebDaemonAdd => usage_web_daemon_add(),
@@ -2722,12 +2794,17 @@ fn usage_web() -> String {
 hyoui web [--listen=<host:port>] [--web-assets-dir=<path>]
 hyoui web daemon <subcommand>
 hyoui web service <subcommand>
+hyoui web passkey <subcommand>
+hyoui web session <subcommand>
 
-Start the HTTP gateway, or manage its instances and per-user OS service.
+Start the HTTP gateway, or manage its instances, its per-user OS service, and
+who may open it.
 
 SUBCOMMANDS:
   daemon     Register, inspect, and run gateway instances (units).
   service    Register, unregister, or inspect OS startup integration.
+  passkey    Issue, list, and revoke the passkeys that may open an endpoint.
+  session    Inspect and revoke authenticated browser sessions.
 
 OPTIONS:
   --listen=<host:port>       Override bind address (default: config
@@ -2741,9 +2818,160 @@ Endpoints:
   GET  /                           HTML session list page.
   GET  /sessions/:id               HTML session view (xterm.js + input form).
   GET  /assets/*                   Static assets.
+  POST /auth/*                     Passkey sign-in.
   GET  /api/sessions               List live sessions as JSON.
   GET  /api/sessions/:id/screen    ANSI screen dump.
   POST /api/sessions/:id/input     Send input specs.
+
+`/api/*` and the WebSocket attach require a registered passkey; the pages,
+assets, /healthz, and /version stay open. Register a device with
+`hyoui web passkey add --endpoint <url>` before opening the endpoint in a
+browser -- an endpoint with no passkey cannot be signed in to.
+"
+    .to_string()
+}
+
+fn usage_web_passkey() -> String {
+    "\
+hyoui web passkey <subcommand>
+
+Manage the passkeys that may open a web endpoint. Registration is issued here
+and nowhere else: there is no remote enrolment path and no recovery path.
+
+Every command reads and writes
+`${XDG_STATE_HOME:-~/.local/state}/hyoui-web/auth.json` (and `pending.json`)
+directly. No running gateway is required -- add works while every unit is
+stopped. No arguments prints this help.
+
+SUBCOMMANDS:
+  add --endpoint <url>           Issue an invite URL and a 6-digit code.
+  list                           Print registered passkeys.
+  remove <sub>                   Revoke a passkey and its sessions.
+
+OPTIONS:
+  --help, -h    Show this help.
+
+A passkey works only on the endpoint it was registered for. Register the HA
+endpoint for day-to-day use, and the per-unit endpoints only when you need to
+open one unit on purpose.
+"
+    .to_string()
+}
+
+fn usage_web_passkey_add() -> String {
+    "\
+hyoui web passkey add --endpoint <url> [--label <name>]
+
+Issue one invite URL and one 6-digit code. Open the URL on the device that
+should hold the passkey, type the code, and the device is registered.
+
+The endpoint has no default: the gateway does not know where it is mounted, so
+only you can say which URL the browser will use. The URL is normalised to
+`scheme://host[:port]/<path>/` -- the same string the browser computes and the
+gateway looks the record up by. A value that cannot be normalised is refused.
+
+OPTIONS:
+  --endpoint <url>   Endpoint the passkey will be used on (required).
+  --label <name>     Note kept with the record; never used to authenticate.
+  --help, -h         Show this help.
+
+The invite URL carries its token in the fragment (`#register=...`), so it never
+reaches the server, a proxy log, or a Referer header. The code is printed here
+only -- it is not in the URL, and five wrong entries burn the URL. The URL also
+expires after 10 minutes; issue a new one if either happens.
+
+Output is JSON; errors are JSON on stderr with a non-zero exit.
+"
+    .to_string()
+}
+
+fn usage_web_passkey_list() -> String {
+    "\
+hyoui web passkey list
+
+Print every registered passkey: which endpoint it works on, its `sub`, the
+labels, when it was registered and last used, and the backup flags reported by
+the authenticator.
+
+The labels and flags are there to help you recognise a device. They are never
+read to decide whether a request is authenticated.
+
+OPTIONS:
+  --help, -h    Show this help.
+
+Revoked entries are kept and shown as revoked, so `remove` leaves a trace.
+
+Output is JSON; errors are JSON on stderr with a non-zero exit.
+"
+    .to_string()
+}
+
+fn usage_web_passkey_remove() -> String {
+    "\
+hyoui web passkey remove <sub>
+
+Revoke one passkey. Its credentials and every session minted for it are marked
+revoked, so the next authentication and the next refresh both fail.
+
+A WebSocket that is already open keeps running until it next extends its
+session, which is at most 4 hours. To cut every connection immediately, restart
+the units instead (`hyoui web daemon restart --all`).
+
+OPTIONS:
+  --help, -h    Show this help.
+
+Output is JSON; errors are JSON on stderr with a non-zero exit.
+"
+    .to_string()
+}
+
+fn usage_web_session() -> String {
+    "\
+hyoui web session <subcommand>
+
+Inspect and revoke authenticated browser sessions. These are the token families
+minted after a passkey signs in -- not the PTY sessions that `hyoui list`
+prints. No arguments prints this help.
+
+SUBCOMMANDS:
+  list                           Print authenticated sessions.
+  remove <id>                    Revoke one session.
+
+OPTIONS:
+  --help, -h    Show this help.
+"
+    .to_string()
+}
+
+fn usage_web_session_list() -> String {
+    "\
+hyoui web session list
+
+Print every authenticated session: its id, the endpoint and `sub` it belongs
+to, when its access and refresh tokens expire, and whether it is revoked.
+
+OPTIONS:
+  --help, -h    Show this help.
+
+Output is JSON; errors are JSON on stderr with a non-zero exit.
+"
+    .to_string()
+}
+
+fn usage_web_session_remove() -> String {
+    "\
+hyoui web session remove <id>
+
+Revoke one authenticated session, leaving the passkey itself registered. Use
+`hyoui web session list` to find the id.
+
+The next refresh from that browser fails, and a WebSocket that is already open
+is cut when it next extends its session (at most 4 hours).
+
+OPTIONS:
+  --help, -h    Show this help.
+
+Output is JSON; errors are JSON on stderr with a non-zero exit.
 "
     .to_string()
 }
@@ -4394,6 +4622,12 @@ fn parse_web(args: &[String]) -> Command {
     if args.first().map(String::as_str) == Some("daemon") {
         return parse_web_daemon(&args[1..]);
     }
+    if args.first().map(String::as_str) == Some("passkey") {
+        return parse_web_passkey(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("session") {
+        return parse_web_session(&args[1..]);
+    }
 
     let mut listen: Option<String> = None;
     let mut assets_dir: Option<std::path::PathBuf> = None;
@@ -4441,6 +4675,181 @@ fn parse_web(args: &[String]) -> Command {
         i += 1;
     }
     Command::Web(WebCommand::Serve(WebConfig { listen, assets_dir }))
+}
+
+/// `hyoui web passkey <subcommand>` (= DR-0036 決定 2)。
+///
+/// endpoint の正規形の判定は実行層 (`hyoui_web::contract::Endpoint`) が持つので、
+/// ここでは値の有無だけを見る (= 正規形の正本を 1 箇所にする、決定 3)。
+fn parse_web_passkey(args: &[String]) -> Command {
+    let Some(head) = args.first().map(String::as_str) else {
+        return Command::Help {
+            topic: HelpTopic::WebPasskey,
+        };
+    };
+    if matches!(head, "--help" | "-h") {
+        return Command::Help {
+            topic: HelpTopic::WebPasskey,
+        };
+    }
+    let rest = &args[1..];
+    match head {
+        "add" => parse_web_passkey_add(rest),
+        "list" => {
+            if rest.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+                return Command::Help {
+                    topic: HelpTopic::WebPasskeyList,
+                };
+            }
+            match rest.first() {
+                Some(arg) => {
+                    Command::Error(format!("web passkey list: unexpected argument: {arg}"))
+                }
+                None => Command::Web(WebCommand::Passkey(WebPasskeyCommand::List)),
+            }
+        }
+        "remove" => {
+            if rest.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+                return Command::Help {
+                    topic: HelpTopic::WebPasskeyRemove,
+                };
+            }
+            match rest {
+                [sub] if !sub.starts_with('-') => {
+                    Command::Web(WebCommand::Passkey(WebPasskeyCommand::Remove {
+                        sub: sub.clone(),
+                    }))
+                }
+                [] => Command::Help {
+                    topic: HelpTopic::WebPasskeyRemove,
+                },
+                [_, extra, ..] => {
+                    Command::Error(format!("web passkey remove: unexpected argument: {extra}"))
+                }
+                [other] => Command::Error(format!("web passkey remove: unknown option: {other}")),
+            }
+        }
+        other if other.starts_with('-') => {
+            Command::Error(format!("web passkey: unknown option: {other}"))
+        }
+        other => Command::Error(format!(
+            "web passkey: unknown subcommand `{other}` (supported: {})",
+            WEB_PASSKEY_SUBCOMMANDS.join(", ")
+        )),
+    }
+}
+
+fn parse_web_passkey_add(args: &[String]) -> Command {
+    let mut config = WebPasskeyAddConfig::default();
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "--help" | "-h" => {
+                return Command::Help {
+                    topic: HelpTopic::WebPasskeyAdd,
+                };
+            }
+            _ if arg.starts_with("--endpoint=") => {
+                let value = &arg["--endpoint=".len()..];
+                if value.is_empty() {
+                    return Command::Error("web passkey add: --endpoint requires a URL".into());
+                }
+                config.endpoint = value.to_string();
+            }
+            "--endpoint" => {
+                i += 1;
+                match args.get(i) {
+                    Some(value) if !value.is_empty() => config.endpoint = value.clone(),
+                    _ => {
+                        return Command::Error("web passkey add: --endpoint requires a URL".into());
+                    }
+                }
+            }
+            _ if arg.starts_with("--label=") => {
+                let value = &arg["--label=".len()..];
+                if value.is_empty() {
+                    return Command::Error("web passkey add: --label requires a value".into());
+                }
+                config.label = Some(value.to_string());
+            }
+            "--label" => {
+                i += 1;
+                match args.get(i) {
+                    Some(value) if !value.is_empty() => config.label = Some(value.clone()),
+                    _ => return Command::Error("web passkey add: --label requires a value".into()),
+                }
+            }
+            other => {
+                return Command::Error(format!("web passkey add: unexpected argument: {other}"));
+            }
+        }
+        i += 1;
+    }
+    if config.endpoint.is_empty() {
+        // **endpoint は省略できない。** gateway は自分の endpoint を知らないので
+        // (決定 3)、既定値を持てる者がいない。
+        return Command::Error("web passkey add: --endpoint <url> is required".into());
+    }
+    Command::Web(WebCommand::Passkey(WebPasskeyCommand::Add(config)))
+}
+
+/// `hyoui web session <subcommand>` (= DR-0036 決定 5)。
+fn parse_web_session(args: &[String]) -> Command {
+    let Some(head) = args.first().map(String::as_str) else {
+        return Command::Help {
+            topic: HelpTopic::WebSession,
+        };
+    };
+    if matches!(head, "--help" | "-h") {
+        return Command::Help {
+            topic: HelpTopic::WebSession,
+        };
+    }
+    let rest = &args[1..];
+    match head {
+        "list" => {
+            if rest.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+                return Command::Help {
+                    topic: HelpTopic::WebSessionList,
+                };
+            }
+            match rest.first() {
+                Some(arg) => {
+                    Command::Error(format!("web session list: unexpected argument: {arg}"))
+                }
+                None => Command::Web(WebCommand::Session(WebSessionCommand::List)),
+            }
+        }
+        "remove" => {
+            if rest.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+                return Command::Help {
+                    topic: HelpTopic::WebSessionRemove,
+                };
+            }
+            match rest {
+                [id] if !id.starts_with('-') => {
+                    Command::Web(WebCommand::Session(WebSessionCommand::Remove {
+                        id: id.clone(),
+                    }))
+                }
+                [] => Command::Help {
+                    topic: HelpTopic::WebSessionRemove,
+                },
+                [_, extra, ..] => {
+                    Command::Error(format!("web session remove: unexpected argument: {extra}"))
+                }
+                [other] => Command::Error(format!("web session remove: unknown option: {other}")),
+            }
+        }
+        other if other.starts_with('-') => {
+            Command::Error(format!("web session: unknown option: {other}"))
+        }
+        other => Command::Error(format!(
+            "web session: unknown subcommand `{other}` (supported: {})",
+            WEB_SESSION_SUBCOMMANDS.join(", ")
+        )),
+    }
 }
 
 /// `hyoui web daemon <subcommand>` (= DR-0034 決定 1、P2 の範囲)。
@@ -6795,6 +7204,12 @@ pub const WEB_DAEMON_SUBCOMMANDS: &[&str] = &[
     "status",
     "log",
 ];
+
+/// `hyoui web passkey` の子 subcommand 一覧 (= DR-0036 決定 2)。
+pub const WEB_PASSKEY_SUBCOMMANDS: &[&str] = &["add", "list", "remove"];
+
+/// `hyoui web session` の子 subcommand 一覧 (= DR-0036 決定 5)。
+pub const WEB_SESSION_SUBCOMMANDS: &[&str] = &["list", "remove"];
 
 /// `hyoui screen snapshot --include` の help / completion に出す component 名一覧。
 ///
@@ -11618,6 +12033,134 @@ mod tests {
             Command::Error(message) if message.contains("unexpected argument")
         ));
         assert!(usage(&HelpTopic::Version).contains("restart_needed"));
+    }
+
+    /// `web passkey` の parse (= DR-0036 決定 2)。
+    #[test]
+    fn web_passkey_parses_its_leaves() {
+        assert_eq!(
+            parse_args(&args(&[
+                "web",
+                "passkey",
+                "add",
+                "--endpoint",
+                "https://hyoui.example.jp",
+                "--label",
+                "mac",
+            ])),
+            Command::Web(WebCommand::Passkey(WebPasskeyCommand::Add(
+                WebPasskeyAddConfig {
+                    endpoint: "https://hyoui.example.jp".to_string(),
+                    label: Some("mac".to_string()),
+                }
+            ))),
+            "正規化は実行層が持つので、parser は受け取った値をそのまま渡す"
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "web",
+                "passkey",
+                "add",
+                "--endpoint=https://hyoui.example.jp/",
+            ])),
+            Command::Web(WebCommand::Passkey(WebPasskeyCommand::Add(
+                WebPasskeyAddConfig {
+                    endpoint: "https://hyoui.example.jp/".to_string(),
+                    label: None,
+                }
+            )))
+        );
+        // endpoint は省略できない (= gateway は自分の endpoint を知らない、決定 3)。
+        assert!(matches!(
+            parse_args(&args(&["web", "passkey", "add"])),
+            Command::Error(message) if message.contains("--endpoint")
+        ));
+        assert!(matches!(
+            parse_args(&args(&["web", "passkey", "add", "--endpoint"])),
+            Command::Error(message) if message.contains("requires a URL")
+        ));
+
+        assert_eq!(
+            parse_args(&args(&["web", "passkey", "list"])),
+            Command::Web(WebCommand::Passkey(WebPasskeyCommand::List))
+        );
+        assert_eq!(
+            parse_args(&args(&["web", "passkey", "remove", "hyoui.example.jp-1"])),
+            Command::Web(WebCommand::Passkey(WebPasskeyCommand::Remove {
+                sub: "hyoui.example.jp-1".to_string(),
+            }))
+        );
+        // 対象を省いた remove は help (= 既定の対象を勝手に選ばない)。
+        assert!(matches!(
+            parse_args(&args(&["web", "passkey", "remove"])),
+            Command::Help {
+                topic: HelpTopic::WebPasskeyRemove
+            }
+        ));
+        assert!(matches!(
+            parse_args(&args(&["web", "passkey"])),
+            Command::Help {
+                topic: HelpTopic::WebPasskey
+            }
+        ));
+        assert!(matches!(
+            parse_args(&args(&["web", "passkey", "nope"])),
+            Command::Error(message) if message.contains("unknown subcommand")
+        ));
+    }
+
+    /// `web session` の parse (= 認証セッション、DR-0036 決定 5)。
+    #[test]
+    fn web_session_parses_its_leaves() {
+        assert_eq!(
+            parse_args(&args(&["web", "session", "list"])),
+            Command::Web(WebCommand::Session(WebSessionCommand::List))
+        );
+        assert_eq!(
+            parse_args(&args(&["web", "session", "remove", "fam-1"])),
+            Command::Web(WebCommand::Session(WebSessionCommand::Remove {
+                id: "fam-1".to_string(),
+            }))
+        );
+        assert!(matches!(
+            parse_args(&args(&["web", "session"])),
+            Command::Help {
+                topic: HelpTopic::WebSession
+            }
+        ));
+        assert!(matches!(
+            parse_args(&args(&["web", "session", "remove", "a", "b"])),
+            Command::Error(message) if message.contains("unexpected argument")
+        ));
+    }
+
+    /// passkey / session help は親と各 leaf の操作面を別々に説明する。
+    #[test]
+    fn usage_web_passkey_and_session_topics_are_specific() {
+        // 親 (`hyoui web`) の help から子へ辿れる。
+        assert!(usage(&HelpTopic::Web).contains("passkey"));
+        assert!(usage(&HelpTopic::Web).contains("session"));
+        for subcommand in WEB_PASSKEY_SUBCOMMANDS {
+            assert!(
+                usage(&HelpTopic::WebPasskey).contains(subcommand),
+                "{subcommand}"
+            );
+        }
+        for subcommand in WEB_SESSION_SUBCOMMANDS {
+            assert!(
+                usage(&HelpTopic::WebSession).contains(subcommand),
+                "{subcommand}"
+            );
+        }
+        // option は help に出る (= 実装 / help / completion の 3 者を揃える)。
+        assert!(usage(&HelpTopic::WebPasskeyAdd).contains("--endpoint"));
+        assert!(usage(&HelpTopic::WebPasskeyAdd).contains("--label"));
+        // 失効がいつ効くかを help が答える (決定 4)。
+        assert!(usage(&HelpTopic::WebPasskeyRemove).contains("4 hours"));
+        assert!(usage(&HelpTopic::WebSessionRemove).contains("4 hours"));
+        // 認証セッションと PTY session の区別を help で言う。
+        assert!(usage(&HelpTopic::WebSession).contains("not the PTY sessions"));
+        assert!(usage(&HelpTopic::WebPasskeyList).contains("authenticated"));
     }
 
     /// daemon help は親と各 leaf の操作面を別々に説明する。
