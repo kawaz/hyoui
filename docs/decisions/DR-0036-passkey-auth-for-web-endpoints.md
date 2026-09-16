@@ -1,6 +1,6 @@
 # DR-0036: web endpoint を passkey で守る。gateway は自分の endpoint を知らない
 
-- Status: 🟡 実装中 (2026-09-16)。**W2-1 / W2-2 / W2-3 / W2-4 / W2-6 (runbook) まで実装済み、残りは W2-5 (front の overlay ログイン UI と tab-share) だけ**。gate 3 は Chrome 分を実測して通過 (Safari / iOS は kawaz 確認待ち)、gate 4 は実測の結果 3 件を裁定して確定 (決定 2 / 決定 6 / 決定 8 に反映済み)。**この時点で認証は既に有効なので、W2-5 が入るまでブラウザからは開けない** (= `/api/*` が 401 を返し、ログイン UI がまだ無い)
+- Status: 🟢 実装済み (2026-09-16)。**W2-1 〜 W2-6 が入り、登録 → 認証 → refresh → 失効の通しを実ブラウザで観測済み** (Chrome + CDP 仮想 authenticator)。残るのは **kawaz が本番 3 endpoint に登録する運用手順** (runbook あり) と **Safari / iOS の gate 3 確認**の 2 点。W3 (ccmsg-webui への `allow` 依頼) / W4 (canddy のコメント修正依頼) は別リポの責務
 - Date: 2026-09-16
 - Related: DR-0035 (web 契約と世代 version。決定 6 の endpoint 基点相対 URL が本 DR の前提), DR-0027 (認証は当面なし・tailnet 前提という現行前提を本 DR が置き換える), DR-0034 (`/healthz` `/version` は認証境界を変えない、stable / unstable 2 unit と HA endpoint), DR-0013 (attach 復元。`ro` 相当の mode の出どころ), DR-0022 (`POST /input` の auto-lock と `HYOUI_LOCK_TOKEN`。lock token は HTTP 認証ではない), DR-0008 §7 (daemon 境界の認証は同 UID + socket perm。本 DR は触らない)
 - Origin: `docs/research/2026-09-15-web-protocol-and-passkey-grand-design.md` (§4 / §5 / §6)、事実は `docs/findings/2026-09-15-web-contract-and-ccmsg-passkey-inventory.md`
@@ -322,10 +322,11 @@ reference は「library は要らない」と書くが、その根拠は「attes
 | W2-4 | `hyoui web passkey` / `session` の CLI (決定 2) | 登録 → 認証 → `passkey list` → `remove` が一続きで通る。**`remove` 後は (a) 新規認証が落ち、(b) `/auth/refresh` が落ち、(c) 確立済み WS は次の `auth.extend` で切れる** (決定 4 の「失効はいつ効くか」)。gateway が停止していても `passkey add` が URL を発行できる (決定 2) |
 | | | ✅ **CLI は通過** (`hyoui web passkey add \| list \| remove`、`hyoui web session list \| remove`。parse / help / completion 3 shell を test で同期)。`crates/hyoui-cli/tests/auth_store_concurrency.rs` が **本物の 2 プロセス**で「並行 `passkey add` が登録を落とさない」「6 桁コードの試行回数が 2 unit 合計で数えられる」「片 unit で置いた session が両 unit で通り、tombstone が両方に即効く」を固定。**登録 → 認証の通し (= 署名を伴う一続き) は W2-5 の front が入ってから実機で見る** |
 | W2-5 | front の overlay ログイン UI と tab-share (決定 5) | reference `multi-tab-token-refresh` の 7 性質を test で固定する。**2 タブの access が同時に切れても refresh が 1 回だけ**走る |
+| | | ✅ **通過。** 7 性質は `crates/hyoui-web/tests/js/auth-share.test.js` (node の test runner、`just test-js` と CI の js job) が `assets/auth-share.js` を本物のまま読んで固定する。**実ブラウザでは 2 つの bug が出て直した**: (1) channel を sub で張り替えると**開いたばかりのタブ (sub 未知) が sub を知っているタブに届かない** → 待ち合わせ場所を endpoint 単位にし、誰の値かは message の `sub` で判定する (決定 5 の「配るメッセージには sub を載せる」がこのため)、(2) 予定した延長を `ensure` (= 期限内なら何もしない) で呼んでいて**実際には走っていなかった** → 先回りの入口 (`refreshAhead`) を分けた。どちらも test に落としてある |
 | W2-6 | runbook を書き、kawaz が各 endpoint に登録 (決定 10) | HA endpoint に登録した 1 本で、**fallback を起こしても再認証を求められない** (実機で unstable を落として stable に回す) |
 | | | ✅ **runbook は `docs/runbooks/2026-09-16-web-passkey-registration.md`**。gate 3 の検証ページを `docs/runbooks/assets/dr36-gate3/` に置いた (Safari / iOS の確認手順込み)。⬜ **kawaz の登録そのものは W2-5 待ち** — 招待 URL を開いた先の登録ページが front の成果物なので、W2-5 が入るまで手順は実行できない |
 
-**残る未検証事項は 2 つである** (2026-09-16 時点): Safari / iOS Safari の gate 3 と、**`residentKey: required` のままの登録 → 認証の通し**。後者が Rust の test に載らないのは仮想 authenticator が resident key 非対応だからで (決定 8 の表)、W2-5 の front が入ってから実ブラウザ (Chrome の CDP 仮想 authenticator) で見る。gate 4 と前提条件表の「平文 http では refresh cookie が保存されない」は実測で埋まり、実測の結果 3 件を裁定して決定 2 / 決定 6 / 決定 8 に反映した。**推測のまま実装に進まない。**
+**残る未検証事項は Safari / iOS Safari の gate 3 だけである** (2026-09-16 時点)。**`residentKey: required` のままの登録 → 認証は実ブラウザで通した** (Chrome + CDP 仮想 authenticator、2026-09-16): 招待 URL → 6 桁コード → `create()` → 登録が即サインイン → cookie を消して `get()` で再サインイン → record の `last_used_at` と `sign_count` が動く → `passkey remove` で次の要求から落ちる、までを観測した。同じ経路で `auth.extend` → `auth.extend.result (ok:true)` の往復も CDP の WS frame で確認した。gate 4 と前提条件表の「平文 http では refresh cookie が保存されない」は実測で埋まり、実測の結果 3 件を裁定して決定 2 / 決定 6 / 決定 8 に反映した。**推測のまま実装に進まない。**
 
 ## Alternatives Considered
 

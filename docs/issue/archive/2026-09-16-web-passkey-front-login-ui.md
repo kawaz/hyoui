@@ -1,6 +1,6 @@
 ---
 title: "DR-0036 W2-5: front の overlay ログイン UI と登録ページ、tab-share (= 認証は有効だがブラウザから開けない状態)"
-status: open
+status: resolved
 category: task
 created: 2026-09-16T21:55:00+09:00
 last_read: 2026-09-16T21:55:00+09:00
@@ -9,12 +9,24 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-16T22:15:00+09:00
 discard_reason:
 pending_reason:
 ---
 
 # DR-0036 W2-5: front の overlay ログイン UI と登録ページ、tab-share
+
+## 決着 (2026-09-16)
+
+実装して close。**裁定は (A) + (B) の分担**で、7 性質は node の test runner
+(`crates/hyoui-web/tests/js/`、`just test-js` と CI の js job)、実ブラウザでの通しは
+playwright (Chrome + CDP 仮想 authenticator) が見る。
+
+実機で 2 つの bug が出て直した (どちらも test に落とした): channel を sub で
+張り替えると開いたばかりのタブに届かない / 予定した延長が `ensure` 経由で実際には
+走っていない。詳細は DR-0036 の W2-5 行。
+
+以下は起票時の記述。
 
 ## 今どうなっているか
 

@@ -5,7 +5,6 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
 | 2026-09-16 | bug | open | [ci-cargo-deny-argument-order](./2026-09-16-ci-cargo-deny-argument-order.md) | CI の cargo-deny-action は cargo-deny 0.20 系で `check --all-features` の引数順エラーになる (時間で壊れる) |
-| 2026-09-16 | task | open | [web-passkey-front-login-ui](./2026-09-16-web-passkey-front-login-ui.md) | DR-0036 W2-5: 認証は既に有効だが front に 401 を扱う経路が無く、ブラウザから開けない。overlay ログイン UI / 登録ページ / tab-share と、7 性質の test をどこで回すかの裁定が要る |
 | 2026-09-16 | task | open | [dr-index-archive-convention](./2026-09-16-dr-index-archive-convention.md) | docs-layout の archive 運用規約更新を受けて、hyoui の docs/decisions/INDEX.md (Archived 節 / Superseded 行 / 状態列の日付) を新規約に揃える (ccmsg 依頼 2026-09-16) |
 | 2026-09-15 | task | open | [service-subcommand-multi-unit-ha](./2026-09-15-service-subcommand-multi-unit-ha.md) | hyoui service を reference の daemon/service 体系 (multi-unit) にし、stable/unstable 2 インスタンスの HA を組む (kawaz 裁定 2026-09-15) |
 | 2026-09-15 | task | open | [upgrade-e2e-test](./2026-09-15-upgrade-e2e-test.md) | daemon graceful upgrade (DR-0028 Phase 1〜3) の検証マトリクスと e2e テストが未整備 (unit test 5 本のみ、Phase gate 未達) |
