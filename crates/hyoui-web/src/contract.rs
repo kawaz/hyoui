@@ -279,6 +279,90 @@ impl VersionResponse {
     }
 }
 
+// -----------------------------------------------------------------------------
+// /auth/* (DR-0036 決定 3 / 決定 5)
+// -----------------------------------------------------------------------------
+
+/// `POST /auth/challenge` の request body。
+///
+/// **ブラウザが endpoint URL を計算して載せる** (DR-0036 決定 3)。gateway は自分の
+/// endpoint を知らないので、この値で record 集合を絞る。**ブラウザが名乗った値を
+/// 信じているわけではない** — 本体の検証は `clientDataJSON.origin` と `rpIdHash` で、
+/// この `endpoint` は record を引く索引にすぎない (違えば引けないだけ)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChallengeRequest {
+    /// 自分の endpoint (正規形)。
+    pub endpoint: Endpoint,
+}
+
+/// `POST /auth/challenge` の応答。
+///
+/// `options` は WebAuthn の `publicKey` をそのまま載せる (= crate が組んだ形を
+/// 素通しする)。`endpoint` を応答にも載せるのは、**「challenge を取った endpoint」と
+/// 「使う endpoint」のすり替えを効かなくする**ため (決定 3)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChallengeResponse {
+    /// この challenge の識別子。消費時に提示する。
+    pub challenge_id: String,
+    /// challenge を発行した endpoint。
+    pub endpoint: Endpoint,
+    /// `navigator.credentials.get()` / `create()` に渡す options。
+    pub options: serde_json::Value,
+}
+
+/// `POST /auth/register` の request body (DR-0036 決定 2)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterRequest {
+    /// 自分の endpoint (正規形)。
+    pub endpoint: Endpoint,
+    /// `/auth/challenge` で得た識別子。
+    pub challenge_id: String,
+    /// 招待 URL の fragment に入っていた jwt。
+    pub jwt: String,
+    /// CLI が別経路で表示した 6 桁コード。**URL には含まれない。**
+    pub code: String,
+    /// `navigator.credentials.create()` の結果。
+    pub credential: serde_json::Value,
+    /// 登録ページで利用者が付けた端末のラベル。**認証の材料ではない** (決定 3)。
+    #[serde(default)]
+    pub device_label: Option<String>,
+}
+
+/// `POST /auth/assert` の request body。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssertRequest {
+    /// 自分の endpoint (正規形)。
+    pub endpoint: Endpoint,
+    /// `/auth/challenge` で得た識別子。
+    pub challenge_id: String,
+    /// `navigator.credentials.get()` の結果。
+    pub credential: serde_json::Value,
+}
+
+/// `POST /auth/refresh` の request body。
+///
+/// refresh token 自体は cookie で運ぶ (body に載せない、決定 5)。body にあるのは
+/// **引いた family の `endpoint` と突き合わせる値**だけである。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshRequest {
+    /// 自分の endpoint (正規形)。
+    pub endpoint: Endpoint,
+}
+
+/// 認証が通った時の応答 (`/auth/register` / `/auth/assert` / `/auth/refresh` 共通)。
+///
+/// **access token は body で返す** (ブラウザのメモリにだけ置く)。refresh token は
+/// `Set-Cookie` だけで返し、body に載せない (決定 5)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionResponse {
+    /// access token (base64url)。`Authorization: Bearer` と WS subprotocol に使う。
+    pub access_token: String,
+    /// access の期限 (ISO 8601)。`hello.auth_expires_at` と同じ値。
+    pub expires_at: String,
+    /// 誰として通ったか (= credential の `sub`)。tab-share の key に使う。
+    pub sub: String,
+}
+
 /// `POST /api/sessions/{id}/input` の request body。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputRequest {
