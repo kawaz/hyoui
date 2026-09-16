@@ -659,6 +659,42 @@ fn e2e_ws_attach_bridge_roundtrip() {
         .unwrap();
     let (mut ws, _resp) = client(req, stream).expect("ws handshake");
 
+    // DR-0035 決定 3: 最初の text frame は hello で、attach.info より前に来る。
+    // browser は再接続のたびにこれを見て世代を比べるので、順序が契約である。
+    // caps は daemon と intersect 済みの集合 (決定 4)。
+    let first_text = loop {
+        match ws.read().expect("WS first frame") {
+            Message::Text(text) => {
+                break serde_json::from_str::<serde_json::Value>(text.as_str())
+                    .expect("WS control frame JSON");
+            }
+            // binary (= 接続時点の redraw) は順序の対象外。
+            Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+            Message::Close(_) => panic!("WS closed before hello"),
+        }
+    };
+    assert_eq!(
+        first_text["kind"], "hello",
+        "最初の text frame は hello: {first_text}"
+    );
+    assert_eq!(
+        first_text["protocol"],
+        serde_json::json!(hyoui_web::contract::WEB_PROTOCOL_VERSION),
+        "hello の protocol: {first_text}"
+    );
+    assert!(
+        first_text["caps"]
+            .as_array()
+            .is_some_and(|caps| caps.iter().any(|cap| cap == "data")),
+        "hello の caps は intersect 済みの集合: {first_text}"
+    );
+    // 認証は DR-0036 で載る。無効な間は null (決定 1)。
+    assert_eq!(
+        first_text["auth_expires_at"],
+        serde_json::Value::Null,
+        "hello の auth_expires_at: {first_text}"
+    );
+
     // WS → daemon: "HELLOWS\n" を送る (= line-echo shell が echo back する)。
     ws.send(Message::Binary(b"HELLOWS\n".to_vec().into()))
         .expect("ws send");
@@ -746,8 +782,13 @@ fn e2e_ws_attach_bridge_roundtrip() {
         }
     };
     assert_eq!(zero_ack["ok"], false, "zero resize ack={zero_ack}");
+    // error は {code, message} の 1 型 (DR-0035 決定 2)。
+    assert_eq!(
+        zero_ack["error"]["code"], "invalid-request",
+        "zero resize error={zero_ack}"
+    );
     assert!(
-        zero_ack["error"]
+        zero_ack["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("must be > 0")),
         "zero resize error={zero_ack}"
