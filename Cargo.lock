@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "hyoui"
-version = "0.9.51"
+version = "0.9.52"
 dependencies = [
  "ciborium",
  "crossbeam-channel",
@@ -1104,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "hyoui-cli"
-version = "0.9.51"
+version = "0.9.52"
 dependencies = [
  "ciborium",
  "hyoui",
@@ -1125,7 +1125,7 @@ dependencies = [
 
 [[package]]
 name = "hyoui-web"
-version = "0.9.51"
+version = "0.9.52"
 dependencies = [
  "axum",
  "base64 0.22.1",
