@@ -52,7 +52,7 @@ Status 列は **ラベル + 最終判定日** だけを載せる。実装範囲�
 | [DR-0033](./DR-0033-leader-request-takeover.md) | ✅ 実装済 (2026-08-01) | `leader.request` — rw client による leader 奪取 (takeover) |
 | [DR-0034](./DR-0034-service-multi-unit-and-stable-unstable-ha.md) | 🟡 部分実装 (2026-09-15) | `hyoui web daemon` / `hyoui web service` の 2 系統化 (= unit = 登録簿 1 ファイル + 監督者 1 つを OS に載せる) と stable / unstable 2 インスタンスの HA |
 | [DR-0035](./DR-0035-web-contract-and-protocol-generation.md) | 🟡 部分実装 (2026-09-16) | web 境界の契約を `contract.rs` の serde 型で正本化し、世代 version (`WEB_PROTOCOL_VERSION`) で stale なページを検出する (= 伝達は WS hello frame と `/version` のみ、帯で reload 誘導)。W1-1〜W1-6 実装済、gate 1(b) は canddy の 3 endpoint 待ち / W1-5 の cap 不足 daemon への 501 は実機未検証 |
-| [DR-0036](./DR-0036-passkey-auth-for-web-endpoints.md) | ⬜ 未実装 (2026-09-16) | web endpoint を passkey で守る (= 登録は CLI 発行の招待 URL、gateway は自分の endpoint を知らず record の endpoint で検証、無認証 mode を持たない) |
+| [DR-0036](./DR-0036-passkey-auth-for-web-endpoints.md) | 🟡 実装中 (2026-09-16) | web endpoint を passkey で守る (= 登録は CLI 発行の招待 URL、gateway は自分の endpoint を知らず record の endpoint で検証、無認証 mode を持たない) |
 ## Archived
 
 (なし)
