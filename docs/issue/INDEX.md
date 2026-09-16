@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-09-16 | task | open | [dr-index-archive-convention](./2026-09-16-dr-index-archive-convention.md) | docs-layout の archive 運用規約更新を受けて、hyoui の docs/decisions/INDEX.md (Archived 節 / Superseded 行 / 状態列の日付) を新規約に揃える (ccmsg 依頼 2026-09-16) |
 | 2026-09-15 | task | open | [service-subcommand-multi-unit-ha](./2026-09-15-service-subcommand-multi-unit-ha.md) | hyoui service を reference の daemon/service 体系 (multi-unit) にし、stable/unstable 2 インスタンスの HA を組む (kawaz 裁定 2026-09-15) |
 | 2026-09-15 | task | open | [upgrade-e2e-test](./2026-09-15-upgrade-e2e-test.md) | daemon graceful upgrade (DR-0028 Phase 1〜3) の検証マトリクスと e2e テストが未整備 (unit test 5 本のみ、Phase gate 未達) |
 | 2026-08-25 | request | open | [hyoui-attach-take-leader](./2026-08-25-hyoui-attach-take-leader.md) | hyoui attach --take-leader を実装する (LR2-Q1 裁定 a、DR-0033 leader.request 奪取の CLI 後続) |
