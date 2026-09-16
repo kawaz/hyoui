@@ -55,7 +55,11 @@ lint: lint-rust lint-unsafe
 # test file を中に置くと配布物に入る。
 [script]
 test-js:
-    node --test crates/hyoui-web/tests/js/
+    # **ディレクトリではなくファイルを渡す。** `node --test <dir>` を受け付ける
+    # かは node の版で違い、古い版は位置引数を script path と解釈して
+    # `Cannot find module` で落ちる (CI の runner 既定 node で実際に落ちた)。
+    # ファイル glob なら `node --test` を持つ全ての版で通る。
+    node --test crates/hyoui-web/tests/js/*.test.js
 
 # cargo test --workspace (ARGS で追加引数を渡せる、例: `just test -- --nocapture`)
 [script]

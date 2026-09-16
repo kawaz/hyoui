@@ -30,6 +30,11 @@ jobs:
         with:
           shared-key: ${{ matrix.os }}-${{ matrix.rust }}
       - uses: extractions/setup-just@v3
+      # `just test` の deps に `test-js` が居るので node が要る。**runner 既定の
+      # node に依存させない** — 版によって `node --test` の引数の受け付けが違う。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       # just ci = lint (fmt + clippy + unsafe 封じ込め gate) + test + build。
       # ローカルと同一エントリで検査範囲を一致させる。
       - run: just ci
@@ -82,8 +87,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      # ディレクトリ引数は node の版で受け付けが違うのでファイル glob を渡す
+      # (`just test-js` と同じ形)。
       - name: node --test (crates/hyoui-web/tests/js)
-        run: node --test crates/hyoui-web/tests/js/
+        run: node --test crates/hyoui-web/tests/js/*.test.js
 
   audit:
     name: cargo-audit (RUSTSEC advisories)
