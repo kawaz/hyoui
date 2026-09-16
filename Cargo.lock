@@ -1128,11 +1128,13 @@ name = "hyoui-web"
 version = "0.9.50"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "futures-util",
  "hmac 0.12.1",
  "hyoui",
  "include_dir",
  "nix",
+ "rand 0.9.4",
  "serde",
  "serde_json",
  "sha2 0.10.9",

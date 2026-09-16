@@ -12,13 +12,17 @@
 //! gateway は読むだけである (決定 2 / 決定 4)。
 
 mod record;
+mod routes;
 mod store;
+pub mod token;
 mod webauthn;
 
 pub use record::{
-    ACCESS_TTL_MS, Access, AuthFile, CODE_ATTEMPT_LIMIT, ChallengePurpose, CodeOutcome,
+    ACCESS_TTL_MS, Access, AuthFile, CODE_ATTEMPT_LIMIT, CodeOutcome, CredentialRecord,
     FamilyRecord, PendingChallenge, PendingFile, PendingRegistration, REFRESH_REPLAY_GRACE_MS,
     REFRESH_TTL_MS, REGISTRATION_TTL_MS, RefreshOutcome, RetiredRefresh, TokenGeneration,
 };
+pub use routes::{AuthContext, Identity, WS_TOKEN_PROTOCOL_PREFIX, WsAuth};
+pub(crate) use routes::{require_auth, routes, ws_token_protocol};
 pub use store::{StateDir, StateFile, StoreError};
-pub use webauthn::{Rp, WebauthnFailure, find_by_credential_id};
+pub use webauthn::{Rp, WebauthnFailure};

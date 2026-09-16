@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use webauthn_rs_core::WebauthnCore;
 use webauthn_rs_core::proto::{
-    AttestationConveyancePreference, AuthenticationState, COSEAlgorithm, Credential, CredentialID,
+    AttestationConveyancePreference, AuthenticationState, COSEAlgorithm, Credential,
     PublicKeyCredential, RegisterPublicKeyCredential, RegistrationState, UserVerificationPolicy,
 };
 
@@ -219,19 +219,6 @@ impl Rp {
     }
 }
 
-/// credential id を **バイト比較** で引く (決定 5)。
-///
-/// base64url の表現が正規形でない (padding / alphabet の揺れ) ので、文字列で引くと
-/// 同じ credential を別物として扱いうる。
-pub fn find_by_credential_id<'a, T>(
-    records: impl IntoIterator<Item = (&'a CredentialID, T)>,
-    presented: &CredentialID,
-) -> Option<T> {
-    records.into_iter().find_map(|(id, value)| {
-        super::record::constant_time_eq(id.as_ref(), presented.as_ref()).then_some(value)
-    })
-}
-
 /// `clientDataJSON` が `crossOrigin: true` を名乗っているか。
 ///
 /// **present であることは要求しない** — Chrome 系は最上位フレームでも常に `false` を
@@ -297,22 +284,6 @@ mod tests {
             br#"{"type":"webauthn.create"}"#
         ));
         assert!(!client_data_says_cross_origin(b"not json"));
-    }
-
-    #[test]
-    fn credential_id_lookup_compares_bytes() {
-        // base64url が正規形でないのでバイト比較で引く (決定 5)。
-        let a = CredentialID::from(vec![1, 2, 3]);
-        let b = CredentialID::from(vec![1, 2, 4]);
-        let records = vec![(&a, "first"), (&b, "second")];
-        assert_eq!(
-            find_by_credential_id(records.clone(), &CredentialID::from(vec![1, 2, 4])),
-            Some("second")
-        );
-        assert_eq!(
-            find_by_credential_id(records, &CredentialID::from(vec![9])),
-            None
-        );
     }
 
     /// 検証経路が端から端まで繋がっている (gate 4)。

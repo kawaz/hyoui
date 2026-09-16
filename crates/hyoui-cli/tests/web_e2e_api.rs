@@ -10,6 +10,14 @@
 //! 4. TCP 直叩きで HTTP/1.1 request を組み立て、3 endpoint を叩く
 //! 5. input POST 後、screen dump に送信文字列が現れるまで待つ
 //!
+//! ## 認証と state dir の隔離 (DR-0036 決定 9)
+//!
+//! 認証には無認証 mode が無いので、`/api/*` と WS attach は登録 fixture で通す。
+//! **`XDG_STATE_HOME` は必ず tempdir を指す** — `env_remove` にすると gateway が
+//! 実利用の `~/.local/state/hyoui-web/auth.json` を読み、kawaz の本番 credential に
+//! 対して test が走る。record を直に置き、access token を `Authorization: Bearer`
+//! (WS は subprotocol `hyoui.token.<値>`) で提示する。
+//!
 //! ## HTTP client を素朴に書く理由
 //!
 //! reqwest / hyper client を dev-dep に加えると依存が肥大する (= Phase 1 の
@@ -36,9 +44,64 @@ fn runtime_dir() -> tempfile::TempDir {
     d
 }
 
-fn spawn_detached(runtime: &Path, sid: &str) {
+/// 隔離した `XDG_STATE_HOME` (= 認証登録簿の置き場、決定 9)。
+fn state_home() -> tempfile::TempDir {
+    let d = tempfile::Builder::new()
+        .prefix("hyoui-web-e2e-state-")
+        .tempdir()
+        .expect("tempdir");
+    std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    d
+}
+
+/// 認証済みの API client (= bind した port と、その endpoint の access token)。
+struct Api {
+    port: u16,
+    token: String,
+}
+
+impl Api {
+    /// `Authorization: Bearer` 付きで 1 要求投げる。
+    fn request(&self, method: &str, path: &str, body: Option<(&str, &[u8])>) -> HttpResponse {
+        http_request(self.port, method, path, body, Some(&self.token))
+    }
+
+    /// WS attach の subprotocol (= access token の運び方、決定 5)。
+    fn ws_protocol(&self) -> String {
+        format!("hyoui.token.{}", self.token)
+    }
+}
+
+/// 隔離した state dir に登録 fixture を置き、access token を返す。
+///
+/// endpoint は gateway が bind した `http://127.0.0.1:<port>/` の正規形。**この値が
+/// record の key と一致することが、正規形の扱い (決定 3) の test でもある。**
+fn seed_credential(state: &Path, port: u16) -> String {
+    use hyoui_web::auth::{AuthFile, StateDir, token};
+
+    let endpoint = hyoui_web::contract::Endpoint::parse(&format!("http://127.0.0.1:{port}/"))
+        .expect("bind 先の endpoint は正規化できる");
+    let access = token::random_token();
+    StateDir::under_state_home(state)
+        .auth()
+        .update::<AuthFile, _, _>(|file| {
+            file.mint_family(
+                &endpoint,
+                "e2e-1",
+                "fam-e2e".to_string(),
+                access.clone(),
+                token::random_token(),
+                hyoui::time::now_unix_ms(),
+            );
+        })
+        .expect("登録 fixture を置く");
+    access
+}
+
+fn spawn_detached(runtime: &Path, state: &Path, sid: &str) {
     spawn_detached_command(
         runtime,
+        state,
         sid,
         &[],
         // stdin を line 単位で echo back。POST /input の text が visible に反映される。
@@ -46,7 +109,13 @@ fn spawn_detached(runtime: &Path, sid: &str) {
     );
 }
 
-fn spawn_detached_command(runtime: &Path, sid: &str, run_options: &[&str], command: &str) {
+fn spawn_detached_command(
+    runtime: &Path,
+    state: &Path,
+    sid: &str,
+    run_options: &[&str],
+    command: &str,
+) {
     let mut args = vec![
         "run".to_string(),
         "--detached".to_string(),
@@ -59,7 +128,7 @@ fn spawn_detached_command(runtime: &Path, sid: &str, run_options: &[&str], comma
     let status = Command::new(hyoui_bin())
         .args(args)
         .env("XDG_RUNTIME_DIR", runtime)
-        .env_remove("XDG_STATE_HOME")
+        .env("XDG_STATE_HOME", state)
         .env_remove("HYOUI_SESSION_ID")
         .env_remove("HYOUI_LOCK_TOKEN")
         .env_remove("HYOUI_NAMESPACE")
@@ -99,11 +168,11 @@ fn cleanup(runtime: &Path, sid: &str) {
 ///
 /// `hyoui_web::serve` は起動時に `hyoui web: listening on http://127.0.0.1:<port>`
 /// の 1 行を stderr に書く (= lib.rs)。stderr を pipe で読み、port を parse する。
-fn spawn_web(runtime: &Path) -> (Child, u16) {
+fn spawn_web(runtime: &Path, state: &Path) -> (Child, Api) {
     let mut child = Command::new(hyoui_bin())
         .args(["web", "--listen=127.0.0.1:0"])
         .env("XDG_RUNTIME_DIR", runtime)
-        .env_remove("XDG_STATE_HOME")
+        .env("XDG_STATE_HOME", state)
         .env_remove("HYOUI_SESSION_ID")
         .env_remove("HYOUI_LOCK_TOKEN")
         .env_remove("HYOUI_NAMESPACE")
@@ -133,7 +202,9 @@ fn spawn_web(runtime: &Path) -> (Child, u16) {
                 let mut buf = Vec::new();
                 let _ = reader.into_inner().read_to_end(&mut buf);
             });
-            return (child, port);
+            // 認証は常に有効なので (決定 9)、port が決まった時点で fixture を置く。
+            let token = seed_credential(state, port);
+            return (child, Api { port, token });
         }
     }
     let _ = child.kill();
@@ -147,12 +218,21 @@ struct HttpResponse {
     body: Vec<u8>,
 }
 
-fn http_request(port: u16, method: &str, path: &str, body: Option<(&str, &[u8])>) -> HttpResponse {
+fn http_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<(&str, &[u8])>,
+    token: Option<&str>,
+) -> HttpResponse {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("tcp connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
+    if let Some(token) = token {
+        req.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
     if let Some((ctype, b)) = body {
         req.push_str(&format!("Content-Type: {ctype}\r\n"));
         req.push_str(&format!("Content-Length: {}\r\n", b.len()));
@@ -198,20 +278,21 @@ fn http_request(port: u16, method: &str, path: &str, body: Option<(&str, &[u8])>
 #[test]
 fn e2e_screen_both_preserves_alternate_screen_mode() {
     let runtime = runtime_dir();
+    let state = state_home();
     let sid = "web-e2e-alt-screen";
     spawn_detached_command(
         runtime.path(),
+        state.path(),
         sid,
         &["--size=80x24"],
         "printf '\\033[?1049h\\033[2J\\033[HWEB-ALT-PROBE'; exec sleep 60",
     );
-    let (mut web, port) = spawn_web(runtime.path());
+    let (mut web, api) = spawn_web(runtime.path(), state.path());
     let panic_guard = ChildGuard(&mut web);
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let response = loop {
-        let response = http_request(
-            port,
+        let response = api.request(
             "GET",
             &format!("/api/sessions/{sid}/screen?layer=both"),
             None,
@@ -244,21 +325,23 @@ fn e2e_screen_both_preserves_alternate_screen_mode() {
 #[test]
 fn e2e_screen_layer_query_selects_visible_scrollback_or_both() {
     let runtime = runtime_dir();
+    let state = state_home();
     let sid = "web-e2e-screen-layer";
     spawn_detached_command(
         runtime.path(),
+        state.path(),
         sid,
         &["--size=80x10", "--scrollback-rows=100"],
         "i=1; while [ $i -le 40 ]; do printf 'WEB-HISTORY-%03d\\n' $i; i=$((i+1)); done; printf 'WEB-VISIBLE-END\\n'; exec sleep 60",
     );
-    let (mut web, port) = spawn_web(runtime.path());
+    let (mut web, api) = spawn_web(runtime.path(), state.path());
     let panic_guard = ChildGuard(&mut web);
 
     // query 省略時は既存 API と同じ visible layer。web UI は full reset 時に
     // `layer=both` を明示し、他の API caller は必要な範囲を選べる。
     let deadline = Instant::now() + Duration::from_secs(5);
     let visible = loop {
-        let response = http_request(port, "GET", &format!("/api/sessions/{sid}/screen"), None);
+        let response = api.request("GET", &format!("/api/sessions/{sid}/screen"), None);
         if response.status == 200 && response.body.windows(15).any(|w| w == b"WEB-VISIBLE-END") {
             break response;
         }
@@ -272,8 +355,7 @@ fn e2e_screen_layer_query_selects_visible_scrollback_or_both() {
 
     // both は daemon の rows-based ring と現 viewport を連結する。web 初期表示は
     // この layer を選び、xterm.js が古い行を scrollback として復元できる。
-    let both = http_request(
-        port,
+    let both = api.request(
         "GET",
         &format!("/api/sessions/{sid}/screen?layer=both"),
         None,
@@ -284,8 +366,7 @@ fn e2e_screen_layer_query_selects_visible_scrollback_or_both() {
     assert!(both.body.len() > visible.body.len());
 
     // scrollback layer は過去行だけを返し、現在の viewport は混ぜない。
-    let scrollback = http_request(
-        port,
+    let scrollback = api.request(
         "GET",
         &format!("/api/sessions/{sid}/screen?layer=scrollback"),
         None,
@@ -299,8 +380,7 @@ fn e2e_screen_layer_query_selects_visible_scrollback_or_both() {
 
     // 未知の layer は visible へ黙って fallback せず 400 にする。typo で初期履歴を
     // 欠落させても成功扱いになる状態を避けるため。
-    let invalid = http_request(
-        port,
+    let invalid = api.request(
         "GET",
         &format!("/api/sessions/{sid}/screen?layer=unknown"),
         None,
@@ -314,15 +394,16 @@ fn e2e_screen_layer_query_selects_visible_scrollback_or_both() {
 #[test]
 fn e2e_sessions_screen_input() {
     let runtime = runtime_dir();
+    let state = state_home();
     let sid = "web-e2e-1";
 
-    spawn_detached(runtime.path(), sid);
-    let (mut web, port) = spawn_web(runtime.path());
+    spawn_detached(runtime.path(), state.path(), sid);
+    let (mut web, api) = spawn_web(runtime.path(), state.path());
 
     let panic_guard = ChildGuard(&mut web);
 
     // 1. GET /api/sessions
-    let r = http_request(port, "GET", "/api/sessions", None);
+    let r = api.request("GET", "/api/sessions", None);
     assert_eq!(r.status, 200);
     let json: serde_json::Value = serde_json::from_slice(&r.body).expect("json parse");
     let arr = json.as_array().expect("array");
@@ -334,7 +415,7 @@ fn e2e_sessions_screen_input() {
     assert!(found["argv"].is_array());
 
     // 2. GET /api/sessions/:id/screen
-    let r = http_request(port, "GET", &format!("/api/sessions/{sid}/screen"), None);
+    let r = api.request("GET", &format!("/api/sessions/{sid}/screen"), None);
     assert_eq!(r.status, 200);
     assert!(
         r.content_type.starts_with("text/plain"),
@@ -346,8 +427,7 @@ fn e2e_sessions_screen_input() {
     // 3. POST /api/sessions/:id/input で HELLO\n 相当 (text:HELLO + key:Enter)
     let body_json = serde_json::json!({"specs": ["text:HELLO", "key:Enter"]});
     let body = serde_json::to_vec(&body_json).unwrap();
-    let r = http_request(
-        port,
+    let r = api.request(
         "POST",
         &format!("/api/sessions/{sid}/input"),
         Some(("application/json", &body)),
@@ -365,7 +445,7 @@ fn e2e_sessions_screen_input() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut got_hello = false;
     while Instant::now() < deadline {
-        let r = http_request(port, "GET", &format!("/api/sessions/{sid}/screen"), None);
+        let r = api.request("GET", &format!("/api/sessions/{sid}/screen"), None);
         if r.status == 200 && r.body.windows(5).any(|w| w == b"HELLO") {
             got_hello = true;
             break;
@@ -375,13 +455,12 @@ fn e2e_sessions_screen_input() {
     assert!(got_hello, "input 後の screen dump に 'HELLO' が現れない");
 
     // 4. 未知 session_id → 404
-    let r = http_request(port, "GET", "/api/sessions/no-such-xyz/screen", None);
+    let r = api.request("GET", "/api/sessions/no-such-xyz/screen", None);
     assert_eq!(r.status, 404);
 
     // 5. 不正 spec → 400
     let bad = serde_json::to_vec(&serde_json::json!({"specs": ["notaknownprefix:xx"]})).unwrap();
-    let r = http_request(
-        port,
+    let r = api.request(
         "POST",
         &format!("/api/sessions/{sid}/input"),
         Some(("application/json", &bad)),
@@ -403,10 +482,11 @@ fn e2e_sessions_screen_input() {
 #[test]
 fn e2e_input_returns_409_while_external_client_holds_lock() {
     let runtime = runtime_dir();
+    let state = state_home();
     let sid = "web-e2e-lock-2";
 
-    spawn_detached(runtime.path(), sid);
-    let (mut web, port) = spawn_web(runtime.path());
+    spawn_detached(runtime.path(), state.path(), sid);
+    let (mut web, api) = spawn_web(runtime.path(), state.path());
     let panic_guard = ChildGuard(&mut web);
 
     // 外部 CLI で lock acquire → stdout に token が 1 行 print される。
@@ -444,8 +524,7 @@ fn e2e_input_returns_409_while_external_client_holds_lock() {
     let body_json = serde_json::json!({"specs": ["text:BLOCKED", "key:Enter"]});
     let body = serde_json::to_vec(&body_json).unwrap();
     let t0 = Instant::now();
-    let r = http_request(
-        port,
+    let r = api.request(
         "POST",
         &format!("/api/sessions/{sid}/input"),
         Some(("application/json", &body)),
@@ -464,7 +543,7 @@ fn e2e_input_returns_409_while_external_client_holds_lock() {
         "409 が早すぎます (= 実際に retry しているか怪しい): {elapsed:?}"
     );
     // 画面には送っていないはず (= BLOCKED 文字列は入らない)。
-    let r = http_request(port, "GET", &format!("/api/sessions/{sid}/screen"), None);
+    let r = api.request("GET", &format!("/api/sessions/{sid}/screen"), None);
     assert_eq!(r.status, 200);
     assert!(
         !r.body.windows(7).any(|w| w == b"BLOCKED"),
@@ -479,8 +558,7 @@ fn e2e_input_returns_409_while_external_client_holds_lock() {
     let body_json = serde_json::json!({"specs": ["text:AFTER", "key:Enter"]});
     let body = serde_json::to_vec(&body_json).unwrap();
     while Instant::now() < deadline {
-        let r = http_request(
-            port,
+        let r = api.request(
             "POST",
             &format!("/api/sessions/{sid}/input"),
             Some(("application/json", &body)),
@@ -506,16 +584,16 @@ fn e2e_input_returns_409_while_external_client_holds_lock() {
 #[test]
 fn e2e_resize_endpoint() {
     let runtime = runtime_dir();
+    let state = state_home();
     let sid = "web-e2e-resize";
 
-    spawn_detached(runtime.path(), sid);
-    let (mut web, port) = spawn_web(runtime.path());
+    spawn_detached(runtime.path(), state.path(), sid);
+    let (mut web, api) = spawn_web(runtime.path(), state.path());
     let panic_guard = ChildGuard(&mut web);
 
     // 未知 session → 404
     let body = serde_json::to_vec(&serde_json::json!({"cols": 100u16, "rows": 30u16})).unwrap();
-    let r = http_request(
-        port,
+    let r = api.request(
         "POST",
         "/api/sessions/no-such-xyz/resize",
         Some(("application/json", &body)),
@@ -524,8 +602,7 @@ fn e2e_resize_endpoint() {
 
     // cols=0 → 400
     let bad = serde_json::to_vec(&serde_json::json!({"cols": 0u16, "rows": 30u16})).unwrap();
-    let r = http_request(
-        port,
+    let r = api.request(
         "POST",
         &format!("/api/sessions/{sid}/resize"),
         Some(("application/json", &bad)),
@@ -534,8 +611,7 @@ fn e2e_resize_endpoint() {
 
     // valid → 204
     let ok = serde_json::to_vec(&serde_json::json!({"cols": 123u16, "rows": 37u16})).unwrap();
-    let r = http_request(
-        port,
+    let r = api.request(
         "POST",
         &format!("/api/sessions/{sid}/resize"),
         Some(("application/json", &ok)),
@@ -615,49 +691,77 @@ fn e2e_ws_attach_bridge_roundtrip() {
     use tungstenite::{Message, client, handshake::client::Request};
 
     let runtime = runtime_dir();
+    let state = state_home();
     let sid = "web-e2e-wsattach";
 
-    spawn_detached(runtime.path(), sid);
-    let (mut web, port) = spawn_web(runtime.path());
+    spawn_detached(runtime.path(), state.path(), sid);
+    let (mut web, api) = spawn_web(runtime.path(), state.path());
+    let port = api.port;
     let panic_guard = ChildGuard(&mut web);
 
-    // 未知 session の WS upgrade は 404 が返るはず。upgrade 前の HTTP status で
-    // handshake が失敗すること (= tungstenite が Err を返す) だけ確認。
-    {
-        let bad_url = format!("ws://127.0.0.1:{port}/api/sessions/no-such-xyz-ws/attach");
-        let bad_req = Request::builder()
-            .uri(&bad_url)
+    // upgrade 要求の組み立て。token は subprotocol で運ぶ (DR-0036 決定 5)。
+    let upgrade_request = |path: &str, protocol: Option<String>| {
+        let builder = Request::builder()
+            .uri(format!("ws://127.0.0.1:{port}{path}"))
             .header("Host", format!("127.0.0.1:{port}"))
             .header("Upgrade", "websocket")
             .header("Connection", "Upgrade")
             .header("Sec-WebSocket-Version", "13")
-            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
-            .body(())
-            .unwrap();
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+        let builder = match protocol {
+            Some(protocol) => builder.header("Sec-WebSocket-Protocol", protocol),
+            None => builder,
+        };
+        builder.body(()).unwrap()
+    };
+    // 失敗は文字列に畳む (= handshake の Err 型は大きく、Result に載せると
+    // 呼び出し側の戻り値が膨らむ)。
+    let connect = |request, timeout| {
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("tcp");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let res = client(bad_req, stream);
-        assert!(res.is_err(), "unknown session の WS handshake は失敗すべき");
-    }
+        stream.set_read_timeout(Some(timeout)).unwrap();
+        client(request, stream).map_err(|e| e.to_string())
+    };
 
-    // 正常 session の WS attach。
-    let url = format!("ws://127.0.0.1:{port}/api/sessions/{sid}/attach");
-    let req = Request::builder()
-        .uri(&url)
-        .header("Host", format!("127.0.0.1:{port}"))
-        .header("Upgrade", "websocket")
-        .header("Connection", "Upgrade")
-        .header("Sec-WebSocket-Version", "13")
-        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .body(())
-        .unwrap();
-    let stream = TcpStream::connect(("127.0.0.1", port)).expect("tcp");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let (mut ws, _resp) = client(req, stream).expect("ws handshake");
+    // 未知 session の WS upgrade は handshake 前に落ちる (= tungstenite が Err)。
+    assert!(
+        connect(
+            upgrade_request(
+                "/api/sessions/no-such-xyz-ws/attach",
+                Some(api.ws_protocol())
+            ),
+            Duration::from_secs(5),
+        )
+        .is_err(),
+        "unknown session の WS handshake は失敗すべき"
+    );
+
+    // token を提示しない WS attach は 401 で弾かれる (決定 1)。
+    assert!(
+        connect(
+            upgrade_request(&format!("/api/sessions/{sid}/attach"), None),
+            Duration::from_secs(5),
+        )
+        .is_err(),
+        "認証なしの WS attach は 401 で落ちるべき (決定 1)"
+    );
+
+    // 正常 session の WS attach。**選んだ subprotocol はそのまま echo される** (決定 5)。
+    let (mut ws, response) = connect(
+        upgrade_request(
+            &format!("/api/sessions/{sid}/attach"),
+            Some(api.ws_protocol()),
+        ),
+        Duration::from_secs(10),
+    )
+    .expect("ws handshake");
+    assert_eq!(
+        response
+            .headers()
+            .get("sec-websocket-protocol")
+            .and_then(|value| value.to_str().ok()),
+        Some(api.ws_protocol().as_str()),
+        "server は選んだ subprotocol を echo する (決定 5)"
+    );
 
     // DR-0035 決定 3: 最初の text frame は hello で、attach.info より前に来る。
     // browser は再接続のたびにこれを見て世代を比べるので、順序が契約である。
@@ -688,11 +792,54 @@ fn e2e_ws_attach_bridge_roundtrip() {
             .is_some_and(|caps| caps.iter().any(|cap| cap == "data")),
         "hello の caps は intersect 済みの集合: {first_text}"
     );
-    // 認証は DR-0036 で載る。無効な間は null (決定 1)。
-    assert_eq!(
-        first_text["auth_expires_at"],
-        serde_json::Value::Null,
+    // access の期限が載る (DR-0036 決定 5)。browser は残り寿命の 90% 時点で
+    // `/auth/refresh` を打ち、得た access を同一接続の `auth.extend` で提示する。
+    // **認証は常に有効なので null にならない** (決定 9)。
+    assert!(
+        first_text["auth_expires_at"]
+            .as_str()
+            .is_some_and(|value| value.ends_with('Z')),
         "hello の auth_expires_at: {first_text}"
+    );
+
+    // 同一接続で認証の期限を延ばす (決定 5)。**失効を確立済み接続に反映する
+    // 唯一の点でもある** (決定 4)。
+    ws.send(Message::Text(
+        serde_json::json!({
+            "kind": "auth.extend",
+            "requestId": 7u64,
+            "accessToken": api.token,
+        })
+        .to_string()
+        .into(),
+    ))
+    .expect("auth.extend send");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let extend_ack = loop {
+        assert!(Instant::now() < deadline, "auth.extend.result timeout");
+        match ws.read() {
+            Ok(Message::Text(text)) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(text.as_str()).expect("WS control response JSON");
+                if value["kind"] == "auth.extend.result" {
+                    break value;
+                }
+            }
+            Ok(Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
+            Ok(Message::Close(_)) => panic!("WS closed before auth.extend.result"),
+            Err(tungstenite::Error::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => panic!("auth.extend read error: {e}"),
+        }
+    };
+    assert_eq!(extend_ack["ok"], true, "auth.extend ack={extend_ack}");
+    assert_eq!(extend_ack["requestId"], 7u64);
+    assert!(
+        extend_ack["expires_at"]
+            .as_str()
+            .is_some_and(|value| value.ends_with('Z')),
+        "延長後の期限が返る: {extend_ack}"
     );
 
     // WS → daemon: "HELLOWS\n" を送る (= line-echo shell が echo back する)。
@@ -734,8 +881,7 @@ fn e2e_ws_attach_bridge_roundtrip() {
 
     // WS bridge が persistent leader を保持中、fallback POST は正直に 409 を返す。
     let post_body = serde_json::to_vec(&serde_json::json!({"cols": 77u16, "rows": 22u16})).unwrap();
-    let response = http_request(
-        port,
+    let response = api.request(
         "POST",
         &format!("/api/sessions/{sid}/resize"),
         Some(("application/json", &post_body)),
@@ -859,12 +1005,73 @@ fn e2e_ws_attach_bridge_roundtrip() {
         "WS resize が daemon window size に反映されていない: {compact}"
     );
 
-    // client → daemon: 明示 Close。daemon 側 attach が cleanup されて daemon の
-    // client 数が減ることは snapshot でも観測可能だが本 test では skip (= 別 test で
-    // sessions API が client 数を出すのを確認済み)。
-    ws.close(None).expect("ws close");
-    // close frame の echo 待ちで少し drain。
-    let _ = ws.read();
+    // 失効させると、**次の `auth.extend` でこの接続が切れる** (決定 4 の
+    // 「失効はいつ効くか」)。CLI は gateway に通知しないので、確立済み接続に
+    // 失効が反映される点はここだけである。
+    hyoui_web::auth::StateDir::under_state_home(state.path())
+        .auth()
+        .update::<hyoui_web::auth::AuthFile, _, _>(|file| {
+            file.tombstone_sub("e2e-1", hyoui::time::now_unix_ms());
+        })
+        .expect("family を tombstone にする");
+    ws.send(Message::Text(
+        serde_json::json!({
+            "kind": "auth.extend",
+            "requestId": 8u64,
+            "accessToken": api.token,
+        })
+        .to_string()
+        .into(),
+    ))
+    .expect("auth.extend send after revocation");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let revoked_ack = loop {
+        assert!(
+            Instant::now() < deadline,
+            "失効後の auth.extend.result timeout"
+        );
+        match ws.read() {
+            Ok(Message::Text(text)) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(text.as_str()).expect("WS control response JSON");
+                if value["kind"] == "auth.extend.result" && value["requestId"] == 8u64 {
+                    break value;
+                }
+            }
+            Ok(Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
+            Ok(Message::Close(_)) => panic!("応答より先に閉じた (= 理由が読めない)"),
+            Err(tungstenite::Error::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => panic!("失効後の auth.extend read error: {e}"),
+        }
+    };
+    assert_eq!(revoked_ack["ok"], false, "失効: {revoked_ack}");
+    assert_eq!(revoked_ack["error"]["code"], "auth-failed");
+    // 応答の後に閉じる (= 理由を送ってから切る)。
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut closed = false;
+    while Instant::now() < deadline {
+        match ws.read() {
+            Ok(Message::Close(_)) => {
+                closed = true;
+                break;
+            }
+            Ok(_) => {}
+            // 相手が閉じた後の read は protocol error / io error になりうる。
+            Err(tungstenite::Error::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => {
+                closed = true;
+                break;
+            }
+        }
+    }
+    assert!(closed, "失効を返した接続は閉じる (決定 4)");
+
+    // client → daemon の明示 Close はここでは不要 (= gateway が既に閉じた)。
+    // daemon 側 attach の cleanup は socket 切断に任せる。
 
     drop(panic_guard);
     cleanup(runtime.path(), sid);

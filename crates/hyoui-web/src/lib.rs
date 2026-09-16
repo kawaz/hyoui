@@ -53,14 +53,17 @@ static EMBEDDED_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/assets");
 /// `Config` は `hyoui::config::Config` の owned copy を持ち回る (= Arc は不要な size、
 /// でも handler 内で clone 増やしすぎない用に Arc に包む)。
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     #[allow(dead_code)]
-    // 将来 `[web]` セクションから rate limit / auth を読む余地。現時点では未使用。
+    // 将来 `[web]` セクションから rate limit を読む余地。現時点では未使用
+    // (**認証は config を持たない** — DR-0036 決定 9 で `[web].auth` を設けない)。
     config: Arc<hyoui::config::Config>,
     /// 開発モードで指定されたローカル assets ディレクトリ (= `--web-assets-dir` /
     /// config `[web].assets_dir`)。`Some` の時は都度ファイル読み込み、`None` なら
     /// `EMBEDDED_ASSETS` から返す。
     assets_dir: Option<Arc<PathBuf>>,
+    /// 認証 state の置き場と `/auth/*` の rate limit (DR-0036)。
+    pub(crate) auth: auth::AuthContext,
 }
 
 /// axum Router を返す (= test / bin 側で `axum::serve` に渡すか
@@ -68,23 +71,45 @@ struct AppState {
 ///
 /// `assets_dir` が `Some` なら開発モード: `/assets/*` と HTML page 群を
 /// そのディレクトリから都度読む。`None` なら埋め込みアセットを返す。
+///
+/// **認証は常に有効である** (DR-0036 決定 9 — `auth = "none"` を設けない)。登録簿は
+/// `$XDG_STATE_HOME/hyoui-web/` から読む。test は `XDG_STATE_HOME` を隔離して
+/// 登録 fixture を置く (= 本番 record に対して test を走らせない)。
 pub fn router(config: hyoui::config::Config, assets_dir: Option<PathBuf>) -> Router {
+    router_with_auth(config, assets_dir, auth::AuthContext::new())
+}
+
+/// 認証 state の置き場を明示して Router を組む (= test の隔離 `XDG_STATE_HOME`)。
+pub fn router_with_auth(
+    config: hyoui::config::Config,
+    assets_dir: Option<PathBuf>,
+    auth: auth::AuthContext,
+) -> Router {
     let state = AppState {
         config: Arc::new(config),
         assets_dir: assets_dir.map(Arc::new),
+        auth: auth.clone(),
     };
-    Router::new()
-        .route("/", get(get_index_page))
-        .route("/healthz", get(get_healthz))
-        .route("/version", get(get_version))
-        .route("/sessions/{id}", get(get_session_page))
-        .route("/assets/{*path}", get(get_asset))
+    // 守るのは `/api/*` と WS attach への到達だけ (DR-0036 決定 1)。
+    let guarded = Router::new()
         .route("/api/sessions", get(get_sessions))
         .route("/api/sessions/{id}/screen", get(get_screen))
         .route("/api/sessions/{id}/input", post(post_input))
         .route("/api/sessions/{id}/resume", post(post_resume))
         .route("/api/sessions/{id}/resize", post(post_resize))
         .route("/api/sessions/{id}/attach", get(get_ws_attach))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
+    Router::new()
+        .route("/", get(get_index_page))
+        .route("/healthz", get(get_healthz))
+        .route("/version", get(get_version))
+        .route("/sessions/{id}", get(get_session_page))
+        .route("/assets/{*path}", get(get_asset))
+        .merge(auth::routes(auth))
+        .merge(guarded)
         .with_state(state)
 }
 
@@ -640,16 +665,30 @@ fn resize_blocking(socket_path: &std::path::Path, cols: u16, rows: u16) -> Resul
 /// WebSocket attach handler。upgrade 前に session 存在 (= live socket) を確認し、
 /// upgrade 後は `ws_attach::run_bridge` が daemon `ClientConnection` (Rw) と WS を
 /// 1:1 双方向 bridge する。
+/// **access token は subprotocol で受け、選んだ subprotocol を echo する**
+/// (DR-0036 決定 5)。`Authorization` ヘッダを WS upgrade に載せる手段が browser に
+/// 無いためで、認証そのものは middleware が済ませている (= ここは echo だけ)。
 async fn get_ws_attach(
     Path(id): Path<String>,
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    identity: axum::Extension<auth::Identity>,
     ws: WebSocketUpgrade,
 ) -> Response {
     let sock = match resolve_socket(&id).await {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    ws_attach::on_upgrade(ws, sock)
+    let ws = match auth::ws_token_protocol(&headers) {
+        Some((protocol, _)) => ws.protocols([protocol]),
+        // Bearer で通した client (= test / script) は subprotocol を提案しない。
+        None => ws,
+    };
+    let ws_auth = auth::WsAuth::new(
+        state.auth.state_dir_handle(),
+        identity.0.access_expires_at_ms,
+    );
+    ws_attach::on_upgrade(ws, sock, ws_auth)
 }
 
 // -----------------------------------------------------------------------------
@@ -879,6 +918,59 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
+    /// 認証済みの router 1 つ (= 登録 fixture で通す、DR-0036 決定 9)。
+    ///
+    /// **無認証 mode が無いので、`/api/*` の test は fixture と state dir の隔離が
+    /// 前提になる** (決定 9)。record を `auth.json` に直接置き、access token を
+    /// 提示する形で回す。WebAuthn の署名経路自体は `auth::webauthn` の test が
+    /// 仮想 authenticator で別に見る。
+    struct AuthedApp {
+        app: Router,
+        token: String,
+        /// 隔離した `XDG_STATE_HOME`。**drop すると消えるので保持する。**
+        _state: tempfile::TempDir,
+    }
+
+    impl AuthedApp {
+        fn new() -> Self {
+            let state = tempfile::tempdir().expect("tempdir");
+            let context = auth::AuthContext::at(auth::StateDir::at(state.path()));
+            let endpoint = contract::Endpoint::parse("http://127.0.0.1:43690/").unwrap();
+            let token = auth::token::random_token();
+            context
+                .state_dir()
+                .auth()
+                .update::<auth::AuthFile, _, _>(|file| {
+                    file.mint_family(
+                        &endpoint,
+                        "fixture-1",
+                        "fam-fixture".to_string(),
+                        token.clone(),
+                        auth::token::random_token(),
+                        hyoui::time::now_unix_ms(),
+                    );
+                })
+                .expect("fixture の family を置く");
+            Self {
+                app: router_with_auth(hyoui::config::Config::default(), None, context),
+                token,
+                _state: state,
+            }
+        }
+
+        /// `Authorization: Bearer` 付きで 1 要求投げる。
+        fn request(&self, method: &str, uri: &str) -> axum::http::request::Builder {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {}", self.token))
+        }
+
+        async fn send(&self, request: Request<Body>) -> Response {
+            self.app.clone().oneshot(request).await.unwrap()
+        }
+    }
+
     #[tokio::test]
     async fn healthz_returns_ok() {
         let response = router(hyoui::config::Config::default(), None)
@@ -1040,16 +1132,15 @@ mod tests {
     #[tokio::test]
     async fn missing_session_returns_404() {
         // daemon が居ない状態でも router は動く。unknown session_id は 404。
-        let app = router(hyoui::config::Config::default(), None);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/sessions/no-such-session-xyz/screen")
+        let authed = AuthedApp::new();
+        let resp = authed
+            .send(
+                authed
+                    .request("GET", "/api/sessions/no-such-session-xyz/screen")
                     .body(Body::empty())
                     .unwrap(),
             )
-            .await
-            .unwrap();
+            .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let body = error_body(resp).await;
         assert_eq!(body.error.code, code::SESSION_NOT_FOUND);
@@ -1064,7 +1155,7 @@ mod tests {
     async fn every_api_error_path_uses_the_contract_error_shape() {
         // plain text body の経路を残さない (DR-0035 決定 2)。extractor が弾く
         // 経路 (不正 JSON / 不正 query) も、handler が弾く経路も同じ形にする。
-        let app = router(hyoui::config::Config::default(), None);
+        let authed = AuthedApp::new();
         let cases: Vec<(&str, &str, Option<&[u8]>, StatusCode)> = vec![
             (
                 "GET",
@@ -1098,7 +1189,7 @@ mod tests {
             ),
         ];
         for (method, uri, body, expected) in cases {
-            let request = Request::builder().method(method).uri(uri);
+            let request = authed.request(method, uri);
             let request = match body {
                 Some(b) => request
                     .header("content-type", "application/json")
@@ -1106,7 +1197,7 @@ mod tests {
                     .unwrap(),
                 None => request.body(Body::empty()).unwrap(),
             };
-            let resp = app.clone().oneshot(request).await.unwrap();
+            let resp = authed.send(request).await;
             assert_eq!(resp.status(), expected, "{method} {uri}");
             let parsed = error_body(resp).await;
             assert!(!parsed.error.code.is_empty(), "{method} {uri}: code が空");
@@ -1119,16 +1210,15 @@ mod tests {
 
     #[tokio::test]
     async fn sessions_endpoint_returns_array() {
-        let app = router(hyoui::config::Config::default(), None);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/sessions")
+        let authed = AuthedApp::new();
+        let resp = authed
+            .send(
+                authed
+                    .request("GET", "/api/sessions")
                     .body(Body::empty())
                     .unwrap(),
             )
-            .await
-            .unwrap();
+            .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -1476,35 +1566,31 @@ mod tests {
 
     #[tokio::test]
     async fn resume_unknown_session_returns_404() {
-        let app = router(hyoui::config::Config::default(), None);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/sessions/no-such-session-xyz/resume")
+        let authed = AuthedApp::new();
+        let resp = authed
+            .send(
+                authed
+                    .request("POST", "/api/sessions/no-such-session-xyz/resume")
                     .body(Body::empty())
                     .unwrap(),
             )
-            .await
-            .unwrap();
+            .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn input_bad_json_returns_400() {
-        let app = router(hyoui::config::Config::default(), None);
+        let authed = AuthedApp::new();
         // 空 body / 不正 JSON は axum::Json extractor が 400 に落とす。
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/sessions/anything/input")
+        let resp = authed
+            .send(
+                authed
+                    .request("POST", "/api/sessions/anything/input")
                     .header("content-type", "application/json")
                     .body(Body::from(b"not a json".as_slice()))
                     .unwrap(),
             )
-            .await
-            .unwrap();
+            .await;
         // axum の JSON extractor は 400 を返す。
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(error_body(resp).await.error.code, code::INVALID_REQUEST);

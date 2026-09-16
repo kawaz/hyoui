@@ -254,53 +254,7 @@ pub fn validate_name(name: &str) -> Result<()> {
 
 /// 今の時刻を unit の `added_at` として書ける形で返す。
 pub fn now_iso8601() -> String {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs() as i64);
-    format_iso8601_utc(seconds)
-}
-
-/// epoch 秒を UTC の ISO 8601 に整形する。
-///
-/// Design rationale: 時刻 crate を足さずに自前で持つ。offset は UTC (`Z`) 固定で
-/// local offset を解決しない — 登録時刻は絶対時刻として読めれば足り、tz database
-/// を引くために依存を増やす理由が無い。
-fn format_iso8601_utc(seconds: i64) -> String {
-    let days = seconds.div_euclid(86_400);
-    let time_of_day = seconds.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    let (hour, minute, second) = (
-        time_of_day / 3600,
-        (time_of_day % 3600) / 60,
-        time_of_day % 60,
-    );
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-/// epoch からの日数を暦の (年, 月, 日) に開く。
-///
-/// Howard Hinnant の `civil_from_days` (public domain) と同じ式で、3 月を年の
-/// 起点に取り直してうるう年の分岐を無くしている。
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let shifted = days + 719_468;
-    let era = if shifted >= 0 {
-        shifted
-    } else {
-        shifted - 146_096
-    } / 146_097;
-    let day_of_era = shifted - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_position = (5 * day_of_year + 2) / 153;
-    let day = (day_of_year - (153 * month_position + 2) / 5 + 1) as u32;
-    let month = if month_position < 10 {
-        month_position + 3
-    } else {
-        month_position - 9
-    } as u32;
-    (year + i64::from(month <= 2), month, day)
+    hyoui::time::now_iso8601()
 }
 
 /// listen が既存 unit とぶつかる形。
@@ -579,18 +533,9 @@ mod tests {
     }
 
     #[test]
-    fn epoch_seconds_format_as_iso8601() {
-        assert_eq!(format_iso8601_utc(0), "1970-01-01T00:00:00Z");
-        assert_eq!(format_iso8601_utc(1), "1970-01-01T00:00:01Z");
-        // うるう年の 2 月 29 日と、その翌日。
-        assert_eq!(format_iso8601_utc(1_709_164_800), "2024-02-29T00:00:00Z");
-        assert_eq!(format_iso8601_utc(1_709_251_199), "2024-02-29T23:59:59Z");
-        assert_eq!(format_iso8601_utc(1_709_251_200), "2024-03-01T00:00:00Z");
-        // うるう年でない年の 3 月 1 日 (2100 は 400 で割れないので平年)。
-        assert_eq!(format_iso8601_utc(4_107_542_400), "2100-03-01T00:00:00Z");
-        // epoch より前も暦として開ける。
-        assert_eq!(format_iso8601_utc(-1), "1969-12-31T23:59:59Z");
-        // 登録時刻は登録簿に書いた形のまま読み戻せる。
+    fn registered_at_is_written_in_the_shared_iso8601_form() {
+        // 暦の開き方そのものは `hyoui::time` が固定する。ここで見るのは
+        // 登録簿が書く形が読み戻せる表記であること。
         assert!(now_iso8601().ends_with('Z'));
         assert_eq!(now_iso8601().len(), "1970-01-01T00:00:00Z".len());
     }

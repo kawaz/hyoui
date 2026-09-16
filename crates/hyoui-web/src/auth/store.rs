@@ -108,6 +108,12 @@ impl StateDir {
         Self { root: root.into() }
     }
 
+    /// `XDG_STATE_HOME` 相当の dir から導出する (= test が gateway と同じ計算で
+    /// 置き場に到達する口)。`hyoui-web/` の 1 段を test 側に書き写させない。
+    pub fn under_state_home(state_home: impl AsRef<Path>) -> Self {
+        Self::from_env(Some(state_home.as_ref().as_os_str()), None)
+    }
+
     /// root の path。
     pub fn root(&self) -> &Path {
         &self.root

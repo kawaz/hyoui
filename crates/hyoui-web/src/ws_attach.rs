@@ -43,6 +43,7 @@ use std::sync::Arc;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use futures_util::{SinkExt, StreamExt};
 
+use crate::auth::WsAuth;
 use crate::contract::{
     AttachMode, ClientFrame, ErrorInfo, ServerFrame, WEB_PROTOCOL_VERSION, code,
 };
@@ -86,7 +87,7 @@ enum PendingControl {
 /// # Errors
 /// 内部の pipe 作成 / bridge join / connect 失敗を文字列で返す (= caller は log 出力のみ、
 /// レスポンス body には反映されない = WS 既に upgrade 済み)。
-pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf) -> Result<(), String> {
+pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf, auth: WsAuth) -> Result<(), String> {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (input_tx, input_rx) = std::sync::mpsc::channel::<BridgeCmd>();
     let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<BridgeOutput>();
@@ -99,6 +100,7 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf) -> Result<(), Str
     // writer queue へ直接積む。bridge は daemon との往復を担っており、browser の
     // 形式違反はそこへ持ち込む理由が無い。
     let wake_w_a = wake_w.clone();
+    let auth_for_reader = auth.clone();
     let input_tx_a = input_tx;
     let reject_tx = output_tx.clone();
     let reader_task = tokio::spawn(async move {
@@ -118,17 +120,30 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf) -> Result<(), Str
                     Ok(ClientFrame::LeaderRequest { request_id }) => {
                         BridgeCmd::LeaderRequest { request_id }
                     }
-                    // 契約表には載っているが、この gateway では認証が有効に
-                    // なっていない (DR-0035 決定 1)。daemon へは持ち込まない。
-                    Ok(ClientFrame::AuthExtend { request_id, .. }) => {
-                        let frame = ServerFrame::Error {
-                            request_id: Some(request_id),
-                            error: ErrorInfo::new(
-                                code::UNSUPPORTED,
-                                "authentication is not enabled on this gateway",
-                            ),
+                    // 認証の期限を延ばす (DR-0036 決定 5)。daemon へは持ち込まない
+                    // — 認証は gateway の HTTP 層の話で、daemon 境界は変わらない。
+                    //
+                    // **失効が確立済み接続に反映される唯一の点がここである** (決定 4)。
+                    // unit は family を file から読み直し、tombstone を見たら
+                    // `ok:false` を返して接続を閉じる。
+                    Ok(ClientFrame::AuthExtend {
+                        request_id,
+                        access_token,
+                    }) => {
+                        let extended = auth_for_reader.extend(&access_token);
+                        let revoked = extended.is_none();
+                        let frame = ServerFrame::AuthExtendResult {
+                            request_id,
+                            ok: !revoked,
+                            expires_at: extended,
+                            error: revoked.then(|| {
+                                ErrorInfo::new(
+                                    code::AUTH_FAILED,
+                                    "the authenticated session is no longer valid",
+                                )
+                            }),
                         };
-                        if !send_or_stop(&frame, &reject_tx) {
+                        if !send_or_stop(&frame, &reject_tx) || revoked {
                             break;
                         }
                         continue;
@@ -182,9 +197,11 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf) -> Result<(), Str
     // Task C: blocking bridge (= ClientConnection を保持するのは単一 thread のみ、
     // reader/writer を跨ぐ split は不要 = pending_frames の順序が保たれる)。
     let sock_owned = sock_path;
-    let bridge_res =
-        tokio::task::spawn_blocking(move || bridge_loop(&sock_owned, input_rx, wake_r, output_tx))
-            .await;
+    let auth_expires_at = hyoui::time::format_unix_ms_iso8601(auth.expires_at_ms);
+    let bridge_res = tokio::task::spawn_blocking(move || {
+        bridge_loop(&sock_owned, input_rx, wake_r, output_tx, auth_expires_at)
+    })
+    .await;
 
     // どちらの task も bridge 終了で自然に自走停止するが、念のため abort で明示閉じ。
     reader_task.abort();
@@ -266,6 +283,7 @@ fn bridge_loop(
     input_rx: std::sync::mpsc::Receiver<BridgeCmd>,
     wake_r: std::os::fd::OwnedFd,
     output_tx: tokio::sync::mpsc::UnboundedSender<BridgeOutput>,
+    auth_expires_at: String,
 ) -> Result<(), String> {
     use hyoui::client::{AttachOptions, ClientConnection};
     use hyoui::protocol::{ControlMessage, MVP_CAPS, Mode, TYPE_CBOR_CONTROL, TYPE_RAW_DATA};
@@ -290,8 +308,10 @@ fn bridge_loop(
             version: hyoui::VERSION.to_string(),
             build_id: hyoui::BUILD_ID.map(str::to_string),
             caps: conn.response.caps.clone(),
-            // 認証は DR-0036 で載る。無効な間は null (決定 1)。
-            auth_expires_at: None,
+            // access の期限 (DR-0036 決定 5)。browser は残り寿命の 90% 時点で
+            // `/auth/refresh` を打ち、得た access を同一接続の `auth.extend` で
+            // 提示して延ばす。**認証は常に有効なので null にならない** (決定 9)。
+            auth_expires_at: Some(auth_expires_at),
         },
         &output_tx,
     )?;
@@ -566,9 +586,13 @@ fn resize_on_connection(
 }
 
 /// axum handler の型ヘルパ。`WebSocketUpgrade::on_upgrade` から `run_bridge` を呼ぶ。
-pub fn on_upgrade(ws: WebSocketUpgrade, sock_path: PathBuf) -> axum::response::Response {
+pub fn on_upgrade(
+    ws: WebSocketUpgrade,
+    sock_path: PathBuf,
+    auth: WsAuth,
+) -> axum::response::Response {
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = run_bridge(socket, sock_path).await {
+        if let Err(e) = run_bridge(socket, sock_path, auth).await {
             eprintln!("hyoui-web: WS attach ended: {e}");
         }
     })

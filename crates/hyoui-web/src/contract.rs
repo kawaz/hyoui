@@ -234,6 +234,19 @@ pub mod code {
     pub const INTERNAL_ERROR: &str = "internal-error";
     /// 受け取った WS text frame の `kind` が未知、または JSON が不正。
     pub const UNKNOWN_KIND: &str = "unknown-kind";
+    /// access token が無い / 期限切れ / 失効済み (DR-0036 決定 1)。
+    ///
+    /// ブラウザはこれを受けて **ページ内に overlay でログイン UI を出す** — ログイン
+    /// 専用ページへの redirect はしない (iframe 内で redirect が起きると、親の
+    /// Terminal タブがログインページに化けて何が起きたか読めなくなる)。
+    pub const AUTH_REQUIRED: &str = "auth-required";
+    /// `/auth/*` の検証が通らなかった (DR-0036 決定 5)。
+    ///
+    /// **失敗理由を分けない。** jwt が違うのか 6 桁コードが違うのか challenge が
+    /// 無いのかを応答で区別しない (= 総当たりに手がかりを与えない)。
+    pub const AUTH_FAILED: &str = "auth-failed";
+    /// `/auth/*` の要求が rate limit を超えた (DR-0036 決定 5)。
+    pub const RATE_LIMITED: &str = "rate-limited";
     /// 契約に載っているが、この gateway では有効になっていない操作
     /// (= 認証が無効な間の `auth.extend`、DR-0035 決定 1)。
     pub const UNSUPPORTED: &str = "unsupported";
@@ -283,6 +296,21 @@ impl VersionResponse {
 // /auth/* (DR-0036 決定 3 / 決定 5)
 // -----------------------------------------------------------------------------
 
+/// challenge の用途 (DR-0036 決定 4)。
+///
+/// **登録用の challenge を認証に使い回させない。** 発行時に用途を記録し、消費時に
+/// 同じ用途で引く (違えば「無い」と同じに扱う)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ChallengePurpose {
+    /// `navigator.credentials.get()` 用。
+    #[default]
+    #[serde(rename = "assert")]
+    Assert,
+    /// `navigator.credentials.create()` 用。招待 URL の jwt が要る。
+    #[serde(rename = "register")]
+    Register,
+}
+
 /// `POST /auth/challenge` の request body。
 ///
 /// **ブラウザが endpoint URL を計算して載せる** (DR-0036 決定 3)。gateway は自分の
@@ -293,6 +321,17 @@ impl VersionResponse {
 pub struct ChallengeRequest {
     /// 自分の endpoint (正規形)。
     pub endpoint: Endpoint,
+    /// 用途。省略時は認証 (`assert`)。
+    #[serde(default)]
+    pub purpose: ChallengePurpose,
+    /// `purpose: "register"` の時だけ要る、招待 URL の fragment の jwt。
+    ///
+    /// `create()` の options は `user.id` と `rp.id` を claims から採るので
+    /// (DR-0036 決定 2)、challenge を出す時点で jwt が必要になる。**ここでは
+    /// 6 桁コードを見ず、jti も challenge も消費しない** — 消費は
+    /// `/auth/register` が検証を通してから行う (決定 2 の検証順序)。
+    #[serde(default)]
+    pub jwt: Option<String>,
 }
 
 /// `POST /auth/challenge` の応答。
@@ -518,6 +557,26 @@ pub enum ServerFrame {
         request_id: u64,
         /// 成否。
         ok: bool,
+        /// 失敗の内容 (成功時は省略)。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<ErrorInfo>,
+    },
+    /// `auth.extend` への応答 (DR-0036 決定 5)。
+    ///
+    /// **長命 WS は切らずに延ばす。** `exp` で必ず切ると画面が周期的に瞬くので、
+    /// 切るのは延長を怠った接続だけである。`ok: false` は「その family が失効した」
+    /// ことを意味し、gateway はこの応答の後に接続を閉じる (決定 4 の「失効はいつ
+    /// 効くか」— この処理が失効を確立済み接続に反映する唯一の点である)。
+    #[serde(rename = "auth.extend.result")]
+    AuthExtendResult {
+        /// 要求と同じ番号。
+        #[serde(rename = "requestId")]
+        request_id: u64,
+        /// 成否。
+        ok: bool,
+        /// 延長後の期限 (ISO 8601)。失敗時は省略。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expires_at: Option<String>,
         /// 失敗の内容 (成功時は省略)。
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<ErrorInfo>,

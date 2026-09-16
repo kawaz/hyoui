@@ -60,6 +60,9 @@ pub mod input_bytes;
 
 pub mod version;
 
+// 時刻の表記 (= unit 登録簿の `added_at` と web の認証期限が同じ形を出す)。
+pub mod time;
+
 /// Library version (matches `Cargo.toml`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

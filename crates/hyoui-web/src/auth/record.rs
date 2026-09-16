@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::contract::Endpoint;
+use crate::contract::{ChallengePurpose, Endpoint};
 
 /// credential の claim (DR-0036 決定 7)。
 ///
@@ -45,12 +45,243 @@ impl Access {
 
 /// `auth.json` の中身 (決定 4)。
 ///
-/// key は `family/<endpoint>/<id>` で、endpoint は record の属性ではなく key の 1 段。
+/// key は `credential/<endpoint>/<sub>/<credential_id>` と `family/<endpoint>/<id>` で、
+/// endpoint は record の属性ではなく key の 1 段。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthFile {
+    /// credential record。`credential/<endpoint>/<sub>/<credential_id>`。
+    ///
+    /// 最下段の key は credential id の base64url だが、**引くときは
+    /// [`AuthFile::find_live_credential_mut`] がバイト比較する** (base64url の
+    /// 表現が正規形でないため、決定 5)。
+    #[serde(default)]
+    pub credentials: BTreeMap<Endpoint, BTreeMap<String, BTreeMap<String, CredentialRecord>>>,
     /// token family。`family/<endpoint>/<id>`。
     #[serde(default)]
     pub families: BTreeMap<Endpoint, BTreeMap<String, FamilyRecord>>,
+}
+
+/// 登録済み credential 1 本 (決定 2 / 決定 3)。
+///
+/// 保守メタ情報 (`issued_label` / `device_label` / `registered_*` / `last_used_*` /
+/// BE / BS) は `hyoui web passkey list` で見せるが、**認証・認可の判定には使わない**
+/// — これは記憶の手がかりであって認証の材料ではない (決定 3)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialRecord {
+    /// 誰の credential か。
+    pub sub: String,
+    /// user handle (16 byte)。**assertion の `userHandle` と毎回照合する** (決定 2)。
+    pub user_id: Vec<u8>,
+    /// claim (決定 7)。**当面読まれない。**
+    #[serde(default)]
+    pub access: Access,
+    /// crate が検証して組んだ credential (公開鍵 / counter / transports)。
+    pub credential: webauthn_rs_core::proto::Credential,
+    /// 直近の署名カウンタ。
+    #[serde(default)]
+    pub sign_count: u32,
+    /// backup eligible (BE)。登録時と認証時の両方で記録する (決定 3)。
+    #[serde(default)]
+    pub backup_eligible: bool,
+    /// backup state (BS)。同上。
+    #[serde(default)]
+    pub backup_state: bool,
+    /// 発行時に管理者が付けたラベル (`passkey add --label`)。
+    #[serde(default)]
+    pub issued_label: Option<String>,
+    /// 登録ページで利用者が付けた端末のラベル。
+    #[serde(default)]
+    pub device_label: Option<String>,
+    /// 登録時刻 (unix ms)。
+    pub registered_at_ms: u64,
+    /// 登録時の user agent。
+    #[serde(default)]
+    pub registered_user_agent: Option<String>,
+    /// 最後に認証に使われた時刻 (unix ms)。
+    #[serde(default)]
+    pub last_used_at_ms: Option<u64>,
+    /// 最後に認証に使われた時の user agent。
+    #[serde(default)]
+    pub last_used_user_agent: Option<String>,
+    /// 失効時刻 (unix ms)。`Some` なら tombstone (決定 4 — 削除ではない)。
+    #[serde(default)]
+    pub tombstoned_at_ms: Option<u64>,
+}
+
+impl CredentialRecord {
+    /// tombstone 済みか。
+    pub fn is_tombstoned(&self) -> bool {
+        self.tombstoned_at_ms.is_some()
+    }
+
+    /// credential id (bytes)。
+    pub fn credential_id(&self) -> &[u8] {
+        &self.credential.cred_id
+    }
+
+    /// 認証が通った事実を record に映す。
+    ///
+    /// counter / BE / BS は認証ごとに更新する (決定 3)。判定には使わないが、
+    /// `passkey list` で「その端末が今どういう状態か」を読めるようにする。
+    pub fn record_use(
+        &mut self,
+        result: &webauthn_rs_core::proto::AuthenticationResult,
+        now_ms: u64,
+        user_agent: Option<String>,
+    ) {
+        self.sign_count = result.counter();
+        self.backup_eligible = result.backup_eligible();
+        self.backup_state = result.backup_state();
+        self.last_used_at_ms = Some(now_ms);
+        self.last_used_user_agent = user_agent;
+        if result.needs_update() {
+            self.credential.counter = result.counter();
+            self.credential.backup_eligible = result.backup_eligible();
+            self.credential.backup_state = result.backup_state();
+        }
+    }
+}
+
+impl AuthFile {
+    /// その endpoint の生きた credential (= tombstone でないもの)。
+    pub fn live_credentials(&self, endpoint: &Endpoint) -> Vec<&CredentialRecord> {
+        self.credentials
+            .get(endpoint)
+            .into_iter()
+            .flat_map(|subs| subs.values())
+            .flat_map(|records| records.values())
+            .filter(|record| !record.is_tombstoned())
+            .collect()
+    }
+
+    /// その endpoint の生きた credential を、提示された id の**バイト比較**で引く。
+    ///
+    /// base64url の表現が正規形でない (padding / alphabet の揺れ) ので、文字列で
+    /// 引くと同じ credential を別物として扱いうる (決定 5)。key に base64url を
+    /// 使っていても、引くのは常に bytes である。
+    pub fn find_live_credential_mut(
+        &mut self,
+        endpoint: &Endpoint,
+        presented: &[u8],
+    ) -> Option<&mut CredentialRecord> {
+        self.credentials
+            .get_mut(endpoint)?
+            .values_mut()
+            .flat_map(|records| records.values_mut())
+            .find(|record| {
+                !record.is_tombstoned() && constant_time_eq(record.credential_id(), presented)
+            })
+    }
+
+    /// credential を 1 本足す。
+    pub fn insert_credential(&mut self, endpoint: &Endpoint, record: CredentialRecord) {
+        let id = base64url(record.credential_id());
+        self.credentials
+            .entry(endpoint.clone())
+            .or_default()
+            .entry(record.sub.clone())
+            .or_default()
+            .insert(id, record);
+    }
+
+    /// access token で family を引く (= `/api/*` と WS の検証、決定 5)。
+    ///
+    /// **endpoint を跨いで探す。** `Authorization: Bearer` には endpoint が乗らず、
+    /// token 自体が身元を答える値である。
+    pub fn find_live_family_by_access(
+        &self,
+        presented: &str,
+        now_ms: u64,
+    ) -> Option<&FamilyRecord> {
+        self.families
+            .values()
+            .flat_map(|families| families.values())
+            .find(|family| {
+                !family.is_tombstoned()
+                    && family.access.is_live(now_ms)
+                    && constant_time_eq(family.access.value.as_bytes(), presented.as_bytes())
+            })
+    }
+
+    /// 新しい token family を 1 本作って入れ、その record を返す。
+    ///
+    /// token は署名しない opaque 乱数で、検証は lookup で行う (決定 5)。
+    pub fn mint_family(
+        &mut self,
+        endpoint: &Endpoint,
+        sub: &str,
+        id: String,
+        access: String,
+        refresh: String,
+        now_ms: u64,
+    ) -> FamilyRecord {
+        let record = FamilyRecord {
+            id: id.clone(),
+            sub: sub.to_string(),
+            endpoint: endpoint.clone(),
+            access: TokenGeneration {
+                value: access,
+                expires_at_ms: now_ms + ACCESS_TTL_MS,
+            },
+            refresh: TokenGeneration {
+                value: refresh,
+                expires_at_ms: now_ms + REFRESH_TTL_MS,
+            },
+            retired: Vec::new(),
+            tombstoned_at_ms: None,
+        };
+        self.families
+            .entry(endpoint.clone())
+            .or_default()
+            .insert(id, record.clone());
+        record
+    }
+
+    /// その endpoint で次に使う `sub` の既定値 (`<endpoint の host>-<連番>`、決定 2)。
+    ///
+    /// **unit に依存させない。** 連番は当該 endpoint の record から採り、
+    /// tombstone 済みの名前もスキップする (= 消した端末の名前を再利用しない)。
+    pub fn next_sub(&self, endpoint: &Endpoint) -> String {
+        let taken = self.credentials.get(endpoint);
+        for n in 1.. {
+            let candidate = format!("{}-{n}", endpoint.rp_id());
+            if !taken.is_some_and(|subs| subs.contains_key(&candidate)) {
+                return candidate;
+            }
+        }
+        unreachable!("連番は必ず空きに当たる")
+    }
+
+    /// その sub の credential と family を全て tombstone にする (`passkey remove`)。
+    ///
+    /// 返すのは畳んだ件数 (credential, family)。
+    pub fn tombstone_sub(&mut self, sub: &str, now_ms: u64) -> (usize, usize) {
+        let mut credentials = 0;
+        for records in self.credentials.values_mut() {
+            if let Some(by_id) = records.get_mut(sub) {
+                for record in by_id.values_mut().filter(|r| !r.is_tombstoned()) {
+                    record.tombstoned_at_ms = Some(now_ms);
+                    credentials += 1;
+                }
+            }
+        }
+        let mut families = 0;
+        for by_id in self.families.values_mut() {
+            for family in by_id.values_mut() {
+                if family.sub == sub && !family.is_tombstoned() {
+                    family.tombstoned_at_ms = Some(now_ms);
+                    families += 1;
+                }
+            }
+        }
+        (credentials, families)
+    }
+}
+
+/// base64url (padding なし)。credential id の key と jwt の claims に使う。
+pub fn base64url(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// access / refresh の 1 世代 (決定 5)。
@@ -315,19 +546,18 @@ pub struct PendingChallenge {
     pub endpoint: Endpoint,
     /// 用途。登録用の challenge を認証に使い回させない。
     pub purpose: ChallengePurpose,
+    /// 登録用 challenge の場合、その登録 (`jti`) に束縛する。
+    ///
+    /// **別の登録 URL 向けに出した challenge を使い回させない**ため。認証用は `None`。
+    #[serde(default)]
+    pub jti: Option<String>,
+    /// crate が持つ検証途中の state (`RegistrationState` / `AuthenticationState`)。
+    ///
+    /// **file に置く。** challenge を出した unit と消費する unit が違いうるので
+    /// (決定 4)、プロセスのメモリには残せない。
+    pub state: serde_json::Value,
     /// 失効時刻 (unix ms)。
     pub expires_at_ms: u64,
-}
-
-/// challenge の用途。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ChallengePurpose {
-    /// `navigator.credentials.create()` 用。
-    #[serde(rename = "register")]
-    Register,
-    /// `navigator.credentials.get()` 用。
-    #[serde(rename = "assert")]
-    Assert,
 }
 
 impl PendingFile {
@@ -345,6 +575,27 @@ impl PendingFile {
             .retain(|_, challenges| !challenges.is_empty());
     }
 
+    /// challenge を消費せずに引く (= 検証を先に通すため、決定 2 の検証順序)。
+    ///
+    /// 用途違い / 期限切れ / endpoint 不一致はいずれも「無い」と同じに扱う
+    /// (= 失敗理由を分けない、決定 5)。
+    pub fn challenge(
+        &self,
+        endpoint: &Endpoint,
+        id: &str,
+        purpose: ChallengePurpose,
+        now_ms: u64,
+    ) -> Option<&PendingChallenge> {
+        let challenge = self.challenges.get(endpoint)?.get(id)?;
+        if challenge.purpose != purpose
+            || now_ms >= challenge.expires_at_ms
+            || &challenge.endpoint != endpoint
+        {
+            return None;
+        }
+        Some(challenge)
+    }
+
     /// challenge を 1 本消費する (= 使用済みにする)。既に無ければ `None`。
     ///
     /// **lock 下で呼ぶ。** lock の外で消費すると、2 unit に同時に来た要求が同じ
@@ -356,17 +607,8 @@ impl PendingFile {
         purpose: ChallengePurpose,
         now_ms: u64,
     ) -> Option<PendingChallenge> {
-        let challenges = self.challenges.get_mut(endpoint)?;
-        let challenge = challenges.get(id)?;
-        // 用途違い / 期限切れ / endpoint 不一致はいずれも「無い」と同じに扱う
-        // (= 失敗理由を分けない、決定 5)。
-        if challenge.purpose != purpose
-            || now_ms >= challenge.expires_at_ms
-            || &challenge.endpoint != endpoint
-        {
-            return None;
-        }
-        challenges.remove(id)
+        self.challenge(endpoint, id, purpose, now_ms)?;
+        self.challenges.get_mut(endpoint)?.remove(id)
     }
 }
 
@@ -554,6 +796,8 @@ mod tests {
                 id: "c1".to_string(),
                 endpoint: endpoint(),
                 purpose: ChallengePurpose::Assert,
+                jti: None,
+                state: serde_json::Value::Null,
                 expires_at_ms: now + 60_000,
             },
         );
@@ -581,6 +825,8 @@ mod tests {
                 id: "c1".to_string(),
                 endpoint: endpoint(),
                 purpose: ChallengePurpose::Assert,
+                jti: None,
+                state: serde_json::Value::Null,
                 expires_at_ms: now + 60_000,
             },
         );
@@ -613,6 +859,8 @@ mod tests {
                 id: "c1".to_string(),
                 endpoint: endpoint(),
                 purpose: ChallengePurpose::Assert,
+                jti: None,
+                state: serde_json::Value::Null,
                 expires_at_ms: 500,
             },
         );

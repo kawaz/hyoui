@@ -43,6 +43,10 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+# web e2e (tests/web_e2e_api.rs) が隔離した `XDG_STATE_HOME` に登録 fixture を
+# 置くために使う (= DR-0036 決定 9、本番 record に対して test を走らせない)。
+# integration test は lib の [dependencies] を継承しないのでここにも並べる。
+hyoui-web = { path = "../hyoui-web", version = "0.9" }
 # integration tests (tests/lock_cli.rs) で nix::sys::signal::kill を使う
 nix = { workspace = true }
 # DR-0014 マトリクス検証用 PTY harness (tests/common/pty.rs)。
