@@ -13,6 +13,7 @@
 
 mod record;
 mod store;
+mod webauthn;
 
 pub use record::{
     ACCESS_TTL_MS, Access, AuthFile, CODE_ATTEMPT_LIMIT, ChallengePurpose, CodeOutcome,
@@ -20,3 +21,4 @@ pub use record::{
     REFRESH_TTL_MS, REGISTRATION_TTL_MS, RefreshOutcome, RetiredRefresh, TokenGeneration,
 };
 pub use store::{StateDir, StateFile, StoreError};
+pub use webauthn::{Rp, WebauthnFailure, find_by_credential_id};

@@ -34,6 +34,17 @@ sha2 = "0.10"
 hmac = "0.12"
 # auth.json / pending.json の tmp + rename (DR-0036 決定 4)。
 tempfile = { workspace = true }
+# WebAuthn の検証手順 (L2 §7.1 / §7.2) と COSE / CBOR の解釈 (DR-0036 決定 8)。
+#
+# **exact pin。** 0.5 系は openssl-sys に依存し
+# `cargo clippy --target x86_64-unknown-linux-gnu` が落ちる (実測)。0.6 系は
+# crypto-glue (pure Rust / p256) に移っており 3 系統すべて通る。
+#
+# 高レベルの `webauthn-rs` ではなく core を直に使うのは、`residentKey: "required"`
+# (決定 2) が core の builder でしか表せないため — 高レベル API は
+# `residentKey: "discouraged"` を hardcode する。
+webauthn-rs-core = "=0.6.1-dev"
+url = "2.5.8"
 
 [dev-dependencies]
 # Router 単体の smoke test 用 (実 daemon を巻き込む e2e は hyoui-cli/tests/web_e2e_api.rs
@@ -42,3 +53,6 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 serde_json = { workspace = true }
 futures-util = { version = "0.3", default-features = false }
+# gate 4 の仮想 authenticator。`crypto` は softtoken を `AuthenticatorBackend`
+# (= client_data を自分で組む口) として使うために要る。
+webauthn-authenticator-rs = { version = "=0.6.1-dev", features = ["softtoken", "crypto"] }
