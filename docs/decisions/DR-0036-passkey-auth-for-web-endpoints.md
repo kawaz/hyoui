@@ -50,7 +50,7 @@ hyoui web には認証が一切無い。router に auth middleware も token 検
 | 前提 | 満たさない場合 |
 |---|---|
 | DR-0035 決定 6 が済んでおり、ブラウザが `location` から自分の endpoint を計算できる | endpoint を要求に載せられず、gateway が record を引けない。endpoint を config に持つ形に倒す判断が必要になる (= 目的の後段に反する) |
-| endpoint が https である (前段が TLS 終端する) | refresh cookie に `Secure` が付くので保存されない。リロードごとに passkey を求められる (`http://localhost` は secure context 扱いで動くが、`http://<LAN IP>` は動かない — findings の ccmsg 側の指摘と同型、**未検証**) |
+| endpoint が https である (前段が TLS 終端する) | refresh cookie に `Secure` が付くので保存されない。リロードごとに passkey を求められる (`http://localhost` は secure context 扱いで動くが、`http://<LAN IP>` は動かない — findings の ccmsg 側の指摘と同型。**未検証なので gate 3 (d) で実測する**) |
 | stable / unstable の 2 unit が同一ホストで同じ state dir を読める (DR-0034 決定 2) | HA endpoint の credential と session が unit 間で引き継げず、fallback のたびに再認証になる |
 | 前段が `Sec-WebSocket-Protocol` を透過する (DR-0027) | WS への access token 提示経路が無くなる |
 | 利用者が 1 人 (kawaz) で、端末ごとに credential が分かれる | `sub` の採番規則と「認可を持たない」判断 (決定 7) の前提が変わる |
@@ -93,12 +93,12 @@ hyoui web session list
 hyoui web session remove <id>
 ```
 
-`add` が出すのは **招待 URL `<endpoint>/#register=<jwt>` と 6 桁コード**の 2 つ。reference `passkey-registration-local-first` の規定そのままで、hyoui 固有の差分は決定 4 (file 共有) だけである。
+`add` が出すのは **招待 URL `<endpoint>#register=<jwt>` と 6 桁コード**の 2 つ (`<endpoint>` は正規形なので末尾 `/` を含む、決定 3)。reference `passkey-registration-local-first` の規定そのままで、hyoui 固有の差分は決定 4 (file 共有) だけである。
 
 | 項目 | 形 |
 |---|---|
-| jwt の claims | `{iss, sub, endpoint, rp_id (= endpoint の hostname), user_id, access, exp (10 分), jti}` |
-| jwt の署名 | **登録 1 本ごとの乱数 32 byte secret による HMAC (HS256)**。永続鍵を持たない |
+| jwt の claims | `{sub, endpoint (正規形), rp_id (= endpoint の hostname), user_id, access, exp (10 分), jti}`。reference の `iss` (発行 instance の id) は**持たない** — 発行するのは CLI で、検証するのはどの unit でもよいので、指す対象が無い |
+| jwt の署名 | **登録 1 本ごとの乱数 32 byte secret による HMAC (HS256)**。永続鍵を持たない。secret は CLI が `pending.json` に書き、gateway は読むだけ (決定 4) |
 | jwt の運び方 | **fragment (`#`)**。server にも proxy log にも Referer にも乗らない |
 | 6 桁コード | URL には含めず CLI にだけ表示する。登録要求の必須引数。**5 回の誤入力でその URL (jti) を焼く** |
 | ブラウザ側 `create()` | `residentKey: "preferred"`、`userVerification: "required"`、`attestation: "none"`、`user.id` = claims の `user_id`、`rp.id` = claims の `rp_id` |
@@ -107,13 +107,25 @@ hyoui web session remove <id>
 
 **attestation は `none` で足りる。** 「この credential を作ってよい人か」は jwt と 6 桁コードが既に担保しており、authenticator の出自証明は要件に無い。要求すると証明書チェーンの検証と信頼リストという管理対象が増える。
 
-**リモートからの登録経路も復旧経路も持たない。** 登録がホスト上の CLI に閉じることがこの設計の安全性の根である。発行した unit が再起動すると secret が消えて登録は失敗するが、fallback は置かず「登録 URL を再発行してください」と言う。
+**リモートからの登録経路も復旧経路も持たない。** 登録がホスト上の CLI に閉じることがこの設計の安全性の根である。
+
+**`passkey add` は gateway に要求を送らない。CLI が `pending.json` に直接書き、gateway は読むだけである。** 書くのは jwt の HMAC secret と、その jti / endpoint / claims / 6 桁コードのハッシュ / 試行回数 / `exp`。CLI は同じホスト上で同じ uid で走り、state dir に書ける (= 到達が権限である。ccmsg が UDS の管理フレームで表していることを、hyoui では file の所有権で表す)。
+
+この形にする理由が 2 つある。**gateway に管理用の経路を足さずに済む** — 登録 URL の発行に gateway の生存が要らず、`hyoui web daemon` が全て停止していても `passkey add` が打てる。もう 1 つは **secret がプロセスのメモリに無いので、どの unit が POST を受けても検証できる** (決定 4 の HA 対応がこれで成立する)。ccmsg は secret を発行 instance のメモリに置き「発行者へ転送」で解いているが、hyoui は file を正本にすることでその転送を要らなくした。
+
+**したがって「発行した unit の再起動で登録が失敗する」制約は hyoui には無い。** 登録 URL が失効するのは `exp` (10 分) と 6 桁コードの 5 回失敗だけで、その時の文言は「登録 URL を再発行してください」にする。
+
+`sub` の既定は `<endpoint の host>-<連番>` とし、**unit に依存させない** (連番は `auth.json` の当該 endpoint の record から採る。tombstone 済みの名前はスキップする)。credential は endpoint に束縛される (決定 3) ので、`sub` の名前空間も endpoint 側に置くのが揃う。ccmsg は `<unit>-<連番>` だが、hyoui の unit (stable / unstable) は endpoint と 1:1 でないので、unit 名を入れると HA endpoint の登録が「どちらの unit で発行したか」に依存して見える。
 
 **reference の任意ゲート (b) (ホスト PC の生体認証による承認) は本 DR に入れない。** 6 桁コードで「URL が漏れただけでは登録にならない」は満たしており、離席中の第三者を防ぐ層は独立に積める (reference がそう設計している)。必要になった時に足す。
 
 ### 3. gateway は endpoint を知らない。RP は record の endpoint から決まる
 
 **passkey は endpoint ごとに個別登録する。** §Context の 3 endpoint はそれぞれ別の RP ID を持ち、credential は登録した endpoint でだけ使える。同じ host の `/` と `/hyoui/` も別 endpoint = 別登録である。
+
+**endpoint は DR-0035 決定 6 の正規形 (`scheme://host[:port]/<path>/`、末尾 `/` 必須、query / fragment なし) で扱う。** record の key、jwt の claims、要求の body、challenge に埋める値のすべてが正規形の文字列であり、**比較は正規化した文字列の完全一致で行う** (URL として解釈し直して比較する経路を持たない)。`hyoui web passkey add --endpoint` は受け取った値を正規化してから jwt と `pending.json` に書き、正規化できない値は拒否する。ブラウザ側の 2 つの計算は正規形をそのまま返す。
+
+正規形を固定しないと、**`--endpoint https://hyoui.<host>` (スラッシュ無し) で登録した record を、ブラウザが送る `https://hyoui.<host>/` では引けない**。key が 1 文字違うだけで登録済みの credential が使えなくなり、原因は認証失敗としてしか見えない。
 
 - **ブラウザが endpoint URL を計算して要求に載せる。** DR-0035 決定 6 と同じ計算 (index は `new URL(".", location.href)`、session ページは `location.href` から `sessions/<id>` と query を落としたもの) で、`/auth/challenge` `/auth/assert` `/auth/refresh` の body に `endpoint` として送る
 - **認証の検証**: 要求の `endpoint` で record 集合を絞り、assertion の `rawId` で record を引く。record の `endpoint` から `rp_id` (= hostname) と origin を取り、`authData.rpIdHash` == `sha256(rp_id)` と `clientDataJSON.origin` == record の endpoint の origin (完全一致) を照合する
@@ -142,28 +154,59 @@ root を `hyoui-web/` にするのは DR-0034 決定 2 と同じ理由で、`$XD
 
 **`pending.json` に secret と challenge を書くのは、HA endpoint 宛の登録で発行 unit と受信 unit が違いうるため。** CLI が発行した URL の POST を受けるのは canddy の振り分け次第で、fallback の瞬間にどちらに落ちるかは決められない。ccmsg は「発行者へ転送」で解いているが、hyoui では file 共有で unit の区別を消す。個別 endpoint 宛なら受ける unit は 1 つに決まるが、経路を分けずに同じ file に書く。
 
-**`flock` を writer の直列化に使う。** token family の rotate は「lock → 読む → 書く → unlock」を 1 単位にする。credential は mtime で cache してよいが、**family の検証は cache を使わず毎回 file を読む** — 書き換わる頻度が高く、rotate の直後に他 unit が古い cache で判定すると再利用検知が誤発火する。
+#### lock は別 file に取る
+
+**`flock` は `auth.json.lock` / `pending.json.lock` に取る。data file 自身には取らない。** data file は tmp + rename で差し替えるので、rename の瞬間に inode が入れ替わる。data file に lock を取る形だと、後から来た writer が**既に置き換えられた古い inode** の lock を掴んで「自分だけが書いている」と信じ、read-modify-write が衝突して lost update になる (rename は lock の状態を引き継がない)。lock 対象を差し替えられない別 file に固定すれば、lock の identity が writer 全員で一致する。
+
+lock の下で行う read-modify-write は次のもので、いずれも「lock → 読む → 変更 → tmp に書く → rename → unlock」を 1 単位にする:
+
+| 操作 | 対象 file |
+|---|---|
+| token family の rotate、失効 (tombstone)、credential の登録 / 削除 | `auth.json` |
+| **challenge の消費** (発行した challenge を使用済みにする) | `pending.json` |
+| **6 桁コードの試行回数の加算**と 5 回到達での jti の焼き切り | `pending.json` |
+| 登録 URL の発行 (CLI が secret と claims を書く) | `pending.json` |
+
+challenge の消費と試行回数の加算を lock の外で行うと、**2 unit に同時に来た要求が同じ challenge を 2 回消費でき、試行回数も数え落とす** (= 総当たりの回数上限が unit の数だけ緩む)。回数は 1 箇所で数えるのが要件なので (reference)、file が唯一の計数場所になる。
+
+credential は mtime で cache してよいが、**family の検証は cache を使わず毎回 file を読む** — 書き換わる頻度が高く、rotate の直後に他 unit が古い cache で判定すると再利用検知が誤発火する。
 
 **instance 間の複製 protocol (ccmsg の `auth.records` topic) は持たない。** 2 unit は同一ホストで同じ file を読める。DR-0034 の「gateway 間の状態共有をしない」は「gateway 自身が状態を持たない」の意味で、file を正本にして各 unit が読むだけの形はこれに反しない (DR-0006 §1 の socket dir が正本なのと同じ形)。
 
-失効は tombstone で表す (削除ではなく)。`passkey remove <sub>` はその sub の credential 全部と family 全部を失効させ、認証済みの WS を切る。`session remove <id>` は family 1 本だけを落とす。
+#### 失効はいつ効くか
+
+失効は tombstone で表す (削除ではなく)。`passkey remove <sub>` はその sub の credential 全部と family 全部を、`session remove <id>` は family 1 本を tombstone にする。
+
+**CLI は gateway に通知しない** (決定 2 と同じく、CLI が書いて gateway が読む)。したがって失効が確立済みの WS に効く時点は、**その接続の refresh 延長 (`auth.extend`) で unit が family を読み直し、tombstone を見て切る**時である。
+
+**最長の猶予は access token の TTL (4 時間) になる。** 延長は残り寿命の 90% 時点で走るので実際にはそれより早いが、上限としてはこれが正しい値である。「今すぐ全部切る」が要る場面は `hyoui web daemon restart` が答える (WS は unit の再起動で必ず切れる)。
+
+**猶予を無くすために gateway へ通知経路を足さない。** 足すと決定 2 で消した「CLI → unit の管理経路」が戻り、CLI が gateway の生存に依存する。失効の目的は「盗まれた credential で以後入れないこと」で、それは次の認証と次の refresh で満たされる。確立済みの 1 接続が最長 4 時間生き延びることを許容できない要件は今は無く、必要になったら `restart` で足りる。
 
 ### 5. 認証セッションは access + refresh の 2 段。reference どおり
 
 | 値 | 置き場 | 属性 / 寿命 | 提示方法 |
 |---|---|---|---|
 | access token | **ブラウザのメモリのみ** (署名しない opaque 乱数)。localStorage には置かない | 4 時間 | HTTP は `Authorization: Bearer`、WS は subprotocol `hyoui.token.<値>` (server は選んだ subprotocol を echo) |
-| refresh token | **httpOnly cookie** | `HttpOnly; Secure; SameSite=Strict`、名前 `__Secure-hyoui-<sha256(endpoint + "\n" + sub) 先頭 16 hex>`、**`Path` = endpoint の path** (host だけの endpoint なら `Path=/`、`https://example.jp/hyoui` なら `Path=/hyoui`)、7 日 | cookie のみ (body に token を載せない) |
+| refresh token | **httpOnly cookie** | `HttpOnly; Secure; SameSite=Strict`、名前 `__Secure-hyoui-<sha256(endpoint) 先頭 16 hex>`、**`Path` = 正規形 endpoint の path から末尾 `/` を落とした値** (root の endpoint は `/`、`https://example.jp/hyoui/` なら `Path=/hyoui`)、7 日 | cookie のみ (body に token を載せない) |
 
 token は署名せず、**token family の record を lookup して検証する**。署名鍵を持つと保管・rotate・配布という管理対象が増えるが、record を引く形なら鍵なしで同じことが済む。
 
-**`__Host-` ではなく `__Secure-` + `Path` を選ぶ。** 同一 host の `/` と `/hyoui/` を別 endpoint (別登録) として扱うには cookie を `Path` で分ける必要があり、`__Host-` は `Path=/` を強制する。**`Path` は認可境界ではない** (同一 origin の JS は任意の path に fetch できる) ので、この分離は帯域と露出面の絞り込みに留まる。
+**cookie 名に `sub` を混ぜない。** reference と ccmsg は `sha256(発行者 id + "\n" + sub)` を使うが、`/auth/refresh` を受けた時点で server は **まだ誰の要求か知らない** (refresh token 自体が身元を答える値である)。ccmsg はこれを「`__Secure-ccmsg-` prefix の全 cookie を試す」ことで解いているが、hyoui は名前を **endpoint のハッシュだけ**にして 1 つに決める。endpoint ごとに別 cookie になる要件 (下記) はこれで満たされ、試行の必要が消える。
+
+代償は **同一 endpoint に複数の `sub` が同時にログインできない**ことで、cookie が後の登録で上書きされる。利用者が 1 人 (前提条件表) で `sub` が端末ごとに分かれる運用では、同じブラウザに 2 つの `sub` が並ぶ場面が無い。必要になった時は名前に `sub` を戻し、prefix の全 cookie を試す形に変える (record の形は変わらない)。
+
+**`__Host-` ではなく `__Secure-` + `Path` を選ぶ。** 同一 host の `/` と `/hyoui/` を別 endpoint (別登録) として扱うには cookie を `Path` で分ける必要があり、`__Host-` は `Path=/` を強制する。
+
+**`Path` は認可境界ではない。** 同一 origin の JS は任意の path に fetch でき、cookie の `Path` は「ブラウザが自発的に付けて送る範囲」しか決めない。したがって `https://example.jp/` の endpoint と `https://example.jp/hyoui/` の endpoint を**別の信頼境界として扱うことはできない** — 前者のページで走るスクリプトは後者の `/auth/refresh` を叩けるし、その時 cookie も送られる。この分離は帯域と露出面の絞り込みに留まる。同一 host に信頼の異なるものを並べるなら、分けるべきは path ではなく host (eTLD+1) である。
 
 **rotate と再利用検知**: refresh は使うたび rotate する。family は退役した値のダイジェストを本来の exp まで保持し、**どの世代の値でも再提示を見たら family ごと失効**させ、その sub の WS を切る。直前 1 世代だけは 60 秒の再送猶予として前回の答えを返す (rotate しない)。
 
 **access は据え置く**: 残り寿命が TTL の半分を切るまで同じ値を返す。これが複数タブで 1 本の access を共有する土台になる (reference `multi-tab-token-refresh` のサーバ側手順)。
 
-**長命 WS は切らずに延ばす。** `hello` frame (DR-0035 決定 3) に access の `exp` を載せ、ブラウザは残り寿命の 90% 時点で `/auth/refresh` を打ち、**同一接続上の refresh op で接続の期限を延ばす**。`exp` で必ず切ると画面が周期的に瞬く。切るのは延長を怠った接続だけである。
+**長命 WS は切らずに延ばす。** `hello` frame の `auth_expires_at` (DR-0035 決定 1 の表に収録済み) に access の期限を載せ、ブラウザは残り寿命の 90% 時点で `/auth/refresh` を打ち、得た access を **同一接続上の `auth.extend` で提示して期限を延ばす** (応答は `auth.extend.result`)。`exp` で必ず切ると画面が周期的に瞬く。切るのは延長を怠った接続だけである。
+
+この `auth.extend` の処理が、失効を確立済み接続に反映する唯一の点でもある (決定 4 の「失効はいつ効くか」)。unit は family を file から読み直し、tombstone を見たら `ok:false` を返して接続を切る。
 
 **tab-share は `multi-tab-token-refresh` を素の JS で書く。** `navigator.locks.request("hyoui.auth.refresh:<endpoint>:<sub>")` の中でだけ refresh し、得た access を `BroadcastChannel("hyoui.auth:<endpoint>:<sub>")` でメモリからメモリへ配る。ロックを取った側は先に `{kind:"ask"}` を投げて 50ms 待ち、誰かが期限内の access を持っていれば refresh しない。sub が分かる前は endpoint だけの key で待ち、確定後に張り替える。Web Locks が無い環境では各タブが自分で refresh する (収束はサーバ側の据え置きが担う)。reference が固定を要求する 7 性質をそのまま test にする。
 
@@ -212,6 +255,9 @@ reference は「library は要らない」と書くが、その根拠は「attes
 **`[web].auth` のような config 項目を持たない。** 認証は常に有効である (裁定 Q7: 「`none` があること自体が事故の元」)。
 
 - **test は登録 fixture で通す。** record を `auth.json` に直接置き、family も直接書いて access token を提示する形で `/api/*` の test を回す。WebAuthn の署名経路自体の test は仮想 authenticator で別に持つ
+- **test は必ず `XDG_STATE_HOME` を隔離する。** 現行の e2e (`crates/hyoui-cli/tests/web_e2e_api.rs`、6 test) は gateway を `env_remove("XDG_STATE_HOME")` で起動しており (`:106`、session daemon 側も `:62`)、そのままだと認証を足した瞬間に **実利用の `~/.local/state/hyoui-web/auth.json` を読み、kawaz の本番 credential に対して test が走る**。読むだけでも fixture を足す過程で書く経路が生まれ、`passkey remove` の test が本番 record を消しうる。`env_remove` を **tempdir を指す `env("XDG_STATE_HOME", …)` に変える**のが要件で、これは認証を足す変更と同じ commit で行う (後回しにすると、その間の test 実行が本番 state を触る)
+
+この隔離は「無認証 mode を持たない」判断 (本決定) の直接の帰結である。`auth = "none"` があれば test はそれを選べたが、無いので **fixture と state dir の隔離が test の前提**になる。
 - **127.0.0.1 直結 (経路 [3]) で使えるのは無認証の口だけ** = `/healthz` と `/version` (決定 1)。`hyoui web daemon status` / `restart` の `/healthz` 待ち (DR-0034 決定 5 / 7) はこれで足りる
 - **loopback を認証免除にはしない。** canddy 経由も loopback 発なので判定できない (§Context)。`X-Forwarded-For` を信じる形は、前段がそれを付けない構成で穴になる
 - **WebAuthn の RP ID は domain であり IP アドレスは使えない** ので、`http://127.0.0.1:43690/` を endpoint として登録する経路も無い。loopback から `/api/*` を叩く需要が出たら、その時に手段を設計する (今は無い)
@@ -240,11 +286,11 @@ reference は「library は要らない」と書くが、その根拠は「attes
 
 | Phase | 内容 | gate |
 |---|---|---|
-| W2-0 | (実装前) iframe 経路の実機確認 | **gate 3**: 現行 gateway に test 用ハンドラを立て、**Chrome / Safari / iOS Safari の 3 category**で (a) `allow="publickey-credentials-get"` 付き iframe 内の `navigator.credentials.get()` が通る、(b) `clientDataJSON.topOrigin` に親 origin が入る、(c) 同一 site iframe 内のリクエストに `SameSite=Strict` の cookie が乗る、を確認する。(a) か (c) が崩れたら決定 6 を Alternatives の (P) に差し替える |
+| W2-0 | (実装前) iframe 経路の実機確認 | **gate 3**: 現行 gateway に test 用ハンドラを立て、**Chrome / Safari / iOS Safari の 3 category**で (a) `allow="publickey-credentials-get"` 付き iframe 内の `navigator.credentials.get()` が通る、(b) `clientDataJSON.topOrigin` に親 origin が入る、(c) 同一 site iframe 内のリクエストに `SameSite=Strict` の cookie が乗る、(d) **平文 http の endpoint (`http://<LAN IP>:<port>/`) で `Secure` cookie が保存されないこと**、を確認する。(a) か (c) が崩れたら決定 6 を Alternatives の (P) に差し替える。(d) は前提条件表の「endpoint が https である」を実測に変えるためのもので、結果がどちらでも設計は変わらない (https を要求する根拠が確定するだけ) |
 | W2-1 | `webauthn-rs` を足し、登録 / 認証の検証経路を作る (決定 8) | **gate 4**: `attestation: none` / `userVerification: required` / `residentKey: preferred` が crate の設定で表せる。表せなければ自作の範囲を決めてから進む。仮想 authenticator で登録 → 認証が通る |
-| W2-2 | `auth.json` / `pending.json` と `flock` (決定 4) | 2 プロセスから同時に rotate しても family が壊れない (並行 test)。HA endpoint の credential を片方の unit で登録し、**もう片方の unit で認証が通る** |
-| W2-3 | `/auth/*` 4 経路と middleware (決定 1 / 3 / 5) | `/api/*` と WS が 401 を返し、`/healthz` `/version` `/assets` `/` `/sessions/{id}` は通る (決定 1 の表を test で固定する)。endpoint をすり替えた challenge / assert が落ちる |
-| W2-4 | `hyoui web passkey` / `session` の CLI (決定 2) | 登録 → 認証 → `passkey list` → `remove` で WS が切れる、が一続きで通る |
+| W2-2 | `auth.json` / `pending.json` と別 file への `flock` (決定 4) | 2 プロセスから同時に rotate しても family が壊れない (並行 test)。**tmp + rename を挟んでも lost update が起きない** (lock file 方式の検証。data file に lock を取る実装だと落ちる test を書く)。**同じ challenge が 2 回消費できない**、**6 桁コードの試行回数が 2 プロセス合計で数えられる**。HA endpoint の credential を片方の unit で登録し、**もう片方の unit で認証が通る** |
+| W2-3 | `/auth/*` 4 経路と middleware (決定 1 / 3 / 5) | `/api/*` と WS が 401 を返し、`/healthz` `/version` `/assets` `/` `/sessions/{id}` は通る (決定 1 の表を test で固定する)。endpoint をすり替えた challenge / assert が落ちる。**既存 e2e `crates/hyoui-cli/tests/web_e2e_api.rs` の 6 test が、tempdir の `XDG_STATE_HOME` + 登録 fixture (Bearer / WS subprotocol 付き、endpoint は `http://127.0.0.1:<port>/`) で全通過する** (決定 9)。正規形の endpoint が record の key と一致することがこの test で同時に固定される |
+| W2-4 | `hyoui web passkey` / `session` の CLI (決定 2) | 登録 → 認証 → `passkey list` → `remove` が一続きで通る。**`remove` 後は (a) 新規認証が落ち、(b) `/auth/refresh` が落ち、(c) 確立済み WS は次の `auth.extend` で切れる** (決定 4 の「失効はいつ効くか」)。gateway が停止していても `passkey add` が URL を発行できる (決定 2) |
 | W2-5 | front の overlay ログイン UI と tab-share (決定 5) | reference `multi-tab-token-refresh` の 7 性質を test で固定する。**2 タブの access が同時に切れても refresh が 1 回だけ**走る |
 | W2-6 | runbook を書き、kawaz が各 endpoint に登録 (決定 10) | HA endpoint に登録した 1 本で、**fallback を起こしても再認証を求められない** (実機で unstable を落として stable に回す) |
 
@@ -266,6 +312,9 @@ reference は「library は要らない」と書くが、その根拠は「attes
 | credential 単位の `rw` / `ro` を今から実装する | `passkey add --ro` で決め、gateway が `ro` の入力を 403 で落とし daemon に `Ro` mode で張る | 利用者が 1 人で、観測だけ許したい端末が今は無い。claim の定義だけ置いて実装は必要時に行う (裁定 Q5) |
 | ccmsg の自前 WebAuthn 実装 (TS 550 行) を Rust に移植 | `ciborium` + 署名検証 crate で自作 | ccmsg 側で「ライブラリに劣らないテスト」が未達のまま残っており、その負債を引き継ぐ。crate で表せない部分が出た時に、その部分だけを書く |
 | instance 間の record 複製 (ccmsg の `auth.records` topic) と発行者への転送 | peer 間で record を複製し、HMAC secret / challenge / rotate は発行者に問い合わせる | 2 unit は同一ホストで同じ file を読める。転送 protocol を持つより file + `flock` の方が hyoui の形に合う (決定 4) |
+| CLI → gateway の管理経路を持つ (ccmsg の UDS 管理フレーム `passkey_add` 相当) | CLI が走っている gateway に登録要求を送り、secret は gateway のメモリに置く | gateway の生存が `passkey add` の前提になり、全 unit が停止していると登録 URL を発行できない。さらに HA endpoint では「発行した unit」と「POST を受ける unit」が違いうるので、ccmsg と同じ「発行者へ転送」が要る。CLI が `pending.json` に書く形 (決定 2) なら両方が消える |
+| cookie 名に `sub` のハッシュを含め、`__Secure-hyoui-*` の全 cookie を試す (ccmsg と同じ) | 認証前は誰の cookie か分からないので、prefix 一致の cookie を順に検証する | 同一 endpoint に複数 `sub` を並べられる利点があるが、利用者 1 人の運用でその場面が無い。試行のループは「どの cookie で失敗したか」を分ける必要も生み、失敗理由を分けない方針 (決定 5) と噛み合わない。endpoint だけのハッシュで 1 つに決める |
+| `flock` を `auth.json` / `pending.json` 自身に取る | data file を直接 lock する | tmp + rename で inode が入れ替わるため、rename を跨いだ writer 同士が別の inode の lock を掴み lost update になる。lock を差し替えられない別 file に固定する (決定 4) |
 | webui から passkey の一覧 / 削除ができるようにする | `/api/passkeys` を足す | ccmsg でも未実装。CLI 一本で足りており、認証済みの画面から認証情報を消せる経路を増やす理由が無い |
 
 ## Consequences
@@ -276,6 +325,10 @@ reference は「library は要らない」と書くが、その根拠は「attes
 - **2 unit が 1 file を共有する依存が生まれる。** `auth.json` が壊れれば両方の unit の認証が止まる。逆に片方の unit だけを入れ替えても session は続く (fallback で再認証を求められない) のが、この共有の目的である
 - **`webauthn-rs` の依存が入る。** hyoui-web に閉じるので core の依存は変わらないが、crate の設計に合わない要件が出た時に自作へ倒す判断が残る (gate 4)
 - **ccmsg-webui と canddy に依頼が 2 本出る。** どちらも別リポの責務で、hyoui 側から設定を書き換えない。W3 が済むまで iframe 内は別タブ送りになる
+- **CSP を保留した帰結として、任意のサイトが hyoui を iframe に埋め込み `allow="publickey-credentials-get"` を付けて passkey のプロンプトを出せる。** 認証が通るのは `clientDataJSON.origin` が record の endpoint と一致する場合だけなので、そのサイトが session の内容や token を得ることはない (取れるのは「利用者が生体認証を求められた」という体験だけ) が、埋め込み元を絞る手段は今の設計には無い。clickjacking の面は `X-Frame-Options` / `frame-ancestors` を付けない現行 (findings Part 1-C) と同等で、認証を足すことで悪化はしない。絞る必要が出た時に別 DR で `frame_ancestors` を決める (決定 6)
+- **cookie 名を endpoint だけのハッシュにしたので、同一 endpoint に 2 つの `sub` を同時にログインさせられない** (決定 5)。利用者 1 人の前提が変わったら名前に `sub` を戻す
+- **失効が確立済み WS に効くまで最長 4 時間かかる** (決定 4)。即時に切る手段は `hyoui web daemon restart` である
+- **test が `XDG_STATE_HOME` の隔離に依存する。** 隔離を外した変更は「本番 state を触る test」を作る。無認証 mode を持たない判断の代償で、決定 9 に明記した
 - **`rw` / `ro` の claim が record に定義されるが、当面読まれない。** 使われない field が残るのは、後から足すと既存 record の欠落を扱う分岐が要るためである (決定 7)
 - **平文 http の endpoint は成立しない。** `Secure` cookie が保存されず、リロードごとに passkey を求められる。https を前段が終端することが前提条件になる (未検証の項目として残る)
 
@@ -285,6 +338,7 @@ reference は「library は要らない」と書くが、その根拠は「attes
 - `docs/findings/2026-09-15-web-contract-and-ccmsg-passkey-inventory.md` — ccmsg の passkey 実装事実 (登録 / 認証 / 認可 / RP ID / iframe / ライブラリ)、hyoui 側の現行認証 (Part 1-C / 1-D)、reference ↔ ccmsg 実装の差分
 - `~/.local/share/repos/github.com/kawaz/claude-rules-personal/main/reference/auth-patterns/passkey-registration-local-first.md` — 登録 / 検証手順 / token family / RP ID 制約の正本
 - 同 `multi-tab-token-refresh.md` — tab-share の手順と、test で固定する 7 性質
-- DR-0035 — web 契約と世代 version。決定 6 (endpoint 基点の相対 URL) が本 DR の前提
+- DR-0035 — web 契約と世代 version。決定 6 (endpoint 基点の相対 URL と正規形) が本 DR の前提で、本 DR が使う WS frame (`hello.auth_expires_at` / `auth.extend` / `auth.extend.result`) と WS upgrade の 401 は DR-0035 決定 1 の契約表に収録されている
+- `crates/hyoui-cli/tests/web_e2e_api.rs` — 認証を足す時に `XDG_STATE_HOME` の隔離が要る既存 e2e (決定 9 / W2-3)
 - DR-0034 決定 2 (`hyoui-web/` state dir)、決定 5 (`/healthz` 待ち)、決定 8 (HA fallback)、P6 の canddy issue
 - DR-0027 §1 (crate 構成), §4 (bundler 無し assets), Consequences (認証は scope 外 — 本 DR が置き換える)
