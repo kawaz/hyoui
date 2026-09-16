@@ -56,6 +56,7 @@ daemon 境界は逆で、client と daemon の版が独立に動く (古い daem
 | reload で新しい assets が取れる (cache ヘッダを持たない、findings Part 1-D) | 帯を出しても reload が効かず、誘導が嘘になる。cache ヘッダを足す判断をする時は、この前提を壊さないことが要件になる |
 | 前段が `Sec-WebSocket-Protocol` と WS upgrade を透過する (DR-0027) | hello frame が届かず検出経路がゼロになる |
 | 前段が path を strip する場合も、strip しない場合も、相対リンクだけでページが成立する (決定 6) | prefix 付き endpoint でページが壊れ、DR-0036 の endpoint 判定に到達しない |
+| prefix 付き endpoint をスラッシュ無しで開いた時 (`https://example.jp/hyoui`) に、前段が `/hyoui/` へ redirect する | ブラウザの相対解決の基点が 1 段上になり、`assets/...` が `/assets/...` に化けてページが壊れる。**スラッシュ無しの URL を正規形へ寄せるのは前段 (canddy) の責務**で、gateway は自分のマウント path を知らないので redirect を書けない (決定 6 の正規形) |
 
 ## 介入判断 self-check (CLAUDE.md / DR-0014)
 
@@ -95,9 +96,11 @@ daemon 境界は逆で、client と daemon の版が独立に動く (古い daem
 | POST | `/api/sessions/{id}/input` | `{"specs": ["text:...","key:Enter"]}` | `{"sent_bytes":N,"specs":M}` | 400 / 404 / 409 / 500 / 501 / 503 |
 | POST | `/api/sessions/{id}/resume` | 空 | 204 | 404 / 500 / 501 |
 | POST | `/api/sessions/{id}/resize` | `{"cols":W,"rows":H}` | 204 | 400 / 404 / 409 / 500 |
-| GET | `/api/sessions/{id}/attach` | WS upgrade | WS (下記) | 400 / 404 |
+| GET | `/api/sessions/{id}/attach` | WS upgrade | WS (下記) | 400 / 401 / 404 |
 
 `/version` に足すのは `protocol` 1 field。`version` / `build_id` は DR-0034 決定 7 のまま意味を変えない。
+
+`/api/*` と WS attach の `401` は認証が有効な時だけ出る (DR-0036 決定 1)。body は決定 2 のエラー形で、`/auth/*` の route 自体の形は DR-0036 が決める。
 
 #### WS text frame (browser → gateway)
 
@@ -105,18 +108,24 @@ daemon 境界は逆で、client と daemon の版が独立に動く (古い daem
 |---|---|
 | `resize` | `{"kind":"resize","requestId":N,"cols":W,"rows":H}` |
 | `leader.request` | `{"kind":"leader.request","requestId":N}` |
+| `auth.extend` | `{"kind":"auth.extend","requestId":N,"accessToken":"<値>"}` — DR-0036 決定 5 で使う |
 
 #### WS text frame (gateway → browser)
 
 | kind | payload | 送信契機 |
 |---|---|---|
-| `hello` | `{"kind":"hello","protocol":N,"version":"0.9.x","build_id":"abc123\|null","caps":["data","lock",...]}` | WS 確立直後、`attach.info` より前 (決定 3) |
+| `hello` | `{"kind":"hello","protocol":N,"version":"0.9.x","build_id":"abc123\|null","caps":["data","lock",...],"auth_expires_at":"<ISO 8601>\|null"}` | WS 確立直後、`attach.info` より前 (決定 3)。`auth_expires_at` は DR-0036 決定 5 で使う |
 | `attach.info` | `{"kind":"attach.info","mode":"rw"\|"ro"\|"rw-no-leader"\|"unknown","leader":bool}` | `hello` の直後、`leader.notify` / `mode.change` 受信時 |
 | `resize.result` | `{"kind":"resize.result","requestId":N,"ok":bool,"error"?:{"code":"...","message":"..."}}` | `resize` への応答 |
 | `leader.result` | `{"kind":"leader.result","requestId":N,"ok":bool,"error"?:{"code":"...","message":"..."}}` | `leader.request` への応答 |
+| `auth.extend.result` | `{"kind":"auth.extend.result","requestId":N,"ok":bool,"auth_expires_at":"<ISO 8601>"?,"error"?:{"code":"...","message":"..."}}` | `auth.extend` への応答 — DR-0036 決定 5 で使う |
 | `error` | `{"kind":"error","requestId":N\|null,"error":{"code":"...","message":"..."}}` | 未知 `kind` / 不正 JSON を受けた時 (決定 2) |
 
 binary frame は双方向とも PTY bytes の 1:1 転写で、契約の世代に依存しない。
+
+**`auth.extend` / `auth.extend.result` / `hello.auth_expires_at` と、WS upgrade の 401 応答は、契約として本 DR の表に先に載せる。** 使うのは DR-0036 だが、契約の正本は 1 箇所 (`contract.rs` と本表) であるべきで、認証を足す時に「どの kind があるか」を別 DR に探しに行かせない。**追加であって削除も意味変更もしないので、DR-0036 で `WEB_PROTOCOL_VERSION` は上げない** (決定 3 の上げる条件)。認証が無効な間は `auth_expires_at` が `null` で、`auth.extend` は `error` (`code: "unsupported"`) を返す。
+
+WS upgrade は認証が要る経路なので、**`101` の前に `401` を返しうる** (DR-0036 決定 1)。この場合 frame は 1 つも流れないので、browser は HTTP 応答として 401 を読む。
 
 表示設定の query パラメータ (DR-0027 §5 が正本) は契約に含めるが、**未知 key を無視する前方互換方針は変えない。** 表示設定は閲覧者ごとの値であって protocol ではないので、世代の対象外である。
 
@@ -176,6 +185,16 @@ endpoint の決め方:
 - index ページ: `new URL(".", location.href)`
 - session ページ: `location.href` から末尾の `sessions/<id>` と query を落とした URL
 
+#### endpoint の正規形
+
+**endpoint は `scheme://host[:port]/<path>/` の形とし、末尾の `/` を必須とする。** query と fragment を含まない。ccmsg の `Endpoint` 型 (`^https?://[^/?#\s]+(/[^?#\s]*)?/$`) と同じ形である。
+
+正規形を仕様で固定するのは、**複数の実装 (ブラウザの JS、`hyoui web passkey add` の CLI、record を引く gateway) が同一の文字列に到達しなければならない**ためである。`new URL(".", location.href)` は必ず末尾 `/` 付きを返すのに対し、人が CLI に渡す `--endpoint https://hyoui.<host>` はスラッシュ無しなので、決めずに放置すると **record の key が食い違って引けない** (DR-0036 決定 3 / 決定 4)。どちらでもよいが 1 つに決める、が正しい箇所である。
+
+- 上の 2 つの計算は正規形をそのまま返す
+- CLI は受け取った `--endpoint` を正規化する (末尾 `/` を足し、query / fragment を落とす)。正規化できない値は拒否する
+- cookie の `Path` は正規形から**末尾の `/` を落とした値**を使う (root の endpoint は `/` のまま)。`https://example.jp/hyoui/` なら `Path=/hyoui` (DR-0036 決定 5)
+
 直す箇所:
 
 | 箇所 | 現行 | 直し方 |
@@ -208,9 +227,9 @@ endpoint の決め方:
 | W1-1 | `contract.rs` 新設。既存の `json!` 手書きを型に寄せ、golden test で JSON 例を固定 | golden の JSON が現行の実際の frame と byte 一致する (= この Phase では契約を変えていない) |
 | W1-2 | エラー形の JSON 統一、未知 `kind` への `error` 応答 (決定 2) | `hyoui screen` / `input` / session ページの既存操作が全部通る。エラー時の body が全経路で `{error:{code,message}}` |
 | W1-3 | `WEB_PROTOCOL_VERSION = 1`、`hello` frame、`/version` の `protocol`、決定 7 の test (決定 1 / 3) | 世代番号の Rust / JS 一致 test が通る。`hyoui web daemon status` から `/version` の `protocol` が読める |
-| W1-4 | 帯の UI と制御 frame の停止 (決定 5) | **実機確認 (gate 1)**: stable / unstable を別の `WEB_PROTOCOL_VERSION` でビルドし、(a) ページを開いたまま `daemon restart` で入れ替える、(b) HA endpoint で fallback を起こす、の 2 経路で帯が出る。**帯が出ている間に古いページから入力を送って画面が崩れないこと**を `hyoui screen dump` で確認する (崩れるなら決定 5 を binary も止める形に直す) |
+| W1-4 | 帯の UI と制御 frame の停止 (決定 5) | **実機確認 (gate 1)**: stable / unstable を別の `WEB_PROTOCOL_VERSION` でビルドし、(a) ページを開いたまま `daemon restart` で入れ替える、(b) HA endpoint で fallback を起こす、の 2 経路で帯が出る。**帯が出ている間に古いページから入力を送って画面が崩れないこと**を `hyoui screen dump` で確認する (崩れるなら決定 5 を binary も止める形に直す)。**(a) だけで先に通してよい** — (b) は canddy の 3 endpoint (DR-0034 P6) が立つまで確かめられないが、決定 5 の判断に必要な事実は (a) で揃う。(b) は endpoint が立った時点で確認する |
 | W1-5 | cap 透過 (決定 4) | `leader-request-v1` を持たない daemon (旧版) に対して、WS は `caps` から落ち、HTTP は 501 を返す。**3 category で確認** (TUI = vim / line-oriented = cat / REPL = bash の session それぞれに対して) |
-| W1-6 | 相対パス化 (決定 6) | **実機確認 (gate 2)**: (a) root 直下 (`http://127.0.0.1:43690/`)、(b) 前段が path を strip する prefix 付き (`https://<host>/hyoui` → strip)、(c) strip しない prefix 付き、の 3 構成で index / session の両ページが動き、WS が繋がる |
+| W1-6 | 相対パス化 (決定 6) | **実機確認 (gate 2)**: (a) root 直下 (`http://127.0.0.1:43690/`)、(b) 前段が path を strip する prefix 付き (`https://<host>/hyoui/` → strip)、(c) strip しない prefix 付き、の 3 構成で index / session の両ページが動き、WS が繋がる。加えて **(d) prefix 付きをスラッシュ無し (`https://<host>/hyoui`) で開いた場合**の挙動を観測し、前段の redirect が無いと壊れることを確認して前提条件表の依頼内容 (canddy への redirect 追加) を確定する。ブラウザが計算する endpoint が 3 構成すべてで正規形 (決定 6) になることも見る |
 
 gate 1 と gate 2 は DR-0036 の実装より前に通す。gate 2 が通らないと DR-0036 の endpoint 判定が成立しない。
 
@@ -234,6 +253,7 @@ gate 1 と gate 2 は DR-0036 の実装より前に通す。gate 2 が通らな�
 - **写しが 2 つになる。** Rust の定数と JS の定数。一致は test で固定する (決定 7)。これは「bundler を持たない」(DR-0027 §4) の帰結で、型を共有できない以上避けられない
 - **`--web-assets-dir` の dev では帯が出うる。** ローカル dir の assets が binary の世代と食い違う場合で、前提条件表のとおり受け入れる
 - **cap 透過で 501 が増える。** 旧版 daemon に繋いだ session では操作が個別に落ちるようになる (現在は 500 か手作りのエラー文字列)。DR-0034 決定 8 が要求した形であり、browser 側で灰色表示に落とせる
+- **endpoint の正規形が 3 者 (JS / CLI / gateway) の共通語彙になる。** 末尾 `/` を必須にしたので、スラッシュ無しで開かれた prefix 付き endpoint を正規形へ寄せる redirect が前段に要る。これは canddy への依頼が 1 本増えることを意味する (DR-0034 P6 の issue に相乗りできる)
 - **相対パス化が DR-0036 の前提になる。** gate 2 が通らなければ、DR-0036 の「gateway は endpoint を知らない」は成立せず、endpoint を config に持つ形に倒す判断が必要になる
 - **index ページの polling が 1 本増える** (`/api/sessions` に加えて `/version`)。同じ周期に乗せるので往復は増えるが、頻度は変わらない
 
