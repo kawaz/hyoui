@@ -1,7 +1,7 @@
 # web 境界の契約整理と passkey 認証のグランドデザイン
 
 - Date: 2026-09-15
-- Status: In Progress <!-- In Progress / Concluded / Archived -->
+- Status: Concluded (2026-09-16 kawaz 裁定済み、DR 化へ)
 
 ## 動機
 
@@ -278,6 +278,18 @@ kawaz の運用 (tailnet からの閲覧、ccmsg 経由の Terminal タブ) を�
 裁定済み (kawaz 2026-09-15): Q3 bootstrap は (A) CLI 発行の招待 URL で確定 (§4.2)。passkey は endpoint ごとに個別登録し、canddy には個別 2 endpoint + HA 1 endpoint を並べる。gateway は endpoint を知らず port を listen するだけで、RP は record の endpoint から決まる。endpoint は path 付き (`https://example.jp/hyoui`) でもよい (§4.4)。
 
 裁定でないもの (本文で決めた): 契約の正本を Rust 型に置き JSON Schema を持たない (§2)、エラー形の JSON 統一と未知 kind への `error` 応答 (§2)、assets / API / WS の絶対パスを相対にして prefix 下で動かす (§2)、gateway は世代不一致を拒否せず browser が判断する (§3)、`/healthz` `/version` `/assets` `HTML` は無認証のまま (§4.1)、challenge に endpoint を埋める (§4.4)、127.0.0.1 直結は `auth = "none"` の gateway でだけ使う、script 向け token は初版に無い (§4.4)、cookie の `Path` は endpoint の path (§4.5)、record は endpoint を key に `auth.json` を 2 unit で file 共有し pending と family の rotate も file + `flock` で扱う (§4.6)、`[web].frame_ancestors` が空なら現行どおりヘッダ無し (§4.7)。
+
+## kawaz 裁定 (2026-09-16)
+
+| # | 裁定 | 補足 (kawaz の言葉の要点) |
+|---|---|---|
+| Q1 | (a) 世代番号 1 つ | **応答ヘッダ `X-Hyoui-Web-Protocol` は持たない** (CORS を考慮すると preflight が要る)。伝えるのは WS の hello frame と `GET /version` だけ |
+| Q2 | (R) iframe 内 WebAuthn | ccmsg-webui の iframe に `allow="publickey-credentials-get"`。CSP / frame_ancestors の細部は保留 |
+| Q3 | (A) 確定済み | reference どおり |
+| Q4 | (S2) reference どおり access + refresh cookie | ccmsg にある発展形 (front assets のホスティング分離) は採らず、**hyoui の endpoint 自身が front assets の提供者** |
+| Q5 | credential に `rw` / `ro` の claim を**定義だけ**して当面 `rw` 固定 | session ごとの区別も当面なし。必要になった時に rw/ro の実装と一緒に拡張する (設計も今はしない) |
+| Q6 | (L) `webauthn-rs` | 仕様上都合が悪い部分が出たら自作を検討 |
+| Q7 | (b) W2 の時点で既定 `passkey` | `none` があること自体が事故の元。test は登録 fixture で通す |
 
 ## 暫定的な結論
 

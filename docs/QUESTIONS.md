@@ -20,105 +20,21 @@
 
 ## 裁定待ち
 
-### 👺ECO-Q1: `ignored-tests` job の `continue-on-error: true` を外すか
-
-外部レビュー H-1 の提案。実測 (直近 15 run) では macOS は 08-21 以降 8 run 連続 green、ubuntu は毎回違う 1〜2 本 (daemon shutdown 系 / attach 系) が落ちる = 負荷依存の不安定で、レビューが言う「固定 2 本の恒常 fail」は現状と合わない。
-
-- [ ] a: 外さない (統括推し)。外すと ubuntu の負荷依存 fail で main が常時 red になり、それ自体が別のノイズになる。代わりに issue `2026-07-26-bug-ignored-tests-job-permanently-red` の集計を現状 (macOS green / ubuntu は毎回違うテスト) に更新し、ubuntu 側の真因調査を継続する
-- [ ] b: 外す。red を見えるようにして、落ちる各テストを `#[ignore = "<理由 + issue>"]` で明示 skip に倒しながら潰す
-- [ ] c: 外さないが、ubuntu job だけ retry (`nick-fields/retry` 等) を入れて 1 回の負荷依存 fail を吸収する
-
-
-### 👺WEB-Q1: web 境界の version 方式
-
-グランドデザイン [research/2026-09-15-web-protocol-and-passkey-grand-design.md](research/2026-09-15-web-protocol-and-passkey-grand-design.md) §3。assets は gateway 自身が配るので browser と gateway は平常時同ビルド、ずれるのは restart / brew upgrade / canddy fallback で裏の unit が変わった時。
-
-- [ ] a: 世代番号 1 つ (`WEB_PROTOCOL_VERSION`、統括推し)。WS の hello frame + `X-Hyoui-Web-Protocol` ヘッダ + `/version` で伝え、不一致なら画面端に帯 + 再読み込みボタン (自動リロードなし、既存 WS は切らない)。build_id は情報表示のみ
-- [ ] b: daemon 境界と同型の cap 方式
-- [ ] c: 併用
-
-### 👺WEB-Q2: ccmsg webui の iframe 内での認証経路
-
-同 §4.3。ccmsg の `topOrigin` 拒否は「ccmsg 自身が iframe に入らない」判断で hyoui の RP には無関係 (kawaz 2026-09-15)。ccmsg と hyoui は別 origin だが同一 site (`*.kawaz.jp`)。**cookie が iframe 内のリクエストに乗るか (同一 site) は a / c どちらでも同じ前提で実機未検証。**
-
-- [ ] a: top-level で hyoui にログイン (popup) → cookie が iframe 内にも乗る → BroadcastChannel で通知 (ccmsg 側変更ゼロ)
-- [ ] b: ccmsg が短命 token を発行して iframe に渡す (hyoui が ccmsg を IdP として信頼)
-- [ ] c: iframe 内で WebAuthn を走らせる (統括推し)。ccmsg-webui の iframe に `allow="publickey-credentials-get"` (登録は CLI 招待 URL を top-level で開くので `create` は不要)、hyoui は `[web].frame_ancestors` に ccmsg の origin を allowlist して `topOrigin` を照合し、同じ値で CSP `frame-ancestors` を出す
-
-### 👺WEB-Q4: 認証セッションの形
-
-同 §4.5。reference `passkey-registration-local-first` は access (opaque、メモリ) + refresh (httpOnly cookie、rotate + 再利用検知) を規定している。
-
-- [ ] a: reference どおり (統括推し)。tab 間の refresh 調停は `multi-tab-token-refresh` を素の JS (Web Locks + BroadcastChannel) で実装する
-- [ ] b: httpOnly cookie 1 本 (sliding 30 日、CLI で失効)。reference から乖離する (素の JS に tab-share を持ち込まない、利用者 1 人)
-
-### 👺WEB-Q5: 認可の軸
-
-同 §4.6。
-
-- [ ] a: credential 単位 `rw` / `ro` (`hyoui web passkey add --ro`) を daemon の attach mode に写す。既定 rw (統括推し。スマホ等「観測だけの端末」を既存 mode で表す)
-- [ ] b: 認可を持たない (登録済みは全員 rw)
-
-### 👺WEB-Q6: WebAuthn の実装
-
-同 §4.8。
-
-- [ ] a: `webauthn-rs` crate (依存は hyoui-web に閉じる。統括推し。attestation none / UV required が crate 設定で表せなければ b)
-- [ ] b: ccmsg の自前実装 (TS 550 行) を Rust に移植 (ccmsg 側のテスト負債も引き継ぐ)
-
-### 👺WEB-Q7: 認証の既定を `passkey` に切り替える時期
-
-同 §6。W2 (実装) は `[web].auth = "none"` 既定で出し、W3 で kawaz が stable に登録して config で切替。
-
-- [ ] a: W3 の実運用を通してから W4 で既定を `passkey` に (= major bump、統括推し)
-- [ ] b: W2 の時点で既定 `passkey`
+(現在なし)
 
 ## 確認待ち
 
-### 👺DR32-C1: DR-0032 実装 (v0.9.32) の実機確認
+### 👺DR32-C1: child action menu の実機確認 (v0.9.39 以降)
 
-- [ ] a: `~/.config/hyoui/config.toml` に `[session]` `on_child_suspend = "show_child_action_menu"` を書き、attach 中に ^Z×2 等で子を止めると menu (脱出: d/z、子への操作: c・Esc/i/h/k) が出て各操作が効く。Esc = 起こして戻る、それ以外のキーは無反応
-- [ ] b: `[attach]` `ctrlz_x1_action = "select_on_demand"` で、^Z 単発 → 1 行プロンプト → ^Z/^C/Esc の 3 択が効く (他キーは無反応)
-- [ ] c (v0.9.39): **unattended 中に子が止まった後で attach** しても menu キーが効く
-  (= 子を止めた状態で detach → 再 attach、または attach していない間に子が止まる)
+- [ ] a: `~/.config/hyoui/config.toml` に `[session]` `on_child_suspend = "show_child_action_menu"` を書き、attach 中に ^Z×2 で子を止めると menu が出て各キー (d/z = 脱出、c・Esc/i/h/k = 子への操作、Esc = 起こして戻る) が効く
+- [ ] b: `[attach]` `ctrlz_x1_action = "select_on_demand"` で ^Z 単発 → 1 行プロンプト → ^Z/^C/Esc の 3 択が効く
+- [ ] c: 子を止めた状態で detach → 再 attach しても menu キーが効く
 
-m41-43 の裁定 (閉じる廃止 / Esc=resume / UX 視点の 2 群) は v0.9.32 で反映済み。
+### 👺LINK-C1: ターミナル内リンク (v0.9.40 以降) の実機確認
 
-**確認は v0.9.39 以降で** (`brew upgrade hyoui`)。v0.9.38 以前には「handshake 時点で子が
-停止していると、menu が画面に出ているのに menu キーが効かず子への入力になる」bug があった
-(= 初回 attach redraw を client が「子が resume した証拠」と誤認して menu の focus を
-閉じていた)。項目 c はその経路の確認。項目 a の「attach 中に ^Z×2 で止める」順序は
-別経路 (STOP_NOTIFY) なので v0.9.38 以前でも動いていた。
-
-### 👺LINK-C1: ターミナル内リンク (v0.9.40) の実機確認
-
-**前提** (どちらか欠けるとリンクは開けない。2026-08-25 に統括が実施済み):
-1. `brew upgrade kawaz/tap/hyoui` で hyoui 本体を v0.9.40 以降にする。**web の assets は
-   バイナリに埋め込まれている**ため、古いバイナリのままだと古い session.js が配信される
-   (実際に v0.9.35 のままで `linkHandler` が無く、xterm 既定の `confirm()` が呼ばれて
-   `Ignored call to 'confirm()'. The document is sandboxed` になった)
-2. web gateway を再起動する (launchd 管理なので pid を kill すれば KeepAlive が復帰させる。
-   `hyoui web service status` で新 pid を確認)
-3. ブラウザをリロードする (ccmsg 経由なら iframe の `allow-popups` を読み込むためにも必要。
-   ccmsg v0.112.1 以降)
-
-検証コマンド: `curl -s http://127.0.0.1:43690/assets/session.js | grep -c 'linkHandler'`
-が 1 以上なら新しい assets が配信されている。
-
-- [ ] a: デスクトップで Claude Code の応答内 markdown リンクをクリック → 新規タブで開く
-  (確認ダイアログは出ない。開いた先が正常に表示・動作する)
-- [ ] b: 素の URL テキスト (`https://...` と書かれただけの文字列) もクリックで開く
-- [ ] c: **iPad**: リンクを tap → 開く。その後ソフトウェアキーボードが閉じる
-- [ ] d: **iPad**: nvim 等 (mouse 有効な TUI) を開いた状態で focus 済み tap →
-  **カーソルがタップ位置へジャンプしない** (= 従来どおり閉じ操作だけ)
-- [ ] e: **iPad**: LT-C1 b/c の回帰確認 — focus 済み tap でキーボードが閉じる /
-  パネル open 中の tap は常に close のみ
-- [ ] f: popup がブロックされる環境 (iOS Safari のポップアップブロック on 等) で
-  リンクを開くと、URL とコピーボタンのパネルが出る (Esc / × で閉じられる)
-
-**今回開けるようにならないもの** (仕様、確認不要):
-- `file://` / `vscode://` (status line に出るもの) — xterm.js の公開 API が
-  「http/https のみ」か「`javascript:` 含む全 scheme」の二択しかなく、後者は危険なため
-  http/https に限定した。要望があれば別途対応する
-- 再接続前から画面にあったリンク — daemon が OSC 8 を保持しないため
-  ([docs/issue/2026-08-24-attach-osc8-hyperlink-metadata-loss.md](issue/2026-08-24-attach-osc8-hyperlink-metadata-loss.md))
+- [ ] a: デスクトップで Claude Code 応答内の markdown リンクをクリック → 新規タブで開く (確認ダイアログなし)
+- [ ] b: 素の URL テキストもクリックで開く
+- [ ] c: iPad: リンク tap → 開き、ソフトウェアキーボードが閉じる
+- [ ] d: iPad: nvim 等 (mouse 有効 TUI) で focus 済み tap → カーソルがタップ位置へジャンプしない
+- [ ] e: iPad: focus 済み tap でキーボードが閉じる / パネル open 中の tap は close のみ
+- [ ] f: popup ブロック環境でリンクを開くと URL + コピーボタンのパネルが出る (Esc / × で閉じる)
