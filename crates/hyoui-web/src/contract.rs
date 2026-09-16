@@ -12,6 +12,19 @@
 
 use serde::{Deserialize, Serialize};
 
+/// web 境界の契約の世代番号 (DR-0035 決定 3)。
+///
+/// **上げるのは kind / field の削除と意味変更をした時だけ。** field や kind の
+/// 追加では上げない (= 追加だけの変更で古い JS が新機能を使えないのは reload で
+/// 解消する状態であって「話せない」ではない)。
+///
+/// 伝達経路は WS の `hello` frame と `GET /version` の 2 つだけで、応答ヘッダ /
+/// query / cookie / assets のファイル名には出さない。
+///
+/// JS 側の写しは `assets/contract.js`。一致は
+/// `tests::rust_and_js_protocol_version_agree` (lib.rs) が固定する (決定 7)。
+pub const WEB_PROTOCOL_VERSION: u32 = 1;
+
 // -----------------------------------------------------------------------------
 // エラー (DR-0035 決定 2)
 // -----------------------------------------------------------------------------
@@ -69,6 +82,9 @@ pub mod code {
     pub const INTERNAL_ERROR: &str = "internal-error";
     /// 受け取った WS text frame の `kind` が未知、または JSON が不正。
     pub const UNKNOWN_KIND: &str = "unknown-kind";
+    /// 契約に載っているが、この gateway では有効になっていない操作
+    /// (= 認証が無効な間の `auth.extend`、DR-0035 決定 1)。
+    pub const UNSUPPORTED: &str = "unsupported";
 }
 
 /// HTTP エラー body の外枠 — `{"error": {"code": ..., "message": ...}}`。
@@ -87,6 +103,29 @@ impl From<ErrorInfo> for ErrorEnvelope {
 // -----------------------------------------------------------------------------
 // HTTP body (DR-0035 決定 1 の routes 表)
 // -----------------------------------------------------------------------------
+
+/// `GET /version` の応答 (DR-0034 決定 7 の body に `protocol` を 1 field 足した形)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionResponse {
+    /// crate version。
+    pub version: String,
+    /// build script が埋めた識別子 (無ければ `null`)。
+    pub build_id: Option<String>,
+    /// web 境界の契約の世代 ([`WEB_PROTOCOL_VERSION`])。
+    pub protocol: u32,
+}
+
+impl VersionResponse {
+    /// この process の版と契約世代を返す。
+    pub fn current() -> Self {
+        let info = hyoui::version::VersionInfo::current();
+        Self {
+            version: info.version,
+            build_id: info.build_id,
+            protocol: WEB_PROTOCOL_VERSION,
+        }
+    }
+}
 
 /// `POST /api/sessions/{id}/input` の request body。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +178,21 @@ pub enum ClientFrame {
         #[serde(rename = "requestId")]
         request_id: u64,
     },
+    /// 認証の有効期限を延ばす (DR-0036 決定 5 で使う)。
+    ///
+    /// 契約の正本を 1 箇所にするため、使うのが DR-0036 でも kind は本 DR の表に
+    /// 先に載せる (= 認証を足す時に「どの kind があるか」を別 DR に探しに
+    /// 行かせない)。**認証が無効な間は `error` (`code: "unsupported"`) を返す**
+    /// (DR-0035 決定 1)。
+    #[serde(rename = "auth.extend")]
+    AuthExtend {
+        /// 応答と相関させる番号。
+        #[serde(rename = "requestId")]
+        request_id: u64,
+        /// 延長に使う token。
+        #[serde(rename = "accessToken")]
+        access_token: String,
+    },
 }
 
 // -----------------------------------------------------------------------------
@@ -177,7 +231,29 @@ impl From<hyoui::protocol::Mode> for AttachMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum ServerFrame {
-    /// 実効 mode / leader 状態。attach 直後と、`leader.notify` /
+    /// WS 確立直後、`attach.info` より前に 1 回送る (DR-0035 決定 3)。
+    ///
+    /// `caps` は **その session の daemon と intersect した cap 集合** (決定 4)。
+    /// daemon が handshake 応答で返す値そのままで、新しい cap も message も
+    /// 足していない。
+    ///
+    /// `build_id` は表示のためだけに載せ、**世代不一致の判定には使わない**
+    /// (決定 3 — unstable の再ビルドで値が動くたびに誘導を出すと、契約が同じでも
+    /// 「リロードしろ」が出続けて警告が形骸化する)。
+    #[serde(rename = "hello")]
+    Hello {
+        /// 契約の世代 ([`WEB_PROTOCOL_VERSION`])。
+        protocol: u32,
+        /// gateway の crate version。
+        version: String,
+        /// gateway の build 識別子 (無ければ `null`)。
+        build_id: Option<String>,
+        /// daemon と intersect 済みの cap 名一覧。
+        caps: Vec<String>,
+        /// 認証の期限 (ISO 8601)。認証が無効な間は `null` (DR-0036 決定 5 で使う)。
+        auth_expires_at: Option<String>,
+    },
+    /// 実効 mode / leader 状態。`hello` の直後と、`leader.notify` /
     /// `mode.change` 受信時に送る。
     #[serde(rename = "attach.info")]
     AttachInfo {
@@ -276,6 +352,46 @@ mod tests {
     }
 
     #[test]
+    fn client_frame_auth_extend_golden() {
+        let frame: ClientFrame = serde_json::from_value(
+            json!({"kind": "auth.extend", "requestId": 3, "accessToken": "tok"}),
+        )
+        .expect("decode auth.extend");
+        assert_eq!(
+            frame,
+            ClientFrame::AuthExtend {
+                request_id: 3,
+                access_token: "tok".to_string()
+            }
+        );
+        golden(
+            &frame,
+            json!({"kind": "auth.extend", "requestId": 3, "accessToken": "tok"}),
+        );
+    }
+
+    #[test]
+    fn server_frame_hello_golden() {
+        golden(
+            &ServerFrame::Hello {
+                protocol: WEB_PROTOCOL_VERSION,
+                version: "0.9.48".to_string(),
+                build_id: Some("abc123".to_string()),
+                caps: vec!["data".to_string(), "lock".to_string()],
+                auth_expires_at: None,
+            },
+            json!({
+                "kind": "hello",
+                "protocol": 1,
+                "version": "0.9.48",
+                "build_id": "abc123",
+                "caps": ["data", "lock"],
+                "auth_expires_at": null,
+            }),
+        );
+    }
+
+    #[test]
     fn server_frame_attach_info_golden() {
         golden(
             &ServerFrame::AttachInfo {
@@ -366,6 +482,14 @@ mod tests {
 
     #[test]
     fn http_bodies_golden() {
+        golden(
+            &VersionResponse {
+                version: "0.9.48".to_string(),
+                build_id: None,
+                protocol: WEB_PROTOCOL_VERSION,
+            },
+            json!({"version": "0.9.48", "build_id": null, "protocol": 1}),
+        );
         golden(
             &ErrorEnvelope::from(ErrorInfo::new(
                 code::SESSION_NOT_FOUND,

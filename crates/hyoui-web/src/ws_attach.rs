@@ -43,7 +43,9 @@ use std::sync::Arc;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use futures_util::{SinkExt, StreamExt};
 
-use crate::contract::{AttachMode, ClientFrame, ErrorInfo, ServerFrame, code};
+use crate::contract::{
+    AttachMode, ClientFrame, ErrorInfo, ServerFrame, WEB_PROTOCOL_VERSION, code,
+};
 
 /// bridge thread への入力コマンド。
 enum BridgeCmd {
@@ -116,6 +118,21 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf) -> Result<(), Str
                     Ok(ClientFrame::LeaderRequest { request_id }) => {
                         BridgeCmd::LeaderRequest { request_id }
                     }
+                    // 契約表には載っているが、この gateway では認証が有効に
+                    // なっていない (DR-0035 決定 1)。daemon へは持ち込まない。
+                    Ok(ClientFrame::AuthExtend { request_id, .. }) => {
+                        let frame = ServerFrame::Error {
+                            request_id: Some(request_id),
+                            error: ErrorInfo::new(
+                                code::UNSUPPORTED,
+                                "authentication is not enabled on this gateway",
+                            ),
+                        };
+                        if !send_or_stop(&frame, &reject_tx) {
+                            break;
+                        }
+                        continue;
+                    }
                     Err(e) => {
                         // 黙殺すると「新しい browser + 古い gateway」が検出不能に
                         // なる (DR-0035 決定 2)。requestId は JSON が壊れている
@@ -127,15 +144,8 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf) -> Result<(), Str
                                 format!("unrecognized WS text frame: {e}"),
                             ),
                         };
-                        match encode_server_frame(&frame) {
-                            Ok(text) => {
-                                if reject_tx.send(BridgeOutput::Control(text)).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(encode_err) => {
-                                eprintln!("hyoui-web: encode error frame: {encode_err}");
-                            }
+                        if !send_or_stop(&frame, &reject_tx) {
+                            break;
                         }
                         continue;
                     }
@@ -184,6 +194,23 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf) -> Result<(), Str
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e),
         Err(e) => Err(format!("bridge join: {e}")),
+    }
+}
+
+/// reader task から error frame を 1 つ返す。送れなくなったら `false`。
+///
+/// encode 失敗は契約型の不整合 (= bug) で、この経路では bridge を畳む手段が
+/// 無いので log に出して読み続ける (= browser の形式違反 1 件で接続を切らない)。
+fn send_or_stop(
+    frame: &ServerFrame,
+    tx: &tokio::sync::mpsc::UnboundedSender<BridgeOutput>,
+) -> bool {
+    match encode_server_frame(frame) {
+        Ok(text) => tx.send(BridgeOutput::Control(text)).is_ok(),
+        Err(encode_err) => {
+            eprintln!("hyoui-web: encode error frame: {encode_err}");
+            true
+        }
     }
 }
 
@@ -240,6 +267,20 @@ fn bridge_loop(
     };
     let mut conn = ClientConnection::connect(sock_path, opts)
         .map_err(|e| format!("connect/handshake: {e}"))?;
+    // 世代の検出点 (DR-0035 決定 3)。`attach.info` より前に 1 回だけ送る。
+    // `caps` は daemon が handshake 応答で返した intersect 済みの集合で、
+    // browser はこれを見て操作の可否を表示に落とす (決定 4)。
+    send_server_frame(
+        &ServerFrame::Hello {
+            protocol: WEB_PROTOCOL_VERSION,
+            version: hyoui::VERSION.to_string(),
+            build_id: hyoui::BUILD_ID.map(str::to_string),
+            caps: conn.response.caps.clone(),
+            // 認証は DR-0036 で載る。無効な間は null (決定 1)。
+            auth_expires_at: None,
+        },
+        &output_tx,
+    )?;
     send_attach_info(&conn.response, &output_tx)?;
     // 非 leader の resize は daemon へ送れないが、browser の現在 grid 提案として保持する。
     // takeover 成功後に同じ connection から再送し、新 leader の viewport に PTY を合わせる。

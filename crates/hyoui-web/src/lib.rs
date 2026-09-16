@@ -118,8 +118,8 @@ async fn get_healthz() -> &'static str {
     "ok"
 }
 
-async fn get_version() -> axum::Json<hyoui::version::VersionInfo> {
-    axum::Json(hyoui::version::VersionInfo::current())
+async fn get_version() -> axum::Json<contract::VersionResponse> {
+    axum::Json(contract::VersionResponse::current())
 }
 
 // -----------------------------------------------------------------------------
@@ -849,6 +849,69 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["version"], serde_json::json!(hyoui::VERSION));
         assert_eq!(json["build_id"], serde_json::json!(hyoui::BUILD_ID));
+        // DR-0035 決定 3: index ページと `hyoui web daemon status` の検出点。
+        assert_eq!(
+            json["protocol"],
+            serde_json::json!(contract::WEB_PROTOCOL_VERSION)
+        );
+    }
+
+    /// DR-0035 決定 7: Rust と JS の世代番号が一致する。
+    ///
+    /// bundler を持たない (DR-0027 §4) ので型を共有できず、写しが 2 つになる。
+    /// 片方だけ上げる変更を test で止める。
+    #[test]
+    fn rust_and_js_protocol_version_agree() {
+        let js = EMBEDDED_ASSETS
+            .get_file("contract.js")
+            .expect("assets/contract.js が埋め込まれていること")
+            .contents_utf8()
+            .expect("contract.js は UTF-8");
+        let marker = "const WEB_PROTOCOL_VERSION = ";
+        let start = js
+            .find(marker)
+            .unwrap_or_else(|| panic!("contract.js に {marker:?} の宣言が無い"))
+            + marker.len();
+        let rest = &js[start..];
+        let end = rest
+            .find(';')
+            .expect("WEB_PROTOCOL_VERSION の宣言が `;` で終わっていない");
+        let js_version: u32 = rest[..end]
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("JS 側の世代番号が整数でない ({e}): {:?}", &rest[..end]));
+        assert_eq!(
+            js_version,
+            contract::WEB_PROTOCOL_VERSION,
+            "Rust ({}) と JS ({js_version}) の WEB_PROTOCOL_VERSION がずれている",
+            contract::WEB_PROTOCOL_VERSION
+        );
+    }
+
+    /// DR-0035 決定 3: version を名乗る経路は hello と `/version` の 2 つだけ。
+    ///
+    /// 応答ヘッダを足すと cross-origin で読むために CORS preflight が要り、
+    /// endpoint 構成が増えるたびに preflight の設計が付いてくる (裁定 Q1)。
+    #[tokio::test]
+    async fn no_response_header_announces_the_protocol() {
+        let app = router(hyoui::config::Config::default(), None);
+        for uri in ["/version", "/api/sessions", "/healthz"] {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let offending: Vec<String> = resp
+                .headers()
+                .keys()
+                .map(|k| k.as_str().to_ascii_lowercase())
+                .filter(|k| k.contains("protocol") || k.contains("hyoui"))
+                .collect();
+            assert!(
+                offending.is_empty(),
+                "{uri} の応答ヘッダが version/protocol を名乗っている: {offending:?}"
+            );
+        }
     }
 
     #[tokio::test]
