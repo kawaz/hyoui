@@ -1,6 +1,6 @@
 # DR-0035: web 境界の契約を型で正本化し、世代 version で stale なページを検出する
 
-- Status: ⬜ 未実装 (2026-09-16)
+- Status: Active — W1-1〜W1-6 実装済 (2026-09-16)。gate 1(a) と gate 2(a)(b)(d) は実機で通過。gate 1(b) (HA fallback) は canddy の 3 endpoint 待ち、W1-5 の「cap 不足 daemon への 501」は実機未検証 (下記 Implementation phases)
 - Date: 2026-09-16
 - Related: DR-0027 (web gateway 同居、route / WS frame / query の現行正本), DR-0034 (`/version` と `build_id`、stable / unstable の HA fallback), DR-0008 (daemon 境界は cap flag 一本で固定 version を持たない), DR-0033 (`leader.request` = cap 差を browser に返す唯一の既存実例), DR-0013 (screen state 正本化。`layer=both` 復元が契約に乗る), DR-0022 (`POST /input` の auto-lock), DR-0036 (認証。本 DR の契約の上に載る)
 - Origin: `docs/research/2026-09-15-web-protocol-and-passkey-grand-design.md` (§2 / §3)、事実は `docs/findings/2026-09-15-web-contract-and-ccmsg-passkey-inventory.md` Part 1-A〜1-F
@@ -14,7 +14,7 @@ browser ↔ gateway の契約には version 識別子が無い。assets にも A
 
 エラーの形も 2 系統ある。HTTP `/api/*` は plain text body で code の語彙が無く、WS は `ok:false` + `error` 文字列 1 本。未知の `kind` は `eprintln!` して黙って continue するので、browser には何も返らない。
 
-assets は root 直下前提で書かれている。`/assets/...` の絶対参照が計 15 箇所、`fetch('/api/sessions')`、WS URL は `${proto}//${location.host}/api/sessions/<id>/attach`、session id の抽出は `location.pathname.split('/')[1]`。
+assets は root 直下前提で書かれている。HTML の `/assets/...` 絶対参照が計 18 箇所 (index 6 / session 12)、`fetch('/api/sessions')`、WS URL は `${proto}//${location.host}/api/sessions/<id>/attach`、session id の抽出は `location.pathname.split('/')[1]`。HTML 以外にも `style.css` の `@font-face url()` 2 箇所と `manifest.webmanifest` の `start_url` / `scope` / `icon` が絶対である。
 
 ### 目的
 
@@ -55,8 +55,8 @@ daemon 境界は逆で、client と daemon の版が独立に動く (古い daem
 | assets が gateway binary と同一ビルドで配られる (DR-0027 §4) | 世代の比較対象が「配った gateway」と「応答する gateway」の 2 つに分かれ、世代番号 1 つでは表せなくなる。`--web-assets-dir` でローカル dir を指す dev ではこれが起きるので、その時は帯が出続けるのを受け入れる (dev の便宜であって運用形ではない) |
 | reload で新しい assets が取れる (cache ヘッダを持たない、findings Part 1-D) | 帯を出しても reload が効かず、誘導が嘘になる。cache ヘッダを足す判断をする時は、この前提を壊さないことが要件になる |
 | 前段が `Sec-WebSocket-Protocol` と WS upgrade を透過する (DR-0027) | hello frame が届かず検出経路がゼロになる |
-| 前段が path を strip する場合も、strip しない場合も、相対リンクだけでページが成立する (決定 6) | prefix 付き endpoint でページが壊れ、DR-0036 の endpoint 判定に到達しない |
-| prefix 付き endpoint をスラッシュ無しで開いた時 (`https://example.jp/hyoui`) に、前段が `/hyoui/` へ redirect する | ブラウザの相対解決の基点が 1 段上になり、`assets/...` が `/assets/...` に化けてページが壊れる。**スラッシュ無しの URL を正規形へ寄せるのは前段 (canddy) の責務**で、gateway は自分のマウント path を知らないので redirect を書けない (決定 6 の正規形) |
+| **前段は prefix を strip して gateway に渡す (strip しない構成は非対応)** | gateway の route は prefix 無しのまま (決定 6) なので、`/hyoui/...` がそのまま届くと全ての route が 404 になる。実測で確認済 (2026-09-16、`/hyoui/` `/hyoui/assets/...` `/hyoui/version` いずれも 404)。**これは前提であって、満たさない構成を成立させる余地は無い** — 成立させるには gateway がマウント path を知る必要があり、決定 6 と DR-0036 の設計が崩れる |
+| prefix 付き endpoint をスラッシュ無しで開いた時 (`https://example.jp/hyoui`) に、前段が `/hyoui/` へ redirect する | ブラウザの相対解決の基点が 1 段上になり、`assets/...` が `/assets/...` に化けてページが壊れる。**実測で確定** (2026-09-16、gate 2(d)): `style.css` / `contract.js` / `index.js` / `icon.svg` が全て 404 になり `window.hyouiContract` が undefined でページが成立しない。**スラッシュ無しの URL を正規形へ寄せるのは前段 (canddy) の責務**で、gateway は自分のマウント path を知らないので redirect を書けない (決定 6 の正規形)。依頼内容は `/<prefix>` → `/<prefix>/` の redirect 1 本 |
 
 ## 介入判断 self-check (CLAUDE.md / DR-0014)
 
@@ -150,7 +150,11 @@ Rust 側に `pub const WEB_PROTOCOL_VERSION: u32` を `contract.rs` に、JS 側
 | 経路 | 伝え方 | 検出する側 |
 |---|---|---|
 | WS `/api/sessions/{id}/attach` | 確立直後の `hello` frame | session ページ。**再接続のたびに比べる**ので、fallback で裏の unit が変わっても拾える |
-| `GET /version` | body の `protocol` | index ページ (WS を持たないので、`/api/sessions` の polling と同じ周期で `/version` も引く)。人と `hyoui web daemon status` |
+| `GET /version` | body の `protocol` | index ページ (WS を持たないので、`/api/sessions` の polling と同じ周期で `/version` も引く)。人が直接引く場合もここ |
+
+**`hyoui web daemon status` は `protocol` を表示しない。** status が版を出す経路は DR-0034 決定 7 の `VersionProbe` → `VersionPair` → `UnitStatus` で、web 境界の世代はそこに乗る概念ではない (= `VersionInfo` は `hyoui --version` と共有の型で、web の契約世代を持たせると意味が混ざる)。人が見たい時は `/version` を直接引けば足りる。
+
+**WS 側で検出できないのは「hello をそもそも送らない gateway に再接続した」場合だけである。** 「hello が来ない」の判定には timeout 機構が要り、検出点を増やすことになるので持たない。この場合でも index ページは `/version` の `protocol` が数値でなければ世代不明として帯を出すので、経路はゼロにならない。
 
 **応答ヘッダ (`X-Hyoui-Web-Protocol` 等) は持たない** (裁定 Q1)。カスタムヘッダは cross-origin で読むために CORS の preflight を要し、endpoint 構成が増えるたびに preflight の設計が付いてくる。hello frame と `/version` で検出点は足りている。
 
@@ -178,7 +182,7 @@ Rust 側に `pub const WEB_PROTOCOL_VERSION: u32` を `contract.rs` に、JS 側
 
 ### 6. assets / API / WS の URL を endpoint 基点の相対にする
 
-ブラウザは `location` から **自分の endpoint (origin + マウント path) を 1 回決め**、以降の URL をそれ基点で組む。gateway はマウント先を知らず、route は `/{prefix}` 無しのままで、相対リンクだけで成立させる (前段が strip する構成でも、strip しない構成でも動く)。
+ブラウザは `location` から **自分の endpoint (origin + マウント path) を 1 回決め**、以降の URL をそれ基点で組む。gateway はマウント先を知らず、route は `/{prefix}` 無しのままで、相対リンクだけで成立させる。**前段が prefix を strip する構成が前提**である (前提条件表) — route が prefix 無しなので、strip しない構成では相対リンクの成否に関わらず全 route が 404 になる。
 
 endpoint の決め方:
 
@@ -199,8 +203,12 @@ endpoint の決め方:
 
 | 箇所 | 現行 | 直し方 |
 |---|---|---|
-| `index.html` / `session.html` の `<link>` `<script>` (`/assets/...` 計 15 箇所) | 絶対 | `<base href>` は使わず相対に。`index.html` は `assets/...`、`session.html` は `/sessions/<id>` から配られるので `../assets/...` |
+| `index.html` / `session.html` の `<link>` `<script>` (`/assets/...` 計 18 箇所 = index 6 / session 12) | 絶対 | `<base href>` は使わず相対に。`index.html` は `assets/...`、`session.html` は `/sessions/<id>` から配られるので `../assets/...` |
+| `session.html` の `<a href="/">` (sessions 一覧へ戻るリンク) | 絶対 | `../` |
+| `style.css` の `@font-face url('/assets/vendor/fonts/...')` 2 箇所 | 絶対 | `vendor/fonts/...` (= stylesheet 自身が `/assets/` 配下にあるので、ブラウザはそこ基準で解決する)。絶対のままだと prefix 付きで font が 404 になり、行内の桁ずれ対策 (style.css 冒頭の unicode-range) ごと効かなくなる |
+| `manifest.webmanifest` の `start_url` / `scope` (`/`) と `icons[].src` (`/assets/icon.svg`) | 絶対 | `../` / `icon.svg` (= manifest 自身が `/assets/` 配下なので同じ理屈)。絶対のままだと prefix 付きで PWA の scope が gateway 外を指す |
 | `index.js:92` の `fetch('/api/sessions')`、`index.js:117` の `<a href="/sessions/...">` | 絶対 | `api/sessions`、`sessions/<id>` |
+| index ページの `/version` polling (決定 3) | 絶対 | `version` |
 | `session.js:934,1026,1051,1079,1107` の `fetch('/api/sessions/...')` | 絶対 | `../api/sessions/...` |
 | `session.js:1769-1770` の WS URL (`${proto}//${location.host}/...`) | host 直下 | `new URL('../api/sessions/<id>/attach', location.href)` で prefix を保ち、scheme だけ `ws(s):` に置換 |
 | `session.js:10` の session id 抽出 (`location.pathname.split('/')[1]`) | root 前提 | 末尾 2 要素 (`sessions/<id>`) から取る |
@@ -218,7 +226,8 @@ endpoint の決め方:
 | 各 kind の JSON 表現が動いていない | golden test (決定 1)。表を写す元でもある |
 | `/version` が `protocol` を含む | 既存の `/version` test に 1 assert |
 | 応答ヘッダに version を名乗る経路が無い | `/api/*` と `/version` の応答ヘッダに `protocol` を含む名前のヘッダが無いことを見る test (決定 3 の「持たない」を固定) |
-| assets に絶対パス参照が無い | `assets/*.html` / `*.js` に `"/assets/` `'/api/` `"/sessions/` のリテラルが無いことを見る test (決定 6) |
+| assets に絶対パス参照が無い | `assets/` の `*.html` / `*.js` / `*.css` / `*.webmanifest` に `"/assets/` `'/api/` `"/sessions/` `'/version'` 等のリテラルが無いことを見る test (決定 6)。`vendor/` は upstream の配布物をそのまま埋め込んでいる (DR-0027 §4) ので対象外 — hyoui の route を指す参照を持たない |
+| cap 不足が 501 と daemon の code で返る | intersect に無い cap を要求した時、status が `501` で body の `code` が `unsupported-capability` になることを見る test (決定 4)。**cap 不足の daemon は手元に無いので実機では確かめられない** (W1-5 の gate) ため、判定関数を直接叩いて固定する |
 
 ## Implementation phases
 
@@ -226,12 +235,12 @@ endpoint の決め方:
 |---|---|---|
 | W1-1 | `contract.rs` 新設。既存の `json!` 手書きを型に寄せ、golden test で JSON 例を固定 | golden の JSON が現行の実際の frame と byte 一致する (= この Phase では契約を変えていない) |
 | W1-2 | エラー形の JSON 統一、未知 `kind` への `error` 応答 (決定 2) | `hyoui screen` / `input` / session ページの既存操作が全部通る。エラー時の body が全経路で `{error:{code,message}}` |
-| W1-3 | `WEB_PROTOCOL_VERSION = 1`、`hello` frame、`/version` の `protocol`、決定 7 の test (決定 1 / 3) | 世代番号の Rust / JS 一致 test が通る。`hyoui web daemon status` から `/version` の `protocol` が読める |
-| W1-4 | 帯の UI と制御 frame の停止 (決定 5) | **実機確認 (gate 1)**: stable / unstable を別の `WEB_PROTOCOL_VERSION` でビルドし、(a) ページを開いたまま `daemon restart` で入れ替える、(b) HA endpoint で fallback を起こす、の 2 経路で帯が出る。**帯が出ている間に古いページから入力を送って画面が崩れないこと**を `hyoui screen dump` で確認する (崩れるなら決定 5 を binary も止める形に直す)。**(a) だけで先に通してよい** — (b) は canddy の 3 endpoint (DR-0034 P6) が立つまで確かめられないが、決定 5 の判断に必要な事実は (a) で揃う。(b) は endpoint が立った時点で確認する |
-| W1-5 | cap 透過 (決定 4) | `leader-request-v1` を持たない daemon (旧版) に対して、WS は `caps` から落ち、HTTP は 501 を返す。**3 category で確認** (TUI = vim / line-oriented = cat / REPL = bash の session それぞれに対して) |
-| W1-6 | 相対パス化 (決定 6) | **実機確認 (gate 2)**: (a) root 直下 (`http://127.0.0.1:43690/`)、(b) 前段が path を strip する prefix 付き (`https://<host>/hyoui/` → strip)、(c) strip しない prefix 付き、の 3 構成で index / session の両ページが動き、WS が繋がる。加えて **(d) prefix 付きをスラッシュ無し (`https://<host>/hyoui`) で開いた場合**の挙動を観測し、前段の redirect が無いと壊れることを確認して前提条件表の依頼内容 (canddy への redirect 追加) を確定する。ブラウザが計算する endpoint が 3 構成すべてで正規形 (決定 6) になることも見る |
+| W1-3 | `WEB_PROTOCOL_VERSION = 1`、`hello` frame、`/version` の `protocol`、決定 7 の test (決定 1 / 3) | ✅ 世代番号の Rust / JS 一致 test が通る。`GET /version` が `{"version","build_id","protocol"}` を返し、version を名乗る応答ヘッダが無いことを test で固定。`hyoui web daemon status` には出さない (決定 3) |
+| W1-4 | 帯の UI と制御 frame の停止 (決定 5) | **実機確認 (gate 1)**: 世代の違うページと gateway を突き合わせ、(a) ページを開いたまま gateway を入れ替える、(b) HA endpoint で fallback を起こす、の 2 経路で帯が出る。**帯が出ている間に古いページから入力を送って画面が崩れないこと**を `hyoui screen dump` で確認する (崩れるなら決定 5 を binary も止める形に直す)。<br>✅ **(a) 通過** (2026-09-16、隔離 `XDG_STATE_HOME` + port 43701): 世代の違う assets を配る gateway に対して帯が出て、制御 frame は停止し (`resize failed: この画面は gateway と契約世代が違います`)、その状態でページから打った入力は PTY に届き `screen dump` も崩れなかった。**よって決定 5 の「binary は通す」を確定**とする。gateway を同世代の assets に入れ替えて再読み込みすると帯が消え、reload で収束することも確認した。index ページも `/version` 経由で同じ帯が出る。<br>⬜ **(b) 未検証**: canddy の 3 endpoint (DR-0034 P6) が立つまで確かめられない。決定 5 の判断に必要な事実は (a) で揃っているので、endpoint が立った時点で確認する |
+| W1-5 | cap 透過 (決定 4) | ⬜ **実機は未検証。cap 不足の daemon が手元に無い** (2026-09-16): 旧版として当てにした brew 版も `leader-request-v1` を advertise していた (hello の `caps` を直接読んで確認)。作るには core の `MVP_CAPS` を削ったビルドが要るが、**そのためのパッチビルドはしない** (= 検査のために製品の cap 集合を偽る経路を残さない)。cap 不足時の 501 と `unsupported-capability` は判定関数を直接叩く test で固定した (決定 7)。<br>✅ 3 category (TUI = vim / line-oriented = cat / REPL = bash) で回帰なしは確認済 — cap が揃った daemon に対し screen 200 / resume 204 / input 200、`hello.caps` に intersect 済みの 11 cap が載る |
+| W1-6 | 相対パス化 (決定 6) | **実機確認 (gate 2)**: (a) root 直下、(b) 前段が path を strip する prefix 付き (`https://<host>/hyoui/` → strip) の 2 構成で index / session の両ページが動き、WS が繋がる。ブラウザが計算する endpoint が両構成で正規形 (決定 6) になることも見る。加えて **(d) prefix 付きをスラッシュ無し (`https://<host>/hyoui`) で開いた場合**の挙動を観測し、前段の redirect が無いと壊れることを確認して前提条件表の依頼内容 (canddy への redirect 追加) を確定する。<br>✅ **通過** (2026-09-16、前段は prefix 外を 404 にした検証用 reverse proxy): (a) (b) とも両ページが動き、WS が繋がり (mode rw)、font が読め、prefix 構成のページから打った入力も PTY に届いた。endpoint は両構成で正規形 (`http://127.0.0.1:43701/` と `http://127.0.0.1:43702/hyoui/`)。(d) は endpoint が 1 段上の `/` に化けて assets が全て 404 になりページが成立せず、**前段の redirect が必要**と確定した (前提条件表) |
 
-gate 1 と gate 2 は DR-0036 の実装より前に通す。gate 2 が通らないと DR-0036 の endpoint 判定が成立しない。
+gate 1 と gate 2 は DR-0036 の実装より前に通す。gate 2 が通らないと DR-0036 の endpoint 判定が成立しない。gate 2 は通ったので、DR-0036 の「gateway は endpoint を知らない」は前提として成立する (= endpoint を config に持つ形に倒す必要はない)。
 
 ## Alternatives Considered
 
@@ -245,6 +254,7 @@ gate 1 と gate 2 は DR-0036 の実装より前に通す。gate 2 が通らな�
 | gateway が世代不一致の接続を拒否する (ccmsg 型) | hello の前に `bad_request` で切る | 帯を出す前に切れて「なぜ切れたか」が画面に残らない。判断は browser が持てば足りる |
 | 自動リロード | 不一致を検出したら `location.reload()` | 入力中の内容を予告なく捨てる。kawaz 指示で明示的に不採用 |
 | `<base href>` で prefix を吸収する | ページに `<base>` を 1 つ置く | 効く範囲がページ内の全相対 URL に及び、将来足す URL の解決も暗黙に変わる。endpoint を JS が 1 回計算して組む方が、どこで解決されたかが読める |
+| 前段が strip しない構成も成立させる | gateway が自分のマウント path を知り、route を `/{prefix}` 付きで張る | gateway が endpoint を知る形に戻り、決定 6 と DR-0036 の「gateway は自分の endpoint を知らない」が崩れる。strip は前段の設定 1 行で足りるので、その 1 行を前提条件に置く方が安い (前提条件表) |
 
 ## Consequences
 
@@ -253,8 +263,9 @@ gate 1 と gate 2 は DR-0036 の実装より前に通す。gate 2 が通らな�
 - **写しが 2 つになる。** Rust の定数と JS の定数。一致は test で固定する (決定 7)。これは「bundler を持たない」(DR-0027 §4) の帰結で、型を共有できない以上避けられない
 - **`--web-assets-dir` の dev では帯が出うる。** ローカル dir の assets が binary の世代と食い違う場合で、前提条件表のとおり受け入れる
 - **cap 透過で 501 が増える。** 旧版 daemon に繋いだ session では操作が個別に落ちるようになる (現在は 500 か手作りのエラー文字列)。DR-0034 決定 8 が要求した形であり、browser 側で灰色表示に落とせる
-- **endpoint の正規形が 3 者 (JS / CLI / gateway) の共通語彙になる。** 末尾 `/` を必須にしたので、スラッシュ無しで開かれた prefix 付き endpoint を正規形へ寄せる redirect が前段に要る。これは canddy への依頼が 1 本増えることを意味する (DR-0034 P6 の issue に相乗りできる)
-- **相対パス化が DR-0036 の前提になる。** gate 2 が通らなければ、DR-0036 の「gateway は endpoint を知らない」は成立せず、endpoint を config に持つ形に倒す判断が必要になる
+- **endpoint の正規形が 3 者 (JS / CLI / gateway) の共通語彙になる。** 末尾 `/` を必須にしたので、スラッシュ無しで開かれた prefix 付き endpoint を正規形へ寄せる redirect が前段に要る。gate 2(d) の実測でこれは**確定**し、canddy への依頼が 1 本増えた (DR-0034 P6 の issue に相乗りできる)
+- **相対パス化が DR-0036 の前提になる。** gate 2 が通ったので、DR-0036 の「gateway は endpoint を知らない」は前提として成立する (= endpoint を config に持つ形に倒す判断は要らない)
+- **前段の構成に 2 つの要件が乗る。** prefix の strip と、スラッシュ無し URL の redirect。どちらも gateway 側では代われない (= マウント path を知らないため) ので、endpoint を増やすたびに前段側で満たす必要がある
 - **index ページの polling が 1 本増える** (`/api/sessions` に加えて `/version`)。同じ周期に乗せるので往復は増えるが、頻度は変わらない
 
 ## 関連
