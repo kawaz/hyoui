@@ -28,9 +28,14 @@ serde_json = { workspace = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 # 越境 wake pipe と poll 系。core crate と同一 workspace dep を再利用。
 nix = { workspace = true }
+# 認証 state の digest / cookie 名 / 登録 jwt の HMAC (DR-0036 決定 2 / 決定 5)。
+# pure Rust で、cross target の check を壊さない。
+sha2 = "0.10"
+hmac = "0.12"
+# auth.json / pending.json の tmp + rename (DR-0036 決定 4)。
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 # Router 単体の smoke test 用 (実 daemon を巻き込む e2e は hyoui-cli/tests/web_e2e_api.rs
 # 側で `CARGO_BIN_EXE_hyoui` 経由で subprocess として daemon を起動する)。
 tower = { version = "0.5", default-features = false, features = ["util"] }

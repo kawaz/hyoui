@@ -10,7 +10,159 @@
 //! 命名は `noun.verb` を維持する: 応答は `<noun>.result`、通知は `<noun>.info`。
 //! 名前空間 prefix は付けない (= この WS は hyoui 専用)。
 
+use std::fmt;
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
+
+/// endpoint の正規形 (DR-0035 決定 6)。
+///
+/// **`scheme://host[:port]/<path>/` — 末尾 `/` 必須、query と fragment を含まない。**
+///
+/// 正規形を型で持つのは、**複数の実装が同一の文字列に到達しなければならない**ため
+/// (DR-0036 決定 3)。ブラウザの JS (`assets/contract.js`)、`hyoui web passkey add`
+/// の CLI、record を引く gateway の 3 者が同じ key を作る必要があり、1 文字違うと
+/// 登録済みの credential が引けなくなって「認証失敗」としてしか見えない。
+///
+/// **比較は正規化した文字列の完全一致で行う。** URL として解釈し直して比較する
+/// 経路は持たない (DR-0036 決定 3)。`Ord` を持つのは record の key に使うため。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Endpoint(String);
+
+/// [`Endpoint`] の正規化に失敗した理由。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndpointError {
+    /// scheme が `http` / `https` でない。
+    UnsupportedScheme,
+    /// host が無い、または空。
+    MissingHost,
+    /// query / fragment が付いている。
+    HasQueryOrFragment,
+    /// URL として解釈できない。
+    Malformed,
+}
+
+impl fmt::Display for EndpointError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            EndpointError::UnsupportedScheme => "scheme must be http or https",
+            EndpointError::MissingHost => "endpoint must have a host",
+            EndpointError::HasQueryOrFragment => "endpoint must not carry a query or fragment",
+            EndpointError::Malformed => "endpoint is not a valid absolute URL",
+        };
+        f.write_str(text)
+    }
+}
+
+impl std::error::Error for EndpointError {}
+
+impl Endpoint {
+    /// 受け取った値を正規形にする。正規化できない値は拒否する。
+    ///
+    /// 足すのは末尾の `/` だけで、host の小文字化のような正規化は**しない** — 既定 port
+    /// の省略や大文字小文字の畳み込みを入れると、ブラウザの `location` 由来の値と
+    /// CLI に人が打った値が別の規則で揃うことになり、「3 者が同じ文字列に到達する」
+    /// 保証を型の外に出してしまう。ブラウザが返すのは既に正規形なので、CLI 側が
+    /// 末尾 `/` を補うだけで足りる。
+    pub fn parse(raw: &str) -> Result<Self, EndpointError> {
+        let raw = raw.trim();
+        if raw.contains('?') || raw.contains('#') {
+            return Err(EndpointError::HasQueryOrFragment);
+        }
+        let (scheme, rest) = raw.split_once("://").ok_or(EndpointError::Malformed)?;
+        if scheme != "http" && scheme != "https" {
+            return Err(EndpointError::UnsupportedScheme);
+        }
+        let (authority, path) = match rest.split_once('/') {
+            Some((authority, path)) => (authority, path),
+            None => (rest, ""),
+        };
+        if authority.is_empty() {
+            return Err(EndpointError::MissingHost);
+        }
+        // path の各 component が空 (= `//`) や `.` / `..` を含む値は、ブラウザの
+        // 相対解決を通った形ではないので正規形ではない。
+        if path
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .any(|c| c == "." || c == "..")
+        {
+            return Err(EndpointError::Malformed);
+        }
+        let path = path.trim_end_matches('/');
+        let canonical = if path.is_empty() {
+            format!("{scheme}://{authority}/")
+        } else {
+            format!("{scheme}://{authority}/{path}/")
+        };
+        Ok(Self(canonical))
+    }
+
+    /// 正規形の文字列。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// origin (`scheme://host[:port]`)。`clientDataJSON.origin` の期待値になる。
+    pub fn origin(&self) -> &str {
+        let after_scheme = self.0.find("://").map(|i| i + 3).unwrap_or(0);
+        match self.0[after_scheme..].find('/') {
+            Some(slash) => &self.0[..after_scheme + slash],
+            None => &self.0,
+        }
+    }
+
+    /// RP ID (= hostname、port を含まない)。WebAuthn の RP ID は domain である。
+    pub fn rp_id(&self) -> &str {
+        let origin = self.origin();
+        let host = &origin[origin.find("://").map(|i| i + 3).unwrap_or(0)..];
+        match host.rfind(':') {
+            // IPv6 リテラル (`[::1]`) の `:` は port 区切りではない。
+            Some(colon) if !host[colon..].contains(']') => &host[..colon],
+            _ => host,
+        }
+    }
+
+    /// cookie の `Path` (DR-0036 決定 5)。
+    ///
+    /// 正規形の path から**末尾の `/` を落とした値**。root の endpoint は `/` のまま。
+    pub fn cookie_path(&self) -> &str {
+        let origin_len = self.origin().len();
+        let path = &self.0[origin_len..];
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() { "/" } else { trimmed }
+    }
+}
+
+impl fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for Endpoint {
+    type Err = EndpointError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+impl Serialize for Endpoint {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Endpoint {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        // 受け取った値も正規化して入れる (= 手で書かれた record を黙って別 key に
+        // しない)。正規形でない値は拒否ではなく正規化で揃える方が、file を人が
+        // 直した時の事故が少ない。
+        Endpoint::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
 
 /// web 境界の契約の世代番号 (DR-0035 決定 3)。
 ///
@@ -314,6 +466,74 @@ mod tests {
     fn golden<T: Serialize>(value: &T, expected: serde_json::Value) {
         let actual = serde_json::to_value(value).expect("serialize");
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn endpoint_canonical_form_adds_the_trailing_slash() {
+        // DR-0035 決定 6 の正規形。3 者 (JS / CLI / gateway) が同じ文字列に
+        // 到達しなければ record が引けない (DR-0036 決定 3)。
+        for (raw, expected) in [
+            ("https://hyoui.example.jp", "https://hyoui.example.jp/"),
+            ("https://hyoui.example.jp/", "https://hyoui.example.jp/"),
+            ("https://example.jp/hyoui", "https://example.jp/hyoui/"),
+            ("https://example.jp/hyoui/", "https://example.jp/hyoui/"),
+            ("http://127.0.0.1:43690", "http://127.0.0.1:43690/"),
+            ("  https://example.jp/a/b  ", "https://example.jp/a/b/"),
+        ] {
+            let endpoint = Endpoint::parse(raw).unwrap_or_else(|e| panic!("{raw:?}: {e}"));
+            assert_eq!(endpoint.as_str(), expected, "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn endpoint_rejects_values_that_cannot_be_normalized() {
+        for raw in [
+            "ftp://example.jp/",
+            "https://",
+            "example.jp/",
+            "https://example.jp/?a=1",
+            "https://example.jp/#x",
+            "https://example.jp/../a",
+        ] {
+            assert!(
+                Endpoint::parse(raw).is_err(),
+                "正規化できない値は拒否する: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_derives_origin_rp_id_and_cookie_path() {
+        let root = Endpoint::parse("https://hyoui.example.jp").unwrap();
+        assert_eq!(root.origin(), "https://hyoui.example.jp");
+        assert_eq!(root.rp_id(), "hyoui.example.jp");
+        // root の endpoint の cookie Path は `/` のまま (DR-0036 決定 5)。
+        assert_eq!(root.cookie_path(), "/");
+
+        let prefixed = Endpoint::parse("https://example.jp/hyoui/").unwrap();
+        assert_eq!(prefixed.origin(), "https://example.jp");
+        assert_eq!(prefixed.rp_id(), "example.jp");
+        // 末尾の `/` を落とした値 (DR-0036 決定 5)。
+        assert_eq!(prefixed.cookie_path(), "/hyoui");
+
+        // port は origin に含むが RP ID には含まない (RP ID は domain)。
+        let with_port = Endpoint::parse("http://localhost:43690/").unwrap();
+        assert_eq!(with_port.origin(), "http://localhost:43690");
+        assert_eq!(with_port.rp_id(), "localhost");
+
+        // IPv6 リテラルの `:` を port 区切りと誤らない。
+        let v6 = Endpoint::parse("http://[::1]:43690/").unwrap();
+        assert_eq!(v6.rp_id(), "[::1]");
+    }
+
+    #[test]
+    fn endpoint_round_trips_through_json_as_a_string() {
+        let endpoint = Endpoint::parse("https://example.jp/hyoui/").unwrap();
+        let json = serde_json::to_value(&endpoint).unwrap();
+        assert_eq!(json, json!("https://example.jp/hyoui/"));
+        // record を人が直した時に、末尾 `/` の欠けで別 key に化けない。
+        let parsed: Endpoint = serde_json::from_value(json!("https://example.jp/hyoui")).unwrap();
+        assert_eq!(parsed, endpoint);
     }
 
     #[test]

@@ -36,6 +36,7 @@ use include_dir::{Dir, include_dir};
 
 pub use axum;
 
+pub mod auth;
 pub mod contract;
 mod ws_attach;
 
