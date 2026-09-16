@@ -41,5 +41,66 @@
     return errorText(frame && frame.error, fallback);
   }
 
-  window.hyouiContract = { WEB_PROTOCOL_VERSION, httpError, frameErrorText };
+  // ---- 世代不一致の検出と帯 (DR-0035 決定 3 / 決定 5) ----
+  //
+  // 平常時、assets は gateway binary に埋め込まれて配られるので配る側と受ける側は
+  // 同じビルドである。ずれるのは「ページを開いたまま gateway が入れ替わった」場合と
+  // 「HA endpoint の裏で stable / unstable が入れ替わった」場合の 2 つ。
+  //
+  // 検出したら出すのは「再読み込みしてください」の 1 つだけで、互換経路は持たない。
+  // 自動リロードはしない (kawaz 指示 — 入力中の内容を予告なく捨てる)。
+
+  let mismatch = null;
+
+  // gateway 世代を人向けに書く。protocol を名乗らない gateway は「不明」。
+  function describeGatewayProtocol(value) {
+    return typeof value === 'number' ? String(value) : '不明 (protocol を名乗らない版)';
+  }
+
+  function showMismatchBanner() {
+    if (document.getElementById('protocolBanner')) return;
+    const banner = document.createElement('div');
+    banner.id = 'protocolBanner';
+    banner.className = 'protocol-banner';
+    banner.setAttribute('role', 'alert');
+    const text = document.createElement('span');
+    text.textContent = `この画面は契約世代 ${mismatch.page}、gateway は ${describeGatewayProtocol(mismatch.gateway)} です。再読み込みしてください。`;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = '再読み込み';
+    // query (表示設定) をそのまま残すため location.reload() のみ。
+    button.addEventListener('click', () => location.reload());
+    banner.append(text, button);
+    document.body.insertBefore(banner, document.body.firstChild);
+  }
+
+  // gateway が名乗った世代を受け取る。不一致なら帯を出して true を返す。
+  //
+  // `hello` は再接続のたびに届くので、fallback で裏の unit が変わっても拾える。
+  // index ページは `/version` の `protocol` を同じ周期で渡す。
+  function reportGatewayProtocol(gatewayProtocol) {
+    if (gatewayProtocol === WEB_PROTOCOL_VERSION) return false;
+    if (!mismatch) {
+      mismatch = { page: WEB_PROTOCOL_VERSION, gateway: gatewayProtocol };
+      if (document.body) showMismatchBanner();
+      else window.addEventListener('DOMContentLoaded', showMismatchBanner);
+    }
+    return true;
+  }
+
+  // 世代が合っていないと分かっているか。制御 frame の送信可否に使う。
+  //
+  // 一度検出したら戻さない: 同じページの JS が新しい gateway の契約を話せる
+  // ようになることは無く、収束させる手段は reload だけである。
+  function protocolMismatched() {
+    return mismatch !== null;
+  }
+
+  window.hyouiContract = {
+    WEB_PROTOCOL_VERSION,
+    httpError,
+    frameErrorText,
+    reportGatewayProtocol,
+    protocolMismatched,
+  };
 })();

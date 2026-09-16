@@ -277,6 +277,25 @@ body.embed #term .xterm-screen {
   min-width: 2.2rem;
   line-height: 1.2;
 }
+/* 契約世代の不一致を知らせる帯 (DR-0035 決定 5)。画面端に出し、embed でも
+   消さない (= 帯が出ている画面は制御操作が通らないため、理由が見えている必要がある)。 */
+.protocol-banner {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid #c92a2a;
+  background: rgba(201, 42, 42, 0.16);
+  color: var(--fg);
+  font-size: 0.9rem;
+}
+.protocol-banner button {
+  margin-left: auto;
+  border-color: #c92a2a;
+}
 .stopped-banner {
   display: flex;
   gap: 0.6rem;

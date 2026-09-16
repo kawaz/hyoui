@@ -86,8 +86,22 @@
     }
   }
 
+  // index ページは WS を持たないので、世代の検出点は `/version` の protocol になる
+  // (DR-0035 決定 3)。一覧取得と同じ周期に乗せる (= 往復は増えるが頻度は変わらない)。
+  async function fetchProtocol() {
+    try {
+      const r = await fetch('/version', { cache: 'no-store' });
+      if (!r.ok) return;
+      const info = await r.json();
+      window.hyouiContract.reportGatewayProtocol(info.protocol);
+    } catch (_e) {
+      // best-effort。取れなければ判定しない (= 帯を出さない)。
+    }
+  }
+
   async function fetchSessions() {
     statusEl.textContent = 'fetching…';
+    fetchProtocol();
     try {
       const r = await fetch('/api/sessions', { cache: 'no-store' });
       if (!r.ok) throw await window.hyouiContract.httpError(r);

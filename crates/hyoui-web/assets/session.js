@@ -3,7 +3,7 @@
 // an xterm.js instance. Input form POSTs to /api/sessions/:id/input.
 (async () => {
   // 契約の読み取りは contract.js に寄せる (DR-0035 決定 2)。
-  const { httpError, frameErrorText } = window.hyouiContract;
+  const { httpError, frameErrorText, reportGatewayProtocol, protocolMismatched } = window.hyouiContract;
 
   const REFRESH_MS = 2000;
   const COLS = 80;
@@ -933,7 +933,13 @@
     else resizePending = null;
   });
 
+  // 世代不一致のまま制御操作を送ると誤動作しうるので、帯が出た時点で制御 frame の
+  // 送信を止める (DR-0035 決定 5)。binary frame (キー入力) は通す — PTY bytes の
+  // 1:1 転写で契約の世代に依存しない。既存 WS は切らない (= 入力中の内容を捨てない)。
+  const STALE_PAGE_REASON = 'この画面は gateway と契約世代が違います。再読み込みしてください。';
+
   async function postResize(cols, rows) {
+    if (protocolMismatched()) throw new Error(STALE_PAGE_REASON);
     const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/resize`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -1592,6 +1598,7 @@
   function wsIsOpen() { return ws && ws.readyState === WebSocket.OPEN; }
 
   function sendResizeOverWs(cols, rows) {
+    if (protocolMismatched()) return Promise.reject(new Error(STALE_PAGE_REASON));
     if (!wsIsOpen()) return Promise.reject(new Error('WS is not connected'));
     const requestId = nextWsResizeId++;
     return new Promise((resolve, reject) => {
@@ -1619,6 +1626,7 @@
   }
 
   async function sendLeaderRequestOverWs() {
+    if (protocolMismatched()) throw new Error(STALE_PAGE_REASON);
     if (!wsIsOpen()) throw new Error('WS is not connected');
     // leader.request 自体は payload を持たない。gateway が takeover 直後に browser の
     // viewport に合う grid で resize できるよう、既存 resize 制御で FitAddon の現在提案値を
@@ -1800,6 +1808,15 @@
       } else if (typeof ev.data === 'string') {
         try {
           const message = JSON.parse(ev.data);
+          if (message.kind === 'hello') {
+            // 世代の検出点はここ 1 本 (DR-0035 決定 3)。再接続のたびに比べるので、
+            // HA fallback で裏の unit が変わっても拾える。build_id は表示のためだけで、
+            // 判定には使わない (再ビルドごとに帯が出て警告が形骸化する)。
+            if (reportGatewayProtocol(message.protocol)) {
+              setWsStatus('stale page (protocol ' + message.protocol + ')');
+            }
+            return;
+          }
           if (message.kind === 'attach.info') {
             updateAttachInfo(message);
             return;
