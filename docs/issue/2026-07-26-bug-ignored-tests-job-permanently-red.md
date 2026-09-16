@@ -3,7 +3,7 @@ title: "CI の ignored-tests job が continue-on-error で恒常 red を隠し�
 status: wip
 category: bug
 created: 2026-07-26T09:40:00+09:00
-last_read: 2026-09-16T17:41:08+09:00
+last_read: 2026-09-16T22:40:00+09:00
 open_entered: 2026-07-26T09:40:00+09:00
 wip_entered: 2026-08-21T11:50:50+09:00
 blocked_entered:
@@ -39,6 +39,45 @@ origin: CI flaky 根治タスク中に GitHub API で直近 12 run × 全 attemp
 | macOS | `smoke_hyoui_run_echo` | 2 | |
 | macOS | `sys::raw::anchor_tests::session_anchor_makes_child_stoppable` | 1 | |
 | macOS | `pipe_send_eof_default_terminates_bc` | 1 | |
+
+## 追加観測 (2026-09-16、v0.9.51 CI run 35103158854)
+
+`smoke_hyoui_run_echo` (macOS) がまた失敗した。**この job は `continue-on-error` なので
+workflow を落としていない** — 同 run の CI 失敗は別原因 (JS test job の node 引数) で、
+そちらは修正済み。
+
+| 観測 | 値 |
+|---|---|
+| 失敗 | `expected 'hello' from /bin/echo within 5s` → PTY EOF |
+| 出力 | `hyoui: attach: connect 失敗: invalid argument: handshake.response decode failed` |
+| 所要 | **0.04s** (= timeout ではなく即死) |
+| ubuntu 側 | 同 run で `daemon_sigterm_terminates_child_and_unlinks_socket` が失敗 (別口) |
+
+**この文言は daemon 側に緩和コードがある既知経路そのもの。**
+`crates/hyoui/src/daemon/session.rs:812-835` に、handshake.response を writer が flush
+する前に `SessionExitNotify` を続けて enqueue すると
+「CI macOS で client 側 decode タイミングが不安定になる (= `handshake.response decode failed`)」
+とあり、**`queued_bytes` が 0 になるまで最大 500ms 待つ** 緩和が入っている (DR-0015 Task 25)。
+`/bin/echo` は即 exit するので、この drain と daemon 終了が最も競る形になる。test 自身の
+`#[ignore]` 理由も「Task 27 stdin pipe 化で daemon 起動 timing が変わり CI macOS で
+handshake race 再発、再 ignore。ローカル macOS では pass、CI のみ偶発失敗 = timing 由来」。
+
+**ローカルでは再現しない**: 素で 5 回 + CPU 負荷 (`yes` × 6) 下で 3 回、計 8/8 pass。
+
+**W2 (DR-0036) 由来ではない。** 根拠:
+
+- `Cargo.lock` で**既存依存の版は 1 つも動いていない** (増えたのは hyoui-web 向けの
+  新規 entry だけ)
+- `hyoui::time` は daemon / client / protocol から使われていない (`grep` で 0 件)。
+  core の変更はこの新 module と `cli.rs` の parser 追加だけ
+- ubuntu 側の恒常 red は v0.9.49 (release 成功) の時点で既に出ている
+
+**未検証の仮説 (要測定)**: v0.9.51 から `hyoui` binary が WebAuthn stack
+(`webauthn-rs-core` / `rsa` / `p256` 等) を link するので、**process 起動が重くなって
+race の窓が広がった**可能性はある。確かめるには v0.9.50 と v0.9.51 の binary で
+「spawn → socket 出現」までの時間を比べる。**根治は DR-0015 Task 28 の範囲**で、
+daemon が終了する前に handshake.response の送出完了を保証する (= 500ms の sleep 待ちを
+やめて、writer の完了を待つ形にする) のが筋。
 
 ## 個別の状況
 
