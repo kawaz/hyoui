@@ -45,9 +45,21 @@ lint-unsafe:
 # lint-rust + lint-unsafe
 lint: lint-rust lint-unsafe
 
+# assets の JS を node の test runner で回す (DR-0036 W2-5)。
+#
+# 対象は `crates/hyoui-web/tests/js/`。ここが見るのは複数タブの協調 core
+# (`assets/auth-share.js`) の 7 性質で、実ブラウザでの通しは playwright が見る
+# (= 役割が違う。fake では時間関係を組めるが実物の WebAuthn は動かない)。
+#
+# test は `assets/` の外に置く: `assets/` は include_dir で binary に埋め込まれるので、
+# test file を中に置くと配布物に入る。
+[script]
+test-js:
+    node --test crates/hyoui-web/tests/js/
+
 # cargo test --workspace (ARGS で追加引数を渡せる、例: `just test -- --nocapture`)
 [script]
-test *ARGS: lint
+test *ARGS: lint test-js
     cargo test --workspace --no-fail-fast "$@"
 
 # cargo build --release --workspace

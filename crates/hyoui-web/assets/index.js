@@ -5,6 +5,10 @@
   const { indexEndpoint, resolve } = window.hyouiContract;
   const ENDPOINT = indexEndpoint();
 
+  // 認証 (DR-0036)。一覧は `/api/*` なので登録済みの端末でしか読めない。401 は
+  // ページ内 overlay のログイン UI で受ける (= redirect しない、決定 1)。
+  const AUTH = window.hyouiAuth.createAuth(ENDPOINT);
+
   const REFRESH_MS = 3000;
   const tbody = document.querySelector('#sessions tbody');
   const statusEl = document.getElementById('status');
@@ -107,7 +111,7 @@
     statusEl.textContent = 'fetching…';
     fetchProtocol();
     try {
-      const r = await fetch(resolve(ENDPOINT, 'api/sessions'), { cache: 'no-store' });
+      const r = await AUTH.fetch('api/sessions', { cache: 'no-store' });
       if (!r.ok) throw await window.hyouiContract.httpError(r);
       const list = await r.json();
       render(list);
@@ -191,4 +195,15 @@
   if (reloadBtn) reloadBtn.addEventListener('click', () => location.reload());
   fetchSessions();
   schedule();
+
+  // 招待 URL (`<endpoint>#register=<jwt>`) で開かれたら登録 UI を出す (DR-0036 決定 2)。
+  // fragment は server に送られないので、ここで読むのが唯一の経路である。
+  // 招待 URL でなければ `null` が返る (= 何もしない)。
+  const pendingRegistration = AUTH.registerFromFragment();
+  if (pendingRegistration) {
+    pendingRegistration.catch((error) => {
+      console.error('hyoui: registration failed', error);
+    });
+  }
+
 })();

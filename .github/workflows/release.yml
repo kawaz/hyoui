@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  # CI 一式 (lint + test + msrv + audit + deny) を release の必須 gate にする。
+  # CI 一式 (lint + test + js + msrv + audit + deny) を release の必須 gate にする。
   # build-release が needs で待つため、CI が green でない commit からは
   # release artifact が一切作られない。
   ci:

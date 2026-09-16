@@ -11,6 +11,10 @@
   // gateway のマウント先は JS が location から 1 回決める (DR-0035 決定 6)。
   const ENDPOINT = sessionEndpoint();
 
+  // 認証 (DR-0036)。`/api/*` と WS は登録済みの端末でしか開けないので、要求は
+  // すべて `AUTH.fetch` を通し、401 は overlay のログイン UI で受ける (決定 1)。
+  const AUTH = window.hyouiAuth.createAuth(ENDPOINT);
+
   const REFRESH_MS = 2000;
   const COLS = 80;
   const ROWS = 24;
@@ -945,7 +949,7 @@
 
   async function postResize(cols, rows) {
     if (protocolMismatched()) throw new Error(STALE_PAGE_REASON);
-    const r = await fetch(resolve(ENDPOINT, `api/sessions/${encodeURIComponent(sid)}/resize`), {
+    const r = await AUTH.fetch(`api/sessions/${encodeURIComponent(sid)}/resize`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ cols, rows }),
@@ -1034,7 +1038,7 @@
     // /api/sessions を一覧して自分の session_id を探し child_stopped で banner を出す。
     // 専用エンドポイントを増やさず既存 API を再利用 (= protocol/API 表面を最小化)。
     try {
-      const r = await fetch(resolve(ENDPOINT, 'api/sessions'), { cache: 'no-store' });
+      const r = await AUTH.fetch('api/sessions', { cache: 'no-store' });
       if (!r.ok) return;
       const list = await r.json();
       const me = Array.isArray(list) ? list.find((s) => s.session_id === sid) : null;
@@ -1059,7 +1063,7 @@
     const orig = resumeBtn.textContent;
     resumeBtn.textContent = 'resuming…';
     try {
-      const r = await fetch(resolve(ENDPOINT, `api/sessions/${encodeURIComponent(sid)}/resume`), { method: 'POST' });
+      const r = await AUTH.fetch(`api/sessions/${encodeURIComponent(sid)}/resume`, { method: 'POST' });
       if (!r.ok) throw await httpError(r);
       // 復帰後 daemon が redraw を送るので、screen と status の両方を fetch し直す。
       setTimeout(() => { fetchScreen(); refreshSessionStatus(); }, 300);
@@ -1084,7 +1088,7 @@
   async function fetchScreen() {
     statusEl.textContent = 'fetching…';
     try {
-      const r = await fetch(resolve(ENDPOINT, `api/sessions/${encodeURIComponent(sid)}/screen?layer=both`), { cache: 'no-store' });
+      const r = await AUTH.fetch(`api/sessions/${encodeURIComponent(sid)}/screen?layer=both`, { cache: 'no-store' });
       if (r.status === 404) {
         statusEl.textContent = 'session not found (404)';
         return;
@@ -1112,7 +1116,7 @@
     if (textSelectionOpen) return;
     sendStatus.textContent = 'sending…';
     try {
-      const r = await fetch(resolve(ENDPOINT, `api/sessions/${encodeURIComponent(sid)}/input`), {
+      const r = await AUTH.fetch(`api/sessions/${encodeURIComponent(sid)}/input`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ specs }),
@@ -1576,6 +1580,8 @@
   const WS_RESIZE_TIMEOUT_MS = 5000;
   const wsLeaderPending = new Map();
   let nextWsLeaderId = 1;
+  // `auth.extend` の採番 (= 応答を相関させるためだけ。resize / leader と別系列)。
+  let nextWsAuthId = 1;
   const WS_LEADER_TIMEOUT_MS = 5000;
 
   // 接続状態バッジ (existing status 領域の右側に別 element を新設)。
@@ -1793,13 +1799,44 @@
     sendBytesToWs(arr);
   });
 
-  function connectWs() {
+  // 認証の期限を同一接続で延ばす (DR-0036 決定 5)。
+  //
+  // `hello.auth_expires_at` を受けたら、access が差し替わるたびに `auth.extend` を
+  // 送る。**`exp` で必ず切ると画面が周期的に瞬く**ので、切るのは延長を怠った接続
+  // だけにしてある。延長の起点 (残り 10% で refresh) は `auth.js` が持つ。
+  let authExtendStop = null;
+
+  function armAuthExtend(expiresAt) {
+    if (authExtendStop) authExtendStop();
+    if (!expiresAt) return;
+    authExtendStop = AUTH.onAccess((access) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({
+        kind: 'auth.extend',
+        requestId: nextWsAuthId++,
+        accessToken: access,
+      }));
+    });
+  }
+
+  async function connectWs() {
     if (wsExplicitClose) return;
     // prefix を保ったまま scheme だけ ws(s): に置き換える (DR-0035 決定 6)。
     const url = resolveWs(ENDPOINT, `api/sessions/${encodeURIComponent(sid)}/attach`);
     setWsStatus('connecting…');
+    // **access token は subprotocol で運ぶ** (DR-0036 決定 5) — browser は WS
+    // upgrade に Authorization ヘッダを載せられない。ここで token が無ければ
+    // ログイン UI まで進む (= 401 を待たない、upgrade は本文を返さないので)。
+    let access;
     try {
-      ws = new WebSocket(url);
+      access = await AUTH.acquire();
+    } catch (e) {
+      setWsStatus('auth required');
+      scheduleWsReconnect();
+      return;
+    }
+    try {
+      ws = new WebSocket(url, [AUTH.wsProtocol(access)]);
     } catch (e) {
       setWsStatus('error: ' + e.message);
       scheduleWsReconnect();
@@ -1841,6 +1878,19 @@
             }
             daemonCaps = Array.isArray(message.caps) ? message.caps : [];
             syncCapabilityAffordances();
+            // 認証の期限 (DR-0036 決定 5)。**切らずに延ばす**ので、access が
+            // 差し替わったら同じ接続で `auth.extend` を送る。
+            armAuthExtend(message.auth_expires_at);
+            return;
+          }
+          if (message.kind === 'auth.extend.result') {
+            // `ok:false` はこの family が失効したという意味で、gateway は応答の
+            // 後に接続を閉じる (DR-0036 決定 4 の「失効はいつ効くか」)。
+            if (!message.ok) {
+              wsExplicitClose = true;
+              setWsStatus('auth revoked');
+              AUTH.overlay.showRevoked();
+            }
             return;
           }
           if (message.kind === 'attach.info') {
@@ -1943,4 +1993,15 @@
   connectWs();
   // status は screen より遅めに poll (= 一覧 API を頻繁に叩かない)。
   setInterval(refreshSessionStatus, 5000);
+
+  // 招待 URL (`<endpoint>#register=<jwt>`) で開かれたら登録 UI を出す (DR-0036 決定 2)。
+  // fragment は server に送られないので、ここで読むのが唯一の経路である。
+  // 招待 URL でなければ `null` が返る (= 何もしない)。
+  const pendingRegistration = AUTH.registerFromFragment();
+  if (pendingRegistration) {
+    pendingRegistration.catch((error) => {
+      console.error('hyoui: registration failed', error);
+    });
+  }
+
 })();

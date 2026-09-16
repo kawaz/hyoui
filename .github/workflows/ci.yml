@@ -72,6 +72,19 @@ jobs:
       - name: cargo check on MSRV
         run: cargo check --workspace
 
+  js:
+    name: assets の JS test (DR-0036 W2-5 の 7 性質)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # node は test runner としてだけ使う。assets は bundler を持たない素の JS
+      # なので (DR-0027 §4)、依存の install も build も無い。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: node --test (crates/hyoui-web/tests/js)
+        run: node --test crates/hyoui-web/tests/js/
+
   audit:
     name: cargo-audit (RUSTSEC advisories)
     runs-on: ubuntu-latest

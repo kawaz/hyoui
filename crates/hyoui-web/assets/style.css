@@ -739,3 +739,79 @@ td.argv, td.cwd {
   .link-fallback-actions { flex-direction: column; }
   .link-fallback-actions button { width: 100%; }
 }
+
+/* 認証 overlay (DR-0036 決定 1)。
+ *
+ * ページの上に重ねるだけで、下のページは残す — iframe 内で redirect すると親の
+ * Terminal タブがログインページに化けて何が起きたか読めなくなるため、ここは
+ * 「別ページ」ではなく「重ね」である。 */
+.auth-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  background: rgba(0, 0, 0, 0.45);
+}
+.auth-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  width: min(28rem, 100%);
+  padding: 1.1rem 1.2rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+}
+.auth-panel h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+.auth-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+.auth-error {
+  margin: 0;
+  color: #c92a2a;
+  font-size: 0.9rem;
+}
+.auth-code,
+.auth-label {
+  padding: 0.45rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 1rem;
+}
+/* 6 桁を 1 文字ずつ読めるように字間を開ける (= 読み上げと打ち直しのため)。 */
+.auth-code {
+  letter-spacing: 0.4em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.auth-primary {
+  padding: 0.45rem 0.7rem;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--accent);
+  font-size: 0.95rem;
+  text-align: center;
+  text-decoration: none;
+  cursor: pointer;
+}
+.auth-primary:disabled {
+  border-color: var(--border);
+  color: var(--muted);
+  cursor: default;
+}
+.auth-secondary {
+  color: var(--muted);
+  font-size: 0.85rem;
+  text-align: center;
+}
