@@ -24,6 +24,9 @@ hyoui の運用・障害対応 runbook 一覧。`docs-structure.md` ルールに
   killpg 化後の意図的 detach 検出と対処
 - [v0.x release deployment checklist](./2026-05-27-deployment-checklist.md) —
   brew tap / SHA256SUMS / SLSA attestation 検証手順
+- [web endpoint に passkey を登録する](./2026-09-16-web-passkey-registration.md) —
+  `hyoui web passkey add --endpoint` で招待 URL と 6 桁コードを出し、端末を
+  登録する手順。失効の効き方 (最長 4 時間) と、Safari / iOS の gate 3 検証も含む
 
 ## Archived
 

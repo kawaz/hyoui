@@ -1,0 +1,57 @@
+<!doctype html><meta charset="utf-8"><title>gate3 child (hyoui RP 相当)</title>
+<body><h1>child</h1><pre id="out">idle</pre>
+<script>
+// DR-0036 gate 3 の観測用。埋め込まれる側 (= hyoui の endpoint 相当)。
+const out = document.getElementById('out');
+function log(o) { out.textContent = JSON.stringify(o, null, 1); try { parent.postMessage({gate3: o}, '*'); } catch (_e) {} }
+
+const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+
+// top-level で 1 度呼んで credential を作る (登録は iframe で走らせない = 決定 6)。
+window.doCreate = async () => {
+  const cred = await navigator.credentials.create({
+    publicKey: {
+      challenge: new Uint8Array(32),
+      rp: { id: location.hostname, name: "gate3" },
+      user: { id: new Uint8Array(16).fill(7), name: "kawaz", displayName: "kawaz" },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+      authenticatorSelection: { residentKey: "required", userVerification: "required" },
+      attestation: "none",
+      timeout: 15000,
+    },
+  });
+  const cd = JSON.parse(new TextDecoder().decode(cred.response.clientDataJSON));
+  return { id: cred.id, clientData: cd };
+};
+
+// (a) iframe 内で get() が走るか / (b) clientDataJSON の中身 / (c) cookie が乗るか
+window.doGet = async () => {
+  const result = { href: location.href, isTop: window.top === window.self };
+  try {
+    const r = await fetch('/whoami', { credentials: 'include' });
+    result.cookieSeenByServer = (await r.json()).cookie;
+  } catch (e) { result.cookieSeenByServer = 'fetch failed: ' + e.message; }
+  try {
+    const cred = await navigator.credentials.get({
+      publicKey: {
+        challenge: new Uint8Array(32),
+        rpId: location.hostname,
+        userVerification: 'required',
+        timeout: 15000,
+      },
+    });
+    result.getResult = 'assertion returned';
+    result.credentialId = cred.id;
+    result.clientData = JSON.parse(new TextDecoder().decode(cred.response.clientDataJSON));
+    result.userHandlePresent = cred.response.userHandle !== null;
+    result.userHandle = cred.response.userHandle ? b64(cred.response.userHandle) : null;
+  } catch (e) {
+    result.getResult = e.name + ': ' + e.message;
+  }
+  log(result);
+  return result;
+};
+
+// iframe に入っている時だけ自動で get() を走らせる。
+if (window.top !== window.self) window.doGet();
+</script>

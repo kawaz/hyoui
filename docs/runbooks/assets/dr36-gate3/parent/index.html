@@ -1,0 +1,13 @@
+<!doctype html><meta charset="utf-8"><title>gate3 parent (ccmsg webui 相当)</title>
+<body><h1>parent</h1><pre id="res">waiting</pre>
+<iframe id="f" width="600" height="300" allow="publickey-credentials-get"
+        src="http://localhost:43712/index.html"></iframe>
+<script>
+window.__gate3 = null;
+addEventListener('message', (e) => {
+  if (e.data && e.data.gate3) {
+    window.__gate3 = e.data.gate3;
+    document.getElementById('res').textContent = JSON.stringify(e.data.gate3, null, 1);
+  }
+});
+</script>
