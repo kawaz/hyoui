@@ -3,15 +3,20 @@
 // an xterm.js instance. Input form POSTs to /api/sessions/:id/input.
 (async () => {
   // 契約の読み取りは contract.js に寄せる (DR-0035 決定 2)。
-  const { httpError, frameErrorText, reportGatewayProtocol, protocolMismatched } = window.hyouiContract;
+  const {
+    httpError, frameErrorText, reportGatewayProtocol, protocolMismatched,
+    sessionEndpoint, sessionIdFromLocation, resolve, resolveWs,
+  } = window.hyouiContract;
+
+  // gateway のマウント先は JS が location から 1 回決める (DR-0035 決定 6)。
+  const ENDPOINT = sessionEndpoint();
 
   const REFRESH_MS = 2000;
   const COLS = 80;
   const ROWS = 24;
 
-  // Extract session id from /sessions/<id>
-  const parts = location.pathname.split('/').filter(Boolean);
-  const sid = decodeURIComponent(parts[1] || '');
+  // session id は URL の末尾要素。root 直下前提を持たない (DR-0035 決定 6)。
+  const sid = sessionIdFromLocation();
   document.getElementById('sid').textContent = sid;
   document.title = `hyoui — ${sid}`;
 
@@ -940,7 +945,7 @@
 
   async function postResize(cols, rows) {
     if (protocolMismatched()) throw new Error(STALE_PAGE_REASON);
-    const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/resize`, {
+    const r = await fetch(resolve(ENDPOINT, `api/sessions/${encodeURIComponent(sid)}/resize`), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ cols, rows }),
@@ -1029,7 +1034,7 @@
     // /api/sessions を一覧して自分の session_id を探し child_stopped で banner を出す。
     // 専用エンドポイントを増やさず既存 API を再利用 (= protocol/API 表面を最小化)。
     try {
-      const r = await fetch('/api/sessions', { cache: 'no-store' });
+      const r = await fetch(resolve(ENDPOINT, 'api/sessions'), { cache: 'no-store' });
       if (!r.ok) return;
       const list = await r.json();
       const me = Array.isArray(list) ? list.find((s) => s.session_id === sid) : null;
@@ -1054,7 +1059,7 @@
     const orig = resumeBtn.textContent;
     resumeBtn.textContent = 'resuming…';
     try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/resume`, { method: 'POST' });
+      const r = await fetch(resolve(ENDPOINT, `api/sessions/${encodeURIComponent(sid)}/resume`), { method: 'POST' });
       if (!r.ok) throw await httpError(r);
       // 復帰後 daemon が redraw を送るので、screen と status の両方を fetch し直す。
       setTimeout(() => { fetchScreen(); refreshSessionStatus(); }, 300);
@@ -1079,7 +1084,7 @@
   async function fetchScreen() {
     statusEl.textContent = 'fetching…';
     try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/screen?layer=both`, { cache: 'no-store' });
+      const r = await fetch(resolve(ENDPOINT, `api/sessions/${encodeURIComponent(sid)}/screen?layer=both`), { cache: 'no-store' });
       if (r.status === 404) {
         statusEl.textContent = 'session not found (404)';
         return;
@@ -1107,7 +1112,7 @@
     if (textSelectionOpen) return;
     sendStatus.textContent = 'sending…';
     try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/input`, {
+      const r = await fetch(resolve(ENDPOINT, `api/sessions/${encodeURIComponent(sid)}/input`), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ specs }),
@@ -1790,8 +1795,8 @@
 
   function connectWs() {
     if (wsExplicitClose) return;
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${proto}//${location.host}/api/sessions/${encodeURIComponent(sid)}/attach`;
+    // prefix を保ったまま scheme だけ ws(s): に置き換える (DR-0035 決定 6)。
+    const url = resolveWs(ENDPOINT, `api/sessions/${encodeURIComponent(sid)}/attach`);
     setWsStatus('connecting…');
     try {
       ws = new WebSocket(url);

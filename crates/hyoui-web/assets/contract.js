@@ -11,6 +11,56 @@
   // kind 一覧や cap 集合の写しは持たない。
   const WEB_PROTOCOL_VERSION = 1;
 
+  // ---- endpoint (DR-0035 決定 6) ----
+  //
+  // gateway は自分のマウント先を知らない (= route は prefix 無しのまま)。ブラウザが
+  // `location` から自分の endpoint を 1 回決め、以降の URL をそれ基点で組む。これで
+  // 前段が path を strip する構成でも、strip しない構成でも同じ JS で成立する。
+  //
+  // `<base href>` は使わない: 効く範囲がページ内の全相対 URL (将来足すものも含む) に
+  // 及び、1 箇所の設定で全ての解決が変わる。endpoint を 1 回計算して組む方が、
+  // どこで解決されたかが読める。
+  //
+  // **正規形は `scheme://host[:port]/<path>/`** — 末尾 `/` 必須、query と fragment を
+  // 含まない。複数の実装 (この JS、`hyoui web passkey add` の CLI、record を引く
+  // gateway) が同一の文字列に到達しなければならないため、仕様で 1 つに決める。
+
+  // index ページ (`/` または `<prefix>/`) の endpoint。
+  // `new URL('.', href)` は末尾 `/` 付きを返し、query / fragment を落とす。
+  function indexEndpoint() {
+    return new URL('.', location.href);
+  }
+
+  // session ページ (`<endpoint>sessions/<id>`) の endpoint。末尾 2 要素を落とす。
+  function sessionEndpoint() {
+    const url = new URL(location.href);
+    url.search = '';
+    url.hash = '';
+    const segments = url.pathname.split('/');
+    // 末尾が `sessions/<id>` なのでその 2 要素を捨て、残りを `/` 終わりにする。
+    segments.splice(-2, 2);
+    url.pathname = `${segments.join('/')}/`;
+    return url;
+  }
+
+  // session ページの URL から session id を取る。root 直下前提を持たない。
+  function sessionIdFromLocation() {
+    const segments = location.pathname.split('/').filter(Boolean);
+    return decodeURIComponent(segments[segments.length - 1] || '');
+  }
+
+  // endpoint 基点で URL を組む。`path` は先頭 `/` 無しの相対 path。
+  function resolve(endpoint, path) {
+    return new URL(path, endpoint).href;
+  }
+
+  // 同じ endpoint の WS URL。prefix を保ち、scheme だけ `ws(s):` に置き換える。
+  function resolveWs(endpoint, path) {
+    const url = new URL(path, endpoint);
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    return url.href;
+  }
+
   // ---- エラー形 (DR-0035 決定 2) ----
   //
   // HTTP も WS も `{"error": {"code", "message"}}` の 1 型。plain text body の
@@ -98,6 +148,11 @@
 
   window.hyouiContract = {
     WEB_PROTOCOL_VERSION,
+    indexEndpoint,
+    sessionEndpoint,
+    sessionIdFromLocation,
+    resolve,
+    resolveWs,
     httpError,
     frameErrorText,
     reportGatewayProtocol,

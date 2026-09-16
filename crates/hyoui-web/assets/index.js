@@ -1,6 +1,10 @@
 // hyoui web — session list page.
 // Polls /api/sessions every few seconds and renders a table.
 (() => {
+  // gateway のマウント先は JS が location から 1 回決める (DR-0035 決定 6)。
+  const { indexEndpoint, resolve } = window.hyouiContract;
+  const ENDPOINT = indexEndpoint();
+
   const REFRESH_MS = 3000;
   const tbody = document.querySelector('#sessions tbody');
   const statusEl = document.getElementById('status');
@@ -90,7 +94,7 @@
   // (DR-0035 決定 3)。一覧取得と同じ周期に乗せる (= 往復は増えるが頻度は変わらない)。
   async function fetchProtocol() {
     try {
-      const r = await fetch('/version', { cache: 'no-store' });
+      const r = await fetch(resolve(ENDPOINT, 'version'), { cache: 'no-store' });
       if (!r.ok) return;
       const info = await r.json();
       window.hyouiContract.reportGatewayProtocol(info.protocol);
@@ -103,7 +107,7 @@
     statusEl.textContent = 'fetching…';
     fetchProtocol();
     try {
-      const r = await fetch('/api/sessions', { cache: 'no-store' });
+      const r = await fetch(resolve(ENDPOINT, 'api/sessions'), { cache: 'no-store' });
       if (!r.ok) throw await window.hyouiContract.httpError(r);
       const list = await r.json();
       render(list);
@@ -128,7 +132,7 @@
       const isStopped = s.status === 'stopped' || !!s.child_stopped;
       tr.className = 'row-' + esc(s.status || 'unknown');
       const link = isLive || isStopped
-        ? `<a href="/sessions/${encodeURIComponent(s.session_id)}">${esc(s.session_id)}</a>`
+        ? `<a href="${esc(resolve(ENDPOINT, 'sessions/' + encodeURIComponent(s.session_id)))}">${esc(s.session_id)}</a>`
         : esc(s.session_id);
       const statusCell = isStopped
         ? `<span class="badge badge-stopped" title="child is stopped (SIGSTOP)">⏸ stopped</span>`

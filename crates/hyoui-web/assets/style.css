@@ -35,7 +35,7 @@
    540=半角 / 1080=全角 の 2 値のみ)。 */
 @font-face {
   font-family: 'HackGen Console NF';
-  src: url('/assets/vendor/fonts/HackGenConsoleNF-Regular.woff2') format('woff2');
+  src: url('vendor/fonts/HackGenConsoleNF-Regular.woff2') format('woff2');
   font-weight: 400;
   font-style: normal;
   font-display: block;
@@ -68,7 +68,7 @@
 }
 @font-face {
   font-family: 'HackGen Console NF';
-  src: url('/assets/vendor/fonts/HackGenConsoleNF-Bold.woff2') format('woff2');
+  src: url('vendor/fonts/HackGenConsoleNF-Bold.woff2') format('woff2');
   font-weight: 700;
   font-style: normal;
   font-display: block;

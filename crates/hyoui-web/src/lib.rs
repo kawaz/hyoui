@@ -1172,7 +1172,7 @@ mod tests {
         let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let s = std::str::from_utf8(&body).unwrap();
         assert!(
-            s.contains("/assets/vendor/xterm.js"),
+            s.contains("../assets/vendor/xterm.js"),
             "body missing xterm.js reference: {s}"
         );
     }
@@ -1195,10 +1195,10 @@ mod tests {
         let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let html = std::str::from_utf8(&body).unwrap();
         let addon = html
-            .find(r#"<script src="/assets/vendor/addon-web-links.js"></script>"#)
+            .find(r#"<script src="../assets/vendor/addon-web-links.js"></script>"#)
             .expect("body missing vendored WebLinksAddon script");
         let session = html
-            .find(r#"<script src="/assets/session.js"></script>"#)
+            .find(r#"<script src="../assets/session.js"></script>"#)
             .expect("body missing session.js script");
         assert!(addon < session, "WebLinksAddon must load before session.js");
     }
@@ -1280,6 +1280,48 @@ mod tests {
             !script.contains("includeScrollback"),
             "fetchScreen must not expose a visible-only restore path"
         );
+    }
+
+    /// DR-0035 決定 6 / 決定 7: assets に絶対パス参照が残っていない。
+    ///
+    /// 1 箇所でも絶対のまま残ると、prefix 付き endpoint でページが壊れ、DR-0036 の
+    /// endpoint 判定に到達しない。CSS の `url()` と manifest も同じ理由で見る
+    /// (= どちらもブラウザが自分の位置基準で解決するので相対で足りる)。
+    #[test]
+    fn assets_contain_no_absolute_path_references() {
+        let forbidden = [
+            "\"/assets/",
+            "'/assets/",
+            "url('/assets/",
+            "'/api/",
+            "\"/api/",
+            "\"/sessions/",
+            "'/version'",
+        ];
+        let mut checked = 0;
+        for file in EMBEDDED_ASSETS.files() {
+            let name = file.path().to_string_lossy().to_string();
+            let is_target = name.ends_with(".html")
+                || name.ends_with(".js")
+                || name.ends_with(".css")
+                || name.ends_with(".webmanifest");
+            // vendor/ は upstream の配布物をそのまま埋め込んでいる (DR-0027 §4)。
+            // hyoui の route を指す参照は持たないので対象外。
+            if !is_target || name.starts_with("vendor/") {
+                continue;
+            }
+            let Some(text) = file.contents_utf8() else {
+                continue;
+            };
+            checked += 1;
+            for needle in forbidden {
+                assert!(
+                    !text.contains(needle),
+                    "{name} に絶対パス参照 {needle:?} が残っている (DR-0035 決定 6)"
+                );
+            }
+        }
+        assert!(checked >= 5, "検査対象が少なすぎる: {checked} ファイル");
     }
 
     #[tokio::test]
