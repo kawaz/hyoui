@@ -1,6 +1,6 @@
 # DR-0036: web endpoint を passkey で守る。gateway は自分の endpoint を知らない
 
-- Status: 🟡 実装中 (2026-09-16)。gate 3 は Chrome 分を実測して通過 (Safari / iOS は kawaz 確認待ち)、gate 4 は実測の結果 3 件を裁定して確定 (決定 2 / 決定 6 / 決定 8 に反映済み)
+- Status: 🟡 実装中 (2026-09-16)。**W2-1 / W2-2 / W2-3 / W2-4 / W2-6 (runbook) まで実装済み、残りは W2-5 (front の overlay ログイン UI と tab-share) だけ**。gate 3 は Chrome 分を実測して通過 (Safari / iOS は kawaz 確認待ち)、gate 4 は実測の結果 3 件を裁定して確定 (決定 2 / 決定 6 / 決定 8 に反映済み)。**この時点で認証は既に有効なので、W2-5 が入るまでブラウザからは開けない** (= `/api/*` が 401 を返し、ログイン UI がまだ無い)
 - Date: 2026-09-16
 - Related: DR-0035 (web 契約と世代 version。決定 6 の endpoint 基点相対 URL が本 DR の前提), DR-0027 (認証は当面なし・tailnet 前提という現行前提を本 DR が置き換える), DR-0034 (`/healthz` `/version` は認証境界を変えない、stable / unstable 2 unit と HA endpoint), DR-0013 (attach 復元。`ro` 相当の mode の出どころ), DR-0022 (`POST /input` の auto-lock と `HYOUI_LOCK_TOKEN`。lock token は HTTP 認証ではない), DR-0008 §7 (daemon 境界の認証は同 UID + socket perm。本 DR は触らない)
 - Origin: `docs/research/2026-09-15-web-protocol-and-passkey-grand-design.md` (§4 / §5 / §6)、事実は `docs/findings/2026-09-15-web-contract-and-ccmsg-passkey-inventory.md`
@@ -102,7 +102,9 @@ hyoui web session remove <id>
 | jwt の運び方 | **fragment (`#`)**。server にも proxy log にも Referer にも乗らない |
 | 6 桁コード | URL には含めず CLI にだけ表示する。登録要求の必須引数。**5 回の誤入力でその URL (jti) を焼く** |
 | ブラウザ側 `create()` | `residentKey: "required"`、`userVerification: "required"`、`attestation: "none"`、`user.id` = claims の `user_id`、`rp.id` = claims の `rp_id`。**`required` を選ぶのは gate 4 の実測による** — `webauthn-rs` は `Required` / `Discouraged` しか emit できず `preferred` の口が無い。実ブラウザでは preferred ≡ required (crate が proto の doc で明言) なので狙いは変わらず、対象端末 (Mac / iPhone) はどちらも resident key 対応で拒まれない |
-| 検証順序 | client data → WebAuthn 登録検証 → 公開鍵の import 可否 → **通ってから jti と challenge を消費**。逆順だと一時的な失敗 1 回で URL が焼ける |
+| 検証順序 | client data → WebAuthn 登録検証 → 公開鍵の import 可否 → **通ってから jti と challenge を消費**。逆順だと一時的な失敗 1 回で URL が焼ける。6 桁コードだけは**外した時点で試行回数を加算する** (= それが総当たりの上限そのもの) ので、lock 下で数えてから WebAuthn 検証に進む |
+| `/auth/challenge` の形 | `{endpoint, purpose: "assert" \| "register", jwt?}`。**登録用 challenge には jwt が要る** — `create()` の options は `user.id` と `rp.id` を claims から採るので、challenge を組む時点で claims が必要になる。ここでは 6 桁コードを見ず、**jti も challenge も消費しない** (消費は `/auth/register` が検証を通してから)。発行した登録用 challenge は jti に束縛し、別の登録 URL 向けの challenge を使い回させない |
+| crate の検証途中 state | `RegistrationState` / `AuthenticationState` を `pending.json` の challenge に載せる。**プロセスのメモリには置けない** — challenge を出した unit と消費する unit が違いうる (決定 4) |
 | `userHandle` の扱い | `residentKey: "required"` なので assertion に handle が**常に載る**。**record の `user_id` と毎回照合する** (reference `passkey-registration-local-first` §7.2 の 3 をそのまま適用。条件分岐を持たない)。**`webauthn-rs` は非 discoverable (allowCredentials) 経路で userHandle を検証しない**ことを gate 4 で実測したので、照合は hyoui 側で実装する |
 | 登録完了時 | そのまま session を mint して返す (登録が即サインイン) |
 
@@ -265,7 +267,7 @@ reference は「library は要らない」と書くが、その根拠は「attes
 | `residentKey: "preferred"` | **表せない。** challenge を組む builder が受けるのは `require_resident_key: bool` だけで、出るのは `Required` / `Discouraged` の 2 値 | **`required` に変更** (決定 2)。実ブラウザでは preferred ≡ required |
 | `crossOrigin` の検査 | **登録経路にだけある** (`register_credential_internal`)。認証経路 (`verify_credential_internal`) には無い。`allow_cross_origin` は `false` 固定で setter が無い | 決定 6 の「登録のみ拒否」とそのまま一致するので、hyoui 側で足すものは無い |
 | `userHandle` の検証 | **しない** (非 discoverable 経路に検証コードが無い) | hyoui 側で毎回照合する (決定 2) |
-| 仮想 authenticator の往復 | softtoken (`webauthn-authenticator-rs`) で登録 → 認証が通る | W2-1 の test に使う |
+| 仮想 authenticator の往復 | softtoken (`webauthn-authenticator-rs`) で登録 → 認証が通る。**ただし resident key は非対応** (`SoftToken` / `SoftPasskey` のどちらも `if resident_key { return Err(NotSupported) }`) | **検証の分担がここで決まる**: crate の配線 (challenge 生成 → 署名 → `register_credential` → 認証 challenge → `authenticate_credential` → `userHandle` 照合) は Rust の test が `residentKey` だけ下げて通し、**`residentKey: required` そのものは実ブラウザ (Chrome の CDP 仮想 authenticator) で見る**。非 resident の credential は assertion に `userHandle` を載せないので、その事実自体も test で固定する (= 決定 2 で `required` が要る理由) |
 
 表せなかったのは `residentKey` 1 点で、しかも実挙動が代替値と同じなので、library を捨てる理由には足りない。`webauthn-rs` に委ねるのは検証手順と COSE / CBOR の解釈で、hyoui 側が書くのは challenge の在庫管理・record の lookup・endpoint との照合 (決定 3)・userHandle の照合である。
 
@@ -310,12 +312,14 @@ reference は「library は要らない」と書くが、その根拠は「attes
 | W2-0 | (実装前) iframe 経路の実機確認 | **gate 3**: (a) `allow="publickey-credentials-get"` 付き iframe 内の `navigator.credentials.get()` が通る、(b) `clientDataJSON.topOrigin` に親 origin が入る、(c) 同一 site iframe 内のリクエストに `SameSite=Strict` の cookie が乗る、(d) 平文 http の endpoint で `Secure` cookie が保存されないこと。(a) か (c) が崩れたら決定 6 を Alternatives の (P) に差し替える。<br>✅ **Chrome 分は通過** (2026-09-16、同一 site・別 origin の 2 port + CDP の仮想 authenticator): (a) assertion が返る、(b) `topOrigin` に親 origin が入る、(c) server が `__Secure-` cookie を受け取る、(d) `http://<LAN IP>` は `isSecureContext: false` で `Secure` cookie が保存されず WebAuthn 自体が走らない。**併せて `crossOrigin: true` が来ることが分かり、決定 6 を「拒否は登録経路のみ」に改めた**。<br>⬜ **Safari / iOS Safari は kawaz 確認待ち。** 検証ページと手順は runbook (W2-6) に置く。最も重要なのは (c) — **iOS Safari の ITP が同一 site iframe の `SameSite=Strict` cookie を落とすと、iframe 内で refresh が効かず Alternatives (P) の popup に倒す判断が要る** |
 | W2-1 | `webauthn-rs` を足し、登録 / 認証の検証経路を作る (決定 8) | **gate 4**: 決定 2 の 3 設定が crate の設定で表せる。表せなければ自作の範囲を決めてから進む。仮想 authenticator で登録 → 認証が通る。<br>✅ **実測して確定** (2026-09-16、決定 8 の表): `attestation: none` と `userVerification: required` は表せ、`residentKey: preferred` だけ表せない (→ `required` に変更)。**0.5 系は openssl 依存で linux target gate が落ちるため `=0.6.1-dev` を pin**。仮想 authenticator (softtoken) の往復は通る。crate は `crossOrigin` を登録経路でだけ検査し、`userHandle` は検証しない |
 | W2-2 | `auth.json` / `pending.json` と別 file への `flock` (決定 4) | 2 プロセスから同時に rotate しても family が壊れない (並行 test)。**tmp + rename を挟んでも lost update が起きない** (lock file 方式の検証。data file に lock を取る実装だと落ちる test を書く)。**同じ challenge が 2 回消費できない**、**6 桁コードの試行回数が 2 プロセス合計で数えられる**。HA endpoint の credential を片方の unit で登録し、**もう片方の unit で認証が通る** |
-| W2-3 | `/auth/*` 4 経路と middleware (決定 1 / 3 / 5) | `/api/*` と WS が 401 を返し、`/healthz` `/version` `/assets` `/` `/sessions/{id}` は通る (決定 1 の表を test で固定する)。endpoint をすり替えた challenge / assert が落ちる。**既存 e2e `crates/hyoui-cli/tests/web_e2e_api.rs` の 6 test が、tempdir の `XDG_STATE_HOME` + 登録 fixture (Bearer / WS subprotocol 付き、endpoint は `http://127.0.0.1:<port>/`) で全通過する** (決定 9)。正規形の endpoint が record の key と一致することがこの test で同時に固定される |
+| W2-3 | `/auth/*` 4 経路と middleware (決定 1 / 3 / 5) | `/api/*` と WS が 401 を返し、`/healthz` `/version` `/assets` `/` `/sessions/{id}` は通る (決定 1 の表を test で固定する)。endpoint をすり替えた challenge / assert が落ちる。**既存 e2e `crates/hyoui-cli/tests/web_e2e_api.rs` の 6 test が、tempdir の `XDG_STATE_HOME` + 登録 fixture (Bearer / WS subprotocol 付き、endpoint は `http://127.0.0.1:<port>/`) で全通過する** (決定 9)。正規形の endpoint が record の key と一致することがこの test で同時に固定される。<br>✅ **通過** (`crates/hyoui-web/tests/auth_routes.rs` が決定 1 の表 / challenge のすり替え / 6 桁コードの試行上限 / refresh の rotate と再利用検知 / tombstone の反映を、e2e 6 test が Bearer + WS subprotocol の echo + `hello.auth_expires_at` + `auth.extend` の往復を固定)。**署名を伴う登録 → 認証の通しは実ブラウザに残る** (gate 4 の仮想 authenticator の制約、決定 8 の表) |
 | W2-4 | `hyoui web passkey` / `session` の CLI (決定 2) | 登録 → 認証 → `passkey list` → `remove` が一続きで通る。**`remove` 後は (a) 新規認証が落ち、(b) `/auth/refresh` が落ち、(c) 確立済み WS は次の `auth.extend` で切れる** (決定 4 の「失効はいつ効くか」)。gateway が停止していても `passkey add` が URL を発行できる (決定 2) |
+| | | ✅ **CLI は通過** (`hyoui web passkey add \| list \| remove`、`hyoui web session list \| remove`。parse / help / completion 3 shell を test で同期)。`crates/hyoui-cli/tests/auth_store_concurrency.rs` が **本物の 2 プロセス**で「並行 `passkey add` が登録を落とさない」「6 桁コードの試行回数が 2 unit 合計で数えられる」「片 unit で置いた session が両 unit で通り、tombstone が両方に即効く」を固定。**登録 → 認証の通し (= 署名を伴う一続き) は W2-5 の front が入ってから実機で見る** |
 | W2-5 | front の overlay ログイン UI と tab-share (決定 5) | reference `multi-tab-token-refresh` の 7 性質を test で固定する。**2 タブの access が同時に切れても refresh が 1 回だけ**走る |
 | W2-6 | runbook を書き、kawaz が各 endpoint に登録 (決定 10) | HA endpoint に登録した 1 本で、**fallback を起こしても再認証を求められない** (実機で unstable を落として stable に回す) |
+| | | ✅ **runbook は `docs/runbooks/2026-09-16-web-passkey-registration.md`**。gate 3 の検証ページを `docs/runbooks/assets/dr36-gate3/` に置いた (Safari / iOS の確認手順込み)。⬜ **kawaz の登録そのものは W2-5 待ち** — 招待 URL を開いた先の登録ページが front の成果物なので、W2-5 が入るまで手順は実行できない |
 
-**残る未検証事項は Safari / iOS Safari の gate 3 だけである** (2026-09-16 時点)。gate 4 と前提条件表の「平文 http では refresh cookie が保存されない」は実測で埋まり、実測の結果 3 件を裁定して決定 2 / 決定 6 / 決定 8 に反映した。**推測のまま実装に進まない。**
+**残る未検証事項は 2 つである** (2026-09-16 時点): Safari / iOS Safari の gate 3 と、**`residentKey: required` のままの登録 → 認証の通し**。後者が Rust の test に載らないのは仮想 authenticator が resident key 非対応だからで (決定 8 の表)、W2-5 の front が入ってから実ブラウザ (Chrome の CDP 仮想 authenticator) で見る。gate 4 と前提条件表の「平文 http では refresh cookie が保存されない」は実測で埋まり、実測の結果 3 件を裁定して決定 2 / 決定 6 / 決定 8 に反映した。**推測のまま実装に進まない。**
 
 ## Alternatives Considered
 
