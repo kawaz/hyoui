@@ -105,7 +105,7 @@ hyoui web daemon status  [<name>] | --all  → {units: [{name, enabled, running,
 hyoui web daemon log     [<name>] | --all [--follow]
 
 hyoui web service register | unregister    監督者 (`hyoui web daemon supervise`) を launchd / systemd に載せる / 外す
-hyoui web service start | stop             監督者の起動 / 停止
+hyoui web service start | stop | restart   監督者の起動 / 停止 / 入れ替え (restart = stop → start、全断を伴う)
 hyoui web service status                   → {registered, running, pid, service: {...}, version: {...}, instances: [...]}
 hyoui web service log [--follow]           監督者と OS 側のログ
 
@@ -131,7 +131,7 @@ option 名は `hyoui web` 側 (`--listen` / `--web-assets-dir`) と一字一句�
 
 **`list` と `status` は配列ではなく `{units, supervisor, ...}` を返す。** 監督者が居ない時に「なぜ `running` が分からないのか」を添える必要があり (下記)、配列にはその置き場が無い。行ごとに `supervisor_running` を重ねるより、答えた相手を 1 箇所に置く。
 
-`hyoui web` の引数なし実行は gateway の foreground 起動 (`daemon run` と同義) のまま維持する。`hyoui web daemon` / `hyoui web service` の引数なし実行と、必須引数を欠く verb は help を出す。help 以外の出力は JSON、`log --follow` は JSONL、エラーは JSON を stderr に出して exit を非 0 にする (reference の出力規約)。
+**`hyoui web` の引数なし実行は help を出す。** gateway を foreground で起動する口は `hyoui web daemon run [name]` と、bind 先を明示した `hyoui web --listen=<host:port>` の 2 つに限る。引数なしで既定の listen を掴みに行く形は、常駐が居る環境では `Address already in use` にしかならず、`hyoui web` を「まず打ってみるコマンド」にできない (= 一番打たれやすい形が一番役に立たない)。`hyoui web daemon` / `hyoui web service` の引数なし実行と、必須引数を欠く verb も同じく help を出す。help 以外の出力は JSON、`log --follow` は JSONL、エラーは JSON を stderr に出して exit を非 0 にする (reference の出力規約)。
 
 ### 2. unit = 登録簿の 1 ファイル。listen も binary も解決して書く
 
@@ -276,6 +276,8 @@ backoff は llm-gateway と同じ形 (初回 1 秒から倍々、上限 60 秒)�
 
 **監督者を止めると子も止まる。** 監督者は SIGTERM / SIGINT で抱えている子を全部止めてから終わる (決定 3)。したがって `service stop` は全 gateway の停止、`service stop` → `service start` は**全断を伴う入れ替え**になる。子を生かしたまま監督者だけを入れ替える経路は持たない — 残ったプロセスが自分の子かどうかは pid では確かめられないので、引き取りを作らない判断 (決定 10) と同じ理由でできない。
 
+この入れ替えは `service restart` の 1 語で打てる。**`stop` → `start` を人が 2 回打つ形にしない**のは、途中で止まった時に「止まっているが上がっていない」状態を人の手元に残すため — 全断を 1 操作にまとめれば、始点と終点だけを見ればよい。macOS には launchd の入れ替え verb が無いので上の 2 手を続けて打ち、降ろす側の失敗は見ない (= 載っていなければ降ろす必要が無く、その時 `restart` は `start` と同じ意味になればよい)。定義が無い時は OS に頼む相手が居ないので断り、`register` を促す。
+
 この帰結として、**日常の更新は `daemon restart --all` (1 台ずつ、断なし) を使い、`service` 層の操作は監督者自身を入れ替える時だけに限る**。llm-gateway も同じ形 (DR-0028 §11: 行儀よく降りる限り子は道連れ) で、hyoui で変える理由は無い。gateway は状態を持たないので、道連れにされても失われるのは確立済みの WS 接続だけ (決定 8 のとおり、これは前段でも救えない)。
 
 **`service stop` を `launchctl stop` で実装してはいけない。** `KeepAlive=true` なので `launchctl stop` が送る SIGTERM の後 launchd が即座に上げ直す。systemd は逆で、`Restart=always` でも明示 `stop` は尊重する。この非対称を verb ごとに吸収する:
@@ -286,6 +288,7 @@ backoff は llm-gateway と同じ形 (初回 1 秒から倍々、上限 60 秒)�
 | `unregister` | `bootout` → plist 削除 → `enable` | `disable --now` → unit 削除 → `daemon-reload` |
 | `start` | `enable` → `bootstrap` (既に載っていれば `kickstart`) | `systemctl --user start <unit>` |
 | `stop` | `bootout gui/$UID/<label>` → `disable gui/$UID/<label>` | `systemctl --user stop <unit>` |
+| `restart` | `stop` の 2 手 → `start` の 2 手 (降ろす側の失敗は見ない) | `systemctl --user restart <unit>` |
 | `status` | `print gui/$UID/<label>` + `print-disabled gui/$UID` | `is-enabled` / `show -p LoadState --value` / `show -p MainPID --value` |
 | `log` | `~/Library/Logs/hyoui-web/<label>.log` を読む | `journalctl --user -u hyoui-web-supervise` |
 
@@ -308,7 +311,7 @@ backoff は llm-gateway と同じ形 (初回 1 秒から倍々、上限 60 秒)�
  "instances": [ /* daemon status と同じ行 */ ]}
 ```
 
-監督者の `running` 版は制御 socket の status 応答に載る `supervisor_version` から取り、`on_disk` は OS 側の定義に焼かれた path の実行ファイルに聞く。`restart_needed: true` は「brew を上げたが監督者を上げ直していない」状態で、そこで打つのが `service stop` → `service start` (全断を伴う、決定 6)。`instances` は監督者に聞いた unit の配列で、監督者が居なければ空配列と `running: false` になる。
+監督者の `running` 版は制御 socket の status 応答に載る `supervisor_version` から取り、`on_disk` は OS 側の定義に焼かれた path の実行ファイルに聞く。`restart_needed: true` は「brew を上げたが監督者を上げ直していない」状態で、そこで打つのが `service restart` (全断を伴う、決定 6)。`instances` は監督者に聞いた unit の配列で、監督者が居なければ空配列と `running: false` になる。
 
 ### 7. gateway に `/healthz` と `/version` を足す
 

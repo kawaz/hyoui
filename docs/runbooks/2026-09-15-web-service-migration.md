@@ -77,14 +77,16 @@ canddy の hyoui ブロックを `reverse_proxy 127.0.0.1:43691 127.0.0.1:43690`
 | 今の状態を見る | `hyoui web daemon status` / `hyoui version` |
 | ログを見る | `hyoui web daemon log <name> --follow` |
 | 監督者自身を見る | `hyoui web service status` / `hyoui web service log` |
+| 監督者を新しい版に入れ替える (全断) | `hyoui web service restart` |
 
-**`service` 層は監督者自身を入れ替える時だけ触る。** `service stop` と
+**`service` 層は監督者自身を入れ替える時だけ触る。** `service restart` / `service stop` と
 `service register` の再実行は監督者の再起動を伴い、抱えている子が道連れで一度落ちる
 (決定 6) = 全断。gateway を更新したいだけなら `daemon restart` を使う。
 
-`register` をやり直す必要があるのは (a) brew で `hyoui` を上げて監督者の path を
-新しい版に向け直す時、(b) 監督者の定義そのもの (label / 環境 / log path) を変えた時
-だけ。unit を足しても消しても定義は変わらない。
+brew で `hyoui` を上げた後は `service restart` だけでよい (定義に焼いた path は
+安定な場所を指しているので、`register` のやり直しは要らない)。`register` を
+やり直す必要があるのは監督者の定義そのもの (label / 環境 / log path / 焼く binary の
+path) を変えた時だけで、unit を足しても消しても定義は変わらない。
 
 ## 戻し方
 
