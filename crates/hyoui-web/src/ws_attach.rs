@@ -23,6 +23,8 @@
 //!   drop で daemon 側 attach が cleanup される (= 明示 Detach message は送らない、
 //!   socket 切断で daemon の `handle_client_disconnect` に任せる)。
 //! - daemon 切断 / recv error → bridge Err で終了、writer task が WS close を送る。
+//! - bridge が終わっても **writer は送り切るまで待つ** (= 積まれた frame → Close の
+//!   順で出し切る)。理由を伝えてから閉じる経路が client から reset に見えないため。
 //! - `send_raw_bytes` の `Error::Remote` (= daemon が ro-rejected / lock-not-held を
 //!   ack で返した) は log 出すのみで bridge は継続 (= 意味論的失敗であって protocol
 //!   fatal ではない)。それ以外の I/O / poison / timeout は fatal で終了。
@@ -47,6 +49,12 @@ use crate::auth::WsAuth;
 use crate::contract::{
     AttachMode, ClientFrame, ErrorInfo, ServerFrame, WEB_PROTOCOL_VERSION, code,
 };
+
+/// bridge 終了後、writer が残り frame と Close を送り切るのを待つ上限。
+///
+/// 相手が読まないまま黙ると socket の送信 buffer が埋まって writer は進めなくなる。
+/// その 1 接続のために handler を残さないため、待ちは有限にする。
+const WRITER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// bridge thread への入力コマンド。
 enum BridgeCmd {
@@ -180,7 +188,7 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf, auth: WsAuth) -> 
     });
 
     // Task B: bridge output → WS binary。
-    let writer_task = tokio::spawn(async move {
+    let mut writer_task = tokio::spawn(async move {
         while let Some(output) = output_rx.recv().await {
             let message = match output {
                 BridgeOutput::Bytes(bytes) => Message::Binary(bytes.into()),
@@ -203,9 +211,22 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf, auth: WsAuth) -> 
     })
     .await;
 
-    // どちらの task も bridge 終了で自然に自走停止するが、念のため abort で明示閉じ。
+    // reader は client の次の frame を待って止まりうるので abort で降ろす。ここで
+    // 先に降ろすのは writer の出口を開けるためでもある: reader は形式違反応答用の
+    // sender を持っており、それが落ちるまで writer の queue は閉じない。
     reader_task.abort();
-    writer_task.abort();
+    let _ = reader_task.await;
+
+    // **writer は abort しない。** queue に積まれた frame を送り切り、自分で Close
+    // を送って終わるのを待つ。送り切る前に落とすと、失効応答のように「理由を伝えて
+    // から閉じる」経路 (DR-0036 決定 4) で client からは reset に見え、理由を読めない
+    // まま切れる。相手が読まないまま黙った時に handler が残らないよう待ちは有限。
+    if tokio::time::timeout(WRITER_DRAIN_TIMEOUT, &mut writer_task)
+        .await
+        .is_err()
+    {
+        writer_task.abort();
+    }
 
     match bridge_res {
         Ok(Ok(())) => Ok(()),
