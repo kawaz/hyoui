@@ -272,7 +272,7 @@ pub struct WebDaemonAddConfig {
 #[non_exhaustive]
 pub enum WebDaemonCommand {
     /// `hyoui web daemon run [name]` — この unit を foreground 起動する。
-    /// name 省略時は `hyoui web` と同じ解決 (= config `[web].listen`)。
+    /// name 省略時は登録簿を見ず config `[web].listen` で解決する。
     Run {
         /// 起動する unit 名。
         name: Option<String>,
@@ -363,7 +363,8 @@ pub enum WebSessionCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WebCommand {
-    /// `hyoui web [options]` — HTTP gateway を foreground 起動する。
+    /// `hyoui web <options>` — HTTP gateway を foreground 起動する。option を
+    /// 1 つも渡さない形は help なので、ここに来るのは明示された時だけ。
     Serve(WebConfig),
     /// `hyoui web daemon ...` — gateway instance (= unit) を管理する。
     Daemon(WebDaemonCommand),
@@ -2791,7 +2792,7 @@ Exit codes:
 /// `hyoui web` subcommand の usage (DR-0027 + DR-0031)。
 fn usage_web() -> String {
     "\
-hyoui web [--listen=<host:port>] [--web-assets-dir=<path>]
+hyoui web --listen=<host:port> [--web-assets-dir=<path>]
 hyoui web daemon <subcommand>
 hyoui web service <subcommand>
 hyoui web passkey <subcommand>
@@ -2800,6 +2801,9 @@ hyoui web session <subcommand>
 Start the HTTP gateway, or manage its instances, its per-user OS service, and
 who may open it.
 
+No arguments prints this help. To start a gateway in the foreground, either
+name the unit (`hyoui web daemon run <name>`) or give the bind address here.
+
 SUBCOMMANDS:
   daemon     Register, inspect, and run gateway instances (units).
   service    Register, unregister, or inspect OS startup integration.
@@ -2807,8 +2811,10 @@ SUBCOMMANDS:
   session    Inspect and revoke authenticated browser sessions.
 
 OPTIONS:
-  --listen=<host:port>       Override bind address (default: config
-                             `[web].listen` or `127.0.0.1:43690`).
+  --listen=<host:port>       Bind address to serve on. Giving it is what makes
+                             this verb start a gateway; `--web-assets-dir`
+                             alone falls back to config `[web].listen` or
+                             `127.0.0.1:43690`.
   --web-assets-dir=<path>    Serve static assets from a local directory (dev
                              mode). Falls back to config `[web].assets_dir`;
                              when both are unset, embedded assets are used.
@@ -3159,8 +3165,10 @@ Start one gateway in the foreground, reading the unit's bind address and assets
 directory from the registry. This is the same path the supervisor uses to start
 a child, so it is also how to try a single unit by hand.
 
-Without a name, this behaves like plain `hyoui web`: the bind address comes from
-config `[web].listen`, or `127.0.0.1:43690` when that is unset.
+Without a name, the registry is not read at all: the bind address comes from
+config `[web].listen`, or `127.0.0.1:43690` when that is unset. There is no
+\"default unit\" -- picking the only registered one would change what this
+command means the moment a second unit is added.
 
 OPTIONS:
   --help, -h    Show this help.
@@ -4627,6 +4635,14 @@ fn parse_web(args: &[String]) -> Command {
     }
     if args.first().map(String::as_str) == Some("session") {
         return parse_web_session(&args[1..]);
+    }
+    // 引数なしは help。既定の listen で foreground 起動すると、常駐が居る環境では
+    // `Address already in use` にしかならないので、この形を既定の入口にしない
+    // (= 手元で 1 台上げる口は `web daemon run` と、明示 option 付きのこの verb)。
+    if args.is_empty() {
+        return Command::Help {
+            topic: HelpTopic::Web,
+        };
     }
 
     let mut listen: Option<String> = None;
@@ -11663,12 +11679,21 @@ mod tests {
         assert!(parse_max_bytes("1.5m").is_err()); // decimal 非対応
     }
 
-    /// `hyoui web` の既存 no-arg gateway 起動 semantics は service family 追加後も維持する。
+    /// 引数なしの `hyoui web` は help。foreground 起動は option を明示した時だけ。
     #[test]
-    fn parse_web_no_args_starts_gateway() {
+    fn parse_web_no_args_shows_help() {
         assert_eq!(
             parse_args(&args(&["web"])),
-            Command::Web(WebCommand::Serve(WebConfig::default()))
+            Command::Help {
+                topic: HelpTopic::Web
+            }
+        );
+        assert_eq!(
+            parse_args(&args(&["web", "--listen=127.0.0.1:43799"])),
+            Command::Web(WebCommand::Serve(WebConfig {
+                listen: Some("127.0.0.1:43799".to_string()),
+                assets_dir: None,
+            }))
         );
     }
 

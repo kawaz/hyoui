@@ -466,8 +466,8 @@ pub fn version_command() -> ExitCode {
 /// `hyoui web daemon run [name]`。
 ///
 /// name を渡すと登録簿の値で起動する。監督者が子を exec するのと同じ経路で、
-/// 手元で 1 台だけ確かめる時にも使う (決定 3)。name 省略時は `hyoui web` と
-/// 同じ解決 (= config `[web].listen`) で起動する (決定 1)。
+/// 手元で 1 台だけ確かめる時にも使う (決定 3)。name 省略時は登録簿を見ず、
+/// config `[web].listen` で解決して起動する (決定 1)。
 pub fn run_command(name: Option<&str>) -> ExitCode {
     let context = "web daemon run";
     let config = match hyoui::config::load() {

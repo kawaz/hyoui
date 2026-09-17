@@ -4790,8 +4790,8 @@ mod tests {
         for argv in [
             vec!["run", "--", "/bin/cat"],
             vec!["attach", "demo"],
-            // HTTP gateway 起動は `hyoui web` (= subcommand 無し)。
-            vec!["web"],
+            // HTTP gateway 起動は bind 先を明示した `hyoui web`。
+            vec!["web", "--listen=127.0.0.1:43799"],
         ] {
             let owned: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
             let cmd = parse_args(&owned);
