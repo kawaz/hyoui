@@ -261,6 +261,8 @@ pub trait Backend {
     fn start(&self, label: &str) -> Result<(), String>;
     /// 止めて、再 login / 再 bootstrap を跨いでも上がらないようにする。
     fn stop(&self, label: &str) -> Result<(), String>;
+    /// 止めて上げ直す (= 全断を伴う入れ替え、決定 6)。
+    fn restart(&self, label: &str) -> Result<(), String>;
     fn status(&self, label: &str) -> Result<ServiceStatus, String>;
     /// ログの取り出し方。
     fn log_source(&self, label: &str) -> Result<LogSource, String>;
@@ -441,6 +443,15 @@ impl Backend for LaunchdBackend {
         Ok(())
     }
 
+    fn restart(&self, label: &str) -> Result<(), String> {
+        // launchd に「入れ替え」の verb は無く、`bootout` + `disable` → `enable` +
+        // `bootstrap` の 2 手になる (決定 6 の verb 表)。降ろす側の失敗は見ない:
+        // 載っていなければ降ろす必要が無く、その時 restart は start と同じ意味に
+        // なればよい (= 冪等)。上げ直しの成否だけを結果とする。
+        let _ = self.stop(label);
+        self.start(label)
+    }
+
     fn status(&self, label: &str) -> Result<ServiceStatus, String> {
         let path = self.definition_path(label)?;
         let target = Self::target(label);
@@ -508,6 +519,14 @@ impl Backend for SystemdBackend {
     fn stop(&self, label: &str) -> Result<(), String> {
         // `Restart=always` でも明示 `stop` は尊重されるので、`disable` は要らない。
         command_success("systemctl", &["--user", "stop", &systemd_unit_name(label)])
+    }
+
+    fn restart(&self, label: &str) -> Result<(), String> {
+        // systemd は入れ替えを 1 語で持ち、止まっている相手にも使える (= 冪等)。
+        command_success(
+            "systemctl",
+            &["--user", "restart", &systemd_unit_name(label)],
+        )
     }
 
     fn log_source(&self, label: &str) -> Result<LogSource, String> {
@@ -736,22 +755,51 @@ pub fn unregister_command() -> ExitCode {
     }))
 }
 
-/// `hyoui web service start` / `stop`。
-pub fn start_command(start: bool) -> ExitCode {
-    let context = if start {
-        "web service start"
-    } else {
-        "web service stop"
-    };
+/// 監督者そのものに対する操作 (= 決定 6、unit 単位の `daemon` 側とは別)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorVerb {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl SupervisorVerb {
+    fn context(self) -> &'static str {
+        match self {
+            Self::Start => "web service start",
+            Self::Stop => "web service stop",
+            Self::Restart => "web service restart",
+        }
+    }
+}
+
+/// `hyoui web service start` / `stop` / `restart`。
+pub fn control_command(verb: SupervisorVerb) -> ExitCode {
+    let context = verb.context();
     let backend = match backend() {
         Ok(backend) => backend,
         Err(error) => return fail(context, &error),
     };
     let label = default_label();
-    let result = if start {
-        backend.start(&label)
-    } else {
-        backend.stop(&label)
+    // 上げる側の verb は、定義が無ければ OS に頼む相手が居ない。backend ごとの
+    // メッセージ (launchd は path、systemd は unit not found) に任せると何を
+    // すればよいか伝わらないので、ここで register への道を示して断る。
+    if matches!(verb, SupervisorVerb::Restart)
+        && let Ok(path) = backend.definition_path(&label)
+        && !path.is_file()
+    {
+        return fail(
+            context,
+            &format!(
+                "{} does not exist; run `hyoui web service register` first",
+                path.display()
+            ),
+        );
+    }
+    let result = match verb {
+        SupervisorVerb::Start => backend.start(&label),
+        SupervisorVerb::Stop => backend.stop(&label),
+        SupervisorVerb::Restart => backend.restart(&label),
     };
     if let Err(error) = result {
         return fail(context, &error);

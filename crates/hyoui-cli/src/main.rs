@@ -504,8 +504,15 @@ fn main() -> ExitCode {
                 web_service::register_command(cfg.binary)
             }
             WebCommand::Service(WebServiceCommand::Unregister) => web_service::unregister_command(),
-            WebCommand::Service(WebServiceCommand::Start) => web_service::start_command(true),
-            WebCommand::Service(WebServiceCommand::Stop) => web_service::start_command(false),
+            WebCommand::Service(WebServiceCommand::Start) => {
+                web_service::control_command(web_service::SupervisorVerb::Start)
+            }
+            WebCommand::Service(WebServiceCommand::Stop) => {
+                web_service::control_command(web_service::SupervisorVerb::Stop)
+            }
+            WebCommand::Service(WebServiceCommand::Restart) => {
+                web_service::control_command(web_service::SupervisorVerb::Restart)
+            }
             WebCommand::Service(WebServiceCommand::Status) => web_service::status_command(),
             WebCommand::Service(WebServiceCommand::Log { follow }) => {
                 web_service::log_command(follow)

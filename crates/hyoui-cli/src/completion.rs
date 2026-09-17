@@ -261,7 +261,7 @@ _hyoui() {
             local service_sub
             service_sub="$(_hyoui_child_of service)"
             if [[ -z "$service_sub" ]]; then
-                COMPREPLY=( $(compgen -W "register unregister start stop status log --help -h" -- "$cur") )
+                COMPREPLY=( $(compgen -W "register unregister start stop restart status log --help -h" -- "$cur") )
                 return 0
             fi
             case "$service_sub" in
@@ -274,7 +274,7 @@ _hyoui() {
                 log)
                     COMPREPLY=( $(compgen -W "--follow --help -h" -- "$cur") )
                     return 0 ;;
-                unregister|start|stop|status)
+                unregister|start|stop|restart|status)
                     COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
                     return 0 ;;
             esac
@@ -762,7 +762,7 @@ _hyoui_service() {
     local word
     for word in $words; do
         case $word in
-            register|unregister|start|stop|status|log) leaf=$word; break ;;
+            register|unregister|start|stop|restart|status|log) leaf=$word; break ;;
         esac
     done
     case $leaf in
@@ -776,12 +776,12 @@ _hyoui_service() {
                 '--follow[Keep printing lines as they are written]' \
                 '(-h --help)'{-h,--help}'[Show help]'
             ;;
-        unregister|start|stop|status)
+        unregister|start|stop|restart|status)
             _arguments '(-h --help)'{-h,--help}'[Show help]'
             ;;
         *)
             _arguments \
-                '1:service subcommand:(register unregister start stop status log)' \
+                '1:service subcommand:(register unregister start stop restart status log)' \
                 '(-h --help)'{-h,--help}'[Show help]'
             ;;
     esac
@@ -1376,6 +1376,7 @@ complete -c hyoui -n __hyoui_web_service_no_sub -f -a register -d 'Install or re
 complete -c hyoui -n __hyoui_web_service_no_sub -f -a unregister -d 'Stop the supervisor and remove its definition'
 complete -c hyoui -n __hyoui_web_service_no_sub -f -a start -d 'Start the supervisor'
 complete -c hyoui -n __hyoui_web_service_no_sub -f -a stop -d 'Stop the supervisor and every gateway it holds'
+complete -c hyoui -n __hyoui_web_service_no_sub -f -a restart -d 'Stop and start the supervisor, taking every gateway down in between'
 complete -c hyoui -n __hyoui_web_service_no_sub -f -a status -d 'Print registration, OS state, versions, and units held'
 complete -c hyoui -n __hyoui_web_service_no_sub -f -a log -d "Print the supervisor's own log"
 complete -c hyoui -n '__hyoui_web_service_using_sub register' -l binary -r -F -d 'Executable to bake in as the supervisor'
@@ -1383,6 +1384,7 @@ complete -c hyoui -n '__hyoui_web_service_using_sub register' -s h -l help -d 'S
 complete -c hyoui -n '__hyoui_web_service_using_sub unregister' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_web_service_using_sub start' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_web_service_using_sub stop' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_web_service_using_sub restart' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_web_service_using_sub status' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_web_service_using_sub log' -l follow -d 'Keep printing lines as they are written'
 complete -c hyoui -n '__hyoui_web_service_using_sub log' -s h -l help -d 'Show help and exit'

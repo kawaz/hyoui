@@ -102,6 +102,7 @@ fn help_routes_through_web_service_tree() {
         (&["web", "service", "unregister", "--help"][..], "remove"),
         (&["web", "service", "start", "--help"][..], "supervisor"),
         (&["web", "service", "stop", "--help"][..], "full outage"),
+        (&["web", "service", "restart", "--help"][..], "full outage"),
         (
             &["web", "service", "status", "--help"][..],
             "control socket",
@@ -117,7 +118,28 @@ fn help_routes_through_web_service_tree() {
     // 親の help は子の全 verb を並べる。
     let parent = hyoui(&["web", "service"], home.path());
     let stdout = String::from_utf8_lossy(&parent.stdout);
-    for verb in ["register", "unregister", "start", "stop", "status", "log"] {
+    for verb in [
+        "register",
+        "unregister",
+        "start",
+        "stop",
+        "restart",
+        "status",
+        "log",
+    ] {
         assert!(stdout.contains(verb), "{verb} missing from {stdout}");
     }
+}
+
+/// 未登録の隔離 HOME では `restart` は register への道を示して断る (= 決定 6)。
+///
+/// 上げ直しは launchd / systemd に頼む操作なので、頼む相手 (定義) が無い時に
+/// backend のメッセージへ落とさず、何をすればよいかを言う口を固定する。
+#[test]
+fn restart_refuses_when_nothing_is_registered() {
+    let home = tempfile::tempdir().expect("isolated HOME");
+    let output = hyoui(&["web", "service", "restart"], home.path());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("hyoui web service register"), "{stderr}");
 }

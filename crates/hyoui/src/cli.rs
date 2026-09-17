@@ -193,6 +193,8 @@ pub enum HelpTopic {
     WebServiceStart,
     /// Help for `web service stop` (= DR-0034 決定 6)。
     WebServiceStop,
+    /// Help for `web service restart` (= DR-0034 決定 6)。
+    WebServiceRestart,
     /// Help for `web service log` (= DR-0034 決定 6)。
     WebServiceLog,
     /// Help for `web service unregister` (= DR-0031)。
@@ -240,6 +242,8 @@ pub enum WebServiceCommand {
     Start,
     /// 監督者を停止する (= 抱えている子も止まる)。
     Stop,
+    /// 監督者を止めて上げ直す (= 全断を伴う入れ替え、決定 6)。
+    Restart,
     /// 登録有無・OS 側の状態・版・抱えている unit を表示する。
     Status,
     /// 監督者と OS 側のログ。
@@ -2682,6 +2686,7 @@ pub fn usage(topic: &HelpTopic) -> String {
         HelpTopic::WebServiceRegister => usage_web_service_register(),
         HelpTopic::WebServiceStart => usage_web_service_start(),
         HelpTopic::WebServiceStop => usage_web_service_stop(),
+        HelpTopic::WebServiceRestart => usage_web_service_restart(),
         HelpTopic::WebServiceLog => usage_web_service_log(),
         HelpTopic::WebServiceUnregister => usage_web_service_unregister(),
         HelpTopic::WebServiceStatus => usage_web_service_status(),
@@ -3251,6 +3256,7 @@ SUBCOMMANDS:
   unregister    Stop the supervisor and remove its definition.
   start         Start the supervisor.
   stop          Stop the supervisor, and with it every gateway it holds.
+  restart       Stop and start it again, taking every gateway down in between.
   status        Print registration, OS state, versions, and the units held.
   log           Print the supervisor's own log.
 
@@ -3259,7 +3265,8 @@ OPTIONS:
 
 Day-to-day gateway updates use `hyoui web daemon restart`, which replaces units
 one at a time without a gap. Reach for this command group only to change the
-supervisor itself: stopping it takes every gateway down with it.
+supervisor itself: stopping it takes every gateway down with it, and so does
+`restart`.
 "
     .to_string()
 }
@@ -3351,6 +3358,30 @@ back.
 
 To replace a rebuilt gateway without an outage, use
 `hyoui web daemon restart <name>` instead.
+
+OPTIONS:
+  --help, -h    Show this help.
+"
+    .to_string()
+}
+
+fn usage_web_service_restart() -> String {
+    "\
+hyoui web service restart
+
+Stop the supervisor and start it again, which is how a newly installed
+supervisor binary is picked up (`status` reports `restart_needed` when the
+version on disk differs from the running one).
+
+This is a full outage: **every gateway it holds goes down and comes back with
+it**. There is no way to swap the supervisor while its children keep running --
+a new supervisor cannot tell which leftover processes were its predecessor's.
+To replace a rebuilt gateway without an outage, use
+`hyoui web daemon restart --all` instead.
+
+Running this while it is already stopped just starts it, and it also clears the
+\"do not start\" marker left by `stop`. It refuses when nothing is registered --
+run `hyoui web service register` first.
 
 OPTIONS:
   --help, -h    Show this help.
@@ -5178,11 +5209,12 @@ fn parse_web_service(args: &[String]) -> Command {
             }
             Command::Web(WebCommand::Service(WebServiceCommand::Log { follow }))
         }
-        "unregister" | "start" | "stop" | "status" => {
+        "unregister" | "start" | "stop" | "restart" | "status" => {
             let topic = match head {
                 "unregister" => HelpTopic::WebServiceUnregister,
                 "start" => HelpTopic::WebServiceStart,
                 "stop" => HelpTopic::WebServiceStop,
+                "restart" => HelpTopic::WebServiceRestart,
                 _ => HelpTopic::WebServiceStatus,
             };
             if rest.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
@@ -5195,6 +5227,7 @@ fn parse_web_service(args: &[String]) -> Command {
                 "unregister" => WebServiceCommand::Unregister,
                 "start" => WebServiceCommand::Start,
                 "stop" => WebServiceCommand::Stop,
+                "restart" => WebServiceCommand::Restart,
                 _ => WebServiceCommand::Status,
             };
             Command::Web(WebCommand::Service(command))
@@ -7204,8 +7237,15 @@ pub const RECORD_SUBCOMMANDS: &[&str] = &["start", "stop", "list"];
 pub const CONFIG_SUBCOMMANDS: &[&str] = &["path", "show"];
 
 /// `hyoui web service` の子 subcommand 一覧 (= DR-0031)。
-pub const WEB_SERVICE_SUBCOMMANDS: &[&str] =
-    &["register", "unregister", "start", "stop", "status", "log"];
+pub const WEB_SERVICE_SUBCOMMANDS: &[&str] = &[
+    "register",
+    "unregister",
+    "start",
+    "stop",
+    "restart",
+    "status",
+    "log",
+];
 
 /// `hyoui web daemon` の子 subcommand 一覧 (= `parse_web_daemon` が dispatch する値)。
 pub const WEB_DAEMON_SUBCOMMANDS: &[&str] = &[
@@ -11753,6 +11793,10 @@ mod tests {
             Command::Web(WebCommand::Service(WebServiceCommand::Stop))
         );
         assert_eq!(
+            parse_args(&args(&["web", "service", "restart"])),
+            Command::Web(WebCommand::Service(WebServiceCommand::Restart))
+        );
+        assert_eq!(
             parse_args(&args(&["web", "service", "log"])),
             Command::Web(WebCommand::Service(WebServiceCommand::Log {
                 follow: false
@@ -11765,6 +11809,7 @@ mod tests {
         for (verb, topic) in [
             ("start", HelpTopic::WebServiceStart),
             ("stop", HelpTopic::WebServiceStop),
+            ("restart", HelpTopic::WebServiceRestart),
             ("log", HelpTopic::WebServiceLog),
         ] {
             assert_eq!(
@@ -11817,6 +11862,9 @@ mod tests {
         assert!(usage(&HelpTopic::WebServiceStatus).contains("control socket"));
         assert!(usage(&HelpTopic::WebServiceStart).contains("supervisor"));
         assert!(usage(&HelpTopic::WebServiceStop).contains("full outage"));
+        // restart は「全断」と「register が前提」の両方を言う (= 決定 6)。
+        assert!(usage(&HelpTopic::WebServiceRestart).contains("full outage"));
+        assert!(usage(&HelpTopic::WebServiceRestart).contains("register"));
         assert!(usage(&HelpTopic::WebServiceLog).contains("--follow"));
     }
 
