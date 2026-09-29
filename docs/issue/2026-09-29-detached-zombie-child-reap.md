@@ -1,11 +1,11 @@
 ---
 title: hyoui run --detached の子 claude が zombie になった時に親が自動回収して終了する
-status: open
+status: wip
 category: bug
 created: 2026-09-29T14:01:29+09:00
-last_read:
+last_read: 2026-09-29T14:04:31+09:00
 open_entered: 2026-09-29T14:01:29+09:00
-wip_entered:
+wip_entered: 2026-09-29T14:04:31+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
@@ -39,12 +39,19 @@ kawaz 裁定 2026-09-29。観測した実例:
 waitingFor: "dialog open"` のまま残る → `claude agents --json` が死んだ
 セッションを waiting として返し続け、ccmsg webui に残骸が出る。
 
-実装の採否・方法は hyoui 側で裏取りして判断する (このリポの責務)。
+## 真因の観測 (2026-09-29、統括)
 
-## 受け入れ条件
+「親が wait していない」ではない。daemon には SIGCHLD self-pipe + `waitpid` の回収経路がある (`sys/signal.rs`、`daemon/session.rs`)。止まっているのは daemon のイベントループ全体:
 
-- [ ] `hyoui run --detached` の子プロセスが終了した時、親 hyoui が検知して
-      `wait(2)` 相当の回収を行い zombie を残さない
-- [ ] 親 hyoui 自身も (再起動方針がなければ) 子の終了とともに終了する
-- [ ] 上記により Claude Code 側の session json が waiting のまま残留しなくなる
-      ことを実機で確認する
+- daemon 46980 の親 46979 は `hyoui attach run-46979-3e1f4139` で **STAT `T` (停止中)**。kawaz の zsh (68878) のジョブとして suspend されたまま
+- `sample 46980`: writer thread が `__sendto` (unix socket `run-46979-3e1f4139.sock` への送信) でブロック、main thread は `_pthread_join` でその thread を待っている
+- `hyoui list` は当該セッションを `stale` と表示
+
+構図: attach client が停止して socket を読まない → kernel の socket バッファが埋まる → `broadcast.rs` の `writer_pump` の `write_all` が永久ブロック → backpressure overflow で disconnect しようとして `ClientHandle::drop` に入る → `set_write_timeout(DROP_FLUSH_TIMEOUT)` を設定してから `join` するが、**既に `sendto` でブロック済みの write には後付けの `SO_SNDTIMEO` が効かない** (仮説、要実機検証) → join が返らず daemon が固まる → SIGCHLD 回収も走らず子が zombie。
+
+## 受け入れ条件 (改訂)
+
+- [ ] 再現: attach client を `SIGSTOP` で止めたまま子に大量出力させると daemon が上記の状態 (writer thread が sendto、main が join) になることを実機で確認する
+- [ ] 修正後: 同条件で daemon が stopped client を bounded time で切断し、イベントループが継続する (他 client の attach / `hyoui list` が応答する)
+- [ ] 修正後: その状態で子が exit したら daemon が回収して終了し、zombie が残らない
+- [ ] Claude Code 側の session json が waiting のまま残留しなくなることを実機で確認する
