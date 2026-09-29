@@ -36,3 +36,9 @@
 - [ ] d: iPad: nvim 等 (mouse 有効 TUI) で focus 済み tap → カーソルがタップ位置へジャンプしない
 - [ ] e: iPad: focus 済み tap でキーボードが閉じる / パネル open 中の tap は close のみ
 - [ ] f: popup ブロック環境でリンクを開くと URL + コピーボタンのパネルが出る (Esc / × で閉じる)
+
+### 👺HANG-C1: v0.9.55 で stopped client を抱えた daemon が固まらないことの実機確認
+
+- [ ] a: 新版 (0.9.55 以降) で `hyoui run --detached -- <長く出力するコマンド>` を起動し `hyoui attach` して ^Z で attach client を止め、そのまま子が大量出力しても `hyoui list` で当該セッションが live のまま応答する (stale にならない)
+- [ ] b: その状態で子を終了させると daemon が exit し、`ps` に zombie が残らない
+- [ ] c: `hyoui web service restart` で gateway が 0.9.55 になっている (statusline / `hyoui web service status` の版で確認)
