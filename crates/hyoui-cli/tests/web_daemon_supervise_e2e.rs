@@ -154,8 +154,9 @@ fn the_supervisor_starts_units_and_restarts_them_when_they_die() {
     );
 
     let supervisor = Supervised::start(home);
-    let status = supervisor.await_status("the unit to come up", |status| {
-        unit_row(status, "unstable").is_some_and(|unit| unit["running"] == true)
+    let status = supervisor.await_status("the unit to answer its version", |status| {
+        unit_row(status, "unstable")
+            .is_some_and(|unit| unit["running"] == true && unit["version"]["running"].is_object())
     });
 
     let unit = unit_row(&status, "unstable").expect("the unit is listed");

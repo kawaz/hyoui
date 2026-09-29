@@ -167,7 +167,10 @@ pub fn query_status(socket_path: &Path) -> StatusQueryResult {
     ) {
         Ok(conn) => conn,
         Err(crate::Error::Errno(nix::errno::Errno::ECONNREFUSED | nix::errno::Errno::ENOENT)) => {
-            if let Err(e) = std::fs::remove_file(socket_path)
+            if socket_path
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_socket())
+                && let Err(e) = std::fs::remove_file(socket_path)
                 && e.kind() != std::io::ErrorKind::NotFound
             {
                 eprintln!(
@@ -341,19 +344,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("unresponsive.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (release, wait_for_release) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            use std::io::Read;
-            let mut request = [0; 4];
-            stream.read_exact(&mut request).unwrap();
-            std::thread::sleep(LIST_RESPONSE_TIMEOUT + std::time::Duration::from_millis(100));
+            let (_stream, _) = listener.accept().unwrap();
+            wait_for_release.recv().unwrap();
         });
         let result = query_status(&path);
+        release.send(()).unwrap();
+        worker.join().unwrap();
         assert!(
-            matches!(result, StatusQueryResult::Hung { daemon_pid: Some(pid), .. } if pid == std::process::id())
+            matches!(result, StatusQueryResult::Hung { daemon_pid: Some(pid), .. } if pid == std::process::id()),
+            "result: {result:?}, self pid: {}",
+            std::process::id()
         );
         assert!(path.exists());
-        worker.join().unwrap();
     }
 
     #[test]
