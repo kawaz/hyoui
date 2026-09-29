@@ -220,8 +220,10 @@ pub mod code {
     pub const INVALID_INPUT_SPEC: &str = "invalid-input-spec";
     /// その名前の session が無い。
     pub const SESSION_NOT_FOUND: &str = "session-not-found";
-    /// entry はあるが stale (= socket 残骸 / handshake 失敗)。
-    pub const SESSION_STALE: &str = "session-stale";
+    /// entry はあるが daemon が応答しない。
+    pub const SESSION_NO_RESPONSE: &str = "session-no-response";
+    /// 接続後に明示的なエラーが返った。
+    pub const SESSION_ERROR: &str = "session-error";
     /// asset が無い。
     pub const ASSET_NOT_FOUND: &str = "asset-not-found";
     /// asset path に `..` / 空 component が含まれる。

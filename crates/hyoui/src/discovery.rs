@@ -14,18 +14,11 @@
 //!
 //! ## 死活判定
 //!
-//! - `probe_liveness` = unix socket connect の可否 (blocking)
-//! - live なら `query_status` = `ClientConnection` 経由で `status.query` を投げ、
-//!   `StatusResponse` を回収 (= 同じ経路を `hyoui-cli` list も使う)。
+//! `query_status` が connect 拒否と接続後の応答失敗を区別する。接続拒否 socket は削除し、接続済みの daemon は無応答でも保持する。
 //!
-//! ## 設計判断 (Phase 1)
-//!
-//! `hyoui-cli::socket_path::existing_base_dirs` / `list_candidate_dirs_all_namespaces`
-//! と機能重複するが、後者は format / prune / jsonl / namespace flag 解決 と絡んで
-//! いて cli binary に閉じている。Phase 1 では **移設ではなく重複** で始め、Phase 2
-//! 以降で必要になったら統合する (= 現時点で移設すると hyoui-cli 側の書き換え範囲が
-//! 大きくなり Phase 1 のスコープを超える)。
+//! CLI と web gateway が同じ接続判定を利用する。socket 配置の走査と出力形式は各 caller が管理する。
 
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
 use crate::client::{AttachOptions, ClientConnection};
@@ -34,8 +27,7 @@ use crate::protocol::{ControlMessage, MVP_CAPS, Mode};
 
 /// 1 session に対応する discovery 結果。
 ///
-/// `live` (= status.query 応答あり) と `stale` (= socket 残骸 or handshake 失敗)
-/// を variant で区別する。format / prune 責務は持たない (= caller 側の仕事)。
+/// 応答した session と応答しない session を区別する。
 #[derive(Debug, Clone)]
 pub struct SessionEntry {
     /// session id (= socket file の `.sock` を除いた stem)。
@@ -50,14 +42,24 @@ pub struct SessionEntry {
     pub status: SessionStatus,
 }
 
-/// [`SessionEntry`] の live / stale variant。
+/// 無応答を示す一覧 status。
+pub const NO_RESPONSE_STATUS: &str = "no-response";
+
+/// [`SessionEntry`] の daemon 状態。
 #[derive(Debug, Clone)]
 pub enum SessionStatus {
-    /// live daemon (= status.query が返した情報を保持)。
+    /// status.query が返した情報。
     Live(LiveInfo),
-    /// stale (= socket 残骸 / handshake 失敗 等)。理由文字列を保持。
-    Stale {
-        /// stale と判定した具体的な理由 (= caller が log / API 応答で使う)。
+    /// 接続済み daemon が handshake または status.query に応答しない。
+    Hung {
+        /// Unix socket peer credential から取得した daemon PID。
+        daemon_pid: Option<u32>,
+        /// 応答失敗の理由。
+        reason: String,
+    },
+    /// 接続先から明示的な拒否または protocol error が返った。
+    Error {
+        /// 失敗理由。
         reason: String,
     },
 }
@@ -123,16 +125,32 @@ pub fn existing_base_dirs() -> Vec<PathBuf> {
     out
 }
 
-/// unix socket connect による死活判定 (blocking、= local domain なので即応答)。
-pub fn probe_liveness(path: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(path).is_ok()
+/// status.query の応答期限。RAW_ACK_TIMEOUT と同じ 5 秒を取り、一時的な遅延を即座に無応答と判定しない。
+pub const LIST_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// status.query の結果と接続した daemon の peer PID。
+#[derive(Debug)]
+pub enum StatusQueryResult {
+    /// daemon が応答した。
+    Live(StatusResponse),
+    /// 接続後に daemon から応答を得られなかった。
+    Hung {
+        /// Unix socket の peer PID。
+        daemon_pid: Option<u32>,
+        /// 失敗理由。
+        reason: String,
+    },
+    /// 接続後の明示的な失敗。
+    Error {
+        /// 接続後の拒否または protocol failure。
+        reason: String,
+    },
+    /// connect が拒否されたため残骸 socket を削除した。
+    Gone,
 }
 
-/// 1 socket に status.query を投げ、`StatusResponse` を回収する。
-///
-/// 失敗理由 (connect / handshake / decode / daemon error) は文字列で返す。
-/// `hyoui-cli::query_status_for_list` と同じ pattern (= blocking、timeout なし)。
-pub fn query_status(socket_path: &Path) -> Result<StatusResponse, String> {
+/// 1 socket に status.query を投げ、接続失敗と無応答を区別する。
+pub fn query_status(socket_path: &Path) -> StatusQueryResult {
     let opts = AttachOptions {
         mode: Mode::Ro,
         caps: MVP_CAPS.iter().map(|s| (*s).to_string()).collect(),
@@ -140,43 +158,86 @@ pub fn query_status(socket_path: &Path) -> Result<StatusResponse, String> {
         exclusive: false,
         detach_others: false,
     };
-    let mut conn = ClientConnection::connect(socket_path, opts)
-        .map_err(|e| format!("connect/handshake: {e}"))?;
-    conn.send_control(&ControlMessage::StatusQuery(StatusQuery {}))
-        .map_err(|e| format!("send status.query: {e}"))?;
+    let mut peer_pid = None;
+    let mut conn = match ClientConnection::connect_with_timeout_and_peer(
+        socket_path,
+        opts,
+        Some(LIST_RESPONSE_TIMEOUT),
+        &mut peer_pid,
+    ) {
+        Ok(conn) => conn,
+        Err(crate::Error::Errno(nix::errno::Errno::ECONNREFUSED | nix::errno::Errno::ENOENT)) => {
+            if let Err(e) = std::fs::remove_file(socket_path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!(
+                    "hyoui: warning: failed to prune {}: {e}",
+                    socket_path.display()
+                );
+            }
+            return StatusQueryResult::Gone;
+        }
+        Err(e) => {
+            return if matches!(&e, crate::Error::Io(io) if matches!(io.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock))
+            {
+                StatusQueryResult::Hung {
+                    daemon_pid: peer_pid,
+                    reason: format!("5 秒応答なし: {e}"),
+                }
+            } else {
+                StatusQueryResult::Error {
+                    reason: format!("connect/handshake: {e}"),
+                }
+            };
+        }
+    };
+    if let Err(e) = conn.send_control(&ControlMessage::StatusQuery(StatusQuery {})) {
+        return StatusQueryResult::Error {
+            reason: format!("send status.query: {e}"),
+        };
+    }
     loop {
         match conn.recv_control(None) {
-            Ok(ControlMessage::StatusResponse(sr)) => return Ok(sr),
+            Ok(ControlMessage::StatusResponse(sr)) => return StatusQueryResult::Live(sr),
             Ok(ControlMessage::ModeChange(_)) | Ok(ControlMessage::LeaderNotify(_)) => continue,
             Ok(ControlMessage::Error(e)) => {
-                return Err(format!("daemon error: {:?} ({})", e.code, e.message));
+                return StatusQueryResult::Error {
+                    reason: format!("daemon error: {:?} ({})", e.code, e.message),
+                };
             }
             Ok(other) => {
-                return Err(format!(
-                    "unexpected response kind: {:?}",
-                    std::mem::discriminant(&other)
-                ));
+                return StatusQueryResult::Error {
+                    reason: format!(
+                        "unexpected response kind: {:?}",
+                        std::mem::discriminant(&other)
+                    ),
+                };
             }
-            Err(e) => return Err(format!("recv: {e}")),
+            Err(e) => {
+                return if matches!(&e, crate::Error::Io(io) if matches!(io.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock))
+                {
+                    StatusQueryResult::Hung {
+                        daemon_pid: peer_pid,
+                        reason: format!("5 秒応答なし: {e}"),
+                    }
+                } else {
+                    StatusQueryResult::Error {
+                        reason: format!("recv: {e}"),
+                    }
+                };
+            }
         }
     }
 }
 
-/// 全 namespace 横断で live session を列挙する。
+/// 全 namespace 横断で接続可能な session を列挙する。
 ///
-/// 各 base dir の直下 `*.sock` を default namespace、サブ dir 配下 `*.sock` を
-/// そのサブ dir 名の namespace として拾う。`probe_liveness` を通ったものだけ
-/// `query_status` して `LiveInfo` を埋める。stale (= probe fail or query fail)
-/// は `SessionStatus::Stale` として残す (= caller 側で filter する余地を残す)。
-///
-/// 並列化は Phase 1 では未実装 (= session 数が数十以下想定なので逐次で許容)。
-/// 必要なら `hyoui-cli::enrich_entries_with_status` 相当の thread fanout を後付け。
+/// 接続拒否 socket は削除して結果から除外し、接続後の応答失敗は PID を添えて保持する。なお各 socket の応答待ちは最大 5 秒。
 pub fn list_sessions() -> Vec<SessionEntry> {
-    let now = std::time::SystemTime::now();
     let mut out: Vec<SessionEntry> = Vec::new();
     for base in existing_base_dirs() {
         // base 直下の `*.sock` = default namespace。
-        collect_socks_in_dir(&base, crate::cli::DEFAULT_NAMESPACE, now, &mut out);
+        collect_socks_in_dir(&base, crate::cli::DEFAULT_NAMESPACE, &mut out);
         // base 配下のサブ dir = 各 namespace。
         let read = match std::fs::read_dir(&base) {
             Ok(r) => r,
@@ -195,42 +256,39 @@ pub fn list_sessions() -> Vec<SessionEntry> {
                 // base 直下と同じ扱い、重複回避。
                 continue;
             }
-            collect_socks_in_dir(&path, &ns, now, &mut out);
+            collect_socks_in_dir(&path, &ns, &mut out);
         }
     }
     // mtime 昇順で安定化 (= hyoui-cli list と同じ順序)。
     out.sort_by_key(|e| e.started_unix_ms);
-    for e in out.iter_mut() {
-        if !matches!(e.status, SessionStatus::Live(_)) {
-            continue;
+    out.retain_mut(|e| match query_status(&e.socket_path) {
+        StatusQueryResult::Live(sr) => {
+            e.status = SessionStatus::Live(LiveInfo {
+                cwd: sr.cwd,
+                argv: sr.argv,
+                clients: sr.clients.len(),
+                child_stopped: sr.child_stopped,
+                child_pid: sr.child_pid,
+                child_pgid: sr.child_pgid,
+                on_child_suspend: sr.on_child_suspend,
+                daemon_version: sr.daemon_version,
+            });
+            true
         }
-        match query_status(&e.socket_path) {
-            Ok(sr) => {
-                e.status = SessionStatus::Live(LiveInfo {
-                    cwd: sr.cwd,
-                    argv: sr.argv,
-                    clients: sr.clients.len(),
-                    child_stopped: sr.child_stopped,
-                    child_pid: sr.child_pid,
-                    child_pgid: sr.child_pgid,
-                    on_child_suspend: sr.on_child_suspend,
-                    daemon_version: sr.daemon_version,
-                });
-            }
-            Err(reason) => {
-                e.status = SessionStatus::Stale { reason };
-            }
+        StatusQueryResult::Hung { daemon_pid, reason } => {
+            e.status = SessionStatus::Hung { daemon_pid, reason };
+            true
         }
-    }
+        StatusQueryResult::Error { reason } => {
+            e.status = SessionStatus::Error { reason };
+            true
+        }
+        StatusQueryResult::Gone => false,
+    });
     out
 }
 
-fn collect_socks_in_dir(
-    dir: &Path,
-    namespace: &str,
-    now: std::time::SystemTime,
-    out: &mut Vec<SessionEntry>,
-) {
+fn collect_socks_in_dir(dir: &Path, namespace: &str, out: &mut Vec<SessionEntry>) {
     let read = match std::fs::read_dir(dir) {
         Ok(r) => r,
         Err(_) => return,
@@ -238,6 +296,9 @@ fn collect_socks_in_dir(
     for entry in read.flatten() {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("sock") {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|kind| kind.is_socket()) {
             continue;
         }
         let session_id = match path.file_stem().and_then(|s| s.to_str()) {
@@ -250,24 +311,9 @@ fn collect_socks_in_dir(
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let _ = now; // 現状 dur は算出しないが、caller が uptime を出す拡張余地。
-        let live = probe_liveness(&path);
-        let status = if live {
-            // placeholder: `list_sessions` の後段 loop で query_status して埋める。
-            SessionStatus::Live(LiveInfo {
-                cwd: String::new(),
-                argv: Vec::new(),
-                clients: 0,
-                child_stopped: false,
-                child_pid: None,
-                child_pgid: None,
-                on_child_suspend: None,
-                daemon_version: String::new(),
-            })
-        } else {
-            SessionStatus::Stale {
-                reason: "socket connect refused (= stale socket)".to_string(),
-            }
+        let status = SessionStatus::Hung {
+            daemon_pid: None,
+            reason: String::new(),
         };
         out.push(SessionEntry {
             session_id,
@@ -291,8 +337,48 @@ mod tests {
     }
 
     #[test]
-    fn probe_liveness_rejects_nonexistent_path() {
-        let p = PathBuf::from("/tmp/definitely-not-a-hyoui-socket.sock");
-        assert!(!probe_liveness(&p));
+    fn unresponsive_listener_is_no_response_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unresponsive.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            use std::io::Read;
+            let mut request = [0; 4];
+            stream.read_exact(&mut request).unwrap();
+            std::thread::sleep(LIST_RESPONSE_TIMEOUT + std::time::Duration::from_millis(100));
+        });
+        let result = query_status(&path);
+        assert!(
+            matches!(result, StatusQueryResult::Hung { daemon_pid: Some(pid), .. } if pid == std::process::id())
+        );
+        assert!(path.exists());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn closed_listener_is_error_not_no_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("closed.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+        assert!(matches!(
+            query_status(&path),
+            StatusQueryResult::Error { .. }
+        ));
+        assert!(path.exists());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn stale_socket_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dead.sock");
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(matches!(query_status(&path), StatusQueryResult::Gone));
+        assert!(!path.exists());
     }
 }

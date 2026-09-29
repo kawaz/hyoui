@@ -1234,11 +1234,10 @@ fn probe_socket_liveness(path: &std::path::Path) -> bool {
 /// `hyoui list` の主要ロジック (R5-H3 対応)。
 ///
 /// socket dir 候補を全部 scan し、`*.sock` ファイルを 1 行ずつ出力する。
-/// 各 socket は `probe_socket_liveness` で死活確認し、`live` / `stale` を 2 列目に
-/// 出す (= 旧形式 `<session>\t<path>` から 3 列目構造に拡張)。
+/// 各 socket に問い合わせ、live / stopped / no-response / error を出す。
 ///
-/// `--prune-stale` 指定時、stale と判定された socket は `unlink(2)` で削除する。
-/// この削除は best-effort (= 失敗してもユーザに warning するだけで exit code は 0)。
+/// 接続を拒否する残骸 socket は削除し、接続後の無応答は no-response として表示する。
+/// 削除失敗は警告する。
 fn list_command(cfg: ListConfig) -> ExitCode {
     // DR-0018: scan 対象 dir を namespace スコープで決める。
     // - --all-namespaces → 全 namespace の (ns, dir) を列挙、NS 列を表示
@@ -1267,18 +1266,18 @@ struct ListEntry {
     socket_path: std::path::PathBuf,
     /// socket file mtime を epoch ms に換算した値 (= sort key + jsonl 出力用)。
     started_unix_ms: u64,
-    /// 起動からの経過時間 (= `now - mtime`)。stale の場合は 0 とする (= 表示時は `-`)。
+    /// 起動からの経過時間 (= `now - mtime`)。
     dur: std::time::Duration,
-    /// daemon 状態 (= live なら status.response の field を必ず持つ、stale なら無し)。
+    /// daemon 状態 (= live なら status.response の field を必ず持つ)。
     status: ListEntryStatus,
 }
 
-/// daemon 状態 (= `hyoui list` の 1 entry が live か stale か、live なら status.response の値)。
+/// daemon 状態 (= live は status.response の値、無応答は peer PID を保持)。
 ///
 /// **設計判断**: live は `cwd` / `argv` / `clients` を必ず持つ (= v1.0 breaking OK 方針、
 /// `status.response` を required field 化したので「live なのに値なし」は protocol 違反)。
-/// 旧実装は live でも `Option<String>` で graceful degradation していたが、daemon が
-/// 一時的に slow なだけで `cwd: -` の誤情報を出す経路ができていた (= kawaz の指摘 #2)。
+
+#[derive(Debug)]
 enum ListEntryStatus {
     /// daemon が socket 上で応答した。`cwd` / `argv` / `clients` は status.response から。
     Live {
@@ -1298,9 +1297,15 @@ enum ListEntryStatus {
         /// 空文字なら旧 daemon で `-` 表示)。
         daemon_version: String,
     },
-    /// socket file は存在するが connect / handshake / status.query が失敗。daemon が
-    /// 既に死亡 (panic / SIGKILL) で stale socket が残留しているケース。
-    Stale,
+    /// 接続済み daemon が応答しない。socket は残して PID を表示する。
+    Hung {
+        daemon_pid: Option<u32>,
+        reason: String,
+    },
+    /// 接続後の明示的な失敗。
+    Error { reason: String },
+    /// 接続拒否で削除済み。
+    Gone,
 }
 
 /// `list_command` の testable な内部実装。`(namespace, dir)` 一覧を引数で受けることで
@@ -1308,7 +1313,6 @@ enum ListEntryStatus {
 fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<(String, std::path::PathBuf)>) -> ExitCode {
     let now = std::time::SystemTime::now();
     let mut entries: Vec<ListEntry> = Vec::new();
-    let mut pruned_count = 0usize;
     for (ns, dir) in dirs {
         let read_entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
@@ -1324,7 +1328,6 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<(String, std::path::PathBuf
                 .and_then(|s| s.to_str())
                 .unwrap_or("?")
                 .to_string();
-            let live = probe_socket_liveness(&path);
             let (started_unix_ms, dur) = match std::fs::metadata(&path).and_then(|m| m.modified()) {
                 Ok(mtime) => {
                     let started_ms = mtime
@@ -1336,23 +1339,9 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<(String, std::path::PathBuf
                 }
                 Err(_) => (0, std::time::Duration::ZERO),
             };
-            // live 暫定判定。enrich で status.query が成功すれば Live に格上げ、
-            // 失敗 (= connect / handshake / decode error) なら Stale のまま。
-            // 初期 status は probe 結果に基づき仮置きで、後段の enrich が確定値を入れる。
-            let status = if live {
-                // placeholder。enrich で必ず上書きされる (= live → Live or Stale 格下げ)。
-                ListEntryStatus::Live {
-                    cwd: String::new(),
-                    argv: Vec::new(),
-                    clients: 0,
-                    child_stopped: false,
-                    child_pid: None,
-                    child_pgid: None,
-                    on_child_suspend: None,
-                    daemon_version: String::new(),
-                }
-            } else {
-                ListEntryStatus::Stale
+            let status = ListEntryStatus::Hung {
+                daemon_pid: None,
+                reason: String::new(),
             };
             entries.push(ListEntry {
                 session,
@@ -1362,19 +1351,6 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<(String, std::path::PathBuf
                 dur,
                 status,
             });
-
-            // R5-H3: --prune-stale で stale socket を unlink。
-            if !live && cfg.prune_stale {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {
-                        pruned_count += 1;
-                        eprintln!("hyoui: pruned stale socket: {}", path.display());
-                    }
-                    Err(e) => {
-                        eprintln!("hyoui: warning: failed to prune {}: {e}", path.display());
-                    }
-                }
-            }
         }
     }
 
@@ -1382,13 +1358,8 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<(String, std::path::PathBuf
     // attach --index=1 が最古、--index=-1 が最新を指す前提。
     entries.sort_by_key(|e| e.started_unix_ms);
 
-    // probe で live と判定された entry に status.query を投げて Live に格上げする
-    // (= cwd / argv / clients を確定値で埋める)。本物の hyoui daemon は local Unix
-    // socket 経由で必ず即応答するため、ここで timeout / graceful degradation は使わず
-    // blocking で query する。失敗 (= connect / handshake / decode error) は probe で
-    // live と判定したのに応答できない状態 = stale 格下げ + error log (= 異常を明示)。
-    // 並列化は wall-clock 短縮目的でのみ残す (= 5 session あっても接続コストは max 1 つ分)。
     enrich_entries_with_status(&mut entries);
+    entries.retain(|e| !matches!(&e.status, ListEntryStatus::Gone));
 
     match cfg.format {
         ListFormat::Plain => print_list_plain(&entries, cfg.all_namespaces),
@@ -1399,22 +1370,8 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<(String, std::path::PathBuf
     }
 
     let found = entries.len();
-    let stale_count = entries
-        .iter()
-        .filter(|e| matches!(e.status, ListEntryStatus::Stale))
-        .count();
     if found == 0 {
-        // 0 件は stderr で明示 (script 用に stdout を汚さない)。
-        // 詳細な誘導 (= 起動例 / socket dir) は冗長で「エラー?」と誤認させるため
-        // 1 行のみとし、context が必要なら `hyoui list --help` を参照させる。
         eprintln!("hyoui: no sessions found");
-    } else if stale_count > 0 && !cfg.prune_stale {
-        eprintln!(
-            "hyoui: {stale_count} stale socket(s) found. \
-             Run `hyoui list --prune-stale` to remove them."
-        );
-    } else if cfg.prune_stale && pruned_count > 0 {
-        eprintln!("hyoui: pruned {pruned_count} stale socket(s)");
     }
     ExitCode::SUCCESS
 }
@@ -1447,164 +1404,43 @@ fn truncate_to(s: &str, max: usize) -> String {
     }
 }
 
-/// `enrich_entries_with_status` の per-entry 戻り値。`query_status_for_list` の結果を
-/// `ListEntryStatus` への mutation 指示として持ち回る。
-enum StatusFetchOutcome {
-    /// daemon が status.response を返した。required field の cwd / argv と clients 数。
-    Live {
-        cwd: String,
-        argv: Vec<String>,
-        clients: usize,
-        /// DR-0017 §柱2: 子が stopped のまま残っているか。
-        child_stopped: bool,
-        /// 子 PTY の PID / pgid (= exited なら None)。`list` の PID 列 / jsonl 用。
-        child_pid: Option<u32>,
-        child_pgid: Option<u32>,
-        /// DR-0019 Update: 現在の on-child-suspend policy。
-        on_child_suspend: Option<hyoui::protocol::messages::OnChildSuspendPolicy>,
-        /// DR-0019 Update: daemon バイナリ version (= 空文字なら旧 daemon)。
-        daemon_version: String,
-    },
-    /// connect / handshake / decode / I/O error。probe では live だったので「異常状態」を
-    /// log に出すために理由を保持する (= silent 格下げを避ける)。
-    Failed(String),
-}
-
-/// probe で live と判定された `ListEntry` に status.query を投げて cwd / argv / clients
-/// を埋める。
-///
-/// **設計判断 (kawaz 指摘 #2 対応)**: timeout は **使わない**。本物の hyoui daemon は local
-/// Unix socket 経由で必ず即応答するため、自前 timeout を埋め込むと「daemon が GC で 300ms
-/// 応答しなかっただけ」で誤情報 (= `cwd: -`) を出す経路が出来てしまう。timeout したら
-/// daemon-side の問題として log + stale 格下げで明示する方が筋。
-///
-/// 並列化は wall-clock 短縮目的で残す (= N 個の daemon を逐次 query すると N × handshake
-/// RTT がかかる、並列化で max(per-query) に抑える)。各 thread は blocking で query し、
-/// 完了したら mpsc で結果を回収する。
+/// status.query は socket ごとに並行して取得する。
 fn enrich_entries_with_status(entries: &mut [ListEntry]) {
-    use std::sync::mpsc;
-
-    let (tx, rx) = mpsc::channel::<(usize, StatusFetchOutcome)>();
-    let mut spawned = 0usize;
-    for (idx, e) in entries.iter().enumerate() {
-        if !matches!(e.status, ListEntryStatus::Live { .. }) {
-            continue;
-        }
-        spawned += 1;
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (idx, entry) in entries.iter().enumerate() {
         let tx = tx.clone();
-        let sock = e.socket_path.clone();
+        let socket = entry.socket_path.clone();
         std::thread::spawn(move || {
-            let outcome = query_status_for_list(&sock);
-            let _ = tx.send((idx, outcome));
+            let result = hyoui::discovery::query_status(&socket);
+            let _ = tx.send((idx, result));
         });
     }
     drop(tx);
-    for _ in 0..spawned {
-        let (idx, outcome) = match rx.recv() {
-            Ok(v) => v,
-            Err(_) => break,
-        };
-        match outcome {
-            StatusFetchOutcome::Live {
-                cwd,
-                argv,
-                clients,
-                child_stopped,
-                child_pid,
-                child_pgid,
-                on_child_suspend,
-                daemon_version,
-            } => {
-                entries[idx].status = ListEntryStatus::Live {
-                    cwd,
-                    argv,
-                    clients,
-                    child_stopped,
-                    child_pid,
-                    child_pgid,
-                    on_child_suspend,
-                    daemon_version,
-                };
-            }
-            StatusFetchOutcome::Failed(reason) => {
-                // probe では live だったが status.query で fail = 異常状態を明示。
-                // silent に Stale に落とすと「kawaz 指摘 #2」の誤情報経路に近い症状に
-                // なるので、必ず stderr に出す。
+    for (idx, result) in rx {
+        entries[idx].status = match result {
+            hyoui::discovery::StatusQueryResult::Live(sr) => ListEntryStatus::Live {
+                cwd: sr.cwd,
+                argv: sr.argv,
+                clients: sr.clients.len(),
+                child_stopped: sr.child_stopped,
+                child_pid: sr.child_pid,
+                child_pgid: sr.child_pgid,
+                on_child_suspend: sr.on_child_suspend,
+                daemon_version: sr.daemon_version,
+            },
+            hyoui::discovery::StatusQueryResult::Hung { daemon_pid, reason } => {
                 eprintln!(
-                    "hyoui: warning: session {} (socket: {}) probed live but status.query failed: {reason} (格下げして stale 扱い)",
+                    "hyoui: warning: session {} (socket: {}) did not respond: {reason}",
                     entries[idx].session,
-                    entries[idx].socket_path.display(),
+                    entries[idx].socket_path.display()
                 );
-                entries[idx].status = ListEntryStatus::Stale;
+                ListEntryStatus::Hung { daemon_pid, reason }
             }
-        }
-    }
-}
-
-/// 1 socket に対し `ClientConnection` 経由で status.query を投げて結果を返す。
-///
-/// **設計判断 (kawaz 指摘 #2 対応)**: timeout / 自前 handshake を一切使わず、`ClientConnection::
-/// connect` の標準経路で blocking query する。本物の hyoui daemon は local Unix socket 経由で
-/// 必ず即応答するので、ここで block しても実害なし。timeout / graceful `-` 表示 (= 旧実装)
-/// は「daemon が GC で slow なだけ」を「壊れた」と誤判定する経路を作っていたので廃止。
-///
-/// **scope (= 対象外を明示)**: daemon が `expected_token` を持つのに caller の env
-/// `HYOUI_LOCK_TOKEN` が不一致 / 未設定の場合、`ClientConnection::connect` が
-/// `AuthTokenMismatch` で `Err` を返すため、本関数は `Stale` 格下げと同等の扱いになる
-/// (= 実体は live、status query 不能)。MVP は token-less 既定で運用しており、token-aware
-/// に拡張する場合は `ListEntryStatus::LiveUnknown` のような第3 variant を導入する必要がある
-/// (= 別 task)。「live なのに `cwd: -`」を主訴とする kawaz 指摘 #2 の本筋は同一 env 下の
-/// 「daemon が一時 slow なだけ」を弾くこと、これは timeout 撤廃で達成済。
-fn query_status_for_list(sock: &std::path::Path) -> StatusFetchOutcome {
-    let opts = AttachOptions {
-        // Ro mode + MVP_CAPS (= status.query は cap 不要だが、handshake で intersect される)。
-        mode: Mode::Ro,
-        caps: hyoui::protocol::MVP_CAPS
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect(),
-        token: std::env::var("HYOUI_LOCK_TOKEN").ok(),
-        exclusive: false,
-        detach_others: false,
-    };
-    let mut conn = match ClientConnection::connect(sock, opts) {
-        Ok(c) => c,
-        Err(e) => return StatusFetchOutcome::Failed(format!("connect/handshake: {e}")),
-    };
-    if let Err(e) = conn.send_control(&ControlMessage::StatusQuery(StatusQuery {})) {
-        return StatusFetchOutcome::Failed(format!("send status.query: {e}"));
-    }
-    // status.response を待つ。ModeChange / LeaderNotify / TailData 等の interrupt
-    // message は無視して次の control を受け取る (= `hyoui status` と同 pattern)。
-    loop {
-        match conn.recv_control(None) {
-            Ok(ControlMessage::StatusResponse(sr)) => {
-                return StatusFetchOutcome::Live {
-                    cwd: sr.cwd,
-                    argv: sr.argv,
-                    clients: sr.clients.len(),
-                    child_stopped: sr.child_stopped,
-                    child_pid: sr.child_pid,
-                    child_pgid: sr.child_pgid,
-                    on_child_suspend: sr.on_child_suspend,
-                    daemon_version: sr.daemon_version,
-                };
+            hyoui::discovery::StatusQueryResult::Error { reason } => {
+                ListEntryStatus::Error { reason }
             }
-            Ok(ControlMessage::ModeChange(_)) | Ok(ControlMessage::LeaderNotify(_)) => continue,
-            Ok(ControlMessage::Error(e)) => {
-                return StatusFetchOutcome::Failed(format!(
-                    "daemon error: {:?} ({})",
-                    e.code, e.message
-                ));
-            }
-            Ok(other) => {
-                return StatusFetchOutcome::Failed(format!(
-                    "unexpected response kind: {:?}",
-                    std::mem::discriminant(&other)
-                ));
-            }
-            Err(e) => return StatusFetchOutcome::Failed(format!("recv: {e}")),
-        }
+            hyoui::discovery::StatusQueryResult::Gone => ListEntryStatus::Gone,
+        };
     }
 }
 
@@ -1669,9 +1505,7 @@ fn fmt_argv(argv: &[String]) -> String {
 /// 機械可読が要るなら `--format=jsonl` を使う)。entries 0 件なら header も出さない。
 ///
 /// **設計判断 (kawaz 指摘 #2 対応)**: live entry は cwd / argv / clients を **必ず**
-/// concrete value で出す (= `-` 表示は stale entry に限定)。timeout で `-` 表示する
-/// graceful degradation 経路は廃止 (= `enrich_entries_with_status` が timeout を
-/// 持たないので、live なら必ず status.response を取れている)。
+/// concrete value で出す。無応答の場合は daemon PID を表示する。
 ///
 /// DR-0018: `show_ns = true` (= `--all-namespaces`) のとき先頭に NS 列を追加する。
 /// 単一 namespace 表示 (= default) では NS 列を出さず、従来の見え方を保つ。
@@ -1734,13 +1568,26 @@ fn print_list_plain(entries: &[ListEntry], show_ns: bool) {
                     "{ns_prefix}{session:<20} {status:<7} {pid_disp:<8} {suspend:<11} {ver:<8} {dur:<10} {clients:<8} {cwd_disp:<32} {argv_disp}"
                 );
             }
-            ListEntryStatus::Stale => {
-                // stale は cwd/argv/clients 取得不能なので `-` 統一。
+            ListEntryStatus::Hung { daemon_pid, .. } => {
+                let pid = daemon_pid
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "-".into());
                 println!(
                     "{ns_prefix}{session:<20} {:<7} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} -",
-                    "stale", "-", "-", "-", "-", "-", "-"
+                    hyoui::discovery::NO_RESPONSE_STATUS,
+                    pid,
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-"
                 );
             }
+            ListEntryStatus::Error { .. } => println!(
+                "{ns_prefix}{session:<20} {:<11} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} -",
+                "error", "-", "-", "-", "-", "-", "-"
+            ),
+            ListEntryStatus::Gone => {}
         }
     }
 }
@@ -1751,7 +1598,7 @@ fn print_list_plain(entries: &[ListEntry], show_ns: bool) {
 /// `dur_ms` / `socket` / `cwd` / `argv` / `clients`。
 ///
 /// **設計判断 (kawaz 指摘 #2 対応)**: live entry の `cwd` / `argv` / `clients` は **必ず**
-/// concrete value (= null にならない、required field)。stale entry は 3 fields とも null。
+/// concrete value (= null にならない、required field)。無応答 entry は 3 fields とも null。
 fn print_list_jsonl(entries: &[ListEntry]) {
     for e in entries {
         let obj = match &e.status {
@@ -1789,10 +1636,12 @@ fn print_list_jsonl(entries: &[ListEntry]) {
                 "argv": argv,
                 "clients": clients,
             }),
-            ListEntryStatus::Stale => serde_json::json!({
+            ListEntryStatus::Hung { daemon_pid, reason } => serde_json::json!({
+                "daemon_pid": daemon_pid,
+                "reason": reason,
                 "session": e.session,
                 "namespace": e.namespace,
-                "status": "stale",
+                "status": hyoui::discovery::NO_RESPONSE_STATUS,
                 "child_pid": serde_json::Value::Null,
                 "child_pgid": serde_json::Value::Null,
                 "started_unix_ms": e.started_unix_ms,
@@ -1802,6 +1651,10 @@ fn print_list_jsonl(entries: &[ListEntry]) {
                 "argv": serde_json::Value::Null,
                 "clients": serde_json::Value::Null,
             }),
+            ListEntryStatus::Error { reason } => {
+                serde_json::json!({"session": e.session, "namespace": e.namespace, "status": "error", "reason": reason, "socket": e.socket_path.display().to_string(), "started_unix_ms": e.started_unix_ms})
+            }
+            ListEntryStatus::Gone => continue,
         };
         println!("{obj}");
     }
@@ -4933,15 +4786,14 @@ mod tests {
         );
     }
 
-    /// R5-H3: `--prune-stale` flag 付きで `list_command_with_dirs` を呼ぶと、
-    /// stale な socket file が unlink される。live socket は触らない。
+    /// 残骸 socket を unlink し、応答する daemon は保持する。
     ///
     /// `list_command` は env (`XDG_RUNTIME_DIR` / `TMPDIR`) で dir を解決するが、
     /// edition 2024 では `env::set_var` が unsafe であり、`#![forbid(unsafe_code)]`
     /// と衝突する。代わりに dir 一覧を直接渡す内部関数 `list_command_with_dirs`
     /// を介してテストする。
     #[test]
-    fn list_prune_stale_removes_dead_sockets() {
+    fn list_removes_dead_sockets() {
         use hyoui::daemon::{DaemonConfig, Session};
 
         let sock_dir = make_0700_dir();
@@ -4955,9 +4807,6 @@ mod tests {
         assert!(stale_path.exists(), "stale socket file should exist");
 
         // live socket: **本物の hyoui daemon を起動** する。
-        // kawaz 指摘 #2 対応で `enrich_entries_with_status` が timeout 無し blocking
-        // になったため、bind-only listener (= accept しても handshake 返さない) では
-        // 永遠に hang する。本物 daemon に置き換えて「live は必ず即応答」を担保。
         let live_path = sock_dir.path().join("live-sess.sock");
         let mut cfg_live = DaemonConfig::new(
             "live-sess",
@@ -4969,10 +4818,7 @@ mod tests {
         let daemon_handle = std::thread::spawn(move || session_live.serve());
 
         // dir 一覧を直接渡して env mutation を回避
-        let cfg = ListConfig {
-            prune_stale: true,
-            ..Default::default()
-        };
+        let cfg = ListConfig::default();
         let _exit = list_command_with_dirs(
             cfg,
             vec![(
@@ -4982,14 +4828,8 @@ mod tests {
         );
 
         // 確認: stale は unlink された、live はまだ残っている
-        assert!(
-            !stale_path.exists(),
-            "--prune-stale should unlink stale socket"
-        );
-        assert!(
-            live_path.exists(),
-            "--prune-stale must not unlink live socket"
-        );
+        assert!(!stale_path.exists(), "list should unlink stale socket");
+        assert!(live_path.exists(), "list must not unlink live socket");
 
         // cleanup: live daemon を kill して thread を畳む
         let opts = AttachOptions {
@@ -5006,35 +4846,16 @@ mod tests {
         let _ = daemon_handle.join();
     }
 
-    /// R5-H3: `--prune-stale` を指定しない時は stale でも socket file は削除しない。
     #[test]
-    fn list_without_prune_keeps_stale_sockets() {
-        let sock_dir = make_0700_dir();
-        let stale_path = sock_dir.path().join("stale.sock");
-        // kawaz 指摘 #2 対応で `enrich_entries_with_status` が timeout 廃止になったため、
-        // bind-then-drop fixture は OS race (= drop 後も accept が成立する瞬間) で
-        // `probe_socket_liveness` が稀に true を返し、enrich が永遠に hang する。
-        // **regular file** を `*.sock` 名で置く方が確実: connect(2) は ENOTSOCK で
-        // 即 fail → probe false → enrich skip → 旧 stale 経路で扱われる。
-        std::fs::write(&stale_path, b"").expect("create regular file as stale fixture");
-        assert!(stale_path.exists());
-
-        let cfg = ListConfig {
-            prune_stale: false,
-            ..Default::default()
-        };
-        let _exit = list_command_with_dirs(
-            cfg,
-            vec![(
-                hyoui::cli::DEFAULT_NAMESPACE.to_string(),
-                sock_dir.path().to_path_buf(),
-            )],
+    fn list_preserves_regular_file() {
+        let dir = make_0700_dir();
+        let path = dir.path().join("ordinary.sock");
+        std::fs::write(&path, b"not a socket").unwrap();
+        let _ = list_command_with_dirs(
+            ListConfig::default(),
+            vec![("default".into(), dir.path().to_path_buf())],
         );
-
-        assert!(
-            stale_path.exists(),
-            "list without --prune-stale must not remove sockets"
-        );
+        assert!(path.exists());
     }
 
     /// R5-FB4: socket がまだ存在しない時点で connect_with_retry を呼んでも、
@@ -6335,11 +6156,7 @@ mod tests {
                     "expected exactly 1 client (= the probe itself); got {clients}"
                 );
             }
-            ListEntryStatus::Stale => {
-                panic!(
-                    "live daemon must NOT be demoted to Stale (= status query 必ず成功する前提)"
-                );
-            }
+            other => panic!("live daemon must return Live, got {other:?}"),
         }
 
         // daemon を kill して serve thread を畳む。
@@ -6357,10 +6174,10 @@ mod tests {
         let _ = daemon_handle.join();
     }
 
-    /// listener 不在 path に対して enrich を呼ぶと Stale 格下げになることを assert。
+    /// listener 不在 path に対して enrich を呼ぶと一覧から除外する。
     /// `hyoui: warning: ...` stderr が出るが test 上は無視 (= eprintln 出力検証は別 task)。
     #[test]
-    fn enrich_demotes_unreachable_socket_to_stale() {
+    fn enrich_marks_unreachable_socket_gone() {
         let sock_dir = make_0700_dir();
         let sock_path = sock_dir.path().join("nope.sock");
         // listener を bind しない (= connect で ECONNREFUSED or ENOENT になる)。
@@ -6383,7 +6200,7 @@ mod tests {
         }];
         enrich_entries_with_status(&mut entries);
         assert!(
-            matches!(entries[0].status, ListEntryStatus::Stale),
+            matches!(entries[0].status, ListEntryStatus::Gone),
             "unreachable socket must be demoted to Stale"
         );
     }

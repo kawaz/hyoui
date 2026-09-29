@@ -234,6 +234,20 @@ impl Drop for UnixSock {
     }
 }
 
+/// Return the process ID of the peer connected to a Unix-domain stream.
+///
+/// # Errors
+///
+/// Returns an I/O error when the operating system cannot provide peer credentials.
+pub fn peer_pid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32> {
+    #[cfg(target_os = "macos")]
+    let pid = socket::getsockopt(stream, socket::sockopt::LocalPeerPid)?;
+    #[cfg(target_os = "linux")]
+    let pid = socket::getsockopt(stream, socket::sockopt::PeerCredentials)?.pid();
+    u32::try_from(pid)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid peer PID"))
+}
+
 /// Connect a fresh Unix-domain socket to `path`. Returns the connected fd.
 pub fn connect<P: AsRef<Path>>(path: P) -> Result<OwnedFd> {
     check_sun_path_len(path.as_ref())?;

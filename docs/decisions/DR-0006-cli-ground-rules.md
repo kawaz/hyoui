@@ -40,7 +40,7 @@ override: --socket /any/path.sock
 ```
 
 - dir mode 0700, sock mode 0600
-- 起動時の stale socket: ping → 応答なければ自動削除、`--force` で奪取は不要 (= 別 owner の sock は触らない)
+- `hyoui list` は connect 拒否の残骸 socket を自動削除して表示しない。接続後 5 秒間 handshake / status.query に応答しない daemon は socket を残して `no-response` と daemon PID を表示する。起動時も別 owner の socket は触らない
 
 ### 3. Name と起動形
 

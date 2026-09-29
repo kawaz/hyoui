@@ -6,7 +6,7 @@
 //!
 //! ## Endpoints
 //!
-//! - `GET  /api/sessions` — 全 namespace 横断で live/stale session を JSON list で返す
+//! - `GET  /api/sessions` — 全 namespace 横断で live/no-response session を JSON list で返す
 //! - `GET  /api/sessions/:id/screen` — `screen.dump.request` の ANSI payload を
 //!   `text/plain; charset=utf-8` で返す。`?layer=visible|scrollback|both` (default:
 //!   `visible`) で取得範囲を選択する
@@ -152,7 +152,7 @@ async fn get_version() -> axum::Json<contract::VersionResponse> {
 // GET /api/sessions
 // -----------------------------------------------------------------------------
 
-/// live/stale session 一覧を JSON で返す (= `hyoui list --format=jsonl` の JSON 配列版)。
+/// live/no-response session 一覧を JSON で返す (= `hyoui list --format=jsonl` の JSON 配列版)。
 async fn get_sessions() -> Response {
     let entries = match tokio::task::spawn_blocking(hyoui::discovery::list_sessions).await {
         Ok(v) => v,
@@ -184,12 +184,16 @@ fn session_entry_to_json(e: &hyoui::discovery::SessionEntry) -> serde_json::Valu
                 serde_json::Value::String(info.daemon_version.clone())
             },
         }),
-        SessionStatus::Stale { reason } => serde_json::json!({
+        SessionStatus::Error { reason } => {
+            serde_json::json!({"session_id": e.session_id, "namespace": e.namespace, "socket_path": e.socket_path.display().to_string(), "status": "error", "reason": reason})
+        }
+        SessionStatus::Hung { daemon_pid, reason } => serde_json::json!({
+            "daemon_pid": daemon_pid,
             "session_id": e.session_id,
             "namespace": e.namespace,
             "socket_path": e.socket_path.display().to_string(),
             "started_unix_ms": e.started_unix_ms,
-            "status": "stale",
+            "status": hyoui::discovery::NO_RESPONSE_STATUS,
             "reason": reason,
         }),
     }
@@ -735,13 +739,15 @@ fn require_cap(caps: &[String], cap: &str) -> Result<(), DaemonCallError> {
 enum ResolveSocketError {
     /// session 列挙の blocking task が join に失敗。500。
     Enumerate(String),
-    /// entry はあるが stale (= socket 残骸 / handshake 失敗)。404。
-    Stale {
+    /// entry はあるが応答しない。404。
+    NoResponse {
         /// 要求された session_id。
         id: String,
-        /// discovery が stale と判定した理由。
+        /// discovery が無応答と判定した理由。
         reason: String,
     },
+    /// 接続後に明示的なエラーが返った。404。
+    SessionError { id: String, reason: String },
     /// その session_id の entry が存在しない。404。
     NotFound {
         /// 要求された session_id。
@@ -755,9 +761,13 @@ impl ResolveSocketError {
             ResolveSocketError::Enumerate(msg) => {
                 internal_error(format!("session enumeration join error: {msg}"))
             }
-            ResolveSocketError::Stale { id, reason } => not_found(
-                code::SESSION_STALE,
-                format!("session {id:?} is stale: {reason}"),
+            ResolveSocketError::NoResponse { id, reason } => not_found(
+                code::SESSION_NO_RESPONSE,
+                format!("session {id:?} did not respond: {reason}"),
+            ),
+            ResolveSocketError::SessionError { id, reason } => not_found(
+                code::SESSION_ERROR,
+                format!("session {id:?} returned an error: {reason}"),
             ),
             ResolveSocketError::NotFound { id } => {
                 not_found(code::SESSION_NOT_FOUND, format!("no session named {id:?}"))
@@ -766,7 +776,7 @@ impl ResolveSocketError {
     }
 }
 
-/// session_id から live socket path を解決する。live entry のみ受理 (= stale は 404)。
+/// session_id から live socket path を解決する。live entry のみ受理 (= 無応答は 404)。
 async fn resolve_socket(id: &str) -> Result<PathBuf, ResolveSocketError> {
     let id = id.to_string();
     let entries = match tokio::task::spawn_blocking(hyoui::discovery::list_sessions).await {
@@ -779,8 +789,11 @@ async fn resolve_socket(id: &str) -> Result<PathBuf, ResolveSocketError> {
         }
         match e.status {
             hyoui::discovery::SessionStatus::Live(_) => return Ok(e.socket_path),
-            hyoui::discovery::SessionStatus::Stale { reason } => {
-                return Err(ResolveSocketError::Stale { id, reason });
+            hyoui::discovery::SessionStatus::Error { reason } => {
+                return Err(ResolveSocketError::SessionError { id, reason });
+            }
+            hyoui::discovery::SessionStatus::Hung { reason, .. } => {
+                return Err(ResolveSocketError::NoResponse { id, reason });
             }
         }
     }

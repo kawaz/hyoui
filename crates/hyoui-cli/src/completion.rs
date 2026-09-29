@@ -354,7 +354,7 @@ _hyoui() {
                 --format=*)
                     COMPREPLY=( $(compgen -W "plain jsonl" -- "${cur#*=}") ); return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--namespace --all-namespaces --prune-stale --format --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--namespace --all-namespaces --format --help -h" -- "$cur") )
             return 0 ;;
         kill)
             case "$prev" in
@@ -474,7 +474,6 @@ _hyoui() {
                     _arguments \
                         '--namespace=[Show only this namespace]:namespace:' \
                         '--all-namespaces[List sessions across all namespaces (adds NS column)]' \
-                        '--prune-stale[Unlink stale sockets]' \
                         '--format=[Output format]:format:(plain jsonl)' \
                         '(-h --help)'{-h,--help}'[Show help]'
                     ;;
@@ -1199,7 +1198,6 @@ complete -c hyoui -n '__hyoui_using_subcommand attach' -s h -l help             
 # `hyoui list` options.
 complete -c hyoui -n '__hyoui_using_subcommand list' -l namespace -x         -d 'Show only this namespace'
 complete -c hyoui -n '__hyoui_using_subcommand list' -l all-namespaces       -d 'List sessions across all namespaces (adds NS column)'
-complete -c hyoui -n '__hyoui_using_subcommand list' -l prune-stale          -d 'Unlink stale sockets'
 complete -c hyoui -n '__hyoui_using_subcommand list' -l format -x -a 'plain jsonl' -d 'Output format'
 complete -c hyoui -n '__hyoui_using_subcommand list' -s h -l help            -d 'Show help and exit'
 
@@ -1468,7 +1466,7 @@ mod tests {
 
     /// Word-boundary aware containment check.
     ///
-    /// `s.contains("list")` matches inside `prune-stale` etc.; for short tokens
+    /// `s.contains("list")` also matches inside unrelated tokens; for short tokens
     /// like `list` / `stop` we want a real boundary so the SSOT verification does
     /// not pass on incidental substrings. Boundaries are the usual shell-script
     /// delimiters plus `\:` (zsh escaped spec prefixes).

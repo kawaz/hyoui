@@ -538,14 +538,6 @@ pub enum ListFormat {
 /// `list` subcommand configuration (R5-H3)。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ListConfig {
-    /// `--prune-stale` (= 接続不能 socket を unlink して掃除)。
-    ///
-    /// daemon が panic / SIGKILL で異常終了すると `UnixSock::drop` が走らず
-    /// socket file が残留し、`hyoui list` で live と区別できなくなる (R5-H3)。
-    /// `--prune-stale` は connect 試行で死活確認し、`ECONNREFUSED` 等で
-    /// 失敗した socket を unlink で除去する。
-    pub prune_stale: bool,
-
     /// 出力 format (= default Plain、`--format=jsonl` で JSON Lines)。
     pub format: ListFormat,
 
@@ -554,7 +546,7 @@ pub struct ListConfig {
     pub namespace: Option<String>,
 
     /// `--all-namespaces` (= DR-0018)。全 namespace を横断 scan し、出力に NS 列を
-    /// 追加する。`--prune-stale` と併用すると全 namespace の stale socket を掃除する。
+    /// 追加する。
     pub all_namespaces: bool,
 }
 
@@ -1288,12 +1280,6 @@ fn parse_list(args: &[String]) -> Command {
     for a in args {
         let (name, inline_value) = split_eq(a.as_str());
         match name.as_str() {
-            "--prune-stale" => {
-                if inline_value.is_some() {
-                    return Command::Error("list: --prune-stale does not take a value".to_string());
-                }
-                cfg.prune_stale = true;
-            }
             "--all-namespaces" => {
                 if inline_value.is_some() {
                     return Command::Error(
@@ -5715,46 +5701,42 @@ fn usage_wait() -> String {
 
 fn usage_list() -> String {
     String::from(
-        "hyoui list — list daemon sessions (= socket dir scan + liveness probe)\n\
+        "hyoui list — list daemon sessions (= socket dir scan + status query)\n\
         \n\
         USAGE:\n    \
-            hyoui list [--namespace=<ns>] [--all-namespaces] [--prune-stale] [--format=plain|jsonl]\n\
+            hyoui list [--namespace=<ns>] [--all-namespaces] [--format=plain|jsonl]\n\
         \n\
         OPTIONS:\n    \
             --namespace NS      表示対象を指定 namespace に絞る (= default: env HYOUI_NAMESPACE\n                                \
                                 or \"default\")。`--all-namespaces` とは排他\n    \
-            --all-namespaces    全 namespace を横断表示 (= NS 列を追加)。`--prune-stale` 併用で\n                                \
-                                全 namespace の stale socket を掃除\n    \
-            --prune-stale       stale socket (= connect 不能) を unlink で削除\n    \
+            --all-namespaces    全 namespace を横断表示 (= NS 列を追加)。\n    \
             --format=plain|jsonl  出力 format (= default plain)。jsonl は 1 session 1 行の JSON object\n    \
             -h, --help          Show this help and exit\n\
         \n\
         OUTPUT (plain, fixed-width columns, sorted by socket mtime ascending):\n    \
             SESSION              STATUS  PID      DUR        CLIENTS  CWD                              ARGV\n    \
             test-claude          live    12345    1h2m       2        kawaz/hyoui/main                 claude\n    \
-            stale-test           stale   -        -          -        -                                -\n\
+            waiting              no-response 12345    -          -        -                                -\n\
         \n\
         COLUMNS (plain):\n    \
             SESSION   session id (= socket file 名から拡張子を除いた値、20ch で truncate)\n    \
-            STATUS    live | stopped | stale (= stopped は子が ^Z/SIGSTOP で停止中)\n    \
-            PID       子 PTY の PID (= ps 突き合わせ用、exited / stale は -)\n    \
+            STATUS    live | stopped | no-response | error (= stopped は子が ^Z/SIGSTOP で停止中)\n    \
+            PID       live/stopped は子 PTY、no-response は daemon の PID\n    \
             DUR       socket mtime からの経過時間 (= 1h2m / 15m / 3d4h 形式)\n    \
             CLIENTS   現在 attach 中の client 数 (= status.query の結果)\n    \
             CWD       daemon 起動時の cwd (= `repos/<host>/` 前カット、~ 前カット、32ch truncate)\n    \
             ARGV      daemon が起動した子 PTY の argv (= space-join、空白含む arg は \"...\" quote)\n\
         \n\
         OUTPUT (jsonl, 1 session = 1 line):\n    \
-            {\"session\":\"<id>\",\"status\":\"live|stopped|stale\",\"child_state\":\"running|stopped|null\",\"child_pid\":<n>|null,\"child_pgid\":<n>|null,\"started_unix_ms\":<ms>,\"dur_ms\":<ms>,\"socket\":\"<path>\",\"cwd\":\"<path>|null\",\"argv\":[...]|null,\"clients\":<n>|null}\n\
+            {\"session\":\"<id>\",\"status\":\"live|stopped|no-response|error\",\"daemon_pid\":<n>|null,\"child_state\":\"running|stopped|null\",\"child_pid\":<n>|null,\"child_pgid\":<n>|null,\"started_unix_ms\":<ms>,\"dur_ms\":<ms>,\"socket\":\"<path>\",\"cwd\":\"<path>|null\",\"argv\":[...]|null,\"clients\":<n>|null}\n\
         \n\
         SORT ORDER:\n    \
             socket mtime ascending (= 古い session が上、新しい session が下)。\n    \
             `hyoui attach --index=1` で 1 番古い、`--index=-1` で 1 番新しい session を指す前提。\n\
         \n\
-        LIVENESS PROBE (R5-H3):\n    \
-            各 socket に対し best-effort connect 試行 (= 100ms timeout)。\n    \
-            成功なら `live`、ECONNREFUSED / timeout なら `stale` 表示。\n    \
-            stale は daemon の panic / SIGKILL で socket が unlink されずに\n    \
-            残留した状態。`hyoui list --prune-stale` で掃除可能。\n\
+        SESSION STATUS:\n    \
+            connect 拒否の残骸 socket は自動削除し表示しない。\n    \
+            接続は成立したが 5 秒以内に応答が無ければ no-response として daemon PID を表示する。daemon の loop 停止だけでなく backlog 飽和や handshake 遅延でも起こり得る。\n\
         \n\
         SCAN ORDER (= socket_path::resolve_in_namespace と同順、最初に見つかった dir のみ):\n    \
             default namespace: base dir 直下 (= 既存互換):\n    \
@@ -5770,7 +5752,6 @@ fn usage_list() -> String {
             hyoui list --namespace=workers          # workers namespace のみ表示\n    \
             hyoui list --all-namespaces             # 全 namespace 横断 (= NS 列付き)\n    \
             hyoui list --format=jsonl               # 機械可読 (1 session 1 行 JSON)\n    \
-            hyoui list --prune-stale                # stale socket を削除して live のみ残す\n    \
             hyoui list --format=jsonl | jq -r '.session'  # session id を抽出\n\
         \n\
         RELATED:\n    \
@@ -8734,26 +8715,11 @@ mod tests {
         }
     }
 
-    /// R5-H3: `list` の引数なし呼び出しは `prune_stale = false` の
-    /// `ListConfig` を返す (= default 動作: liveness 確認のみ、削除しない)。
     #[test]
     fn list_without_flag_returns_default_config() {
         match parse_args(&args(&["list"])) {
-            Command::List(cfg) => {
-                assert!(!cfg.prune_stale, "default should not prune");
-            }
+            Command::List(cfg) => assert_eq!(cfg, ListConfig::default()),
             other => panic!("expected List(default), got {other:?}"),
-        }
-    }
-
-    /// R5-H3: `list --prune-stale` は `prune_stale = true` の `ListConfig` を返す。
-    #[test]
-    fn list_prune_stale_flag_sets_config() {
-        match parse_args(&args(&["list", "--prune-stale"])) {
-            Command::List(cfg) => {
-                assert!(cfg.prune_stale, "--prune-stale should enable prune");
-            }
-            other => panic!("expected List(prune_stale=true), got {other:?}"),
         }
     }
 
@@ -8959,20 +8925,6 @@ mod tests {
         match parse_args(&args(&["list", "--format"])) {
             Command::Error(msg) => {
                 assert!(msg.contains("--format"), "error should mention --format");
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    /// `--prune-stale=true` のような値付きは `Command::Error` (= bool flag に値は取らない)。
-    #[test]
-    fn list_prune_stale_does_not_accept_value() {
-        match parse_args(&args(&["list", "--prune-stale=true"])) {
-            Command::Error(msg) => {
-                assert!(
-                    msg.contains("--prune-stale"),
-                    "error should mention --prune-stale"
-                );
             }
             other => panic!("expected Error, got {other:?}"),
         }

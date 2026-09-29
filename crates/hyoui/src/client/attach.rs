@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::time::Instant;
 
 use nix::poll::{PollFd, PollTimeout};
 
@@ -18,6 +19,25 @@ use crate::protocol::{
     Mode, ProtocolError, TYPE_CBOR_CONTROL, TYPE_RAW_ACK, TYPE_RAW_DATA, Transport,
     UnixStreamTransport,
 };
+
+struct DeadlineReader<'a> {
+    stream: &'a UnixStream,
+    deadline: Instant,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "list response deadline exceeded",
+            ));
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(buf)
+    }
+}
 
 /// stdin read chunk の処理結果 (= `process_ctrlz_guard` の戻り値)。
 ///
@@ -528,6 +548,7 @@ pub enum StdinEofAction {
 pub struct ClientConnection {
     reader: UnixStream,
     writer: UnixStream,
+    read_deadline: Option<Instant>,
     /// daemon が返した handshake response (= 確定した cap / mode / leader / session_id)。
     pub response: HandshakeResponse,
     /// stdin EOF 時の挙動 (R5-FB2)。default `Detach` (= MVP attach 挙動)。
@@ -627,8 +648,24 @@ impl ClientConnection {
     /// * daemon が `error` を返した → 後の Phase で `Error::Protocol` 等を新設予定、
     ///   現在は [`Error::Invalid`] にまとめる
     pub fn connect(socket_path: &Path, opts: AttachOptions) -> Result<Self, Error> {
+        Self::connect_with_timeout_and_peer(socket_path, opts, None, &mut None)
+    }
+
+    /// Connect while recording peer PID before waiting for the handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns a socket, transport, or handshake error.
+    pub fn connect_with_timeout_and_peer(
+        socket_path: &Path,
+        opts: AttachOptions,
+        timeout: Option<std::time::Duration>,
+        peer_pid: &mut Option<u32>,
+    ) -> Result<Self, Error> {
         let fd = sys_socket::connect(socket_path)?;
         let stream = UnixStream::from(fd);
+        *peer_pid = sys_socket::peer_pid(&stream).ok();
+        let deadline = timeout.map(|duration| Instant::now() + duration);
         let transport = UnixStreamTransport::new(stream);
         let (mut reader, mut writer) = transport.split().map_err(Error::from)?;
 
@@ -646,8 +683,17 @@ impl ClientConnection {
             .encode_to(&mut writer)
             .map_err(|_| Error::Invalid("handshake.request frame send failed"))?;
 
-        let resp_frame = Frame::decode_from(&mut reader)
-            .map_err(|_| Error::Invalid("handshake.response decode failed"))?;
+        let resp_frame = match deadline {
+            Some(deadline) => Frame::decode_from(&mut DeadlineReader {
+                stream: &reader,
+                deadline,
+            }),
+            None => Frame::decode_from(&mut reader),
+        }
+        .map_err(|e| match e {
+            FrameError::Io(e) => Error::Io(e),
+            FrameError::Protocol(_) => Error::Invalid("handshake.response decode failed"),
+        })?;
         if resp_frame.ty != TYPE_CBOR_CONTROL {
             return Err(Error::Invalid("handshake response must be CBOR control"));
         }
@@ -692,6 +738,7 @@ impl ClientConnection {
         Ok(Self {
             reader,
             writer,
+            read_deadline: deadline,
             response,
             eof_action: StdinEofAction::Detach,
             outer_tty_raw: false,
@@ -1533,7 +1580,14 @@ impl ClientConnection {
         if let Some(frame) = self.pending_frames.pop_front() {
             return Ok(frame);
         }
-        Frame::decode_from(&mut self.reader).map_err(|e| match e {
+        let frame = match self.read_deadline {
+            Some(deadline) => Frame::decode_from(&mut DeadlineReader {
+                stream: &self.reader,
+                deadline,
+            }),
+            None => Frame::decode_from(&mut self.reader),
+        };
+        frame.map_err(|e| match e {
             FrameError::Io(io) => Error::Io(io),
             FrameError::Protocol(_) => Error::Invalid("frame decode failed"),
         })
@@ -1862,6 +1916,7 @@ mod tests {
         let conn = ClientConnection {
             reader,
             writer,
+            read_deadline: None,
             response: HandshakeResponse {
                 caps: vec![],
                 session_id: "t".into(),
@@ -1920,6 +1975,7 @@ mod tests {
         let mut conn = ClientConnection {
             reader,
             writer,
+            read_deadline: None,
             response: HandshakeResponse {
                 caps: vec![],
                 session_id: "t".into(),
@@ -1954,6 +2010,7 @@ mod tests {
         let mut conn = ClientConnection {
             reader,
             writer,
+            read_deadline: None,
             response: HandshakeResponse {
                 caps: vec![],
                 session_id: "t".into(),
@@ -2010,6 +2067,7 @@ mod tests {
         let conn = ClientConnection {
             reader,
             writer,
+            read_deadline: None,
             response: HandshakeResponse {
                 caps: vec![],
                 session_id: "t".into(),
@@ -2082,6 +2140,7 @@ mod tests {
         let conn = ClientConnection {
             reader,
             writer,
+            read_deadline: None,
             response: HandshakeResponse {
                 caps: vec![],
                 session_id: "t".into(),
@@ -2159,6 +2218,7 @@ mod tests {
         let conn = ClientConnection {
             reader,
             writer,
+            read_deadline: None,
             response: HandshakeResponse {
                 caps: vec![],
                 session_id: "t".into(),
@@ -2708,6 +2768,7 @@ mod tests {
         let conn = ClientConnection {
             reader,
             writer,
+            read_deadline: None,
             response: HandshakeResponse {
                 caps: vec![],
                 session_id: "t".into(),
@@ -3248,6 +3309,7 @@ mod tests {
         let conn = ClientConnection {
             reader,
             writer,
+            read_deadline: None,
             response: HandshakeResponse {
                 caps: vec![],
                 session_id: "t".into(),
@@ -3312,6 +3374,7 @@ mod tests {
         let conn = ClientConnection {
             reader,
             writer,
+            read_deadline: None,
             response: HandshakeResponse {
                 caps: vec![],
                 session_id: "t".into(),
@@ -3379,6 +3442,7 @@ mod tests {
         let conn = ClientConnection {
             reader,
             writer,
+            read_deadline: None,
             response: HandshakeResponse {
                 caps: vec![],
                 session_id: "t".into(),
@@ -3434,6 +3498,7 @@ mod tests {
         let conn = ClientConnection {
             reader,
             writer,
+            read_deadline: None,
             response: HandshakeResponse {
                 caps: vec![],
                 session_id: "t".into(),
@@ -3490,6 +3555,7 @@ mod tests {
         let conn = ClientConnection {
             reader,
             writer,
+            read_deadline: None,
             response: HandshakeResponse {
                 caps: vec![],
                 session_id: "t".into(),
@@ -3546,6 +3612,7 @@ mod tests {
         let conn = ClientConnection {
             reader,
             writer,
+            read_deadline: None,
             response: HandshakeResponse {
                 caps: vec![],
                 session_id: "t".into(),
@@ -3592,6 +3659,7 @@ mod tests {
         let conn = ClientConnection {
             reader,
             writer,
+            read_deadline: None,
             response: HandshakeResponse {
                 caps: vec![],
                 session_id: "t".into(),
@@ -3665,6 +3733,7 @@ mod tests {
         let conn = ClientConnection {
             reader,
             writer,
+            read_deadline: None,
             response: HandshakeResponse {
                 caps: vec![],
                 session_id: "t".into(),
@@ -3714,6 +3783,7 @@ mod tests {
         let conn = ClientConnection {
             reader,
             writer,
+            read_deadline: None,
             response: HandshakeResponse {
                 caps: vec![],
                 session_id: "t".into(),
