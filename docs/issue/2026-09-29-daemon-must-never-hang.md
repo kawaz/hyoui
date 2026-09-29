@@ -23,6 +23,10 @@ origin: 自リポ TODO
 
 kawaz 裁定 2026-09-29: 「daemon が生きているが固まっている状態になること自体が大問題」。v0.9.55 は stopped client への sendto で `ClientHandle::drop` の join が永久ブロックする 1 経路を直しただけで、同種の経路が他に無いことは確認していない。daemon は子プロセスの生殺与奪を握る正本なので、外部 (client / 子 / fs / tty) がどう振る舞ってもイベントループが止まらないことを保証する必要がある。
 
+## 設計方針 (kawaz 裁定 2026-09-29)
+
+**純粋関数以外の IO を伴う部分は、あらゆる箇所で非同期に設計する**。個別の blocking 呼び出しに timeout を後付けする対症療法ではなく、daemon のイベントループが外部 (client socket / 子 PTY / record fs / tty) の応答を前提にした blocking 呼び出しを一切持たないことを不変条件にする。runtime の選択 (nonblocking fd + poll/kqueue のイベント駆動 vs tokio 等の async runtime) は DR で論点化して決める。kernel 同期 API (waitpid / tcsetpgrp 等) は「ブロックしない根拠」を書く扱い。
+
 ## やること
 
 1. **ブロック点の棚卸し**: daemon の serve loop から到達する全ての blocking 呼び出し (socket write / join / waitpid / PTY write / record file write / tcsetattr 等) を列挙し、「相手が応答しない時に bounded で返るか」を表にする (`docs/findings/` に記録)
