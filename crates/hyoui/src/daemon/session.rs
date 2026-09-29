@@ -4223,6 +4223,41 @@ mod tests {
         let _ = join_with_deadline(handle, Duration::from_secs(30), "backpressure daemon serve");
     }
 
+    /// 読まない client (= SIGSTOP された `hyoui attach` 相当) を抱えたまま子が大量出力
+    /// して exit しても、daemon は当該 client を bounded time で切り、子を回収して
+    /// serve を終える (= writer_pump の send block で join が永久に返らず、子が zombie
+    /// のまま残る事象の回帰)。client socket は test 終了まで close も read もしない。
+    #[test]
+    #[ignore = "実 PTY + 子の大量出力を使うため `cargo test -- --ignored` で実行する"]
+    fn serve_reaps_child_while_client_never_reads() {
+        let dir = make_temp_socket_dir();
+        let sock_path = dir.path().join("test.sock");
+        let mut cfg = DaemonConfig::new(
+            "demo",
+            sock_path.clone(),
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "sleep 0.5; head -c 4000000 /dev/zero | tr '\\0' y; exit 7".into(),
+            ],
+        );
+        cfg.client_buffer_bytes = 12 * 1024;
+        let session = Session::start(cfg).expect("start");
+        let handle = std::thread::spawn(move || session.serve());
+
+        let mut stuck = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut stuck);
+
+        let result =
+            join_with_deadline(handle, Duration::from_secs(30), "serve with unread client");
+        assert_eq!(
+            result.expect("serve"),
+            7,
+            "子の exit code を回収して serve が返る"
+        );
+        drop(stuck);
+    }
+
     // ---- Round1 fixes: authorization / token / signal / silent skip ----
 
     #[test]

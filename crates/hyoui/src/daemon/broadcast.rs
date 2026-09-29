@@ -121,13 +121,13 @@ pub(super) struct ClientHandle {
 ///    積まれた frame は順次 Ok で返し**、queue が空になった時点で初めて Err を返す
 ///    (= std::sync::mpsc の標準仕様)。これにより failure ack を含む pending frame が
 ///    socket に flush される
-/// 2. **`reader.set_write_timeout`** で writer 側 fd に upper-bound を設定
-///    (`DROP_FLUSH_TIMEOUT`)。client が socket を読まない / 死んでいる場合に
-///    `write_all` が無限 block するのを防ぐ。`reader` と writer_pump の `sock` は
-///    UnixStreamTransport::split の try_clone で同一 fd を共有しているため、
-///    一方への `set_write_timeout` がもう一方の write にも適用される
-/// 3. **`writer_thread.join()`** で writer_pump 終了を reap。flush 完走 / timeout /
-///    socket error のいずれかで pump は終了する。double-panic は join では起きない
+/// 2. **`DROP_FLUSH_TIMEOUT` まで writer_pump の終了を待つ**。client が読んでいれば
+///    pending frame を flush し切って pump は自然終了する
+/// 3. **期限切れなら `reader.shutdown(Write)` してから join**。client が socket を
+///    読まない (SIGSTOP された attach client 等) と writer_pump は send で block
+///    したままになる。`reader` と writer_pump の `sock` は try_clone で同一 socket を
+///    共有しているので、shutdown(Write) で block 中の send が EPIPE で解除され、
+///    join は bounded time で返る。double-panic は join では起きない
 /// 4. **`reader.shutdown(Both)`** で念のため socket を最終 close。flush 後の clean-up
 ///    として動作する。
 impl Drop for ClientHandle {
@@ -137,15 +137,26 @@ impl Drop for ClientHandle {
         //     終了する (= DR-0021 M1: 失敗 ack が drop で失われないことを保証)。
         let (dummy_tx, _dummy_rx) = mpsc::channel::<SharedBytes>();
         let _ = std::mem::replace(&mut self.writer_tx, dummy_tx);
-        // (2) write_all が無限 block しないよう upper bound を設定。client が読まない
-        //     / 死んでいる場合に flush を諦めて pump が抜けられるようにする。
-        //     `reader` と writer_pump の `sock` は同一 fd を共有 (try_clone) するので
-        //     一方の write_timeout 設定がもう一方の write にも効く。
-        let _ = self.reader.set_write_timeout(Some(DROP_FLUSH_TIMEOUT));
-        // (3) writer_pump の終了を join で reap。flush 完了 / write_timeout / EPIPE
-        //     のいずれかで pump は loop を抜ける。
+        // (2)(3) flush を DROP_FLUSH_TIMEOUT だけ待ち、終わらなければ shutdown(Write)
+        //     で送信側を閉じてから join する。
+        //
+        // Design rationale: `set_write_timeout` (SO_SNDTIMEO) は syscall 開始時に
+        // 読まれるため、既に send で block 中の writer_pump には後付けしても効かない
+        // (macOS 実測: 3 s 経っても解除されない)。stopped / 読まない client で
+        // join が永久に返らず daemon のイベントループ (SIGCHLD 回収含む) ごと止まる。
+        // block 中の send を確実に解除できるのは別 fd からの shutdown(Write) (実測:
+        // 即 EPIPE) なので、timed join の後にそれを使う。JoinHandle に timed join が
+        // 無いため待ち合わせ用の thread を 1 本立てる (client 切断時のみの cost)。
         if let Some(t) = self.writer_thread.take() {
-            let _ = t.join();
+            let (done_tx, done_rx) = mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                let _ = t.join();
+                let _ = done_tx.send(());
+            });
+            if done_rx.recv_timeout(DROP_FLUSH_TIMEOUT).is_err() {
+                let _ = self.reader.shutdown(std::net::Shutdown::Write);
+                let _ = done_rx.recv();
+            }
         }
         // (4) 最終 cleanup として shutdown(Both) を呼ぶ (= 念押し、reader/writer 両側を
         //     close)。flush 後なので失う frame はない。
@@ -741,6 +752,52 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_millis(500),
             "Drop should complete quickly, took {elapsed:?}"
+        );
+    }
+
+    /// peer が socket を読まず writer_pump が send で block 済みでも、Drop は
+    /// bounded time で返る (= stopped attach client で daemon が固まらない)。
+    #[test]
+    fn client_handle_drop_unblocks_writer_stuck_in_send() {
+        // daemon 側は reader と writer_pump の sock が同じ端点の clone (accept.rs と同形)。
+        // peer は保持するが一切読まない (= SIGSTOP された client 相当)。
+        let (reader, _unread_peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let writer_sock = reader.try_clone().expect("clone writer");
+        let (tx, rx) = mpsc::channel::<SharedBytes>();
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let queued_for_pump = Arc::clone(&queued_bytes);
+        let writer_thread =
+            std::thread::spawn(move || writer_pump(rx, writer_sock, queued_for_pump));
+        // socket buffer より十分大きい payload で send を block させる
+        tx.send(Arc::new(vec![0u8; 8 * 1024 * 1024]))
+            .expect("enqueue");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let ch = ClientHandle {
+            id: 98,
+            mode: Mode::Rw,
+            leader: true,
+            subscription: Subscription::Raw,
+            negotiated_caps: vec![],
+            writer_tx: tx,
+            queued_bytes,
+            buffer_limit: 1024,
+            writer_thread: Some(writer_thread),
+            reader,
+            connected_at_unix_ms: 0,
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            drop(ch);
+            let _ = done_tx.send(start.elapsed());
+        });
+        let elapsed = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("Drop must not hang on a writer blocked in send");
+        assert!(
+            elapsed >= DROP_FLUSH_TIMEOUT,
+            "flush 猶予を待たずに打ち切ってはいけない (DR-0021 M1), took {elapsed:?}"
         );
     }
 
