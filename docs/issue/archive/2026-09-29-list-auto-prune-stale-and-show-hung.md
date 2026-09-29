@@ -1,6 +1,6 @@
 ---
 title: hyoui list は残骸 socket を常に自動掃除し、応答しない生き daemon は hung として pid 付きで表示する
-status: open
+status: resolved
 category: request
 created: 2026-09-29T14:25:41+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-29T17:14:58+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: v0.9.57 で実装 (残骸 socket は list が自動 unlink、応答なしは no-response + daemon pid、--prune-stale 廃止)。表示名は NB-Q6 裁定待ち
 blocked_by:
 origin: 自リポ TODO
 ---
