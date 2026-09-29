@@ -100,3 +100,7 @@ main commit `ab46b529` (= DR-0025 Draft land) で CI が再度 failure。CI run 
 DR-0025 Phase 2 (Client domain reducer 化、Transport/Auth/Backpressure sub-state を含む) で
 writer pump / drop sequence の状態管理が reducer 化される見込み。上記 6/30 追記の吸収可能性を
 Phase 2 として確定し、Phase 2 完了待ちとして blocked に遷移する。
+
+## 関連修正 (2026-09-29)
+
+v0.9.55 の `fix(daemon): stopped client で ClientHandle::drop の join が永久 block し daemon が子を回収できない` (`docs/issue/2026-09-29-detached-zombie-child-reap.md`) で、`ClientHandle::drop` が「writer_pump が send で block 中でも bounded time で返る」ように変わった (`set_write_timeout` 後付けは block 済み send に効かないことを macOS 実測で確認、`shutdown(Write)` で解除する方式)。本 issue の仮説シーケンス (writer_pump が send で block したまま Drop の join で止まる) と同根の可能性が高い。CI ubuntu で本テストの hang が再発しなくなったかを数回分観測してから close 判定する。
