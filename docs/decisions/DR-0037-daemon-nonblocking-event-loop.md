@@ -49,18 +49,18 @@ daemon がどの外部 (client / 子 / fs / 標準エラーの読み手) の振�
 
 | 軸 | A. 現行 `poll` + self-pipe の延長 (全 fd nonblocking) | B. mio (kqueue / epoll 抽象) | C. tokio (async runtime) |
 |---|---|---|---|
-| DR-0025 reducer 化との整合 | そのまま。DR-0025 が採った単一 thread loop を変えず、effect の結果を後から feedback するだけ | ほぼそのまま。loop の形は同じで、待ちの primitive が `Poll::poll` + `Waker` に変わる | 衝突する。reducer は同期関数のまま使えるが、effect 実行が `async` になり、DR-0025 が棄却した Alternative B1 (tokio actor) 側へ寄る |
-| 透過原則 (DR-0014) | 影響なし (子から見える挙動は変わらない) | 影響なし | 影響なし。ただし fork (forkpty) と upgrade の self-exec が multi-thread runtime 下になり、fork 後の子で使える API の制約 (async-signal-safe のみ) を runtime の thread と併せて管理する必要が出る |
-| 変更範囲 | client read / write、handshake、PTY write、shutdown 系の state machine 化。新規依存なし | A と同じ範囲 + 待ち primitive の置換 (self-pipe を `Waker` に、SIGCHLD を signal-hook-mio 等に) | serve / accept / broadcast / record / upgrade のほぼ全面書き換え、依存追加 |
-| テスト容易性 | 部分 frame decoder・送信 queue・deadline が純粋 state になり unit test できる。fd 周りは既存の socketpair テストで足りる | A と同等 | runtime 起動込みのテストになる。`#[tokio::test]` で書けるが、PTY / fork を含むと runtime の制約が増える |
+| DR-0025 reducer 化との整合 | そのまま。DR-0025 が採った単一 thread loop を変えず、effect の結果を後から feedback するだけ | そのまま。loop の形は同じで、待ちの primitive が `Poll::poll` に変わる | 単一 task + 同期 reducer の形にすれば DR-0025 の構造は保てる (actor 化は必須ではない)。effect 実行と IO 待ちが `async` 側に移る |
+| 透過原則 (DR-0014) | 影響なし (子から見える挙動は変わらない) | 影響なし | 子から見える挙動は変わらない。current-thread runtime なら runtime 由来の thread は増えないが、blocking IO を `spawn_blocking` に逃がすと thread pool が立ち、fork (forkpty) / upgrade の self-exec の時点で存在する thread の管理が要る |
+| 変更範囲 | client read / write、handshake、PTY write、shutdown 系の state machine 化。新規依存なし | A と同じ範囲 + `poll` 呼び出しの置換。既存の self-pipe / SIGCHLD pipe は fd として登録でき、置き換えは必須ではない | A の state machine 化の代わりに各経路を async IO で書き直す。serve / accept / broadcast / record / upgrade の広い範囲に及び、依存追加 |
+| テスト容易性 | 部分 frame decoder・送信 queue・deadline が純粋 state になり unit test できる。fd 周りは既存の socketpair テストで足りる | A と同等 | reducer 部分の unit test は変わらない。IO を含むテストは runtime 起動込みになる |
 | 待ち fd の数 | `poll(2)` は O(n)。client 上限 64 + 数本なので問題にならない | O(1) 相当 | O(1) 相当 |
-| worker 完了の通知 | self-pipe を 1 本足して waker にする (SIGCHLD self-pipe と同じ作り) | `Waker` が標準で用意される | channel + `.await` |
+| worker 完了の通知 | self-pipe を 1 本足して waker にする (SIGCHLD self-pipe と同じ作り) | 既存 pipe の登録でも、mio の `Waker` でもよい | channel + `.await` |
 
 **推し: A**。理由:
 
 - DR-0025 は単一 thread の同期 loop を既に決めており、本 DR の不変条件はその loop の中身を nonblocking にするだけで満たせる。runtime を替える必然性が無い
-- 待ち fd は最大 70 本程度で、`poll(2)` の O(n) が問題になる規模ではない。B の利点 (スケーラビリティ・Waker) は A でも self-pipe で代替でき、依存を増やす理由にならない
-- C は fork / self-exec / signal の扱いが runtime と絡み、変更範囲に対して得るもの (async 構文) が小さい
+- 待ち fd は最大 70 本程度で、`poll(2)` の O(n) が問題になる規模ではない。B の利点 (kqueue / epoll の O(1)、`Waker`) は A でも self-pipe で代替でき、依存を増やす理由にならない
+- C は single task + 同期 reducer で DR-0025 と両立できるが、得るもの (async 構文による state machine の記述) に対して、既存経路の書き直し範囲と fork / self-exec 時の thread 管理の考慮が増える
 
 B は A と排他ではなく、「`poll(2)` の fd 走査コストが実測で問題になったら置換する」位置づけ。採否は裁定待ち Q1。
 
@@ -70,17 +70,30 @@ findings の ID で対応を示す。
 
 | 対象 | 形 |
 |---|---|
-| client 受信 (C-1) | reader を O_NONBLOCK にし、client ごとの受信 buffer + 増分 frame decoder (純粋関数: `feed(&[u8]) -> Vec<Frame>`) で読む。1 周で読むのは `read` 1 回分まで |
+| client 受信 (C-1) | client ごとの受信 buffer + 増分 frame decoder (純粋関数: `feed(&[u8]) -> Vec<Frame>`) で読む。1 周で読むのは `recv` 1 回分まで。reader と writer は `try_clone` による同一 open file description なので、O_NONBLOCK を fd に付けると writer 側 (handshake response、writer thread の `write_all`) も nonblocking になり EAGAIN で部分送信・切断が起きる。送信が blocking のままの間は `recv(2)` の `MSG_DONTWAIT` (呼び出し単位の nonblocking。Linux / macOS の recv(2) にある) で読み、fd のフラグは変えない。送信も loop 内 nonblocking に移した段で fd ごと O_NONBLOCK にする |
 | client 送信 (C-2, C-6, C-8, C-10) | client ごとの送信 queue を loop が持ち、O_NONBLOCK write + `POLLOUT` で流す。queue の byte 上限超過で切断 (現行 backpressure と同じ判定)。切断は socket close だけで完結し、join が無い。「ack を送り切ってから切る」は queue が空になった時点で close する deadline 付き state で表す。writer thread は廃止 (裁定待ち Q2) |
 | handshake (C-4, C-9) | worker thread をやめ、pending client の state (受信 buffer + deadline 5s) として loop 内で扱う。response も送信 queue に積む。mpsc の `try_recv` のための 50ms poll cap が不要になる |
 | accept (C-5) | listener を O_NONBLOCK にし、EAGAIN / ECONNABORTED は loop に戻る |
-| PTY 書き込み (P-2) | `Effect::TtyWrite` を master の送信 queue に積み、`POLLOUT` で流す。書き切った時点 (または無進捗 deadline 超過) で `EffectResult::TtyWrite` を feedback し、DR-0021 の ack はそこで発行する (発行点の意味は現行と同じ「PTY drain 完了」)。同一 client の後続 raw_data の扱いは裁定待ち Q7 |
+| PTY 書き込み (P-2) | `Effect::TtyWrite` を master の送信 queue に effect 単位 (EffectId 付き) で積み、`POLLOUT` で流す。失敗意味論は下の「PTY 書き込み effect の完了と失敗」で effect 単位に定める |
 | master EOF 時の sleep (P-3) | deadline に置き換え、`poll` の timeout に畳み込む |
 | record (F-3, F-4, F-5) | push は `try_send` (満杯なら既存どおり欠番 + abort)。stop / abort は Sender を落とすだけで join しない。writer thread の終了は waker 経由のイベントで受け、`record.stop` の応答はそのイベントで返す。`record.start` の path 検証と open も worker で行い、結果イベントで応答する |
 | `--debug-dump` (F-1, F-2) | record と同じ IO worker に載せる |
-| upgrade (F-6) | precheck と state file 書き出しを worker で行い、完了イベントで exec に進む。exec 直前の fd 付け替えは loop が行う (worker と fd を共有しない) |
+| upgrade (F-6) | 旧プロセス側: precheck (`metadata`)、state file 書き出し、準備失敗・execve 失敗からの復帰時の state file `remove_file`、prep 失敗時の socket `unlink` (`UnixSock::drop`) を worker で行い、完了イベントで次段 (exec / 旧 serve 継続 / 終了) に進む。exec 直前の CLOEXEC 操作と fd 付け替えは loop が行う (worker と fd を共有しない)。新プロセス側: resume の state file open / decode / `remove_file` は serve loop 開始前に走るので I-1 の対象外だが、固まると upgrade 後の daemon が serve を始めないため、deadline 付きの worker で読み、期限超過なら既存の env 最小 subset fallback で resume する |
+| 通常終了時の socket `unlink` | `UnixSock::drop` の unlink を worker に渡す (serve loop を抜けた後の shutdown state でも loop 外で待たない) |
 | 標準エラー (E-1) | ready 通知の後、fd 2 を daemon 専用の出力先に付け替え、ログは bounded channel 経由で logger thread が書く (満杯なら破棄して件数を数える)。付け替え先は裁定待ち Q3。継承した fd に O_NONBLOCK を付ける方法は、file description を共有する呼び出し元の端末や pipe の挙動まで変えるので採らない |
 | shutdown (C-10, C-11, K-4) | 「drain 中」「finalize 中 (grace deadline)」「linger 中」を serve の state として loop 内で進める。sleep polling を置かない |
+
+## PTY 書き込み effect の完了と失敗
+
+DR-0021 の ack 意味論 (全 byte が master に書けた時だけ `Ok`、IdleTimeout / I/O error / partial は `Error` ack を送ってから当該 client を切断) と、DR-0025 の effect 単位の結果 (`EffectId`、`written_len` / `requested_len`) を、非同期化後も effect 単位で保つ。
+
+1. **完了**: effect の全 byte を master に書けた周回で `EffectResult::TtyWrite { written_len == requested_len }` を feedback し、発行元 client に `Ok` ack を積む
+2. **無進捗 deadline 超過**: 先頭 effect が deadline (現行 `MASTER_WRITE_IDLE_TIMEOUT_MS` = 500ms を「最後に進捗した時刻から」で計る) に達したら、その effect の **残余 byte を破棄** し、`written_len` (書けた prefix) と IdleTimeout を feedback する。書けた prefix は取り消せない (子の line discipline に届いている) ので、record と ack の `written_len` にそのまま載せる
+3. **I/O error / POLLHUP**: 2 と同じく残余を破棄し、error を feedback する
+4. **後続 effect**: 失敗した effect と同じ client から既に queue に積まれている後続の TtyWrite は、**書かずに破棄** し、それぞれ未書込の `Error` ack 相当として扱う (DR-0021 は失敗後に切断するので、後続 bytes を子に届けると「失敗した spec の後ろに後続 spec が続く」順序の嘘になる)。他 client の effect は影響を受けず続行する
+5. **切断の境界**: 失敗時は `Error` ack を当該 client の送信 queue に積み、client を「送信 queue が空になったら close」する draining state にする。draining の deadline (現行の detach ack と同じ 200ms を初期値とする) を過ぎたら queue の残りを捨てて close する。この場合 client は ack を受け取れず EOF を観測する (client が読まない場合の現行 `ClientHandle::drop` と同じ結果)。draining 中の client からの受信は処理しない
+
+同一 client の raw_data が、前の effect の完了前に届いた場合に queue に積むか拒否するかは裁定待ち Q7。DR-0021 の client は ack を同期で待ってから次を送るので、正規 client では起きず、起きるのは ack を待たない外部 client の場合に限る。
 
 ## kernel 同期 API の扱い
 
@@ -88,11 +101,12 @@ I-1 の 3 に当たるもの。各 API について、serve loop で呼んでよ
 
 | API | 呼ぶ場所 | ブロックしない根拠 |
 |---|---|---|
-| `waitpid(WNOHANG \| WUNTRACED \| WCONTINUED)` | SIGCHLD イベント、stopped 中の定期確認 | WNOHANG は状態変化が無ければ即 0 を返す (POSIX)。flag なしの `waitpid` は loop では使わない |
-| `kill` / `killpg` 相当 (`kill(-pgid)`) | kill / signal / 終了条件 | signal の配送は enqueue で、受け手の処理を待たない |
-| `getpgid` / `kill(pid, 0)` | status | プロセス表の参照のみ |
-| `ioctl(TIOCSWINSZ)` | resize | PTY の winsize 構造体の更新と SIGWINCH の enqueue のみで、読み手を待たない |
-| `/proc/<pid>/stat` の read (Linux) | stopped 中の復帰確認 | procfs は kernel 内で生成され、外部の fs に依存しない |
+| `waitpid(WNOHANG \| WUNTRACED \| WCONTINUED)` | SIGCHLD イベント、stopped 中の定期確認 | POSIX `waitpid` (XSH): WNOHANG 指定時、状態が報告可能な子が無ければ呼び出しを中断せず 0 を返す。flag なしの `waitpid` は loop では使わない |
+| `kill` / `killpg` 相当 (`kill(-pgid)`) | kill / signal / 終了条件 | POSIX `kill` (XSH) は signal の送信を規定し、受け手の処理完了を待つ意味論を持たない (配送は非同期)。対象が SIGSTOP 中でも送信側は戻る |
+| `getpgid` / `kill(pid, 0)` | status | POSIX `getpgid` / `kill` (sig=0 は error check のみで signal を送らない)。プロセス表の参照のみ |
+| `ioctl(TIOCSWINSZ)` | resize | tty_ioctl(4) (Linux) / tty(4) (macOS): winsize を設定し、変化があれば foreground process group に SIGWINCH を送る。読み手の応答を待つ操作を含まない |
+| `/proc/<pid>/stat` の open / read / close (Linux、`std::fs::read_to_string`) | stopped 中の復帰確認 | fs 経由の IO だが、proc(5) の procfs は read 時に kernel がプロセス表から内容を生成する擬似 fs で、外部の記憶装置・ネットワークに依存しない。I-1 の「kernel 同期 API」として扱う。ただし一般の fs IO と見分けがつかない形なので、呼び出しを procfs 専用の helper に閉じる |
+| `/dev/urandom` の open + 16 bytes read (lock token 生成、lock.acquire 時) | lock.acquire | random(4) (Linux): urandom の read は初期化後 block しない。macOS random(4): urandom は random と同じで block しない。open は devfs の character device。I-1 の kernel 同期 API として扱い、`getrandom(2)` / `getentropy(3)` に置き換えられるならそちらを使う (path open を無くせる) |
 | `tcsetpgrp` | forkpty 後、exec 前の子プロセス内だけ (`sys/raw.rs`) | serve loop からは呼ばない。子側で呼ぶため loop の不変条件の対象外 |
 
 SIGKILL 後の reap (K-5): 現行は flag なしの `waitpid` で見届ける。D state の子に対しては戻らない。I-1 に合わせ、SIGKILL 後も WNOHANG + deadline で確認し、deadline を過ぎたら reap せずに daemon を終了する (daemon が消えると子は init / launchd に引き取られて回収される)。この場合の exit code の扱いは裁定待ち Q4。
@@ -101,27 +115,27 @@ SIGKILL 後の reap (K-5): 現行は flag なしの `waitpid` で見届ける。
 
 前提として、serve loop が完全に止まると **status.query 自体に応答できない**。heartbeat を status.response に載せても、止まった daemon からは返ってこないので、完全停止の検出には使えない。検出は 2 層に分ける。
 
-1. **CLI 側の分類 (完全停止の検出)**: `hyoui list` / `status` の probe で、`connect` の結果と応答で 3 状態に分ける
-   - `connect` が ECONNREFUSED / ENOENT → `stale` (daemon が居ない)
-   - `connect` は成功 (kernel の listen backlog が受ける) が、handshake response が deadline 内に来ない → `hung` (daemon は居るが loop が止まっている)
+1. **CLI 側の分類 (完全停止の検出)**: `hyoui list` / `status` の probe で、観測した事実だけで 3 状態に分ける
+   - `connect` が ECONNREFUSED / ENOENT → `stale` (応答する daemon が居ない)
+   - `connect` は成功したが、handshake response が deadline 内に来ない → `no-response` (期限内に応答が無かった、という観測の名前)
    - 応答あり → `live`
-   `docs/issue/2026-09-29-list-auto-prune-stale-and-show-hung.md` の表示側と対応する。`hung` の socket は prune 対象にしない (daemon と子が生きているため)
-2. **daemon 内 watchdog (原因の記録)**: serve loop は周回ごとに単調増加カウンタと「今どの処理段にいるか」の label を atomic に書く。watchdog thread がカウンタの停滞 (例: 5 秒) を検出したら、label と停滞時間をログに 1 行書く。watchdog は IO を logger 経由でしか行わないので、それ自体は止まらない
-3. **占有の可視化 (遅延の検出)**: status.response に「直近の loop 1 周の最大所要時間」と「最後に周回を終えてからの経過時間」を載せる。完全停止ではないが数百 ms 占有する経路 (findings の有界な占有) を観測できる
+   `no-response` は「loop が止まっている」の推定を含むが、原因を区別できない: loop の停止、listen backlog の飽和、handshake の遅延 (handshake worker の滞留や高負荷)、接続直後の daemon crash (crash なら直後の再 probe で `stale` に変わる)。表示名は観測事実にとどめ、「止まっている可能性が高い」は help / 説明文に推定として書く。daemon 側の原因は 2 の watchdog ログで確かめる。`no-response` の socket は prune 対象にしない (daemon と子が生きている可能性があるため)。`docs/issue/2026-09-29-list-auto-prune-stale-and-show-hung.md` の表示側と対応する (issue 側の `hung` という名前はこの定義に合わせて読み替える)
+2. **daemon 内 watchdog (原因の記録)**: イベントが無い daemon は `poll` の中で待つので、周回カウンタの停滞だけでは停止と正常な idle を区別できない。serve loop は「今どの処理段にいるか」の label と、その段に入った時刻を atomic に書く。label のうち `poll` 待機は特別扱いし、watchdog は **`poll` 以外の段に一定時間 (例: 5 秒) 留まっている場合だけ** 診断として label と経過時間をログに 1 行書く。`poll` 待機中は何時間続いても正常 idle として扱う。watchdog は IO を logger 経由でしか行わないので、それ自体は止まらない
+3. **占有の可視化 (遅延の検出)**: status.response に「`poll` 以外の段で費やした 1 周あたりの最大時間」と、その発生時刻・label を載せる (`poll` 待機時間は含めない)。完全停止ではないが数百 ms 占有する経路 (findings の有界な占有) を観測できる
 
-自動 kill は提案しない。daemon を kill すると master fd が閉じて子に SIGHUP が届き、子のセッションごと終わる。loop が止まっても子自身は動き続けており、子を巻き込んで終わらせる必然性は無い (DR-0014 の透過原則)。`hung` を表示し、ユーザが `kill` するかを判断する。
+自動 kill は提案しない。daemon を kill すると master fd が閉じて子に SIGHUP が届き、子のセッションごと終わる。loop が止まっても子自身は動き続けており、子を巻き込んで終わらせる必然性は無い (DR-0014 の透過原則)。`no-response` を表示し、ユーザが `kill` するかを判断する。
 
 ## 段階移行
 
-実機で再現した経路と、影響が大きい経路から順に進める。各段は単独で入れられる。
+実機で再現した経路と、影響が大きい経路から順に進める。段の間の依存は各段に書く (依存を書いていない段は前段と独立に入れられる)。
 
-1. **client 受信の nonblocking 化 + 増分 decoder** (C-1)。1 client で daemon を止められる経路で、実機再現済み。handshake 後の client のみ対象にし、handshake の worker は残してよい
+1. **client 受信の増分 decoder 化** (C-1)。1 client で daemon を止められる経路で、実機再現済み。受信は `recv(MSG_DONTWAIT)` で行い、fd の O_NONBLOCK は付けない (reader と writer が同一 open file description を共有するため、付けると blocking 前提の writer thread と handshake response の `write_all` が EAGAIN で部分送信・切断になる)。handshake 後の client のみ対象にし、handshake の worker は残してよい
 2. **標準エラーの付け替え + logger** (E-1)。起動した呼び出し元の stderr を daemon が持ち続けること自体をやめる
 3. **fs IO の worker 化** (F-1〜F-6)。record の join 撤去が中心
-4. **client 送信の loop 内 nonblocking 化と writer thread の廃止** (C-2, C-6, C-8, C-10)。v0.9.55 の `ClientHandle::drop` の timed join + `shutdown(Write)` は、この段までの **暫定の上限** として残す。この段で writer thread ごと無くなり、Drop は close だけになる
-5. **PTY 書き込みの非同期化** (P-2)。DR-0021 の ack を `EffectResult` から発行する形に移す。DR-0025 の effect feedback の形に合わせて入れる
-6. **handshake の loop 内化、accept の nonblocking 化、sleep の deadline 化、shutdown の state 化** (C-4, C-5, C-9, C-11, P-3, K-4, K-5)
-7. **検出手段** (CLI 側の `hung` 分類は 1 と並行してよい。watchdog と status の占有指標は 4 以降)
+4. **client 送信の loop 内 nonblocking 化と writer thread の廃止** (C-2, C-6, C-8, C-10)。client socket の fd に O_NONBLOCK を付けるのはこの段で、受信の `MSG_DONTWAIT` はこの段で通常の read に戻してよい。handshake response も送信 queue 経由に切り替える (blocking の `write_all` が同じ description に残らないように)。v0.9.55 の `ClientHandle::drop` の timed join + `shutdown(Write)` は、この段までの **暫定の上限** として残す。この段で writer thread ごと無くなり、Drop は close だけになる
+5. **PTY 書き込みの非同期化** (P-2)。「PTY 書き込み effect の完了と失敗」節の意味論で入れる。失敗時の draining state が送信 queue を前提にするので段 4 に依存する
+6. **handshake の loop 内化、accept の nonblocking 化、sleep の deadline 化、shutdown の state 化** (C-4, C-5, C-9, C-11, P-3, K-4, K-5)。handshake の loop 内化は段 4 の送信 queue に依存する。listener の O_NONBLOCK は accept した socket に継承されない前提 (Linux accept(2)) と継承される実装 (BSD 系) の両方で、段 4 以降なら問題にならない
+7. **検出手段** (CLI 側の `no-response` 分類は 1 と並行してよい。watchdog と status の占有指標は 4 以降)
 
 各段の受け入れは、下記テストマトリクスの該当行が serve の応答性を保つこと。
 
@@ -147,9 +161,10 @@ SIGKILL 後の reap (K-5): 現行は flag なしの `waitpid` で見届ける。
 - **Q2 client 送信**: writer thread を廃止して loop 内 nonblocking write にするか、writer thread を残して「Drop は join しない (detach + shutdown)」にするか。推しは廃止 (thread の生存管理と join がそもそも無くなる、backpressure の計算が loop 内の純粋 state になる)。残す案は変更範囲が小さい
 - **Q3 daemon のログ出力先**: 起動後の fd 2 と logger の書き先を、state dir 配下の session ごとのログファイルにするか、`/dev/null` にするか。起動失敗の報告は現行どおり ready 通知前は呼び出し元の stderr に出す
 - **Q4 reap できない子**: SIGKILL 後 deadline を過ぎても reap できない子を置いて daemon が終了するときの exit code (現行の `128 + 9` とするか、別の値で区別するか)
-- **Q5 検出**: 検出節の 3 層 (CLI 側の `hung` 分類 / watchdog のログ / status の占有指標) のうちどこまで入れるか。CLI 側の分類は必須と考える
+- **Q5 検出**: 検出節の 3 層 (CLI 側の `no-response` 分類 / watchdog のログ / status の占有指標) のうちどこまで入れるか。CLI 側の分類は必須と考える
 - **Q6 固まった IO worker**: fs が応答せず worker が戻らない場合に、worker thread の上限を設けるか (上限到達で `record.start` を拒否する等)、record を aborted として表示するか
-- **Q7 PTY 書き込み中の後続 raw_data**: 同一 client の raw_data が前の書き込み完了前に来たとき、queue に積むか、完了まで拒否するか。DR-0022 の auto-lock があるため client 間の順序は lock が保証し、ここで決めるのは同一 client 内の扱い
+- **Q7 PTY 書き込み effect の失敗意味論と後続 raw_data**: 「PTY 書き込み effect の完了と失敗」節の 5 点 (残余破棄、後続 effect の書かずに破棄、draining の deadline 200ms と超過時に client が ack でなく EOF を見ること) をこのまま確定してよいか。あわせて、同一 client の raw_data が前の effect の完了前に来たとき queue に積むか拒否するか。client 間の順序は DR-0022 の auto-lock が保証し、ここで決めるのは同一 client 内の扱い
+- **Q8 no-response の表示名**: CLI の表示状態を観測事実の名前 (`no-response`) にするか、issue 側で使っている `hung` を推定と明記した上で使うか
 
 ## Consequences
 

@@ -27,7 +27,7 @@ main thread が `Frame::decode_from(&mut ch.reader)` の `read_exact` で残り�
 
 | ID | 呼び出し (位置) | 相手 | 応答しない時ブロックするか | 現状の bound | 根拠 |
 |---|---|---|---|---|---|
-| C-1 | `Frame::decode_from(&mut ch.reader)` (`daemon/session.rs` serve_loop の「3. 各 client reader」、`protocol/frame.rs:139` の `read_exact_eof` ×3) | client | **する**。POLLIN は 1 byte 以上で立つが、decode は header 4B + type 1B + body を `read_exact` で読み切るまで戻らない。socket は blocking (`sys/socket.rs:218` の accept は O_NONBLOCK を付けない、`accept.rs:298` で read timeout を `None` に戻す) | 無 | observed(実機) |
+| C-1 | `Frame::decode_from(&mut ch.reader)` (`daemon/session.rs` serve_loop の「3. 各 client reader」、`protocol/frame.rs:139` の `read_exact_eof` ×3) | client | **する**。POLLIN は 1 byte 以上で立つが、decode は header 4B + type 1B + body を `read_exact` で読み切るまで戻らない。socket は blocking (`sys/socket.rs:218` の accept は O_NONBLOCK を付けない、`accept.rs:298` で read timeout を `None` に戻す)。reader と writer は `protocol/transports/unix.rs:40-42` の `try_clone` (= dup、同一 open file description) なので、O_NONBLOCK を reader にだけ付けることはできない (file status flag は description 単位で共有される) | 無 | observed(実機) |
 | C-2 | `ClientHandle::drop` の writer thread join (`daemon/broadcast.rs` の `impl Drop for ClientHandle`) | client | v0.9.55 で `recv_timeout(DROP_FLUSH_TIMEOUT=500ms)` → `shutdown(Write)` → `done_rx.recv()`。最後の `recv()` は shutdown で send が EPIPE 化する前提で待つ | 500ms + shutdown 後の解除時間 (macOS は即時と実測済のコメントあり、Linux は未確認) | observed (Linux の解除は inferred) |
 | C-3 | 待ち合わせ用 thread の生成 (同上) | kernel | しない。ただし client 切断 1 件ごとに thread を 1 本作る | — | observed |
 | C-4 | `finalize_accepted_client` の handshake response / reject の `Frame::encode_to(&mut writer_main)` (`daemon/accept.rs:280-400`) | client | 直前に write timeout を `None` に戻した blocking write を **main thread** で行う。handshake 直後で送信 buffer は空なので小さい frame は即時に書ける | 実質有界 (buffer 空が前提) | observed (書けること自体は inferred) |
@@ -55,7 +55,7 @@ main thread が `Frame::decode_from(&mut ch.reader)` の `read_exact` で残り�
 |---|---|---|---|---|---|
 | K-1 | `lifecycle.poll_with_transition` の `waitpid(WNOHANG\|WUNTRACED\|WCONTINUED)` (`daemon/pty.rs:125`) | kernel | しない (WNOHANG) | — | observed |
 | K-2 | `child_is_stopped_via_waitpid` (`session.rs:1005`) | kernel | しない (WNOHANG) | — | observed |
-| K-3 | `procstate::is_stopped` (Linux は `/proc/<pid>/stat` の読み取り、`sys/procstate.rs:49`) | kernel (procfs) | しない | — | inferred |
+| K-3 | `procstate::is_stopped` (Linux は F-8 の procfs 読み取り、macOS は kernel の process state 直読み) | kernel | しない | — | inferred |
 | K-4 | `finalize_child` の grace loop (`session.rs`) | 子 | 20ms sleep の WNOHANG polling | 5s (`FINALIZE_TERM_GRACE`) | observed |
 | K-5 | `reap_blocking` の `waitpid(0)` (SIGKILL 昇格後 / `ChildExited(None)`) | 子 | SIGKILL 後は通常即時。子が uninterruptible sleep (D state) のままなら戻らない | 無 | inferred |
 | K-6 | `Session::drop` の reap (`session.rs:871-945`) | 子 | serve 未実行時のみ。WNOHANG polling | 500ms 後 SIGKILL | observed |
@@ -69,8 +69,9 @@ main thread が `Frame::decode_from(&mut ch.reader)` の `read_exact` で残り�
 | F-3 | record の `try_push` → `send_timeout(RECORD_PUSH_TIMEOUT)` (`daemon/record.rs:344`)、PTY chunk ごと・sink ごとに `push_bytes_out` から main thread で呼ぶ | record writer thread (→ fs) | writer が fs で止まり queue が満杯になると 1 回 100ms 待つ | 100ms × sink 数 / chunk | observed |
 | F-4 | queue 満杯で abort された sink の `join_writer` (`record.rs:736`) と `record.stop` / `stop_all` の `join_writer` (`record.rs:517-540`)。いずれも main thread | record writer thread (→ fs) | **する**。Sender を落としてから writer thread を join する。writer が fs の write で止まっていれば join は戻らない | 無 | observed (fs の停止は inferred) |
 | F-5 | `record.start` の `validate_output_path` (`canonicalize`) と `open_record_file` (`record.rs:1165-1260`)、main thread | fs | する (応答しない fs 上の path を指定された場合) | 無 | inferred |
-| F-6 | upgrade の `precheck_path` (`metadata`)、`write_state_file` (`daemon/upgrade.rs:160-190`)、main thread | fs | する (同上) | 無 | inferred |
-| F-7 | lock token 生成の `/dev/urandom` 読み (`daemon/lock.rs:524`) | kernel | しない | — | inferred |
+| F-6 | upgrade 経路の fs 操作 (すべて main thread、または exec 前後の単一 thread)。(a) `precheck_path` / `precheck_upgrade_target` の `metadata` (`daemon/upgrade.rs:244-280`)、(b) `write_state_file` の open + CBOR write (`upgrade.rs:160-190`)、(c) exec 準備失敗・execve 失敗からの復帰経路の `remove_file(state_path)` (`upgrade.rs:405,419,485,517`)、(d) prep 失敗時に `UnixSock::drop` が同期実行する socket の `unlink` (`sys/socket.rs:229-232`)、(e) exec 後の新プロセスが resume で行う state file の open / CBOR decode / `remove_file` (`upgrade.rs:202-215` の `read_and_consume_state_file`。`Session::from_upgrade_inherited` 側 `session.rs:361` 付近の resume 経路から呼ばれ、serve 開始前に走る) | fs | する (state dir / socket dir が応答しない fs 上にある場合) | 無 | observed (fs の停止は inferred) |
+| F-7 | lock token 生成の `/dev/urandom` の open + `read_exact` 16 bytes (`daemon/lock.rs:523-534`、`control.rs:791` の lock.acquire から main thread で呼ぶ) | kernel (devfs) | 現行の Linux / macOS の `/dev/urandom` は初期化後に read が block しない。open は devfs 上の character device で外部 fs に依存しない。ただし fd 枯渇 (EMFILE) は error として返る (既存で Denied 応答) | — | inferred (man 4 random) |
+| F-8 | `procstate::is_stopped` の Linux 実装は `std::fs::read_to_string("/proc/<pid>/stat")` (`sys/procstate.rs:49`) で open / read / close を伴う | kernel (procfs) | procfs は kernel が read 時に生成し外部 fs に依存しない。ただし「fs 経由の IO」なので DR-0037 I-1 上は根拠の明記が必要 | — | inferred (proc(5)) |
 
 ### tty / 標準エラー / 同期プリミティブ
 
@@ -84,7 +85,7 @@ main thread が `Frame::decode_from(&mut ch.reader)` の `read_exact` で残り�
 ## まとめ (相手別の unbounded 箇所)
 
 - client: C-1 (実機で再現)、C-5 (推測)
-- fs: F-1、F-2、F-4、F-5、F-6
+- fs: F-1、F-2、F-4、F-5、F-6 (upgrade の準備・復帰・resume の全段)
 - 標準エラー: E-1
 - kernel: K-5 (D state の子のみ)
 

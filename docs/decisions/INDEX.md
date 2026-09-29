@@ -54,7 +54,7 @@ Status 列は **ラベル + 最終判定日** だけを載せる。実装範囲�
 | [DR-0034](./DR-0034-service-multi-unit-and-stable-unstable-ha.md) | 🟡 部分実装 (2026-09-15) | `hyoui web daemon` / `hyoui web service` の 2 系統化 (= unit = 登録簿 1 ファイル + 監督者 1 つを OS に載せる) と stable / unstable 2 インスタンスの HA |
 | [DR-0035](./DR-0035-web-contract-and-protocol-generation.md) | 🟡 部分実装 (2026-09-16) | web 境界の契約を `contract.rs` の serde 型で正本化し、世代 version (`WEB_PROTOCOL_VERSION`) で stale なページを検出する (= 伝達は WS hello frame と `/version` のみ、帯で reload 誘導)。W1-1〜W1-6 実装済、gate 1(b) は canddy の 3 endpoint 待ち / W1-5 の cap 不足 daemon への 501 は実機未検証 |
 | [DR-0036](./DR-0036-passkey-auth-for-web-endpoints.md) | 🟡 実装中 (2026-09-16) | web endpoint を passkey で守る (= 登録は CLI 発行の招待 URL、gateway は自分の endpoint を知らず record の endpoint で検証、無認証 mode を持たない)。W2-1〜W2-4 と W2-6 の runbook 実装済、**残りは W2-5 (front の overlay ログイン UI) だけ** — 認証は既に有効なので、それが入るまでブラウザからは開けない (issue `2026-09-16-web-passkey-front-login-ui`)。gate 3 の Safari / iOS は kawaz 確認待ち |
-| [DR-0037](./DR-0037-daemon-nonblocking-event-loop.md) | 💭 提案 (2026-09-29) | daemon のイベントループは外部 (client / 子 / fs / 標準エラー) の応答を待たない (= 不変条件、runtime 比較、kernel 同期 API の扱い、段階移行、固まった daemon の検出)。裁定待ち Q1〜Q7 |
+| [DR-0037](./DR-0037-daemon-nonblocking-event-loop.md) | 💭 提案 (2026-09-29) | daemon のイベントループは外部 (client / 子 / fs / 標準エラー) の応答を待たない (= 不変条件、runtime 比較、kernel 同期 API の扱い、段階移行、固まった daemon の検出)。裁定待ち Q1〜Q8 |
 ## Archived
 
 (なし)
