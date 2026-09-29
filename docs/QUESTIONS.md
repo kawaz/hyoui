@@ -18,7 +18,42 @@
 
 ## 裁定待ち
 
-(現在なし)
+### 👺NB-Q1: DR-0037 (daemon イベントループ非同期化) の runtime
+
+[DR-0037](decisions/DR-0037-daemon-nonblocking-event-loop.md) 「runtime の選択肢」節。統括推しは a (DR-0025 の単一 thread 同期 loop をそのまま nonblocking 化するだけで不変条件を満たせ、依存を増やさない。fd は最大 70 本程度で poll(2) の O(n) は問題にならない)。
+
+- [ ] a: 現行 poll + self-pipe の延長 (全 fd nonblocking)
+- [ ] b: mio (kqueue / epoll 抽象)
+- [ ] c: tokio
+
+### 👺NB-Q2: client 送信の writer thread
+
+統括推しは a (thread の生存管理と join が無くなり、backpressure が loop 内の純粋 state になる。v0.9.55 の Drop 修正はそれまでの暫定上限)。b は変更範囲が小さいが thread と join 起因の穴が残る。
+
+- [ ] a: writer thread を廃止し loop 内 nonblocking write + POLLOUT
+- [ ] b: writer thread を残し、Drop は join せず detach + shutdown
+
+### 👺NB-Q3: 起動後の daemon ログ (fd 2) の出力先
+
+現状は起動元 CLI の stderr (tty / pipe) を継承したままで、読まれない pipe だと eprintln が戻らない (`$(hyoui run --detached ... 2>&1)` が返ってこない実害あり)。統括推しは a (固まった時の原因記録 = watchdog ログの置き場が要る)。
+
+- [ ] a: state dir 配下の session ごとのログファイル
+- [ ] b: /dev/null
+
+### 👺NB-Q4: 固まった daemon の検出をどこまで入れるか
+
+DR-0037 「固まった daemon の検出」節の 3 層。統括推しは c (1 は list-prune で実装中、2 は原因究明に必須、3 は有界な占有の可視化で安い)。
+
+- [ ] a: 1 (CLI 側の stale / hung / live 分類) のみ
+- [ ] b: 1 + 2 (daemon 内 watchdog がループ停滞をログ)
+- [ ] c: 1 + 2 + 3 (status に直近 1 周の最大所要時間と最終周回からの経過も載せる)
+
+### 👺NB-Q5: 段階 1 (client 受信の nonblocking 化) を Q1 の裁定前に着手してよいか
+
+1 client が frame を途中まで送るだけで daemon が止まる経路 (実機再現済み) の修正で、a / b どちらの runtime でも同じ形 (nonblocking fd + 増分 decoder)。統括推しは a。
+
+- [ ] a: 着手してよい
+- [ ] b: Q1 裁定まで待つ
 
 ## 確認待ち
 
