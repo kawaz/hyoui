@@ -1,4 +1,5 @@
 /target/
+/target-linux/
 *.profraw
 *.profdata
 .DS_Store
