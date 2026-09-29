@@ -28,6 +28,16 @@ kawaz 裁定 2026-09-29: 「stale が残る状況が意味不明、list 時点�
 1. **connect 拒否 (ECONNREFUSED 等)** = daemon が SIGKILL / panic / OS 再起動で死んで socket ファイルだけ残った残骸。誰も使えないので `hyoui list` が常に unlink してよい (`--prune-stale` フラグは廃止)
 2. **connect 成功だが status 応答なし** = daemon は生きているが固まっている (例: 2026-09-29 の stopped client への sendto ブロック)。socket を消すと生き daemon と子が孤児化して attach も kill もできなくなるので unlink しない。`hung` のような別 status で daemon pid を表示し、kill の手掛かりを残す
 
+## 設計裁定 (統括 2026-09-29、worker の衝突報告への回答)
+
+`crates/hyoui-cli/src/main.rs` の `enrich_entries_with_status` 周辺にある「list で timeout を使わない」判断は「本物の daemon は local socket で必ず即応答する」前提で、2026-09-29 に実機で崩れた (daemon が生きたまま無応答) ので反転する。旧判断が守ろうとした「遅いだけの daemon を壊れた扱いにして誤情報を出さない」は以下で守る:
+
+- timeout は 5 秒 (DR-0006 の RAW_ACK_TIMEOUT と同値) を定数化し根拠を書く
+- 超過は silent に stale へ落とさず `hung` として daemon pid と理由 (「5 秒応答なし」) を表示、stderr warning も残す、unlink しない
+- 実装は ClientConnection API に handshake 前から効く timeout (`connect_with_timeout` 相当) を追加して `discovery.rs` と list 双方で使う。thread detach 方式は web gateway で leak するので不採用
+- daemon pid は peer credential (macOS `LOCAL_PEERPID` / Linux `SO_PEERCRED`) で connect 直後に取る (`sys/` 配下に wrapper)
+- main.rs の doc comment は現在形で書き直す
+
 ## 受け入れ条件
 
 - [ ] `hyoui list` (namespace 指定 / `--all-namespaces` 双方) が connect 拒否の socket を表示せず unlink する
