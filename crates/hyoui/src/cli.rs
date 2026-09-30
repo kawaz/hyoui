@@ -5720,7 +5720,7 @@ fn usage_list() -> String {
         \n\
         COLUMNS (plain):\n    \
             SESSION   session id (= socket file 名から拡張子を除いた値、20ch で truncate)\n    \
-            STATUS    live | stopped | no-response | error (= stopped は子が ^Z/SIGSTOP で停止中)\n    \
+            STATUS    live | stopped | no-response | stale | error (= stopped は子が ^Z/SIGSTOP で停止中)\n    \
             PID       live/stopped は子 PTY、no-response は daemon の PID\n    \
             DUR       socket mtime からの経過時間 (= 1h2m / 15m / 3d4h 形式)\n    \
             CLIENTS   現在 attach 中の client 数 (= status.query の結果)\n    \
@@ -5728,15 +5728,15 @@ fn usage_list() -> String {
             ARGV      daemon が起動した子 PTY の argv (= space-join、空白含む arg は \"...\" quote)\n\
         \n\
         OUTPUT (jsonl, 1 session = 1 line):\n    \
-            {\"session\":\"<id>\",\"status\":\"live|stopped|no-response|error\",\"daemon_pid\":<n>|null,\"child_state\":\"running|stopped|null\",\"child_pid\":<n>|null,\"child_pgid\":<n>|null,\"started_unix_ms\":<ms>,\"dur_ms\":<ms>,\"socket\":\"<path>\",\"cwd\":\"<path>|null\",\"argv\":[...]|null,\"clients\":<n>|null}\n\
+            {\"session\":\"<id>\",\"status\":\"live|stopped|no-response|stale|error\",\"daemon_pid\":<n>|null,\"child_state\":\"running|stopped|null\",\"child_pid\":<n>|null,\"child_pgid\":<n>|null,\"started_unix_ms\":<ms>,\"dur_ms\":<ms>,\"socket\":\"<path>\",\"cwd\":\"<path>|null\",\"argv\":[...]|null,\"clients\":<n>|null}\n\
         \n\
         SORT ORDER:\n    \
             socket mtime ascending (= 古い session が上、新しい session が下)。\n    \
             `hyoui attach --index=1` で 1 番古い、`--index=-1` で 1 番新しい session を指す前提。\n\
         \n\
         SESSION STATUS:\n    \
-            connect 拒否の残骸 socket は自動削除し表示しない。\n    \
-            接続は成立したが 5 秒以内に応答が無ければ no-response として daemon PID を表示する。daemon の loop 停止だけでなく backlog 飽和や handshake 遅延でも起こり得る。\n\
+            connect 拒否時は daemon lock の非保持を確認した残骸だけ socket と lock を削除する。lock 保持中は no-response、lock 不在は stale として socket を残す。\n    \
+            接続後 5 秒以内に応答が無ければ no-response として daemon PID を表示する。backlog 飽和で connect を拒否された場合も no-response とするが、PID は不明。\n\
         \n\
         SCAN ORDER (= socket_path::resolve_in_namespace と同順、最初に見つかった dir のみ):\n    \
             default namespace: base dir 直下 (= 既存互換):\n    \

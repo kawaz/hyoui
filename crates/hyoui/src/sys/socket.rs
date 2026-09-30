@@ -17,10 +17,10 @@
 //! `unlink(2)`s the socket file (best-effort).
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+use nix::fcntl::{FcntlArg, FdFlag, Flock, FlockArg, fcntl};
 use nix::sys::socket::{self, AddressFamily, Backlog, SockFlag, SockType, UnixAddr};
 
 use super::error::{Error, Result};
@@ -30,6 +30,24 @@ use super::error::{Error, Result};
 fn set_cloexec<F: AsFd>(fd: &F) -> Result<()> {
     fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(Error::from)?;
     Ok(())
+}
+
+/// Serialize socket bind and removal in the same directory.
+pub(crate) fn lock_socket_dir(path: &Path) -> Result<Flock<std::fs::File>> {
+    let dir = path
+        .parent()
+        .ok_or(Error::Invalid("socket path has no parent directory"))?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(dir.join(".dir.lock"))
+        .map_err(Error::from)?;
+    let held = Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, e)| Error::from(e))?;
+    set_cloexec(&*held)?;
+    Ok(held)
 }
 
 /// `bind(2)` / `connect(2)` に渡せる socket path の最大バイト長 (= NUL 終端を除く)。
@@ -93,6 +111,7 @@ impl Drop for UmaskGuard {
 pub struct UnixSock {
     fd: Option<OwnedFd>,
     path: Option<PathBuf>,
+    lock: Option<Flock<std::fs::File>>,
 }
 
 impl UnixSock {
@@ -135,33 +154,57 @@ impl UnixSock {
         check_sun_path_len(&path)?;
         Self::check_parent_dir(&path)?;
 
+        let _dir_lock = lock_socket_dir(&path)?;
+        let lock_path = path.with_extension("lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(Error::from)?;
+        let lock =
+            Flock::lock(lock, FlockArg::LockExclusiveNonblock).map_err(|(_, e)| Error::from(e))?;
+
         match nix::unistd::unlink(&path) {
-            Ok(()) => {}
-            Err(nix::errno::Errno::ENOENT) => {}
+            Ok(()) | Err(nix::errno::Errno::ENOENT) => {}
             Err(e) => return Err(Error::from(e)),
         }
-
-        let fd = socket::socket(
-            AddressFamily::Unix,
-            SockType::Stream,
-            SockFlag::empty(),
-            None,
-        )
-        .map_err(Error::from)?;
-        // L6: set FD_CLOEXEC on listener fd (portable).
-        set_cloexec(&fd)?;
-
-        let addr = UnixAddr::new(path.as_path()).map_err(Error::from)?;
-
-        let _umask = UmaskGuard::set(nix::sys::stat::Mode::from_bits_truncate(0o077));
-        socket::bind(fd.as_raw_fd(), &addr).map_err(Error::from)?;
-        drop(_umask);
-
-        socket::listen(&fd, Backlog::new(5).map_err(Error::from)?).map_err(Error::from)?;
+        let mut bound = false;
+        let result = (|| -> Result<OwnedFd> {
+            let fd = socket::socket(
+                AddressFamily::Unix,
+                SockType::Stream,
+                SockFlag::empty(),
+                None,
+            )
+            .map_err(Error::from)?;
+            set_cloexec(&fd)?;
+            set_cloexec(&*lock)?;
+            let addr = UnixAddr::new(path.as_path()).map_err(Error::from)?;
+            let _umask = UmaskGuard::set(nix::sys::stat::Mode::from_bits_truncate(0o077));
+            socket::bind(fd.as_raw_fd(), &addr).map_err(Error::from)?;
+            bound = true;
+            drop(_umask);
+            socket::listen(&fd, Backlog::new(5).map_err(Error::from)?).map_err(Error::from)?;
+            Ok(fd)
+        })();
+        let fd = match result {
+            Ok(fd) => fd,
+            Err(e) => {
+                if bound {
+                    let _ = nix::unistd::unlink(&path);
+                }
+                let _ = nix::unistd::unlink(&lock_path);
+                return Err(e);
+            }
+        };
 
         Ok(Self {
             fd: Some(fd),
             path: Some(path),
+            lock: Some(lock),
         })
     }
 
@@ -187,10 +230,15 @@ impl UnixSock {
     /// DR-0028 Phase 1: 既存 listener fd (= self-exec 前の親から継承した bind 済 fd)
     /// と socket path から `UnixSock` を組み立てる。bind / listen は既に済んでいる
     /// 前提。Drop で socket file を unlink するのは通常挙動と同じ。
-    pub fn from_listener_fd(fd: OwnedFd, path: PathBuf) -> Self {
+    pub fn from_listener_fd(
+        fd: OwnedFd,
+        path: PathBuf,
+        lock: Option<Flock<std::fs::File>>,
+    ) -> Self {
         Self {
             fd: Some(fd),
             path: Some(path),
+            lock,
         }
     }
 
@@ -202,7 +250,7 @@ impl UnixSock {
     /// 取り出し後は `self` の Drop が走っても both fields が `None` なので unlink
     /// は発生しない。exec 経路以外で使うと socket file が新プロセス側でも継承されず
     /// leak するので、DR-0028 upgrade path 専用。
-    pub fn into_parts_for_exec(mut self) -> (OwnedFd, PathBuf) {
+    pub fn into_parts_for_exec(mut self) -> (OwnedFd, PathBuf, Option<Flock<std::fs::File>>) {
         let fd = self
             .fd
             .take()
@@ -211,7 +259,8 @@ impl UnixSock {
             .path
             .take()
             .expect("UnixSock::into_parts_for_exec called twice (bug)");
-        (fd, path)
+        let lock = self.lock.take();
+        (fd, path, lock)
     }
 
     /// `accept(2)` + `FD_CLOEXEC` set via fcntl. Returns the client fd.
@@ -227,9 +276,18 @@ impl UnixSock {
 
 impl Drop for UnixSock {
     fn drop(&mut self) {
-        // path が `None` (= into_parts_for_exec で取り出し済) なら unlink skip。
-        if let Some(p) = self.path.as_ref() {
-            let _ = nix::unistd::unlink(p);
+        if let Some(p) = self.path.as_ref()
+            && let Ok(_dir_lock) = lock_socket_dir(p)
+        {
+            let same_lock = self.lock.as_ref().is_some_and(|lock| {
+                std::fs::metadata(p.with_extension("lock"))
+                    .and_then(|meta| lock.metadata().map(|held| meta.ino() == held.ino()))
+                    .unwrap_or(false)
+            });
+            if same_lock {
+                let _ = nix::unistd::unlink(p);
+                let _ = nix::unistd::unlink(&p.with_extension("lock"));
+            }
         }
     }
 }
@@ -284,8 +342,12 @@ mod tests {
         let path = dir.path().join("test.sock");
         let sock = UnixSock::listen(&path).expect("listen");
         assert!(path.exists());
+        assert!(path.with_extension("lock").exists());
+        assert!(dir.path().join(".dir.lock").exists());
         drop(sock);
         assert!(!path.exists(), "Drop should unlink the socket file");
+        assert!(!path.with_extension("lock").exists());
+        assert!(dir.path().join(".dir.lock").exists());
     }
 
     #[test]

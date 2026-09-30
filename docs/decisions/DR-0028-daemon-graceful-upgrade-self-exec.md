@@ -78,7 +78,7 @@ self-check「kernel 標準機能の再発明をしない」の順方向: kernel 
 
 | state | 引き継ぎ方式 | 根拠 |
 |---|---|---|
-| PTY master fd / listener fd | fd 温存 (CLOEXEC 解除、番号を env `HYOUI_UPGRADE_PTY_FD` / `HYOUI_UPGRADE_LISTENER_FD` で伝達) | kernel 資源、シリアライズ不能 |
+| PTY master fd / listener fd / daemon name lock fd | fd 温存 (CLOEXEC 解除、番号を env `HYOUI_UPGRADE_PTY_FD` / `HYOUI_UPGRADE_LISTENER_FD` / `HYOUI_UPGRADE_LOCK_FD` で伝達) | kernel 資源、シリアライズ不能。name lock は生存判定のため新 daemon も保持し続ける |
 | 子 PID / pgid / spawn 時パラメータ | 一時ファイル (シリアライズ) | 再構築不能 (子は既に走行中) |
 | session 設定 (namespace / on-child-suspend policy / until 条件 / scrub 設定等) | 一時ファイル | 再構築不能 (起動時引数由来) |
 | lock 状態 (holder token) | **引き継がない** (upgrade で全 client 切断 → process-bound GC (DR-0022) と同じ意味論で自動解放) | client 切断 = release が既存意味論 |

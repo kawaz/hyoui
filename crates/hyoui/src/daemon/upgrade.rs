@@ -56,6 +56,8 @@ pub const ENV_UPGRADE_RESUME: &str = "HYOUI_UPGRADE_RESUME";
 pub const ENV_UPGRADE_PTY_FD: &str = "HYOUI_UPGRADE_PTY_FD";
 /// listener fd 番号を伝達する env var。
 pub const ENV_UPGRADE_LISTENER_FD: &str = "HYOUI_UPGRADE_LISTENER_FD";
+/// daemon の排他 lock fd 番号。
+pub const ENV_UPGRADE_LOCK_FD: &str = "HYOUI_UPGRADE_LOCK_FD";
 /// 引き継ぐ子 PID (= state file が使えない fallback path 用の最小情報)。
 pub const ENV_UPGRADE_CHILD_PID: &str = "HYOUI_UPGRADE_CHILD_PID";
 /// 引き継ぐ session_id (= 表示 + 認証境界の識別)。
@@ -78,6 +80,7 @@ const UPGRADE_ENV_KEYS: &[&str] = &[
     ENV_UPGRADE_RESUME,
     ENV_UPGRADE_PTY_FD,
     ENV_UPGRADE_LISTENER_FD,
+    ENV_UPGRADE_LOCK_FD,
     ENV_UPGRADE_CHILD_PID,
     ENV_UPGRADE_SESSION,
     ENV_UPGRADE_SOCKET,
@@ -392,7 +395,7 @@ pub fn perform_self_exec(
     //    `into_parts_for_exec` で Drop を bypass。Pty も `into_master()` で master
     //    OwnedFd を取り出し (残りの Pty 部分は関数 scope 抜けで no-op drop)。
     let master_owned = pty.into_master();
-    let (listener_owned, socket_path) = listener.into_parts_for_exec();
+    let (listener_owned, socket_path, lock) = listener.into_parts_for_exec();
 
     // 2. CLOEXEC 解除 (= execve で新プロセスへ fd を継承させる)。
     if let Err(e) = clear_cloexec(&master_owned) {
@@ -401,7 +404,7 @@ pub fn perform_self_exec(
         // (= old serve_loop 継続)。ここではまだ execve に到達していないので、
         // master_owned は close されず新 Pty に譲る。listener 側も同様。
         let pty = Pty::from_master_fd(master_owned);
-        let listener = UnixSock::from_listener_fd(listener_owned, socket_path);
+        let listener = UnixSock::from_listener_fd(listener_owned, socket_path, lock);
         let _ = std::fs::remove_file(&state_path);
         return PerformSelfExecOutcome::ExecFailed {
             pty,
@@ -415,7 +418,23 @@ pub fn perform_self_exec(
         // master 側 CLOEXEC は復元してから再パッケージ。
         let _ = set_cloexec(&master_owned);
         let pty = Pty::from_master_fd(master_owned);
-        let listener = UnixSock::from_listener_fd(listener_owned, socket_path);
+        let listener = UnixSock::from_listener_fd(listener_owned, socket_path, lock);
+        let _ = std::fs::remove_file(&state_path);
+        return PerformSelfExecOutcome::ExecFailed {
+            pty,
+            listener,
+            child,
+            error: e,
+        };
+    }
+
+    if let Some(held) = &lock
+        && let Err(e) = clear_cloexec(&**held)
+    {
+        let _ = set_cloexec(&master_owned);
+        let _ = set_cloexec(&listener_owned);
+        let pty = Pty::from_master_fd(master_owned);
+        let listener = UnixSock::from_listener_fd(listener_owned, socket_path, lock);
         let _ = std::fs::remove_file(&state_path);
         return PerformSelfExecOutcome::ExecFailed {
             pty,
@@ -455,6 +474,9 @@ pub fn perform_self_exec(
     push_kv(&mut envp, ENV_UPGRADE_RESUME, "1".to_string());
     push_kv(&mut envp, ENV_UPGRADE_PTY_FD, pty_raw.to_string());
     push_kv(&mut envp, ENV_UPGRADE_LISTENER_FD, listener_raw.to_string());
+    if let Some(lock) = &lock {
+        push_kv(&mut envp, ENV_UPGRADE_LOCK_FD, lock.as_raw_fd().to_string());
+    }
     push_kv(&mut envp, ENV_UPGRADE_CHILD_PID, child.as_raw().to_string());
     push_kv(&mut envp, ENV_UPGRADE_SESSION, config.session_id.clone());
     push_kv(
@@ -480,8 +502,11 @@ pub fn perform_self_exec(
             // CLOEXEC 復元 + 再パッケージ (execve に到達していないので fallback path)。
             let _ = set_cloexec(&master_owned);
             let _ = set_cloexec(&listener_owned);
+            if let Some(lock) = &lock {
+                let _ = set_cloexec(&**lock);
+            }
             let pty = Pty::from_master_fd(master_owned);
-            let listener = UnixSock::from_listener_fd(listener_owned, socket_path);
+            let listener = UnixSock::from_listener_fd(listener_owned, socket_path, lock);
             let _ = std::fs::remove_file(&state_path);
             return PerformSelfExecOutcome::ExecFailed {
                 pty,
@@ -512,8 +537,11 @@ pub fn perform_self_exec(
                     "hyoui upgrade: CLOEXEC restore on listener fd failed: {re} (continuing)"
                 );
             }
+            if let Some(lock) = &lock {
+                let _ = set_cloexec(&**lock);
+            }
             let pty = Pty::from_master_fd(master_owned);
-            let listener = UnixSock::from_listener_fd(listener_owned, socket_path);
+            let listener = UnixSock::from_listener_fd(listener_owned, socket_path, lock);
             let _ = std::fs::remove_file(&state_path);
             PerformSelfExecOutcome::ExecFailed {
                 pty,
@@ -537,6 +565,8 @@ pub struct UpgradeResumeEnv {
     pub pty_fd: std::os::fd::RawFd,
     /// 同じく渡された listener の raw fd。
     pub listener_fd: std::os::fd::RawFd,
+    /// 引き継ぐ daemon lock fd。
+    pub lock_fd: Option<std::os::fd::RawFd>,
     /// 引き継ぐ子 process の PID (= exec 前後で不変)。
     pub child_pid: i32,
     /// 引き継ぐ PTY 列数。
@@ -567,6 +597,10 @@ pub fn read_upgrade_env() -> Result<UpgradeResumeEnv, String> {
     let socket = PathBuf::from(get(ENV_UPGRADE_SOCKET)?);
     let pty_fd = parse_i32(ENV_UPGRADE_PTY_FD, get(ENV_UPGRADE_PTY_FD)?)?;
     let listener_fd = parse_i32(ENV_UPGRADE_LISTENER_FD, get(ENV_UPGRADE_LISTENER_FD)?)?;
+    let lock_fd = std::env::var(ENV_UPGRADE_LOCK_FD)
+        .ok()
+        .map(|s| parse_i32(ENV_UPGRADE_LOCK_FD, s))
+        .transpose()?;
     let child_pid = parse_i32(ENV_UPGRADE_CHILD_PID, get(ENV_UPGRADE_CHILD_PID)?)?;
     let cols = parse_u16(ENV_UPGRADE_COLS, get(ENV_UPGRADE_COLS)?)?;
     let rows = parse_u16(ENV_UPGRADE_ROWS, get(ENV_UPGRADE_ROWS)?)?;
@@ -576,6 +610,7 @@ pub fn read_upgrade_env() -> Result<UpgradeResumeEnv, String> {
         socket,
         pty_fd,
         listener_fd,
+        lock_fd,
         child_pid,
         cols,
         rows,

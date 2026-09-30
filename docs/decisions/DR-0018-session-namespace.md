@@ -91,7 +91,7 @@ ns 内から別 ns で起動するには `--namespace=<別ns>` を明示する
 
 - default: 現在の namespace のみ表示 (= default ns では従来と同じ見え方、NS 列なし)
 - `--all-namespaces`: 全 ns 横断 scan + **NS 列を先頭に追加**。`--namespace` と排他
-- 接続拒否 socket の自動掃除は list の走査 namespace に限定する (= `--all-namespaces` で全 ns)。接続後の無応答は no-response として残す
+- 接続拒否時の自動掃除は daemon name lock の非保持を確認できた socket に限り、list の走査 namespace 内で行う (= `--all-namespaces` で全 ns)。name lock 保持中は no-response、lock 不在は stale として残す。bind・prune・Drop の削除は namespace dir ごとの永続 `.dir.lock` で直列化する
 - `--format=jsonl` は `namespace` field を**常時**出力 (= default ns は `"default"`)
 
 ## Rejected alternatives

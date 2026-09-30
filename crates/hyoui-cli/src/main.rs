@@ -1304,7 +1304,9 @@ enum ListEntryStatus {
     },
     /// 接続後の明示的な失敗。
     Error { reason: String },
-    /// 接続拒否で削除済み。
+    /// daemon 生存を判定できない。
+    Stale { reason: String },
+    /// 残骸として削除済み。
     Gone,
 }
 
@@ -1438,6 +1440,9 @@ fn enrich_entries_with_status(entries: &mut [ListEntry]) {
             }
             hyoui::discovery::StatusQueryResult::Error { reason } => {
                 ListEntryStatus::Error { reason }
+            }
+            hyoui::discovery::StatusQueryResult::Stale { reason } => {
+                ListEntryStatus::Stale { reason }
             }
             hyoui::discovery::StatusQueryResult::Gone => ListEntryStatus::Gone,
         };
@@ -1587,6 +1592,10 @@ fn print_list_plain(entries: &[ListEntry], show_ns: bool) {
                 "{ns_prefix}{session:<20} {:<11} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} -",
                 "error", "-", "-", "-", "-", "-", "-"
             ),
+            ListEntryStatus::Stale { .. } => println!(
+                "{ns_prefix}{session:<20} {:<7} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} -",
+                "stale", "-", "-", "-", "-", "-", "-"
+            ),
             ListEntryStatus::Gone => {}
         }
     }
@@ -1653,6 +1662,9 @@ fn print_list_jsonl(entries: &[ListEntry]) {
             }),
             ListEntryStatus::Error { reason } => {
                 serde_json::json!({"session": e.session, "namespace": e.namespace, "status": "error", "reason": reason, "socket": e.socket_path.display().to_string(), "started_unix_ms": e.started_unix_ms})
+            }
+            ListEntryStatus::Stale { reason } => {
+                serde_json::json!({"session": e.session, "namespace": e.namespace, "status": "stale", "reason": reason, "socket": e.socket_path.display().to_string(), "started_unix_ms": e.started_unix_ms})
             }
             ListEntryStatus::Gone => continue,
         };
@@ -4805,6 +4817,7 @@ mod tests {
             let _l = UnixListener::bind(&stale_path).expect("bind stale");
         }
         assert!(stale_path.exists(), "stale socket file should exist");
+        std::fs::File::create(stale_path.with_extension("lock")).expect("stale daemon lock");
 
         // live socket: **本物の hyoui daemon を起動** する。
         let live_path = sock_dir.path().join("live-sess.sock");
@@ -4829,6 +4842,7 @@ mod tests {
 
         // 確認: stale は unlink された、live はまだ残っている
         assert!(!stale_path.exists(), "list should unlink stale socket");
+        assert!(!stale_path.with_extension("lock").exists());
         assert!(live_path.exists(), "list must not unlink live socket");
 
         // cleanup: live daemon を kill して thread を畳む

@@ -18,6 +18,7 @@
 //!
 //! CLI と web gateway が同じ接続判定を利用する。socket 配置の走査と出力形式は各 caller が管理する。
 
+use nix::fcntl::{Flock, FlockArg};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
@@ -60,6 +61,11 @@ pub enum SessionStatus {
     /// 接続先から明示的な拒否または protocol error が返った。
     Error {
         /// 失敗理由。
+        reason: String,
+    },
+    /// lock が無く daemon の生存状態を判定できない。
+    Stale {
+        /// 判定不能の理由。
         reason: String,
     },
 }
@@ -145,7 +151,12 @@ pub enum StatusQueryResult {
         /// 接続後の拒否または protocol failure。
         reason: String,
     },
-    /// connect が拒否されたため残骸 socket を削除した。
+    /// lock が無く生存を判定できない socket。
+    Stale {
+        /// 判定不能の理由。
+        reason: String,
+    },
+    /// 残骸 socket を削除したか、走査後に消えた。
     Gone,
 }
 
@@ -166,19 +177,67 @@ pub fn query_status(socket_path: &Path) -> StatusQueryResult {
         &mut peer_pid,
     ) {
         Ok(conn) => conn,
-        Err(crate::Error::Errno(nix::errno::Errno::ECONNREFUSED | nix::errno::Errno::ENOENT)) => {
-            if socket_path
-                .symlink_metadata()
-                .is_ok_and(|m| m.file_type().is_socket())
-                && let Err(e) = std::fs::remove_file(socket_path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                eprintln!(
-                    "hyoui: warning: failed to prune {}: {e}",
-                    socket_path.display()
-                );
+        Err(crate::Error::Errno(nix::errno::Errno::ENOENT)) => return StatusQueryResult::Gone,
+        Err(crate::Error::Errno(nix::errno::Errno::ECONNREFUSED)) => {
+            let _dir_lock = match crate::sys::socket::lock_socket_dir(socket_path) {
+                Ok(lock) => lock,
+                Err(e) => {
+                    return StatusQueryResult::Error {
+                        reason: format!("socket directory lock を取得できない: {e}"),
+                    };
+                }
+            };
+            let lock_path = socket_path.with_extension("lock");
+            let lock = match std::fs::File::open(&lock_path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return StatusQueryResult::Stale {
+                        reason: "daemon lock がないため生存不明".into(),
+                    };
+                }
+                Err(e) => {
+                    return StatusQueryResult::Error {
+                        reason: format!("daemon lock を開けない: {e}"),
+                    };
+                }
+            };
+            match Flock::lock(lock, FlockArg::LockExclusiveNonblock) {
+                Ok(_guard) => {
+                    if socket_path
+                        .symlink_metadata()
+                        .is_ok_and(|m| m.file_type().is_socket())
+                    {
+                        if let Err(e) = std::fs::remove_file(socket_path)
+                            && e.kind() != std::io::ErrorKind::NotFound
+                        {
+                            eprintln!(
+                                "hyoui: warning: failed to prune {}: {e}",
+                                socket_path.display()
+                            );
+                        }
+                        if let Err(e) = std::fs::remove_file(&lock_path)
+                            && e.kind() != std::io::ErrorKind::NotFound
+                        {
+                            eprintln!(
+                                "hyoui: warning: failed to prune {}: {e}",
+                                lock_path.display()
+                            );
+                        }
+                    }
+                    return StatusQueryResult::Gone;
+                }
+                Err((_, nix::errno::Errno::EWOULDBLOCK)) => {
+                    return StatusQueryResult::Hung {
+                        daemon_pid: None,
+                        reason: "daemon が稼働中だが接続を受け付けられない".into(),
+                    };
+                }
+                Err((_, e)) => {
+                    return StatusQueryResult::Error {
+                        reason: format!("daemon lock の確認に失敗: {e}"),
+                    };
+                }
             }
-            return StatusQueryResult::Gone;
         }
         Err(e) => {
             return if matches!(&e, crate::Error::Io(io) if matches!(io.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock))
@@ -286,6 +345,10 @@ pub fn list_sessions() -> Vec<SessionEntry> {
             e.status = SessionStatus::Error { reason };
             true
         }
+        StatusQueryResult::Stale { reason } => {
+            e.status = SessionStatus::Stale { reason };
+            true
+        }
         StatusQueryResult::Gone => false,
     });
     out
@@ -382,7 +445,55 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dead.sock");
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        std::fs::File::create(path.with_extension("lock")).unwrap();
         assert!(matches!(query_status(&path), StatusQueryResult::Gone));
         assert!(!path.exists());
+        assert!(!path.with_extension("lock").exists());
+    }
+
+    #[test]
+    fn socket_without_lock_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sock");
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(matches!(
+            query_status(&path),
+            StatusQueryResult::Stale { .. }
+        ));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn locked_listener_is_preserved_when_backlog_fills() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy.sock");
+        let listener = crate::sys::UnixSock::listen(&path).unwrap();
+        let mut connections = Vec::new();
+        let mut refused = false;
+        for _ in 0..32 {
+            match std::os::unix::net::UnixStream::connect(&path) {
+                Ok(stream) => connections.push(stream),
+                Err(e) if e.raw_os_error() == Some(nix::errno::Errno::ECONNREFUSED as i32) => {
+                    refused = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected connect error: {e}"),
+            }
+        }
+        #[cfg(target_os = "macos")]
+        assert!(refused, "macOS backlog saturation must return ECONNREFUSED");
+        if refused {
+            assert!(matches!(
+                query_status(&path),
+                StatusQueryResult::Hung {
+                    daemon_pid: None,
+                    ..
+                }
+            ));
+            assert!(path.exists());
+            assert!(path.with_extension("lock").exists());
+        }
+        drop(connections);
+        drop(listener);
     }
 }

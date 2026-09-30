@@ -590,6 +590,7 @@ pub fn run_upgrade_resume_child() -> ExitCode {
         upgrade::ENV_UPGRADE_RESUME,
         upgrade::ENV_UPGRADE_PTY_FD,
         upgrade::ENV_UPGRADE_LISTENER_FD,
+        upgrade::ENV_UPGRADE_LOCK_FD,
         upgrade::ENV_UPGRADE_CHILD_PID,
         upgrade::ENV_UPGRADE_SESSION,
         upgrade::ENV_UPGRADE_SOCKET,
@@ -604,6 +605,11 @@ pub fn run_upgrade_resume_child() -> ExitCode {
     // kernel には有効な fd として残っている。
     let master_owned = hyoui::sys::raw::own_raw_fd(env.pty_fd);
     let listener_owned = hyoui::sys::raw::own_raw_fd(env.listener_fd);
+    let lock = env.lock_fd.map(|fd| {
+        let file = std::fs::File::from(hyoui::sys::raw::own_raw_fd(fd));
+        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .expect("inherited daemon lock must remain held")
+    });
 
     // DR-0028 Phase 2: state file (CBOR versioned) から DaemonConfig / scrollback
     // bytes / 子 PID を復元する。state file が読めない / decode 失敗 / version
@@ -681,6 +687,7 @@ pub fn run_upgrade_resume_child() -> ExitCode {
         dcfg,
         master_owned,
         listener_owned,
+        lock,
         Pid::from_raw(child_pid),
     ) {
         Ok(s) => s,

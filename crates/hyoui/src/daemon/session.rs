@@ -362,12 +362,13 @@ impl Session {
         config: DaemonConfig,
         master_fd: std::os::fd::OwnedFd,
         listener_fd: std::os::fd::OwnedFd,
+        lock: Option<nix::fcntl::Flock<std::fs::File>>,
         child: Pid,
     ) -> Result<Self, Error> {
         use crate::sys::FdExt as _;
         let pty = Pty::from_master_fd(master_fd);
         pty.master_fd().set_nonblocking(true)?;
-        let listener = UnixSock::from_listener_fd(listener_fd, config.socket_path.clone());
+        let listener = UnixSock::from_listener_fd(listener_fd, config.socket_path.clone(), lock);
         Ok(Self {
             config,
             inner: Some(SessionInner {

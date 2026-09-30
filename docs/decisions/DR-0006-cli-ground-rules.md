@@ -40,7 +40,7 @@ override: --socket /any/path.sock
 ```
 
 - dir mode 0700, sock mode 0600
-- `hyoui list` は connect 拒否の残骸 socket を自動削除して表示しない。接続後 5 秒間 handshake / status.query に応答しない daemon は socket を残して `no-response` と daemon PID を表示する。起動時も別 owner の socket は触らない
+- `hyoui list` は connect 拒否時に daemon lock を非ブロック取得できた場合だけ socket と name lock を削除し表示しない。lock 保持中は `no-response` (PID 不明)、lock 不在は `stale` として socket を残す。接続後 5 秒間 handshake / status.query に応答しない daemon は `no-response` と daemon PID を表示する。bind・prune・Drop の name lock 削除はディレクトリ単位の永続 `.dir.lock` で直列化する。起動時も別 owner の socket は触らない
 
 ### 3. Name と起動形
 

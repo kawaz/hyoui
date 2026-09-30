@@ -184,6 +184,9 @@ fn session_entry_to_json(e: &hyoui::discovery::SessionEntry) -> serde_json::Valu
                 serde_json::Value::String(info.daemon_version.clone())
             },
         }),
+        SessionStatus::Stale { reason } => {
+            serde_json::json!({"session_id": e.session_id, "namespace": e.namespace, "socket_path": e.socket_path.display().to_string(), "status": "stale", "reason": reason})
+        }
         SessionStatus::Error { reason } => {
             serde_json::json!({"session_id": e.session_id, "namespace": e.namespace, "socket_path": e.socket_path.display().to_string(), "status": "error", "reason": reason})
         }
@@ -789,6 +792,9 @@ async fn resolve_socket(id: &str) -> Result<PathBuf, ResolveSocketError> {
         }
         match e.status {
             hyoui::discovery::SessionStatus::Live(_) => return Ok(e.socket_path),
+            hyoui::discovery::SessionStatus::Stale { reason } => {
+                return Err(ResolveSocketError::SessionError { id, reason });
+            }
             hyoui::discovery::SessionStatus::Error { reason } => {
                 return Err(ResolveSocketError::SessionError { id, reason });
             }
