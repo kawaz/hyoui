@@ -466,6 +466,12 @@ mod tests {
     #[test]
     fn locked_listener_is_preserved_when_backlog_fills() {
         let dir = tempfile::tempdir().unwrap();
+        // UnixSock::listen は親 dir が 0700 であることを要求する (tempdir の mode は環境依存)
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let path = dir.path().join("busy.sock");
         let listener = crate::sys::UnixSock::listen(&path).unwrap();
         let mut connections = Vec::new();
