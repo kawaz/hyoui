@@ -31,6 +31,18 @@ v0.9.57 の `discovery::query_status` は `connect()` が `ECONNREFUSED` なら 
 
 daemon が socket の隣に `<name>.lock` を作って生存中 `flock(LOCK_EX)` を保持する。list は ECONNREFUSED 時に `flock(LOCK_EX|LOCK_NB)` を試し、**取れた時だけ**残骸と確定して unlink。取れなければ `no-response` (生きているが接続を受けられない) として unlink しない。lock ファイルが無い旧 daemon は判定不能なので unlink しない。
 
+## 設計裁定 (統括 2026-09-30、lock unlink の TOCTOU への回答)
+
+flock は inode 単位なので「lock ファイルを unlink する」と、別プロセスが新 inode を作って lock が分裂する race がある。inode 再照合だけでは check と unlink の間の TOCTOU は消えない。対策は臨界区間の直列化:
+
+- state dir と各 namespace dir に unlink しない `.dir.lock` を 1 つ置く (dir ごとに 1 個なので溜まらない)
+- daemon 起動: dir lock (`LOCK_EX`、短時間) → `<name>.lock` を open/create → `flock(LOCK_EX|LOCK_NB)` (失敗 = 本当の名前衝突) → bind → dir lock 解放 (name lock は保持)
+- list の prune: dir lock → `<name>.lock` を `LOCK_NB` で試し、取れた時だけ socket と name lock を unlink → 解放
+- daemon の Drop / 起動失敗: dir lock → 自分の name lock fd と path の inode が一致する時だけ socket と name lock を unlink → 解放
+- DR-0028 upgrade は name lock fd を継承するだけ
+
+「lock ファイルを永続化して socket だけ prune する」案は、名前が `run-<pid>-<hash>` で無限に増えるため不採用。dir lock は serve loop 内で保持しない。
+
 ## 復旧
 
 unlink 済み socket は外から再生成できないので attach 経路は失われる。`kill 27892` → 子 claude の session (`150b0876-9327-49bc-bdcb-eb05e4826963`, name `main-ccmsg`) を `claude --resume` で再開する。
