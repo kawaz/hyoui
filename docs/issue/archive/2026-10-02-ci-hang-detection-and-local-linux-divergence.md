@@ -1,6 +1,6 @@
 ---
 title: CI の単体テストのハングが Test job の timeout を食う + ローカル Linux コンテナと CI で結果が食い違う
-status: open
+status: resolved
 category: bug
 created: 2026-10-02T23:55:22+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-03T02:27:39+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: v0.9.64 で解消。(2) は serve_loop の SIGCHLD 経路が drain 窓を飛ばす実装 bug と test helper が attach redraw を捨てる test bug の 2 つの race、(3) は SystemdBackend::status の is-active spawn 失敗だけ致命扱いの不整合。観測記録は docs/findings/2026-10-03-linux-container-test-divergence.md。(4) はローカル Linux 環境を CI に揃えない (race が出やすい環境として検出力を残す) と決定
 blocked_by:
 origin: 自リポ TODO
 ---
@@ -55,6 +55,6 @@ CI の単体テスト 1 本のハングが Test job の 30 分 timeout を丸ご
 ## 受け入れ条件
 
 - [x] CI の test step に上限時間 (または nextest の slow-timeout / terminate-after) を入れ、ハングが数分で fail として表面化する (v0.9.63: `.config/nextest.toml` で 180s 打ち切り、CI は nextest 必須)
-- [ ] (2) の真因を、軸 / 再現条件 / 仮説を押さえて特定する (実機マトリクスで確認)
-- [ ] (3) の原因 (systemctl 不在か) を確認する
-- [ ] ローカル Linux 検証環境を CI と揃えるか、環境前提をテスト側で明示するかを決める
+- [x] (2) の真因を、軸 / 再現条件 / 仮説を押さえて特定する (実機マトリクスで確認) (findings 2026-10-03)
+- [x] (3) の原因 (systemctl 不在か) を確認する (systemctl 不在で確定)
+- [x] ローカル Linux 検証環境を CI と揃えるか、環境前提をテスト側で明示するかを決める (揃えない。dash / 少 core の race 検出力を残す)
