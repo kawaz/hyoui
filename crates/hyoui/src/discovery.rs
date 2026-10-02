@@ -178,6 +178,14 @@ pub fn query_status(socket_path: &Path) -> StatusQueryResult {
     ) {
         Ok(conn) => conn,
         Err(crate::Error::Errno(nix::errno::Errno::ENOENT)) => return StatusQueryResult::Gone,
+        // Linux の backlog 満杯。listener の実在が確定しているので lock 判定せず保持する。
+        Err(crate::Error::Errno(nix::errno::Errno::EAGAIN)) => {
+            return StatusQueryResult::Hung {
+                daemon_pid: None,
+                reason: "daemon が稼働中だが接続を受け付けられない".into(),
+            };
+        }
+        // macOS の backlog 満杯と listener 不在はどちらも ECONNREFUSED なので lock で区別する。
         Err(crate::Error::Errno(nix::errno::Errno::ECONNREFUSED)) => {
             let _dir_lock = match crate::sys::socket::lock_socket_dir(socket_path) {
                 Ok(lock) => lock,
@@ -474,31 +482,35 @@ mod tests {
         .unwrap();
         let path = dir.path().join("busy.sock");
         let listener = crate::sys::UnixSock::listen(&path).unwrap();
+        // backlog 満杯は macOS で ECONNREFUSED、Linux で EAGAIN (blocking connect だと Linux は無期限 block)。
         let mut connections = Vec::new();
-        let mut refused = false;
+        let mut saturated = false;
         for _ in 0..32 {
-            match std::os::unix::net::UnixStream::connect(&path) {
-                Ok(stream) => connections.push(stream),
-                Err(e) if e.raw_os_error() == Some(nix::errno::Errno::ECONNREFUSED as i32) => {
-                    refused = true;
+            match crate::sys::socket::connect_no_wait(&path) {
+                Ok(fd) => connections.push(fd),
+                Err(crate::sys::Error::Errno(
+                    nix::errno::Errno::ECONNREFUSED | nix::errno::Errno::EAGAIN,
+                )) => {
+                    saturated = true;
                     break;
                 }
                 Err(e) => panic!("unexpected connect error: {e}"),
             }
         }
-        #[cfg(target_os = "macos")]
-        assert!(refused, "macOS backlog saturation must return ECONNREFUSED");
-        if refused {
-            assert!(matches!(
-                query_status(&path),
+        assert!(saturated, "backlog must saturate within 32 connections");
+        let result = query_status(&path);
+        assert!(
+            matches!(
+                result,
                 StatusQueryResult::Hung {
                     daemon_pid: None,
                     ..
                 }
-            ));
-            assert!(path.exists());
-            assert!(path.with_extension("lock").exists());
-        }
+            ),
+            "result: {result:?}"
+        );
+        assert!(path.exists());
+        assert!(path.with_extension("lock").exists());
         drop(connections);
         drop(listener);
     }

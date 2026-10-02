@@ -653,6 +653,9 @@ impl ClientConnection {
 
     /// Connect while recording peer PID before waiting for the handshake.
     ///
+    /// With `timeout`, a full listen backlog fails immediately (`ECONNREFUSED` on macOS,
+    /// `EAGAIN` on Linux) instead of waiting for the daemon to accept.
+    ///
     /// # Errors
     ///
     /// Returns a socket, transport, or handshake error.
@@ -662,7 +665,12 @@ impl ClientConnection {
         timeout: Option<std::time::Duration>,
         peer_pid: &mut Option<u32>,
     ) -> Result<Self, Error> {
-        let fd = sys_socket::connect(socket_path)?;
+        // timeout 指定時は backlog 満杯で待たない (Linux の blocking connect は accept まで無期限に block する)。
+        let fd = if timeout.is_some() {
+            sys_socket::connect_no_wait(socket_path)?
+        } else {
+            sys_socket::connect(socket_path)?
+        };
         let stream = UnixStream::from(fd);
         *peer_pid = sys_socket::peer_pid(&stream).ok();
         let deadline = timeout.map(|duration| Instant::now() + duration);

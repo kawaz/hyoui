@@ -20,7 +20,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use nix::fcntl::{FcntlArg, FdFlag, Flock, FlockArg, fcntl};
+use nix::fcntl::{FcntlArg, FdFlag, Flock, FlockArg, OFlag, fcntl};
 use nix::sys::socket::{self, AddressFamily, Backlog, SockFlag, SockType, UnixAddr};
 
 use super::error::{Error, Result};
@@ -320,6 +320,29 @@ pub fn connect<P: AsRef<Path>>(path: P) -> Result<OwnedFd> {
     // L6: set FD_CLOEXEC on client fd (portable).
     set_cloexec(&fd)?;
     socket::connect(fd.as_raw_fd(), &addr).map_err(Error::from)?;
+    Ok(fd)
+}
+
+/// Connect like [`connect`], but fail instead of waiting when the listener's
+/// backlog is full. Returns a blocking fd on success.
+///
+/// A full backlog is reported as `ECONNREFUSED` on macOS and `EAGAIN` on Linux
+/// (Linux blocks a blocking AF_UNIX connect until the peer accepts, with no timeout).
+pub fn connect_no_wait<P: AsRef<Path>>(path: P) -> Result<OwnedFd> {
+    check_sun_path_len(path.as_ref())?;
+    let addr = UnixAddr::new(path.as_ref()).map_err(Error::from)?;
+    let fd = socket::socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::empty(),
+        None,
+    )
+    .map_err(Error::from)?;
+    set_cloexec(&fd)?;
+    let flags = OFlag::from_bits_retain(fcntl(&fd, FcntlArg::F_GETFL).map_err(Error::from)?);
+    fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).map_err(Error::from)?;
+    socket::connect(fd.as_raw_fd(), &addr).map_err(Error::from)?;
+    fcntl(&fd, FcntlArg::F_SETFL(flags)).map_err(Error::from)?;
     Ok(fd)
 }
 
