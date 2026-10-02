@@ -34,12 +34,15 @@ CLI Design は `~/.claude-personal/rules/cli-design-preferences.md` (= subcomman
 ### 2. Socket 配置
 
 ```
-Linux:    $XDG_RUNTIME_DIR/hyoui/<name>.sock
-other:    /tmp/hyoui-$UID/<name>.sock   (incl. macOS; /tmp 固定, $TMPDIR は読まない)
+$XDG_RUNTIME_DIR/hyoui/<name>.sock                      ($XDG_RUNTIME_DIR が実在 dir のとき)
+${XDG_STATE_HOME:-$HOME/.local/state}/hyoui/<name>.sock  (それ以外、macOS 含む)
 override: --socket /any/path.sock
 ```
 
-- dir mode 0700, sock mode 0600
+- `$TMPDIR` / `/tmp` は使わない (OS の掃除で daemon 生存中に socket が消えるのを避けるため、ユーザ管理下の state dir を使う)
+- dir は新規作成時 mode 0700、既存 dir は所有者 = euid と mode 0700 を検証して不一致ならエラー。sock mode 0600
+- 完成 path は bind 前に `sun_path` 上限と照合する
+- `<name>.lock` (name lock) は `<name>.sock` と同じ dir、`.dir.lock` はその dir の直下に置く
 - `hyoui list` は connect 拒否時に daemon lock を非ブロック取得できた場合だけ socket と name lock を削除し表示しない。lock 保持中は `no-response` (PID 不明)、lock 不在は `stale` として socket を残す。接続後 5 秒間 handshake / status.query に応答しない daemon は `no-response` と daemon PID を表示する。bind・prune・Drop の name lock 削除はディレクトリ単位の永続 `.dir.lock` で直列化する。起動時も別 owner の socket は触らない
 
 ### 3. Name と起動形

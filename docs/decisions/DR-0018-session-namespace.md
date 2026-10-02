@@ -22,12 +22,9 @@ socket 配置を namespace ごとの dir に分離する:
 | `default` (= 予約名) | `<base>/<session>.sock` (= **従来 dir 直下、既存セッションと完全互換**) |
 | その他 `<ns>` | `<base>/<ns>/<session>.sock` |
 
-`<base>` は `$XDG_RUNTIME_DIR/hyoui` (実在時) / **`/tmp/hyoui-<uid>`** (それ以外、
-= macOS 含む)。後者は tmux の `/tmp/tmux-<uid>` と同じ前例で、unix socket の
-`sun_path` 上限 (macOS 104 / Linux 108 bytes) に namespace + session 名を載せる予算を
-確保するため `$TMPDIR` を使わず `/tmp` 固定にしている (= macOS の per-user TMPDIR
-`/var/folders/.../T/` が長すぎて namespace path が ENAMETOOLONG になる bug への対処、
-2026-06-11、breaking だが v0.x で許容)。
+`<base>` は `$XDG_RUNTIME_DIR/hyoui` (`$XDG_RUNTIME_DIR` が実在 dir のとき) / `${XDG_STATE_HOME:-$HOME/.local/state}/hyoui` (それ以外、= macOS 含む)。
+`$TMPDIR` / `/tmp` は使わない (macOS の per-user TMPDIR は長く `sun_path` 上限 (macOS 104 / Linux 108 bytes) の予算を圧迫し、`/tmp` は OS の掃除で daemon 生存中に socket file だけが消えるため、ユーザ管理下の state dir を使う)。
+`<name>.lock` と `.dir.lock` は socket と同じ dir (default なら `<base>`、それ以外は `<base>/<ns>`) に置く。
 namespace dir の作成・検証は base dir と同じ規律 (= 新規作成時 mode 0700、既存 dir は
 所有者 + mode 検証) を 2 段で適用する (`socket_path::resolve_in_namespace`)。
 
