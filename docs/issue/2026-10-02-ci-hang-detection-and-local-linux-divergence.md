@@ -54,7 +54,7 @@ CI の単体テスト 1 本のハングが Test job の 30 分 timeout を丸ご
 
 ## 受け入れ条件
 
-- [ ] CI の test step に上限時間 (または nextest の slow-timeout / terminate-after) を入れ、ハングが数分で fail として表面化する
+- [x] CI の test step に上限時間 (または nextest の slow-timeout / terminate-after) を入れ、ハングが数分で fail として表面化する (v0.9.63: `.config/nextest.toml` で 180s 打ち切り、CI は nextest 必須)
 - [ ] (2) の真因を、軸 / 再現条件 / 仮説を押さえて特定する (実機マトリクスで確認)
 - [ ] (3) の原因 (systemctl 不在か) を確認する
 - [ ] ローカル Linux 検証環境を CI と揃えるか、環境前提をテスト側で明示するかを決める

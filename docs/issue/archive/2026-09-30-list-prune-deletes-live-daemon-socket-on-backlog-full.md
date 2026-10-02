@@ -1,6 +1,6 @@
 ---
 title: hyoui list の残骸 socket 自動掃除が backlog 満杯の生き daemon の socket を消す (v0.9.57 回帰)
-status: wip
+status: resolved
 category: bug
 created: 2026-09-30T10:12:00+09:00
 last_read: 2026-09-30T10:12:00+09:00
@@ -9,10 +9,10 @@ wip_entered: 2026-09-30T10:12:00+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-03T01:32:05+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: v0.9.58 で name lock + dir lock による残骸判定、v0.9.60 で Linux の backlog 満杯 (EAGAIN) を待たずに no-response 判定、v0.9.63 で DR-0028 upgrade 時の lock 引き継ぎと旧 daemon からの upgrade での lock 取り直しを実装。全受け入れ条件を実機と単体テストで確認
 blocked_by:
 origin: 自リポ TODO
 ---
@@ -49,7 +49,7 @@ unlink 済み socket は外から再生成できないので attach 経路は失
 
 ## 受け入れ条件
 
-- [ ] backlog 満杯の生き daemon に対して list が socket を消さず no-response と表示する (macOS で ECONNREFUSED が実際に出ることをテストで確認)
-- [ ] lock を誰も保持していない socket + lock は unlink される
-- [ ] lock ファイルの無い旧 daemon の socket は unlink されない
-- [ ] DR-0028 upgrade で lock が新プロセスに正しく引き継がれる (または再取得される)
+- [x] backlog 満杯の生き daemon に対して list が socket を消さず no-response と表示する (macOS で ECONNREFUSED が実際に出ることをテストで確認)
+- [x] lock を誰も保持していない socket + lock は unlink される
+- [x] lock ファイルの無い旧 daemon の socket は unlink されない
+- [x] DR-0028 upgrade で lock が新プロセスに正しく引き継がれる (または再取得される)

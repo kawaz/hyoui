@@ -4,7 +4,6 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
-| 2026-09-30 | bug | wip | [list-prune-deletes-live-daemon-socket-on-backlog-full](./2026-09-30-list-prune-deletes-live-daemon-socket-on-backlog-full.md) | hyoui list の残骸 socket 自動掃除が backlog 満杯の生き daemon の socket を消す (v0.9.57 回帰) |
 | 2026-10-02 | bug | open | [ci-hang-detection-and-local-linux-divergence](./2026-10-02-ci-hang-detection-and-local-linux-divergence.md) | CI の単体テストのハングが Test job の 30 分 timeout を食う + ローカル Linux コンテナと CI で結果が食い違う |
 | 2026-09-29 | bug | open | [daemon-must-never-hang](./2026-09-29-daemon-must-never-hang.md) | daemon が「生きているが固まる」状態を構造的に排除する (イベントループのブロック点棚卸し + 再発防止) |
 | 2026-09-29 | bug | wip | [detached-zombie-child-reap](./2026-09-29-detached-zombie-child-reap.md) | hyoui run --detached の子 claude が zombie になった時に親が自動回収して終了する |
