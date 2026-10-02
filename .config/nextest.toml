@@ -1,0 +1,6 @@
+# ハングしたテスト 1 本が job の timeout-minutes を丸ごと食って「cancelled」に
+# なるのを防ぎ、数分以内に「そのテストの失敗」として表面化させる。
+# 通常の最長テストは hyoui-cli の e2e で 30-60 秒台 (並列負荷時)。
+# period x terminate-after = 180s 超で SIGTERM → 失敗扱い。
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 3 }

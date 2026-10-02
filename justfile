@@ -61,10 +61,22 @@ test-js:
     # ファイル glob なら `node --test` を持つ全ての版で通る。
     node --test crates/hyoui-web/tests/js/*.test.js
 
-# cargo test --workspace (ARGS で追加引数を渡せる、例: `just test -- --nocapture`)
+# cargo nextest (無ければ cargo test) で workspace のテスト (ARGS は runner にそのまま渡る。nextest なら `just test --no-capture`、cargo test なら `just test -- --nocapture`)。
+# nextest を使う理由: テスト 1 本のハングを `.config/nextest.toml` の slow-timeout で
+# 打ち切り、job 全体の timeout (cancelled) でなくそのテストの失敗として出すため。
+# nextest 未導入のローカルは `cargo test` に落とす。CI (CI=true) で nextest が無いのは
+# 打ち切りが無効になる事故なので fail させる。doctest は nextest 非対応なので別途実行。
 [script]
 test *ARGS: lint test-js
-    cargo test --workspace --no-fail-fast "$@"
+    if cargo nextest --version >/dev/null 2>&1; then
+        cargo nextest run --workspace --no-fail-fast "$@"
+        cargo test --workspace --doc
+    elif [ -n "${CI:-}" ]; then
+        echo "error: cargo-nextest が CI に無い (ハング打ち切りが効かない)" >&2
+        exit 1
+    else
+        cargo test --workspace --no-fail-fast "$@"
+    fi
 
 # cargo build --release --workspace
 build: lint

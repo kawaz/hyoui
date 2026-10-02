@@ -30,6 +30,9 @@ jobs:
         with:
           shared-key: ${{ matrix.os }}-${{ matrix.rust }}
       - uses: extractions/setup-just@v3
+      # `just test` が使う。テスト 1 本のハングを slow-timeout で打ち切り、
+      # job 全体の cancelled でなくそのテストの失敗として出す。
+      - uses: taiki-e/install-action@nextest
       # `just test` の deps に `test-js` が居るので node が要る。**runner 既定の
       # node に依存させない** — 版によって `node --test` の引数の受け付けが違う。
       - uses: actions/setup-node@v4
