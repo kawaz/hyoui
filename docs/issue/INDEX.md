@@ -6,7 +6,6 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 |---|---|---|---|---|
 | 2026-09-30 | bug | wip | [list-prune-deletes-live-daemon-socket-on-backlog-full](./2026-09-30-list-prune-deletes-live-daemon-socket-on-backlog-full.md) | hyoui list の残骸 socket 自動掃除が backlog 満杯の生き daemon の socket を消す (v0.9.57 回帰) |
 | 2026-10-02 | bug | open | [ci-hang-detection-and-local-linux-divergence](./2026-10-02-ci-hang-detection-and-local-linux-divergence.md) | CI の単体テストのハングが Test job の 30 分 timeout を食う + ローカル Linux コンテナと CI で結果が食い違う |
-| 2026-10-02 | bug | open | [web-full-scan-per-request](./2026-10-02-web-full-scan-per-request.md) | hyoui-web が session 単位の操作・状態取得のたびに全 session 全 daemon へ status.query を投げる (list_sessions 全走査) のをやめる |
 | 2026-09-29 | bug | open | [daemon-must-never-hang](./2026-09-29-daemon-must-never-hang.md) | daemon が「生きているが固まる」状態を構造的に排除する (イベントループのブロック点棚卸し + 再発防止) |
 | 2026-09-29 | bug | wip | [detached-zombie-child-reap](./2026-09-29-detached-zombie-child-reap.md) | hyoui run --detached の子 claude が zombie になった時に親が自動回収して終了する |
 | 2026-09-16 | bug | open | [ci-cargo-deny-argument-order](./2026-09-16-ci-cargo-deny-argument-order.md) | CI の cargo-deny-action は cargo-deny 0.20 系で `check --all-features` の引数順エラーになる (時間で壊れる) |

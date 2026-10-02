@@ -1,6 +1,6 @@
 ---
 title: hyoui-web が session 単位の操作・状態取得のたびに全 session 全 daemon へ status.query を投げる (list_sessions 全走査) のをやめる
-status: open
+status: resolved
 category: bug
 created: 2026-10-02T23:35:25+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-03T00:49:42+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: v0.9.62 で実装 (session 単位要求は find_session で同名 socket だけ解決、GET /api/sessions/{id} 追加、一覧と 1 件解決を single-flight で束ねる。TTL キャッシュは入れない)
 blocked_by:
 origin: 自リポ TODO
 ---
@@ -44,6 +44,6 @@ hyoui-web が session 単位の操作・状態取得のたびに全 session 全 
 
 ## 受け入れ条件
 
-- [ ] session 単位のリクエスト (`/api/sessions/:id/*`) が他 session の daemon に接続しない
-- [ ] session 画面の状態更新が全走査に依存しない
-- [ ] 一覧の全走査が多重 in-flight にならず、タブ数に比例して daemon への接続数が増えない
+- [x] session 単位のリクエスト (`/api/sessions/:id/*`) が他 session の daemon に接続しない
+- [x] session 画面の状態更新が全走査に依存しない
+- [x] 一覧の全走査が多重 in-flight にならず、タブ数に比例して daemon への接続数が増えない
