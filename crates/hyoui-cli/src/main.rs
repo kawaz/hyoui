@@ -4800,7 +4800,7 @@ mod tests {
 
     /// 残骸 socket を unlink し、応答する daemon は保持する。
     ///
-    /// `list_command` は env (`XDG_RUNTIME_DIR` / `TMPDIR`) で dir を解決するが、
+    /// `list_command` は env (`XDG_RUNTIME_DIR` / `XDG_STATE_HOME`) で dir を解決するが、
     /// edition 2024 では `env::set_var` が unsafe であり、`#![forbid(unsafe_code)]`
     /// と衝突する。代わりに dir 一覧を直接渡す内部関数 `list_command_with_dirs`
     /// を介してテストする。

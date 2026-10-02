@@ -1,6 +1,6 @@
 ---
 title: socket dir が /tmp 固定 fallback のため macOS 定期掃除で daemon 生存中に socket file が消える
-status: open
+status: resolved
 category: bug
 created: 2026-07-20T17:52:49+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-03T03:19:09+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: 実装済みを確認して close。fallback は ${XDG_STATE_HOME:-$HOME/.local/state}/hyoui (socket_path.rs / discovery.rs)、XDG_RUNTIME_DIR 優先、cli.rs help と socket.rs エラーヒントも追従済み。実機で ~/.local/state/hyoui の socket が日を跨いで残存 (2026-10-01 作成分を 10-03 に確認)。DR-0006/DR-0018 本文も v0.9.63 で追従
 blocked_by:
 origin: 自リポ TODO
 ---
@@ -47,11 +47,11 @@ kawaz 裁定: `/tmp` をやめる。
 
 ## 受け入れ条件
 
-- [ ] macOS fallback dir が `/tmp` 以外の掃除対象外 per-user 常設 dir になっている
-- [ ] `XDG_RUNTIME_DIR` が設定されている環境ではそちらが優先されることを確認
-- [ ] `cli.rs` のヘルプ文言 2 箇所が新 fallback パスに追従している
-- [ ] `socket.rs` のエラーヒント文言が新 fallback パスに追従している
-- [ ] macOS 定期掃除下で daemon 生存中に socket file が消えないことを実機確認
+- [x] macOS fallback dir が `/tmp` 以外の掃除対象外 per-user 常設 dir になっている
+- [x] `XDG_RUNTIME_DIR` が設定されている環境ではそちらが優先されることを確認
+- [x] `cli.rs` のヘルプ文言 2 箇所が新 fallback パスに追従している
+- [x] `socket.rs` のエラーヒント文言が新 fallback パスに追従している
+- [x] macOS 定期掃除下で daemon 生存中に socket file が消えないことを実機確認
 
 ## 追記 (2026-07-20)
 
