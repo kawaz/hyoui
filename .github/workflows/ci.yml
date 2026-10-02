@@ -41,6 +41,17 @@ jobs:
       # just ci = lint (fmt + clippy + unsafe 封じ込め gate) + test + build。
       # ローカルと同一エントリで検査範囲を一致させる。
       - run: just ci
+      # 1 core 縛りの daemon session テスト (Linux のみ)。GitHub runner は多 core で
+      # 速く、子 exit 周りの race (serve_loop の SIGCHLD 経路が drain 窓を飛ばす等、
+      # docs/findings/2026-10-03-linux-container-test-divergence.md) が表に出ない。
+      # 1 core だと master POLLHUP と SIGCHLD が同じ poll 周回で ready になり、
+      # test helper の attach redraw 捨ても起動速度の差で露出する。
+      # 別 job でなく Test job の step にする理由: `just ci` で build 済の test
+      # binary と rust-cache をそのまま使えるので増分が実行時間 (~15 秒) だけで済む。
+      # taskset は macOS に無いので Linux だけ。
+      - name: daemon session tests pinned to 1 core (Linux)
+        if: runner.os == 'Linux'
+        run: taskset -c 0 cargo nextest run --locked -p hyoui --lib -E 'test(/daemon::session/)' --no-fail-fast
 
   ignored-tests:
     name: Ignored tests (${{ matrix.os }} / PTY+daemon)
