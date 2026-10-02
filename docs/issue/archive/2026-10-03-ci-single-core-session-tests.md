@@ -1,6 +1,6 @@
 ---
 title: CI に 1 core 制約の daemon session テスト job を足す
-status: open
+status: resolved
 category: task
 created: 2026-10-03T02:32:04+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-03T03:06:09+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ci.yml の ubuntu Test job に taskset -c 0 で daemon::session テストを回す step を追加。ローカル 1 core コンテナで現行 3/3 pass (65 件 約 13 秒)、v0.9.64 の serve_loop 修正を revert すると 3/3 fail を確認
 blocked_by:
 origin: 自リポ TODO
 ---
@@ -31,6 +31,6 @@ CI に 1 core 制約 (`taskset -c 0` 等) で daemon session テストを回す 
 
 ## 受け入れ条件
 
-- [ ] v0.9.64 の修正を revert すると CI の 1 core job が fail することを確認してから入れる
-- [ ] 追加 job の所要時間とコストを見積もり、許容範囲であることを確認
-- [ ] Linux (ubuntu) のみで動作する
+- [x] v0.9.64 の修正を revert すると CI の 1 core job が fail することを確認してから入れる
+- [x] 追加 job の所要時間とコストを見積もり、許容範囲であることを確認
+- [x] Linux (ubuntu) のみで動作する
