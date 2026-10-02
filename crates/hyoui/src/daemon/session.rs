@@ -1300,6 +1300,24 @@ fn timeout_poll_cap_ms(
     }
 }
 
+/// 子 exit 検出後に遅れて届く client frame を処理し続ける drain 窓の長さ
+/// (= serve_loop の `deferred_exit` doc 参照)。
+const EXIT_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// 子 exit を観測した検出点が呼ぶ共通入口。即 return せず `deferred_exit` に
+/// 保留して drain 窓を開く。既に保留済なら最初の観測を保つ (= 後続の検出点は
+/// reap 済の子に対する waitpid なので code を持たない)。
+fn defer_child_exit(
+    deferred_exit: &mut Option<RelayOutcome>,
+    exit_drain_deadline: &mut Option<Instant>,
+    code: Option<i32>,
+) {
+    if deferred_exit.is_none() {
+        *deferred_exit = Some(RelayOutcome::ChildExited(code));
+        *exit_drain_deadline = Some(Instant::now() + EXIT_DRAIN_BUDGET);
+    }
+}
+
 /// serve loop の本体。`Session::serve` から切り出して所有権整理を平坦化。
 #[allow(clippy::too_many_arguments)]
 fn serve_loop(
@@ -1360,9 +1378,22 @@ fn serve_loop(
     // 子は既に死んでいるので新規出力は増えない。残りは「既に飛んできた / 飛びかけて
     // いる client 要求を捌く」だけであり、短い固定 budget で drain してから抜ければ
     // 取りこぼしが無くなる。budget 経過後は従来どおり cleanup へ進む。
-    const EXIT_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+    //
+    // 子 exit の検出点は master EOF / EIO だけでなく SIGCHLD self-pipe /
+    // EINTR / Timeout (= self-pipe 無し fallback) の waitpid もあり、**全検出点が
+    // この保留枠を通る** (= [`defer_child_exit`])。Linux では子 exit 時に slave
+    // close (= master POLLHUP) と SIGCHLD が同一 poll 周回で ready になることがあり、
+    // step 0 の SIGCHLD 経路が step 2 の master 経路より先に exit を観測する
+    // (= 実測 2026-10-03、docs/findings/2026-10-03-linux-container-test-divergence.md)。
+    // SIGCHLD 経路だけ即 return していると、その周回で登録された client の
+    // tail.request が捨てられる。
     let mut deferred_exit: Option<RelayOutcome> = None;
     let mut exit_drain_deadline: Option<Instant> = None;
+    // master を EOF / EIO まで読み切ったか。SIGCHLD 経路で exit を先に観測した場合、
+    // master にはまだ子の最後の出力が残っていることがあるため、drain 窓でも
+    // 読み切るまでは master を poll し続ける (= 子 exit 検出と master 読み切りは
+    // 別事象)。
+    let mut master_drained = false;
     loop {
         // DR-0028 §2 (Phase 3): upgrade.request 受理後は drain (= 同期 raw_data 経路の
         // 既完了性) を trivially 満たすので次回 iteration 冒頭で UpgradeRequested を返す。
@@ -1414,11 +1445,13 @@ fn serve_loop(
         let mut poll_fds: Vec<PollFd> =
             Vec::with_capacity(2 + clients.len() + usize::from(sigchld_pipe.is_some()));
         poll_fds.push(PollFd::new(listener_fd, PollFlags::POLLIN));
-        // drain 窓 (= `deferred_exit`) 中は master を poll 対象から **外す**。子は
-        // 既に死んでおり新規出力は無い一方、master は POLLHUP が立ちっぱなしで
+        // master を EOF / EIO まで読み切ったら poll 対象から **外す**。子は既に
+        // 死んでおり新規出力は無い一方、master は POLLHUP が立ちっぱなしで
         // (= POLLHUP は要求 mask に関係なく報告される) poll が即 return し続け、
-        // 100ms の budget を busy-spin で焼いてしまうため。
-        let poll_master = deferred_exit.is_none();
+        // 100ms の drain budget を busy-spin で焼いてしまうため。読み切る前
+        // (= SIGCHLD 経路で exit を先に観測した直後) は子の最後の出力が残って
+        // いるので poll し続ける。
+        let poll_master = !master_drained;
         if poll_master {
             poll_fds.push(PollFd::new(master_fd, PollFlags::POLLIN));
         }
@@ -1547,7 +1580,7 @@ fn serve_loop(
                 }
                 let (child_state, transition) = lifecycle.poll_with_transition(child);
                 if let ChildState::Exited(code) = child_state {
-                    return RelayOutcome::ChildExited(code);
+                    defer_child_exit(&mut deferred_exit, &mut exit_drain_deadline, code);
                 }
                 match transition {
                     Some(ChildTransition::Stopped { sig }) => {
@@ -1572,7 +1605,7 @@ fn serve_loop(
                 if sigchld_pipe.is_none() || lifecycle.is_stopped() {
                     let (child_state, transition) = lifecycle.poll_with_transition(child);
                     if let ChildState::Exited(code) = child_state {
-                        return RelayOutcome::ChildExited(code);
+                        defer_child_exit(&mut deferred_exit, &mut exit_drain_deadline, code);
                     }
                     match transition {
                         Some(ChildTransition::Stopped { sig }) => {
@@ -1686,7 +1719,10 @@ fn serve_loop(
             }
             let (child_state, transition) = lifecycle.poll_with_transition(child);
             if let ChildState::Exited(code) = child_state {
-                return RelayOutcome::ChildExited(code);
+                // 即 return しない: 同一周回の listener / master / client frame
+                // (= 直前の process_pending_handshakes で登録された client の
+                // tail.request を含む) を後段で処理させる。
+                defer_child_exit(&mut deferred_exit, &mut exit_drain_deadline, code);
             }
             match transition {
                 Some(ChildTransition::Stopped { sig }) => {
@@ -1729,14 +1765,18 @@ fn serve_loop(
         }
 
         // 2. master: 子 PTY 出力を全 client に broadcast
-        // drain 窓では master_revents は空 (= poll 対象から外している) なので、
-        // ここは自然に false になる。
+        // master を読み切った後は master_revents は空 (= poll 対象から外している)
+        // なので、ここは自然に false になる。
         let pty_ready = master_revents.contains(PollFlags::POLLIN)
             || master_revents.contains(PollFlags::POLLHUP)
             || master_revents.contains(PollFlags::POLLERR);
         if pty_ready {
             let mut buf = [0u8; 8192];
             match pty.master_fd().read_some(&mut buf) {
+                // 子 exit を SIGCHLD 等で観測済 (= reap 済) の後の EOF は、master を
+                // 読み切った印でしかない。waitpid は ECHILD で Alive を返すため、
+                // 下の分岐に入れると ALIVE_RETRY の retry に落ちる。
+                Ok(0) if deferred_exit.is_some() => master_drained = true,
                 Ok(0) => {
                     let (child_state, transition) = lifecycle.poll_with_transition(child);
                     match transition {
@@ -1762,10 +1802,8 @@ fn serve_loop(
                             );
                             // 即 return せず保留し、drain 窓を開く (= 遅れて届く
                             // client frame も処理する)。`deferred_exit` の doc 参照。
-                            if deferred_exit.is_none() {
-                                deferred_exit = Some(RelayOutcome::ChildExited(code));
-                                exit_drain_deadline = Some(Instant::now() + EXIT_DRAIN_BUDGET);
-                            }
+                            master_drained = true;
+                            defer_child_exit(&mut deferred_exit, &mut exit_drain_deadline, code);
                         }
                         ChildState::Stopped => {
                             // R4-H14: SIGTSTP'd 子で master EOF/POLLHUP が連続する間の
@@ -1819,7 +1857,11 @@ fn serve_loop(
                     // 子 process group へ SIGTERM を投げて session 終了させる。
                     // (broadcast / scrollback の後で match 判定するのは、最後の
                     // chunk も client / scrollback には届けるため。)
-                    if let Some(ref mut w) = until_watcher
+                    // 子 exit を観測済 (= SIGCHLD 経路で reap 済、master の残りを読み
+                    // 切っている最中) なら kill する相手が居ない。終了理由は子自身の
+                    // exit なので、保留中の ChildExited(code) を優先して match 判定しない。
+                    if deferred_exit.is_none()
+                        && let Some(ref mut w) = until_watcher
                         && w.feed(&buf[..n])
                     {
                         // DR-0019 §4: until match も timeout / idle-timeout と同じ
@@ -1838,6 +1880,10 @@ fn serve_loop(
                         return RelayOutcome::ClientDetachedOrKilled;
                     }
                 }
+                // EOF と同じ (= Linux の master は slave 全 close 後に EIO を返す)。
+                Err(Error::Errno(nix::errno::Errno::EIO)) if deferred_exit.is_some() => {
+                    master_drained = true;
+                }
                 Err(Error::Errno(nix::errno::Errno::EIO)) => {
                     let (child_state, transition) = lifecycle.poll_with_transition(child);
                     match transition {
@@ -1851,10 +1897,8 @@ fn serve_loop(
                     match child_state {
                         // EOF と同じく保留する (= EIO も master 側の子終了検出点)。
                         ChildState::Exited(code) => {
-                            if deferred_exit.is_none() {
-                                deferred_exit = Some(RelayOutcome::ChildExited(code));
-                                exit_drain_deadline = Some(Instant::now() + EXIT_DRAIN_BUDGET);
-                            }
+                            master_drained = true;
+                            defer_child_exit(&mut deferred_exit, &mut exit_drain_deadline, code);
                         }
                         ChildState::Stopped => {
                             std::thread::sleep(STOPPED_POLL_INTERVAL);
@@ -2860,6 +2904,22 @@ mod tests {
     }
 
     fn do_client_handshake(stream: &mut UnixStream) -> HandshakeResponse {
+        // DR-0013 §4 Phase A: handshake response 直後に daemon が
+        // attach 復元用 raw_data frame を 1 つ送る。test code は control を
+        // 期待するので、redraw frame を 1 個読み捨てる。
+        do_client_handshake_keep_redraw(stream).0
+    }
+
+    /// `do_client_handshake` と同じ handshake を行い、attach 復元用 redraw frame の
+    /// body を捨てずに返す。
+    ///
+    /// 子の出力を待つ test は redraw body を [`read_until_contains`] の初期値に
+    /// 渡すこと。attach 前に子が出した bytes は live raw_data ではなく redraw
+    /// (= screen state からの復元) にだけ載るため、redraw を捨てると marker を
+    /// 永久に待つ (= 子の出力と attach の前後は子の起動速度次第で、Linux の
+    /// dash では attach 前に出力し切ることが多い。
+    /// docs/findings/2026-10-03-linux-container-test-divergence.md)。
+    fn do_client_handshake_keep_redraw(stream: &mut UnixStream) -> (HandshakeResponse, Vec<u8>) {
         let req = ControlMessage::HandshakeRequest(HandshakeRequest {
             caps: MVP_CAPS.iter().map(|s| s.to_string()).collect(),
             mode: Mode::Rw,
@@ -2878,21 +2938,23 @@ mod tests {
                 ControlMessage::HandshakeResponse(r) => r,
                 other => panic!("unexpected: {other:?}"),
             };
-        // DR-0013 §4 Phase A: handshake response 直後に daemon が
-        // attach 復元用 raw_data frame を 1 つ送る。test code は control を
-        // 期待するので、redraw frame を 1 個読み捨てる。
-        discard_attach_redraw(stream);
-        resp
+        let redraw = read_attach_redraw(stream);
+        (resp, redraw)
     }
 
     /// DR-0013 §4 Phase A test helper:
     /// 手動 handshake する test (= `do_client_handshake` を使わない経路) でも
     /// handshake response の直後に attach 復元用 raw_data frame が 1 つ来るため、
-    /// それを読み捨てるための共通ヘルパ。raw frame でなければ panic (= 順序仮定
-    /// 違反のサイン)。Phase A の `build_attach_redraw` は primary 空画面でも
-    /// `\x1b[?1049l` prepend + state_formatted の最小 sequence を必ず返すため、
-    /// 「frame が来ない」case は無い前提。
+    /// それを読み捨てるための共通ヘルパ。
     fn discard_attach_redraw(stream: &mut UnixStream) {
+        let _ = read_attach_redraw(stream);
+    }
+
+    /// handshake response 直後の attach 復元用 raw_data frame を 1 つ読み、body を
+    /// 返す。raw frame でなければ panic (= 順序仮定違反のサイン)。frame は常に
+    /// 1 つ来る (= `build_attach_redraw` は pristine 画面 (= 子がまだ何も描画して
+    /// いない) では空 bytes を返すが、空 body の frame として送られる)。
+    fn read_attach_redraw(stream: &mut UnixStream) -> Vec<u8> {
         let f = Frame::decode_from(stream).expect("attach redraw frame");
         assert_eq!(
             f.ty,
@@ -2900,6 +2962,7 @@ mod tests {
             "expected attach redraw raw_data frame after handshake response, got ty={}",
             f.ty
         );
+        f.body
     }
 
     // ---- Phase 9 (Session::serve) tests ----
@@ -3654,11 +3717,11 @@ mod tests {
 
         // 1st client: marker を読み取って detach
         let mut s1 = client_connect_with_retry(&sock_path);
-        let _r1 = do_client_handshake(&mut s1);
+        let (_r1, redraw) = do_client_handshake_keep_redraw(&mut s1);
         // leader.notify を discard
         let _ = Frame::decode_from(&mut s1).expect("s1 leader.notify");
         // 子の output を marker が来るまで待つ (= screen state に反映される時間も稼ぐ)
-        read_until_contains(&mut s1, b"ATTACH_TEST_OK");
+        read_until_contains(&mut s1, redraw, b"ATTACH_TEST_OK");
         // 1st client は drop (= detach)、daemon は state を保持し続ける
         drop(s1);
 
@@ -3736,9 +3799,9 @@ mod tests {
 
         // 1st client: marker を読み取って detach。
         let mut s1 = client_connect_with_retry(&sock_path);
-        let _r1 = do_client_handshake(&mut s1);
+        let (_r1, redraw) = do_client_handshake_keep_redraw(&mut s1);
         let _ = Frame::decode_from(&mut s1).expect("s1 leader.notify");
-        read_until_contains(&mut s1, b"ALT_MARKER");
+        read_until_contains(&mut s1, redraw, b"ALT_MARKER");
         drop(s1);
 
         std::thread::sleep(Duration::from_millis(100));
@@ -3802,9 +3865,14 @@ mod tests {
         }
     }
 
-    /// 子 PTY 出力 (= raw_data) を `target` 含むまで読み込む。
-    fn read_until_contains(s: &mut UnixStream, target: &[u8]) {
-        let mut got = Vec::new();
+    /// 子 PTY 出力を `target` 含むまで読み込む。
+    ///
+    /// `redraw` には handshake 直後の attach 復元 redraw body
+    /// ([`do_client_handshake_keep_redraw`] の戻り値) を渡す。attach 前の子出力は
+    /// redraw に、attach 後の子出力は live raw_data に載るので、両者を連結した
+    /// ものが「attach 以降に client が観測した子の画面」になる。
+    fn read_until_contains(s: &mut UnixStream, redraw: Vec<u8>, target: &[u8]) {
+        let mut got = redraw;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !got.windows(target.len()).any(|w| w == target) {
             if std::time::Instant::now() > deadline {
@@ -3839,11 +3907,11 @@ mod tests {
         };
 
         let mut s = client_connect_with_retry(&sock_path);
-        let _r = do_client_handshake(&mut s);
+        let (_r, redraw) = do_client_handshake_keep_redraw(&mut s);
         let _ = Frame::decode_from(&mut s).expect("leader.notify");
 
         // 子の "hello" が到着するまで raw_data を読む
-        read_until_contains(&mut s, b"hello");
+        read_until_contains(&mut s, redraw, b"hello");
 
         // tail.request (follow=false)
         Frame::cbor_control(
@@ -4952,9 +5020,9 @@ mod tests {
         let (_, sock_path, _dir, handle) = spawn_serve_thread(cmd);
 
         let mut s = client_connect_with_retry(&sock_path);
-        let _r = do_client_handshake(&mut s);
+        let (_r, redraw) = do_client_handshake_keep_redraw(&mut s);
         let _ = Frame::decode_from(&mut s).expect("leader.notify");
-        read_until_contains(&mut s, b"DUMPMARK");
+        read_until_contains(&mut s, redraw, b"DUMPMARK");
 
         // screen.dump.request (format=ansi, layer=visible, serial=42)
         let req = ControlMessage::ScreenDumpRequest(ScreenDumpRequest {
@@ -5014,9 +5082,9 @@ mod tests {
         let (_, sock_path, _dir, handle) = spawn_serve_thread(cmd);
 
         let mut s = client_connect_with_retry(&sock_path);
-        let _r = do_client_handshake(&mut s);
+        let (_r, redraw) = do_client_handshake_keep_redraw(&mut s);
         let _ = Frame::decode_from(&mut s).expect("leader.notify");
-        read_until_contains(&mut s, b"CBORDUMP");
+        read_until_contains(&mut s, redraw, b"CBORDUMP");
 
         let req = ControlMessage::ScreenDumpRequest(ScreenDumpRequest {
             format: ProtoDumpFormat::Cbor,
@@ -5090,10 +5158,10 @@ mod tests {
         let (_, sock_path, _dir, handle) = spawn_serve_thread(cmd);
 
         let mut s = client_connect_with_retry(&sock_path);
-        let _r = do_client_handshake(&mut s);
+        let (_r, redraw) = do_client_handshake_keep_redraw(&mut s);
         let _ = Frame::decode_from(&mut s).expect("leader.notify");
         // VISIBLE_TAIL が出るまで待って、子の全出力が screen state に反映されたことを保証。
-        read_until_contains(&mut s, b"VISIBLE_TAIL");
+        read_until_contains(&mut s, redraw, b"VISIBLE_TAIL");
 
         // 1) layer=visible: SCROLLED_OUT_HEAD は含まれない (= スクロールアウト確認)
         let req_visible = ControlMessage::ScreenDumpRequest(ScreenDumpRequest {

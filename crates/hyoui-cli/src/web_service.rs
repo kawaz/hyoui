@@ -558,22 +558,20 @@ impl Backend for SystemdBackend {
     fn status(&self, label: &str) -> Result<ServiceStatus, String> {
         let path = self.definition_path(label)?;
         let unit = systemd_unit_name(label);
-        let active = command_output("systemctl", &["--user", "is-active", &unit])?;
-        let running = String::from_utf8_lossy(&active.stdout).trim() == "active";
-        let loaded = command_output(
-            "systemctl",
-            &["--user", "show", "-p", "LoadState", "--value", &unit],
-        )
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "loaded")
-        .unwrap_or(false);
-        let show = |property: &str| {
-            command_output(
-                "systemctl",
-                &["--user", "show", "-p", property, "--value", &unit],
-            )
-            .ok()
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        // systemd に聞けない時 (= systemctl が無い / user manager の bus に届かない) は
+        // OS 側の見え方を「載っていない・走っていない」として答える。status は未登録でも
+        // 答える口で (= DR-0034 決定 6)、`registered` は定義ファイルだけで決まるため、
+        // OS に聞けないことを理由に全体を失敗させない。bus に届かない場合は systemctl
+        // 自体は起動でき、非 0 終了 + 空 stdout で同じ結論になる。systemctl が無い場合も
+        // それと揃える (= 聞けない理由で答えの形を変えない)。
+        let query = |args: &[&str]| {
+            command_output("systemctl", args)
+                .ok()
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
         };
+        let running = query(&["--user", "is-active", &unit]).as_deref() == Some("active");
+        let show = |property: &str| query(&["--user", "show", "-p", property, "--value", &unit]);
+        let loaded = show("LoadState").as_deref() == Some("loaded");
         let pid = running
             .then(|| show("MainPID"))
             .flatten()
