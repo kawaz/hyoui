@@ -64,6 +64,13 @@ DR-0037 「固まった daemon の検出」節。観測できるのは「期限�
 
 ## 確認待ち
 
+### 👺PRUNE-C1: v0.9.61 への切り替え (socket 誤削除の止血)
+
+stable web gateway (pid 1811) は 0.9.57 のまま動いており、backlog 満杯の生き daemon の socket を消す判定を回し続けている ([issue](issue/2026-09-30-list-prune-deletes-live-daemon-socket-on-backlog-full.md))。brew は 0.9.61 に上げ済み。
+
+- [ ] a: `hyoui web service restart` で gateway を 0.9.61 にする (接続中の webui タブは一度切れる)
+- [ ] b: socket を失った run-24993-2b8fcf16 (daemon pid 24994) を kill して claude を `--resume` で再開する (確認ダイアログの状態は失われる)
+
 ### 👺DR32-C1: child action menu の実機確認 (v0.9.39 以降)
 
 - [ ] a: `~/.config/hyoui/config.toml` に `[session]` `on_child_suspend = "show_child_action_menu"` を書き、attach 中に ^Z×2 で子を止めると menu が出て各キー (d/z = 脱出、c・Esc/i/h/k = 子への操作、Esc = 起こして戻る) が効く
