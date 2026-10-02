@@ -1034,14 +1034,25 @@
     } catch (_e) { /* best-effort */ }
   }
 
+  // 自分の session 1 件の状態を取り、child_stopped で banner を出す。
+  // 一覧 API は host 上の全 daemon に問い合わせるので使わない (= この session の daemon だけに聞く)。
+  // 応答形は一覧の 1 要素と同じ。404 は「session-not-found」の時だけ「居ない」と扱い、
+  // それ以外の失敗 (旧 gateway の未知 route 等) は表示を据え置く。
+  async function fetchOwnSession() {
+    const r = await AUTH.fetch(`api/sessions/${encodeURIComponent(sid)}`, { cache: 'no-store' });
+    if (r.ok) return { me: await r.json() };
+    if (r.status === 404) {
+      const body = await r.json().catch(() => null);
+      if (body && body.error && body.error.code === 'session-not-found') return { me: null };
+    }
+    return null;
+  }
+
   async function refreshSessionStatus() {
-    // /api/sessions を一覧して自分の session_id を探し child_stopped で banner を出す。
-    // 専用エンドポイントを増やさず既存 API を再利用 (= protocol/API 表面を最小化)。
     try {
-      const r = await AUTH.fetch('api/sessions', { cache: 'no-store' });
-      if (!r.ok) return;
-      const list = await r.json();
-      const me = Array.isArray(list) ? list.find((s) => s.session_id === sid) : null;
+      const got = await fetchOwnSession();
+      if (!got) return;
+      const me = got.me;
       const stopped = !!(me && me.child_stopped);
       stoppedBanner.hidden = !stopped;
       if (me) {
@@ -1991,7 +2002,7 @@
   schedule();
   // WS attach 開始 (= 成功すればポーリング停止、失敗しても指数バックオフで再試行)。
   connectWs();
-  // status は screen より遅めに poll (= 一覧 API を頻繁に叩かない)。
+  // status は screen より遅めに poll。
   setInterval(refreshSessionStatus, 5000);
 
   // 招待 URL (`<endpoint>#register=<jwt>`) で開かれたら登録 UI を出す (DR-0036 決定 2)。

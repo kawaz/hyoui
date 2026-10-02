@@ -128,6 +128,7 @@ async fn the_public_and_guarded_routes_follow_decision_1() {
     // 守る: session の画面内容と入力。
     for (method, uri) in [
         ("GET", "/api/sessions"),
+        ("GET", "/api/sessions/x"),
         ("GET", "/api/sessions/x/screen"),
         ("POST", "/api/sessions/x/input"),
         ("POST", "/api/sessions/x/resize"),

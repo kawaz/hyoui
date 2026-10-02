@@ -2817,6 +2817,7 @@ Endpoints:
   GET  /assets/*                   Static assets.
   POST /auth/*                     Passkey sign-in.
   GET  /api/sessions               List live sessions as JSON.
+  GET  /api/sessions/:id           One session's state (same shape as a list item).
   GET  /api/sessions/:id/screen    ANSI screen dump.
   POST /api/sessions/:id/input     Send input specs.
 

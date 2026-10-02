@@ -7,6 +7,7 @@
 //! ## Endpoints
 //!
 //! - `GET  /api/sessions` — 全 namespace 横断で live/no-response session を JSON list で返す
+//! - `GET  /api/sessions/:id` — session 1 件の状態を一覧の 1 要素と同じ形で返す
 //! - `GET  /api/sessions/:id/screen` — `screen.dump.request` の ANSI payload を
 //!   `text/plain; charset=utf-8` で返す。`?layer=visible|scrollback|both` (default:
 //!   `visible`) で取得範囲を選択する
@@ -15,11 +16,17 @@
 //!
 //! ## namespace の扱い (Phase 1)
 //!
-//! path param `:id` は **session_id 名のみ**を受け付ける。全 namespace を横断走査して
-//! 同名 session を探す (= `discovery::list_sessions` が返した中から最初の match を採用)。
+//! path param `:id` は **session_id 名のみ**を受け付ける。`discovery::find_session` が
+//! DR-0018 の配置規則で全 namespace の同名 socket だけを候補にし、mtime 昇順で最初に
+//! 残ったものを採用する (= 一覧の先頭一致と同じ選び方。他 session の daemon には接続しない)。
 //! 名前衝突が起きる運用は現状想定していない (= namespace は運用グループ分離目的、
 //! 同名 session を複数 namespace で並走させる事故は list JSON で発覚する)。将来
 //! `?namespace=X` query の受理は必要になった段階で追加する。
+//!
+//! ## daemon への問い合わせの束ね方
+//!
+//! 一覧走査と session 1 件の解決は [`single_flight::SingleFlight`] で gateway 内 1 本に束ねる
+//! (= タブ数に比例して daemon への同時接続が増えない)。
 
 #![warn(missing_docs)]
 
@@ -38,6 +45,7 @@ pub use axum;
 
 pub mod auth;
 pub mod contract;
+mod single_flight;
 mod ws_attach;
 
 use contract::{ErrorEnvelope, ErrorInfo, InputRequest, InputResponse, ResizeRequest, code};
@@ -64,7 +72,15 @@ pub(crate) struct AppState {
     assets_dir: Option<Arc<PathBuf>>,
     /// 認証 state の置き場と `/auth/*` の rate limit (DR-0036)。
     pub(crate) auth: auth::AuthContext,
+    /// `GET /api/sessions` の全走査を 1 本に束ねる。
+    list_flight: Arc<SessionListFlight>,
+    /// session 1 件の解決 (= その socket への status.query) を session_id ごとに 1 本に束ねる。
+    resolve_flight: Arc<SessionResolveFlight>,
 }
+
+type SessionListFlight = single_flight::SingleFlight<(), Vec<hyoui::discovery::SessionEntry>>;
+type SessionResolveFlight =
+    single_flight::SingleFlight<String, Option<hyoui::discovery::SessionEntry>>;
 
 /// axum Router を返す (= test / bin 側で `axum::serve` に渡すか
 /// `tower::ServiceExt::oneshot` で直接叩ける)。
@@ -89,10 +105,13 @@ pub fn router_with_auth(
         config: Arc::new(config),
         assets_dir: assets_dir.map(Arc::new),
         auth: auth.clone(),
+        list_flight: single_flight::SingleFlight::new(),
+        resolve_flight: single_flight::SingleFlight::new(),
     };
     // 守るのは `/api/*` と WS attach への到達だけ (DR-0036 決定 1)。
     let guarded = Router::new()
         .route("/api/sessions", get(get_sessions))
+        .route("/api/sessions/{id}", get(get_session))
         .route("/api/sessions/{id}/screen", get(get_screen))
         .route("/api/sessions/{id}/input", post(post_input))
         .route("/api/sessions/{id}/resume", post(post_resume))
@@ -153,13 +172,36 @@ async fn get_version() -> axum::Json<contract::VersionResponse> {
 // -----------------------------------------------------------------------------
 
 /// live/no-response session 一覧を JSON で返す (= `hyoui list --format=jsonl` の JSON 配列版)。
-async fn get_sessions() -> Response {
-    let entries = match tokio::task::spawn_blocking(hyoui::discovery::list_sessions).await {
+///
+/// 走行中の走査があれば相乗りする (= 同時に何本要求が来ても daemon への走査は 1 本)。
+async fn get_sessions(State(state): State<AppState>) -> Response {
+    let entries = match state
+        .list_flight
+        .run((), hyoui::discovery::list_sessions)
+        .await
+    {
         Ok(v) => v,
-        Err(e) => return internal_error(format!("session enumeration join error: {e}")),
+        Err(single_flight::Abandoned) => {
+            return internal_error("session enumeration aborted");
+        }
     };
     let json: Vec<serde_json::Value> = entries.iter().map(session_entry_to_json).collect();
     axum::Json(json).into_response()
+}
+
+// -----------------------------------------------------------------------------
+// GET /api/sessions/:id
+// -----------------------------------------------------------------------------
+
+/// session 1 件の状態を `GET /api/sessions` の 1 要素と同じ形で返す。
+///
+/// 無応答 / error / stale も一覧と同じく 200 + `status` で返し、session が存在しない時だけ 404。
+async fn get_session(Path(id): Path<String>, State(state): State<AppState>) -> Response {
+    match find_session(&state, &id).await {
+        Ok(Some(entry)) => axum::Json(session_entry_to_json(&entry)).into_response(),
+        Ok(None) => ResolveSocketError::NotFound { id }.into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 fn session_entry_to_json(e: &hyoui::discovery::SessionEntry) -> serde_json::Value {
@@ -215,13 +257,13 @@ struct ScreenQuery {
 async fn get_screen(
     Path(id): Path<String>,
     query: Result<Query<ScreenQuery>, QueryRejection>,
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> Response {
     let Query(query) = match query {
         Ok(q) => q,
         Err(rejection) => return invalid_request(rejection.status(), rejection.body_text()),
     };
-    let sock = match resolve_socket(&id).await {
+    let sock = match resolve_socket(&state, &id).await {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
@@ -352,7 +394,7 @@ impl InputError {
 
 async fn post_input(
     Path(id): Path<String>,
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     body: Result<axum::Json<InputRequest>, JsonRejection>,
 ) -> Response {
     let axum::Json(body) = match body {
@@ -366,7 +408,7 @@ async fn post_input(
         Ok(v) => v,
         Err(msg) => return bad_request(code::INVALID_INPUT_SPEC, msg),
     };
-    let sock = match resolve_socket(&id).await {
+    let sock = match resolve_socket(&state, &id).await {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
@@ -513,8 +555,8 @@ fn send_input_blocking(
 /// rw attach で connect し `send_child_resume()` を呼ぶ (= CLI `hyoui attach` の
 /// reattach auto-resume 経路と同じ)。子が既に running でも daemon 側で SIGCONT が
 /// 冪等に飛ぶので害はない (= running プロセスへの SIGCONT は no-op)。
-async fn post_resume(Path(id): Path<String>, State(_state): State<AppState>) -> Response {
-    let sock = match resolve_socket(&id).await {
+async fn post_resume(Path(id): Path<String>, State(state): State<AppState>) -> Response {
+    let sock = match resolve_socket(&state, &id).await {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
@@ -560,7 +602,7 @@ fn resume_child_blocking(socket_path: &std::path::Path) -> Result<(), DaemonCall
 /// terminal は WS bridge の persistent leader connection 経由で resize する。
 async fn post_resize(
     Path(id): Path<String>,
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     body: Result<axum::Json<ResizeRequest>, JsonRejection>,
 ) -> Response {
     let axum::Json(body) = match body {
@@ -576,7 +618,7 @@ async fn post_resize(
             ),
         );
     }
-    let sock = match resolve_socket(&id).await {
+    let sock = match resolve_socket(&state, &id).await {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
@@ -682,7 +724,7 @@ async fn get_ws_attach(
     identity: axum::Extension<auth::Identity>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let sock = match resolve_socket(&id).await {
+    let sock = match resolve_socket(&state, &id).await {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
@@ -740,8 +782,8 @@ fn require_cap(caps: &[String], cap: &str) -> Result<(), DaemonCallError> {
 /// `Err` に載せると `Result` を返す全 caller の戻り値が膨らむ。
 #[derive(Debug)]
 enum ResolveSocketError {
-    /// session 列挙の blocking task が join に失敗。500。
-    Enumerate(String),
+    /// 解決処理が結果を返さずに終わった (= blocking task の panic)。500。
+    Aborted,
     /// entry はあるが応答しない。404。
     NoResponse {
         /// 要求された session_id。
@@ -761,9 +803,7 @@ enum ResolveSocketError {
 impl ResolveSocketError {
     fn into_response(self) -> Response {
         match self {
-            ResolveSocketError::Enumerate(msg) => {
-                internal_error(format!("session enumeration join error: {msg}"))
-            }
+            ResolveSocketError::Aborted => internal_error("session lookup aborted"),
             ResolveSocketError::NoResponse { id, reason } => not_found(
                 code::SESSION_NO_RESPONSE,
                 format!("session {id:?} did not respond: {reason}"),
@@ -779,31 +819,38 @@ impl ResolveSocketError {
     }
 }
 
+/// session_id 1 件を解決する (= 同名 socket だけに status.query、DR-0018 の配置規則)。
+///
+/// 同じ session_id の解決が走行中なら相乗りする。
+async fn find_session(
+    state: &AppState,
+    id: &str,
+) -> Result<Option<hyoui::discovery::SessionEntry>, ResolveSocketError> {
+    let key = id.to_string();
+    let lookup = key.clone();
+    state
+        .resolve_flight
+        .run(key, move || hyoui::discovery::find_session(&lookup))
+        .await
+        .map_err(|single_flight::Abandoned| ResolveSocketError::Aborted)
+}
+
 /// session_id から live socket path を解決する。live entry のみ受理 (= 無応答は 404)。
-async fn resolve_socket(id: &str) -> Result<PathBuf, ResolveSocketError> {
+async fn resolve_socket(state: &AppState, id: &str) -> Result<PathBuf, ResolveSocketError> {
     let id = id.to_string();
-    let entries = match tokio::task::spawn_blocking(hyoui::discovery::list_sessions).await {
-        Ok(v) => v,
-        Err(e) => return Err(ResolveSocketError::Enumerate(e.to_string())),
+    let Some(e) = find_session(state, &id).await? else {
+        return Err(ResolveSocketError::NotFound { id });
     };
-    for e in entries {
-        if e.session_id != id {
-            continue;
+    match e.status {
+        hyoui::discovery::SessionStatus::Live(_) => Ok(e.socket_path),
+        hyoui::discovery::SessionStatus::Stale { reason }
+        | hyoui::discovery::SessionStatus::Error { reason } => {
+            Err(ResolveSocketError::SessionError { id, reason })
         }
-        match e.status {
-            hyoui::discovery::SessionStatus::Live(_) => return Ok(e.socket_path),
-            hyoui::discovery::SessionStatus::Stale { reason } => {
-                return Err(ResolveSocketError::SessionError { id, reason });
-            }
-            hyoui::discovery::SessionStatus::Error { reason } => {
-                return Err(ResolveSocketError::SessionError { id, reason });
-            }
-            hyoui::discovery::SessionStatus::Hung { reason, .. } => {
-                return Err(ResolveSocketError::NoResponse { id, reason });
-            }
+        hyoui::discovery::SessionStatus::Hung { reason, .. } => {
+            Err(ResolveSocketError::NoResponse { id, reason })
         }
     }
-    Err(ResolveSocketError::NotFound { id })
 }
 
 // -----------------------------------------------------------------------------
@@ -1167,6 +1214,48 @@ mod tests {
             body.error.message.contains("no-such-session-xyz"),
             "message に session 名が要る: {}",
             body.error.message
+        );
+    }
+
+    #[tokio::test]
+    async fn single_session_endpoint_returns_404_for_missing_or_invalid_id() {
+        // 存在しない id と、path に組めない id (= traversal) はどちらも session-not-found。
+        let authed = AuthedApp::new();
+        for (uri, id) in [
+            ("/api/sessions/no-such-session-xyz", "no-such-session-xyz"),
+            ("/api/sessions/..", ".."),
+            ("/api/sessions/a%2Fb", "a/b"),
+        ] {
+            let resp = authed
+                .send(authed.request("GET", uri).body(Body::empty()).unwrap())
+                .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+            let body = error_body(resp).await;
+            assert_eq!(body.error.code, code::SESSION_NOT_FOUND, "{uri}");
+            assert!(
+                body.error.message.contains(id),
+                "{uri}: message に session 名が要る: {}",
+                body.error.message
+            );
+        }
+    }
+
+    #[test]
+    fn session_asset_polls_only_its_own_session() {
+        // session ページの状態更新は自分の 1 件だけを引く。一覧 API (= host 上の全 daemon に
+        // 問い合わせる) を叩く経路を残さない。
+        let script = EMBEDDED_ASSETS
+            .get_file("session.js")
+            .expect("assets/session.js")
+            .contents_utf8()
+            .expect("UTF-8");
+        assert!(
+            !script.contains("'api/sessions'") && !script.contains("\"api/sessions\""),
+            "session.js が一覧 API を叩いている"
+        );
+        assert!(
+            script.contains("`api/sessions/${encodeURIComponent(sid)}`"),
+            "session.js が 1 件 API を使っていない"
         );
     }
 

@@ -92,6 +92,7 @@ daemon 境界は逆で、client と daemon の版が独立に動く (古い daem
 | GET | `/healthz` | — | `ok` (text) | — |
 | GET | `/version` | — | `{"version": "<crate version>", "build_id": "<id>\|null", "protocol": N}` | — |
 | GET | `/api/sessions` | — | session オブジェクトの JSON 配列 | 500 |
+| GET | `/api/sessions/{id}` | — | session オブジェクト 1 件 (`/api/sessions` の要素と同じ形。無応答 / error / stale も `status` で返す) | 404 / 500 |
 | GET | `/api/sessions/{id}/screen` | `layer=visible\|scrollback\|both` | ANSI bytes (`text/plain`) | 404 / 500 / 501 |
 | POST | `/api/sessions/{id}/input` | `{"specs": ["text:...","key:Enter"]}` | `{"sent_bytes":N,"specs":M}` | 400 / 404 / 409 / 500 / 501 / 503 |
 | POST | `/api/sessions/{id}/resume` | 空 | 204 | 404 / 500 / 501 |

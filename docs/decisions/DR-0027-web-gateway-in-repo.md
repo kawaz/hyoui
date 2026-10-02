@@ -68,7 +68,7 @@ daemon protocol / capability は増やさない。browser は成功応答後だ�
 取得できない場合は daemon の `mode.not-leader` を握りつぶさず HTTP 409 で返す。
 
 既存キーボード FAB のフローティングパネルは「入力」「情報」の 2 タブを持つ。情報タブは
-attach の実効 mode / leader、URL query から決まる表示設定と出自、`/api/sessions` で取得できる
+attach の実効 mode / leader、URL query から決まる表示設定と出自、`/api/sessions/:id` で取得できる
 session id / child pid / child state / attach client 数を read-only 表示する。gateway は WS 確立時と
 leader / mode の変化時に次の text frame を browser へ送る。daemon protocol は変更しない。
 

@@ -122,6 +122,11 @@ fn spawn_detached_command(
         format!("--session={sid}"),
     ];
     args.extend(run_options.iter().map(|arg| (*arg).to_string()));
+    // DR-0018: `--namespace=<ns>` を渡したら socket は `<base>/<ns>/` に置かれる。
+    let namespace = run_options
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--namespace="))
+        .filter(|ns| *ns != "default");
     args.extend(["--", "sh", "-c"].map(str::to_string));
     args.push(command.to_string());
 
@@ -139,7 +144,12 @@ fn spawn_detached_command(
         .expect("spawn detached daemon");
     assert!(status.success(), "run --detached が成功すること");
 
-    let sock = runtime.join("hyoui").join(format!("{sid}.sock"));
+    let base = runtime.join("hyoui");
+    let sock = match namespace {
+        Some(ns) => base.join(ns),
+        None => base,
+    }
+    .join(format!("{sid}.sock"));
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if sock.exists() {
@@ -414,6 +424,17 @@ fn e2e_sessions_screen_input() {
     assert_eq!(found["status"].as_str(), Some("live"));
     assert!(found["argv"].is_array());
 
+    // 1b. GET /api/sessions/:id は一覧の 1 要素と同じ形。
+    let r = api.request("GET", &format!("/api/sessions/{sid}"), None);
+    assert_eq!(r.status, 200, "body={:?}", String::from_utf8_lossy(&r.body));
+    let one: serde_json::Value = serde_json::from_slice(&r.body).expect("json parse");
+    assert_eq!(
+        &one, found,
+        "1 件 API と一覧の要素が一致しない (clients 等の揺れが無い静止状態で比べている)"
+    );
+    let r = api.request("GET", "/api/sessions/no-such-xyz", None);
+    assert_eq!(r.status, 404);
+
     // 2. GET /api/sessions/:id/screen
     let r = api.request("GET", &format!("/api/sessions/{sid}/screen"), None);
     assert_eq!(r.status, 200);
@@ -469,6 +490,55 @@ fn e2e_sessions_screen_input() {
 
     drop(panic_guard);
     cleanup(runtime.path(), sid);
+}
+
+/// `GET /api/sessions/:id` と session 単位 API は namespace を問わず id で引ける
+/// (= DR-0018 の配置規則で同名 socket を直接探す)。
+#[test]
+fn e2e_single_session_resolves_across_namespaces() {
+    let runtime = runtime_dir();
+    let state = state_home();
+    let (sid_default, sid_ns, ns) = ("web-e2e-ns-a", "web-e2e-ns-b", "e2e-grp");
+
+    spawn_detached(runtime.path(), state.path(), sid_default);
+    spawn_detached_command(
+        runtime.path(),
+        state.path(),
+        sid_ns,
+        &["--namespace=e2e-grp"],
+        "while IFS= read -r line; do echo \"$line\"; done",
+    );
+    let (mut web, api) = spawn_web(runtime.path(), state.path());
+    let panic_guard = ChildGuard(&mut web);
+
+    for (sid, expected_ns) in [(sid_default, "default"), (sid_ns, ns)] {
+        let r = api.request("GET", &format!("/api/sessions/{sid}"), None);
+        assert_eq!(
+            r.status,
+            200,
+            "{sid}: {:?}",
+            String::from_utf8_lossy(&r.body)
+        );
+        let one: serde_json::Value = serde_json::from_slice(&r.body).expect("json parse");
+        assert_eq!(one["session_id"].as_str(), Some(sid));
+        assert_eq!(one["namespace"].as_str(), Some(expected_ns));
+        assert_eq!(one["status"].as_str(), Some("live"));
+        // 同じ解決経路を通る screen も引ける。
+        let r = api.request("GET", &format!("/api/sessions/{sid}/screen"), None);
+        assert_eq!(r.status, 200, "{sid} screen");
+    }
+
+    drop(panic_guard);
+    cleanup(runtime.path(), sid_default);
+    let _ = Command::new(hyoui_bin())
+        .args(["kill", "--namespace=e2e-grp", sid_ns])
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env_remove("HYOUI_SESSION_ID")
+        .env_remove("HYOUI_NAMESPACE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// DR-0022 auto-lock の web 側統合を検証する e2e。
