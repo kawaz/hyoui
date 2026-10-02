@@ -8054,11 +8054,10 @@ mod tests {
         // `tx` は DR-0006 §7 の wrapper、別 task で実装中。
         // `lock` / `unlock` は task #20 で実装済 (= `parse_lock_*` がある)、本テストでは
         // 「引数なしで Error にならない (= Help か Error)」を別 test で確認するため除外。
-        for name in ["tx"] {
-            match parse_args(&args(&[name])) {
-                Command::Error(msg) => assert!(msg.contains(name), "msg = {msg}"),
-                other => panic!("expected Error for `{name}`, got {other:?}"),
-            }
+        let name = "tx";
+        match parse_args(&args(&[name])) {
+            Command::Error(msg) => assert!(msg.contains(name), "msg = {msg}"),
+            other => panic!("expected Error for `{name}`, got {other:?}"),
         }
     }
 
