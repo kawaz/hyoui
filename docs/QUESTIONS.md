@@ -64,14 +64,14 @@ DR-0037 「固まった daemon の検出」節。観測できるのは「期限�
 
 ## 確認待ち
 
-### 👺PRUNE-C1: v0.9.63 への切り替え (socket 誤削除の止血)
+### 👺PRUNE-C1: v0.9.65 への切り替え (socket 誤削除の止血)
 
-stable web gateway (pid 1811) は 0.9.57 のまま動いており、backlog 満杯の生き daemon の socket を消す判定を回し続けている ([issue](issue/archive/2026-09-30-list-prune-deletes-live-daemon-socket-on-backlog-full.md))。brew は 0.9.63 に上げ済み (v0.9.62 で web の全件走査を廃止、v0.9.63 で upgrade 時の lock 取り直し)。
+stable web gateway (pid 1811) は 0.9.57 のまま動いており、backlog 満杯の生き daemon の socket を消す判定を回し続けている ([issue](issue/archive/2026-09-30-list-prune-deletes-live-daemon-socket-on-backlog-full.md))。brew は 0.9.65 に上げ済み (v0.9.62 で web の全件走査を廃止、v0.9.63 で upgrade 時の lock 取り直し、v0.9.65 で子 exit 直前の client 要求取りこぼしを修正)。
 
-- [ ] a: `hyoui web service restart` で gateway を 0.9.63 にする (接続中の webui タブは一度切れる)
+- [ ] a: `hyoui web service restart` で gateway を 0.9.65 にする (接続中の webui タブは一度切れる)
 - [ ] b: socket を失った run-24993-2b8fcf16 (daemon pid 24994) を kill して claude を `--resume` で再開する (確認ダイアログの状態は失われる)
 
-注: 常駐 daemon は全て lock を持たない 0.9.57 以前。0.9.62 以前の binary で `hyoui upgrade` すると lock 無しのまま動き続ける (v0.9.63 で修正)。upgrade は brew の 0.9.63 で行える。
+注: 常駐 daemon は全て lock を持たない 0.9.57 以前。0.9.62 以前の binary で `hyoui upgrade` すると lock 無しのまま動き続ける (v0.9.63 で修正)。upgrade は brew の 0.9.65 で行える。
 
 ### 👺DR32-C1: child action menu の実機確認 (v0.9.39 以降)
 
