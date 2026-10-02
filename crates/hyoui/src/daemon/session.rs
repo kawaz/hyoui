@@ -347,9 +347,10 @@ impl Session {
     ///
     /// `master_fd` / `listener_fd` は前 daemon が CLOEXEC を clear した状態で execve
     /// 経由に継承した bind 済 fd。`child` は前 daemon が親子関係を保っていた子 PID
-    /// (= exec 前後で PID / PPID は不変、DR-0028 §1)。socket file の unlink 責務は
-    /// 通常の `UnixSock::Drop` が担うので `from_listener_fd` で普通に組み立てる
-    /// (= socket path は既存 file を指したまま bind 済)。
+    /// (= exec 前後で PID / PPID は不変、DR-0028 §1)。listener と name lock は
+    /// [`UnixSock::resume_inherited`] で組み立てる (= CLOEXEC 復元、lock を持たない
+    /// 旧 daemon からの upgrade なら name lock を取り直す)。socket file の unlink 責務は
+    /// 通常の `UnixSock::Drop` が担う (= socket path は既存 file を指したまま bind 済)。
     ///
     /// `Pty::master_fd` は fd inheritance で有効だが nonblock 属性は execve でも
     /// 保存されるので (= `F_SETFL` は fd 属性)、Session::start と同じく nonblock
@@ -368,7 +369,7 @@ impl Session {
         use crate::sys::FdExt as _;
         let pty = Pty::from_master_fd(master_fd);
         pty.master_fd().set_nonblocking(true)?;
-        let listener = UnixSock::from_listener_fd(listener_fd, config.socket_path.clone(), lock);
+        let listener = UnixSock::resume_inherited(listener_fd, config.socket_path.clone(), lock);
         Ok(Self {
             config,
             inner: Some(SessionInner {

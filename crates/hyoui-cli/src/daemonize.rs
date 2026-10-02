@@ -605,10 +605,18 @@ pub fn run_upgrade_resume_child() -> ExitCode {
     // kernel には有効な fd として残っている。
     let master_owned = hyoui::sys::raw::own_raw_fd(env.pty_fd);
     let listener_owned = hyoui::sys::raw::own_raw_fd(env.listener_fd);
-    let lock = env.lock_fd.map(|fd| {
+    // 継承 lock fd は同じ open file description なので再 flock は成功する (= exec 跨ぎで
+    // lock は外れない)。失敗時は panic せず None にし、`UnixSock::resume_inherited` の
+    // 取り直しに任せる (= 子を抱えた upgrade を lock 都合で落とさない)。
+    let lock = env.lock_fd.and_then(|fd| {
         let file = std::fs::File::from(hyoui::sys::raw::own_raw_fd(fd));
-        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
-            .expect("inherited daemon lock must remain held")
+        match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+            Ok(held) => Some(held),
+            Err((_, e)) => {
+                eprintln!("hyoui: warning: inherited daemon lock fd {fd} unusable: {e}");
+                None
+            }
+        }
     });
 
     // DR-0028 Phase 2: state file (CBOR versioned) から DaemonConfig / scrollback

@@ -50,6 +50,24 @@ pub(crate) fn lock_socket_dir(path: &Path) -> Result<Flock<std::fs::File>> {
     Ok(held)
 }
 
+/// daemon の name lock (`<name>.lock`) を open/create して `LOCK_EX|LOCK_NB` で取る。
+/// caller は [`lock_socket_dir`] を保持した状態で呼ぶ (= prune / Drop との直列化)。
+/// 他プロセスが保持中なら `EWOULDBLOCK` を返す。
+fn acquire_name_lock(lock_path: &Path) -> Result<Flock<std::fs::File>> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(lock_path)
+        .map_err(Error::from)?;
+    let lock =
+        Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, e)| Error::from(e))?;
+    set_cloexec(&*lock)?;
+    Ok(lock)
+}
+
 /// `bind(2)` / `connect(2)` に渡せる socket path の最大バイト長 (= NUL 終端を除く)。
 ///
 /// `libc::sockaddr_un` 全体サイズから `sun_path` field の offset を引いて
@@ -156,16 +174,7 @@ impl UnixSock {
 
         let _dir_lock = lock_socket_dir(&path)?;
         let lock_path = path.with_extension("lock");
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&lock_path)
-            .map_err(Error::from)?;
-        let lock =
-            Flock::lock(lock, FlockArg::LockExclusiveNonblock).map_err(|(_, e)| Error::from(e))?;
+        let lock = acquire_name_lock(&lock_path)?;
 
         match nix::unistd::unlink(&path) {
             Ok(()) | Err(nix::errno::Errno::ENOENT) => {}
@@ -181,7 +190,6 @@ impl UnixSock {
             )
             .map_err(Error::from)?;
             set_cloexec(&fd)?;
-            set_cloexec(&*lock)?;
             let addr = UnixAddr::new(path.as_path()).map_err(Error::from)?;
             let _umask = UmaskGuard::set(nix::sys::stat::Mode::from_bits_truncate(0o077));
             socket::bind(fd.as_raw_fd(), &addr).map_err(Error::from)?;
@@ -240,6 +248,51 @@ impl UnixSock {
             path: Some(path),
             lock,
         }
+    }
+
+    /// DR-0028 upgrade-resume: self-exec で継承した listener fd と name lock から
+    /// `UnixSock` を組み立てる。
+    ///
+    /// - 継承 fd は exec 前に CLOEXEC を解除されているので、通常起動 ([`Self::listen`])
+    ///   と同じ CLOEXEC 状態に戻す (= 以後 spawn する process に listener / lock を
+    ///   漏らさない。lock が漏れると daemon 死亡後も lock が残り prune が効かなくなる)。
+    /// - `lock` が `None` (= name lock を持たない旧 daemon からの upgrade) なら dir lock
+    ///   下で `<name>.lock` を取り直す。lock を持たないまま serve すると discovery の
+    ///   生存判定・同名 `run` の衝突検出・Drop の socket unlink がいずれも効かない。
+    ///   取れなければ (= 別プロセスが同名 lock を保持) warning を出して lock 無しで
+    ///   続行する (= upgrade は子を抱えたまま進めるので、ここで失敗させない)。
+    pub fn resume_inherited(
+        fd: OwnedFd,
+        path: PathBuf,
+        lock: Option<Flock<std::fs::File>>,
+    ) -> Self {
+        if let Err(e) = set_cloexec(&fd) {
+            eprintln!("hyoui: warning: CLOEXEC restore on inherited listener failed: {e}");
+        }
+        let lock = match lock {
+            Some(held) => {
+                if let Err(e) = set_cloexec(&*held) {
+                    eprintln!(
+                        "hyoui: warning: CLOEXEC restore on inherited daemon lock failed: {e}"
+                    );
+                }
+                Some(held)
+            }
+            None => {
+                let lock_path = path.with_extension("lock");
+                match lock_socket_dir(&path).and_then(|_dir_lock| acquire_name_lock(&lock_path)) {
+                    Ok(held) => Some(held),
+                    Err(e) => {
+                        eprintln!(
+                            "hyoui: warning: daemon lock {} を取得できない ({e}); lock 無しで続行",
+                            lock_path.display()
+                        );
+                        None
+                    }
+                }
+            }
+        };
+        Self::from_listener_fd(fd, path, lock)
     }
 
     /// DR-0028 Phase 1/3: self-exec 直前に fd + path を取り出す。**socket file の
@@ -371,6 +424,76 @@ mod tests {
         assert!(!path.exists(), "Drop should unlink the socket file");
         assert!(!path.with_extension("lock").exists());
         assert!(dir.path().join(".dir.lock").exists());
+    }
+
+    /// 別 open file description から `LOCK_EX|LOCK_NB` を試す (= discovery の prune 判定と同じ)。
+    fn name_lock_is_held_elsewhere(lock_path: &Path) -> bool {
+        let file = std::fs::File::open(lock_path).expect("open lock");
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(_) => false,
+            Err((_, nix::errno::Errno::EWOULDBLOCK)) => true,
+            Err((_, e)) => panic!("unexpected flock error: {e}"),
+        }
+    }
+
+    fn has_cloexec<F: AsFd>(fd: &F) -> bool {
+        let flags = fcntl(fd, FcntlArg::F_GETFD).expect("F_GETFD");
+        FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC)
+    }
+
+    /// DR-0028 upgrade: exec 前に CLOEXEC を外して継承した listener / name lock を
+    /// `resume_inherited` が同じ lock (inode) のまま保持し、CLOEXEC を戻す。
+    #[test]
+    fn resume_inherited_keeps_lock_and_restores_cloexec() {
+        let dir = make_0700_dir();
+        let path = dir.path().join("up.sock");
+        let lock_path = path.with_extension("lock");
+        let (fd, sock_path, lock) = UnixSock::listen(&path)
+            .expect("listen")
+            .into_parts_for_exec();
+        let lock = lock.expect("listen holds name lock");
+        let ino = lock.metadata().expect("lock metadata").ino();
+        crate::sys::clear_cloexec(&fd).expect("clear listener cloexec");
+        crate::sys::clear_cloexec(&*lock).expect("clear lock cloexec");
+
+        let sock = UnixSock::resume_inherited(fd, sock_path, Some(lock));
+        assert!(name_lock_is_held_elsewhere(&lock_path));
+        assert_eq!(std::fs::metadata(&lock_path).expect("lock file").ino(), ino);
+        assert!(
+            has_cloexec(&sock.as_fd()),
+            "listener CLOEXEC must be restored"
+        );
+        assert!(
+            has_cloexec(&**sock.lock.as_ref().expect("lock kept")),
+            "lock CLOEXEC must be restored"
+        );
+
+        drop(sock);
+        assert!(!path.exists());
+        assert!(!lock_path.exists());
+    }
+
+    /// name lock を持たない旧 daemon からの upgrade (= lock fd 未継承) では
+    /// `resume_inherited` が `<name>.lock` を取り直し、生存判定と Drop の unlink を効かせる。
+    #[test]
+    fn resume_inherited_reacquires_missing_name_lock() {
+        let dir = make_0700_dir();
+        let path = dir.path().join("old.sock");
+        let lock_path = path.with_extension("lock");
+        let (fd, sock_path, lock) = UnixSock::listen(&path)
+            .expect("listen")
+            .into_parts_for_exec();
+        drop(lock);
+        std::fs::remove_file(&lock_path).expect("simulate lock-less old daemon");
+
+        let sock = UnixSock::resume_inherited(fd, sock_path, None);
+        assert!(lock_path.exists(), "name lock file must be recreated");
+        assert!(name_lock_is_held_elsewhere(&lock_path));
+        assert!(has_cloexec(&**sock.lock.as_ref().expect("lock reacquired")));
+
+        drop(sock);
+        assert!(!path.exists(), "Drop must unlink socket once lock is held");
+        assert!(!lock_path.exists());
     }
 
     #[test]
