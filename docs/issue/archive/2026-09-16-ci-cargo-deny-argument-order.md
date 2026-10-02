@@ -1,6 +1,6 @@
 ---
 title: CI の cargo-deny-action は cargo-deny 0.20 系で引数順エラーになる
-status: open
+status: discarded
 category: bug
 created: 2026-09-16T22:00:00+09:00
 last_read:
@@ -8,9 +8,9 @@ open_entered: 2026-09-16T22:00:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
-discarded_entered:
+discarded_entered: 2026-10-03T03:20:06+09:00
 resolved_entered:
-discard_reason:
+discard_reason: 前提が誤り。cargo-deny-action@v2 の action.yml は args を `--log-level ... --manifest-path ... ${arguments} ${command} ${command-arguments}` の順で組み立てており、`arguments: --all-features` は command (check) の前に置かれる (= `cargo deny --all-features check`)。action の Dockerfile は既に cargo-deny 0.20.2 を pin しており、2026-10-03 の CI (run 37045559264) で通っている
 pending_reason:
 close_reason:
 blocked_by:

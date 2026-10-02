@@ -6,7 +6,6 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 |---|---|---|---|---|
 | 2026-09-29 | bug | open | [daemon-must-never-hang](./2026-09-29-daemon-must-never-hang.md) | daemon が「生きているが固まる」状態を構造的に排除する (イベントループのブロック点棚卸し + 再発防止) |
 | 2026-09-29 | bug | wip | [detached-zombie-child-reap](./2026-09-29-detached-zombie-child-reap.md) | hyoui run --detached の子 claude が zombie になった時に親が自動回収して終了する |
-| 2026-09-16 | bug | open | [ci-cargo-deny-argument-order](./2026-09-16-ci-cargo-deny-argument-order.md) | CI の cargo-deny-action は cargo-deny 0.20 系で `check --all-features` の引数順エラーになる (時間で壊れる) |
 | 2026-09-16 | task | open | [dr-index-archive-convention](./2026-09-16-dr-index-archive-convention.md) | docs-layout の archive 運用規約更新を受けて、hyoui の docs/decisions/INDEX.md (Archived 節 / Superseded 行 / 状態列の日付) を新規約に揃える (ccmsg 依頼 2026-09-16) |
 | 2026-09-15 | task | open | [service-subcommand-multi-unit-ha](./2026-09-15-service-subcommand-multi-unit-ha.md) | hyoui service を reference の daemon/service 体系 (multi-unit) にし、stable/unstable 2 インスタンスの HA を組む (kawaz 裁定 2026-09-15) |
 | 2026-09-15 | task | open | [upgrade-e2e-test](./2026-09-15-upgrade-e2e-test.md) | daemon graceful upgrade (DR-0028 Phase 1〜3) の検証マトリクスと e2e テストが未整備 (unit test 5 本のみ、Phase gate 未達) |
