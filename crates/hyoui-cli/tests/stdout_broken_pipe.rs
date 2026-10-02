@@ -24,14 +24,11 @@ fn run_with_dead_stdout(args: &[&str]) -> (Option<i32>, Option<i32>, String) {
     use std::os::unix::process::ExitStatusExt;
 
     let (rd, wr) = nix::unistd::pipe().expect("pipe");
-    // 読み端の FD_CLOEXEC 必須: 素の `pipe(2)` の fd は子に継承されるため、子自身が
-    // 読み手として残って EPIPE が起きない (= test が常に green になる偽陽性。macOS の
-    // nix には `pipe2` が無いので fcntl で立てる)。
-    nix::fcntl::fcntl(
-        &rd,
-        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
-    )
-    .expect("set FD_CLOEXEC on read end");
+    // 読み端は spawn より **前に** close する。spawn は子の exec 完了で戻るが、子はその
+    // 時点で走り出しており、親が spawn 後に close すると短い出力 (`--version`) は close
+    // より先に pipe buffer へ書けてしまい exit 0 になる (= CI で実測)。fork 前に閉じれば
+    // 子にも継承されず、子の最初の write が必ず EPIPE になる。
+    drop(rd);
     let wr: OwnedFd = wr;
     let mut child = Command::new(hyoui_bin())
         .args(args)
@@ -43,8 +40,6 @@ fn run_with_dead_stdout(args: &[&str]) -> (Option<i32>, Option<i32>, String) {
         .env_remove("HYOUI_NAMESPACE")
         .spawn()
         .expect("spawn hyoui");
-    // 読み端を即 close する = 以降の stdout write は必ず EPIPE / SIGPIPE。
-    drop(rd);
 
     let mut stderr = String::new();
     if let Some(mut e) = child.stderr.take() {
