@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-10-04 | design | open | [webui-terminal-app-rework](./2026-10-04-design-webui-terminal-app-rework.md) | web UI をブラウザ上のターミナルアプリとして作り直す (新規セッション作成 / タブグループ・タブ・pane / web 専用アクション / 構造は共有・配置は端末ごと / leader 優先 + content-fit / ソフトキー)。議論中、合意と未決を記録 |
 | 2026-09-29 | bug | open | [daemon-must-never-hang](./2026-09-29-daemon-must-never-hang.md) | daemon が「生きているが固まる」状態を構造的に排除する (イベントループのブロック点棚卸し + 再発防止) |
 | 2026-09-29 | bug | wip | [detached-zombie-child-reap](./2026-09-29-detached-zombie-child-reap.md) | hyoui run --detached の子 claude が zombie になった時に親が自動回収して終了する |
 | 2026-09-16 | task | open | [dr-index-archive-convention](./2026-09-16-dr-index-archive-convention.md) | docs-layout の archive 運用規約更新を受けて、hyoui の docs/decisions/INDEX.md (Archived 節 / Superseded 行 / 状態列の日付) を新規約に揃える (ccmsg 依頼 2026-09-16) |

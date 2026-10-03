@@ -1,0 +1,96 @@
+---
+title: web UI をブラウザ上のターミナルアプリとして作り直す (新規セッション作成 / タブ・pane / アクション / ソフトキー)
+status: open
+category: design
+created: 2026-10-04T00:30:00+09:00
+last_read: 2026-10-04T00:30:00+09:00
+open_entered: 2026-10-04T00:30:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+---
+
+# web UI をブラウザ上のターミナルアプリとして作り直す
+
+議論フェーズの記録。合意したものを「合意」、未決を「未決」に置く。DR 起草はここが固まってから。現状の棚卸しは `docs/findings/2026-10-03-web-api-protocol-inventory.md` と `docs/findings/2026-10-03-web-component-tree.md`。
+
+## 目的
+
+daemon が動いていれば、ブラウザからリモートでターミナルを開いてローカル作業ができる。iTerm / Ghostty のようなフルスクリーンのターミナルアプリの使い心地を軸にしつつ、全描画領域を文字セルで敷き詰める必要があるというターミナル特有の制限には囚われない。
+
+## 合意 (2026-10-04)
+
+### 新規セッション作成
+
+- web から新規セッションを作れるようにする。設定はターミナルアプリのプロファイル相当 (shell、引数、login shell か、cwd の既定は `$HOME`、env)
+- shell の既定は gateway の env ではなく passwd から引く (gateway は launchd 起動で env がログイン時と違いうる)。既定は login shell 起動
+
+### アクション
+
+- 新規タブ・画面分割・leader 昇格などを **web 専用のアクション** として形式化し、後からショートカットを割り当てられるようにする。hyoui の TUI 側にキー割り当ては足さない (TUI の手前の層)
+- UI のボタンもショートカットも、アクションを invoke するだけ (1 操作 = 1 アクション)
+
+### コンポーネントツリー (1 から作り直す)
+
+```
+Window
+  menubar
+  split コンテナ
+    session list (サイドバー、出し入れ可)
+    タブコンテナ
+      tabbar (ターミナル 1 つなら非表示など)
+      ターミナルコンテナ (中で pane 分割)
+        pane (複数) — 1 pane = 1 hyoui session
+      ソフトキーツール (タッチデバイスで下部、出し入れ可)
+```
+
+- タブコンテナ・特定タブ・特定 pane は単独で別ブラウザタブに開ける。iframe の木にして postMessage で疎結合する。ソフトキーツールは 1 つで済ませたい (iOS での成立は PoC で検証中: `docs/research/poc/2026-10-04-softkey-iframe-focus/`)
+
+### session list の構造
+
+```
+タブグループ (ターミナルアプリのウインドウ相当)
+  タブ
+    pane (1 hyoui session に紐づく)
+未アタッチ (どこにも属さない session)
+```
+
+- pane → session は 1 つ。1 session に複数 pane が紐づいてよい
+- **pane を閉じる = detach**。session は終了しない。閉じた pane の session は未アタッチ一覧に移る。選ぶとデフォルトのタブグループ等に新規タブとしてアタッチする。session の終了は別のアクション
+
+### 共有する構造と端末ごとの配置
+
+| 層 | 中身 | 置き場所 |
+|---|---|---|
+| 構造 (共有) | タブグループ → タブ → pane のツリー、pane と session の紐付け、未アタッチ一覧 | gateway |
+| 配置 (端末ごと) | 分割の向き・比率、サイドバー開閉、pane の非表示 | ブラウザ (localStorage = 端末単位。必要になればウィンドウ単位を sessionStorage で上書き) |
+
+- pane の別タブ・別タブグループへの移動は構造の変更なので共有。分割比率は配置なので共有しない
+- 閉じる (構造から外れ全端末で未アタッチへ) と 非表示 (この端末の配置で見せないだけ) を分ける
+- 他端末が構造に pane を足したら、手元の配置には既定で末尾に分割して足す (非表示で足すと気づけない)
+- 構造の正本は gateway 1 か所、変更は操作単位 + 版番号、他端末へは push で配る。web 契約 (DR-0035) に構造の取得・変更・変更通知が加わる
+
+### サイズ違い (1 session を大きさの違う複数 pane で見る)
+
+- cols/rows は leader 優先 (DR-0033)
+- leader より大きい pane は余白を置く。**余白は余白と分かる見た目にする** (ターミナル背景色と同じにすると cols/rows を誤認させる)
+- leader より小さい pane は cols/rows を変えず、その縦横比の矩形を pane に収まるよう丸ごと縮小する (content-fit)。実装は `transform: scale()` だと xterm のマウス座標がずれるので、収まる fontSize を計算して設定するのが第一候補
+- 非 leader pane には leader 昇格のアクション (ボタン + ショートカット)。昇格すると cols/rows が変わり TUI アプリが再描画する
+
+### 入力の 2 系統
+
+- xterm への直打ち (1 文字ごとに TUI の反応を受ける、claude の `/` 補完等) と、テキストエリアでまとめて送る (IME 変換位置を TUI に縛られない) の 2 系統を両方持つ。運ぶ経路は WS 接続中なら両方 WS に寄せ、HTTP `POST /input` は未接続時の予備にする案 (細部は作り直し時に決める)
+
+## 未決
+
+- 新規セッション作成が web 境界に「任意コマンド起動」を足すことの DR 化 (DR-0027 / DR-0036 の前提の更新)、DR-0024 の env scrub を web 起動 session に掛けるか
+- アクションの既定キー割り当て: ブラウザ予約キー (Cmd+T / W / N 等) は通常タブで奪えない。prefix キー方式か等、端末入力とアクション入力の優先規則
+- iframe 間のキー転送 (キーイベントは iframe 境界を越えない) と focus の扱い
+- WS 制御 frame の拡充 (子の exit / stop 通知、入力拒否、close 理由) — pane の「プロセスが終了しました」表示の前提
+- leader が去った時の次の leader と再レイアウトの体験 (実装時に観測して決める)
