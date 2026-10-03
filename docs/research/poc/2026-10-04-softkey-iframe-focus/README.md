@@ -82,10 +82,10 @@ pane A (textarea) / pane B (xterm.js helper textarea) で全セル同じ結果�
 
 | 方式 | iPhone Safari | iPad Safari | iPad PWA | 備考 |
 |---|---|---|---|---|
-| (a) button + click | | | | |
-| (b) pointerdown pD | | | | |
-| (c) mousedown/touchstart pD | | | | |
-| (d) tabindex=-1 + pointerdown pD | | | | |
-| (e) div role=button + click | | | | |
+| (a) button + click | | キーボード閉じる | | kawaz 実機 2026-10-04 (iPad。Safari 想定、pane 別は未記録) |
+| (b) pointerdown pD | | キーボード維持 | | kawaz 実機 2026-10-04 |
+| (c) mousedown/touchstart pD | | キーボード維持 | | kawaz 実機 2026-10-04 |
+| (d) tabindex=-1 + pointerdown pD | | キーボード維持 | | kawaz 実機 2026-10-04 |
+| (e) div role=button + click | | キーボード閉じる | | kawaz 実機 2026-10-04 |
 
 pane B (xterm.js) で結果が A と違った場合は備考に書く。
