@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-10-03 | bug | open | [web-passkey-register-toporigin-check](./2026-10-03-web-passkey-register-toporigin-check.md) | passkey 登録経路が topOrigin を見ず crossOrigin だけで埋め込みを判定している (topOrigin あり ∧ crossOrigin 欠落を通す) |
 | 2026-10-03 | bug | open | [web-ws-auth-expiry-not-enforced](./2026-10-03-web-ws-auth-expiry-not-enforced.md) | web WS 接続に access の期限と失効が効いていない (DR-0036 決定 5 の WS 側: 期限での切断 / `auth.extend` の family 照合 / 再利用検知時の WS 切断が未実装) |
 | 2026-09-29 | bug | open | [daemon-must-never-hang](./2026-09-29-daemon-must-never-hang.md) | daemon が「生きているが固まる」状態を構造的に排除する (イベントループのブロック点棚卸し + 再発防止) |
 | 2026-09-29 | bug | wip | [detached-zombie-child-reap](./2026-09-29-detached-zombie-child-reap.md) | hyoui run --detached の子 claude が zombie になった時に親が自動回収して終了する |
