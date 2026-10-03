@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pane (textarea)</title>
+<style>
+  html, body { margin: 0; height: 100%; font: 12px/1.3 ui-monospace, Menlo, monospace; }
+  body { display: flex; flex-direction: column; box-sizing: border-box; padding: 4px; gap: 4px; }
+  #head { display: flex; gap: 6px; align-items: center; }
+  #name { font-weight: bold; }
+  #state { padding: 0 4px; border-radius: 3px; background: #ccc; }
+  #state.on { background: #2a2; color: #fff; }
+  textarea { width: 100%; height: 3.2em; box-sizing: border-box; font-size: 16px; /* 16px 未満だと iOS が focus 時にズームする */ }
+  #log { flex: 1; overflow: auto; margin: 0; background: #f4f4f4; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="head"><span id="name"></span><span id="state">blur</span></div>
+<textarea id="input" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" placeholder="ここをタップして focus"></textarea>
+<pre id="log"></pre>
+<script type="module">
+import { connectPane } from "./pane-common.js";
+
+const input = document.getElementById("input");
+connectPane({
+  input,
+  onKey(key) {
+    // 受信したキーは textarea 末尾に書き足して目視でも分かるようにする (value 変更は focus に影響しない)
+    input.value += `[${key}]`;
+  },
+});
+</script>
+</body>
+</html>

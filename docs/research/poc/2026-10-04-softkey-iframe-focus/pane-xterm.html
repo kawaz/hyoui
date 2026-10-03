@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pane (xterm.js)</title>
+<!-- サーバをリポ root で起動している前提の相対参照 -->
+<link rel="stylesheet" href="../../../../crates/hyoui-web/assets/vendor/xterm.css">
+<script src="../../../../crates/hyoui-web/assets/vendor/xterm.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; font: 12px/1.3 ui-monospace, Menlo, monospace; }
+  body { display: flex; flex-direction: column; box-sizing: border-box; padding: 4px; gap: 4px; }
+  #head { display: flex; gap: 6px; align-items: center; }
+  #name { font-weight: bold; }
+  #state { padding: 0 4px; border-radius: 3px; background: #ccc; }
+  #state.on { background: #2a2; color: #fff; }
+  #term { height: 6em; }
+  #log { flex: 1; overflow: auto; margin: 0; background: #f4f4f4; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="head"><span id="name"></span><span id="state">blur</span></div>
+<div id="term"></div>
+<pre id="log"></pre>
+<script type="module">
+import { connectPane } from "./pane-common.js";
+
+const term = new window.Terminal({ rows: 5, fontSize: 14, cursorBlink: true });
+term.open(document.getElementById("term"));
+term.write("xterm.js pane: タップして入力\r\n");
+term.onData((d) => term.write(d === "\r" ? "\r\n" : d));
+
+connectPane({
+  input: term.textarea, // xterm の helper textarea
+  onKey(key) {
+    term.write(`\x1b[33m[${key}]\x1b[0m`);
+  },
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+{
+  "name": "softkey iframe focus PoC",
+  "short_name": "softkey PoC",
+  "start_url": "./index.html",
+  "display": "standalone"
+}
