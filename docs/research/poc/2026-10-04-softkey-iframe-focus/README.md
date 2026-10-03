@@ -44,8 +44,8 @@ python3 -m http.server 18765 --bind 0.0.0.0
 
 開く URL (Mac の IP は環境で変わる。`ipconfig getifaddr en0` / `tailscale ip -4` で確認):
 
-- 同一 LAN: `http://192.168.2.133:18765/docs/research/poc/2026-10-04-softkey-iframe-focus/`
-- tailnet: `http://100.76.5.89:18765/docs/research/poc/2026-10-04-softkey-iframe-focus/`
+- 同一 LAN: `http://<Mac の LAN IP>:18765/docs/research/poc/2026-10-04-softkey-iframe-focus/`
+- tailnet: `http://<Mac の tailnet IP>:18765/docs/research/poc/2026-10-04-softkey-iframe-focus/`
 
 ## iPhone / iPad での確認手順
 
