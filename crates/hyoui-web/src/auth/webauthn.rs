@@ -153,15 +153,15 @@ impl Rp {
 
     /// 登録を検証して credential を得る。
     ///
-    /// **`crossOrigin: true` は crate が登録経路で拒否する** ので、hyoui 側で足す
-    /// 判定は無い (決定 6 / gate 4 の実測)。念のため同じ判定を自分でも行い、crate の
-    /// 挙動が変わった時に黙って iframe 登録が通らないよう固定する。
+    /// **`crossOrigin: true` は crate が登録経路で拒否する** が、`topOrigin` は crate が
+    /// 読まない (決定 6 / gate 4 の表)。埋め込み由来の登録は hyoui 側で `topOrigin` /
+    /// `crossOrigin` を独立に検査して拒む。認証経路は任意の `topOrigin` を許す (決定 6)。
     pub fn finish_registration(
         &self,
         response: &RegisterPublicKeyCredential,
         state: &RegistrationState,
     ) -> Result<Credential> {
-        if client_data_says_cross_origin(&response.response.client_data_json) {
+        if client_data_says_embedded(&response.response.client_data_json) {
             return Err(WebauthnFailure::CrossOriginRegistration);
         }
         self.core
@@ -219,19 +219,23 @@ impl Rp {
     }
 }
 
-/// `clientDataJSON` が `crossOrigin: true` を名乗っているか。
+/// `clientDataJSON` が埋め込み (cross-origin iframe 等) 由来を名乗っているか。
 ///
-/// **present であることは要求しない** — Chrome 系は最上位フレームでも常に `false` を
-/// 送るが、送らない実装もある (reference)。`true` のときだけ拒む。
-fn client_data_says_cross_origin(client_data_json: &[u8]) -> bool {
-    #[derive(serde::Deserialize)]
-    struct ClientData {
-        #[serde(rename = "crossOrigin", default)]
-        cross_origin: bool,
-    }
-    serde_json::from_slice::<ClientData>(client_data_json)
-        .map(|data| data.cross_origin)
-        .unwrap_or(false)
+/// `topOrigin` が present、または `crossOrigin: true` なら真。両者は独立に検査する —
+/// `topOrigin` だけ付いて `crossOrigin` が欠ける値は client の不整合で、片方の検査に
+/// 頼るとそれを通す。`topOrigin` は値の型・内容によらず present (null 含む) なら拒む。
+///
+/// **`crossOrigin` が present であることは要求しない** — Chrome 系は最上位フレームでも
+/// 常に `false` を送るが、送らない実装もある (reference)。`true` のときだけ拒む。
+/// JSON として読めない入力は真にしない (crate 側の検証が拒む)。
+fn client_data_says_embedded(client_data_json: &[u8]) -> bool {
+    let Ok(serde_json::Value::Object(data)) =
+        serde_json::from_slice::<serde_json::Value>(client_data_json)
+    else {
+        return false;
+    };
+    data.contains_key("topOrigin")
+        || data.get("crossOrigin") == Some(&serde_json::Value::Bool(true))
 }
 
 #[cfg(test)]
@@ -276,14 +280,25 @@ mod tests {
     }
 
     #[test]
-    fn cross_origin_client_data_is_detected_only_when_true() {
-        assert!(client_data_says_cross_origin(br#"{"crossOrigin":true}"#));
-        assert!(!client_data_says_cross_origin(br#"{"crossOrigin":false}"#));
-        // present でないことは拒否の理由にしない (reference)。
-        assert!(!client_data_says_cross_origin(
-            br#"{"type":"webauthn.create"}"#
+    fn embedded_client_data_is_detected_by_top_origin_or_cross_origin_true() {
+        // topOrigin のみ (crossOrigin 欠落) — client の不整合値、通さない。
+        assert!(client_data_says_embedded(
+            br#"{"topOrigin":"https://top.example"}"#
         ));
-        assert!(!client_data_says_cross_origin(b"not json"));
+        // crossOrigin: true のみ。
+        assert!(client_data_says_embedded(br#"{"crossOrigin":true}"#));
+        // 両方。
+        assert!(client_data_says_embedded(
+            br#"{"crossOrigin":true,"topOrigin":"https://top.example"}"#
+        ));
+        // topOrigin は crossOrigin の値によらず拒む。
+        assert!(client_data_says_embedded(
+            br#"{"crossOrigin":false,"topOrigin":"https://top.example"}"#
+        ));
+        // 両方無し / crossOrigin: false 明示は通す (present を要求しない、reference)。
+        assert!(!client_data_says_embedded(br#"{"type":"webauthn.create"}"#));
+        assert!(!client_data_says_embedded(br#"{"crossOrigin":false}"#));
+        assert!(!client_data_says_embedded(b"not json"));
     }
 
     /// 検証経路が端から端まで繋がっている (gate 4)。
