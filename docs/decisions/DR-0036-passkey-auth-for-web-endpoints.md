@@ -1,6 +1,6 @@
 # DR-0036: web endpoint を passkey で守る。gateway は自分の endpoint を知らない
 
-- Status: 🟢 実装済み (2026-09-16)。**W2-1 〜 W2-6 が入り、登録 → 認証 → refresh → 失効の通しを実ブラウザで観測済み** (Chrome + CDP 仮想 authenticator)。残るのは **kawaz が本番 3 endpoint に登録する運用手順** (runbook あり) と **Safari / iOS の gate 3 確認**の 2 点。W3 (ccmsg-webui への `allow` 依頼) / W4 (canddy のコメント修正依頼) は別リポの責務
+- Status: 🟡 部分実装 (2026-10-03)。**W2-1 〜 W2-6 が入り、登録 → 認証 → refresh → 失効の通しを実ブラウザで観測済み** (Chrome + CDP 仮想 authenticator)。**決定 5 の WS 側が未実装**: 延長を怠った接続を access の期限で切る処理、`auth.extend` が提示 token をその接続の family と照合する処理、refresh 再利用検知時にその sub の WS を切る処理が無い (`docs/findings/2026-10-03-web-api-protocol-inventory.md` §7)。ほかに残るのは **kawaz が本番 3 endpoint に登録する運用手順** (runbook あり) と **Safari / iOS の gate 3 確認**の 2 点。W3 (ccmsg-webui への `allow` 依頼) / W4 (canddy のコメント修正依頼) は別リポの責務
 - Date: 2026-09-16
 - Related: DR-0035 (web 契約と世代 version。決定 6 の endpoint 基点相対 URL が本 DR の前提), DR-0027 (認証は当面なし・tailnet 前提という現行前提を本 DR が置き換える), DR-0034 (`/healthz` `/version` は認証境界を変えない、stable / unstable 2 unit と HA endpoint), DR-0013 (attach 復元。`ro` 相当の mode の出どころ), DR-0022 (`POST /input` の auto-lock と `HYOUI_LOCK_TOKEN`。lock token は HTTP 認証ではない), DR-0008 §7 (daemon 境界の認証は同 UID + socket perm。本 DR は触らない)
 - Origin: `docs/research/2026-09-15-web-protocol-and-passkey-grand-design.md` (§4 / §5 / §6)、事実は `docs/findings/2026-09-15-web-contract-and-ccmsg-passkey-inventory.md`
