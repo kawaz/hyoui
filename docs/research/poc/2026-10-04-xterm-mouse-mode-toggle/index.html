@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PoC: xterm.js 6.0.0 マウスモード on/off</title>
+<link rel="stylesheet" href="lib/xterm.css">
+<script>
+  // ?platform=Linux 等で navigator.platform を差し替える (xterm の Browser.isMac はモジュール評価時に navigator.platform で決まるため、module より前の classic script で行う)
+  (() => {
+    const p = new URLSearchParams(location.search).get('platform');
+    if (p) Object.defineProperty(Navigator.prototype, 'platform', { get: () => p, configurable: true });
+  })();
+</script>
+<style>
+  body { font: 13px/1.4 system-ui, sans-serif; margin: 8px; }
+  fieldset { display: inline-block; vertical-align: top; margin: 0 6px 6px 0; padding: 4px 8px; }
+  button { margin: 2px; }
+  button.on { background: #2a6; color: #fff; }
+  #status { font-family: ui-monospace, monospace; margin: 4px 0; }
+  #status b { padding: 1px 6px; border-radius: 3px; }
+  .st-none { background: #ddd; }
+  .st-fwd { background: #2a6; color: #fff; }
+  .st-block { background: #c33; color: #fff; }
+  /* カルーセル: 横フリックはブラウザの scroll-snap に任せる */
+  #carousel { display: flex; overflow-x: auto; scroll-snap-type: x mandatory; width: 760px; max-width: 100%; border: 1px solid #888; }
+  #carousel > .slide { flex: 0 0 100%; scroll-snap-align: start; }
+  #host { height: 360px; }
+  #host.touch-own { touch-action: pan-x; }
+  .slide2 { display: flex; align-items: center; justify-content: center; height: 360px; background: #eee; }
+  #log { font: 12px/1.3 ui-monospace, monospace; height: 180px; overflow: auto; border: 1px solid #888; padding: 4px; white-space: pre; width: 760px; max-width: 100%; box-sizing: border-box; }
+</style>
+</head>
+<body>
+<div>
+  <fieldset><legend>疑似アプリ (term.write する DECSET/DECRST)</legend>
+    <button data-dec="1000">?1000</button>
+    <button data-dec="1002">?1002</button>
+    <button data-dec="1003">?1003</button>
+    <button data-dec="1006">?1006</button>
+    <button data-dec="1049">?1049 alt</button>
+    <button data-dec="1">?1 DECCKM</button>
+    <button id="fill">行を 200 行書く</button>
+  </fieldset>
+  <fieldset><legend>UI マウスモード</legend>
+    <button id="fwd">転送: オン</button>
+  </fieldset>
+  <fieldset><legend>オフ時の方式</legend>
+    <label><input type="radio" name="method" value="1"> (1) 止めるだけ</label><br>
+    <label><input type="radio" name="method" value="2"> (2) +修飾キー合成</label><br>
+    <label><input type="radio" name="method" value="3"> (3) +wheel 自前</label><br>
+    <label><input type="radio" name="method" value="4" checked> (4) +touch 自前</label>
+  </fieldset>
+  <fieldset><legend>ログ</legend>
+    <button id="clearlog">消去</button>
+  </fieldset>
+</div>
+<div id="status"></div>
+<div id="carousel">
+  <div class="slide"><div id="host"></div></div>
+  <div class="slide slide2">隣の pane (カルーセル 2 枚目)</div>
+</div>
+<div id="log"></div>
+<script type="module" src="index.js"></script>
+</body>
+</html>
