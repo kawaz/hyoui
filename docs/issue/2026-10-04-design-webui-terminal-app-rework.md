@@ -88,7 +88,8 @@ Window
 - 既定はアプリの要求に従う。ユーザがオフにしたらその pane で明示的に遮断
 - 記憶単位は pane × 端末 (配置と同じ層)
 - alt screen 中の縦フリックは矢印キーに変換する (xterm 系の慣習)
-- 作り直し前に、xterm.js で転送だけを止める手段を小さく確かめる (無ければ親側でイベントを止める)
+- xterm.js 6.0.0 で転送だけを止められることを PoC で確認 (`docs/research/poc/2026-10-04-xterm-mouse-mode-toggle/`、headless Chromium / WebKit)。オフ時は capture で mouse / wheel を止め、左 mousedown を修飾キー付き (Mac は Option + `macOptionClickForcesSelection`、他は Shift) で渡し直して xterm 自身の強制選択経路を使う。wheel は normal で `scrollLines`、alt で矢印キー列。touch の縦スワイプは自前、横は `scroll-snap` のカルーセル。DECSET は全 224 ケースで保持、遮断中の report は 0 byte。Mac の `altClickMovesCursor` (本物の mouseup の altKey を見る) は mouseup の altKey を外して渡し直す
+- 未決: 転送オン時のタッチ。xterm 6.0.0 は touch を扱わず、TUI に届くのは tap (互換 mouse) だけ。スワイプまで TUI に渡すなら touch → mouse report の変換を自前で持つ。touch でのドラッグ選択の操作 (長押し等) と iOS 実機も未確認
 
 ### サイズ違い (1 session を大きさの違う複数 pane で見る)
 
