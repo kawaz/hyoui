@@ -254,6 +254,21 @@ pub mod code {
     pub const UNSUPPORTED: &str = "unsupported";
 }
 
+/// gateway が WS を閉じる時の close code (DR-0035 決定 1 の WS close 表)。
+///
+/// RFC 6455 §7.4.2 が private use に空けている 4000〜4999 から採る。理由を載せずに
+/// 閉じる経路 (子の終了 / daemon 切断) は従来どおり close frame に code を載せない
+/// (browser には 1005 に見える)。
+pub mod ws_close {
+    /// 接続の認証が終わった (DR-0036 決定 5)。access の期限を延長しないまま過ぎた、
+    /// 接続を開いた family が失効した、`auth.extend` が拒まれた、のいずれか。
+    ///
+    /// browser はこれを受けたら **同じ access で再接続しない**。閉じた接続の access を
+    /// 捨てて取り直し (他タブ → `/auth/refresh`)、それも駄目ならログイン overlay に
+    /// 進む。HTTP の 401 に揃えた番号にしてある。
+    pub const AUTH_ENDED: u16 = 4401;
+}
+
 /// HTTP エラー body の外枠 — `{"error": {"code": ..., "message": ...}}`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorEnvelope {
@@ -566,9 +581,10 @@ pub enum ServerFrame {
     /// `auth.extend` への応答 (DR-0036 決定 5)。
     ///
     /// **長命 WS は切らずに延ばす。** `exp` で必ず切ると画面が周期的に瞬くので、
-    /// 切るのは延長を怠った接続だけである。`ok: false` は「その family が失効した」
-    /// ことを意味し、gateway はこの応答の後に接続を閉じる (決定 4 の「失効はいつ
-    /// 効くか」— この処理が失効を確立済み接続に反映する唯一の点である)。
+    /// 切るのは延長を怠った接続だけである。延ばせるのは**その接続を開いた family の
+    /// 現行 access** だけで、`ok: false` は「別 family / 期限切れ / 不明の access を
+    /// 出した」か「その family が失効した」ことを意味する。gateway はこの応答の後に
+    /// [`ws_close::AUTH_ENDED`] で接続を閉じる。
     #[serde(rename = "auth.extend.result")]
     AuthExtendResult {
         /// 要求と同じ番号。
@@ -828,6 +844,51 @@ mod tests {
                 },
             }),
         );
+    }
+
+    #[test]
+    fn server_frame_auth_extend_result_golden() {
+        // 期限の field 名は `expires_at` (`SessionResponse` と同じ名前)。
+        golden(
+            &ServerFrame::AuthExtendResult {
+                request_id: 3,
+                ok: true,
+                expires_at: Some("2026-10-03T12:00:00.000Z".to_string()),
+                error: None,
+            },
+            json!({
+                "kind": "auth.extend.result",
+                "requestId": 3,
+                "ok": true,
+                "expires_at": "2026-10-03T12:00:00.000Z",
+            }),
+        );
+        golden(
+            &ServerFrame::AuthExtendResult {
+                request_id: 4,
+                ok: false,
+                expires_at: None,
+                error: Some(ErrorInfo::new(
+                    code::AUTH_FAILED,
+                    "the authenticated session is no longer valid",
+                )),
+            },
+            json!({
+                "kind": "auth.extend.result",
+                "requestId": 4,
+                "ok": false,
+                "error": {
+                    "code": "auth-failed",
+                    "message": "the authenticated session is no longer valid",
+                },
+            }),
+        );
+    }
+
+    /// close code は RFC 6455 の private use 帯 (4000〜4999) にある。
+    #[test]
+    fn ws_close_codes_are_in_the_private_use_range() {
+        assert!((4000..=4999).contains(&ws_close::AUTH_ENDED));
     }
 
     #[test]

@@ -77,25 +77,34 @@ impl Api {
 /// endpoint は gateway が bind した `http://127.0.0.1:<port>/` の正規形。**この値が
 /// record の key と一致することが、正規形の扱い (決定 3) の test でもある。**
 fn seed_credential(state: &Path, port: u16) -> String {
+    seed_family(state, port, "fam-e2e").0
+}
+
+/// family を 1 本置き、(access, refresh) を返す。sub は全部 `e2e-1`。
+fn seed_family(state: &Path, port: u16, family_id: &str) -> (String, String) {
     use hyoui_web::auth::{AuthFile, StateDir, token};
 
-    let endpoint = hyoui_web::contract::Endpoint::parse(&format!("http://127.0.0.1:{port}/"))
-        .expect("bind 先の endpoint は正規化できる");
     let access = token::random_token();
+    let refresh = token::random_token();
     StateDir::under_state_home(state)
         .auth()
         .update::<AuthFile, _, _>(|file| {
             file.mint_family(
-                &endpoint,
+                &e2e_endpoint(port),
                 "e2e-1",
-                "fam-e2e".to_string(),
+                family_id.to_string(),
                 access.clone(),
-                token::random_token(),
+                refresh.clone(),
                 hyoui::time::now_unix_ms(),
             );
         })
         .expect("登録 fixture を置く");
-    access
+    (access, refresh)
+}
+
+fn e2e_endpoint(port: u16) -> hyoui_web::contract::Endpoint {
+    hyoui_web::contract::Endpoint::parse(&format!("http://127.0.0.1:{port}/"))
+        .expect("bind 先の endpoint は正規化できる")
 }
 
 fn spawn_detached(runtime: &Path, state: &Path, sid: &str) {
@@ -1118,33 +1127,198 @@ fn e2e_ws_attach_bridge_roundtrip() {
     };
     assert_eq!(revoked_ack["ok"], false, "失効: {revoked_ack}");
     assert_eq!(revoked_ack["error"]["code"], "auth-failed");
-    // 応答の後に閉じる (= 理由を送ってから切る)。
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut closed = false;
-    while Instant::now() < deadline {
-        match ws.read() {
-            Ok(Message::Close(_)) => {
-                closed = true;
-                break;
-            }
-            Ok(_) => {}
-            // 相手が閉じた後の read は protocol error / io error になりうる。
-            Err(tungstenite::Error::Io(e))
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => {
-                closed = true;
-                break;
-            }
-        }
-    }
-    assert!(closed, "失効を返した接続は閉じる (決定 4)");
+    // 応答の後に、「認証切れ」の close code で閉じる (= 理由を送ってから切る)。
+    assert_eq!(
+        read_close_code(&mut ws),
+        Some(hyoui_web::contract::ws_close::AUTH_ENDED),
+        "失効を返した接続は認証切れの code で閉じる (決定 4)"
+    );
 
     // client → daemon の明示 Close はここでは不要 (= gateway が既に閉じた)。
     // daemon 側 attach の cleanup は socket 切断に任せる。
 
     drop(panic_guard);
     cleanup(runtime.path(), sid);
+}
+
+/// WS 接続は自分を開いた family にだけ延長を許し、認証が終わったら認証切れの close
+/// code で閉じる (DR-0036 決定 5)。
+///
+/// - 別 family の有効な access で `auth.extend` すると `ok:false` の後に閉じる
+/// - `/auth/refresh` が再利用を検知すると、その family の確立済み接続を (延長を待たずに) 閉じる
+///
+/// 期限切れで閉じる経路は時計を進める必要があるので、`hyoui-web` の `auth::ws` の
+/// test が tokio の時計を止めて固定している (= ここで実時間を待たない)。
+#[test]
+fn e2e_ws_attach_closes_with_the_auth_code_when_its_family_ends() {
+    let runtime = runtime_dir();
+    let state = state_home();
+    let sid = "web-e2e-wsauth";
+
+    spawn_detached(runtime.path(), state.path(), sid);
+    let (mut web, api) = spawn_web(runtime.path(), state.path());
+    let port = api.port;
+    let panic_guard = ChildGuard(&mut web);
+    // 同じ sub の 2 本目の family (= 別のタブ / 端末でのサインイン相当)。
+    let (other_access, other_refresh) = seed_family(state.path(), port, "fam-other");
+    let path = format!("/api/sessions/{sid}/attach");
+
+    // (1) 別 family の有効な access では延ばせない。
+    let mut ws = ws_connect(port, &path, &api.ws_protocol());
+    read_text_kind(&mut ws, "hello");
+    ws_send_json(
+        &mut ws,
+        serde_json::json!({"kind": "auth.extend", "requestId": 1u64, "accessToken": other_access}),
+    );
+    let ack = read_text_kind(&mut ws, "auth.extend.result");
+    assert_eq!(ack["ok"], false, "別 family の access: {ack}");
+    assert_eq!(ack["error"]["code"], "auth-failed");
+    assert_eq!(
+        read_close_code(&mut ws),
+        Some(hyoui_web::contract::ws_close::AUTH_ENDED),
+        "拒んだ接続は認証切れの code で閉じる"
+    );
+
+    // (2) refresh の再利用検知は、その family の確立済み接続を切る。
+    let mut ws = ws_connect(port, &path, &format!("hyoui.token.{other_access}"));
+    read_text_kind(&mut ws, "hello");
+    assert_eq!(post_refresh(port, &other_refresh), 200, "1 度目は rotate");
+    hyoui_web::auth::StateDir::under_state_home(state.path())
+        .auth()
+        .update::<hyoui_web::auth::AuthFile, _, _>(|file| {
+            for family in file.families.values_mut().flat_map(|f| f.values_mut()) {
+                for retired in &mut family.retired {
+                    retired.retired_at_ms = 0;
+                }
+            }
+        })
+        .expect("再送猶予を潰す");
+    assert_eq!(
+        post_refresh(port, &other_refresh),
+        401,
+        "旧い refresh の再提示は再利用"
+    );
+    assert_eq!(
+        read_close_code(&mut ws),
+        Some(hyoui_web::contract::ws_close::AUTH_ENDED),
+        "再利用検知で畳んだ family の接続は、延長を待たずに閉じる"
+    );
+
+    // 再利用で畳まれたのはその family だけで、最初の family の access はまだ通る。
+    let mut ws = ws_connect(port, &path, &api.ws_protocol());
+    read_text_kind(&mut ws, "hello");
+    ws_send_json(
+        &mut ws,
+        serde_json::json!({"kind": "auth.extend", "requestId": 2u64, "accessToken": api.token}),
+    );
+    let ack = read_text_kind(&mut ws, "auth.extend.result");
+    assert_eq!(ack["ok"], true, "他の family は生きている: {ack}");
+
+    drop(panic_guard);
+    cleanup(runtime.path(), sid);
+}
+
+/// WS attach を token 付きで開く。
+fn ws_connect(
+    port: u16,
+    path: &str,
+    protocol: &str,
+) -> tungstenite::WebSocket<std::net::TcpStream> {
+    use tungstenite::{client, handshake::client::Request};
+
+    let request = Request::builder()
+        .uri(format!("ws://127.0.0.1:{port}{path}"))
+        .header("Host", format!("127.0.0.1:{port}"))
+        .header("Upgrade", "websocket")
+        .header("Connection", "Upgrade")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("Sec-WebSocket-Protocol", protocol)
+        .body(())
+        .unwrap();
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("tcp");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    client(request, stream)
+        .map_err(|e| e.to_string())
+        .expect("ws handshake")
+        .0
+}
+
+fn ws_send_json(ws: &mut tungstenite::WebSocket<std::net::TcpStream>, value: serde_json::Value) {
+    ws.send(tungstenite::Message::Text(value.to_string().into()))
+        .expect("WS send");
+}
+
+/// `kind` の text frame が来るまで読む (binary や他の kind は読み飛ばす)。
+fn read_text_kind(
+    ws: &mut tungstenite::WebSocket<std::net::TcpStream>,
+    kind: &str,
+) -> serde_json::Value {
+    use tungstenite::Message;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(Instant::now() < deadline, "{kind} が届かない");
+        match ws.read() {
+            Ok(Message::Text(text)) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(text.as_str()).expect("WS control frame JSON");
+                if value["kind"] == kind {
+                    return value;
+                }
+            }
+            Ok(Message::Close(frame)) => panic!("{kind} より先に閉じた: {frame:?}"),
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => panic!("{kind} の read error: {e}"),
+        }
+    }
+}
+
+/// 相手が閉じるまで読み、close frame の code を返す (code が載っていなければ `None`)。
+fn read_close_code(ws: &mut tungstenite::WebSocket<std::net::TcpStream>) -> Option<u16> {
+    use tungstenite::Message;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(Instant::now() < deadline, "接続が閉じない");
+        match ws.read() {
+            Ok(Message::Close(frame)) => return frame.map(|frame| u16::from(frame.code)),
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => panic!("close frame を受ける前に read error: {e}"),
+        }
+    }
+}
+
+/// `POST /auth/refresh` を refresh cookie 付きで打ち、status を返す。
+fn post_refresh(port: u16, refresh: &str) -> u16 {
+    let endpoint = e2e_endpoint(port);
+    let body = serde_json::json!({"endpoint": endpoint.as_str()}).to_string();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("tcp connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let request = format!(
+        "POST /auth/refresh HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nCookie: {}={refresh}\r\n\r\n{body}",
+        body.len(),
+        hyoui_web::auth::token::cookie_name(&endpoint),
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("read_to_end");
+    std::str::from_utf8(&response)
+        .ok()
+        .and_then(|text| text.split_whitespace().nth(1))
+        .and_then(|status| status.parse().ok())
+        .expect("status code")
 }
 
 /// panic 時に web subprocess を確実に kill する RAII guard。

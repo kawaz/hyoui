@@ -19,7 +19,7 @@ hyoui = { path = "../hyoui", version = "0.9" }
 
 # HTTP server: axum + tokio + tower。JSON body / query.
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "fs", "time"] }
 include_dir = "0.7"
 tower = { version = "0.5", default-features = false }
 serde = { workspace = true }
@@ -57,7 +57,8 @@ tempfile = { workspace = true }
 # Router 単体の smoke test 用 (実 daemon を巻き込む e2e は hyoui-cli/tests/web_e2e_api.rs
 # 側で `CARGO_BIN_EXE_hyoui` 経由で subprocess として daemon を起動する)。
 tower = { version = "0.5", default-features = false, features = ["util"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# `test-util` は WS の認証期限を時計を止めて進める test 用 (auth/ws.rs)。
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 serde_json = { workspace = true }
 futures-util = { version = "0.3", default-features = false }
 # gate 4 の仮想 authenticator。`crypto` は softtoken を `AuthenticatorBackend`

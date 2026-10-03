@@ -196,11 +196,13 @@ impl AuthFile {
         self.families
             .values()
             .flat_map(|families| families.values())
-            .find(|family| {
-                !family.is_tombstoned()
-                    && family.access.is_live(now_ms)
-                    && constant_time_eq(family.access.value.as_bytes(), presented.as_bytes())
-            })
+            .find(|family| family.holds_live_access(presented, now_ms))
+    }
+
+    /// endpoint と id で family を 1 本引く (= 確立済み WS が自分を開いた family を
+    /// 読み直す、決定 5)。tombstone 済みでも返す。
+    pub fn family(&self, endpoint: &Endpoint, id: &str) -> Option<&FamilyRecord> {
+        self.families.get(endpoint)?.get(id)
     }
 
     /// 新しい token family を 1 本作って入れ、その record を返す。
@@ -381,6 +383,15 @@ impl FamilyRecord {
     /// tombstone 済みか。
     pub fn is_tombstoned(&self) -> bool {
         self.tombstoned_at_ms.is_some()
+    }
+
+    /// 提示された access がこの family の現行の値で、`now_ms` 時点で生きているか。
+    ///
+    /// 比較は**タイミング安全**に行う (決定 5)。
+    pub fn holds_live_access(&self, presented: &str, now_ms: u64) -> bool {
+        !self.is_tombstoned()
+            && self.access.is_live(now_ms)
+            && constant_time_eq(self.access.value.as_bytes(), presented.as_bytes())
     }
 
     /// 提示された refresh 値をこの family に照らす。

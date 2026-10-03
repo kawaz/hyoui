@@ -40,6 +40,7 @@ use super::record::{
 use super::store::StateDir;
 use super::token;
 use super::webauthn::Rp;
+use super::ws::{RevocationSignal, WsAuth};
 use crate::AppState;
 use crate::contract::{
     AssertRequest, ChallengePurpose, ChallengeRequest, ChallengeResponse, Endpoint, ErrorInfo,
@@ -69,6 +70,8 @@ const CHALLENGE_TTL_MS: u64 = 10 * 60 * 1000;
 pub struct AuthContext {
     state_dir: Arc<StateDir>,
     limiter: Arc<Mutex<RateLimiter>>,
+    /// このプロセスが family を失効させたことを確立済み WS へ知らせる (決定 5)。
+    revocations: RevocationSignal,
 }
 
 impl AuthContext {
@@ -82,6 +85,7 @@ impl AuthContext {
         Self {
             state_dir: Arc::new(state_dir),
             limiter: Arc::new(Mutex::new(RateLimiter::new(AUTH_RATE_PER_SECOND))),
+            revocations: RevocationSignal::new(),
         }
     }
 
@@ -90,9 +94,13 @@ impl AuthContext {
         &self.state_dir
     }
 
-    /// 置き場の共有 handle (= WS へ持ち込む分)。
-    pub(crate) fn state_dir_handle(&self) -> Arc<StateDir> {
-        self.state_dir.clone()
+    /// middleware を通った身元で、確立する WS 1 本の認証を組む。
+    pub(crate) fn ws_auth(&self, identity: &Identity) -> WsAuth {
+        self.ws_auth_at(identity, hyoui::time::now_unix_ms())
+    }
+
+    pub(crate) fn ws_auth_at(&self, identity: &Identity, now_ms: u64) -> WsAuth {
+        WsAuth::new(self.state_dir.clone(), &self.revocations, identity, now_ms)
     }
 }
 
@@ -140,6 +148,9 @@ pub struct Identity {
     pub sub: String,
     /// どの endpoint の family か。
     pub endpoint: Endpoint,
+    /// 通した access の family の id。WS は接続を開いた family をこれで覚え、
+    /// `auth.extend` をその family の access に限る (決定 5)。
+    pub family_id: String,
     /// access の期限 (unix ms)。`hello.auth_expires_at` に載る。
     pub access_expires_at_ms: u64,
 }
@@ -215,6 +226,7 @@ pub(crate) async fn require_auth(
     request.extensions_mut().insert(Identity {
         sub: family.sub.clone(),
         endpoint: family.endpoint.clone(),
+        family_id: family.id.clone(),
         access_expires_at_ms: family.access.expires_at_ms,
     });
     next.run(request).await
@@ -627,10 +639,17 @@ async fn post_refresh(
     };
     let dir = state.auth.state_dir.clone();
     let endpoint = request.endpoint.clone();
-    match tokio::task::spawn_blocking(move || refresh_blocking(&dir, &endpoint, &presented)).await {
+    let outcome =
+        tokio::task::spawn_blocking(move || refresh_blocking(&dir, &endpoint, &presented)).await;
+    // 再利用検知で畳んだ family の確立済み WS を切る (決定 5)。tombstone は書き終えて
+    // いるので、知らせを受けた接続が file を読み直せば失効が見える。
+    if matches!(outcome, Ok(Err(AuthFailure::Reused))) {
+        state.auth.revocations.notify();
+    }
+    match outcome {
         Ok(Ok(minted)) => minted.into_response(),
         // family を畳んだ時は cookie も落とす (= 次のリロードで即ログイン UI に落ちる)。
-        Ok(Err(AuthFailure::Revoked)) => (
+        Ok(Err(AuthFailure::Revoked | AuthFailure::Reused)) => (
             StatusCode::UNAUTHORIZED,
             [(header::SET_COOKIE, token::clear_cookie(&request.endpoint))],
             axum::Json(crate::contract::ErrorEnvelope::from(ErrorInfo::new(
@@ -672,10 +691,11 @@ fn refresh_blocking(
                 }
                 // 直前 1 世代の猶予内の再送。rotate せず前回の答えを返す (決定 5)。
                 RefreshOutcome::Replay => {}
-                // どの世代かの再提示は family ごと失効させ、その sub の WS を切る。
+                // どの世代かの再提示は family ごと失効させ、その family の WS を切る
+                // (切るのは呼び出し側。tombstone を書き終えてから知らせる)。
                 RefreshOutcome::Reused => {
                     family.tombstoned_at_ms = Some(now_ms);
-                    return Err(AuthFailure::Revoked);
+                    return Err(AuthFailure::Reused);
                 }
                 RefreshOutcome::Unknown => unreachable!("Unknown は上で弾いている"),
             }
@@ -754,6 +774,9 @@ enum AuthFailure {
     Denied(String),
     /// family が失効している。401 + cookie を落とす。
     Revoked,
+    /// refresh の再利用を検知して family を失効させた。応答は `Revoked` と同じで、
+    /// 加えてその family の確立済み WS を切る (決定 5)。
+    Reused,
     /// gateway 内部の失敗 (= state file が読めない)。500。
     Internal(String),
 }
@@ -793,7 +816,7 @@ impl IntoResponse for AuthFailure {
                     "authentication failed",
                 )
             }
-            AuthFailure::Revoked => failure(
+            AuthFailure::Revoked | AuthFailure::Reused => failure(
                 StatusCode::UNAUTHORIZED,
                 code::AUTH_FAILED,
                 "the authenticated session is no longer valid",
@@ -827,46 +850,6 @@ fn header_string(headers: &HeaderMap, name: header::HeaderName) -> Option<String
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_string())
-}
-
-// -----------------------------------------------------------------------------
-// WS の認証 (決定 5)
-// -----------------------------------------------------------------------------
-
-/// 確立済み WS が `auth.extend` で提示した token を検証する土台。
-///
-/// **family を file から読み直す。** これが失効を確立済み接続に反映する唯一の点
-/// である (決定 4 / 決定 5)。
-#[derive(Clone)]
-pub struct WsAuth {
-    dir: Arc<StateDir>,
-    /// hello に載せる access の期限 (unix ms)。
-    pub expires_at_ms: u64,
-}
-
-impl WsAuth {
-    pub(crate) fn new(dir: Arc<StateDir>, expires_at_ms: u64) -> Self {
-        Self { dir, expires_at_ms }
-    }
-
-    /// 提示された access token でこの接続の期限を延ばす。
-    ///
-    /// 返すのは延長後の期限 (ISO 8601)。`None` は「その family は失効した」で、
-    /// 呼び出し側は接続を閉じる。
-    pub fn extend(&self, presented: &str) -> Option<String> {
-        let now_ms = hyoui::time::now_unix_ms();
-        let file: AuthFile = match self.dir.auth().read() {
-            Ok(file) => file,
-            Err(e) => {
-                eprintln!("hyoui-web: auth.json read failed during auth.extend: {e}");
-                return None;
-            }
-        };
-        let family = file.find_live_family_by_access(presented, now_ms)?;
-        Some(hyoui::time::format_unix_ms_iso8601(
-            family.access.expires_at_ms,
-        ))
-    }
 }
 
 #[cfg(test)]

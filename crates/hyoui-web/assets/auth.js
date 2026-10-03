@@ -473,18 +473,6 @@
         box.appendChild(link);
       },
 
-      /** 失効を伝える (= `auth.extend` が `ok:false` を返した時)。 */
-      showRevoked() {
-        const box = panel('この認証セッションは失効しました');
-        message(box, 'ホストで失効させたか、別の端末で使い直された可能性があります。');
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'auth-primary';
-        button.textContent = '再読み込み';
-        button.addEventListener('click', () => location.reload());
-        box.appendChild(button);
-      },
-
       close: clear,
     };
   }

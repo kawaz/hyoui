@@ -42,12 +42,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use futures_util::{SinkExt, StreamExt};
 
-use crate::auth::WsAuth;
+use crate::auth::{AuthLoss, WsAuth};
 use crate::contract::{
-    AttachMode, ClientFrame, ErrorInfo, ServerFrame, WEB_PROTOCOL_VERSION, code,
+    AttachMode, ClientFrame, ErrorInfo, ServerFrame, WEB_PROTOCOL_VERSION, code, ws_close,
 };
 
 /// bridge 終了後、writer が残り frame と Close を送り切るのを待つ上限。
@@ -76,6 +76,8 @@ enum BridgeCmd {
 enum BridgeOutput {
     Bytes(Vec<u8>),
     Control(String),
+    /// 理由付きで閉じる。writer はこれを送ったら後続を捨てて終わる。
+    Close(CloseFrame),
 }
 
 /// 1 回の wake drain 内で受け取った制御操作。browser が送った順序を保存する。
@@ -107,12 +109,28 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf, auth: WsAuth) -> 
     // 未知 `kind` / 不正 JSON の応答 (DR-0035 決定 2) は bridge thread を経由させず、
     // writer queue へ直接積む。bridge は daemon との往復を担っており、browser の
     // 形式違反はそこへ持ち込む理由が無い。
+    //
+    // 接続の認証 (DR-0036 決定 5) もこの task が持つ。`auth.extend` を受けるのも、
+    // 期限切れ / 失効で接続を終わらせるのもここで、終わらせる時は理由付きの close を
+    // writer queue に積んでから読むのをやめる。
     let wake_w_a = wake_w.clone();
-    let auth_for_reader = auth.clone();
+    let auth_expires_at_ms = auth.expires_at_ms();
+    let mut auth = auth;
     let input_tx_a = input_tx;
     let reject_tx = output_tx.clone();
     let reader_task = tokio::spawn(async move {
-        while let Some(msg) = ws_rx.next().await {
+        let mut lost: Option<AuthLoss> = None;
+        loop {
+            let msg = tokio::select! {
+                msg = ws_rx.next() => match msg {
+                    Some(msg) => msg,
+                    None => break,
+                },
+                loss = auth.lost() => {
+                    lost = Some(loss);
+                    break;
+                }
+            };
             let cmd = match msg {
                 Ok(Message::Binary(b)) => BridgeCmd::Bytes(b.to_vec()),
                 Ok(Message::Text(s)) => match serde_json::from_str::<ClientFrame>(s.as_str()) {
@@ -131,27 +149,30 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf, auth: WsAuth) -> 
                     // 認証の期限を延ばす (DR-0036 決定 5)。daemon へは持ち込まない
                     // — 認証は gateway の HTTP 層の話で、daemon 境界は変わらない。
                     //
-                    // **失効が確立済み接続に反映される唯一の点がここである** (決定 4)。
-                    // unit は family を file から読み直し、tombstone を見たら
-                    // `ok:false` を返して接続を閉じる。
+                    // 延ばせるのはこの接続を開いた family の現行 access だけで、
+                    // unit は family を file から読み直す (= CLI の失効もここで効く、
+                    // 決定 4)。拒んだら `ok:false` を返してから接続を閉じる。
                     Ok(ClientFrame::AuthExtend {
                         request_id,
                         access_token,
                     }) => {
-                        let extended = auth_for_reader.extend(&access_token);
-                        let revoked = extended.is_none();
+                        let extended = auth.extend(&access_token);
                         let frame = ServerFrame::AuthExtendResult {
                             request_id,
-                            ok: !revoked,
-                            expires_at: extended,
-                            error: revoked.then(|| {
+                            ok: extended.is_ok(),
+                            expires_at: extended.ok().map(hyoui::time::format_unix_ms_iso8601),
+                            error: extended.is_err().then(|| {
                                 ErrorInfo::new(
                                     code::AUTH_FAILED,
                                     "the authenticated session is no longer valid",
                                 )
                             }),
                         };
-                        if !send_or_stop(&frame, &reject_tx) || revoked {
+                        if !send_or_stop(&frame, &reject_tx) {
+                            break;
+                        }
+                        if let Err(loss) = extended {
+                            lost = Some(loss);
                             break;
                         }
                         continue;
@@ -183,29 +204,43 @@ pub async fn run_bridge(socket: WebSocket, sock_path: PathBuf, auth: WsAuth) -> 
             // wake pipe に 1 byte 書いて bridge thread の poll を起こす。
             let _ = nix::unistd::write(wake_w_a.as_ref(), &[1u8]);
         }
+        if let Some(loss) = lost {
+            // browser が「認証切れ」を再接続ループと区別できるよう、code と理由を
+            // 載せて閉じる (contract `ws_close`)。
+            let _ = reject_tx.send(BridgeOutput::Close(CloseFrame {
+                code: ws_close::AUTH_ENDED,
+                reason: loss.close_reason().into(),
+            }));
+        }
         let _ = input_tx_a.send(BridgeCmd::Shutdown);
         let _ = nix::unistd::write(wake_w_a.as_ref(), &[1u8]);
     });
 
     // Task B: bridge output → WS binary。
     let mut writer_task = tokio::spawn(async move {
+        let mut close = None;
         while let Some(output) = output_rx.recv().await {
             let message = match output {
                 BridgeOutput::Bytes(bytes) => Message::Binary(bytes.into()),
                 BridgeOutput::Control(text) => Message::Text(text.into()),
+                // 理由付きの close より後ろは送らない (= 認証が切れた接続に画面を流さない)。
+                BridgeOutput::Close(frame) => {
+                    close = Some(frame);
+                    break;
+                }
             };
             if ws_tx.send(message).await.is_err() {
                 break;
             }
         }
         // bridge 側が閉じたら WS も明示的に close。
-        let _ = ws_tx.send(Message::Close(None)).await;
+        let _ = ws_tx.send(Message::Close(close)).await;
     });
 
     // Task C: blocking bridge (= ClientConnection を保持するのは単一 thread のみ、
     // reader/writer を跨ぐ split は不要 = pending_frames の順序が保たれる)。
     let sock_owned = sock_path;
-    let auth_expires_at = hyoui::time::format_unix_ms_iso8601(auth.expires_at_ms);
+    let auth_expires_at = hyoui::time::format_unix_ms_iso8601(auth_expires_at_ms);
     let bridge_res = tokio::task::spawn_blocking(move || {
         bridge_loop(&sock_owned, input_rx, wake_r, output_tx, auth_expires_at)
     })

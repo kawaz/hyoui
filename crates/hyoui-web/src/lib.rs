@@ -733,10 +733,8 @@ async fn get_ws_attach(
         // Bearer で通した client (= test / script) は subprotocol を提案しない。
         None => ws,
     };
-    let ws_auth = auth::WsAuth::new(
-        state.auth.state_dir_handle(),
-        identity.0.access_expires_at_ms,
-    );
+    // 接続を開いた family と access の期限をここで覚える (DR-0036 決定 5)。
+    let ws_auth = state.auth.ws_auth(&identity.0);
     ws_attach::on_upgrade(ws, sock, ws_auth)
 }
 
@@ -1106,6 +1104,32 @@ mod tests {
             "Rust ({}) と JS ({js_version}) の WEB_PROTOCOL_VERSION がずれている",
             contract::WEB_PROTOCOL_VERSION
         );
+    }
+
+    /// 認証切れの close code を session.js が同じ値で見ている (DR-0036 決定 5)。
+    ///
+    /// ずれると browser は認証切れを普通の切断と取り違え、同じ access で再接続を
+    /// 繰り返す (= 何度でも弾かれる)。
+    #[test]
+    fn rust_and_js_ws_auth_close_code_agree() {
+        let js = EMBEDDED_ASSETS
+            .get_file("session.js")
+            .expect("assets/session.js が埋め込まれていること")
+            .contents_utf8()
+            .expect("session.js は UTF-8");
+        let marker = "const WS_CLOSE_AUTH_ENDED = ";
+        let start = js
+            .find(marker)
+            .unwrap_or_else(|| panic!("session.js に {marker:?} の宣言が無い"))
+            + marker.len();
+        let rest = &js[start..];
+        let end = rest
+            .find(';')
+            .expect("WS_CLOSE_AUTH_ENDED の宣言が `;` で終わっていない");
+        let js_code: u16 = rest[..end].trim().parse().unwrap_or_else(|e| {
+            panic!("JS 側の close code が整数でない ({e}): {:?}", &rest[..end])
+        });
+        assert_eq!(js_code, contract::ws_close::AUTH_ENDED);
     }
 
     /// DR-0035 決定 3: version を名乗る経路は hello と `/version` の 2 つだけ。

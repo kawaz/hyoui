@@ -1593,6 +1593,14 @@
   let nextWsLeaderId = 1;
   // `auth.extend` の採番 (= 応答を相関させるためだけ。resize / leader と別系列)。
   let nextWsAuthId = 1;
+  // 応答待ちの `auth.extend` が提示した access (requestId → access)。
+  const wsAuthPending = new Map();
+  // 今の接続を通している access (= 開いた時の値か、最後に延長が通った値)。
+  let wsAccess = null;
+  // gateway が「この接続の認証が終わった」(期限切れ / 失効 / 延長拒否) で閉じる時の
+  // close code (contract.rs の `ws_close::AUTH_ENDED`)。これで閉じた接続は同じ access で
+  // 繋ぎ直さず、その値を捨てて取り直す (= 他タブ → refresh → 駄目ならログイン overlay)。
+  const WS_CLOSE_AUTH_ENDED = 4401;
   const WS_LEADER_TIMEOUT_MS = 5000;
 
   // 接続状態バッジ (existing status 領域の右側に別 element を新設)。
@@ -1822,12 +1830,30 @@
     if (!expiresAt) return;
     authExtendStop = AUTH.onAccess((access) => {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const requestId = nextWsAuthId++;
+      wsAuthPending.set(requestId, access);
       ws.send(JSON.stringify({
         kind: 'auth.extend',
-        requestId: nextWsAuthId++,
+        requestId,
         accessToken: access,
       }));
     });
+  }
+
+  // 認証切れで閉じられた接続を繋ぎ直す。閉じた接続の access を捨てて取り直してから
+  // 繋ぐので、同じ値で再接続を繰り返さない。取り直しが refresh まで通らなければ
+  // `acquire` がログイン overlay を出して、サインインが済むまでここで待つ。
+  // 取り直した後の接続は通常の backoff に乗せる (= 時計のずれ等で同じ切れ方が続いても
+  // 連打にならない。繋がれば onopen が間隔を戻す)。
+  async function reconnectAfterAuthEnded(rejected) {
+    setWsStatus('auth ended — renewing…');
+    try {
+      await AUTH.acquire(rejected);
+    } catch (_e) {
+      // 取り直せなかった時も backoff の再接続に任せる (= connectWs が再び acquire する)。
+    }
+    if (wsExplicitClose) return;
+    scheduleWsReconnect();
   }
 
   async function connectWs() {
@@ -1848,6 +1874,8 @@
     }
     try {
       ws = new WebSocket(url, [AUTH.wsProtocol(access)]);
+      wsAccess = access;
+      wsAuthPending.clear();
     } catch (e) {
       setWsStatus('error: ' + e.message);
       scheduleWsReconnect();
@@ -1895,12 +1923,15 @@
             return;
           }
           if (message.kind === 'auth.extend.result') {
-            // `ok:false` はこの family が失効したという意味で、gateway は応答の
-            // 後に接続を閉じる (DR-0036 決定 4 の「失効はいつ効くか」)。
-            if (!message.ok) {
-              wsExplicitClose = true;
-              setWsStatus('auth revoked');
-              AUTH.overlay.showRevoked();
+            const presented = wsAuthPending.get(message.requestId);
+            wsAuthPending.delete(message.requestId);
+            // `ok:false` は「この接続の family の access ではない / family が失効した」で、
+            // gateway は応答の後に認証切れの close code で接続を閉じる。繋ぎ直しは
+            // onclose が受け持つ。
+            if (message.ok) {
+              if (presented) wsAccess = presented;
+            } else {
+              setWsStatus('auth rejected');
             }
             return;
           }
@@ -1959,6 +1990,13 @@
       autoEl.title = '';
       if (wsExplicitClose) return;
       schedule();
+      if (ev.code === WS_CLOSE_AUTH_ENDED) {
+        // 認証切れは backoff の再接続ループに入れない (同じ access では何度でも
+        // 弾かれる)。理由は close reason に載る (期限切れ / 失効 / 延長拒否)。
+        if (window.__hyouiDebug) window.__hyouiDebug('warn', 'WS auth ended: ' + ev.reason);
+        reconnectAfterAuthEnded(wsAccess);
+        return;
+      }
       scheduleWsReconnect();
     };
     ws.onerror = (_e) => {

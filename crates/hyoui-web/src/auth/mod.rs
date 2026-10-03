@@ -16,13 +16,15 @@ mod routes;
 mod store;
 pub mod token;
 mod webauthn;
+mod ws;
 
 pub use record::{
     ACCESS_TTL_MS, Access, AuthFile, CODE_ATTEMPT_LIMIT, CodeOutcome, CredentialRecord,
     FamilyRecord, PendingChallenge, PendingFile, PendingRegistration, REFRESH_REPLAY_GRACE_MS,
     REFRESH_TTL_MS, REGISTRATION_TTL_MS, RefreshOutcome, RetiredRefresh, TokenGeneration,
 };
-pub use routes::{AuthContext, Identity, WS_TOKEN_PROTOCOL_PREFIX, WsAuth};
+pub use routes::{AuthContext, Identity, WS_TOKEN_PROTOCOL_PREFIX};
 pub(crate) use routes::{require_auth, routes, ws_token_protocol};
 pub use store::{StateDir, StateFile, StoreError};
 pub use webauthn::{Rp, WebauthnFailure};
+pub(crate) use ws::{AuthLoss, WsAuth};
