@@ -119,10 +119,21 @@ daemon 境界は逆で、client と daemon の版が独立に動く (古い daem
 | `attach.info` | `{"kind":"attach.info","mode":"rw"\|"ro"\|"rw-no-leader"\|"unknown","leader":bool}` | `hello` の直後、`leader.notify` / `mode.change` 受信時 |
 | `resize.result` | `{"kind":"resize.result","requestId":N,"ok":bool,"error"?:{"code":"...","message":"..."}}` | `resize` への応答 |
 | `leader.result` | `{"kind":"leader.result","requestId":N,"ok":bool,"error"?:{"code":"...","message":"..."}}` | `leader.request` への応答 |
-| `auth.extend.result` | `{"kind":"auth.extend.result","requestId":N,"ok":bool,"auth_expires_at":"<ISO 8601>"?,"error"?:{"code":"...","message":"..."}}` | `auth.extend` への応答 — DR-0036 決定 5 で使う |
+| `auth.extend.result` | `{"kind":"auth.extend.result","requestId":N,"ok":bool,"expires_at":"<ISO 8601>"?,"error"?:{"code":"...","message":"..."}}` | `auth.extend` への応答 — DR-0036 決定 5 で使う。`ok:false` の後に gateway は close code `4401` で閉じる |
 | `error` | `{"kind":"error","requestId":N\|null,"error":{"code":"...","message":"..."}}` | 未知 `kind` / 不正 JSON を受けた時 (決定 2) |
 
 binary frame は双方向とも PTY bytes の 1:1 転写で、契約の世代に依存しない。
+
+#### WS close (gateway → browser)
+
+| code | reason | 閉じる契機 |
+|---|---|---|
+| `4401` | `access expired` / `access revoked` / `access rejected` | 接続の認証が終わった (DR-0036 決定 5): 期限までに `auth.extend` で延ばさなかった、接続を開いた family が失効した、`auth.extend` が別 family / 期限切れ / 不明の access を出した。browser はこれを受けたら同じ access で再接続せず、その値を捨てて取り直す (他タブ → `/auth/refresh` → 駄目ならログイン overlay) |
+| (code なし = browser には `1005`) | — | 上記以外 (子の終了、daemon 切断、encode 失敗) |
+
+code は RFC 6455 §7.4.2 の private use 帯 (4000〜4999) から採る。正本は `contract.rs` の `ws_close`、JS 側は `session.js` の `WS_CLOSE_AUTH_ENDED` で、一致は test で固定する (決定 7)。browser の扱いを分けるのは code だけで、reason の文言は log と開発者向けである。
+
+JS 側に持つのは「自分が分岐に使う値」だけで、kind の文字列リテラルと同じ扱いである (= kind 一覧や code 一覧の写しは持たない)。ただしこの値がずれると、browser は認証切れを普通の切断と取り違えて同じ access で再接続を繰り返し、それがどこにも表に出ない。そのためこの 1 値だけは Rust との一致を test で見る。
 
 **`auth.extend` / `auth.extend.result` / `hello.auth_expires_at` と、WS upgrade の 401 応答は、契約として本 DR の表に先に載せる。** 使うのは DR-0036 だが、契約の正本は 1 箇所 (`contract.rs` と本表) であるべきで、認証を足す時に「どの kind があるか」を別 DR に探しに行かせない。**追加であって削除も意味変更もしないので、DR-0036 で `WEB_PROTOCOL_VERSION` は上げない** (決定 3 の上げる条件)。認証が無効な間は `auth_expires_at` が `null` で、`auth.extend` は `error` (`code: "unsupported"`) を返す。
 
@@ -224,6 +235,7 @@ endpoint の決め方:
 | 固定する性質 | 形 |
 |---|---|
 | Rust と JS の世代番号が一致する | `contract.rs` の定数と `assets/contract.js` の定数を読み比べる test (JS は正規表現で 1 行抽出) |
+| Rust と JS の認証切れ close code が一致する | `contract.rs` の `ws_close::AUTH_ENDED` と `assets/session.js` の `WS_CLOSE_AUTH_ENDED` を読み比べる test (決定 1 の WS close 表) |
 | 各 kind の JSON 表現が動いていない | golden test (決定 1)。表を写す元でもある |
 | `/version` が `protocol` を含む | 既存の `/version` test に 1 assert |
 | 応答ヘッダに version を名乗る経路が無い | `/api/*` と `/version` の応答ヘッダに `protocol` を含む名前のヘッダが無いことを見る test (決定 3 の「持たない」を固定) |

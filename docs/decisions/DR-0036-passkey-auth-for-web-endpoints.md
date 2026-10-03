@@ -1,6 +1,6 @@
 # DR-0036: web endpoint を passkey で守る。gateway は自分の endpoint を知らない
 
-- Status: 🟡 部分実装 (2026-10-03)。**W2-1 〜 W2-6 が入り、登録 → 認証 → refresh → 失効の通しを実ブラウザで観測済み** (Chrome + CDP 仮想 authenticator)。**決定 5 の WS 側が未実装**: 延長を怠った接続を access の期限で切る処理、`auth.extend` が提示 token をその接続の family と照合する処理、refresh 再利用検知時にその sub の WS を切る処理が無い (`docs/findings/2026-10-03-web-api-protocol-inventory.md` §7)。ほかに残るのは **kawaz が本番 3 endpoint に登録する運用手順** (runbook あり) と **Safari / iOS の gate 3 確認**の 2 点。W3 (ccmsg-webui への `allow` 依頼) / W4 (canddy のコメント修正依頼) は別リポの責務
+- Status: ✅ 実装済 (2026-10-04)。**W2-1 〜 W2-6 が入り、登録 → 認証 → refresh → 失効の通しを実ブラウザで観測済み** (Chrome + CDP 仮想 authenticator)。決定 5 の WS 側 (延長を怠った接続を access の期限で切る、`auth.extend` をその接続の family に限る、refresh 再利用検知でその family の確立済み WS を切る、認証切れを close code `4401` で伝える) も入った。残るのは **kawaz が本番 3 endpoint に登録する運用手順** (runbook あり) と **Safari / iOS の gate 3 確認**の 2 点で、どちらも実装ではなく運用 / 実機確認である。W3 (ccmsg-webui への `allow` 依頼) / W4 (canddy のコメント修正依頼) は別リポの責務
 - Date: 2026-09-16
 - Related: DR-0035 (web 契約と世代 version。決定 6 の endpoint 基点相対 URL が本 DR の前提), DR-0027 (認証は当面なし・tailnet 前提という現行前提を本 DR が置き換える), DR-0034 (`/healthz` `/version` は認証境界を変えない、stable / unstable 2 unit と HA endpoint), DR-0013 (attach 復元。`ro` 相当の mode の出どころ), DR-0022 (`POST /input` の auto-lock と `HYOUI_LOCK_TOKEN`。lock token は HTTP 認証ではない), DR-0008 §7 (daemon 境界の認証は同 UID + socket perm。本 DR は触らない)
 - Origin: `docs/research/2026-09-15-web-protocol-and-passkey-grand-design.md` (§4 / §5 / §6)、事実は `docs/findings/2026-09-15-web-contract-and-ccmsg-passkey-inventory.md`
@@ -181,9 +181,11 @@ credential は mtime で cache してよいが、**family の検証は cache を
 
 失効は tombstone で表す (削除ではなく)。`passkey remove <sub>` はその sub の credential 全部と family 全部を、`session remove <id>` は family 1 本を tombstone にする。
 
-**CLI は gateway に通知しない** (決定 2 と同じく、CLI が書いて gateway が読む)。したがって失効が確立済みの WS に効く時点は、**その接続の refresh 延長 (`auth.extend`) で unit が family を読み直し、tombstone を見て切る**時である。
+**CLI は gateway に通知しない** (決定 2 と同じく、CLI が書いて gateway が読む)。したがって CLI の失効が確立済みの WS に効く時点は、**その接続の refresh 延長 (`auth.extend`) で unit が family を読み直し、tombstone を見て切る**時か、**延長されないまま access の期限が来て切る**時のどちらか早い方である。
 
-**最長の猶予は access token の TTL (4 時間) になる。** 延長は残り寿命の 90% 時点で走るので実際にはそれより早いが、上限としてはこれが正しい値である。「今すぐ全部切る」が要る場面は `hyoui web daemon restart` が答える (WS は unit の再起動で必ず切れる)。
+**最長の猶予は access token の TTL (4 時間) になる。** WS は接続ごとに access の期限を持ち、延長されなければ期限で必ず切れる (決定 5) ので、`auth.extend` を送らない client の接続にもこの上限が効く。延長は残り寿命の 90% 時点で走るので実際にはそれより早いが、上限としてはこれが正しい値である。「今すぐ全部切る」が要る場面は `hyoui web daemon restart` が答える (WS は unit の再起動で必ず切れる)。
+
+**refresh の再利用検知 (決定 5) は gateway 自身が失効を書くので、同じプロセス内の確立済み接続にはその場で知らせて切る。** もう片方の unit の接続には届かず、そちらは CLI の失効と同じく延長か期限で切れる (= unit 間の通知経路は足さない)。
 
 **猶予を無くすために gateway へ通知経路を足さない。** 足すと決定 2 で消した「CLI → unit の管理経路」が戻り、CLI が gateway の生存に依存する。失効の目的は「盗まれた credential で以後入れないこと」で、それは次の認証と次の refresh で満たされる。確立済みの 1 接続が最長 4 時間生き延びることを許容できない要件は今は無く、必要になったら `restart` で足りる。
 
@@ -206,13 +208,17 @@ token は署名せず、**token family の record を lookup して検証する*
 
 **`Path` は認可境界ではない。** 同一 origin の JS は任意の path に fetch でき、cookie の `Path` は「ブラウザが自発的に付けて送る範囲」しか決めない。したがって `https://example.jp/` の endpoint と `https://example.jp/hyoui/` の endpoint を**別の信頼境界として扱うことはできない** — 前者のページで走るスクリプトは後者の `/auth/refresh` を叩けるし、その時 cookie も送られる。この分離は帯域と露出面の絞り込みに留まる。同一 host に信頼の異なるものを並べるなら、分けるべきは path ではなく host (eTLD+1) である。
 
-**rotate と再利用検知**: refresh は使うたび rotate する。family は退役した値のダイジェストを本来の exp まで保持し、**どの世代の値でも再提示を見たら family ごと失効**させ、その sub の WS を切る。直前 1 世代だけは 60 秒の再送猶予として前回の答えを返す (rotate しない)。
+**rotate と再利用検知**: refresh は使うたび rotate する。family は退役した値のダイジェストを本来の exp まで保持し、**どの世代の値でも再提示を見たら family ごと失効**させ、その family で開いた確立済み WS を切る (同じ sub の他の family は失効させない — 漏れたのはその family の refresh であり、他の family の接続を切っても有効な token で繋ぎ直せるので意味が無い)。直前 1 世代だけは 60 秒の再送猶予として前回の答えを返す (rotate しない)。
 
 **access は据え置く**: 残り寿命が TTL の半分を切るまで同じ値を返す。これが複数タブで 1 本の access を共有する土台になる (reference `multi-tab-token-refresh` のサーバ側手順)。
 
 **長命 WS は切らずに延ばす。** `hello` frame の `auth_expires_at` (DR-0035 決定 1 の表に収録済み) に access の期限を載せ、ブラウザは残り寿命の 90% 時点で `/auth/refresh` を打ち、得た access を **同一接続上の `auth.extend` で提示して期限を延ばす** (応答は `auth.extend.result`)。`exp` で必ず切ると画面が周期的に瞬く。切るのは延長を怠った接続だけである。
 
-この `auth.extend` の処理が、失効を確立済み接続に反映する唯一の点でもある (決定 4 の「失効はいつ効くか」)。unit は family を file から読み直し、tombstone を見たら `ok:false` を返して接続を切る。
+**WS は接続ごとに「開いた family」と「現在の access の期限」を持つ。** 期限は `hello.auth_expires_at` の値から始まり、`auth.extend` が通るたびにその family の現行 access の期限へ進む。期限までに延ばさなかった接続を gateway が閉じる。
+
+**`auth.extend` で延ばせるのは、その接続を開いた family の現行 access だけである。** unit は family を file から読み直し、別 family の access・期限切れ・不明の値・family の tombstone のいずれかなら `ok:false` を返して接続を切る (= CLI の失効が延長時に効く点でもある、決定 4 の「失効はいつ効くか」)。別 family の access が来るのは、別タブで新しくサインインした値が tab-share で届いた場合などで、その時は browser が新しい値で繋ぎ直せば足りる。
+
+**認証が終わって閉じる時は close code `4401` を載せる** (DR-0035 決定 1 の WS close 表)。browser はこれを受けたら同じ access で再接続のループに入らず、閉じた接続の access を捨てて取り直し (他タブ → `/auth/refresh`)、それも通らなければログイン overlay に進む。
 
 **tab-share は `multi-tab-token-refresh` を素の JS で書く。** `navigator.locks.request("hyoui.auth.refresh:<endpoint>:<sub>")` の中でだけ refresh し、得た access を `BroadcastChannel("hyoui.auth:<endpoint>:<sub>")` でメモリからメモリへ配る。ロックを取った側は先に `{kind:"ask"}` を投げて 50ms 待ち、誰かが期限内の access を持っていれば refresh しない。sub が分かる前は endpoint だけの key で待ち、確定後に張り替える。Web Locks が無い環境では各タブが自分で refresh する (収束はサーバ側の据え置きが担う)。reference が固定を要求する 7 性質をそのまま test にする。
 
@@ -360,7 +366,7 @@ reference は「library は要らない」と書くが、その根拠は「attes
 - **ccmsg-webui と canddy に依頼が 2 本出る。** どちらも別リポの責務で、hyoui 側から設定を書き換えない。W3 が済むまで iframe 内は別タブ送りになる
 - **CSP を保留した帰結として、任意のサイトが hyoui を iframe に埋め込み `allow="publickey-credentials-get"` を付けて passkey のプロンプトを出せる。** 認証が通るのは `clientDataJSON.origin` が record の endpoint と一致する場合だけなので、そのサイトが session の内容や token を得ることはない (取れるのは「利用者が生体認証を求められた」という体験だけ) が、埋め込み元を絞る手段は今の設計には無い。clickjacking の面は `X-Frame-Options` / `frame-ancestors` を付けない現行 (findings Part 1-C) と同等で、認証を足すことで悪化はしない。絞る必要が出た時に別 DR で `frame_ancestors` を決める (決定 6)
 - **cookie 名を endpoint だけのハッシュにしたので、同一 endpoint に 2 つの `sub` を同時にログインさせられない** (決定 5)。利用者 1 人の前提が変わったら名前に `sub` を戻す
-- **失効が確立済み WS に効くまで最長 4 時間かかる** (決定 4)。即時に切る手段は `hyoui web daemon restart` である
+- **CLI の失効が確立済み WS に効くまで最長 4 時間かかる** (決定 4)。上限は WS が access の期限で必ず切れることで成り立つ。即時に切る手段は `hyoui web daemon restart` である。refresh の再利用検知は、検知した unit の接続をその場で切る
 - **test が `XDG_STATE_HOME` の隔離に依存する。** 隔離を外した変更は「本番 state を触る test」を作る。無認証 mode を持たない判断の代償で、決定 9 に明記した
 - **`rw` / `ro` の claim が record に定義されるが、当面読まれない。** 使われない field が残るのは、後から足すと既存 record の欠落を扱う分岐が要るためである (決定 7)
 - **平文 http の endpoint は成立しない。** `Secure` cookie が保存されず、リロードごとに passkey を求められる。https を前段が終端することが前提条件になる (未検証の項目として残る)
