@@ -18,6 +18,44 @@
 
 ## 裁定待ち
 
+### 👺WR-Q1: web の状態の置き場が session socket の木と衝突する
+
+`hyoui/web/` に置くと、macOS では session socket の base (`~/.local/state/hyoui/`、直下のサブ dir = namespace) と同居し、`web/supervisor.sock` が namespace `web` の session として discovery に拾われる ([issue](issue/2026-10-04-web-unit-registry-holds-settings.md)、DR-0018)。統括推しは d (同居そのものをやめる。予約語を作らず、機能を足す時も同じ形。ccmsg の hyoui 連携も同時に直す)。
+
+- [ ] a: 監督者 socket を `web/run/` に下げ、namespace 名 `web` を予約語にする
+- [ ] b: socket だけ 1 段下げる (予約語なし)
+- [ ] c: `hyoui-web/` のまま
+- [ ] d: session socket を `hyoui/sessions/<ns>/` に移し、`hyoui/` 直下は機能別サブ dir だけ
+
+### 👺WR-Q2: 合成画面から出力する時、セル以外の端末状態をどう届けるか
+
+[DR-0040](decisions/DR-0040-daemon-own-cell-model-and-layer-composition.md) 決定 5 で素通しをやめると、DECSET (マウス / bracketed paste / kitty keyboard / application cursor) と BEL / OSC 52 / title が client に届かなくなる。[DR-0039](decisions/DR-0039-webui-terminal-app-rework.md) のマウス制御は xterm.js に DECSET が届く前提。統括推しは a (tmux と同じ。外から見えるのは今と同じ正しい TTY 出力のまま)。
+
+- [ ] a: crate がモードを追跡して出力に再発行し、BEL / OSC 52 / title はイベントとして転送
+- [ ] b: 別案 (自由記述)
+
+### 👺WR-Q3: web から作る session をログイン shell + 最小 env で起動する手段
+
+[DR-0039](decisions/DR-0039-webui-terminal-app-rework.md) 決定 1 は「既存の `hyoui run --detached` を呼ぶだけ、新 CLI 不要」と「argv[0] を `-zsh` 形式、env は最小から」の両方を持つが、`hyoui run` には argv0 指定も env を空にする option も無い (`hyoui run --help` で確認)。統括推しは a (`hyoui run` に option を足すのは CLI の拡張であって新しい起動経路ではない)。
+
+- [ ] a: `hyoui run` に `--login` (argv0 を `-<shell>` に、env を最小に) 相当の option を足す
+- [ ] b: gateway が自前で組み立てて daemon を起動する (`hyoui run` を経由しない)
+
+### 👺WR-Q4: タブグループ / タブ / pane の構造の保存先と範囲
+
+[DR-0039](decisions/DR-0039-webui-terminal-app-rework.md) 決定 5 は「構造の正本は gateway 1 か所」までで、stable / unstable の 2 unit で共有するか、gateway の再起動をまたいで残すかが未定。統括推しは a (再起動で消えると「家の Mac のタブ構成を出先で開く」が成り立たない。HA の 2 unit で構造が違うと切り替わった時に別物に見える)。
+
+- [ ] a: file に保存し、2 unit で同じ file を共有する
+- [ ] b: unit ごとに file
+- [ ] c: メモリだけ (再起動で消える)
+
+### 👺WR-Q5: DR-0005 の「範囲外」(window / pane UI、session グループ) との関係
+
+DR-0005 は window / pane UI と session グループを範囲外にしているが、[DR-0039](decisions/DR-0039-webui-terminal-app-rework.md) はタブグループ / タブ / pane を gateway と browser に持たせる。統括推しは a (DR-0005 が避けたのは daemon / TUI 側を multiplexer にすることで、web の表示層が並べ方を持つのは別物。1 session = 1 daemon と TUI へのキー割り当て無しは保たれる)。
+
+- [ ] a: DR-0005 の範囲外は daemon / TUI の話と明記し直し、web の表示層は対象外と注記する
+- [ ] b: DR-0005 を改訂して範囲を広げる
+
 ### 👺NB-Q1: DR-0037 (daemon イベントループ非同期化) の runtime
 
 [DR-0037](decisions/DR-0037-daemon-nonblocking-event-loop.md) 「runtime の選択肢」節。統括推しは a (DR-0025 の単一 thread 同期 loop をそのまま nonblocking 化するだけで不変条件を満たせ、依存を増やさない。fd は最大 70 本程度で poll(2) の O(n) は問題にならない)。
