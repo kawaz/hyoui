@@ -9,7 +9,7 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered: 2026-10-04T12:00:00+09:00
+resolved_entered: 2026-10-04T10:57:07+09:00
 discard_reason:
 pending_reason:
 close_reason: RowCellSnap に fg / bg / dim を持たせ rows_to_ansi が色 SGR を出すようにした
