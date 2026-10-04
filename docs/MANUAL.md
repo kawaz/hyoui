@@ -389,9 +389,34 @@ defaults are appended as TOML comments (= they are not config keys).
 ### 11. Operate from a browser (`web`)
 
 ```sh
-hyoui web --listen=127.0.0.1:43690
+hyoui web daemon run
 # Open http://127.0.0.1:43690/ in a browser.
 ```
+
+`hyoui web daemon run` is the one way to start a gateway in the foreground. Without a name it reads `${XDG_CONFIG_HOME:-~/.config}/hyoui/web/config.toml` (and binds `127.0.0.1:43690` when that file does not exist). `hyoui web` itself only groups the `daemon` / `service` / `passkey` / `session` commands.
+
+To keep gateways running, give each instance (unit) its own config file and register it. A unit is one config file; the registry only records which file each unit reads:
+
+```toml
+# ~/.config/hyoui/web/base.toml — shared by every unit
+[web]
+listen = "127.0.0.1:43690"
+
+# ~/.config/hyoui/web/unstable.toml
+extends = "base.toml"            # resolved next to this file
+[web]
+listen = "127.0.0.1:43691"
+binary_path = "~/src/hyoui/target/release/hyoui"
+```
+
+```sh
+hyoui web daemon add ~/.config/hyoui/web/unstable.toml     # unit name: unstable
+hyoui web daemon add --name stable ~/.config/hyoui/web/base.toml
+hyoui web service register   # load the supervisor that holds every unit
+hyoui web daemon status
+```
+
+`extends` layers a file over another: tables merge key by key, other values replace. `[web].binary_path` is copied into the registry when the unit is added (without it, the executable running `daemon add`); `listen` and `assets_dir` are read from the file at every start. State (registry, logs, passkeys) lives in `${XDG_STATE_HOME:-~/.local/state}/hyoui/web/`. `service register` pins the location variables (`HOME`, `XDG_*`) into the OS definition and refuses to change them later without `--force`.
 
 Open the keyboard FAB on a session page and select the Information tab to see the
 attach mode and leader state. If another browser is leader, click “Become leader”

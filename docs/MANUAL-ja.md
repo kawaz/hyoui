@@ -373,9 +373,34 @@ hyoui config show   # 実効設定を TOML で表示 (= 未設定項目も defau
 ### 11. ブラウザから操作する (`web`)
 
 ```sh
-hyoui web --listen=127.0.0.1:43690
+hyoui web daemon run
 # ブラウザで http://127.0.0.1:43690/ を開く
 ```
+
+gateway を foreground で起動する口は `hyoui web daemon run` 1 本。名前を省くと `${XDG_CONFIG_HOME:-~/.config}/hyoui/web/config.toml` を読む (無ければ `127.0.0.1:43690` で起動する)。`hyoui web` 自体は `daemon` / `service` / `passkey` / `session` を束ねる名前空間でしかない。
+
+常駐させるには、インスタンス (unit) ごとに config ファイルを 1 つ書いて登録する。unit = config ファイル 1 つで、登録簿はどのファイルを読むかだけを覚える:
+
+```toml
+# ~/.config/hyoui/web/base.toml — 全 unit の土台
+[web]
+listen = "127.0.0.1:43690"
+
+# ~/.config/hyoui/web/unstable.toml
+extends = "base.toml"            # このファイルの隣から解く
+[web]
+listen = "127.0.0.1:43691"
+binary_path = "~/src/hyoui/target/release/hyoui"
+```
+
+```sh
+hyoui web daemon add ~/.config/hyoui/web/unstable.toml     # unit 名は unstable
+hyoui web daemon add --name stable ~/.config/hyoui/web/base.toml
+hyoui web service register   # 全 unit を抱える監督者を OS に載せる
+hyoui web daemon status
+```
+
+`extends` は土台のファイルに重ねる: 表は鍵ごとに潜り、それ以外は置き換える。`[web].binary_path` は `daemon add` の時点で登録簿に写る (無ければ `daemon add` を打った実行ファイル)。`listen` / `assets_dir` は起動のたびにファイルから読む。状態 (登録簿・ログ・passkey) は `${XDG_STATE_HOME:-~/.local/state}/hyoui/web/` に置く。`service register` は場所を決める env (`HOME` / `XDG_*`) を OS の定義に固定し、後から違う値で打つと `--force` 無しでは書き換えない。
 
 セッション画面のキーボード FAB を開いて「情報」タブへ切り替えると、attach の mode / leader
 を確認できる。leader が別 browser にある場合は「leader になる」を押すと接続を切らずに
