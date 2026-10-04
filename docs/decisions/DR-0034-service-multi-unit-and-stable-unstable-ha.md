@@ -1,6 +1,6 @@
 # DR-0034: `hyoui web` を multi-unit にし、stable / unstable 2 インスタンスの HA を組む
 
-- Status: Active — P1〜P5 実装・実機移行済 (v0.9.48、2026-09-15)。P6 (canddy の 3 endpoint + HA) は canddy リポの issue `2026-09-15-request-hyoui-three-endpoints-and-ha` で依頼中
+- Status: Active — P1〜P5 実装・実機移行済 (v0.9.48、2026-09-15)。P6 (canddy の 3 endpoint + HA) は canddy リポの issue `2026-09-15-request-hyoui-three-endpoints-and-ha` で依頼中。**部分 Superseded by [DR-0038](./DR-0038-web-unit-is-a-config-file.md)** (2026-10-04): unit の中身と `add` の形 (決定 1 / 2)、`hyoui web` 単体起動 (決定 1 / 11)、置き場 (決定 2 / 4 / 9 の `hyoui-web/` と決定 6 の log)、service の環境 (決定 6 の「最小 `PATH` のみ」)、版の出力の `binary` の名前 (決定 7a)。それ以外は本 DR が有効
 - Date: 2026-09-15
 - Related: DR-0027 (web gateway 同居), DR-0031 (`web service` 単一 unit 登録、本 DR の P5 完了時点で Superseded になる), DR-0006 (CLI 地盤ルール), DR-0024 (config ファイル機構), DR-0014 (介入 self-check / 検証主義), DR-0033 (`leader.request` = cap 差の具体例)
 - Origin: `docs/issue/2026-09-15-service-subcommand-multi-unit-ha.md` (kawaz 裁定 2026-09-15、QUESTIONS ECO-Q2 への回答)

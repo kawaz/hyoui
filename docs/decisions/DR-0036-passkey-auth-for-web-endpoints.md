@@ -145,7 +145,7 @@ hyoui web session remove <id>
 
 ### 4. record と pending は endpoint を key にした file。2 unit が `flock` で共有する
 
-置き場は **`$XDG_STATE_HOME/hyoui-web/auth.json`** (mode 0600、tmp + rename、書き込みは `flock`) と、その隣の **`pending.json`**。
+置き場は **`$XDG_STATE_HOME/hyoui-web/auth.json`** (mode 0600、tmp + rename、書き込みは `flock`) と、その隣の **`pending.json`**。(置き場は [DR-0038](./DR-0038-web-unit-is-a-config-file.md) 決定 4 で `$XDG_STATE_HOME/hyoui/web/` に置き換わった。file の形・lock・書き手の規則は本節のまま)
 
 root を `hyoui-web/` にするのは DR-0034 決定 2 と同じ理由で、`$XDG_STATE_HOME/hyoui/` は session discovery の走査 base だからである。DR-0034 が作った `hyoui-web/` (`units/` / `logs/` / `supervisor.sock`) にこの 2 file を並べる。
 
