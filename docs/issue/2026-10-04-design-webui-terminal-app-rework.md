@@ -122,6 +122,13 @@ Window
   - 入力が拒否されたことの通知 (ro / lock 未保持 等の理由付き。現状は log に出るだけ)
   - 接続を閉じた理由 (close code + reason。認証切れの 4401 は実装済み、子の終了・daemon 切断も区別できるようにする)
 
+### ブラウザ側の描画と daemon 側の仮想スクリーン
+
+- ブラウザ側は xterm.js 6.0.0 を使う (5.3.0 から上げる)。外に出るのは TTY の raw bytes だけなので、daemon 側の画面モデルを替えてもブラウザの経路は変わらない (`docs/research/2026-10-04-web-terminal-renderer-survey.md`、マウスは `docs/research/poc/2026-10-04-xterm-mouse-mode-toggle/`)
+- 自前で作り直す候補は daemon 側の仮想スクリーン (vt100 → 自前のセルモデル)。色・属性・OSC 8 をセル単位で持つ (screenshot / snapshot の貧弱さ、web 初期表示のモノクロ、`attach-osc8-hyperlink-metadata-loss`)、rect 指定の切り出しと監視 (`screen-region-watch-api`)、オーバーレイ (`screen-overlay-general-mechanism`)、履歴の保持がまとめて同じ方向を向く。DR-0013 を引き継ぐ大きな別案件で、webui 作り直しとは別 track にする
+- オーバーレイは子 PTY に送らない原則。web では DOM の層 (制御 frame で位置と内容を送る) で描き、TTY bytes に混ぜない案。CLI attach は bytes で重ねるしかないので、届け先で方式が分かれる点を DR で決める
+- 未確認: web 初期表示のモノクロの原因が「vt100 が色を持たない」か「web が色を保つ形式 (`state_formatted()` 由来の ANSI) を使っていない」か。後者なら短期で直せる
+
 ### 旧 API の扱い
 
 - web の HTTP / WS 契約は作り直しで一新する。旧 API (`POST /input` 等) は残さない。旧 UI と並行運用する切り替え期間だけ存在し、切り替え完了で消す
