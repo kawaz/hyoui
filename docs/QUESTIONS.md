@@ -18,19 +18,11 @@
 
 ## 裁定待ち
 
-### 👺WR-Q4: タブグループ / タブ / pane の構造の保存先と範囲
-
-[DR-0039](decisions/DR-0039-webui-terminal-app-rework.md) 決定 5 は「構造の正本は gateway 1 か所」までで、stable / unstable の 2 unit で共有するか、gateway の再起動をまたいで残すかが未定。統括推しは a (再起動で消えると「家の Mac のタブ構成を出先で開く」が成り立たない。HA の 2 unit で構造が違うと切り替わった時に別物に見える)。
-
-- [ ] a: file に保存し、2 unit で同じ file を共有する
-- [ ] b: unit ごとに file
-- [ ] c: メモリだけ (再起動で消える)
-
 ### 👺WR-Q5: DR-0005 の「範囲外」(window / pane UI、session グループ) との関係
 
 DR-0005 は window / pane UI と session グループを範囲外にしているが、[DR-0039](decisions/DR-0039-webui-terminal-app-rework.md) はタブグループ / タブ / pane を gateway と browser に持たせる。統括推しは a (DR-0005 が避けたのは daemon / TUI 側を multiplexer にすることで、web の表示層が並べ方を持つのは別物。1 session = 1 daemon と TUI へのキー割り当て無しは保たれる)。
 
-- [ ] a: DR-0005 の範囲外は daemon / TUI の話と明記し直し、web の表示層は対象外と注記する
+- [x] a: DR-0005 の範囲外は daemon / TUI の話と明記し直し、web の表示層は対象外と注記する
 - [ ] b: DR-0005 を改訂して範囲を広げる
 
 ### 👺NB-Q1: DR-0037 (daemon イベントループ非同期化) の runtime
