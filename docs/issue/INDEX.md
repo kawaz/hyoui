@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-10-04 | bug | open | [web-supervisor-blocks-on-control-read](./2026-10-04-web-supervisor-blocks-on-control-read.md) | web の監督者が制御 socket の要求を main loop で 5 秒 timeout 付きで読み、改行を送らない client 1 つで止まる |
 | 2026-10-04 | design | open | [session-id-uuid-and-tags](./2026-10-04-design-session-id-uuid-and-tags.md) | session id を UUID に、namespace を廃止して tag に、socket を `hyoui/sessions/` にフラットに置く (DR-0018 を置き換える)。WR-Q1 の解消を含む。議論中 |
 | 2026-10-04 | design | open | [web-unit-registry-holds-settings](./2026-10-04-web-unit-registry-holds-settings.md) | web の unit 登録簿が listen 等の設定値を持っている (DR-0034 が daemon / service パターンから逸脱)。unit = config ファイル 1 つに直し、登録簿は config 参照 + binary + enabled だけにする |
 | 2026-10-04 | design | open | [daemon-own-cell-model](./2026-10-04-design-daemon-own-cell-model.md) | daemon の仮想スクリーンを vt100 から自前のセルモデルにする (層の合成でオーバーレイ、attach 出力は常に合成画面から作る tmux 型)。議論中、web UI 作り直しとは別 track |
