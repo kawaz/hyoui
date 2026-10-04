@@ -250,6 +250,34 @@ mod tests {
         c
     }
 
+    // DR-0039 決定 1: `--login` の子 env は最小 env から始まるので、builtin の kill
+    // pattern (claude 向け) を最大限に掛けても何も消えない (= scrub の対象が無い)。
+    #[test]
+    fn minimal_login_env_has_nothing_for_scrub_to_remove() {
+        use crate::sys::login::{LoginCaller, LoginUser, minimal_env};
+        let user = LoginUser {
+            name: "u".into(),
+            home: "/h".into(),
+            shell: "/bin/zsh".into(),
+        };
+        let caller = LoginCaller {
+            lang: Some("C".into()),
+            term: Some("xterm".into()),
+            path_for_lookup: None,
+        };
+        let env = minimal_env(&user, "/usr/bin:/bin", &caller);
+        let patterns: Vec<String> = builtin_kill_defaults("claude")
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for (name, _) in &env {
+            assert!(
+                !patterns.iter().any(|p| glob_match(p, name)),
+                "{name} が scrub pattern に当たる"
+            );
+        }
+    }
+
     #[test]
     fn glob_match_literal() {
         assert!(glob_match("CLAUDECODE", "CLAUDECODE"));

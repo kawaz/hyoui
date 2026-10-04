@@ -685,6 +685,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
             cfg.timeout_ms,
             cfg.idle_timeout_ms,
             scrub_env_plan,
+            cfg.login,
             cfg.command,
         );
     }
@@ -709,6 +710,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
         cfg.timeout_ms,
         cfg.idle_timeout_ms,
         scrub_env_plan,
+        cfg.login,
         cfg.command,
     ) {
         Ok(pair) => pair,

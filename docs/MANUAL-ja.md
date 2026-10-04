@@ -312,6 +312,25 @@ config パースエラー (= 不正 TOML / 型不一致) のときは hyoui の�
 (= 意図しない設定での起動は親 Internal Context 漏洩リスクがあるため)。一時的に
 迂回したい場合は `--no-scrub-env` を使う。
 
+**`--login` の session には scrub の対象が無い** (= 子の env は呼び出し元から引き継がず最小から始まるため)。
+
+#### ログイン shell として起動する (`--login`)
+
+通常のターミナルアプリと同じログイン shell として起動する
+([DR-0039](./decisions/DR-0039-webui-terminal-app-rework.md) 決定 1)。
+
+```sh
+hyoui run --login --detached                 # passwd の shell を login shell で
+hyoui run --login --detached -- zsh -f       # コマンド明示 (rc を読ませない例)
+```
+
+- shell は passwd (`getpwuid`) から引く。呼び出し元の `$SHELL` は見ない
+- argv[0] は `-<shell の basename>` (例: `-zsh`)。rc は shell が読む
+- 子の env は呼び出し元から引き継がず最小から始める: `HOME` / `USER` / `LOGNAME` / `SHELL` / 初期 `PATH` / `LANG` (呼び出し元に在れば) / `TERM` (呼び出し元に在れば)。初期 `PATH` は macOS では `/etc/paths` と `/etc/paths.d/*` から、それ以外は `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`
+- `HYOUI_SESSION_ID` / `HYOUI_NAMESPACE` は最小化しても子に残る
+- コマンドを明示した時は、そのコマンドを argv[0] の `-` 付けなしでそのまま起動し、env だけ最小にする
+- 最小化するのは子の env だけ。hyoui 自身がどの面の root (`XDG_*` / `HYOUI_NAMESPACE`) を使うかは呼び出し元の env のまま決まる
+
 ### 11. 子が停止した時のふるまいと Ctrl+Z の action
 
 `~/.config/hyoui/config.toml` の `[session]` / `[attach]` で設定する

@@ -36,5 +36,7 @@ mod session;
 mod tail;
 pub mod upgrade;
 
-pub use config::{ChildSuspendPolicy, DaemonConfig, SIZE_MAX, SIZE_MIN, normalize_size};
+pub use config::{
+    ChildLaunch, ChildSuspendPolicy, DaemonConfig, SIZE_MAX, SIZE_MIN, normalize_size,
+};
 pub use session::Session;

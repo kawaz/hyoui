@@ -91,6 +91,19 @@ impl Pty {
     /// 起点 dir で実コマンドを動かす透過性回復、bug fix 2026-06-11)。`None` なら
     /// 呼び出しプロセスの cwd を継承する (= 従来挙動)。
     pub fn spawn(argv: &[&str], cols: u16, rows: u16, cwd: Option<&Path>) -> Result<Spawned> {
+        Self::spawn_with(argv, cols, rows, cwd, None)
+    }
+
+    /// [`Pty::spawn`] の exec 先 / environ 明示版。`exec = Some` なら daemon の environ
+    /// を継承せず、[`raw::ChildExec`] の path / environ で `execve` する (= `--login`、
+    /// argv[0] は exec 先と独立)。
+    pub fn spawn_with(
+        argv: &[&str],
+        cols: u16,
+        rows: u16,
+        cwd: Option<&Path>,
+        exec: Option<&raw::ChildExec>,
+    ) -> Result<Spawned> {
         if argv.is_empty() {
             return Err(Error::Invalid("argv must not be empty"));
         }
@@ -109,7 +122,8 @@ impl Pty {
             }
             None => None,
         };
-        let forked = match raw::openpty_fork_anchor_exec(&argv_c, cols, rows, cwd_c.as_ref()) {
+        let forked = match raw::openpty_fork_anchor_exec(&argv_c, cols, rows, cwd_c.as_ref(), exec)
+        {
             Ok(f) => f,
             Err(Error::Precondition(_)) => {
                 // anchor 前提を満たさない (= TIOCSCTTY 失敗)。production の daemon は
@@ -121,7 +135,7 @@ impl Pty {
                      旧 forkpty 構造で child を起動します (= child が独立 session leader、^Z は効きません)。\
                      production の daemon は setsid 済のためこの経路には入りません (= テスト等の直接呼び出しのみ)。"
                 );
-                raw::forkpty_then_exec_legacy(&argv_c, cols, rows, cwd_c.as_ref())?
+                raw::forkpty_then_exec_legacy(&argv_c, cols, rows, cwd_c.as_ref(), exec)?
             }
             Err(e) => return Err(e),
         };

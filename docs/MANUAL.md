@@ -323,6 +323,25 @@ If the config has a parse error (= invalid TOML / type mismatch) hyoui refuses
 to start (= booting with an unintended config risks leaking the parent's
 Internal Context). Use `--no-scrub-env` if you need to bypass it temporarily.
 
+**`--login` sessions have nothing for scrub to remove** (= the child env starts from a minimal set instead of inheriting the caller's).
+
+#### Starting as a login shell (`--login`)
+
+Starts the child like an ordinary terminal app does
+([DR-0039](./decisions/DR-0039-webui-terminal-app-rework.md) decision 1).
+
+```sh
+hyoui run --login --detached                 # the passwd shell, as a login shell
+hyoui run --login --detached -- zsh -f       # explicit command (e.g. skip rc files)
+```
+
+- The shell comes from passwd (`getpwuid`); the caller's `$SHELL` is ignored
+- argv[0] is `-<basename of the shell>` (e.g. `-zsh`); the shell reads its own rc files
+- The child env starts minimal instead of inheriting the caller's: `HOME` / `USER` / `LOGNAME` / `SHELL` / an initial `PATH` / `LANG` (if the caller has it) / `TERM` (if the caller has it). The initial `PATH` is built from `/etc/paths` and `/etc/paths.d/*` on macOS, and is `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` elsewhere
+- `HYOUI_SESSION_ID` / `HYOUI_NAMESPACE` stay in the child even though the env is minimal
+- With an explicit command, that command runs as-is (no `-` prefix on argv[0]) and only the env is minimal
+- Only the child's env is minimized. Which surface root hyoui itself uses (`XDG_*` / `HYOUI_NAMESPACE`) is still decided by the caller's env
+
 ### 11. What happens when the child stops, and what Ctrl+Z does
 
 Configured under `[session]` / `[attach]` in `~/.config/hyoui/config.toml`

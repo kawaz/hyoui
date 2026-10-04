@@ -71,6 +71,41 @@ pub fn ioctl_set_winsize(fd: BorrowedFd<'_>, cols: u16, rows: u16) -> Result<()>
 // openpty + manual fork + execvp (DR-0017 session anchor)
 // ---------------------------------------------------------------------------
 
+/// 子の exec 先と environ を明示する (= `--login` 経路、DR-0039 決定 1)。
+///
+/// `None` を渡す従来経路は `execvp(argv[0], argv)` で daemon の environ を継承する。
+/// `Some` の場合は `execve(path, argv, envp)` で **この environ だけ** を子に渡す
+/// (= argv[0] は `path` と独立に決められる、login shell の `-zsh` 形式のため)。
+/// C 文字列配列は fork 前に確保済みで、child path は alloc しない。
+#[derive(Debug, Clone)]
+pub struct ChildExec {
+    path: CString,
+    envp: Vec<CString>,
+}
+
+impl ChildExec {
+    /// `path` (= exec する実体) と `env` (= `KEY=VALUE` に直して渡す) から作る。
+    /// NUL を含む値は reject。
+    pub fn new(path: &str, env: &[(String, String)]) -> Result<Self> {
+        let path = CString::new(path).map_err(|_| Error::Invalid("exec path contained NUL"))?;
+        let envp = env
+            .iter()
+            .map(|(k, v)| {
+                CString::new(format!("{k}={v}"))
+                    .map_err(|_| Error::Invalid("child env contained NUL"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { path, envp })
+    }
+
+    /// null 終端の `envp` ポインタ配列 (= 借用元の `self` が生存する間のみ有効)。
+    fn envp_ptrs(&self) -> Vec<*const libc::c_char> {
+        let mut v: Vec<*const libc::c_char> = self.envp.iter().map(|c| c.as_ptr()).collect();
+        v.push(std::ptr::null());
+        v
+    }
+}
+
 /// Result of [`openpty_fork_anchor_exec`] in the parent process.
 #[derive(Debug)]
 pub struct ForkedChild {
@@ -129,6 +164,7 @@ pub fn openpty_fork_anchor_exec(
     cols: u16,
     rows: u16,
     cwd: Option<&CString>,
+    exec: Option<&ChildExec>,
 ) -> Result<ForkedChild> {
     if argv.is_empty() {
         return Err(Error::Invalid("argv must not be empty"));
@@ -168,6 +204,14 @@ pub fn openpty_fork_anchor_exec(
     // cwd の C ポインタも fork 前に取り出す (= post-fork alloc 禁止)。`cwd` (= 借用元
     // CString) は本関数 scope 内で生存するため、ptr は fork→exec 区間で有効。
     let cwd_ptr: *const libc::c_char = cwd.map(|c| c.as_ptr()).unwrap_or(std::ptr::null());
+    // `--login` 経路の execve 引数も fork 前に用意する (= `envp_ptrs` は本関数 scope で生存)。
+    let envp_ptrs: Option<Vec<*const libc::c_char>> = exec.map(ChildExec::envp_ptrs);
+    let execve_path: *const libc::c_char =
+        exec.map(|e| e.path.as_ptr()).unwrap_or(std::ptr::null());
+    let envp_ptr: *const *const libc::c_char = envp_ptrs
+        .as_ref()
+        .map(|v| v.as_ptr())
+        .unwrap_or(std::ptr::null());
 
     // 4. fork。
     // SAFETY: `fork(2)`。child path では async-signal-safe な操作のみ
@@ -229,8 +273,13 @@ pub fn openpty_fork_anchor_exec(
                 libc::write(2, MSG.as_ptr() as *const libc::c_void, MSG.len());
                 libc::_exit(127);
             }
-            // execvp は失敗時のみ戻る。
-            libc::execvp(exec_path, argv_ptr);
+            // exec は失敗時のみ戻る。`exec` 指定時は daemon の environ を継承せず
+            // 明示 envp だけを渡す。
+            if !execve_path.is_null() {
+                libc::execve(execve_path, argv_ptr, envp_ptr);
+            } else {
+                libc::execvp(exec_path, argv_ptr);
+            }
             // exec 失敗。Rust destructor を絶対に走らせず即終了。
             libc::_exit(127);
         }
@@ -296,6 +345,7 @@ pub fn forkpty_then_exec_legacy(
     cols: u16,
     rows: u16,
     cwd: Option<&CString>,
+    exec: Option<&ChildExec>,
 ) -> Result<ForkedChild> {
     if argv.is_empty() {
         return Err(Error::Invalid("argv must not be empty"));
@@ -309,6 +359,16 @@ pub fn forkpty_then_exec_legacy(
 
     // cwd の C ポインタを fork 前に取り出す (= post-fork alloc 禁止)。
     let cwd_ptr: *const libc::c_char = cwd.map(|c| c.as_ptr()).unwrap_or(std::ptr::null());
+    // argv / execve 引数も fork 前に用意する (= post-fork alloc 禁止)。
+    let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|c| c.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
+    let envp_ptrs: Option<Vec<*const libc::c_char>> = exec.map(ChildExec::envp_ptrs);
+    let execve_path: *const libc::c_char =
+        exec.map(|e| e.path.as_ptr()).unwrap_or(std::ptr::null());
+    let envp_ptr: *const *const libc::c_char = envp_ptrs
+        .as_ref()
+        .map(|v| v.as_ptr())
+        .unwrap_or(std::ptr::null());
 
     // SAFETY: `nix::pty::forkpty` is documented `unsafe` because in the
     // child path only async-signal-safe code may run. Between fork and exec
@@ -346,8 +406,13 @@ pub fn forkpty_then_exec_legacy(
                     libc::_exit(127);
                 }
             }
-            // execvp returns only on failure.
-            let _ = unistd::execvp(&argv[0], argv);
+            // exec returns only on failure.
+            if !execve_path.is_null() {
+                // SAFETY: 3 つとも fork 前に構築した null 終端の C 配列 / 文字列。
+                unsafe { libc::execve(execve_path, argv_ptrs.as_ptr(), envp_ptr) };
+            } else {
+                let _ = unistd::execvp(&argv[0], argv);
+            }
             // SAFETY: `_exit` is async-signal-safe and never returns; we
             // must NOT run Rust destructors in the child.
             unsafe { libc::_exit(127) };
@@ -499,7 +564,7 @@ mod anchor_tests {
             std::ffi::CString::new("/bin/sleep").unwrap(),
             std::ffi::CString::new("60").unwrap(),
         ];
-        let forked = match openpty_fork_anchor_exec(&argv, 80, 24, None) {
+        let forked = match openpty_fork_anchor_exec(&argv, 80, 24, None, None) {
             Ok(f) => f,
             // SAFETY: _exit は async-signal-safe。
             Err(_) => unsafe { libc::_exit(code::SPAWN_FAILED) },

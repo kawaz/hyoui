@@ -35,6 +35,7 @@ pub fn run_detached_parent(
     timeout_ms: Option<u64>,
     idle_timeout_ms: Option<u64>,
     scrub_env: Option<hyoui::sys::env_scrub::ScrubPlan>,
+    login: bool,
     cmd: Vec<String>,
 ) -> ExitCode {
     match spawn_detached_daemon_and_wait_ready(
@@ -49,6 +50,7 @@ pub fn run_detached_parent(
         timeout_ms,
         idle_timeout_ms,
         scrub_env,
+        login,
         cmd,
     ) {
         Ok((session_id, _sock)) => {
@@ -83,6 +85,7 @@ pub fn spawn_detached_daemon_and_wait_ready(
     timeout_ms: Option<u64>,
     idle_timeout_ms: Option<u64>,
     scrub_env: Option<hyoui::sys::env_scrub::ScrubPlan>,
+    login: bool,
     cmd: Vec<String>,
 ) -> Result<(String, PathBuf), ExitCode> {
     let session_id = session_id_override.unwrap_or_else(socket_path::auto_session_id);
@@ -145,6 +148,7 @@ pub fn spawn_detached_daemon_and_wait_ready(
         idle_timeout_ms,
         // DR-0023: 親で解決した env scrub patterns を daemon child に渡す。
         scrub_env,
+        login,
     };
     let init_json = match serde_json::to_string(&init) {
         Ok(s) => s,
@@ -158,6 +162,10 @@ pub fn spawn_detached_daemon_and_wait_ready(
     child.env("HYOUI_DAEMONIZE_INIT", &init_json);
     child.arg("run");
     child.arg("--detached");
+    if login {
+        // ps から login 起動と分かるように見せる (= 解釈は init JSON の `login`)。
+        child.arg("--login");
+    }
     child.arg("--");
     for c in cmd {
         child.arg(c);
@@ -357,6 +365,12 @@ struct DaemonizeInit {
     ///   (= 空 patterns は target builtin なし & user 設定なしの no-op を表現)
     #[serde(rename = "scrub_env", skip_serializing_if = "Option::is_none", default)]
     scrub_env: Option<hyoui::sys::env_scrub::ScrubPlan>,
+
+    /// DR-0039 決定 1: `hyoui run --login`。daemon child が passwd から shell を引き、
+    /// 子 PTY を最小 env + login argv[0] で起動する。旧 init JSON 互換のため `default`
+    /// (= false) で skip。
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    login: bool,
 }
 
 /// `DaemonizeInit.namespace` の serde default (= 旧 init JSON 互換)。
@@ -492,7 +506,41 @@ pub fn run_daemon_child() -> ExitCode {
     // chdir / (= cwd を free 化、umount 妨げない慣習)
     let _ = nix::unistd::chdir("/");
 
+    // DR-0039 決定 1: `--login` は子の argv / exec 先 / environ を最小 env から組み直す。
+    // daemon 自身の environ (= 面の root を決める XDG_* / HYOUI_NAMESPACE 等) は触らない。
+    // 子に渡す environ だけを `child_exec` に持たせ、hyoui の常時注入 env (DR-0018 /
+    // DR-0020) は最小化しても残す。HYOUI_LOCK_TOKEN は最小 env に入らない (= 子に漏れない)。
+    let (cmd, child_exec) = if init.login {
+        let user = match hyoui::sys::login::current_user() {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("hyoui: --login: passwd の引き当てに失敗: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        let mut plan = hyoui::sys::login::plan(
+            &user,
+            &hyoui::sys::login::initial_path(),
+            &hyoui::sys::login::LoginCaller::from_env(),
+            &cmd,
+        );
+        plan.env
+            .push(("HYOUI_NAMESPACE".to_string(), init.namespace.clone()));
+        plan.env
+            .push(("HYOUI_SESSION_ID".to_string(), init.session.clone()));
+        (
+            plan.argv,
+            Some(hyoui::daemon::ChildLaunch {
+                path: plan.path,
+                env: plan.env,
+            }),
+        )
+    } else {
+        (cmd, None)
+    };
+
     let mut dcfg = DaemonConfig::new(session_id, socket, cmd);
+    dcfg.child_exec = child_exec;
     dcfg.cwd = Some(invoked_cwd);
     dcfg.cols = cols;
     dcfg.rows = rows;

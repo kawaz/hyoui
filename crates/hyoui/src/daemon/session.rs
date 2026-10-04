@@ -326,8 +326,17 @@ impl Session {
         // DR-0005)。daemon 自身は daemonize 慣習で chdir("/") 済だが、子 (= claude 等)
         // は起動元 dir で動くべき。`config.cwd` が None (= test 経路や cwd 取得失敗) なら
         // chdir せず daemon の cwd を継承 (= 従来挙動、後方互換)。
-        let Spawned { pty, child } =
-            Pty::spawn(&argv, config.cols, config.rows, config.cwd.as_deref())?;
+        let child_exec = match config.child_exec.as_ref() {
+            Some(l) => Some(crate::sys::raw::ChildExec::new(&l.path, &l.env)?),
+            None => None,
+        };
+        let Spawned { pty, child } = Pty::spawn_with(
+            &argv,
+            config.cols,
+            config.rows,
+            config.cwd.as_deref(),
+            child_exec.as_ref(),
+        )?;
         // master FD を nonblock にして、POLLHUP 偽陽性 (macOS) で read_some が
         // block するのを防ぐ。read_some は EAGAIN を返す → serve_loop で continue。
         pty.master_fd().set_nonblocking(true)?;

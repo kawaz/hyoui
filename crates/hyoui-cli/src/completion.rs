@@ -333,7 +333,7 @@ _hyoui() {
                 --stdin-eof=*)
                     COMPREPLY=( $(compgen -W "detach send-eof" -- "${cur#*=}") ); return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --session --detached --timeout --idle-timeout --until --on-child-suspend --stdin-eof --scrollback-rows --no-scrub-env --debug-dump-server --debug-dump-client --size --cols --rows --help -h --" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --namespace --session --detached --timeout --idle-timeout --until --on-child-suspend --stdin-eof --scrollback-rows --login --no-scrub-env --debug-dump-server --debug-dump-client --size --cols --rows --help -h --" -- "$cur") )
             return 0 ;;
         completion)
             COMPREPLY=( $(compgen -W "bash zsh fish --help -h" -- "$cur") )
@@ -993,6 +993,7 @@ _hyoui_run() {
         '--on-child-suspend=[Action when child is stopped]:action:(notify auto-resume)' \
         '--stdin-eof=[stdin EOF action]:action:(detach send-eof)' \
         '--scrollback-rows=[vt100 scrollback ring max rows (default 1000)]:rows:' \
+        '--login[Start as a login shell with a minimal child env (DR-0039)]' \
         '--no-scrub-env[Disable child env scrubbing (DR-0024 escape hatch)]' \
         '--debug-dump-server=[Append child PTY raw bytes to a file]:file:_files' \
         '--debug-dump-client=[Append daemon->client raw bytes to a file]:file:_files' \
@@ -1167,6 +1168,7 @@ complete -c hyoui -n '__hyoui_using_subcommand run' -l stdin-eof         -x -a '
 complete -c hyoui -n '__hyoui_using_subcommand run' -l scrollback-rows   -x                              -d 'vt100 scrollback ring max rows (default 1000)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l session           -x                              -d 'Explicit session id instead of auto-numbering (DR-0015)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l detached                                           -d 'Fork the daemon and exit immediately (DR-0015)'
+complete -c hyoui -n '__hyoui_using_subcommand run' -l login                                              -d 'Start as a login shell with a minimal child env (DR-0039)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l no-scrub-env                                       -d 'Disable child env scrubbing (DR-0024 escape hatch)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l debug-dump-server -r -F                          -d 'Append child PTY raw bytes to a file'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l debug-dump-client -r -F                          -d 'Append daemon->client raw bytes to a file'
@@ -1741,6 +1743,7 @@ mod tests {
                     "socket",
                     "session",
                     "detached",
+                    "login",
                     "no-scrub-env",
                     "debug-dump-server",
                     "debug-dump-client",

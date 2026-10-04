@@ -171,6 +171,12 @@ pub struct DaemonConfig {
     /// cwd を inherit している瞬間の値)。test 経路や cwd 取得失敗時は `None`。
     pub cwd: Option<PathBuf>,
 
+    /// 子の exec 先 + environ の明示指定 (= `hyoui run --login`、DR-0039 決定 1)。
+    /// `None` (= 既定) は daemon の environ を継承して `execvp(cmd[0])`。`Some` は
+    /// daemon の environ を子に渡さず、この environ だけで `execve` する
+    /// (= daemon 自身の environ は面の root 解決等にそのまま使われる)。
+    pub child_exec: Option<ChildLaunch>,
+
     /// daemon プロセス起動を識別する一意 ID (DR-0016 §3 jsonl header)。
     ///
     /// pid は OS が再利用するため、**daemon restart を跨いだ真の識別子**として
@@ -256,6 +262,7 @@ impl DaemonConfig {
             // 子 stopped 観測時は notify_child_stopped が cap-aware に leader へ通知する。
             debug_dump_path: None,
             cwd: None,
+            child_exec: None,
             // DR-0016 §3: daemon プロセス起動毎に UUID v4 を生成し、jsonl header の
             // `daemon_boot_id` に乗せる。pid 再利用に強い識別子。
             daemon_boot_id: uuid::Uuid::new_v4().to_string(),
@@ -266,6 +273,15 @@ impl DaemonConfig {
             idle_timeout_ms: None,
         }
     }
+}
+
+/// 子の exec 先 path と environ (= [`DaemonConfig::child_exec`])。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildLaunch {
+    /// `execve` する実体の path (= argv[0] とは独立。login shell は argv[0] が `-zsh`)。
+    pub path: String,
+    /// 子に渡す environ の全部 (= 順序保存の `(KEY, VALUE)`)。
+    pub env: Vec<(String, String)>,
 }
 
 #[cfg(test)]

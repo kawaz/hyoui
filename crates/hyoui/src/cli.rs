@@ -424,7 +424,13 @@ pub struct RunConfig {
     /// config の `scrub_env_enabled = false` と等価。kill/keep の細かい制御は
     /// `~/.config/hyoui/config.toml` で行う (= CLI flag は最小化)。
     pub no_scrub_env: bool,
-    /// argv of the child command.
+    /// `--login` (DR-0039 決定 1): 通常のターミナルアプリと同じログイン shell として
+    /// 起動する。shell は passwd から引き、argv[0] を `-<shell>` にし、子の env は
+    /// 最小 (`HOME` / `USER` / `LOGNAME` / `SHELL` / `PATH` + 在れば `LANG` / `TERM`)
+    /// から始める。`command` が空なら login shell、明示されていればそのコマンドを
+    /// argv そのままで env だけ最小にする。
+    pub login: bool,
+    /// argv of the child command (`--login` のときだけ空を許す)。
     pub command: Vec<String>,
 }
 
@@ -3431,6 +3437,8 @@ fn parse_run(args: &[String]) -> Command {
     let mut debug_dump_client: Option<String> = None;
     // DR-0024: child env scrub flag (kill/keep glob は config で管理)
     let mut no_scrub_env = false;
+    // DR-0039 決定 1: ログイン shell として起動
+    let mut login = false;
 
     let mut i = 0usize;
     let mut in_command = false;
@@ -3612,6 +3620,14 @@ fn parse_run(args: &[String]) -> Command {
                 no_scrub_env = true;
                 consumed_extra = false; // bool flag は次 arg を食わない
             }
+            // DR-0039 決定 1: ログイン shell として起動 (bool flag)。
+            "--login" => {
+                if arg.contains('=') {
+                    return Command::Error("--login does not take a value".into());
+                }
+                login = true;
+                consumed_extra = false;
+            }
             other => return Command::Error(format!("unknown option: {other}")),
         }
 
@@ -3622,8 +3638,10 @@ fn parse_run(args: &[String]) -> Command {
         i += 1;
     }
 
-    if command.is_empty() {
-        return Command::Error("no command given (use `-- cmd [args...]`)".into());
+    if command.is_empty() && !login {
+        return Command::Error(
+            "no command given (use `-- cmd [args...]`, or `--login` for the login shell)".into(),
+        );
     }
 
     // Virtual size: explicit 指定のみ Some、未指定なら None で caller (= run_command)
@@ -3644,6 +3662,7 @@ fn parse_run(args: &[String]) -> Command {
         namespace,
         stdin_eof,
         no_scrub_env,
+        login,
         command,
     })
 }
@@ -5257,7 +5276,8 @@ fn usage_run() -> String {
         "hyoui run — run a command inside a PTY as a transparent proxy\n\
         \n\
         USAGE:\n    \
-            hyoui run [options] -- cmd [args...]\n\
+            hyoui run [options] -- cmd [args...]\n    \
+            hyoui run --login [options] [-- cmd [args...]]\n\
         \n\
         OPTIONS:\n    \
             --size COLSxROWS              Virtual screen size, e.g. 80x24\n    \
@@ -5290,6 +5310,13 @@ fn usage_run() -> String {
                 stdin EOF 時の挙動 (DR-0019)。default: 非 tty stdin なら\n                                  \
                 send-eof (= EOT を子に送り `echo ... | hyoui run -- bc` で\n                                  \
                 子が自然 exit)、tty なら detach。detach は EOF で切断のみ\n    \
+            --login                       通常のターミナルアプリと同じログイン shell として起動\n                                  \
+                (DR-0039)。shell は passwd から引き (呼び出し元の $SHELL は\n                                  \
+                見ない)、argv[0] を -<shell> にし、子の env は最小\n                                  \
+                (HOME USER LOGNAME SHELL PATH + 在れば LANG TERM) から始める。\n                                  \
+                `-- cmd` を省略すると login shell、明示するとその command を\n                                  \
+                argv そのままで env だけ最小にする (rc を読ませない例:\n                                  \
+                `--login -- zsh -f`)。hyoui 自身の env (面の root) は不変\n    \
             --no-scrub-env                親 Internal Context env の子への漏洩防止を\n                                  \
                 無効化 (= debug / 互換目的 escape hatch、DR-0024)。\n                                  \
                 kill/keep glob の細かい制御は\n                                  \
@@ -7519,6 +7546,42 @@ mod tests {
             }
             other => panic!("expected Run, got {other:?}"),
         }
+    }
+
+    // DR-0039 決定 1: --login は command 省略 (= login shell) を許し、明示も受ける。
+    #[test]
+    fn run_login_parses_without_command() {
+        match parse_args(&args(&["run", "--login", "--detached"])) {
+            Command::Run(cfg) => {
+                assert!(cfg.login);
+                assert!(cfg.command.is_empty());
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_login_with_explicit_command_keeps_it() {
+        match parse_args(&args(&["run", "--login", "--", "zsh", "-f"])) {
+            Command::Run(cfg) => {
+                assert!(cfg.login);
+                assert_eq!(cfg.command, vec!["zsh", "-f"]);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_without_login_still_requires_command() {
+        assert!(matches!(parse_args(&args(&["run"])), Command::Error(_)));
+        match parse_args(&args(&["run", "--", "cat"])) {
+            Command::Run(cfg) => assert!(!cfg.login),
+            other => panic!("expected Run, got {other:?}"),
+        }
+        assert!(matches!(
+            parse_args(&args(&["run", "--login=1", "--", "cat"])),
+            Command::Error(_)
+        ));
     }
 
     #[test]
