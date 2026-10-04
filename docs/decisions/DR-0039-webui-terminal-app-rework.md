@@ -69,6 +69,10 @@
 
 **起動するのは、普通のターミナルアプリと同じく利用者のログイン shell である。** shell は passwd から引き、argv[0] を `-zsh` の形 (= ログイン shell の慣習) にする。env は gateway のものを引き継がず、ログイン時と同じ最小の env から始めて、残りは shell の rc に任せる。gateway の env を持ち込まないので、DR-0024 の scrub の論点は生じない。
 
+**ログイン shell としての起動は `hyoui run` の option で行い、引数の組み立ては gateway の責務とする (2026-10-04 裁定)。** `hyoui run` にログイン shell として起動する option (`--login` 相当: argv[0] を `-<shell>` にし、env を最小にする) を足し、gateway が引数を組み立てて呼ぶ。新しい起動経路は作らない (`hyoui run` の拡張であって別の CLI ではない)。
+
+**gateway は自分と同じ binary の `hyoui run` を呼ぶ。** gateway の unit は binary を個別に持てる (DR-0038、stable = brew / unstable = repo build)。新規作成で PATH 上の `hyoui` を呼ぶと、gateway と session の daemon が別の版になりうる。自分自身の binary (`current_exe`、= unit の `binary_path`) を使えば、unit ごとに gateway と daemon の版が揃い、HA の 2 unit で「どちらの版の session か」で混乱しない。
+
 **プロファイルやコマンド限定の仕組みは持たない。** 目的は普通のターミナルアプリと同じ起動で、何を走らせるかは利用者が shell の中で決める。
 
 設定は初期ディレクトリだけで、作り方ごとに「元 pane の cwd を引き継ぐ」か「HOME」を選ぶ。既定は Ghostty / iTerm と同じにする:

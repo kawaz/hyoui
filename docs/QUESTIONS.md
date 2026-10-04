@@ -18,20 +18,6 @@
 
 ## 裁定待ち
 
-### 👺WR-Q2: 合成画面から出力する時、セル以外の端末状態をどう届けるか
-
-[DR-0040](decisions/DR-0040-daemon-own-cell-model-and-layer-composition.md) 決定 5 で素通しをやめると、DECSET (マウス / bracketed paste / kitty keyboard / application cursor) と BEL / OSC 52 / title が client に届かなくなる。[DR-0039](decisions/DR-0039-webui-terminal-app-rework.md) のマウス制御は xterm.js に DECSET が届く前提。統括推しは a (tmux と同じ。外から見えるのは今と同じ正しい TTY 出力のまま)。
-
-- [ ] a: crate がモードを追跡して出力に再発行し、BEL / OSC 52 / title はイベントとして転送
-- [ ] b: 別案 (自由記述)
-
-### 👺WR-Q3: web から作る session をログイン shell + 最小 env で起動する手段
-
-[DR-0039](decisions/DR-0039-webui-terminal-app-rework.md) 決定 1 は「既存の `hyoui run --detached` を呼ぶだけ、新 CLI 不要」と「argv[0] を `-zsh` 形式、env は最小から」の両方を持つが、`hyoui run` には argv0 指定も env を空にする option も無い (`hyoui run --help` で確認)。統括推しは a (`hyoui run` に option を足すのは CLI の拡張であって新しい起動経路ではない)。
-
-- [ ] a: `hyoui run` に `--login` (argv0 を `-<shell>` に、env を最小に) 相当の option を足す
-- [ ] b: gateway が自前で組み立てて daemon を起動する (`hyoui run` を経由しない)
-
 ### 👺WR-Q4: タブグループ / タブ / pane の構造の保存先と範囲
 
 [DR-0039](decisions/DR-0039-webui-terminal-app-rework.md) 決定 5 は「構造の正本は gateway 1 か所」までで、stable / unstable の 2 unit で共有するか、gateway の再起動をまたいで残すかが未定。統括推しは a (再起動で消えると「家の Mac のタブ構成を出先で開く」が成り立たない。HA の 2 unit で構造が違うと切り替わった時に別物に見える)。
