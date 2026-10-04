@@ -13,13 +13,25 @@ use std::process::Command;
 
 use stable_which::{Candidate, ScoringPolicy, resolve_stable_path};
 
-/// 監督者の label。
+/// 監督者の OS 登録名の部品 (= label を組み立てる唯一の場所)。
 ///
-/// 逆引き domain を `com.github.kawaz` から `jp.kawaz` に変えたのは kawaz 製ツールの
-/// label を 1 つの名前空間に揃えるため (決定 6)。副産物として、移行の途中で旧 label
-/// と同時に載っても互いを踏まない。
-pub const MACOS_LABEL: &str = "jp.kawaz.hyoui-web.supervise";
-pub const LINUX_LABEL: &str = "hyoui-web-supervise";
+/// 逆引き domain の接頭辞と、hyoui の下で監督者を指す部分を分けて持つ。名前を
+/// 変える時はここだけを直す (DR-0038 決定 4、接頭辞と区切りの形は裁定待ち)。
+macro_rules! label_domain {
+    () => {
+        "jp.kawaz"
+    };
+}
+macro_rules! label_app {
+    () => {
+        "hyoui-web"
+    };
+}
+
+/// 監督者の launchd label (= `<domain>.<app>.supervise`)。
+pub const MACOS_LABEL: &str = concat!(label_domain!(), ".", label_app!(), ".supervise");
+/// 監督者の systemd user unit 名 (= `<app>-supervise`)。
+pub const LINUX_LABEL: &str = concat!(label_app!(), "-supervise");
 
 /// launchd / systemd user に共通するサービスの意味記述。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1294,6 +1306,13 @@ mod tests {
             parse_launchctl_pid("state = running\npid = 4242\n"),
             Some(4242)
         );
+    }
+
+    /// label の値は組み立てても変わらない (= OS に登録済みの契約名を動かさない)。
+    #[test]
+    fn labels_keep_their_registered_values() {
+        assert_eq!(MACOS_LABEL, "jp.kawaz.hyoui-web.supervise");
+        assert_eq!(LINUX_LABEL, "hyoui-web-supervise");
     }
 
     /// OS 名差は label だけで、各 backend の定義 basename と 1:1 に対応する。

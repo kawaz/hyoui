@@ -120,39 +120,58 @@ fn add_location_warnings(
     }
 }
 
-/// 置き場を移す前の web の状態 dir の名前 (= `$XDG_STATE_HOME/<これ>`、DR-0038 移行節)。
+/// 置き場を移す前の web の dir の名前 (DR-0038 移行節)。
 ///
 /// 新しいバイナリはここを読まない。残っているかを見て警告するためだけに名前を持つ。
-const LEGACY_STATE_DIR_NAME: &str = "hyoui-web";
+const LEGACY_DIR_NAME: &str = "hyoui-web";
 
 /// 古い置き場が残っていれば stderr に警告する (DR-0038 移行節 (3))。
 ///
-/// symlink なら「移行済み、古いバイナリ用の symlink が残っている = 後で消す」、
-/// 実体の dir なら「移行していない = passkey も登録簿も新しい置き場に無い」。
-/// どちらも読まず、二重に拾わない。
+/// `hyoui web ...` の全 verb (= 監督者・子の `daemon run`・`status` 等) の入口で呼ぶ。
+/// 監督者と子の stderr は監督者のログに入るので、常駐側の痕跡にもなる。
 pub fn warn_legacy_state_dir() {
-    let env = hyoui::paths::Env::current();
-    if let Some(warning) = legacy_state_warning(&env) {
+    for warning in legacy_warnings(&hyoui::paths::Env::current()) {
         eprintln!("hyoui: warning: {warning}");
     }
 }
 
-fn legacy_state_warning(env: &hyoui::paths::Env) -> Option<String> {
-    let legacy = env.state_home()?.join(LEGACY_STATE_DIR_NAME);
-    let meta = legacy.symlink_metadata().ok()?;
-    let current = env.web_state_dir();
-    Some(if meta.file_type().is_symlink() {
-        format!(
-            "{} is a symlink left for older hyoui binaries; remove it once none of them run (DR-0038)",
-            legacy.display()
-        )
-    } else {
-        format!(
-            "{} still holds web state that this hyoui does not read; move it to {} and leave a symlink in its place (DR-0038)",
-            legacy.display(),
-            current.display()
-        )
-    })
+/// 古い置き場と、それぞれの移し先。
+fn legacy_places(env: &hyoui::paths::Env) -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
+    let mut places = Vec::new();
+    if let Some(state_home) = env.state_home() {
+        places.push((state_home.join(LEGACY_DIR_NAME), env.web_state_dir()));
+    }
+    // 監督者のログは state の `logs/` に移った (DR-0038 決定 4)。
+    if let Some(home) = env.home() {
+        places.push((
+            home.join("Library/Logs").join(LEGACY_DIR_NAME),
+            env.web_state_dir().join("logs"),
+        ));
+    }
+    places
+}
+
+/// 残っている古い置き場ごとの警告文。symlink なら「後で消す」、実体なら「移していない」。
+/// どちらも中身は読まない (= 新しい置き場と二重に拾わない)。
+fn legacy_warnings(env: &hyoui::paths::Env) -> Vec<String> {
+    legacy_places(env)
+        .into_iter()
+        .filter_map(|(legacy, current)| {
+            let meta = legacy.symlink_metadata().ok()?;
+            Some(if meta.file_type().is_symlink() {
+                format!(
+                    "{} is a symlink left for older hyoui binaries; remove it once none of them run (DR-0038)",
+                    legacy.display()
+                )
+            } else {
+                format!(
+                    "{} is not read by this hyoui; move it to {} and leave a symlink in its place (DR-0038)",
+                    legacy.display(),
+                    current.display()
+                )
+            })
+        })
+        .collect()
 }
 
 /// 監督者に届かない時、OS の定義に固定された場所が今の shell と違えば
@@ -826,28 +845,44 @@ mod tests {
         assert!(resolved.ends_with("web/stable.toml"));
     }
 
-    /// 古い置き場が symlink か実体かで警告を言い分け、無ければ黙る (DR-0038 移行節)。
+    /// 古い置き場 (状態 dir と監督者のログ dir) が symlink か実体かで警告を言い分け、
+    /// 無ければ黙る (DR-0038 移行節)。
     #[test]
-    fn the_legacy_state_dir_is_reported_but_not_read() {
+    fn legacy_places_are_reported_but_not_read() {
         let home = tempfile::tempdir().unwrap();
-        let state = home.path().join("state");
-        let state_os = state.clone().into_os_string();
-        let env = hyoui::paths::Env::from_lookup(|name| {
-            (name == "XDG_STATE_HOME").then(|| state_os.clone())
-        });
+        let home_os = home.path().as_os_str().to_os_string();
+        let env = hyoui::paths::Env::from_lookup(|name| (name == "HOME").then(|| home_os.clone()));
+        let state = home.path().join(".local/state");
         std::fs::create_dir_all(&state).unwrap();
-        assert_eq!(legacy_state_warning(&env), None);
+        assert!(legacy_warnings(&env).is_empty());
 
-        let legacy = state.join(LEGACY_STATE_DIR_NAME);
-        std::fs::create_dir(&legacy).unwrap();
-        let warning = legacy_state_warning(&env).expect("a real dir is reported");
-        assert!(warning.contains("does not read"), "{warning}");
+        // 移していない状態 dir は「読まない」と言う。
+        let legacy_state = state.join(LEGACY_DIR_NAME);
+        std::fs::create_dir(&legacy_state).unwrap();
+        let warnings = legacy_warnings(&env);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("is not read"), "{warnings:?}");
+        assert!(warnings[0].contains("hyoui/web"), "{warnings:?}");
 
-        std::fs::remove_dir(&legacy).unwrap();
-        std::fs::create_dir_all(env.web_state_dir()).unwrap();
-        std::os::unix::fs::symlink(env.web_state_dir(), &legacy).unwrap();
-        let warning = legacy_state_warning(&env).expect("a symlink is reported");
-        assert!(warning.contains("symlink"), "{warning}");
+        // 移して symlink にすれば「後で消す」になる。
+        std::fs::remove_dir(&legacy_state).unwrap();
+        std::fs::create_dir_all(env.web_state_dir().join("logs")).unwrap();
+        std::os::unix::fs::symlink(env.web_state_dir(), &legacy_state).unwrap();
+        let logs = home.path().join("Library/Logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::os::unix::fs::symlink(env.web_state_dir().join("logs"), logs.join(LEGACY_DIR_NAME))
+            .unwrap();
+        let warnings = legacy_warnings(&env);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings.iter().all(|w| w.contains("symlink left")),
+            "{warnings:?}"
+        );
+
+        // 消せば黙る。
+        std::fs::remove_file(&legacy_state).unwrap();
+        std::fs::remove_file(logs.join(LEGACY_DIR_NAME)).unwrap();
+        assert!(legacy_warnings(&env).is_empty());
     }
 
     #[test]
