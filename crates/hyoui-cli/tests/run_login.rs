@@ -34,7 +34,7 @@ fn run_login(runtime: &Path, sid: &str, extra: &[&str]) {
         .env("HYOUI_E2E_DUMMY", "must-not-leak")
         .env("CLAUDE_CODE_SESSION_ID", "must-not-leak")
         .env("LANG", "ja_JP.UTF-8")
-        .env("TERM", "xterm-256color")
+        .env("TERM", "xterm-ghostty")
         .env_remove("HYOUI_SESSION_ID")
         .env_remove("HYOUI_LOCK_TOKEN")
         .stdin(Stdio::null())
@@ -110,7 +110,7 @@ fn explicit_command_gets_minimal_env_and_injected_env() {
     assert!(!env.contains_key("CLAUDE_CODE_SESSION_ID"), "{env:?}");
     // 面の env (XDG_RUNTIME_DIR) も子には渡らない (= hyoui 自身だけが使う)。
     assert!(!env.contains_key("XDG_RUNTIME_DIR"), "{env:?}");
-    // 最小 env + 呼び出し元の LANG / TERM。
+    // 最小 env + 呼び出し元の LANG。TERM は呼び出し元 (xterm-ghostty) を引き継がず固定値。
     for k in ["HOME", "USER", "LOGNAME", "SHELL", "PATH"] {
         assert!(env.contains_key(k), "{k} が無い: {env:?}");
     }

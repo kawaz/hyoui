@@ -426,7 +426,7 @@ pub struct RunConfig {
     pub no_scrub_env: bool,
     /// `--login` (DR-0039 決定 1): 通常のターミナルアプリと同じログイン shell として
     /// 起動する。shell は passwd から引き、argv[0] を `-<shell>` にし、子の env は
-    /// 最小 (`HOME` / `USER` / `LOGNAME` / `SHELL` / `PATH` + 在れば `LANG` / `TERM`)
+    /// 最小 (`HOME` / `USER` / `LOGNAME` / `SHELL` / `PATH` / `TERM=xterm-256color` + 在れば `LANG`)
     /// から始める。`command` が空なら login shell、明示されていればそのコマンドを
     /// argv そのままで env だけ最小にする。
     pub login: bool,

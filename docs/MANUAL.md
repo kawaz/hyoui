@@ -337,7 +337,7 @@ hyoui run --login --detached -- zsh -f       # explicit command (e.g. skip rc fi
 
 - The shell comes from passwd (`getpwuid`); the caller's `$SHELL` is ignored
 - argv[0] is `-<basename of the shell>` (e.g. `-zsh`); the shell reads its own rc files
-- The child env starts minimal instead of inheriting the caller's: `HOME` / `USER` / `LOGNAME` / `SHELL` / an initial `PATH` / `LANG` (if the caller has it) / `TERM` (if the caller has it). The initial `PATH` is built from `/etc/paths` and `/etc/paths.d/*` on macOS, and is `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` elsewhere
+- The child env starts minimal instead of inheriting the caller's: `HOME` / `USER` / `LOGNAME` / `SHELL` / an initial `PATH` / `LANG` (if the caller has it) / `TERM=xterm-256color` (always this value, not the caller's: the session may later be viewed from another terminal such as the web UI, so it uses one every viewer understands). The initial `PATH` is built from `/etc/paths` and `/etc/paths.d/*` on macOS, and is `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` elsewhere
 - `HYOUI_SESSION_ID` / `HYOUI_NAMESPACE` stay in the child even though the env is minimal
 - With an explicit command, that command runs as-is (no `-` prefix on argv[0]) and only the env is minimal
 - Only the child's env is minimized. Which surface root hyoui itself uses (`XDG_*` / `HYOUI_NAMESPACE`) is still decided by the caller's env

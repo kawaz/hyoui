@@ -30,8 +30,6 @@ pub struct LoginUser {
 pub struct LoginCaller {
     /// `LANG` (在れば引き継ぎ、無ければ付けない)。
     pub lang: Option<String>,
-    /// `TERM` (PTY の端末種別。在れば引き継ぐ)。
-    pub term: Option<String>,
     /// 明示コマンドの `PATH` 探索に使う呼び出し元の `PATH` (子には渡さない)。
     pub path_for_lookup: Option<String>,
 }
@@ -42,7 +40,6 @@ impl LoginCaller {
         let get = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         Self {
             lang: get("LANG"),
-            term: get("TERM"),
             path_for_lookup: get("PATH"),
         }
     }
@@ -129,7 +126,15 @@ pub fn join_path_entries(entries: Vec<String>) -> String {
         .join(":")
 }
 
-/// 最小 env (`HOME` / `USER` / `LOGNAME` / `SHELL` / `PATH` + 在れば `LANG` / `TERM`)。
+/// session の子に設定する端末種別。
+///
+/// 呼び出し元の `TERM` は引き継がない。session は起動後に別の端末 (CLI の attach、
+/// web の xterm.js) から見られるので、起動した端末固有の値 (例 `xterm-ghostty`)
+/// を持ち込むと、別の端末から見た時に通じない sequence が出る。どこから見ても通じる
+/// 共通の値に固定する (DR-0039 決定 1)。
+pub const SESSION_TERM: &str = "xterm-256color";
+
+/// 最小 env (`HOME` / `USER` / `LOGNAME` / `SHELL` / `PATH` / `TERM` + 在れば `LANG`)。
 pub fn minimal_env(user: &LoginUser, path: &str, caller: &LoginCaller) -> Vec<(String, String)> {
     let mut env = vec![
         ("HOME".to_string(), user.home.clone()),
@@ -141,9 +146,7 @@ pub fn minimal_env(user: &LoginUser, path: &str, caller: &LoginCaller) -> Vec<(S
     if let Some(l) = &caller.lang {
         env.push(("LANG".to_string(), l.clone()));
     }
-    if let Some(t) = &caller.term {
-        env.push(("TERM".to_string(), t.clone()));
-    }
+    env.push(("TERM".to_string(), SESSION_TERM.to_string()));
     env
 }
 
@@ -240,7 +243,6 @@ mod tests {
     fn env_is_minimal_and_excludes_caller_values() {
         let caller = LoginCaller {
             lang: Some("ja_JP.UTF-8".into()),
-            term: Some("xterm-256color".into()),
             path_for_lookup: Some("/caller/bin".into()),
         };
         let p = plan(&user(), "/usr/bin:/bin", &caller, &[]);
@@ -254,11 +256,11 @@ mod tests {
     }
 
     #[test]
-    fn lang_and_term_omitted_when_caller_has_none() {
+    fn lang_omitted_and_term_fixed_when_caller_has_none() {
         let p = plan(&user(), "/bin", &LoginCaller::default(), &[]);
         assert_eq!(get(&p.env, "LANG"), None);
-        assert_eq!(get(&p.env, "TERM"), None);
-        assert_eq!(p.env.len(), 5);
+        assert_eq!(get(&p.env, "TERM"), Some(SESSION_TERM));
+        assert_eq!(p.env.len(), 6);
     }
 
     #[test]

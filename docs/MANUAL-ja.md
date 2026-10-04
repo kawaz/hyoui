@@ -326,7 +326,7 @@ hyoui run --login --detached -- zsh -f       # コマンド明示 (rc を読ま�
 
 - shell は passwd (`getpwuid`) から引く。呼び出し元の `$SHELL` は見ない
 - argv[0] は `-<shell の basename>` (例: `-zsh`)。rc は shell が読む
-- 子の env は呼び出し元から引き継がず最小から始める: `HOME` / `USER` / `LOGNAME` / `SHELL` / 初期 `PATH` / `LANG` (呼び出し元に在れば) / `TERM` (呼び出し元に在れば)。初期 `PATH` は macOS では `/etc/paths` と `/etc/paths.d/*` から、それ以外は `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`
+- 子の env は呼び出し元から引き継がず最小から始める: `HOME` / `USER` / `LOGNAME` / `SHELL` / 初期 `PATH` / `LANG` (呼び出し元に在れば) / `TERM=xterm-256color` (呼び出し元の値は引き継がず常にこの値。session は後から web など別の端末で見られるので、どこから見ても通じる値にする)。初期 `PATH` は macOS では `/etc/paths` と `/etc/paths.d/*` から、それ以外は `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`
 - `HYOUI_SESSION_ID` / `HYOUI_NAMESPACE` は最小化しても子に残る
 - コマンドを明示した時は、そのコマンドを argv[0] の `-` 付けなしでそのまま起動し、env だけ最小にする
 - 最小化するのは子の env だけ。hyoui 自身がどの面の root (`XDG_*` / `HYOUI_NAMESPACE`) を使うかは呼び出し元の env のまま決まる
