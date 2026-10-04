@@ -39,6 +39,8 @@ reference の `cli-daemon-subcommands` (kawaz 製 CLI 共通の正本) は unit 
 - 共通部分は `extends` で土台を共有し、unit ごとには `[web] listen` 等だけを上書きする (llm-gateway の stable / unstable は listen だけが違う)。土台も `web/` の中に置く (例: `web/base.toml`)。gateway は PTY session の設定 (DR-0024 の `[session]`) を使わないので `~/.config/hyoui/config.toml` を土台にせず、web の設定は web の中で閉じる (推し)。そのために hyoui の config 読み込みに `extends` (llm-gateway DR-0013: 表は鍵ごとに潜り他は置き換え、相対パスは書いたファイルの隣から、循環はその場で止める) を入れる
 - 稼働中の gateway への問い合わせ先は、登録簿の unit から config を引いて listen で組み立てる (llm-gateway DR-0028 決定 6)
 - 状態の置き場も揃える (推し): 現在の `~/.local/state/hyoui-web/` (登録簿、passkey の `auth.json` / `pending.json`、logs、supervisor.sock) を `~/.local/state/hyoui/web/` に。移行手順が要るが v1.0 前なので互換は残さず同じ是正で動かす
+- service の env 固定 (パターンからの逸脱): reference `cli-daemon-subcommands` は「`service register` は場所の導出に効く env (`XDG_STATE_HOME` / `XDG_CONFIG_HOME` / `HOME` 等) を register 時の値で unit に固定し、re-register で値が違えば差分を示して止まる (`--force` で上書き)。client 側にも検知を持つ」とする。現 plist (`jp.kawaz.hyoui-web.supervise`) の `EnvironmentVariables` は `PATH` だけ (`crates/hyoui-cli/src/web_service.rs` 54 付近) で、固定も差分検知も無い。今ずれていないのは kawaz の shell の XDG が既定値と同じだからにすぎない。config と状態の置き場を env から導く今回の是正と同じ中で入れる。固定する変数の一覧は path 導出コードが読む変数を正とし、unit 生成側に別のリストを持たない
+- ログの置き場 (`~/Library/Logs/hyoui-web/`) も状態と同じく `hyoui/web/` に揃える (推し)。launchd の label `jp.kawaz.hyoui-web.supervise` は OS 登録の契約名なので変えない (推し)
 - 既存の stable / unstable 2 unit の移行 (v1.0 前なので互換を残さず置き換えてよい範囲)
 - DR-0034 の該当部分を新しい DR で置き換える
 
