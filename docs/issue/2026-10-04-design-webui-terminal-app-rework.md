@@ -127,7 +127,7 @@ Window
 - ブラウザ側は xterm.js 6.0.0 を使う (5.3.0 から上げる)。外に出るのは TTY の raw bytes だけなので、daemon 側の画面モデルを替えてもブラウザの経路は変わらない (`docs/research/2026-10-04-web-terminal-renderer-survey.md`、マウスは `docs/research/poc/2026-10-04-xterm-mouse-mode-toggle/`)
 - 自前で作り直す候補は daemon 側の仮想スクリーン (vt100 → 自前のセルモデル)。色・属性・OSC 8 をセル単位で持つ (screenshot / snapshot の貧弱さ、web 初期表示のモノクロ、`attach-osc8-hyperlink-metadata-loss`)、rect 指定の切り出しと監視 (`screen-region-watch-api`)、オーバーレイ (`screen-overlay-general-mechanism`)、履歴の保持がまとめて同じ方向を向く。DR-0013 を引き継ぐ大きな別案件で、webui 作り直しとは別 track にする
 - オーバーレイは子 PTY に送らない原則。web では DOM の層 (制御 frame で位置と内容を送る) で描き、TTY bytes に混ぜない案。CLI attach は bytes で重ねるしかないので、届け先で方式が分かれる点を DR で決める
-- 未確認: web 初期表示のモノクロの原因が「vt100 が色を持たない」か「web が色を保つ形式 (`state_formatted()` 由来の ANSI) を使っていない」か。後者なら短期で直せる
+- web 初期表示のモノクロは vt100 ではなく hyoui 側の手抜きが原因で、自前セルモデルを待たずに直せる (issue `2026-10-04-screen-scrollback-ansi-drops-color`)。自前セルモデルが本当に要るのは vt100 で持てない OSC 8・オーバーレイ・rect 単位の切り出しと監視
 
 ### 旧 API の扱い
 
