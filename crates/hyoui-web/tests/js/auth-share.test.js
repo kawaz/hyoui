@@ -41,9 +41,33 @@ function createLockManager() {
 //
 // 名前ごとの hub。**同じ名前の相手にだけ届く** ので、endpoint / sub が違うタブが
 // 調停しないことがこの構造で表れる。
+//
+// `idle()` は「配送中の message が無くなった」時に解決する。受け手が onmessage の中で
+// 返した message (ask への offer) も配送中に数えるので、往復が全部済むまで待つ。
+// 「届くはずのものが届いた後」を実時間の待ちでなくこの順序で表す。
 function createChannelHub() {
   const byName = new Map();
+  let inFlight = 0;
+  let waiters = [];
+  function settle() {
+    if (inFlight !== 0) return;
+    const ready = waiters;
+    waiters = [];
+    for (const resolve of ready) resolve();
+  }
   return {
+    idle() {
+      return new Promise((resolve) => {
+        waiters.push(resolve);
+        settle();
+      });
+    },
+    // auth-share の `schedule` に渡す。問い合わせの打ち切りを、応答が全部届いた
+    // 後に回す (= 「答える相手が居るのに打ち切りが先に来る」を起こさない)。
+    // ms は見ない: 打ち切りの長さではなく、応答との前後関係を固定するためのもの。
+    schedule(callback) {
+      this.idle().then(callback);
+    },
     make(name) {
       const peers = byName.get(name) ?? new Set();
       byName.set(name, peers);
@@ -54,11 +78,14 @@ function createChannelHub() {
         postMessage(data) {
           for (const peer of peers) {
             if (peer === channel || peer.closed) continue;
+            inFlight += 1;
             // 実物と同じく非同期に届く (= lock と message が別 queue で渡る)。
             setTimeout(() => {
               if (!peer.closed && typeof peer.onmessage === 'function') {
                 peer.onmessage({ data });
               }
+              inFlight -= 1;
+              settle();
             }, 0);
           }
         },
@@ -84,7 +111,7 @@ function createTab(options) {
     locks: options.locks ?? null,
     makeChannel: options.hub ? (name) => options.hub.make(name) : null,
     now: options.now ?? (() => Date.now()),
-    askTimeoutMs: options.askTimeoutMs ?? 5,
+    schedule: options.hub ? (callback, ms) => options.hub.schedule(callback, ms) : undefined,
     refresh: async () => {
       state.refreshes += 1;
       return options.serve(state.refreshes);
@@ -129,7 +156,7 @@ test('refresh したタブの結果が、待っていたタブにも届く', asy
 
   await refresher.share.ensure();
   // message は非同期に届く。
-  await new Promise((resolve) => setTimeout(resolve, 5));
+  await hub.idle();
 
   assert.deepEqual(received, ['access-shared'], '配られた値がそのまま届く');
   assert.equal(waiter.share.current().value, 'access-shared');
@@ -151,7 +178,7 @@ test('期限切れの値は配らない (受けた側も提示に使わない)',
   // 既に切れている値を「持っている」と名乗る相手を直に作る。
   const rogue = hub.make(`hyoui.auth:${ENDPOINT}`);
   rogue.postMessage({ kind: 'offer', sub: 'sub-1', accessToken: 'stale', expiresAtMs: clock - 1 });
-  await new Promise((resolve) => setTimeout(resolve, 5));
+  await hub.idle();
 
   assert.equal(receiver.share.current(), null, '期限切れの offer は採らない');
 
@@ -167,7 +194,7 @@ test('期限切れの値は配らない (受けた側も提示に使わない)',
     if (event.data.kind === 'offer') answers.push(event.data.accessToken);
   };
   asker.postMessage({ kind: 'ask' });
-  await new Promise((resolve) => setTimeout(resolve, 5));
+  await hub.idle();
   assert.deepEqual(answers, [], '切れた値は配らない');
 });
 
@@ -273,7 +300,7 @@ test('endpoint が違うタブ、sub が違うタブとは調停しない', asyn
     otherSub.share.ensure(),
     otherEndpoint.share.ensure(),
   ]);
-  await new Promise((resolve) => setTimeout(resolve, 5));
+  await hub.idle();
 
   // 3 者とも自分で取っている (= 待ち合わせていない)。
   assert.equal(mine.state.refreshes, 1);
@@ -410,7 +437,7 @@ test('先回りの延長でも、他のタブが持っている値があれば s
   const holder = createTab({ locks, hub, now, serve, sub: 'sub-1' });
   const other = createTab({ locks, hub, now, serve, sub: 'sub-1' });
   await holder.share.ensure();
-  await new Promise((resolve) => setTimeout(resolve, 5));
+  await hub.idle();
 
   await other.share.refreshAhead();
   assert.equal(other.state.refreshes, 0, '協調の中で取り直すので往復が増えない');

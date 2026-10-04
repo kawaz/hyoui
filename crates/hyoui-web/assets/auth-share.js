@@ -15,7 +15,7 @@
 // ## この file が持たないもの
 //
 // DOM も fetch も `navigator` も直接触らない。**依存は全部引数で受ける** —
-// ブラウザでは実物 (`navigator.locks` / `BroadcastChannel` / `Date.now`) を、test では
+// ブラウザでは実物 (`navigator.locks` / `BroadcastChannel` / `Date.now` / `setTimeout`) を、test では
 // fake を渡す。7 性質 (reference) を test で固定できる形にするためである。
 //
 // ## 永続化しない
@@ -38,6 +38,9 @@
       locks = null,
       makeChannel = null,
       now = () => Date.now(),
+      // 問い合わせの打ち切りを仕掛ける。test は「届く応答が全部届いてから打ち切る」
+      // 順序の fake を渡す (= 実時間の競争にしない)。
+      schedule = (callback, ms) => setTimeout(callback, ms),
       refresh,
       askTimeoutMs = DEFAULT_ASK_TIMEOUT_MS,
     } = options;
@@ -137,7 +140,7 @@
           resolve(access);
         });
         post({ kind: 'ask' });
-        setTimeout(() => {
+        schedule(() => {
           if (settled) return;
           settled = true;
           stop();
