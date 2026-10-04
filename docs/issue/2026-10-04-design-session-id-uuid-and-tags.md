@@ -49,7 +49,7 @@ blocked_by:
 - 面は状態の root を決める環境変数 1 つで決まる (`CLAUDE_CONFIG_DIR` と同じ考え方)。hyoui の一式 (CLI、session の socket、web の監督者・unit・登録簿・auth.json・logs) はその root の中で完結する。tag は分類で、認証境界の分離には使わない
 - 面をまたぐ仕組み (複数の面を横断する option、1 つの監督者で複数の面の unit を抱える等) は持たない。複数の面を扱う時は面ごとに環境変数を指定してそれぞれで実行して回る
 - web の監督者も面ごとに立つ: 面の `.envrc` が効いた状態で `hyoui web service register` すれば、その面の root が plist に固定される (DR-0038 の env 固定)
-- 未決: launchd の label が固定 (`jp.kawaz.hyoui-web.supervise`) なので、2 つ目の面で register すると衝突する。推し: register 時に名前を与え、省略時は既定の label (追加の面だけ名前を足す。launchctl でどの面か読める)。root のパスから導く案もある
+- 未決: 面ごとに監督者を立てると launchd label がぶつかる。label は hyoui の名前空間の下 (`jp.kawaz.hyoui.web.supervise`、DR-0038 で `hyoui-web` から改める) に置き、追加の面は register 時に名前を与えて末尾に足す (`jp.kawaz.hyoui.web.supervise.<name>`) 案が推し。root のパスから導く案もある
 
 ## 未決
 
