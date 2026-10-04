@@ -18,6 +18,20 @@
 
 ## 裁定待ち
 
+### 👺SID-Q1: 面の root を決める環境変数
+
+[DR-0041](decisions/DR-0041-session-id-uuid-and-tags.md) 決定 6 は「面は状態の root を決める環境変数 1 つで決まる」だが、現行は Linux で `XDG_RUNTIME_DIR` が在れば socket はそちら、web の状態は `XDG_STATE_HOME` 側で root が 2 つに分かれる。統括推しは a (`CLAUDE_CONFIG_DIR` と同じく 1 つの値で面が決まる形に揃う)。
+
+- [ ] a: hyoui 専用の変数を 1 つ作る (例 `HYOUI_HOME`、未指定なら XDG から導く)。socket も web の状態もその下
+- [ ] b: `XDG_STATE_HOME` をそのまま使い、Linux で root が分かれるのは受け入れる
+
+### 👺SID-Q2: UUID の表記の揺れ
+
+大文字小文字やハイフンの有無が違うと、同じ UUID でも別のファイル名になり重複判定をすり抜ける。統括推しは a (外から渡した値とファイル名が常に一致する)。
+
+- [ ] a: 小文字・ハイフン付きの標準形だけ受け付け、それ以外は run のエラー
+- [ ] b: 受け取って標準形に正規化する
+
 ### 👺WR-Q5: DR-0005 の「範囲外」(window / pane UI、session グループ) との関係
 
 DR-0005 は window / pane UI と session グループを範囲外にしているが、[DR-0039](decisions/DR-0039-webui-terminal-app-rework.md) はタブグループ / タブ / pane を gateway と browser に持たせる。統括推しは a (DR-0005 が避けたのは daemon / TUI 側を multiplexer にすることで、web の表示層が並べ方を持つのは別物。1 session = 1 daemon と TUI へのキー割り当て無しは保たれる)。

@@ -35,7 +35,7 @@ Status 列は **ラベル + 最終判定日** だけを載せる。実装範囲�
 | [DR-0015](./DR-0015-run-as-fork-plus-attach.md) | ✅ 実装済 (2026-05-28) | `hyoui run` を fork daemon + attach client の合成に再定義し client/server 同居を廃止 |
 | [DR-0016](./DR-0016-tty-io-record.md) | 🟡 部分実装 | `hyoui record` — tty I/O timeline の永続録画 subcommand (= bug 解析の観測道具) |
 | [DR-0017](./DR-0017-session-anchor-and-suspend-policy.md) | ✅ 実装済 (2026-06-11) | session anchor 化 + suspend policy 改訂 (= TUI の Ctrl-Z を本来の意味論で動かす) |
-| [DR-0018](./DR-0018-session-namespace.md) | ✅ 実装済 (2026-06-11) | session namespace — socket dir 分離で `hyoui list` の用途グループ混在を防止 |
+| [DR-0018](./DR-0018-session-namespace.md) | ✅ 実装済 (2026-06-11)。DR-0041 で置き換え予定 | session namespace — socket dir 分離で `hyoui list` の用途グループ混在を防止 |
 | [DR-0019](./DR-0019-run-option-cleanup-and-suspend-policy-placement.md) | ✅ 実装済 (2026-06-12) | run オプション棚卸し + suspend policy の daemon 配線 |
 | [DR-0020](./DR-0020-self-session-reference.md) | ✅ 実装済 (2026-06-12) | self-session 参照 (= 子へ `HYOUI_SESSION_ID` 注入 + session 引数の省略時解決規則) |
 | [DR-0021](./DR-0021-pty-drain-ack-for-bytes-input.md) | ✅ 実装済 (2026-06-16) | bytes 系 input spec の完了点を「PTY drain ack」に強化 |
@@ -58,6 +58,7 @@ Status 列は **ラベル + 最終判定日** だけを載せる。実装範囲�
 | [DR-0038](./DR-0038-web-unit-is-a-config-file.md) | 🚧 Active (2026-10-04) | web の unit = 任意 path の config ファイル 1 つ (登録簿は `{config, binary_path, enabled}`、`extends` で土台を共有)、foreground 起動は `daemon run` 1 本、置き場を `hyoui/web/` に揃える、service に場所の env を固定し差分で止まる |
 | [DR-0039](./DR-0039-webui-terminal-app-rework.md) | ⬜ 未実装 | web UI をブラウザ上のターミナルアプリとして作り直す (新規セッション作成、タブグループ / タブ / pane、web 専用アクション、構造は共有・配置は端末ごと、マウスモード切り替え、入力経路は WS 1 本、xterm.js 6.0.0)。裁定待ち WR-Q2〜Q5 |
 | [DR-0040](./DR-0040-daemon-own-cell-model-and-layer-composition.md) | ⬜ 未実装 | daemon の仮想スクリーンを vt100 から自前のセルモデル crate にし、rect 単位の層合成でオーバーレイを重ね、attach 出力は常に合成画面から作る (tmux 型)。裁定待ち WR-Q2 |
+| [DR-0041](./DR-0041-session-id-uuid-and-tags.md) | ⬜ 未実装 | session id を UUID にし、namespace を廃止して tag にし、socket を `hyoui/sessions/` にフラットに置く (DR-0018 を置き換える)。面は状態の root を決める環境変数 1 つで決まる。裁定待ち SID-Q1 / SID-Q2 |
 ## Archived
 
 (なし)
