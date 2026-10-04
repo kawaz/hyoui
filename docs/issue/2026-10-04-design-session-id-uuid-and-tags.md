@@ -46,12 +46,12 @@ blocked_by:
 
 ### 面の分離 (使うなら)
 
-- 業務面などで session を分けたい場合は、session の socket の base dir を面ごとに分ける (tag では認証境界の分離にならない。「基本は全部見える」と矛盾する)。CLI は面の `.envrc` で base dir の env (例: `HYOUI_SESSIONS_DIR`) を切り替える
-- web gateway も面ごとに unit を立てられるようにする: unit の config (`docs/issue/2026-10-04-web-unit-registry-holds-settings.md` の「unit = config ファイル 1 つ」) に session の base dir を書く。監督者は unit の中身を解釈しないので、複数の面の unit を 1 つの監督者で抱えられる (面ごとに launchd 登録を増やさない)
-- gateway の unit config と CLI の env が同じ値を指すように揃えるのは各面の `.envrc` と unit config の責務
+- 面は状態の root を決める環境変数 1 つで決まる (`CLAUDE_CONFIG_DIR` と同じ考え方)。hyoui の一式 (CLI、session の socket、web の監督者・unit・登録簿・auth.json・logs) はその root の中で完結する。tag は分類で、認証境界の分離には使わない
+- 面をまたぐ仕組み (複数の面を横断する option、1 つの監督者で複数の面の unit を抱える等) は持たない。複数の面を扱う時は面ごとに環境変数を指定してそれぞれで実行して回る
+- web の監督者も面ごとに立つ: 面の `.envrc` が効いた状態で `hyoui web service register` すれば、その面の root が plist に固定される (DR-0038 の env 固定)
+- 未決: launchd の label が固定 (`jp.kawaz.hyoui-web.supervise`) なので、2 つ目の面で register すると衝突する。推し: register 時に名前を与え、省略時は既定の label (追加の面だけ名前を足す。launchctl でどの面か読める)。root のパスから導く案もある
 
 ## 未決
 
-- passkey の `auth.json` を面ごとに切り替えられるようにするか (推し: unit の config で置き場を切り替えられるようにし、既定は共有。record は endpoint ごとなので面ごとに endpoint を分ければ混ざらないが、業務の passkey を個人面と同じファイルに置きたくない場合のため)
 - 現行の `HYOUI_NAMESPACE` を使っている箇所の移行: 業務面の `.envrc`、ccmsg の hyoui terminal 連携 (`src/terminals/hyoui.ts` が base と namespace を直書きで discovery している。ccmsg 側の issue として起票が要る)
 - 動いている session の移行 (新旧の hyoui が混在する短い期間の扱い)。方式は合意 (2026-10-04): 置き場を移す時は移動して古い置き場に新しい置き場への symlink を残し、後で必ず消す。古い CLI は symlink をたどって `connect` できる。新しいバイナリは新しい置き場だけを見る (symlink を二重に拾わない)。新しいバイナリは古い置き場の symlink が残っていれば警告する。symlink を消す条件は版で明記する
