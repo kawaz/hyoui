@@ -24,9 +24,9 @@ OSC の dispatch は `vt100-0.16.2/src/perform.rs:198` の `osc_dispatch(params,
 | 8 (参考) | しない | しない | `unhandled_osc` | 同上 |
 
 - title / icon name を保持する field も取得 API も無い。`Screen` (`screen.rs`) と `lib.rs` に `title` / `icon` を含む識別子は 0 件 (grep で確認)。値を取る唯一の経路は callback
-- callback は `vt100-0.16.2/src/callbacks.rs` の `Callbacks` trait。title は `set_window_title(&mut Screen, &[u8])` (`callbacks.rs:50`)、icon name は `set_window_icon_name(&mut Screen, &[u8])` (`callbacks.rs:42`)、クリップボードは `copy_to_clipboard(&mut Screen, ty: &[u8], data: &[u8])` / `paste_from_clipboard(&mut Screen, ty: &[u8])`、それ以外は `unhandled_osc(&mut Screen, params: &[&[u8]])` (`callbacks.rs:66`)。全メソッドに空の default 実装があり、`impl Callbacks for ()` がある (`callbacks.rs` 末尾)
+- callback は `vt100-0.16.2/src/callbacks.rs` の `Callbacks` trait。title は `set_window_title(&mut Screen, &[u8])` (`callbacks.rs:23`)、icon name は `set_window_icon_name(&mut Screen, &[u8])` (`callbacks.rs:15`)、クリップボードは `copy_to_clipboard(&mut Screen, ty: &[u8], data: &[u8])` / `paste_from_clipboard(&mut Screen, ty: &[u8])`、それ以外は `unhandled_osc(&mut Screen, params: &[&[u8]])` (`callbacks.rs:66`)。全メソッドに空の default 実装があり、`impl Callbacks for ()` がある (`callbacks.rs` 末尾)
 - 値は生の `&[u8]` (UTF-8 とは限らない)
-- callback を渡す入口は `Parser::new_with_callbacks` (`parser.rs:29`)、`Parser::new` は `()` を渡す。callback 側の状態は `Parser::callbacks()` 等で参照できる (`parser.rs:66` 付近)
+- callback を渡す入口は `Parser::new_with_callbacks` (`parser.rs:29`)、`Parser::new` は `()` を渡す。callback 側の状態は `Parser::callbacks()` 等で参照できる (`parser.rs:68`)
 - 引数の個数に依存する点 (事実、vte の挙動と合わせた読み): vte は `;` で OSC を分割し、最大 16 params を超える分は読み捨てる (`vte-0.15.0/src/lib.rs:45` の `MAX_OSC_PARAMS = 16`、`:529-530`)。vt100 の `[b"0", s]` は 2 要素ちょうどにしか一致しないので、title 文字列自体に `;` が含まれると `0;a;b` は 3 要素になり title callback に行かず `unhandled_osc` に落ちる。**この落ち方は読解からの推論で、実行では未確認**
 - `unhandled_osc` に来る OSC 7 / 133 / 9 / 777 / 8 は、`params` の形で受け取れる (例: `[b"7", b"file://host/path"]`、`[b"133", b"A"]`、`[b"9", b"4", b"1", b"50"]`)。URI 内の `;` もそのまま分割されるので、受け側で結合し直す必要がある。これも読解からの推論で未確認
 
@@ -34,7 +34,7 @@ OSC の dispatch は `vt100-0.16.2/src/perform.rs:198` の `osc_dispatch(params,
 
 - vt100 に渡す層は 1 つだけ: `crates/hyoui/src/daemon/screen/state.rs` の `ScreenState`。フィールド `parser: vt100::Parser` (`state.rs:42`)。型パラメータ省略なので callback は `()` で、**callback は使っていない**
 - 生成は `vt100::Parser::new(rows, cols, scrollback_len)` が 2 箇所: 初期化 `state.rs:95`、resize 時の組み直し `state.rs:250`。`new_with_callbacks` の呼び出しは hyoui 内に 0 件
-- bytes の流れ: `ScreenState::process` (`state.rs:112`) が `self.parser.process(bytes)` (`state.rs:116`) を呼ぶ。その直後に自前で見るのは DEC sync update (`\x1b[?2026h/l`) の chunk 跨ぎ走査 `update_sync_flag_with_carry` (`state.rs:119` 付近、carry 長 `SYNC_SCAN_CARRY_LEN = 7` が `state.rs:30` 付近) と alt screen の変化のみ。OSC を自前で観測する層は無い
+- bytes の流れ: `ScreenState::process` (`state.rs:112`) が `self.parser.process(bytes)` (`state.rs:116`) を呼ぶ。その直後に自前で見るのは DEC sync update (`\x1b[?2026h/l`) の chunk 跨ぎ走査 `update_sync_flag_with_carry` (`state.rs:119`、定義は `:450`、carry 長 `SYNC_SCAN_CARRY_LEN = 7` が `state.rs:33`) と alt screen の変化のみ。OSC を自前で観測する層は無い
 - 自前 scan の前例: 上記の sync 走査は、vt100 が内部処理しない sequence を parser の外側で bytes から検出する実装になっている (`state.rs` のコメントにも「vt100 は本 mode を内部処理しないため」とある)。OSC 用の同種の層は未実装
 - resize 時は新 Parser に `input_log` を replay する (`state.rs:246-258`、alt 中なら `\x1b[?1049h` を先に流す)。callback を導入すると、replay された bytes に含まれる OSC で callback が再発火する (読解からの推論、未確認)。`input_log` は primary buffer 中の bytes のみ (alt 中は push しない)
 - 別の ANSI 処理として `crates/hyoui/src/strip.rs` (CSI / OSC / DCS を strip して plain text 化、OSC は BEL / ST 終端、chunk 跨ぎ carry あり) があり、tail (`daemon/tail.rs:84`) と broadcast (`daemon/broadcast.rs:397`) が使う。これは OSC を捨てる側で、取り出す側ではない
@@ -65,7 +65,7 @@ OSC の dispatch は `vt100-0.16.2/src/perform.rs:198` の `osc_dispatch(params,
 共通の注意点 (事実または推論を明記):
 
 - (B) を使うには `vt100::Parser::new` を `new_with_callbacks` に変える必要があり、`ScreenState.parser` の型が `Parser<()>` から変わる。`state.rs:42` / `:95` / `:250` と、型名 `vt100::Parser` が出る箇所 (grep では `state.rs` のみ) が影響範囲 (事実)
-- callback は `ScreenState::process` の呼び出しの中で同期的に発火する。callback 内で得た値は callback 側の構造体に溜め、`process` の後で hyoui が取り出す形になる (`Parser::callbacks()` 経由、`parser.rs:66` 付近、推論)
+- callback は `ScreenState::process` の呼び出しの中で同期的に発火する。callback 内で得た値は callback 側の構造体に溜め、`process` の後で hyoui が取り出す形になる (`Parser::callbacks()` 経由、`parser.rs:68`、推論)
 - resize の replay で再発火する点 (第 2 節) は、同じ OSC を二重に計上する可能性として設計側で考慮が要る (推論、未確認)
 - (C) の自前 scan は、`state.rs` の sync scan と同様に chunk 跨ぎの carry が要る (OSC は BEL / ST 終端でどこでも分割され得る)。`strip.rs` に OSC の carry 付き走査の実装がある
 - 実機での確認 (実際に vt100 へ各 OSC を食わせて callback が呼ばれる / 呼ばれない) は未実施。上記は全てソース読解
