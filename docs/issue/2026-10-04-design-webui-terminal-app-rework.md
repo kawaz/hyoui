@@ -39,7 +39,10 @@ daemon が動いていれば、ブラウザからリモートでターミナル�
 - 候補: OSC 0 / 2 (title)、1 (icon name)、7 (cwd。「cwd を引き継ぐ」の元データ)、133 (shell integration のプロンプト / コマンド境界と終了コード)、9 / 777 (通知)、9;4 (進捗)
 - OSC 7 を出さない shell の cwd は OS から子の cwd を読む (macOS は libproc、Linux は `/proc/<pid>/cwd`) で補う案。どちらを正にするかは実装時
 - OSC 52 (クリップボード読み書き) は観測ではなく操作を伴うので別の論点。少なくとも読み出しは既定で無効
-- 未確認: daemon の vt100 crate がこれらの OSC をどこまで解釈・保持しているか (OSC 8 は捨てる既知問題あり)。捨てているなら daemon 側に OSC を自前で拾う層が要る
+- vt100 0.16.2 はどの OSC も保持しないが、全部 `Callbacks` で拾える (0 / 1 / 2 は title・icon name の callback、52 は clipboard の callback、それ以外は `unhandled_osc`)。vt100 の前段に自前 parser は要らない。hyoui は現在 callback 未使用で、追加の影響は `daemon/screen/state.rs` に閉じる (`docs/findings/2026-10-04-daemon-osc-coverage.md`)
+- `;` を含む title は分割されて `unhandled_osc` に落ちるので結合し直す
+- resize は入力ログを新 parser に replay するので callback が再発火する。title / cwd は最後の値で上書きなので無害、通知 (9 / 777) は重複するので replay 中は callback を無視する印が要る
+- session 一覧の `cwd` は現状起動時 cwd。現在 cwd を OS から読む処理は無い
 
 ### アクション
 
