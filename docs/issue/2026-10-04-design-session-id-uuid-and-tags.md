@@ -54,4 +54,4 @@ blocked_by:
 
 - passkey の `auth.json` を面ごとに切り替えられるようにするか (推し: unit の config で置き場を切り替えられるようにし、既定は共有。record は endpoint ごとなので面ごとに endpoint を分ければ混ざらないが、業務の passkey を個人面と同じファイルに置きたくない場合のため)
 - 現行の `HYOUI_NAMESPACE` を使っている箇所の移行: 業務面の `.envrc`、ccmsg の hyoui terminal 連携 (`src/terminals/hyoui.ts` が base と namespace を直書きで discovery している。ccmsg 側の issue として起票が要る)
-- 動いている session の移行 (新旧の hyoui が混在する短い期間の扱い)
+- 動いている session の移行 (新旧の hyoui が混在する短い期間の扱い)。方式は合意 (2026-10-04): 置き場を移す時は移動して古い置き場に新しい置き場への symlink を残し、後で必ず消す。古い CLI は symlink をたどって `connect` できる。新しいバイナリは新しい置き場だけを見る (symlink を二重に拾わない)。新しいバイナリは古い置き場の symlink が残っていれば警告する。symlink を消す条件は版で明記する
