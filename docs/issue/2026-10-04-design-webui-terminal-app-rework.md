@@ -22,13 +22,14 @@ blocked_by:
 
 ## 目的
 
-daemon が動いていれば、ブラウザからリモートでターミナルを開いてローカル作業ができる。iTerm / Ghostty のようなフルスクリーンのターミナルアプリの使い心地を軸にしつつ、全描画領域を文字セルで敷き詰める必要があるというターミナル特有の制限には囚われない。
+daemon が動いていれば、ブラウザからリモートでターミナルを開いてローカル作業ができる。いまは `hyoui run` の起点が ghostty / iTerm2 等のターミナルアプリしかないが、web から session を作れればターミナルアプリを開かずに作業を始められる。iTerm / Ghostty のようなフルスクリーンのターミナルアプリの使い心地を軸にしつつ、全描画領域を文字セルで敷き詰める必要があるというターミナル特有の制限には囚われない。
 
 ## 合意 (2026-10-04)
 
 ### 新規セッション作成
 
-- web から新規セッションを作れるようにする。gateway が `hyoui run --detached` と同じ経路で新しい session の daemon を起動する (1 session = 1 daemon)
+- web から新規セッションを作れるようにする。gateway が既存の `hyoui run --detached` を呼んで新しい session の daemon を起動する (1 session = 1 daemon、新 CLI は不要)
+- gateway の restart / upgrade で session が道連れにならないこと (`--detached` の fork + setsid で独立するはず、未検証) を実装時の検証項目にする
 - 起動するのは普通のターミナルアプリと同じくユーザのログイン shell (passwd から引き、argv[0] を `-zsh` 形式)。env は gateway のものを引き継がず、ログイン時と同じ最小の env から始めて残りは shell の rc に任せる (gateway の env を持ち込まないので DR-0024 の scrub の論点は生じない)。プロファイルやコマンド限定の仕組みは持たない
 - 設定は初期ディレクトリだけ: 新規タブ / 新規分割 / 新規タブグループのそれぞれで「元 pane の cwd を引き継ぐ」か「HOME」。既定はタブと分割が引き継ぎ、タブグループが HOME (Ghostty / iTerm と同じ)
 
