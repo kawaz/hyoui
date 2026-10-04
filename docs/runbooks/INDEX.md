@@ -27,6 +27,9 @@ hyoui の運用・障害対応 runbook 一覧。`docs-structure.md` ルールに
 - [web endpoint に passkey を登録する](./2026-09-16-web-passkey-registration.md) —
   `hyoui web passkey add --endpoint` で招待 URL と 6 桁コードを出し、端末を
   登録する手順。失効の効き方 (最長 4 時間) と、Safari / iOS の gate 3 検証も含む
+- [web gateway を DR-0038 の形へ移す](./web-unit-migration-dr-0038.md) —
+  状態 dir とログ dir を `hyoui/web/` へ移して古い名前を symlink に、旧 label を
+  降ろして hash 付き label で register。ロールバックと symlink・警告を消す条件も含む
 
 ## Archived
 
