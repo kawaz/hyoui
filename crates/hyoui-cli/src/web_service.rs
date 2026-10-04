@@ -828,6 +828,7 @@ pub fn env_in_definition(text: &str) -> BTreeMap<String, String> {
 }
 
 /// 定義に焼かれた監督者のログの path (launchd の `StandardOutPath`)。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn log_path_in_definition(text: &str) -> Option<String> {
     let (_, rest) = text.split_once("<key>StandardOutPath</key>")?;
     let (_, after) = rest.split_once("<string>")?;
