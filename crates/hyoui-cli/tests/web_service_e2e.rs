@@ -58,32 +58,38 @@ fn status_reports_definition_state_in_isolated_home() {
 
     let label = status["label"].as_str().expect("label");
     let path = status["path"].as_str().expect("path");
+    // OS ごとに名前を分けない (DR-0038 決定 4)。
+    assert_eq!(label, "com.github.kawaz.hyoui.web.supervise");
     if cfg!(target_os = "macos") {
-        assert_eq!(label, "jp.kawaz.hyoui-web.supervise");
         assert!(path.contains("Library/LaunchAgents"), "{path}");
         assert!(
-            path.ends_with("jp.kawaz.hyoui-web.supervise.plist"),
+            path.ends_with("com.github.kawaz.hyoui.web.supervise.plist"),
             "{path}"
         );
     } else if cfg!(target_os = "linux") {
-        assert_eq!(label, "hyoui-web-supervise");
         assert!(
-            path.ends_with("systemd/user/hyoui-web-supervise.service"),
+            path.ends_with("systemd/user/com.github.kawaz.hyoui.web.supervise.service"),
             "{path}"
         );
     }
 }
 
-/// 旧 label は引き取らない (= 決定 11、移行は runbook の手作業)。
+/// 旧 label は引き取らない (= DR-0034 決定 11 / DR-0038 移行節、移行は人の手作業)。
 #[test]
-fn the_old_single_gateway_label_is_not_referenced() {
+fn old_labels_are_not_used() {
     let home = tempfile::tempdir().expect("isolated HOME");
     let status = json(&hyoui(&["web", "service", "status"], home.path()));
     let rendered = status.to_string();
-    assert!(
-        !rendered.contains("com.github.kawaz"),
-        "the old label still appears: {rendered}"
-    );
+    for old in [
+        "com.github.kawaz.hyoui-web\"",
+        "jp.kawaz.hyoui-web.supervise",
+        "hyoui-web-supervise",
+    ] {
+        assert!(
+            !rendered.contains(old),
+            "old label `{old}` appears: {rendered}"
+        );
+    }
     // 旧 verb の意味も残さない: `register` は listen を受けない。
     let output = hyoui(
         &["web", "service", "register", "--listen=127.0.0.1:1"],

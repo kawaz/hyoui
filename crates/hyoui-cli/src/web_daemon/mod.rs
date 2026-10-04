@@ -125,6 +125,12 @@ fn add_location_warnings(
 /// 新しいバイナリはここを読まない。残っているかを見て警告するためだけに名前を持つ。
 const LEGACY_DIR_NAME: &str = "hyoui-web";
 
+/// OS 登録名を変える前の監督者の定義名 (launchd label / systemd unit、DR-0038 移行節)。
+///
+/// 新しいバイナリはこの名前で登録も操作もしない。定義ファイルが残っていれば、旧い
+/// 監督者が新しい監督者と並んで同じ port を取り合いうるので警告する。
+const LEGACY_SERVICE_LABELS: [&str; 2] = ["jp.kawaz.hyoui-web.supervise", "hyoui-web-supervise"];
+
 /// 古い置き場が残っていれば stderr に警告する (DR-0038 移行節 (3))。
 ///
 /// `hyoui web ...` の全 verb (= 監督者・子の `daemon run`・`status` 等) の入口で呼ぶ。
@@ -151,9 +157,36 @@ fn legacy_places(env: &hyoui::paths::Env) -> Vec<(std::path::PathBuf, std::path:
     places
 }
 
+/// 残っている古い OS 定義 (= 旧 label の plist / systemd unit) の path。
+fn legacy_service_definitions(env: &hyoui::paths::Env) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    for label in LEGACY_SERVICE_LABELS {
+        if let Some(home) = env.home() {
+            paths.push(crate::web_service::launchd_definition_path(home, label));
+        }
+        if let Some(config_home) = env.config_home() {
+            paths.push(crate::web_service::systemd_definition_path(
+                &config_home,
+                label,
+            ));
+        }
+    }
+    paths
+}
+
 /// 残っている古い置き場ごとの警告文。symlink なら「後で消す」、実体なら「移していない」。
-/// どちらも中身は読まない (= 新しい置き場と二重に拾わない)。
+/// どちらも中身は読まない (= 新しい置き場と二重に拾わない)。旧 label の OS 定義が
+/// 残っていれば、外す手順を言う。
 fn legacy_warnings(env: &hyoui::paths::Env) -> Vec<String> {
+    let definitions = legacy_service_definitions(env)
+        .into_iter()
+        .filter(|path| path.symlink_metadata().is_ok())
+        .map(|path| {
+            format!(
+                "{} is the supervisor definition under an old label; unload and remove it (launchctl bootout / systemctl --user disable --now) so that two supervisors do not fight over the same ports (DR-0038)",
+                path.display()
+            )
+        });
     legacy_places(env)
         .into_iter()
         .filter_map(|(legacy, current)| {
@@ -171,6 +204,7 @@ fn legacy_warnings(env: &hyoui::paths::Env) -> Vec<String> {
                 )
             })
         })
+        .chain(definitions)
         .collect()
 }
 
@@ -883,6 +917,29 @@ mod tests {
         std::fs::remove_file(&legacy_state).unwrap();
         std::fs::remove_file(logs.join(LEGACY_DIR_NAME)).unwrap();
         assert!(legacy_warnings(&env).is_empty());
+
+        // 旧 label の定義が残っていれば外す手順を言い、新しい label の定義には黙る。
+        let agents = home.path().join("Library/LaunchAgents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join(format!("{}.plist", crate::web_service::SERVICE_LABEL)),
+            "",
+        )
+        .unwrap();
+        assert!(legacy_warnings(&env).is_empty());
+        let old = agents.join("jp.kawaz.hyoui-web.supervise.plist");
+        std::fs::write(&old, "").unwrap();
+        let warnings = legacy_warnings(&env);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("old label") && warnings[0].contains("bootout"),
+            "{warnings:?}"
+        );
+        std::fs::remove_file(&old).unwrap();
+        let unit_dir = home.path().join(".config/systemd/user");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::write(unit_dir.join("hyoui-web-supervise.service"), "").unwrap();
+        assert_eq!(legacy_warnings(&env).len(), 1);
     }
 
     #[test]
