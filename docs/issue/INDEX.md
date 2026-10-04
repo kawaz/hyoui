@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-10-04 | design | open | [web-unit-registry-holds-settings](./2026-10-04-web-unit-registry-holds-settings.md) | web の unit 登録簿が listen 等の設定値を持っている (DR-0034 が daemon / service パターンから逸脱)。unit = config ファイル 1 つに直し、登録簿は config 参照 + binary + enabled だけにする |
 | 2026-10-04 | design | open | [daemon-own-cell-model](./2026-10-04-design-daemon-own-cell-model.md) | daemon の仮想スクリーンを vt100 から自前のセルモデルにする (層の合成でオーバーレイ、attach 出力は常に合成画面から作る tmux 型)。議論中、web UI 作り直しとは別 track |
 | 2026-10-04 | design | open | [webui-terminal-app-rework](./2026-10-04-design-webui-terminal-app-rework.md) | web UI をブラウザ上のターミナルアプリとして作り直す (新規セッション作成 / タブグループ・タブ・pane / web 専用アクション / 構造は共有・配置は端末ごと / leader 優先 + content-fit / ソフトキー)。議論中、合意と未決を記録 |
 | 2026-09-29 | bug | open | [daemon-must-never-hang](./2026-09-29-daemon-must-never-hang.md) | daemon が「生きているが固まる」状態を構造的に排除する (イベントループのブロック点棚卸し + 再発防止) |
