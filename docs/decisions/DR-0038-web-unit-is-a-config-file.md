@@ -90,9 +90,16 @@ llm-gateway DR-0013 の規則をそのまま採る。`config.toml` と web の c
 
 **監督者の socket は `web/` 直下に置かず `run/` に 1 段下げる。** `${XDG_STATE_HOME}/hyoui/` は session socket の base (DR-0018) で、discovery (`crates/hyoui/src/discovery.rs`) は直下の dir をすべて namespace とみなし、その中の `*.sock` に hyoui protocol で問い合わせる。`web/supervisor.sock` に置くと、`hyoui list --all-namespaces` と web gateway の `/api/sessions` に namespace `web` の session `supervisor` として並ぶだけでなく、discovery の handshake と監督者の 1 行読み (JSON 1 行の制御 socket、DR-0034 決定 4) が互いの応答を待ち合い、**監督者の event loop が 1 回 5 秒止まる** (実測: `list --all-namespaces` が 5.05 秒、その最中の `web daemon list` が 4.95 秒)。gateway は `/api/sessions` のたびに discovery を回すので、常駐すれば監督者が繰り返し止まる。discovery は 1 段しか潜らないので `run/` の中は見ない。`units/` / `logs/` に `*.sock` は無いので同じ理由で拾われない。
 
-session socket の木と `hyoui/` 直下の機能別 dir の衝突そのものは、session socket を `hyoui/sessions/` に移す設計 (`docs/issue/2026-10-04-design-session-id-uuid-and-tags.md`) が解く。それまでは `hyoui run --namespace=web` の session socket が `hyoui/web/` に置かれうる (= passkey の state と同じ dir)。これは利用者が明示した namespace であり、本 DR では予約語を足して塞がない (足すと namespace を廃止する設計の前に、消える概念へ例外を 1 つ増やすことになる)。
+**`hyoui/web/` と session socket の木の衝突は session 側の別 DR で解消する (それまでは namespace `web` の session を作らない運用)。** session socket を `hyoui/sessions/<uuid>.sock` にフラット化し namespace を廃止する設計 (`docs/issue/2026-10-04-design-session-id-uuid-and-tags.md`) の範囲で、本 DR は session の socket の場所・namespace・discovery を変えない。予約語は足さない (namespace を廃止する設計の前に、消える概念へ例外を増やさない)。
 
-**古い置き場 (`hyoui-web/`、`~/Library/Logs/hyoui-web/`) からの自動移行は書かない。** v1.0 前で利用者は kawaz だけなので、移行は人が 1 回行う。一度通ったら二度と通らないコードを製品に残さない (DR-0034 決定 11 と同じ理由)。passkey の `auth.json` は移さないと登録済みの passkey が全部失効するので、移行手順に必ず含める。
+#### 移行: 移動して古い置き場に symlink を残し、後で必ず消す
+
+1. **状態 dir は丸ごと新しい置き場へ移し、古い dir 名を symlink にする。** `$XDG_STATE_HOME/hyoui-web` → `$XDG_STATE_HOME/hyoui/web` へ移動し、`$XDG_STATE_HOME/hyoui-web` を `hyoui/web` への symlink にする。古いバイナリも同じ実体 (passkey の `auth.json` を含む) を見るので、新旧が混在する間も登録済みの passkey が失効しない
+2. **新しいバイナリは新しい置き場だけを見る。** symlink は古いバイナリのためだけにあり、新しいバイナリは古い名前を読まない (= 同じ実体を二重に拾わない)
+3. **新しいバイナリは、古い置き場が残っていれば `hyoui web ...` の起動時に stderr へ警告する。** symlink なら「古いバイナリ用の symlink が残っている、後で消す」、実体の dir なら「移行していない (このバイナリは読まない)」と言い分ける
+4. **symlink を消す条件は版で決める:** 本 DR を含む版より前の hyoui (= 古い置き場を読む版) が手元で 1 つも動いていない (brew 版・repo build・監督者・その子の全部が本 DR 以降の版) こと。消したら (3) の警告は黙る。警告のコードは、その次の版で外す
+
+**移動と symlink の作成を自動で行うコードは書かない。** v1.0 前で利用者は kawaz だけなので、移行は人が 1 回行う。一度通ったら二度と通らないコードを製品に残さない (DR-0034 決定 11 と同じ理由)。古い登録簿 (`units/*.toml`) は形が変わったので、移した後に新しい形で `daemon add` し直す。
 
 ### 5. service register は場所を決める env を定義に固定し、変わったら止まる
 
@@ -135,7 +142,7 @@ llm-gateway DR-0028 決定 6 と同じ。監督者の `status` (`/version`)・`r
 
 - unit の設定は config ファイルを開けば読め、書き換えれば次の起動から効く。登録簿は「どの config を、どの実行ファイルで、動かしたいか」だけになる
 - `config.toml` に `[web] listen` / `[web] assets_dir` を書いていると、全コマンドの config 読み込みが廃止 key で止まる。移し先は案内に出る
-- 既存の登録簿・passkey の state・service の定義は新しい置き場に無い。移行するまで `daemon list` は空、passkey は「登録が無い」になる (移行は統括が手で 1 回行う)
+- 移行 (状態 dir の移動 + 古い名前の symlink) をするまで、新しいバイナリから見た登録簿と passkey は空で、`hyoui web ...` は古い置き場が残っていると警告する。移行は人が手で 1 回行う
 - 既存の plist は場所の env を固定していないので、最初の `service register` は差分で止まり `--force` が要る
 - `hyoui-web` の名を持つものは crate 名 / ログの接頭辞と OS 登録の label (`jp.kawaz.hyoui-web.supervise`) だけになる。label は OS に登録した契約名なので変えない
 - systemd 経路は DR-0034 と同じく書けるが未検証
