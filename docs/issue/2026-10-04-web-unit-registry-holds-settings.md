@@ -34,3 +34,9 @@ reference の `cli-daemon-subcommands` (kawaz 製 CLI 共通の正本) は unit 
 - config の置き場所 (未決): (a) unit ごとに `~/.config/hyoui/web/<unit>.toml` (パターンの「unit = config ファイル」に素直) / (b) `config.toml` の中に unit ごとの節 (`[web.units.<name>]`)
 - 既存の stable / unstable 2 unit の移行 (v1.0 前なので互換を残さず置き換えてよい範囲)
 - DR-0034 の該当部分を新しい DR で置き換える
+
+## 同じ根: `hyoui web --listen` が 2 本目の起動経路として残っている
+
+`hyoui web --listen=<addr>` が unit も登録簿も通さず gateway を foreground で起動する。名前を省いた `hyoui web daemon run` (config の listen で起動) と同じことをする 2 本目の経路。パターンでは foreground 起動は `daemon run` 1 本で、`hyoui web` は `daemon` / `service` / `passkey` / `session` を束ねる名前空間でしかない。DR-0031 の 1 unit 固定時代に plist が `hyoui web` の 2 語で直接起動していた頃の入口で、DR-0034 で監督者経由に移った後も消していない (現 plist は supervise)。
+
+消す (`hyoui web` は名前空間だけ、引数なしは help のまま、foreground 起動は `daemon run` に一本化)。直す範囲: e2e test (`crates/hyoui-cli/tests/web_e2e_api.rs`、`auth_store_concurrency.rs`) の起動を `daemon run` 系に置き換え、parse test (`crates/hyoui/src/cli.rs` 11684 付近、`crates/hyoui-cli/src/main.rs` 4666 付近)、`--help` の 1 行目、MANUAL (ja / en) の起動例
