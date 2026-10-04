@@ -1,0 +1,55 @@
+---
+title: session id を UUID に、namespace を廃止して tag に、socket をフラットに置く (DR-0018 を置き換える)
+status: open
+category: design
+created: 2026-10-04T15:30:00+09:00
+last_read: 2026-10-04T15:30:00+09:00
+open_entered: 2026-10-04T15:30:00+09:00
+wip_entered:
+blocked_entered:
+pending_entered:
+discarded_entered:
+resolved_entered:
+discard_reason:
+pending_reason:
+close_reason:
+blocked_by:
+---
+
+# session id を UUID に、namespace を廃止して tag に、socket をフラットに置く
+
+議論フェーズの記録 (2026-10-04)。DR-0018 (namespace) を置き換える DR の素材。発端は web の状態の置き場 (`hyoui/web/`) が session socket の木 (base 直下のサブ dir = namespace) と衝突した件 (`docs/QUESTIONS.md` の WR-Q1、`docs/issue/2026-10-04-web-unit-registry-holds-settings.md`)。
+
+## 合意
+
+### namespace を廃止して tag にする
+
+- namespace は「名前を付ける」と「見えなくする」を 1 つの仕組みに同居させており、後者が「list に出ない」「ns 指定が漏れて操作できない」という UX の悪さを生んでいる。session id は元々一意なので階層化は要らない
+- 分類とフィルタは tag (session のメタデータ) で行い、既定は全部見える
+- DR-0018 が tag 案 (方式 (c)) を退けた理由は (1) 旧 daemon との互換処理 (2) 全 socket に問い合わせた後の絞り込みで I/O が残る、の 2 つ。(1) は v1.0 前で互換を持たない方針なので当たらない、(2) は list が元々全件に問い合わせる作りで件数も数十なので実害が小さい
+
+### session id は UUID だけ
+
+- 自動の id (`run-<pid>-<hex>`) と自分で付ける id の混在をやめ、UUID に揃える。起動側が `--session-id <UUID>` で最初から指定でき (起動後に stdout から id を読まずに済む)、指定が無ければ自動で振る
+- UUID の版は規定しない (外部指定のユースケースがある以上意味がない)。list の並び順は started_at で決め、id の版に依存しない
+- 人が打つための短縮指定 (先頭一致等) は入れない (コピペ前提)
+- 同じ id の socket が既にあれば run 自体をエラーにする。古い socket が残っている (daemon は死んでいる) 場合も重複として扱う。死んだ socket の片付けは片付けの経路の責務で、run は生死を判定しない (判定経路を 2 つに分けない)。エラーには原因と対処 (別 id で起動 / 片付けてから再実行、片付けのコマンド名) を書く
+- 重複の判定は bind / lock の時点で原子的に失敗させる (確認してから作るの 2 段にしない)
+- 子に注入する `HYOUI_SESSION` (DR-0020) は値が UUID になるだけ
+
+### socket をフラットに置く
+
+- session の socket は `hyoui/sessions/<uuid>.sock` に置く。`hyoui/` 直下は機能別のサブ dir (`sessions/`、`web/` ...) だけにする。これで web の状態の置き場 (`hyoui/web/`) と衝突しない (WR-Q1 の解消)
+- unix socket の長さの上限は bind / connect に渡す `sun_path` 引数の長さであって、ファイルシステム上のフルパスの長さではない。フルパスの長さで弾かない (現行の `check_sun_path_len` はフルパスで弾いており誤り)。相対パスを渡して開く。手段は実装時に決める: cwd はプロセス全体で 1 つなので、マルチスレッドのプロセス (gateway の tokio、daemon) では cwd を変える一瞬に他スレッドが巻き込まれる。macOS には dirfd 基準の `bindat` / `connectat` が無い (SDK ヘッダと libsystem_kernel の export で確認、2026-10-04)。候補はスレッドを立てる前の起動直後に cwd を変える / 開くためだけの子プロセスで開いて fd を渡す / 短い symlink 経由 (macOS は `/tmp` を掃除するので置き場に制約)
+
+### 面の分離 (使うなら)
+
+- 業務面などで session を分けたい場合は、session の socket の base dir を面ごとに分ける (tag では認証境界の分離にならない。「基本は全部見える」と矛盾する)。CLI は面の `.envrc` で base dir の env (例: `HYOUI_SESSIONS_DIR`) を切り替える
+- web gateway も面ごとに unit を立てられるようにする: unit の config (`docs/issue/2026-10-04-web-unit-registry-holds-settings.md` の「unit = config ファイル 1 つ」) に session の base dir を書く。監督者は unit の中身を解釈しないので、複数の面の unit を 1 つの監督者で抱えられる (面ごとに launchd 登録を増やさない)
+- gateway の unit config と CLI の env が同じ値を指すように揃えるのは各面の `.envrc` と unit config の責務
+
+## 未決
+
+- passkey の `auth.json` を面ごとに切り替えられるようにするか (推し: unit の config で置き場を切り替えられるようにし、既定は共有。record は endpoint ごとなので面ごとに endpoint を分ければ混ざらないが、業務の passkey を個人面と同じファイルに置きたくない場合のため)
+- 現行の `HYOUI_NAMESPACE` を使っている箇所の移行: 業務面の `.envrc`、ccmsg の hyoui terminal 連携 (`src/terminals/hyoui.ts` が base と namespace を直書きで discovery している。ccmsg 側の issue として起票が要る)
+- 動いている session の移行 (新旧の hyoui が混在する短い期間の扱い)
