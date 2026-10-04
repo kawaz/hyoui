@@ -80,11 +80,13 @@ llm-gateway DR-0013 の規則をそのまま採る。`config.toml` と web の c
 | 監督者自身のログ (launchd) | `${XDG_STATE_HOME:-~/.local/state}/hyoui/web/logs/<label>.log` |
 | passkey の state | `${XDG_STATE_HOME:-~/.local/state}/hyoui/web/auth.json` / `pending.json` (+ `.lock`) |
 | 監督者の制御 socket | `${XDG_STATE_HOME:-~/.local/state}/hyoui/web/run/supervisor.sock` |
+| 監督者の OS 登録名 | launchd label `com.github.kawaz.hyoui.web.supervise`、systemd user unit `com.github.kawaz.hyoui.web.supervise.service` |
 
-`hyoui-web` のような別名の dir は作らない。理由は 2 つ:
+`hyoui-web` のような別名は、dir にも OS 登録名にも作らない。理由は 3 つ:
 
 - **CLI の階層と揃う。** `hyoui web ...` の state と config が `hyoui/web/` にあれば、どこを見ればよいかを CLI の語から辿れる
 - **アクセス許可の書き方と揃う。** auto mode classifier の環境説明は「リポで作業中のセッションから `$XDG_*_HOME/<リポ名>/` へのアクセスを許可」という形で書かれている。`hyoui-web` はこの形から外れて拒否されやすく、classifier 側に例外を持ち込むより置き場をこの単純な形に合わせる
+- **OS 登録名もアプリの名前空間をぶらさない。** reference `cli-daemon-subcommands` の「OS 登録の名前」節に従い、逆引き DNS は**所有を確かめた名前空間だけを使い、既定は `com.github.kawaz.<repo>`** とする (GitHub アカウントの所有と常に一致するので確認が要らない。自前ドメインは手放しや更新切れで正当性を失いうる)。先頭をリポ名にして `hyoui.` の下に置き、その下を CLI の階層と同じ `web.supervise` にする。systemd の unit も同じ文字列に `.service` を付け、OS ごとに名前を分けない。組み立ては `web_service.rs` の 1 か所
 
 監督者のログを state の中に置くのは先行の llm-gateway / ccmsg と同じで、label の名前にするので unit のログ (unit 名は `.` を含まない) と衝突しない。
 
@@ -99,7 +101,9 @@ llm-gateway DR-0013 の規則をそのまま採る。`config.toml` と web の c
 3. **新しいバイナリは、古い置き場 (状態 dir とログ dir) が残っていれば `hyoui web ...` の起動時に stderr へ警告する。** 全 verb の入口で見るので、監督者と子の `daemon run` も警告し、それは監督者のログに残る。symlink なら「古いバイナリ用の symlink が残っている、後で消す」、実体の dir なら「移行していない (このバイナリは読まない)」と言い分ける
 4. **symlink を消す条件は版で決める:** 本 DR を含む版より前の hyoui (= 古い置き場を読む版) が手元で 1 つも動いていない (brew 版・repo build・監督者・その子の全部が本 DR 以降の版) こと。消したら (3) の警告は黙る。警告のコードは、その次の版で外す
 
-**移動と symlink の作成を自動で行うコードは書かない。** v1.0 前で利用者は kawaz だけなので、移行は人が 1 回行う。一度通ったら二度と通らないコードを製品に残さない (DR-0034 決定 11 と同じ理由)。古い登録簿 (`units/*.toml`) は形が変わったので、移した後に新しい形で `daemon add` し直す。
+5. **OS 登録名が変わるので、旧 label (`jp.kawaz.hyoui-web.supervise` / systemd `hyoui-web-supervise`) の定義を外してから新しい label で register する。** 新しいバイナリは旧 label を操作しない。旧 label の定義ファイルが残っていれば (3) と同じ入口で警告する (= 旧い監督者が新しい監督者と並んで同じ port を取り合うのを見逃さない)
+
+**移動と symlink の作成、旧 label の取り外しを自動で行うコードは書かない。** v1.0 前で利用者は kawaz だけなので、移行は人が 1 回行う。一度通ったら二度と通らないコードを製品に残さない (DR-0034 決定 11 と同じ理由)。古い登録簿 (`units/*.toml`) は形が変わったので、移した後に新しい形で `daemon add` し直す。
 
 ### 5. service register は場所を決める env を定義に固定し、変わったら止まる
 
@@ -144,7 +148,8 @@ llm-gateway DR-0028 決定 6 と同じ。監督者の `status` (`/version`)・`r
 - `config.toml` に `[web] listen` / `[web] assets_dir` を書いていると、全コマンドの config 読み込みが廃止 key で止まる。移し先は案内に出る
 - 移行 (状態 dir の移動 + 古い名前の symlink) をするまで、新しいバイナリから見た登録簿と passkey は空で、`hyoui web ...` は古い置き場が残っていると警告する。移行は人が手で 1 回行う
 - 既存の plist は場所の env を固定していないので、最初の `service register` は差分で止まり `--force` が要る
-- `hyoui-web` の名を持つものは crate 名 / ログの接頭辞、古い置き場を検知するための名前、OS 登録名 (`jp.kawaz.hyoui-web.supervise` / `hyoui-web-supervise`) だけになる。OS 登録名は `hyoui` の名前空間の下へ移す方針だが、逆引き domain の接頭辞が kawaz 製ツール横断で裁定待ちのため値は変えず、組み立てを 1 か所 (`web_service.rs` の部品) に寄せた。変えれば移行は「旧 label を unregister → 新 label で register」になる
+- `hyoui-web` の名を持つものは crate 名 / ログの接頭辞と、古い置き場・旧 label を検知して警告するための名前だけになる
+- OS 登録名が変わるので、移行で旧 label を外して新しい label で register し直す。監督者のログのファイル名も新しい label になる
 - systemd 経路は DR-0034 と同じく書けるが未検証
 
 ## 参照した素材
