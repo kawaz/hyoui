@@ -33,7 +33,9 @@ ls -d ~/.config/hyoui ~/.local/state/hyoui/web 2>&1
 
 ## 対処 (移行手順)
 
-### 0. 新しい版を用意する (全断なし)
+### 0. 新しい版を用意する (この時点では止まらないが、手順 1 まで間を空けない)
+
+`brew upgrade` で `/opt/homebrew/bin/hyoui` が新しい版に入れ替わると、稼働中の古い監督者が unit を上げ直す時 (子が落ちた時、`daemon restart` 等) に新しい版の binary で `web daemon run <name>` を起こす。新しい版は旧形式の登録簿を読まないので、その unit は上がらない。動いている子はそのまま動き続けるので即座には止まらないが、手順 0 から手順 1 までは続けて行う。
 
 ```sh
 brew upgrade hyoui
