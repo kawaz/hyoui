@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PoC: xterm.js 6.0.0 の上のテキスト選択層</title>
+<link rel="stylesheet" href="../2026-10-04-xterm-mouse-mode-toggle/lib/xterm.css">
+<style>
+  body { font: 13px/1.4 system-ui, sans-serif; margin: 8px; }
+  fieldset { display: inline-block; vertical-align: top; margin: 0 6px 6px 0; padding: 4px 8px; }
+  fieldset a { margin-right: 6px; }
+  fieldset a.cur { font-weight: bold; text-decoration: none; background: #2a6; color: #fff; padding: 0 4px; border-radius: 3px; }
+  #host { position: relative; display: inline-block; }
+  #status { font-family: ui-monospace, monospace; margin: 4px 0; white-space: pre-wrap; }
+  #paste { width: 600px; max-width: 100%; height: 120px; font: 12px/1.3 ui-monospace, monospace; display: block; }
+  #pasteJson { font: 12px/1.3 ui-monospace, monospace; white-space: pre-wrap; word-break: break-all; width: 600px; max-width: 100%; border: 1px solid #888; padding: 4px; min-height: 2em; }
+  #log { font: 12px/1.3 ui-monospace, monospace; height: 100px; overflow: auto; border: 1px solid #888; padding: 4px; white-space: pre; width: 600px; max-width: 100%; box-sizing: border-box; }
+
+  /* (A) クローン層。xterm-screen の子として同じ原点に重ねる。文字は透明、選択色だけ見せる */
+  .sel-layer {
+    position: absolute; left: 0; top: 0; z-index: 20;
+    color: transparent; user-select: text; -webkit-user-select: text;
+    -webkit-touch-callout: default; cursor: text;
+  }
+  .sel-layer .blk { white-space: normal; overflow-wrap: normal; word-break: normal; }
+  .sel-layer .c { display: inline-block; white-space: pre; overflow: hidden; vertical-align: top; text-align: left; }
+  .sel-layer ::selection { background: rgba(80, 140, 255, 0.45); color: transparent; }
+  /* オーバーレイの目視確認用: ?show=1 で文字を半透明の赤で出す */
+  .sel-layer.show { color: rgba(255, 60, 60, 0.75); }
+
+  /* (B) xterm の行 DOM を選択可能にする */
+  .b-select .xterm .xterm-rows, .b-select .xterm .xterm-rows * { user-select: text; -webkit-user-select: text; -webkit-touch-callout: default; }
+  .b-select .xterm .xterm-rows ::selection { background: rgba(80, 140, 255, 0.45); }
+  .b1 .xterm .xterm-rows { pointer-events: auto !important; }
+</style>
+</head>
+<body>
+<div>
+  <fieldset><legend>方式 (?mode=)</legend><span id="modeLinks"></span></fieldset>
+  <fieldset><legend>(A) 折り返し (?wrap=)</legend><span id="wrapLinks"></span></fieldset>
+  <fieldset><legend>(A) 選択中の再描画 (?freeze=)</legend><span id="freezeLinks"></span></fieldset>
+  <fieldset><legend>(A) 送り幅をセル幅に揃える (?fit=)</legend><span id="fitLinks"></span></fieldset>
+  <fieldset><legend>(A) 目視 (?show=)</legend><span id="showLinks"></span></fieldset>
+  <fieldset><legend>フォーカス戻し (?focus=)</legend><span id="focusLinks"></span></fieldset>
+  <fieldset><legend>操作</legend>
+    <button id="mouse1002">?1002+1006 (アプリのマウス要求)</button>
+    <button id="tick">出力を 1 行追記</button>
+  </fieldset>
+</div>
+<div id="status"></div>
+<div id="host"></div>
+<p>コピーした内容を下に貼り付けると、改行・空白を JSON で表示する (iOS 確認用)。</p>
+<textarea id="paste" placeholder="ここに貼り付け"></textarea>
+<div id="pasteJson"></div>
+<p>onData / onBinary (= PTY に送られるはずのもの):</p>
+<div id="log"></div>
+<script type="module" src="index.js"></script>
+</body>
+</html>
