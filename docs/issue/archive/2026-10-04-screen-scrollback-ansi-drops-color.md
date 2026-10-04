@@ -1,6 +1,6 @@
 ---
 title: screen dump の scrollback / both layer (ANSI) が色を落とし、web の初期表示がモノクロになる
-status: open
+status: resolved
 category: bug
 created: 2026-10-04T11:00:00+09:00
 last_read: 2026-10-04T11:00:00+09:00
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-04T12:00:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: RowCellSnap に fg / bg / dim を持たせ rows_to_ansi が色 SGR を出すようにした
 blocked_by:
 ---
 
@@ -31,3 +31,9 @@ vt100 の `Cell` は前景色・背景色を持っているので、vt100 の制
 ## 関連
 
 - `docs/issue/2026-10-04-design-webui-terminal-app-rework.md` (daemon 側の自前セルモデルは別 track。本件はそれを待たずに直せる)
+
+## 決着 (2026-10-04)
+
+- `RowCellSnap` (`daemon/screen/state.rs`) に `fg` / `bg` (vt100 の `Color`) と `dim` を追加。CBOR の `CellSnapshot` と `attrs` の bit 配置は変えていない。vt100 0.16.2 の `Cell` は blink / strike を持たないため、持たせたのは `Cell` にある dim のみ。
+- `rows_to_ansi` (`daemon/screen/snapshot.rs`) が前景・背景の SGR を出す (default は出さない、indexed 0-7 は `30-37` / `40-47`、8-15 は `90-97` / `100-107`、16-255 は `38;5;N` / `48;5;N`、RGB は `38;2;R;G;B` / `48;2;R;G;B`)。dim は `2`。style が直前 cell から変わった時だけ reset + SGR を吐く方式は維持。
+- test: `both_ansi_matches_visible_cells_with_colors` (indexed 8 / 16 / 256、RGB、fg + bg、属性の組み合わせを visible と both で dump し、同じ vt100 parser で再生したセルの文字・fg・bg・属性が一致) と `both_ansi_keeps_color_in_scrollback` を追加。

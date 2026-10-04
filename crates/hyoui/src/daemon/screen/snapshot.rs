@@ -390,36 +390,24 @@ fn build_layered_snapshot(state: &mut ScreenState, layer: ScreenDumpLayer) -> Sc
 /// いない。本実装では各 cell の SGR 属性を `\x1b[` escape で再構築し、行末に `\r\n` を
 /// 入れて連結する。
 ///
-/// 制限: SGR の **bold / italic / underline / inverse** のみ反映。色情報は
-/// `RowCellSnap` が保持していないため落とす (= MVP scope。色を完全に保持したい
-/// なら snapshot 経路の cbor を使う想定)。caller が `cat` で再生したときに装飾は
-/// 落ちて見えるが、文字列内容は正しく再現される。
+/// 反映する SGR: bold / dim / italic / underline / inverse と前景色・背景色
+/// (indexed 0-7 / 8-15 / 256 色、RGB)。vt100 0.16 の `Cell` は blink / strike を
+/// 持たないので出力できない。属性・色のいずれかが直前 cell から変わった時だけ
+/// `\x1b[0m` + 必要な SGR を吐く。
 fn rows_to_ansi(rows: &[Vec<RowCellSnap>]) -> Vec<u8> {
     let mut out = Vec::new();
     // cursor を 1,1 に移して描画開始 (= state_formatted() に近い前置き)。
     out.extend_from_slice(b"\x1b[H");
-    let mut prev_attrs: u8 = 0;
+    let default_style = RowCellSnap::default();
+    let mut prev = &default_style;
     for row in rows.iter() {
         for cell in row.iter() {
             if cell.is_wide_continuation {
                 continue; // 先頭 cell が 2 col 分の contents を持つので skip
             }
-            // SGR change が必要なら escape を吐く
-            if cell.attrs != prev_attrs {
-                out.extend_from_slice(b"\x1b[0m"); // reset
-                if cell.attrs & 1 != 0 {
-                    out.extend_from_slice(b"\x1b[1m"); // bold
-                }
-                if cell.attrs & (1 << 1) != 0 {
-                    out.extend_from_slice(b"\x1b[3m"); // italic
-                }
-                if cell.attrs & (1 << 2) != 0 {
-                    out.extend_from_slice(b"\x1b[4m"); // underline
-                }
-                if cell.attrs & (1 << 3) != 0 {
-                    out.extend_from_slice(b"\x1b[7m"); // inverse
-                }
-                prev_attrs = cell.attrs;
+            if !same_style(cell, prev) {
+                write_sgr(&mut out, cell);
+                prev = cell;
             }
             if cell.contents.is_empty() {
                 out.push(b' ');
@@ -429,10 +417,49 @@ fn rows_to_ansi(rows: &[Vec<RowCellSnap>]) -> Vec<u8> {
         }
         out.extend_from_slice(b"\r\n");
     }
-    if prev_attrs != 0 {
+    if !same_style(prev, &default_style) {
         out.extend_from_slice(b"\x1b[0m"); // 末尾の attr reset
     }
     out
+}
+
+fn same_style(a: &RowCellSnap, b: &RowCellSnap) -> bool {
+    a.attrs == b.attrs && a.dim == b.dim && a.fg == b.fg && a.bg == b.bg
+}
+
+/// reset してから `cell` の style を表す SGR を書く。
+fn write_sgr(out: &mut Vec<u8>, cell: &RowCellSnap) {
+    out.extend_from_slice(b"\x1b[0m");
+    if cell.attrs & 1 != 0 {
+        out.extend_from_slice(b"\x1b[1m"); // bold
+    }
+    if cell.dim {
+        out.extend_from_slice(b"\x1b[2m");
+    }
+    if cell.attrs & (1 << 1) != 0 {
+        out.extend_from_slice(b"\x1b[3m"); // italic
+    }
+    if cell.attrs & (1 << 2) != 0 {
+        out.extend_from_slice(b"\x1b[4m"); // underline
+    }
+    if cell.attrs & (1 << 3) != 0 {
+        out.extend_from_slice(b"\x1b[7m"); // inverse
+    }
+    write_color_sgr(out, cell.fg, 30, 90, 38);
+    write_color_sgr(out, cell.bg, 40, 100, 48);
+}
+
+/// `base` / `bright_base` は 0-7 / 8-15 の SGR 開始値、`ext` は 256 色・RGB の拡張指定子。
+fn write_color_sgr(out: &mut Vec<u8>, color: vt100::Color, base: u8, bright_base: u8, ext: u8) {
+    use std::io::Write as _;
+    // Vec<u8> への write は失敗しない。
+    let _ = match color {
+        vt100::Color::Default => return,
+        vt100::Color::Idx(i) if i < 8 => write!(out, "\x1b[{}m", base + i),
+        vt100::Color::Idx(i) if i < 16 => write!(out, "\x1b[{}m", bright_base + (i - 8)),
+        vt100::Color::Idx(i) => write!(out, "\x1b[{ext};5;{i}m"),
+        vt100::Color::Rgb(r, g, b) => write!(out, "\x1b[{ext};2;{r};{g};{b}m"),
+    };
 }
 
 /// 与えられた rows × cols の cell grid を plaintext 化する。
@@ -760,6 +787,98 @@ mod tests {
         assert!(
             out.windows(b"L3".len()).any(|w| w == b"L3"),
             "ANSI scrollback should contain L3 marker"
+        );
+    }
+
+    /// 色 / 属性付きの画面を visible (`state_formatted()`) と both (`rows_to_ansi`) で
+    /// dump し、同じ parser で再生した cell が一致する。
+    #[test]
+    fn both_ansi_matches_visible_cells_with_colors() {
+        let input: &[u8] = b"\x1b[31mred\x1b[0m \x1b[91mbrt\x1b[0m \x1b[38;5;200mi200\x1b[0m \x1b[48;5;21mbg21\x1b[0m\r\n\
+\x1b[38;2;10;20;30;48;2;200;100;50mrgb\x1b[0m \x1b[1;2;3;4;7;32;44mattrs\x1b[0m \x1b[102;34mmix\x1b[0m \x1b[2mdim\x1b[0m\r\n";
+        let mut s = ScreenState::new(4, 40, 10);
+        s.process(input);
+        let visible = build_screen_dump(&mut s, ScreenDumpFormat::Ansi, ScreenDumpLayer::Visible)
+            .expect("visible");
+        let both =
+            build_screen_dump(&mut s, ScreenDumpFormat::Ansi, ScreenDumpLayer::Both).expect("both");
+        let mut pv = ScreenState::new(4, 40, 10);
+        pv.process(&visible);
+        // both は各行末に `\r\n` を出すので、再生側は行数に余裕を持たせてスクロールさせない。
+        let mut pb = ScreenState::new(20, 40, 10);
+        pb.process(&both);
+        // rows_to_ansi は空 cell を半角 space で出す (= 見た目は同じ)。比較では同一視する。
+        let norm = |t: &str| {
+            if t.is_empty() {
+                " ".to_string()
+            } else {
+                t.to_string()
+            }
+        };
+        let mut checked_colored = 0;
+        for r in 0..4 {
+            for c in 0..40 {
+                let (a, b) = (
+                    pv.screen().cell(r, c).unwrap(),
+                    pb.screen().cell(r, c).unwrap(),
+                );
+                assert_eq!(
+                    (
+                        norm(a.contents()),
+                        a.fgcolor(),
+                        a.bgcolor(),
+                        a.bold(),
+                        a.dim(),
+                        a.italic(),
+                        a.underline(),
+                        a.inverse()
+                    ),
+                    (
+                        norm(b.contents()),
+                        b.fgcolor(),
+                        b.bgcolor(),
+                        b.bold(),
+                        b.dim(),
+                        b.italic(),
+                        b.underline(),
+                        b.inverse()
+                    ),
+                    "cell ({r},{c}) differs"
+                );
+                if a.fgcolor() != vt100::Color::Default || a.bgcolor() != vt100::Color::Default {
+                    checked_colored += 1;
+                }
+            }
+        }
+        assert!(
+            checked_colored >= 20,
+            "colored cells must exist: {checked_colored}"
+        );
+        // 元画面とも一致 (色の spot check)
+        assert_eq!(
+            pb.screen().cell(0, 0).unwrap().fgcolor(),
+            vt100::Color::Idx(1)
+        );
+        assert_eq!(
+            pb.screen().cell(1, 0).unwrap().bgcolor(),
+            vt100::Color::Rgb(200, 100, 50)
+        );
+    }
+
+    /// scrollback に流れた色付き行も both layer で色を保つ。
+    #[test]
+    fn both_ansi_keeps_color_in_scrollback() {
+        let mut s = ScreenState::new(3, 10, 10);
+        s.process(b"\x1b[38;5;200mFIRST\x1b[0m\r\n");
+        for i in 0..6 {
+            s.process(format!("L{i}\r\n").as_bytes());
+        }
+        let out = build_screen_dump(&mut s, ScreenDumpFormat::Ansi, ScreenDumpLayer::Scrollback)
+            .expect("sb");
+        assert!(
+            out.windows(b"\x1b[38;5;200m".len())
+                .any(|w| w == b"\x1b[38;5;200m"),
+            "scrollback ANSI must keep fg color: {out:?}"
         );
     }
 

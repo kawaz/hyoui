@@ -391,6 +391,12 @@ pub(crate) struct RowCellSnap {
     /// 2 underline / 3 inverse)。Phase B では bool 個別保持ではなく u8 で
     /// 4 フラグだけまとめる (snapshot wrapper 側で詳細を圧縮するため)。
     pub attrs: u8,
+    /// dim (SGR 2)。CBOR の `attrs` bit 配置を変えないため bit pack とは別に持つ。
+    pub dim: bool,
+    /// 前景色 (vt100 の `Color` そのまま)。
+    pub fg: vt100::Color,
+    /// 背景色 (vt100 の `Color` そのまま)。
+    pub bg: vt100::Color,
 }
 
 impl RowCellSnap {
@@ -413,6 +419,9 @@ impl RowCellSnap {
             is_wide: cell.is_wide(),
             is_wide_continuation: cell.is_wide_continuation(),
             attrs,
+            dim: cell.dim(),
+            fg: cell.fgcolor(),
+            bg: cell.bgcolor(),
         }
     }
 }
