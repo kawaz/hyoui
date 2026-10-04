@@ -1,8 +1,9 @@
 //! `auth.json` / `pending.json` の read-modify-write (DR-0036 決定 4)。
 //!
-//! 置き場は `$XDG_STATE_HOME/hyoui-web/` で、DR-0034 決定 2 が作った
-//! `units/` / `logs/` / `supervisor.sock` にこの 2 file を並べる。root を
-//! `hyoui/` にしないのは、そちらが session discovery の走査 base だからである。
+//! 置き場は web の状態の置き場 (`$XDG_STATE_HOME/hyoui/web/`、DR-0038 決定 4) で、
+//! 登録簿の `units/` / `logs/` と同じ dir にこの 2 file を並べる。場所は
+//! [`hyoui::paths::Env::web_state_dir`] が導く (= `web service register` が固定する
+//! env と同じ一覧で導く)。
 //!
 //! ## 書き手が複数いる
 //!
@@ -83,24 +84,9 @@ pub struct StateDir {
 }
 
 impl StateDir {
-    /// `$XDG_STATE_HOME/hyoui-web/` (DR-0034 決定 2 と同じ root)。
+    /// web の状態の置き場 (DR-0038 決定 4、登録簿と同じ dir)。
     pub fn default_root() -> Self {
-        Self::from_env(
-            std::env::var_os("XDG_STATE_HOME").as_deref(),
-            std::env::var_os("HOME").as_deref(),
-        )
-    }
-
-    /// env を引数で受ける形 (= env を触らずに test する口)。
-    fn from_env(state_home: Option<&std::ffi::OsStr>, home: Option<&std::ffi::OsStr>) -> Self {
-        let root = if let Some(state_home) = state_home.filter(|value| !value.is_empty()) {
-            PathBuf::from(state_home).join("hyoui-web")
-        } else if let Some(home) = home.filter(|value| !value.is_empty()) {
-            PathBuf::from(home).join(".local/state/hyoui-web")
-        } else {
-            PathBuf::from(".local/state/hyoui-web")
-        };
-        Self { root }
+        Self::at(hyoui::paths::Env::current().web_state_dir())
     }
 
     /// root を明示して開く (= test / 隔離 `XDG_STATE_HOME`)。
@@ -109,9 +95,13 @@ impl StateDir {
     }
 
     /// `XDG_STATE_HOME` 相当の dir から導出する (= test が gateway と同じ計算で
-    /// 置き場に到達する口)。`hyoui-web/` の 1 段を test 側に書き写させない。
+    /// 置き場に到達する口)。`hyoui/web/` の段を test 側に書き写させない。
     pub fn under_state_home(state_home: impl AsRef<Path>) -> Self {
-        Self::from_env(Some(state_home.as_ref().as_os_str()), None)
+        let state_home = state_home.as_ref().as_os_str().to_os_string();
+        let env = hyoui::paths::Env::from_lookup(|name| {
+            (name == hyoui::paths::LocationVar::XdgStateHome.name()).then(|| state_home.clone())
+        });
+        Self::at(env.web_state_dir())
     }
 
     /// root の path。
@@ -275,22 +265,18 @@ mod tests {
         counters: BTreeMap<String, u64>,
     }
 
+    /// auth.json / pending.json は登録簿と同じ web の状態の置き場に並ぶ (DR-0038 決定 4)。
     #[test]
-    fn state_dir_follows_dr0034_root() {
-        let dir = StateDir::from_env(Some("/tmp/state".as_ref()), None);
-        assert_eq!(dir.root(), Path::new("/tmp/state/hyoui-web"));
+    fn state_dir_is_the_web_state_dir() {
+        let dir = StateDir::under_state_home("/tmp/state");
+        assert_eq!(dir.root(), Path::new("/tmp/state/hyoui/web"));
         assert_eq!(
             dir.auth().path(),
-            Path::new("/tmp/state/hyoui-web/auth.json")
+            Path::new("/tmp/state/hyoui/web/auth.json")
         );
         assert_eq!(
             dir.pending().path(),
-            Path::new("/tmp/state/hyoui-web/pending.json")
-        );
-        let from_home = StateDir::from_env(None, Some("/home/someone".as_ref()));
-        assert_eq!(
-            from_home.root(),
-            Path::new("/home/someone/.local/state/hyoui-web")
+            Path::new("/tmp/state/hyoui/web/pending.json")
         );
     }
 

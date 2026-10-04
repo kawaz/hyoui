@@ -1,7 +1,7 @@
 //! `hyoui web passkey` / `hyoui web session` (DR-0036 決定 2 / 決定 4 / 決定 5)。
 //!
 //! **どのコマンドも gateway に要求を送らない。** CLI が
-//! `$XDG_STATE_HOME/hyoui-web/{auth,pending}.json` を直に読み書きし、gateway は
+//! `$XDG_STATE_HOME/hyoui/web/{auth,pending}.json` を直に読み書きし、gateway は
 //! 読むだけである (決定 2 / 決定 4)。これで 2 つのことが同時に成り立つ:
 //!
 //! - **gateway に管理用の経路を足さずに済む。** 登録 URL の発行に gateway の生存が

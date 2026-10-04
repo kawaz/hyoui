@@ -6,6 +6,7 @@
 //! field 名は llm-gateway から引き写さず hyoui として決めている (決定 4): 識別子は
 //! `name`、時刻は ISO 8601 の絶対時刻、単位を名前に埋めない。
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -82,10 +83,15 @@ pub struct UnitStatus {
     pub pid: Option<u32>,
     /// 今の子が起きた時刻 (ISO 8601)。
     pub started_at: Option<String>,
-    /// bind 先。
-    pub listen: String,
+    /// この unit の config ファイル (= 登録簿が指す先、DR-0038 決定 2)。
+    pub config: PathBuf,
+    /// bind 先 (= config の `[web].listen`)。config が読めなければ `None`。
+    pub listen: Option<String>,
+    /// config が読めなかった理由 (= `listen: None` の原因)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_error: Option<String>,
     /// この unit が起動する実行ファイル。
-    pub binary: PathBuf,
+    pub binary_path: PathBuf,
     /// その実行ファイルが今あるか (= `running: false` の原因が読める)。
     pub binary_exists: bool,
     /// 走っている版と置いてある版。
@@ -103,7 +109,7 @@ pub struct UnitStatus {
 pub struct VersionPair {
     /// 動いているプロセス自身が答えた版。答えない版なら `None`。
     pub running: Option<VersionInfo>,
-    /// `binary` を実行して `--version` を聞いた版。次に上がる時の版。
+    /// `binary_path` を実行して `--version` を聞いた版。次に上がる時の版。
     pub on_disk: Option<VersionInfo>,
     /// 両方分かって食い違う時だけ `true`。
     pub restart_needed: bool,
@@ -134,9 +140,49 @@ pub struct SupervisorInfo {
     /// 監督者の pid。
     pub pid: u32,
     /// 監督者が走らせている実行ファイル。
-    pub binary: PathBuf,
+    pub binary_path: PathBuf,
     /// 監督者がメモリに載せている版 (= 本人しか言えない)。
     pub version: VersionInfo,
+    /// 監督者が場所を導いた env の値 (= [`hyoui::paths::LocationVar`] ごと、未設定は
+    /// `None`)。client が自分の導出と比べ、食い違いを警告する (DR-0038 決定 5)。
+    /// 名乗らない監督者 (= 空) とは比べない。
+    #[serde(default)]
+    pub locations: BTreeMap<String, Option<String>>,
+}
+
+/// この process が場所を導く env の値 (= [`SupervisorInfo::locations`] の形)。
+pub fn current_locations() -> BTreeMap<String, Option<String>> {
+    let env = hyoui::paths::Env::current();
+    hyoui::paths::LocationVar::ALL
+        .iter()
+        .map(|var| {
+            (
+                var.name().to_string(),
+                env.get(*var)
+                    .map(|value| value.to_string_lossy().into_owned()),
+            )
+        })
+        .collect()
+}
+
+/// 監督者が名乗った場所と自分の場所の食い違い (= 警告文)。名乗らなければ無し。
+pub fn location_drift(supervisor: &BTreeMap<String, Option<String>>) -> Vec<String> {
+    if supervisor.is_empty() {
+        return Vec::new();
+    }
+    let mine = current_locations();
+    mine.iter()
+        .filter_map(|(name, value)| {
+            let theirs = supervisor.get(name).cloned().flatten();
+            (theirs != *value).then(|| {
+                format!(
+                    "the supervisor sees {name}={} but this shell has {name}={}; they derive different locations (re-run `hyoui web service register --force` from the shell whose locations should win)",
+                    theirs.as_deref().unwrap_or("(unset)"),
+                    value.as_deref().unwrap_or("(unset)")
+                )
+            })
+        })
+        .collect()
 }
 
 /// 監督者からの応答。
@@ -369,6 +415,28 @@ mod tests {
         );
     }
 
+    /// 名乗った場所が自分と同じなら黙り、違えば変数ごとに言う。名乗らない監督者
+    /// (= 古い版) とは比べない (DR-0038 決定 5)。
+    #[test]
+    fn location_drift_is_reported_per_variable() {
+        let mine = current_locations();
+        assert!(location_drift(&mine).is_empty());
+        assert!(location_drift(&BTreeMap::new()).is_empty());
+
+        let mut theirs = mine.clone();
+        theirs.insert(
+            "XDG_STATE_HOME".to_string(),
+            Some("/somewhere/else".to_string()),
+        );
+        let drift = location_drift(&theirs);
+        assert_eq!(drift.len(), 1, "{drift:?}");
+        assert!(
+            drift[0].contains("XDG_STATE_HOME=/somewhere/else"),
+            "{drift:?}"
+        );
+        assert!(drift[0].contains("--force"), "{drift:?}");
+    }
+
     #[test]
     fn supervisor_absence_carries_a_hint() {
         let error = ErrorBody::supervisor_not_running();
@@ -405,8 +473,10 @@ mod tests {
                 running: true,
                 pid: Some(4242),
                 started_at: Some("2026-09-15T16:02:31Z".to_string()),
-                listen: "127.0.0.1:43691".to_string(),
-                binary: PathBuf::from("/tmp/hyoui"),
+                config: PathBuf::from("/c/unstable.toml"),
+                listen: Some("127.0.0.1:43691".to_string()),
+                config_error: None,
+                binary_path: PathBuf::from("/tmp/hyoui"),
                 binary_exists: true,
                 version: VersionPair::new(Some(version("0.9.44", Some("9f0e1d2"))), None),
                 restarts: 0,
@@ -414,8 +484,9 @@ mod tests {
             }],
             supervisor: SupervisorInfo {
                 pid: 4211,
-                binary: PathBuf::from("/opt/homebrew/bin/hyoui"),
+                binary_path: PathBuf::from("/opt/homebrew/bin/hyoui"),
                 version: version("0.9.44", None),
+                locations: current_locations(),
             },
             notes: vec!["skipped `stable` because it is stopped".to_string()],
         };

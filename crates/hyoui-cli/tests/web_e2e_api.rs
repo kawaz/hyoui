@@ -1,12 +1,12 @@
-//! DR-0027 Phase 1 e2e: `hyoui web` subcommand を実 subprocess として起動し、
+//! DR-0027 Phase 1 e2e: web gateway (`hyoui web daemon run`) を実 subprocess として起動し、
 //! 実 daemon (`hyoui run --detached`) と組み合わせて API 3 endpoint を検証する。
 //!
 //! ## test 内容
 //!
 //! 1. tempdir を `XDG_RUNTIME_DIR` として指定
 //! 2. `hyoui run --detached --session=<sid> -- sh -c "while read...; echo"` で daemon 起動
-//! 3. 同 env で `hyoui web --listen=127.0.0.1:0` を起動
-//!    - port 0 は kernel 割り振り、bind した実 port を stderr 経由で拾う
+//! 3. 同 env で `hyoui web daemon run` を起動
+//!    - 既定の config に listen = port 0 を書く (= kernel 割り振り)、bind した実 port を stderr 経由で拾う
 //! 4. TCP 直叩きで HTTP/1.1 request を組み立て、3 endpoint を叩く
 //! 5. input POST 後、screen dump に送信文字列が現れるまで待つ
 //!
@@ -14,7 +14,7 @@
 //!
 //! 認証には無認証 mode が無いので、`/api/*` と WS attach は登録 fixture で通す。
 //! **`XDG_STATE_HOME` は必ず tempdir を指す** — `env_remove` にすると gateway が
-//! 実利用の `~/.local/state/hyoui-web/auth.json` を読み、kawaz の本番 credential に
+//! 実利用の `~/.local/state/hyoui/web/auth.json` を読み、kawaz の本番 credential に
 //! 対して test が走る。record を直に置き、access token を `Authorization: Bearer`
 //! (WS は subprotocol `hyoui.token.<値>`) で提示する。
 //!
@@ -180,7 +180,19 @@ fn cleanup(runtime: &Path, sid: &str) {
         .status();
 }
 
-/// `hyoui web --listen=127.0.0.1:0` を spawn し、bind した実 port を返す。
+/// `hyoui web daemon run` (名前なし) が読む既定の config を、`XDG_STATE_HOME` の隣の
+/// 隔離 dir に置いて返す (DR-0038 決定 2)。listen は port 0 (= kernel に任せる) で、
+/// 実際に bind した port は gateway が stderr に書く 1 行から拾う。
+fn ephemeral_config_home(state: &Path) -> PathBuf {
+    let config_home = state.join("config-home");
+    let dir = config_home.join("hyoui/web");
+    std::fs::create_dir_all(&dir).expect("config dir");
+    std::fs::write(dir.join("config.toml"), "[web]\nlisten = \"127.0.0.1:0\"\n")
+        .expect("write config");
+    config_home
+}
+
+/// `hyoui web daemon run` を spawn し、bind した実 port を返す。
 ///
 /// child は panic path でも `ChildGuard` 経由で kill/wait される (= zombie 防止)。
 #[allow(clippy::zombie_processes)]
@@ -189,7 +201,8 @@ fn cleanup(runtime: &Path, sid: &str) {
 /// の 1 行を stderr に書く (= lib.rs)。stderr を pipe で読み、port を parse する。
 fn spawn_web(runtime: &Path, state: &Path) -> (Child, Api) {
     let mut child = Command::new(hyoui_bin())
-        .args(["web", "--listen=127.0.0.1:0"])
+        .args(["web", "daemon", "run"])
+        .env("XDG_CONFIG_HOME", ephemeral_config_home(state))
         .env("XDG_RUNTIME_DIR", runtime)
         .env("XDG_STATE_HOME", state)
         .env_remove("HYOUI_SESSION_ID")

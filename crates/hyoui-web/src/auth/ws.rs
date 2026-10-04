@@ -350,11 +350,7 @@ mod tests {
         still_alive(&mut auth_a, Duration::from_secs(1)).await;
         still_alive(&mut auth_b, Duration::from_secs(1)).await;
 
-        let app = crate::router_with_auth(
-            hyoui::config::Config::default(),
-            None,
-            fixture.context.clone(),
-        );
+        let app = crate::router_with_auth(None, fixture.context.clone());
         let refresh = |value: &str| {
             Request::builder()
                 .method("POST")

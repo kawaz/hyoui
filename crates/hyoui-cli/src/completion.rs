@@ -191,12 +191,12 @@ _hyoui() {
     fi
 
     # `web daemon` / `web service` / `web passkey` / `web session` の nested leaf を
-    # 補完。`hyoui web` 自体は従来の gateway options。
+    # 補完。`hyoui web` 自体は名前空間で option を持たない (DR-0038 決定 2)。
     if [[ "$sub" == "web" ]]; then
         local web_sub
         web_sub="$(_hyoui_child_of web)"
         if [[ -z "$web_sub" ]]; then
-            COMPREPLY=( $(compgen -W "daemon service passkey session --listen --web-assets-dir --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "daemon service passkey session --help -h" -- "$cur") )
             return 0
         fi
         if [[ "$web_sub" == "daemon" ]]; then
@@ -209,11 +209,13 @@ _hyoui() {
             case "$daemon_sub" in
                 add)
                     case "$prev" in
-                        --binary) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                        --web-assets-dir) _filedir -d 2>/dev/null || COMPREPLY=( $(compgen -d -- "$cur") ); return 0 ;;
-                        --listen|--port) return 0 ;;
+                        --name) return 0 ;;
                     esac
-                    COMPREPLY=( $(compgen -W "--port --listen --binary --web-assets-dir --help -h" -- "$cur") )
+                    if [[ "$cur" == -* ]]; then
+                        COMPREPLY=( $(compgen -W "--name --help -h" -- "$cur") )
+                    else
+                        _filedir toml 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") )
+                    fi
                     return 0 ;;
                 start|stop|restart|status)
                     COMPREPLY=( $(compgen -W "--all --help -h" -- "$cur") )
@@ -269,7 +271,7 @@ _hyoui() {
                     case "$prev" in
                         --binary) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
                     esac
-                    COMPREPLY=( $(compgen -W "--binary --help -h" -- "$cur") )
+                    COMPREPLY=( $(compgen -W "--binary --force --help -h" -- "$cur") )
                     return 0 ;;
                 log)
                     COMPREPLY=( $(compgen -W "--follow --help -h" -- "$cur") )
@@ -389,13 +391,6 @@ _hyoui() {
                 --namespace|--index|--since|--last-bytes) return 0 ;;
             esac
             COMPREPLY=( $(compgen -W "--socket --namespace --index --follow --strip-ansi --since --since-strict --last-bytes --help -h" -- "$cur") )
-            return 0 ;;
-        web)
-            case "$prev" in
-                --web-assets-dir) _filedir -d 2>/dev/null || COMPREPLY=( $(compgen -d -- "$cur") ); return 0 ;;
-                --listen) return 0 ;;
-            esac
-            COMPREPLY=( $(compgen -W "--listen --web-assets-dir --help -h" -- "$cur") )
             return 0 ;;
         wait)
             case "$prev" in
@@ -597,7 +592,7 @@ _hyoui_subcommands() {
         'unlock:Release a session lock (= lock release alias)'
         'detach:Detach all attached clients from a session'
         'record:Record tty I/O timeline (start, stop, list)'
-        'web:Start the HTTP gateway (REST + HTML UI, DR-0027)'
+        'web:Manage the HTTP gateway (daemon, service, passkey, session)'
         'upgrade:Trigger daemon graceful self-exec upgrade (DR-0028)'
         'config:Inspect the user config file (path, show)'
         'version:Print the versions in place and the versions running (DR-0034)'
@@ -768,6 +763,7 @@ _hyoui_service() {
         register)
             _arguments \
                 '--binary=[Executable to bake in as the supervisor]:binary:_files' \
+                '--force[Replace pinned locations that differ from this shell]' \
                 '(-h --help)'{-h,--help}'[Show help]'
             ;;
         log)
@@ -797,12 +793,9 @@ _hyoui_daemon() {
     case $leaf in
         add)
             _arguments \
-                '--port=[Short form of --listen=127.0.0.1:<n>]:port:' \
-                '--listen=[Bind address host:port]:address:' \
-                '--binary=[Executable this unit starts]:binary:_files' \
-                '--web-assets-dir=[Serve static assets from a local directory]:dir:_files -/' \
+                '--name=[Unit name (default: the config file name without extension)]:unit name:' \
                 '(-h --help)'{-h,--help}'[Show help]' \
-                '1:unit name:'
+                '1:config file:_files -g "*.toml"'
             ;;
         start|stop|restart|status)
             _arguments \
@@ -844,8 +837,6 @@ _hyoui_web() {
         _hyoui_web_session
     else
         _arguments \
-            '--listen=[Bind address host:port (default 127.0.0.1:43690)]:address:' \
-            '--web-assets-dir=[Serve static assets from a local directory]:dir:_files -/' \
             '1:subcommand:(daemon service passkey session)' \
             '(-h --help)'{-h,--help}'[Show help]'
     fi
@@ -1152,7 +1143,7 @@ complete -c hyoui -n __hyoui_no_subcommand -f -a lock       -d 'Acquire / releas
 complete -c hyoui -n __hyoui_no_subcommand -f -a unlock     -d 'Release a session lock (= lock release alias)'
 complete -c hyoui -n __hyoui_no_subcommand -f -a detach     -d 'Detach all attached clients from a session'
 complete -c hyoui -n __hyoui_no_subcommand -f -a record     -d 'Record tty I/O timeline'
-complete -c hyoui -n __hyoui_no_subcommand -f -a web        -d 'Start the HTTP gateway (REST + HTML UI, DR-0027)'
+complete -c hyoui -n __hyoui_no_subcommand -f -a web        -d 'Manage the HTTP gateway (daemon, service, passkey, session)'
 complete -c hyoui -n __hyoui_no_subcommand -f -a version    -d 'Print the versions in place and the versions running (DR-0034)'
 complete -c hyoui -n __hyoui_no_subcommand -f -a upgrade    -d 'Trigger daemon graceful self-exec upgrade (DR-0028)'
 complete -c hyoui -n __hyoui_no_subcommand -f -a config     -d 'Inspect the user config file (path, show)'
@@ -1319,10 +1310,8 @@ complete -c hyoui -n '__hyoui_using_subcommand detach' -l index  -x    -d 'Sessi
 complete -c hyoui -n '__hyoui_using_subcommand detach' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand detach' -s h -l help    -d 'Show help and exit'
 
-# `hyoui web` gateway options + `web service` / `web passkey` / `web session`
-# family (DR-0027 / DR-0031 / DR-0036)
-complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -l listen          -x    -d 'Bind address host:port (default 127.0.0.1:43690)'
-complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -l web-assets-dir  -r -F -d 'Serve static assets from a local directory'
+# `hyoui web` の子 (= 名前空間、DR-0038 決定 2) + `web service` / `web passkey` /
+# `web session` family (DR-0031 / DR-0036)
 complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -f -a daemon -d 'Manage gateway instances (units)'
 complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -f -a service -d 'Manage OS startup integration'
 complete -c hyoui -n '__hyoui_using_subcommand web; and __hyoui_child_none web' -f -a passkey -d 'Manage the passkeys that may open an endpoint'
@@ -1362,10 +1351,8 @@ complete -c hyoui -n '__hyoui_daemon_using_sub log' -l all -d 'Read every unit l
 complete -c hyoui -n '__hyoui_daemon_using_sub log' -l follow -d 'Keep printing lines as they are written'
 complete -c hyoui -n '__hyoui_daemon_using_sub log' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_daemon_using_sub supervise' -s h -l help -d 'Show help and exit'
-complete -c hyoui -n '__hyoui_daemon_using_sub add' -l port -x -d 'Short form of --listen=127.0.0.1:<n>'
-complete -c hyoui -n '__hyoui_daemon_using_sub add' -l listen -x -d 'Bind address host:port'
-complete -c hyoui -n '__hyoui_daemon_using_sub add' -l binary -r -F -d 'Executable this unit starts'
-complete -c hyoui -n '__hyoui_daemon_using_sub add' -l web-assets-dir -r -F -d 'Serve static assets from a local directory'
+complete -c hyoui -n '__hyoui_daemon_using_sub add' -l name -x -d 'Unit name (default: the config file name without extension)'
+complete -c hyoui -n '__hyoui_daemon_using_sub add' -r -F -d 'Config file of the unit'
 complete -c hyoui -n '__hyoui_daemon_using_sub add' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_daemon_using_sub run' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_daemon_using_sub remove' -s h -l help -d 'Show help and exit'
@@ -1378,6 +1365,7 @@ complete -c hyoui -n __hyoui_web_service_no_sub -f -a restart -d 'Stop and start
 complete -c hyoui -n __hyoui_web_service_no_sub -f -a status -d 'Print registration, OS state, versions, and units held'
 complete -c hyoui -n __hyoui_web_service_no_sub -f -a log -d "Print the supervisor's own log"
 complete -c hyoui -n '__hyoui_web_service_using_sub register' -l binary -r -F -d 'Executable to bake in as the supervisor'
+complete -c hyoui -n '__hyoui_web_service_using_sub register' -l force -d 'Replace pinned locations that differ from this shell'
 complete -c hyoui -n '__hyoui_web_service_using_sub register' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_web_service_using_sub unregister' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_web_service_using_sub start' -s h -l help -d 'Show help and exit'
@@ -1698,7 +1686,6 @@ mod tests {
             ("unlock", &["unlock"]),
             ("detach", &["detach"]),
             ("upgrade", &["upgrade"]),
-            ("web", &["web"]),
             ("daemon add", &["web", "daemon", "add"]),
             ("screen dump", &["screen", "dump"]),
             ("screen snapshot", &["screen", "snapshot"]),
@@ -1762,7 +1749,7 @@ mod tests {
             ("attach", &["mode", "debug-dump-client"]),
             ("tail", &["strip-ansi", "last-bytes"]),
             ("input", &["auto-lock-timeout-acquire"]),
-            ("web", &["listen", "web-assets-dir"]),
+            ("daemon add", &["name"]),
             ("upgrade", &["binary", "skip-version-check"]),
         ];
         for sh in ALL_SHELLS {
@@ -1847,7 +1834,7 @@ mod tests {
         }
     }
 
-    /// `web service` の全 leaf と register 固有 `--listen` を 3 shell で同期する。
+    /// `web service` の全 leaf と register 固有 option を 3 shell で同期する。
     #[test]
     fn completion_all_shells_cover_web_service_surface() {
         for sh in ALL_SHELLS {
@@ -1862,10 +1849,12 @@ mod tests {
                     "shell {sh:?} missing `web service {sub}`"
                 );
             }
-            assert!(
-                offers_long_opt(&script, "binary"),
-                "shell {sh:?} missing `web service register --binary`"
-            );
+            for option in ["binary", "force"] {
+                assert!(
+                    offers_long_opt(&script, option),
+                    "shell {sh:?} missing `web service register --{option}`"
+                );
+            }
         }
     }
 
@@ -1920,10 +1909,16 @@ mod tests {
                     "shell {sh:?} missing `web daemon {sub}`"
                 );
             }
-            for option in ["port", "binary", "web-assets-dir"] {
+            assert!(
+                offers_long_opt(&script, "name"),
+                "shell {sh:?} missing `web daemon add --name`"
+            );
+            // 設定値は unit の config が持つので、add も `hyoui web` も受けない
+            // (DR-0038 決定 1 / 2)。補完に残すと parser が断る flag を勧めることになる。
+            for removed in ["port", "listen", "web-assets-dir"] {
                 assert!(
-                    offers_long_opt(&script, option),
-                    "shell {sh:?} missing `web daemon add --{option}`"
+                    !offers_long_opt(&script, removed),
+                    "shell {sh:?} still offers `--{removed}`"
                 );
             }
             // 監督者へ要求する verb は対象の指定を取る。

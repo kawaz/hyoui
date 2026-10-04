@@ -147,14 +147,7 @@ pub fn resolve_in_namespace(
     session_id: &str,
     namespace: &str,
 ) -> std::io::Result<PathBuf> {
-    let env = EnvSnapshot {
-        xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR"),
-        xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
-        home_dir: std::env::var_os("HOME"),
-        uid: nix::unistd::geteuid().as_raw(),
-        namespace: namespace.to_string(),
-    };
-    resolve_with_env(explicit, session_id, &env)
+    resolve_with_env(explicit, session_id, &EnvSnapshot::current(namespace))
 }
 
 /// 環境 snapshot (test injection 用)。
@@ -171,6 +164,25 @@ pub struct EnvSnapshot {
     /// 解決済 session namespace (= DR-0018)。`default` なら base dir 直下、
     /// それ以外は base dir 配下に `<namespace>/` サブ dir を掘る。
     pub namespace: String,
+}
+
+impl EnvSnapshot {
+    /// この process の env から組む。
+    ///
+    /// 読む変数は [`hyoui::paths::LocationVar`] の列挙に従う (= `web service register`
+    /// が unit に固定する変数と同じ一覧、DR-0038 決定 5)。
+    pub fn current(namespace: &str) -> Self {
+        use hyoui::paths::LocationVar;
+        let env = hyoui::paths::Env::current();
+        let owned = |var: LocationVar| env.get(var).map(std::ffi::OsStr::to_os_string);
+        Self {
+            xdg_runtime_dir: owned(LocationVar::XdgRuntimeDir),
+            xdg_state_home: owned(LocationVar::XdgStateHome),
+            home_dir: owned(LocationVar::Home),
+            uid: nix::unistd::geteuid().as_raw(),
+            namespace: namespace.to_string(),
+        }
+    }
 }
 
 /// `resolve` の env を呼び出し側で注入できる test 用版。
@@ -250,13 +262,7 @@ fn pick_base_dir(env: &EnvSnapshot) -> std::io::Result<PathBuf> {
 /// `hyoui list` が走査する、現在実在する base socket dir を優先順で返す。
 /// resolver と同じ環境 snapshot / fallback 規則を使い、起動と列挙の path drift を防ぐ。
 pub fn existing_base_dirs() -> Vec<PathBuf> {
-    let env = EnvSnapshot {
-        xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR"),
-        xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
-        home_dir: std::env::var_os("HOME"),
-        uid: nix::unistd::geteuid().as_raw(),
-        namespace: hyoui::cli::DEFAULT_NAMESPACE.to_string(),
-    };
+    let env = EnvSnapshot::current(hyoui::cli::DEFAULT_NAMESPACE);
     let mut dirs = Vec::new();
     if let Some(runtime) = env.xdg_runtime_dir.as_ref()
         && !runtime.is_empty()

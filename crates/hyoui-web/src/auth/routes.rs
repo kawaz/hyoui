@@ -75,7 +75,7 @@ pub struct AuthContext {
 }
 
 impl AuthContext {
-    /// 既定の置き場 (`$XDG_STATE_HOME/hyoui-web/`) で組む。
+    /// 既定の置き場 (`$XDG_STATE_HOME/hyoui/web/`) で組む。
     pub fn new() -> Self {
         Self::at(StateDir::default_root())
     }

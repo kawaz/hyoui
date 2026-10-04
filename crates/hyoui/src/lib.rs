@@ -60,6 +60,9 @@ pub mod input_bytes;
 
 pub mod version;
 
+// 置き場所 (config / state / runtime) を env から導く唯一の口 (DR-0038 決定 5)。
+pub mod paths;
+
 // 時刻の表記 (= unit 登録簿の `added_at` と web の認証期限が同じ形を出す)。
 pub mod time;
 

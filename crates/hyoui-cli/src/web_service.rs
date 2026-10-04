@@ -20,8 +20,6 @@ use stable_which::{Candidate, ScoringPolicy, resolve_stable_path};
 /// と同時に載っても互いを踏まない。
 pub const MACOS_LABEL: &str = "jp.kawaz.hyoui-web.supervise";
 pub const LINUX_LABEL: &str = "hyoui-web-supervise";
-const SERVICE_PATH: &str =
-    "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// launchd / systemd user に共通するサービスの意味記述。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,21 +35,29 @@ impl ServiceDefinition {
     /// 監督者 1 つを載せる定義 (= 決定 6)。
     ///
     /// argv は `<binary> web daemon supervise` の 4 語で、unit の数や名前は入らない。
-    /// unit を足しても消しても、この定義は 1 文字も変わらない。
-    pub fn for_supervisor(program: &str, log_path: Option<String>) -> Self {
-        Self::labelled(&default_label(), program, log_path)
+    /// unit を足しても消しても、この定義は 1 文字も変わらない。`env` は
+    /// [`pinned_env`] が作る固定値 (DR-0038 決定 5)。
+    pub fn for_supervisor(
+        program: &str,
+        log_path: Option<String>,
+        env: BTreeMap<String, String>,
+    ) -> Self {
+        Self::labelled(&default_label(), program, log_path, env)
     }
 
     /// label を明示して組み立てる (= 隔離 label での実機確認と golden test 用)。
-    pub fn labelled(label: &str, program: &str, log_path: Option<String>) -> Self {
+    pub fn labelled(
+        label: &str,
+        program: &str,
+        log_path: Option<String>,
+        env: BTreeMap<String, String>,
+    ) -> Self {
         let program_args = vec![
             program.to_string(),
             "web".to_string(),
             "daemon".to_string(),
             "supervise".to_string(),
         ];
-        let mut env = BTreeMap::new();
-        env.insert("PATH".to_string(), SERVICE_PATH.to_string());
         Self {
             label: label.to_string(),
             program_args,
@@ -94,24 +100,87 @@ pub fn default_label() -> String {
         .unwrap_or_else(|| builtin_label().to_string())
 }
 
-/// 監督者のログの置き場 (= 決定 6)。
+/// 定義に固定する env (DR-0038 決定 5)。
 ///
-/// 子 gateway のログは監督者が `logs/<name>.log` に集める (決定 9)。ここに来るのは
-/// 監督者自身が書いたものだけ。
-pub fn default_log_path() -> Option<String> {
-    log_path_for(&default_label())
+/// 場所の導出に効く変数は [`hyoui::paths::LocationVar`] の列挙そのもので、ここに
+/// 別のリストを持たない。値の無い変数は書かない (= 「無い」ことも固定される。
+/// launchd / systemd は shell の env を継承しないので、書かなければ無い)。`PATH` も
+/// 同じ枡で固定し、重複と空要素を落として並びを保つ (= register を繰り返しても
+/// 積もらない)。
+pub fn pinned_env(
+    locations: &hyoui::paths::Env,
+    path: Option<&std::ffi::OsStr>,
+) -> BTreeMap<String, String> {
+    let mut env: BTreeMap<String, String> = hyoui::paths::LocationVar::ALL
+        .iter()
+        .filter_map(|var| {
+            locations
+                .get(*var)
+                .map(|value| (var.name().to_string(), value.to_string_lossy().into_owned()))
+        })
+        .collect();
+    if let Some(path) = path.map(|value| normalize_path_var(&value.to_string_lossy()))
+        && !path.is_empty()
+    {
+        env.insert("PATH".to_string(), path);
+    }
+    env
 }
 
-/// label ごとのログ path (= 隔離 label で実機確認する時に分けるため)。
-pub fn log_path_for(label: &str) -> Option<String> {
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(|home| {
-            PathBuf::from(home)
-                .join(format!("Library/Logs/hyoui-web/{label}.log"))
-                .to_string_lossy()
-                .into_owned()
+/// `PATH` の重複と空要素を落とす (= 最初に現れた位置を残す)。
+pub fn normalize_path_var(path: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    path.split(':')
+        .filter(|entry| !entry.is_empty() && seen.insert(*entry))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// 既存の定義に固定された場所の env と、これから書く値の食い違い (DR-0038 決定 5)。
+///
+/// 比べるのは [`hyoui::paths::LocationVar`] だけ。`PATH` は場所を導かないので
+/// 比べない (= shell ごとに違うのが普通で、違っても置き場は食い違わない)。
+pub fn pinned_location_drift(
+    registered: &BTreeMap<String, String>,
+    current: &BTreeMap<String, String>,
+) -> Vec<LocationDifference> {
+    hyoui::paths::LocationVar::ALL
+        .iter()
+        .filter_map(|var| {
+            let name = var.name();
+            let before = registered.get(name);
+            let after = current.get(name);
+            (before != after).then(|| LocationDifference {
+                name: name.to_string(),
+                registered: before.cloned(),
+                current: after.cloned(),
+            })
         })
+        .collect()
+}
+
+/// 固定された値と今の値の差 1 つ (`None` = 未設定)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LocationDifference {
+    /// 変数名。
+    pub name: String,
+    /// 定義に固定されている値。
+    pub registered: Option<String>,
+    /// 今の shell の値。
+    pub current: Option<String>,
+}
+
+/// 監督者のログの置き場 (= 決定 6、DR-0038 決定 4)。
+///
+/// 子 gateway のログと同じ `logs/` に、label の名前で置く (= unit 名は `.` を含め
+/// ないので衝突しない。label を変えれば隔離 label の実機確認でも分かれる)。ここに
+/// 来るのは監督者自身が書いたものだけ。
+pub fn log_path_for(env: &hyoui::paths::Env, label: &str) -> String {
+    env.web_state_dir()
+        .join("logs")
+        .join(format!("{label}.log"))
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -286,6 +355,44 @@ pub fn register(backend: &dyn Backend, def: &ServiceDefinition) -> Result<bool, 
     Ok(true)
 }
 
+/// `register` を断った理由。
+#[derive(Debug)]
+pub enum RegisterError {
+    /// 既存の定義が別の場所を固定している (DR-0038 決定 5)。
+    Drift {
+        /// 既存の定義ファイル。
+        path: PathBuf,
+        /// 変数ごとの差。
+        differences: Vec<LocationDifference>,
+    },
+    /// OS に載せられなかった。
+    Failed(String),
+}
+
+/// 既存の定義が固定した場所と食い違っていれば止まり、そうでなければ [`register`] する。
+///
+/// 黙って書き換えると、監督者と既存の client の片方が別の dir を見続ける。止める側に
+/// 倒すのは、この食い違いが起きた時に気づく手段が他に無いから (reference
+/// `cli-daemon-subcommands`)。`force` で押し切る。
+pub fn register_checked(
+    backend: &dyn Backend,
+    def: &ServiceDefinition,
+    force: bool,
+) -> Result<bool, RegisterError> {
+    if !force {
+        let path = backend
+            .definition_path(&def.label)
+            .map_err(RegisterError::Failed)?;
+        if let Ok(existing) = std::fs::read_to_string(&path) {
+            let differences = pinned_location_drift(&env_in_definition(&existing), &def.env);
+            if !differences.is_empty() {
+                return Err(RegisterError::Drift { path, differences });
+            }
+        }
+    }
+    register(backend, def).map_err(RegisterError::Failed)
+}
+
 /// この OS 向けの定義テキスト。
 pub fn render_definition(def: &ServiceDefinition) -> String {
     #[cfg(target_os = "macos")]
@@ -313,19 +420,20 @@ pub fn backend() -> Result<Box<dyn Backend>, String> {
     Err("web service is supported only on macOS and Linux".to_string())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn home_dir() -> Result<PathBuf, String> {
-    std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+    hyoui::paths::Env::current()
+        .home()
+        .map(Path::to_path_buf)
         .ok_or_else(|| "$HOME is not set; cannot resolve the per-user service path".to_string())
 }
 
 #[cfg(target_os = "linux")]
 fn systemd_config_home() -> Result<PathBuf, String> {
-    Ok(std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or(home_dir()?.join(".config")))
+    hyoui::paths::Env::current().config_home().ok_or_else(|| {
+        "neither $XDG_CONFIG_HOME nor $HOME is set; cannot resolve the per-user service path"
+            .to_string()
+    })
 }
 
 fn command_output(program: &str, args: &[&str]) -> Result<std::process::Output, String> {
@@ -472,9 +580,16 @@ impl Backend for LaunchdBackend {
     }
 
     fn log_source(&self, label: &str) -> Result<LogSource, String> {
-        log_path_for(label)
-            .map(|path| LogSource::File(PathBuf::from(path)))
-            .ok_or_else(|| "$HOME is not set; cannot resolve the supervisor log".to_string())
+        // 書き手 (= 監督者) が使っている path は定義に焼かれている。今の shell の
+        // env から導くと、固定値と食い違った時に別のファイルを読む。
+        let from_definition = self
+            .definition_path(label)
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| log_path_in_definition(&text));
+        Ok(LogSource::File(PathBuf::from(
+            from_definition.unwrap_or_else(|| log_path_for(&hyoui::paths::Env::current(), label)),
+        )))
     }
 }
 
@@ -633,6 +748,93 @@ pub fn program_in_definition(text: &str) -> Option<String> {
     Some(program.to_string()).filter(|value| !value.is_empty())
 }
 
+/// 定義に固定された env を読む (= `EnvironmentVariables` / `Environment=`)。
+///
+/// 読むのは自分が描いた形だけで、手書きの定義を汎用に解釈する parser ではない
+/// (DR-0034 決定 2 と同じ線引き)。
+pub fn env_in_definition(text: &str) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    if let Some((_, rest)) = text.split_once("<key>EnvironmentVariables</key>") {
+        let Some((_, inside)) = rest.split_once("<dict>") else {
+            return env;
+        };
+        let Some((dict, _)) = inside.split_once("</dict>") else {
+            return env;
+        };
+        let mut rest = dict;
+        while let Some((_, after_key)) = rest.split_once("<key>") {
+            let Some((key, after)) = after_key.split_once("</key>") else {
+                break;
+            };
+            let Some((_, after_open)) = after.split_once("<string>") else {
+                break;
+            };
+            let Some((value, tail)) = after_open.split_once("</string>") else {
+                break;
+            };
+            env.insert(xml_unescape(key.trim()), xml_unescape(value));
+            rest = tail;
+        }
+        return env;
+    }
+    for line in text.lines() {
+        let Some(quoted) = line.trim().strip_prefix("Environment=") else {
+            continue;
+        };
+        let Some(inner) = quoted
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+        else {
+            continue;
+        };
+        let unquoted = systemd_unquote(inner);
+        if let Some((key, value)) = unquoted.split_once('=') {
+            env.insert(key.to_string(), value.to_string());
+        }
+    }
+    env
+}
+
+/// 定義に焼かれた監督者のログの path (launchd の `StandardOutPath`)。
+pub fn log_path_in_definition(text: &str) -> Option<String> {
+    let (_, rest) = text.split_once("<key>StandardOutPath</key>")?;
+    let (_, after) = rest.split_once("<string>")?;
+    let (value, _) = after.split_once("</string>")?;
+    Some(xml_unescape(value)).filter(|value| !value.is_empty())
+}
+
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn systemd_unquote(value: &str) -> String {
+    let mut out = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some(other) => out.push(other),
+                None => {}
+            },
+            '%' => {
+                // `%%` は `%` 1 つ (= systemd_quote の対)。
+                if chars.clone().next() == Some('%') {
+                    chars.next();
+                }
+                out.push('%');
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 pub struct ResolvedProgram {
     pub path: PathBuf,
     pub warning: Option<String>,
@@ -655,6 +857,35 @@ fn program_of_registered_definition(backend: &dyn Backend, label: &str) -> Optio
     program_in_definition(&text).map(PathBuf::from)
 }
 
+/// 登録済みの定義に固定された場所が、今の shell と食い違っていれば警告文を返す
+/// (DR-0038 決定 5、client 側の検知)。
+///
+/// 監督者に届かない時の手がかりはこれだけ (= 場所が食い違っていれば socket の
+/// 位置も食い違うので、監督者は名乗れない)。定義が無ければ比べない。
+pub fn registered_location_warnings() -> Vec<String> {
+    let Ok(backend) = backend() else {
+        return Vec::new();
+    };
+    let Ok(path) = backend.definition_path(&default_label()) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let current = pinned_env(&hyoui::paths::Env::current(), None);
+    pinned_location_drift(&env_in_definition(&text), &current)
+        .into_iter()
+        .map(|difference| {
+            format!(
+                "the supervisor is registered with {name}={} but this shell has {name}={}; they derive different locations (re-run `hyoui web service register --force` from the shell whose locations should win)",
+                difference.registered.as_deref().unwrap_or("(unset)"),
+                difference.current.as_deref().unwrap_or("(unset)"),
+                name = difference.name,
+            )
+        })
+        .collect()
+}
+
 /// 監督者の版の組を作る (= 決定 7a、`service status` と `hyoui version` の共通経路)。
 ///
 /// `running` は走っている本人が制御 socket で答えたもの、`on_disk` は OS 側の定義に
@@ -674,8 +905,8 @@ pub fn supervisor_version() -> Option<(VersionPair, PathBuf)> {
     Some((VersionPair::new(running, on_disk), binary))
 }
 
-/// `hyoui web service register [--binary=<path>]`。
-pub fn register_command(binary: Option<PathBuf>) -> ExitCode {
+/// `hyoui web service register [--binary=<path>] [--force]`。
+pub fn register_command(binary: Option<PathBuf>, force: bool) -> ExitCode {
     let context = "web service register";
     let backend = match backend() {
         Ok(backend) => backend,
@@ -710,22 +941,43 @@ pub fn register_command(binary: Option<PathBuf>) -> ExitCode {
     let label = default_label();
     // launchd は StandardOutPath でファイルに落とす、systemd は journald が拾うので
     // 定義に log path を書かない (決定 6)。
+    let locations = hyoui::paths::Env::current();
+    let path_var = std::env::var_os("PATH");
     let definition = ServiceDefinition::for_supervisor(
         &program.to_string_lossy(),
-        default_log_path().filter(|_| cfg!(target_os = "macos")),
+        cfg!(target_os = "macos").then(|| log_path_for(&locations, &label)),
+        pinned_env(&locations, path_var.as_deref()),
     );
-    let changed = match register(backend.as_ref(), &definition) {
+
+    let changed = match register_checked(backend.as_ref(), &definition, force) {
         Ok(changed) => changed,
-        Err(error) => return fail(context, &error),
+        Err(RegisterError::Drift { path, differences }) => {
+            return fail_json(
+                context,
+                json!({
+                    "command": context,
+                    "kind": "location_env_drift",
+                    "error": format!(
+                        "{} pins different locations than this shell; nothing was changed",
+                        path.display()
+                    ),
+                    "path": path,
+                    "differences": differences,
+                    "hint": "run it from the shell whose locations the supervisor should use, or pass --force to replace the pinned values",
+                }),
+            );
+        }
+        Err(RegisterError::Failed(error)) => return fail(context, &error),
     };
     let path = backend.definition_path(&label).unwrap_or_default();
 
     let mut output = json!({
         "label": label,
         "path": path,
-        "binary": program,
+        "binary_path": program,
         "changed": changed,
         "argv": definition.program_args,
+        "env": definition.env,
     });
     if !warnings.is_empty() {
         output["warnings"] = json!(warnings);
@@ -828,14 +1080,19 @@ pub fn status_command() -> ExitCode {
         &registry::supervisor_socket_path(),
         &Request::Status(Target::all()),
     );
-    let (running, instances, supervisor_running_version) = match asked {
+    let (running, instances, supervisor_running_version, supervisor_locations) = match asked {
         Ok((
             Response::Units {
                 units, supervisor, ..
             },
             _,
-        )) => (true, json!(units), Some(supervisor.version)),
-        _ => (false, json!([]), None),
+        )) => (
+            true,
+            json!(units),
+            Some(supervisor.version),
+            Some(supervisor.locations),
+        ),
+        _ => (false, json!([]), None, None),
     };
 
     let binary = program_of_registered_definition(backend.as_ref(), &label);
@@ -844,12 +1101,12 @@ pub fn status_command() -> ExitCode {
         json!({
             "running": pair.running,
             "on_disk": pair.on_disk,
-            "binary": binary,
+            "binary_path": binary,
             "restart_needed": pair.restart_needed,
         })
     });
 
-    emit(&json!({
+    let mut output = json!({
         "label": label,
         "path": service.definition_path,
         "registered": service.registered,
@@ -858,7 +1115,20 @@ pub fn status_command() -> ExitCode {
         "service": service_json(&service),
         "version": version,
         "instances": instances,
-    }))
+    });
+    // 定義に固定された場所と、届いた監督者が名乗った場所の両方を今の shell と比べる
+    // (DR-0038 決定 5)。
+    let mut warnings = registered_location_warnings();
+    if let Some(locations) = &supervisor_locations {
+        warnings.extend(protocol::location_drift(locations));
+    }
+    if !warnings.is_empty() {
+        for warning in &warnings {
+            eprintln!("hyoui: warning: {warning}");
+        }
+        output["warnings"] = json!(warnings);
+    }
+    emit(&output)
 }
 
 /// `hyoui web service log [--follow]` (= 決定 6)。
@@ -934,6 +1204,15 @@ fn emit(value: &Value) -> ExitCode {
     }
 }
 
+/// 組み立て済みのエラー JSON を stderr に書いて非 0 で終わる。
+fn fail_json(context: &str, body: Value) -> ExitCode {
+    match serde_json::to_string_pretty(&body) {
+        Ok(text) => eprintln!("{text}"),
+        Err(_) => eprintln!("hyoui: {context}: {body}"),
+    }
+    ExitCode::from(1)
+}
+
 fn fail(context: &str, message: &str) -> ExitCode {
     match serde_json::to_string_pretty(&json!({"command": context, "error": message})) {
         Ok(text) => eprintln!("{text}"),
@@ -961,11 +1240,39 @@ pub fn resolve_program(current_exe: &Path) -> Result<ResolvedProgram, String> {
 mod tests {
     use super::*;
 
+    fn locations(pairs: &[(&str, &str)]) -> hyoui::paths::Env {
+        let pairs: Vec<(String, std::ffi::OsString)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), std::ffi::OsString::from(v)))
+            .collect();
+        hyoui::paths::Env::from_lookup(|name| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        })
+    }
+
+    fn sample_env() -> BTreeMap<String, String> {
+        pinned_env(
+            &locations(&[
+                ("HOME", "/Users/test"),
+                ("XDG_CONFIG_HOME", "/Users/test/.config"),
+                ("XDG_STATE_HOME", "/Users/test/.local/state"),
+            ]),
+            Some(std::ffi::OsStr::new("/opt/homebrew/bin:/usr/bin:/bin")),
+        )
+    }
+
     fn sample_definition() -> ServiceDefinition {
         ServiceDefinition::labelled(
             MACOS_LABEL,
             "/opt/homebrew/bin/hyoui",
-            Some("/Users/test/Library/Logs/hyoui-web/jp.kawaz.hyoui-web.supervise.log".to_string()),
+            Some(
+                "/Users/test/.local/state/hyoui/web/logs/jp.kawaz.hyoui-web.supervise.log"
+                    .to_string(),
+            ),
+            sample_env(),
         )
     }
 
@@ -1011,22 +1318,253 @@ mod tests {
     /// これが「binary 更新をまたいで安定する契約」の実体で、unit を足しても消しても
     /// この定義は変わらないので `register` をやり直す必要がない。
     #[test]
-    fn definition_builds_the_supervisor_command_and_minimal_path() {
+    fn definition_builds_the_supervisor_command() {
         let def = sample_definition();
         assert_eq!(
             def.program_args,
             ["/opt/homebrew/bin/hyoui", "web", "daemon", "supervise"]
         );
-        assert_eq!(def.env.len(), 1);
-        assert_eq!(def.env.get("PATH").map(String::as_str), Some(SERVICE_PATH));
         // 既定 label で組んでも同じ argv になる。
         assert_eq!(
-            ServiceDefinition::for_supervisor("/opt/homebrew/bin/hyoui", None).program_args,
+            ServiceDefinition::for_supervisor("/opt/homebrew/bin/hyoui", None, BTreeMap::new())
+                .program_args,
             def.program_args
         );
     }
 
-    /// launchd の golden は RunAtLoad + KeepAlive、共通 log、最小 PATH を固定する。
+    /// 固定する env は場所を導く変数の列挙そのもの + PATH。値の無い変数は書かない
+    /// (DR-0038 決定 5)。
+    #[test]
+    fn pinned_env_is_exactly_the_location_vars_that_are_set_plus_path() {
+        let env = pinned_env(
+            &locations(&[
+                ("HOME", "/h"),
+                ("XDG_STATE_HOME", "/s"),
+                ("XDG_RUNTIME_DIR", ""),
+            ]),
+            Some(std::ffi::OsStr::new("/a:/b")),
+        );
+        assert_eq!(
+            env,
+            BTreeMap::from([
+                ("HOME".to_string(), "/h".to_string()),
+                ("XDG_STATE_HOME".to_string(), "/s".to_string()),
+                ("PATH".to_string(), "/a:/b".to_string()),
+            ])
+        );
+
+        // 列挙の全変数が拾われる (= unit 生成側に別のリストが無いことの裏返し)。
+        let all: Vec<(&str, &str)> = hyoui::paths::LocationVar::ALL
+            .iter()
+            .map(|var| (var.name(), "/x"))
+            .collect();
+        let env = pinned_env(&locations(&all), None);
+        for var in hyoui::paths::LocationVar::ALL {
+            assert_eq!(
+                env.get(var.name()).map(String::as_str),
+                Some("/x"),
+                "{var:?}"
+            );
+        }
+        assert!(!env.contains_key("PATH"));
+    }
+
+    /// PATH は重複と空要素を落とし、最初に現れた位置を保つ (= 積もらない)。
+    #[test]
+    fn path_is_normalized_without_duplicates() {
+        assert_eq!(
+            normalize_path_var("/a:/b::/a:/c:/b:"),
+            "/a:/b:/c".to_string()
+        );
+        assert_eq!(normalize_path_var(""), "");
+        // 正規化は冪等。
+        let once = normalize_path_var("/x:/y:/x");
+        assert_eq!(normalize_path_var(&once), once);
+    }
+
+    /// 書いた env を両 format から読み戻せる (= re-register の差分検知の入力)。
+    #[test]
+    fn pinned_env_round_trips_through_both_definitions() {
+        let mut def = sample_definition();
+        def.env
+            .insert("XDG_RUNTIME_DIR".into(), "/run/a&b<c>%d\"e".into());
+        assert_eq!(env_in_definition(&render_launchd_plist(&def)), def.env);
+        assert_eq!(env_in_definition(&render_systemd_unit(&def)), def.env);
+        assert!(env_in_definition("nothing here").is_empty());
+    }
+
+    /// 場所の変数が違えば変数ごとに差分を返し、PATH の違いは差分にしない。
+    #[test]
+    fn location_drift_ignores_path_and_reports_each_variable() {
+        let registered = sample_env();
+        let mut current = registered.clone();
+        current.insert("PATH".into(), "/elsewhere".into());
+        assert!(pinned_location_drift(&registered, &current).is_empty());
+
+        current.insert("XDG_STATE_HOME".into(), "/other/state".into());
+        current.remove("XDG_CONFIG_HOME");
+        current.insert("XDG_RUNTIME_DIR".into(), "/run/user/1".into());
+        let drift = pinned_location_drift(&registered, &current);
+        assert_eq!(
+            drift,
+            vec![
+                LocationDifference {
+                    name: "XDG_CONFIG_HOME".into(),
+                    registered: Some("/Users/test/.config".into()),
+                    current: None,
+                },
+                LocationDifference {
+                    name: "XDG_STATE_HOME".into(),
+                    registered: Some("/Users/test/.local/state".into()),
+                    current: Some("/other/state".into()),
+                },
+                LocationDifference {
+                    name: "XDG_RUNTIME_DIR".into(),
+                    registered: None,
+                    current: Some("/run/user/1".into()),
+                },
+            ]
+        );
+    }
+
+    /// 監督者のログは web の状態の置き場の `logs/` に label の名前で置く。
+    #[test]
+    fn the_supervisor_log_lives_with_the_unit_logs() {
+        assert_eq!(
+            log_path_for(&locations(&[("HOME", "/h")]), MACOS_LABEL),
+            "/h/.local/state/hyoui/web/logs/jp.kawaz.hyoui-web.supervise.log"
+        );
+        assert_eq!(
+            log_path_in_definition(&render_launchd_plist(&sample_definition())).as_deref(),
+            Some("/Users/test/.local/state/hyoui/web/logs/jp.kawaz.hyoui-web.supervise.log")
+        );
+    }
+
+    /// 定義を一時 dir に置き、OS には一切触らない backend (= register の判断だけを見る)。
+    struct FakeBackend {
+        dir: tempfile::TempDir,
+        installed: std::cell::RefCell<Vec<ServiceDefinition>>,
+    }
+
+    impl FakeBackend {
+        fn new() -> Self {
+            Self {
+                dir: tempfile::tempdir().unwrap(),
+                installed: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Backend for FakeBackend {
+        fn definition_path(&self, label: &str) -> Result<PathBuf, String> {
+            Ok(self.dir.path().join(format!("{label}.def")))
+        }
+        fn install(&self, def: &ServiceDefinition) -> Result<(), String> {
+            std::fs::write(self.definition_path(&def.label)?, render_definition(def))
+                .map_err(|error| error.to_string())?;
+            self.installed.borrow_mut().push(def.clone());
+            Ok(())
+        }
+        fn unregister(&self, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
+        fn start(&self, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
+        fn stop(&self, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
+        fn restart(&self, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
+        fn status(&self, label: &str) -> Result<ServiceStatus, String> {
+            let path = self.definition_path(label)?;
+            Ok(ServiceStatus {
+                registered: path.is_file(),
+                loaded: path.is_file(),
+                running: false,
+                pid: None,
+                last_exit: None,
+                definition_path: path,
+            })
+        }
+        fn log_source(&self, _: &str) -> Result<LogSource, String> {
+            unreachable!()
+        }
+    }
+
+    fn definition_with(env: &[(&str, &str)]) -> ServiceDefinition {
+        ServiceDefinition::labelled(
+            "jp.kawaz.hyoui-web.test",
+            "/opt/homebrew/bin/hyoui",
+            None,
+            env.iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        )
+    }
+
+    /// 初回は固定して載せる。同じ場所での再登録は通り、場所が違えば差分を返して
+    /// 何も書き換えない。`--force` で置き換える (DR-0038 決定 5)。
+    #[test]
+    fn re_register_stops_on_location_drift_unless_forced() {
+        let backend = FakeBackend::new();
+        let first = definition_with(&[("HOME", "/h"), ("XDG_STATE_HOME", "/s"), ("PATH", "/a")]);
+        assert!(register_checked(&backend, &first, false).unwrap());
+        assert_eq!(backend.installed.borrow().len(), 1);
+
+        // 同じ場所なら PATH が違っても止まらない (= PATH は場所を導かない)。
+        let same_place =
+            definition_with(&[("HOME", "/h"), ("XDG_STATE_HOME", "/s"), ("PATH", "/b")]);
+        assert!(register_checked(&backend, &same_place, false).unwrap());
+        assert_eq!(backend.installed.borrow().len(), 2);
+
+        // 場所が違えば止まり、定義は前のまま。
+        let moved = definition_with(&[("HOME", "/h"), ("XDG_STATE_HOME", "/elsewhere")]);
+        match register_checked(&backend, &moved, false) {
+            Err(RegisterError::Drift { differences, .. }) => assert_eq!(
+                differences,
+                vec![LocationDifference {
+                    name: "XDG_STATE_HOME".into(),
+                    registered: Some("/s".into()),
+                    current: Some("/elsewhere".into()),
+                }]
+            ),
+            other => panic!("expected drift: {other:?}"),
+        }
+        assert_eq!(backend.installed.borrow().len(), 2);
+        let on_disk =
+            std::fs::read_to_string(backend.definition_path("jp.kawaz.hyoui-web.test").unwrap())
+                .unwrap();
+        assert_eq!(
+            env_in_definition(&on_disk)
+                .get("XDG_STATE_HOME")
+                .map(String::as_str),
+            Some("/s")
+        );
+
+        // 押し切れば置き換わる。
+        assert!(register_checked(&backend, &moved, true).unwrap());
+        assert_eq!(backend.installed.borrow().len(), 3);
+        assert_eq!(backend.installed.borrow()[2].env, moved.env);
+    }
+
+    /// 固定値を持たない定義 (= env の固定を入れる前に書かれたもの) も、場所が「無い」と
+    /// 固定されていたものとして比べる (= 黙って上書きしない)。
+    #[test]
+    fn a_definition_without_pinned_locations_also_needs_force() {
+        let backend = FakeBackend::new();
+        let legacy = definition_with(&[("PATH", "/usr/bin")]);
+        assert!(register_checked(&backend, &legacy, false).unwrap());
+        let pinned = definition_with(&[("HOME", "/h"), ("PATH", "/usr/bin")]);
+        assert!(matches!(
+            register_checked(&backend, &pinned, false),
+            Err(RegisterError::Drift { .. })
+        ));
+        assert!(register_checked(&backend, &pinned, true).unwrap());
+    }
+
+    /// launchd の golden は RunAtLoad + KeepAlive、共通 log、固定した env を固定する。
     #[test]
     fn launchd_plist_golden() {
         let mut def = sample_definition();
@@ -1052,13 +1590,19 @@ mod tests {
 \t<true/>\n\
 \t<key>EnvironmentVariables</key>\n\
 \t<dict>\n\
+\t\t<key>HOME</key>\n\
+\t\t<string>/Users/test</string>\n\
 \t\t<key>PATH</key>\n\
-\t\t<string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>\n\
+\t\t<string>/opt/homebrew/bin:/usr/bin:/bin</string>\n\
+\t\t<key>XDG_CONFIG_HOME</key>\n\
+\t\t<string>/Users/test/.config</string>\n\
+\t\t<key>XDG_STATE_HOME</key>\n\
+\t\t<string>/Users/test/.local/state</string>\n\
 \t</dict>\n\
 \t<key>StandardOutPath</key>\n\
-\t<string>/Users/test/Library/Logs/hyoui-web/jp.kawaz.hyoui-web.supervise.log</string>\n\
+\t<string>/Users/test/.local/state/hyoui/web/logs/jp.kawaz.hyoui-web.supervise.log</string>\n\
 \t<key>StandardErrorPath</key>\n\
-\t<string>/Users/test/Library/Logs/hyoui-web/jp.kawaz.hyoui-web.supervise.log</string>\n\
+\t<string>/Users/test/.local/state/hyoui/web/logs/jp.kawaz.hyoui-web.supervise.log</string>\n\
 </dict>\n\
 </plist>\n"
         );
@@ -1078,7 +1622,10 @@ Description=hyoui HTTP gateway\n\
 Type=simple\n\
 ExecStart=\"/opt/homebrew/bin/hyoui\" \"web\" \"daemon\" \"supervise\"\n\
 Restart=always\n\
-Environment=\"PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin\"\n\
+Environment=\"HOME=/Users/test\"\n\
+Environment=\"PATH=/opt/homebrew/bin:/usr/bin:/bin\"\n\
+Environment=\"XDG_CONFIG_HOME=/Users/test/.config\"\n\
+Environment=\"XDG_STATE_HOME=/Users/test/.local/state\"\n\
 \n\
 [Install]\n\
 WantedBy=default.target\n"
@@ -1089,7 +1636,8 @@ WantedBy=default.target\n"
     /// 各 format の補間値は document boundary を越えないよう escape する。
     #[test]
     fn renderers_escape_interpolated_values() {
-        let def = ServiceDefinition::labelled("x&y<z>", "/tmp/a&b<hyoui> %z", None);
+        let def =
+            ServiceDefinition::labelled("x&y<z>", "/tmp/a&b<hyoui> %z", None, BTreeMap::new());
         let plist = render_launchd_plist(&def);
         assert!(plist.contains("x&amp;y&lt;z&gt;"));
         assert!(plist.contains("/tmp/a&amp;b&lt;hyoui&gt; %z"));
@@ -1164,6 +1712,7 @@ WantedBy=default.target\n"
             "jp.kawaz.hyoui-web.supervise",
             "/opt/homebrew/bin/hyoui",
             None,
+            sample_env(),
         );
         assert_eq!(
             program_in_definition(&render_launchd_plist(&def)).as_deref(),

@@ -1,6 +1,6 @@
 //! `hyoui web daemon supervise` と制御 socket の E2E (= DR-0034 P3)。
 //!
-//! 隔離した `XDG_STATE_HOME` に登録簿と socket を置き、実際の監督者プロセスを
+//! 隔離した HOME に unit の config・登録簿・socket を置き、実際の監督者プロセスを
 //! 起こして観測する。gateway は実 port を掴むので、他の test と重ならない番号を
 //! 使い、監督者は必ず pid 指定で落とす。
 
@@ -41,6 +41,19 @@ fn json(output: &Output) -> serde_json::Value {
     })
 }
 
+/// `<name>.toml` に listen を書き、それを unit として登録する (DR-0038 決定 2)。
+fn add_unit(home: &Path, name: &str, port: u16) -> Output {
+    let dir = home.join(".config/hyoui/web");
+    std::fs::create_dir_all(&dir).expect("config dir");
+    let config = dir.join(format!("{name}.toml"));
+    std::fs::write(&config, format!("[web]\nlisten = \"127.0.0.1:{port}\"\n"))
+        .expect("write config");
+    hyoui(
+        &["web", "daemon", "add", config.to_str().expect("utf-8 path")],
+        home,
+    )
+}
+
 fn error_json(output: &Output) -> serde_json::Value {
     serde_json::from_slice(&output.stderr).unwrap_or_else(|error| {
         panic!(
@@ -77,7 +90,8 @@ impl Supervised {
     }
 
     fn socket(&self) -> PathBuf {
-        self.path().join(".local/state/hyoui-web/supervisor.sock")
+        self.path()
+            .join(".local/state/hyoui/web/run/supervisor.sock")
     }
 
     /// 制御 socket が答えるようになるまで待つ。
@@ -138,20 +152,7 @@ fn unit_row<'a>(status: &'a serde_json::Value, name: &str) -> Option<&'a serde_j
 fn the_supervisor_starts_units_and_restarts_them_when_they_die() {
     let home = tempfile::tempdir().expect("isolated HOME");
     let port = PORT_BASE;
-    assert!(
-        hyoui(
-            &[
-                "web",
-                "daemon",
-                "add",
-                "unstable",
-                &format!("--port={port}")
-            ],
-            home.path()
-        )
-        .status
-        .success()
-    );
+    assert!(add_unit(home.path(), "unstable", port).status.success());
 
     let supervisor = Supervised::start(home);
     let status = supervisor.await_status("the unit to answer its version", |status| {
@@ -164,7 +165,20 @@ fn the_supervisor_starts_units_and_restarts_them_when_they_die() {
     assert!(unit["pid"].as_u64().is_some(), "{unit}");
     assert!(unit["started_at"].as_str().is_some(), "{unit}");
     assert_eq!(unit["listen"], format!("127.0.0.1:{port}"));
+    assert!(
+        unit["config"]
+            .as_str()
+            .is_some_and(|config| config.ends_with("hyoui/web/unstable.toml")),
+        "{unit}"
+    );
     assert_eq!(unit["binary_exists"], true);
+    // 監督者は場所を導いた env を名乗り、同じ env の client には警告を出さない
+    // (DR-0038 決定 5)。
+    assert_eq!(
+        status["supervisor"]["locations"]["XDG_STATE_HOME"],
+        supervisor.path().join(".local/state").to_str().unwrap()
+    );
+    assert!(status["warnings"].is_null(), "{status}");
     // 走っている本人が答えた版と、その実行ファイルが答えた版が並ぶ (= 決定 7a)。
     assert_eq!(unit["version"]["running"]["version"], hyoui_version());
     assert_eq!(unit["version"]["on_disk"]["version"], hyoui_version());
@@ -193,6 +207,26 @@ fn the_supervisor_starts_units_and_restarts_them_when_they_die() {
     );
 }
 
+/// 監督者の socket は session の discovery に拾われない (DR-0038 決定 4)。
+///
+/// web の状態は session socket の base (`hyoui/`) の直下 (`hyoui/web/`) にあり、
+/// discovery はその直下の dir を namespace として `*.sock` に問い合わせる。拾われると
+/// 一覧に `web` の session として並ぶうえ、問い合わせと監督者の 1 行読みが待ち合って
+/// 監督者が止まる。
+#[test]
+fn the_supervisor_socket_is_not_a_session() {
+    let supervisor = Supervised::start(tempfile::tempdir().expect("isolated HOME"));
+    let started = Instant::now();
+    let output = supervisor.run(&["list", "--all-namespaces", "--format=jsonl"]);
+    let took = started.elapsed();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("supervisor"), "{stdout}");
+    assert!(!stderr.contains("supervisor"), "{stderr}");
+    // 問い合わせの待ち (5 秒) に入っていない。
+    assert!(took < Duration::from_secs(4), "list took {took:?}");
+}
+
 /// `add` / `remove` は走行中の監督者に即反映される (= 決定 4)。
 #[test]
 fn add_and_remove_reach_a_running_supervisor() {
@@ -200,7 +234,7 @@ fn add_and_remove_reach_a_running_supervisor() {
     let supervisor = Supervised::start(home);
     let port = PORT_BASE + 1;
 
-    let added = json(&supervisor.run(&["web", "daemon", "add", "late", &format!("--port={port}")]));
+    let added = json(&add_unit(supervisor.path(), "late", port));
     // 監督者が居るので、その場で要求が届いている。
     assert_eq!(added["supervisor"]["running"], true);
     assert_eq!(added["supervisor"]["notified"], true);
@@ -220,7 +254,7 @@ fn add_and_remove_reach_a_running_supervisor() {
     assert!(
         !supervisor
             .path()
-            .join(".local/state/hyoui-web/units/late.toml")
+            .join(".local/state/hyoui/web/units/late.toml")
             .exists()
     );
 }
@@ -230,14 +264,7 @@ fn add_and_remove_reach_a_running_supervisor() {
 fn a_stopped_unit_is_not_revived_by_restart_all() {
     let home = tempfile::tempdir().expect("isolated HOME");
     let port = PORT_BASE + 2;
-    assert!(
-        hyoui(
-            &["web", "daemon", "add", "keeper", &format!("--port={port}")],
-            home.path()
-        )
-        .status
-        .success()
-    );
+    assert!(add_unit(home.path(), "keeper", port).status.success());
     let supervisor = Supervised::start(home);
     supervisor.await_status("the unit to come up", |status| {
         unit_row(status, "keeper").is_some_and(|unit| unit["running"] == true)
@@ -281,14 +308,7 @@ fn a_stopped_unit_is_not_revived_by_restart_all() {
 fn restart_by_name_replaces_a_running_unit() {
     let home = tempfile::tempdir().expect("isolated HOME");
     let port = PORT_BASE + 8;
-    assert!(
-        hyoui(
-            &["web", "daemon", "add", "swap", &format!("--port={port}")],
-            home.path()
-        )
-        .status
-        .success()
-    );
+    assert!(add_unit(home.path(), "swap", port).status.success());
     let supervisor = Supervised::start(home);
     let before = supervisor.await_status("the unit to come up", |status| {
         unit_row(status, "swap").is_some_and(|unit| unit["running"] == true)
@@ -334,14 +354,7 @@ fn restart_all_replaces_running_units_one_at_a_time() {
     let first = PORT_BASE + 3;
     let second = PORT_BASE + 4;
     for (name, port) in [("alpha", first), ("beta", second)] {
-        assert!(
-            hyoui(
-                &["web", "daemon", "add", name, &format!("--port={port}")],
-                home.path()
-            )
-            .status
-            .success()
-        );
+        assert!(add_unit(home.path(), name, port).status.success());
     }
     let supervisor = Supervised::start(home);
     let before = supervisor.await_status("both units to come up", |status| {
@@ -384,14 +397,7 @@ fn restart_all_replaces_running_units_one_at_a_time() {
 #[test]
 fn control_verbs_refuse_without_a_supervisor() {
     let home = tempfile::tempdir().expect("isolated HOME");
-    assert!(
-        hyoui(
-            &["web", "daemon", "add", "stable", "--port=43809"],
-            home.path()
-        )
-        .status
-        .success()
-    );
+    assert!(add_unit(home.path(), "stable", 43809).status.success());
 
     for args in [
         &["web", "daemon", "start", "stable"][..],
@@ -427,14 +433,7 @@ fn control_verbs_refuse_without_a_supervisor() {
 fn unit_output_is_collected_per_unit() {
     let home = tempfile::tempdir().expect("isolated HOME");
     let port = PORT_BASE + 5;
-    assert!(
-        hyoui(
-            &["web", "daemon", "add", "talker", &format!("--port={port}")],
-            home.path()
-        )
-        .status
-        .success()
-    );
+    assert!(add_unit(home.path(), "talker", port).status.success());
     let supervisor = Supervised::start(home);
     supervisor.await_status("the unit to come up", |status| {
         unit_row(status, "talker").is_some_and(|unit| unit["running"] == true)
@@ -443,7 +442,7 @@ fn unit_output_is_collected_per_unit() {
     // gateway は bind 後に listen 先を書くので、その行が集まる。
     let log_path = supervisor
         .path()
-        .join(".local/state/hyoui-web/logs/talker.log");
+        .join(".local/state/hyoui/web/logs/talker.log");
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if std::fs::read_to_string(&log_path).is_ok_and(|text| text.contains("listening on")) {
@@ -476,20 +475,7 @@ fn unit_output_is_collected_per_unit() {
 fn version_reports_the_cli_the_supervisor_and_the_units() {
     let home = tempfile::tempdir().expect("isolated HOME");
     let port = PORT_BASE + 6;
-    assert!(
-        hyoui(
-            &[
-                "web",
-                "daemon",
-                "add",
-                "unstable",
-                &format!("--port={port}")
-            ],
-            home.path()
-        )
-        .status
-        .success()
-    );
+    assert!(add_unit(home.path(), "unstable", port).status.success());
 
     // 監督者が居ない間は「走っている版」を誰も言えない。
     let without = json(&hyoui(&["version"], home.path()));
@@ -525,14 +511,7 @@ fn version_reports_the_cli_the_supervisor_and_the_units() {
 fn stopping_the_supervisor_stops_its_children() {
     let home = tempfile::tempdir().expect("isolated HOME");
     let port = PORT_BASE + 7;
-    assert!(
-        hyoui(
-            &["web", "daemon", "add", "doomed", &format!("--port={port}")],
-            home.path()
-        )
-        .status
-        .success()
-    );
+    assert!(add_unit(home.path(), "doomed", port).status.success());
 
     let child_pid;
     let socket;

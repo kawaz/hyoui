@@ -13,7 +13,7 @@ pub mod protocol;
 pub mod registry;
 pub mod supervisor;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use hyoui::cli::WebDaemonAddConfig;
@@ -67,22 +67,30 @@ pub fn list_command() -> ExitCode {
     // 監督者に聞けた時だけ `running` / `pid` を足す。聞けていない台に「動いて
     // いる」とは書かない (決定 4)。
     match Supervisor::probe().request(&Request::List(Target::all())) {
-        Ok(Response::Units { units, .. }) => emit(&json!({
-            "units": units
-                .into_iter()
-                .map(|unit| json!({
-                    "name": unit.name,
-                    "enabled": unit.enabled,
-                    "running": unit.running,
-                    "pid": unit.pid,
-                    "listen": unit.listen,
-                    "binary": unit.binary,
-                    "binary_exists": unit.binary_exists,
-                }))
-                .collect::<Vec<_>>(),
-            "supervisor": {"running": true},
-            "registry_dir": Registry::open().dir(),
-        })),
+        Ok(Response::Units {
+            units, supervisor, ..
+        }) => {
+            let mut output = json!({
+                "units": units
+                    .into_iter()
+                    .map(|unit| json!({
+                        "name": unit.name,
+                        "enabled": unit.enabled,
+                        "running": unit.running,
+                        "pid": unit.pid,
+                        "config": unit.config,
+                        "listen": unit.listen,
+                        "config_error": unit.config_error,
+                        "binary_path": unit.binary_path,
+                        "binary_exists": unit.binary_exists,
+                    }))
+                    .collect::<Vec<_>>(),
+                "supervisor": {"running": true},
+                "registry_dir": Registry::open().dir(),
+            });
+            add_location_warnings(&mut output, &supervisor.locations);
+            emit(&output)
+        }
         Ok(Response::Error(error)) => fail_with("web daemon list", &error),
         Ok(_) | Err(_) => {
             let mut output = match registry_view(None) {
@@ -92,15 +100,43 @@ pub fn list_command() -> ExitCode {
             output["note"] = json!(
                 "the supervisor is not running, so `running` and `pid` are not known for any unit"
             );
+            add_registered_location_warnings(&mut output);
             emit(&output)
         }
+    }
+}
+
+/// 監督者が名乗った場所が自分の導出と違えば `warnings` に足す (DR-0038 決定 5)。
+fn add_location_warnings(
+    output: &mut Value,
+    locations: &std::collections::BTreeMap<String, Option<String>>,
+) {
+    let drift = protocol::location_drift(locations);
+    if !drift.is_empty() {
+        for warning in &drift {
+            eprintln!("hyoui: warning: {warning}");
+        }
+        output["warnings"] = json!(drift);
+    }
+}
+
+/// 監督者に届かない時、OS の定義に固定された場所が今の shell と違えば
+/// `warnings` に足す (DR-0038 決定 5)。場所が食い違えば socket の位置も食い違うので、
+/// 「届かない」の理由がそれである可能性を言う。
+fn add_registered_location_warnings(output: &mut Value) {
+    let warnings = crate::web_service::registered_location_warnings();
+    if !warnings.is_empty() {
+        for warning in &warnings {
+            eprintln!("hyoui: warning: {warning}");
+        }
+        output["warnings"] = json!(warnings);
     }
 }
 
 /// 登録簿から答えられる範囲だけを組み立てる (= 監督者に聞けない時の答え)。
 ///
 /// 障害時に最初に打つコマンドが監督者の生死に依存すると、状態を見る入口ごと
-/// 失われる (決定 4)。
+/// 失われる (決定 4)。listen は登録簿に無いので各 unit の config から引く。
 fn registry_view(name: Option<&str>) -> std::result::Result<Value, ExitCode> {
     let registry = Registry::open();
     let units = match name {
@@ -117,33 +153,64 @@ fn registry_view(name: Option<&str>) -> std::result::Result<Value, ExitCode> {
     Ok(json!({
         "units": units
             .into_iter()
-            .map(|(name, unit)| json!({
-                "name": name,
-                "enabled": unit.enabled,
-                "running": false,
-                "pid": Value::Null,
-                "listen": unit.listen,
-                "binary": unit.binary,
-                "binary_exists": unit.binary.exists(),
-                "web_assets_dir": unit.web_assets_dir,
-                "added_at": unit.added_at,
-            }))
+            .map(|(name, unit)| {
+                let (listen, config_error) = match unit.load_config() {
+                    Ok(config) => (Some(config.listen), None),
+                    Err(error) => (None, Some(error.to_string())),
+                };
+                json!({
+                    "name": name,
+                    "enabled": unit.enabled,
+                    "running": false,
+                    "pid": Value::Null,
+                    "config": unit.config,
+                    "listen": listen,
+                    "config_error": config_error,
+                    "binary_path": unit.binary_path,
+                    "binary_exists": unit.binary_path.exists(),
+                    "added_at": unit.added_at,
+                })
+            })
             .collect::<Vec<_>>(),
         "supervisor": {"running": false},
         "registry_dir": registry.dir(),
     }))
 }
 
-/// `hyoui web daemon add <name> [options]`。
+/// `hyoui web daemon add [--name <name>] <config-path>` (DR-0038 決定 2)。
 pub fn add_command(cfg: WebDaemonAddConfig) -> ExitCode {
     let context = "web daemon add";
-    if let Err(error) = registry::validate_name(&cfg.name) {
-        return fail(context, &error.to_string(), None);
+    let config_path = match absolute(&cfg.config) {
+        Ok(path) => path,
+        Err(error) => return fail(context, &error, None),
+    };
+    let name = match cfg
+        .name
+        .clone()
+        .map_or_else(|| name_from_config(&config_path), Ok)
+    {
+        Ok(name) => name,
+        Err(error) => return fail(context, &error, None),
+    };
+    if let Err(error) = registry::validate_name(&name) {
+        return fail(
+            context,
+            &error.to_string(),
+            Some(json!({"hint": "give a name with --name <name>"})),
+        );
     }
 
-    let config = match hyoui::config::load() {
-        Ok(config) => config,
-        Err(error) => return fail(context, &format!("could not read config: {error}"), None),
+    // 登録する時点で読めることを確かめる。読めない config を登録すると、監督者が
+    // 起こすたびに子が config で落ち、backoff の理由を探すことになる。
+    let web = match hyoui::config::load_web(&config_path) {
+        Ok(file) => file.web,
+        Err(error) => {
+            return fail(
+                context,
+                &format!("could not read the unit's config: {error}"),
+                Some(json!({"config": config_path})),
+            );
+        }
     };
 
     let registry = Registry::open();
@@ -152,81 +219,120 @@ pub fn add_command(cfg: WebDaemonAddConfig) -> ExitCode {
         Err(error) => return fail(context, &error.to_string(), None),
     };
 
-    let listen = resolve_listen(&cfg, &config.web.listen);
     let mut warnings = Vec::new();
-    match registry::find_listen_conflict(&existing, &listen) {
-        Some(ListenConflict::Same { name, listen }) => {
+    // 既存 unit の listen は各 config から引く。読めない unit は比べられないので、
+    // 止めずに warning にする (= 読めない config が 1 つあるだけで add を塞がない)。
+    let mut listens = Vec::new();
+    for (other, unit) in &existing {
+        if unit.config == config_path {
+            warnings.push(format!(
+                "unit `{other}` already reads {}; two units with one config bind the same address",
+                config_path.display()
+            ));
+        }
+        match unit.load_config() {
+            Ok(config) => listens.push((other.clone(), config.listen)),
+            Err(error) => warnings.push(format!(
+                "could not compare with unit `{other}` because its config is unreadable: {error}"
+            )),
+        }
+    }
+    match registry::find_listen_conflict(&listens, &web.listen) {
+        Some(ListenConflict::Same {
+            name: other,
+            listen,
+        }) => {
             return fail(
                 context,
-                &format!("`{listen}` is already the bind address of unit `{name}`"),
-                Some(json!({"listen": listen, "conflicting_unit": name})),
+                &format!("`{listen}` is already the bind address of unit `{other}`"),
+                Some(json!({"listen": listen, "conflicting_unit": other})),
             );
         }
         Some(ListenConflict::Overlapping {
-            name,
-            listen: other,
+            name: other,
+            listen: other_listen,
             reason,
         }) => warnings.push(format!(
-            "`{listen}` may overlap with unit `{name}` (`{other}`): {reason}"
+            "`{}` may overlap with unit `{other}` (`{other_listen}`): {reason}",
+            web.listen
         )),
         None => {}
     }
 
-    let binary = match cfg.binary.clone().map_or_else(default_binary, Ok) {
+    // binary は config の `binary_path` が正、無ければ登録した時点の自分自身
+    // (llm-gateway DR-0028 決定 2 と同じ)。
+    let binary_path = match web.binary_path.clone().map_or_else(default_binary, Ok) {
         Ok(binary) => binary,
         Err(error) => return fail(context, &error, None),
     };
-    let binary_exists = binary.exists();
+    let binary_exists = binary_path.exists();
     if !binary_exists {
-        // ビルド前に登録する順序を禁じない (決定 2)。
+        // ビルド前に登録する順序を禁じない (DR-0034 決定 2)。
         warnings.push(format!(
             "`{}` does not exist yet; this unit cannot start until it is built",
-            binary.display()
+            binary_path.display()
         ));
     }
 
     let unit = Unit {
-        listen: listen.clone(),
-        binary: binary.clone(),
-        web_assets_dir: cfg
-            .assets_dir
-            .clone()
-            .or_else(|| config.web.assets_dir.clone()),
+        config: config_path,
+        binary_path,
         // `add` は「この gateway を動かしたい」という意思表示なので enabled で入る
-        // (決定 4)。
+        // (DR-0034 決定 4)。
         enabled: true,
         added_at: registry::now_iso8601(),
     };
-    if let Err(error) = registry.add(&cfg.name, &unit) {
+    if let Err(error) = registry.add(&name, &unit) {
         return fail(context, &error.to_string(), None);
     }
 
-    // 走行中の監督者には即反映する (決定 4)。送るのは `reload` で、監督者が登録簿を
-    // 読み直して望みとの差を埋める — 足したばかりの unit は監督者がまだ名前を
+    // 走行中の監督者には即反映する (DR-0034 決定 4)。送るのは `reload` で、監督者が
+    // 登録簿を読み直して望みとの差を埋める — 足したばかりの unit は監督者がまだ名前を
     // 知らないので、`start <name>` を送っても「そんな unit は無い」になる。
-    // `add` は `enabled = true` で書くので、読み直した監督者がその場で起こす。
     let supervisor = Supervisor::probe();
     let started = supervisor.request(&Request::Reload);
     let mut output = json!({
-        "name": cfg.name,
-        "listen": unit.listen,
-        "binary": unit.binary,
+        "name": name,
+        "config": unit.config,
+        "listen": web.listen,
+        "binary_path": unit.binary_path,
         "binary_exists": binary_exists,
-        "web_assets_dir": unit.web_assets_dir,
         "enabled": unit.enabled,
         "added_at": unit.added_at,
         "supervisor": {"running": supervisor.is_running(), "notified": started.is_ok()},
     });
     if let Err(error) = &started {
         output["note"] = json!(format!(
-            "{}: `{}` was recorded in the registry and will start when the supervisor next runs",
-            error.message, cfg.name
+            "{}: `{name}` was recorded in the registry and will start when the supervisor next runs",
+            error.message
         ));
     }
     if !warnings.is_empty() {
         output["warnings"] = json!(warnings);
     }
     emit(&output)
+}
+
+/// 相対 path を cwd から解いた絶対 path にする (= 登録簿はどこから読まれても同じ
+/// ファイルを指す)。symlink は解かない — 利用者が置いた symlink の向き先を差し
+/// 替えれば unit も追従する方が、置き場を決める利用者の意図に沿う。
+fn absolute(path: &Path) -> std::result::Result<PathBuf, String> {
+    let expanded = hyoui::paths::Env::current().expand_tilde(path);
+    if expanded.is_absolute() {
+        return Ok(expanded);
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(expanded))
+        .map_err(|error| format!("cannot resolve the current directory: {error}"))
+}
+
+/// `--name` を省いた時の unit 名 = config の basename から拡張子を除いたもの。
+fn name_from_config(config: &Path) -> std::result::Result<String, String> {
+    config
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("cannot derive a unit name from {}", config.display()))
 }
 
 /// `hyoui web daemon remove <name>`。
@@ -311,7 +417,15 @@ pub fn control_command(verb: ControlVerb, name: Option<&str>) -> ExitCode {
 
     match Supervisor::probe().request(&request) {
         Ok(Response::Error(error)) => fail_with(context, &error),
-        Ok(response) => emit(&json!(response)),
+        Ok(response) => {
+            let locations = match &response {
+                Response::Units { supervisor, .. } => supervisor.locations.clone(),
+                _ => Default::default(),
+            };
+            let mut output = json!(response);
+            add_location_warnings(&mut output, &locations);
+            emit(&output)
+        }
         Err(error) if verb == ControlVerb::Status => {
             // 監督者に聞けないので、登録簿から答えられる範囲を返す。
             let mut output = match registry_view(name) {
@@ -319,6 +433,7 @@ pub fn control_command(verb: ControlVerb, name: Option<&str>) -> ExitCode {
                 Err(code) => return code,
             };
             output["note"] = json!(error.message);
+            add_registered_location_warnings(&mut output);
             emit(&output)
         }
         Err(error) => fail_with(context, &error),
@@ -403,13 +518,13 @@ pub fn version_command() -> ExitCode {
             let binary = registered
                 .as_ref()
                 .map(|(_, binary)| binary.clone())
-                .unwrap_or(supervisor.binary);
+                .unwrap_or(supervisor.binary_path);
             let on_disk = system.on_disk(&binary);
             let pair = protocol::VersionPair::new(Some(supervisor.version), on_disk);
             output["supervisor"] = json!({
                 "running": pair.running,
                 "on_disk": pair.on_disk,
-                "binary": binary,
+                "binary_path": binary,
                 "restart_needed": pair.restart_needed,
             });
             output["units"] = json!(
@@ -419,7 +534,7 @@ pub fn version_command() -> ExitCode {
                         "name": unit.name,
                         "running": unit.version.running,
                         "on_disk": unit.version.on_disk,
-                        "binary": unit.binary,
+                        "binary_path": unit.binary_path,
                         "restart_needed": unit.version.restart_needed,
                     }))
                     .collect::<Vec<_>>()
@@ -432,7 +547,7 @@ pub fn version_command() -> ExitCode {
                 Some((pair, binary)) => json!({
                     "running": Value::Null,
                     "on_disk": pair.on_disk,
-                    "binary": binary,
+                    "binary_path": binary,
                     "restart_needed": false,
                 }),
                 // OS への登録が無ければ「監督者」という対象自体が無い。
@@ -446,12 +561,12 @@ pub fn version_command() -> ExitCode {
                 units
                     .into_iter()
                     .map(|(name, unit)| {
-                        let on_disk = system.on_disk(&unit.binary);
+                        let on_disk = system.on_disk(&unit.binary_path);
                         json!({
                             "name": name,
                             "running": Value::Null,
                             "on_disk": on_disk,
-                            "binary": unit.binary,
+                            "binary_path": unit.binary_path,
                             "restart_needed": false,
                         })
                     })
@@ -463,24 +578,17 @@ pub fn version_command() -> ExitCode {
     emit(&output)
 }
 
-/// `hyoui web daemon run [name]`。
+/// `hyoui web daemon run [name]` (DR-0038 決定 2)。
 ///
-/// name を渡すと登録簿の値で起動する。監督者が子を exec するのと同じ経路で、
-/// 手元で 1 台だけ確かめる時にも使う (決定 3)。name 省略時は登録簿を見ず、
-/// config `[web].listen` で解決して起動する (決定 1)。
+/// name を渡すと登録簿が指す config で起動する。監督者が子を exec するのと同じ
+/// 経路で、手元で 1 台だけ確かめる時にも使う (DR-0034 決定 3)。name 省略時は
+/// 登録簿を見ず、web の config の既定 path (`$XDG_CONFIG_HOME/hyoui/web/config.toml`)
+/// を読む。無ければ組み込みの既定値で起動する。
 pub fn run_command(name: Option<&str>) -> ExitCode {
     let context = "web daemon run";
-    let config = match hyoui::config::load() {
-        Ok(config) => config,
-        Err(error) => return fail(context, &format!("could not read config: {error}"), None),
-    };
-
-    let (listen, assets_dir) = match name {
-        Some(name) => match Registry::open().get(name) {
-            Ok(unit) => (unit.listen, unit.web_assets_dir),
-            Err(error) => return fail(context, &error.to_string(), None),
-        },
-        None => (config.web.listen.clone(), config.web.assets_dir.clone()),
+    let web = match run_target(&Registry::open(), name, hyoui::config::default_web_path()) {
+        Ok(web) => web,
+        Err(error) => return fail(context, &error, None),
     };
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -496,7 +604,8 @@ pub fn run_command(name: Option<&str>) -> ExitCode {
             );
         }
     };
-    match runtime.block_on(hyoui_web::serve(&listen, config, assets_dir)) {
+    let listen = web.listen.clone();
+    match runtime.block_on(hyoui_web::serve(&listen, web.assets_dir)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => fail(
             context,
@@ -506,26 +615,37 @@ pub fn run_command(name: Option<&str>) -> ExitCode {
     }
 }
 
-/// `--listen` → `--port` → config `[web].listen` → 既定の順に解決する (決定 3)。
+/// `daemon run` が起動に使う `[web]` を決める。
 ///
-/// `--listen` と `--port` の排他は parser が弾くので、ここは順序だけを持つ。
-/// config が既定値を持つため「無ければ `127.0.0.1:43690`」は config 側で閉じる。
-fn resolve_listen(cfg: &WebDaemonAddConfig, config_listen: &str) -> String {
-    if let Some(listen) = &cfg.listen {
-        return listen.clone();
+/// 「既定の unit」は持たない — 登録簿に 1 つしかない時それを選ぶ推測を入れると、
+/// 2 つ目を足した瞬間に同じコマンドの意味が変わる (DR-0034 決定 1)。名前を省いた
+/// 時に読むのは登録簿ではなく既定の置き場の config。
+fn run_target(
+    registry: &Registry,
+    name: Option<&str>,
+    default_path: Option<PathBuf>,
+) -> std::result::Result<hyoui::config::WebConfig, String> {
+    match name {
+        Some(name) => {
+            let unit = registry.get(name).map_err(|error| error.to_string())?;
+            unit.load_config()
+                .map_err(|error| format!("could not read the config of unit `{name}`: {error}"))
+        }
+        None => match default_path {
+            Some(path) if path.exists() => hyoui::config::load_web(&path)
+                .map(|file| file.web)
+                .map_err(|error| format!("could not read config: {error}")),
+            _ => Ok(hyoui::config::WebConfig::default()),
+        },
     }
-    if let Some(port) = cfg.port {
-        return format!("127.0.0.1:{port}");
-    }
-    config_listen.to_string()
 }
 
-/// `--binary` 未指定時の既定 (= 決定 2)。
+/// config に `binary_path` が無い時の既定 (= 登録した時点の自分自身、DR-0038 決定 2)。
 ///
 /// `current_exe` をそのまま書き、安定な場所を探して差し替えない。brew 版から
 /// `add` すれば brew の path が、repo build から `add` すればその build の path が
 /// 入る。`resolve_stable_path` を通すと、repo build が brew 版と同一内容だった
-/// 瞬間に unstable unit が stable の binary を指してしまう。
+/// 瞬間に unstable unit が stable の binary を指してしまう (DR-0034 決定 2)。
 fn default_binary() -> std::result::Result<PathBuf, String> {
     std::env::current_exe().map_err(|error| format!("cannot resolve own binary path: {error}"))
 }
@@ -583,99 +703,92 @@ fn fail(context: &str, message: &str, details: Option<Value>) -> ExitCode {
     ExitCode::from(1)
 }
 
-/// `hyoui web daemon run <name>` が登録簿の listen を使うことを見せる補助。
-///
-/// 実際の bind は `serve` が行うので、ここでは解決だけを切り出して test する。
-#[cfg(test)]
-fn resolved_run_target(
-    registry: &Registry,
-    name: Option<&str>,
-    config: &hyoui::config::Config,
-) -> std::result::Result<(String, Option<PathBuf>), String> {
-    match name {
-        Some(name) => registry
-            .get(name)
-            .map(|unit| (unit.listen, unit.web_assets_dir))
-            .map_err(|error| error.to_string()),
-        None => Ok((config.web.listen.clone(), config.web.assets_dir.clone())),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn unit(listen: &str) -> Unit {
+    fn write(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn unit(config: PathBuf) -> Unit {
         Unit {
-            listen: listen.to_owned(),
-            binary: PathBuf::from("/opt/homebrew/bin/hyoui"),
-            web_assets_dir: None,
+            config,
+            binary_path: PathBuf::from("/opt/homebrew/bin/hyoui"),
             enabled: true,
             added_at: registry::now_iso8601(),
         }
     }
 
+    /// 名前付きは登録簿が指す config を、名前なしは既定の置き場の config を読む。
+    /// 既定の置き場に無ければ組み込みの既定値 (DR-0038 決定 2)。
     #[test]
-    fn listen_resolution_follows_the_documented_order() {
-        let config_listen = "127.0.0.1:40000";
+    fn run_reads_the_unit_config_and_the_default_place_without_a_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = Registry::at(directory.path().join("units"));
+        let config = write(
+            directory.path(),
+            "unstable.toml",
+            "[web]\nlisten = \"127.0.0.1:43691\"\nassets_dir = \"/a\"\n",
+        );
+        registry.add("unstable", &unit(config)).unwrap();
 
-        // `--listen` が最優先。
-        assert_eq!(
-            resolve_listen(
-                &WebDaemonAddConfig {
-                    listen: Some("0.0.0.0:1".into()),
-                    port: Some(2),
-                    ..WebDaemonAddConfig::default()
-                },
-                config_listen
-            ),
-            "0.0.0.0:1"
-        );
-        // 次が `--port` (= loopback の短縮形)。
-        assert_eq!(
-            resolve_listen(
-                &WebDaemonAddConfig {
-                    port: Some(43691),
-                    ..WebDaemonAddConfig::default()
-                },
-                config_listen
-            ),
-            "127.0.0.1:43691"
-        );
-        // どちらも無ければ config。config 自身が `127.0.0.1:43690` を既定に持つ。
-        assert_eq!(
-            resolve_listen(&WebDaemonAddConfig::default(), config_listen),
-            config_listen
+        let web = run_target(&registry, Some("unstable"), None).unwrap();
+        assert_eq!(web.listen, "127.0.0.1:43691");
+        assert_eq!(web.assets_dir, Some(PathBuf::from("/a")));
+
+        let default = write(
+            directory.path(),
+            "config.toml",
+            "[web]\nlisten = \"127.0.0.1:40000\"\n",
         );
         assert_eq!(
-            resolve_listen(
-                &WebDaemonAddConfig::default(),
-                &hyoui::config::Config::default().web.listen
-            ),
+            run_target(&registry, None, Some(default)).unwrap().listen,
+            "127.0.0.1:40000"
+        );
+        assert_eq!(
+            run_target(&registry, None, Some(directory.path().join("absent.toml")))
+                .unwrap()
+                .listen,
             "127.0.0.1:43690"
+        );
+
+        assert!(
+            run_target(&registry, Some("missing"), None)
+                .unwrap_err()
+                .contains("no web gateway unit named")
+        );
+
+        // 登録簿が指す config が消えていれば、どの unit の config かを言って断る。
+        registry
+            .add("gone", &unit(directory.path().join("gone.toml")))
+            .unwrap();
+        let error = run_target(&registry, Some("gone"), None).unwrap_err();
+        assert!(
+            error.contains("`gone`") && error.contains("gone.toml"),
+            "{error}"
         );
     }
 
     #[test]
-    fn run_reads_the_unit_listen_and_falls_back_to_config_without_a_name() {
-        let directory = tempfile::tempdir().unwrap();
-        let registry = Registry::at(directory.path().join("units"));
-        registry.add("unstable", &unit("127.0.0.1:43691")).unwrap();
-        let config = hyoui::config::Config::default();
+    fn the_unit_name_defaults_to_the_config_basename_without_extension() {
+        assert_eq!(
+            name_from_config(Path::new("/c/hyoui/web/stable.toml")).unwrap(),
+            "stable"
+        );
+        assert_eq!(
+            name_from_config(Path::new("/c/config-43691-unstable.toml")).unwrap(),
+            "config-43691-unstable"
+        );
+    }
 
-        assert_eq!(
-            resolved_run_target(&registry, Some("unstable"), &config).unwrap(),
-            ("127.0.0.1:43691".to_string(), None)
-        );
-        assert_eq!(
-            resolved_run_target(&registry, None, &config).unwrap().0,
-            config.web.listen
-        );
-        assert!(
-            resolved_run_target(&registry, Some("missing"), &config)
-                .unwrap_err()
-                .contains("no web gateway unit named")
-        );
+    #[test]
+    fn a_relative_config_path_becomes_absolute() {
+        let resolved = absolute(Path::new("web/stable.toml")).unwrap();
+        assert!(resolved.is_absolute());
+        assert!(resolved.ends_with("web/stable.toml"));
     }
 
     #[test]
@@ -689,29 +802,5 @@ mod tests {
     fn the_supervisor_probe_has_two_states() {
         assert!(Supervisor::Running.is_running());
         assert!(!Supervisor::NotRunning.is_running());
-    }
-
-    /// 監督者が居ない時、`status` は登録簿から答えられる範囲を返す (決定 4)。
-    #[test]
-    fn the_registry_answers_when_the_supervisor_cannot() {
-        let directory = tempfile::tempdir().unwrap();
-        let registry = Registry::at(directory.path().join("units"));
-        registry.add("stable", &unit("127.0.0.1:43690")).unwrap();
-
-        // `registry_view` は既定の登録簿を読むので、ここでは組み立ての形だけを
-        // 固定する (= 隔離 `XDG_STATE_HOME` 越しの経路は e2e が見る)。
-        let listed = registry.list().unwrap();
-        assert_eq!(listed.len(), 1);
-        let (name, unit) = &listed[0];
-        let row = json!({
-            "name": name,
-            "enabled": unit.enabled,
-            "running": false,
-            "pid": Value::Null,
-            "listen": unit.listen,
-        });
-        assert_eq!(row["running"], json!(false));
-        assert_eq!(row["pid"], Value::Null);
-        assert_eq!(row["listen"], json!("127.0.0.1:43690"));
     }
 }

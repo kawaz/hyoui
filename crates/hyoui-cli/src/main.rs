@@ -322,7 +322,8 @@ fn is_print_and_exit_command(cmd: &Command) -> bool {
         | Command::Upgrade(_)
         | Command::Completion { .. }
         | Command::Error(_) => true,
-        // Run / Attach / Web serve、および将来追加される subcommand は対象外。
+        // Run / Attach / `web daemon run` (= HTTP server)、および将来追加される
+        // subcommand は対象外。
         _ => false,
     }
 }
@@ -470,7 +471,6 @@ fn main() -> ExitCode {
         },
 
         Command::Web(sub) => match sub {
-            WebCommand::Serve(cfg) => web_command(cfg),
             WebCommand::Daemon(WebDaemonCommand::Run { name }) => {
                 web_daemon::run_command(name.as_deref())
             }
@@ -501,7 +501,7 @@ fn main() -> ExitCode {
             WebCommand::Passkey(command) => web_passkey::passkey_command(command),
             WebCommand::Session(command) => web_passkey::session_command(command),
             WebCommand::Service(WebServiceCommand::Register(cfg)) => {
-                web_service::register_command(cfg.binary)
+                web_service::register_command(cfg.binary, cfg.force)
             }
             WebCommand::Service(WebServiceCommand::Unregister) => web_service::unregister_command(),
             WebCommand::Service(WebServiceCommand::Start) => {
@@ -2265,45 +2265,6 @@ fn socket_path_is_self(p: &std::path::Path) -> bool {
 /// daemon と子 PTY は影響を受けず継続する (= DR-0015 §2.3.1)。session 省略時は
 /// `$HYOUI_SESSION_ID` で自セッションに解決 (= self default 許容、TUI 脱出用途)。
 /// target 指定は持たない (= `DetachConfig` doc 参照、Fable review M1 2026-06-12)。
-/// `hyoui web` subcommand (= DR-0027 Phase 1)。
-///
-/// tokio multi-thread runtime を新規に起こし、`hyoui_web::serve` を回す。
-/// listen アドレスの解決順は CLI flag `--listen` > config.toml `[web].listen` >
-/// hardcoded default (`127.0.0.1:43690` = 0xAAAA)。
-fn web_command(cfg: hyoui::cli::WebConfig) -> ExitCode {
-    let config = match hyoui::config::load() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("hyoui: web: config 読み込み失敗: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let listen = cfg.listen.unwrap_or_else(|| config.web.listen.clone());
-    // assets_dir: CLI flag > config `[web].assets_dir` > None (embedded)。
-    let assets_dir = cfg
-        .assets_dir
-        .clone()
-        .or_else(|| config.web.assets_dir.clone());
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("hyoui: web: tokio runtime 構築失敗: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let result = runtime.block_on(hyoui_web::serve(&listen, config, assets_dir));
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("hyoui: web: serve 失敗 (listen={listen}): {e}");
-            ExitCode::from(1)
-        }
-    }
-}
-
 /// `hyoui config path` — 解決される config ファイルのパスを stdout に 1 行出す。
 ///
 /// ファイル不在でもパスは出す (= 「どこに作ればよいか」を知るのが主用途)。
@@ -4662,8 +4623,8 @@ mod tests {
         for argv in [
             vec!["run", "--", "/bin/cat"],
             vec!["attach", "demo"],
-            // HTTP gateway 起動は bind 先を明示した `hyoui web`。
-            vec!["web", "--listen=127.0.0.1:43799"],
+            // HTTP gateway の foreground 起動 (= DR-0038 決定 2 で 1 本化)。
+            vec!["web", "daemon", "run"],
         ] {
             let owned: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
             let cmd = parse_args(&owned);

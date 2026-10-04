@@ -8,6 +8,17 @@
 //! 2. `$HOME/.config/hyoui/config.toml` (XDG 不在時)
 //! 3. どちらも resolve できなければ unloadable (= [`Config::default`] を使う)
 //!
+//! web gateway の設定は別ファイル ([`WebFile`]) で、unit ごとに 1 つ持つ
+//! (DR-0038 決定 1)。既定の置き場は `$XDG_CONFIG_HOME/hyoui/web/` で、上の
+//! `config.toml` は読まない (= gateway は PTY session の設定を使わない)。
+//!
+//! ## `extends` (DR-0038 決定 3)
+//!
+//! どちらのファイルも `extends = "<path>"` で土台を指せる。表は鍵ごとに潜って重ね、
+//! それ以外 (数・文字列・真偽・配列) は丸ごと置き換える。相対パスは書いたファイルの
+//! 隣から解き、`~` は `$HOME` で開く。辿ったファイルを正規化した実体で覚え、循環は
+//! その場で止める。指した先が無ければ、どのファイルがどのパスを指したかを言う。
+//!
 //! ## 不在 / エラー時 (DR-0024 §7)
 //!
 //! - ファイル不在 = [`Config::default`] (= builtin-only 動作)
@@ -22,7 +33,6 @@
 //! TOML 文字列にできる。出力は同じ loader で読み直せる (= round-trip 可能)。
 
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -40,10 +50,6 @@ pub struct Config {
     /// session 単位の policy 設定 (= TOML の `[session]` セクション、DR-0029)。
     #[serde(default)]
     pub session: SessionConfig,
-
-    /// Web gateway 設定 (= TOML の `[web]` セクション、DR-0027)。
-    #[serde(default)]
-    pub web: WebConfig,
 }
 
 /// session policy 設定 (= TOML の `[session]` 配下、DR-0029 §4 / DR-0032 §1)。
@@ -113,16 +119,24 @@ pub enum CtrlzX1Action {
     SelectOnDemand,
 }
 
-/// Web gateway 設定 (= TOML の `[web]` 配下、DR-0027 §Decision.2)。
+/// web gateway の設定ファイル 1 つ (= unit の中身、DR-0038 決定 1)。
 ///
-/// `hyoui web` subcommand が listen する host:port を持つ。CLI flag
-/// `--listen` があれば config を上書きする (= DR-0024 の flag 最小化方針)。
+/// `hyoui web daemon add <path>` が登録するのはこのファイルの path で、値は
+/// 登録簿に写さない。`daemon run` / 監督者 / `list` が読むたびにここから引く。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct WebFile {
+    /// TOML の `[web]` セクション。
+    #[serde(default)]
+    pub web: WebConfig,
+}
+
+/// web gateway 設定 (= TOML の `[web]` 配下、DR-0027 §Decision.2 / DR-0038 決定 1)。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct WebConfig {
     /// listen する host:port (= default `127.0.0.1:43690` = 0xAAAA、DR-0027)。
     ///
-    /// 前段 Caddy reverse proxy 想定 (= HTTPS / auth は前段が担う)。tailnet の外に
-    /// 直接晒す場合は将来 DR で auth を扱う。
+    /// 「この unit がどこに居るか」でもあり、CLI と監督者の問い合わせ先 (`/healthz`
+    /// / `/version`) もここから組み立てる (DR-0038 決定 6)。
     #[serde(default = "default_web_listen")]
     pub listen: String,
 
@@ -130,12 +144,19 @@ pub struct WebConfig {
     /// DR-0027 §4)。`None` (default) ならリリースビルドに埋め込まれた assets を返す。
     ///
     /// TOML には「値なし」を表す形が無いため、`None` の時は serialize 時に
-    /// key ごと省略する (= `hyoui config show` の出力に現れない)。
+    /// key ごと省略する。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assets_dir: Option<std::path::PathBuf>,
+    pub assets_dir: Option<PathBuf>,
+
+    /// この unit を起動する実行ファイル (DR-0038 決定 2)。`daemon add` が登録簿の
+    /// `binary_path` に写す正本。無ければ `add` した時点の自分自身。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<PathBuf>,
 }
 
-fn default_web_listen() -> String {
+/// `[web]` の listen の既定値。
+#[must_use]
+pub fn default_web_listen() -> String {
     "127.0.0.1:43690".to_string()
 }
 
@@ -144,6 +165,7 @@ impl Default for WebConfig {
         Self {
             listen: default_web_listen(),
             assets_dir: None,
+            binary_path: None,
         }
     }
 }
@@ -329,6 +351,28 @@ impl Default for TargetConfig {
 /// config 読み込み時のエラー (DR-0024 §7)。
 #[derive(Debug)]
 pub enum ConfigError {
+    /// 読もうとした config ファイルが無い (= 明示された path、`add` / 名前付き `run`)。
+    NotFound {
+        /// 探した path。
+        path: PathBuf,
+    },
+    /// `extends` が指したファイルが無い (DR-0038 決定 3)。
+    ExtendsNotFound {
+        /// `extends` を書いたファイル。
+        from: PathBuf,
+        /// 指された path (= 解いた後)。
+        target: PathBuf,
+    },
+    /// `extends` が文字列でない (DR-0038 決定 3)。
+    BadExtends {
+        /// `extends` を書いたファイル。
+        path: PathBuf,
+    },
+    /// `extends` の鎖が自分に戻ってきた (DR-0038 決定 3)。
+    ExtendsCycle {
+        /// 辿った順のファイル (= 最後が最初に戻った先)。
+        chain: Vec<PathBuf>,
+    },
     /// config ファイルの read syscall が失敗 (NotFound 以外、= permission denied 等)。
     Read {
         /// 読み込み試行したパス。
@@ -390,7 +434,24 @@ const REMOVED_KEYS: &[RemovedKey] = &[
                `\"show_child_action_menu\"` (旧 false、= 起こさず child action menu を出す) \
                に書き換えてください",
     },
+    RemovedKey {
+        section: "web",
+        name: "listen",
+        display: "[web] listen",
+        hint: WEB_MOVED_HINT,
+    },
+    RemovedKey {
+        section: "web",
+        name: "assets_dir",
+        display: "[web] assets_dir",
+        hint: WEB_MOVED_HINT,
+    },
 ];
+
+/// `config.toml` の `[web]` が web の config ファイルへ移ったことの案内 (DR-0038 決定 1)。
+const WEB_MOVED_HINT: &str = "web gateway の設定は unit ごとの config ファイルに移りました。\
+     `$XDG_CONFIG_HOME/hyoui/web/<name>.toml` に `[web]` を書き、\
+     `hyoui web daemon add <path>` で登録してください";
 
 /// 廃止 key が書かれていないか検査する (DR-0032 §1 migration)。
 fn check_removed_keys(table: &toml::Table, path: &Path) -> Result<(), ConfigError> {
@@ -413,6 +474,27 @@ fn check_removed_keys(table: &toml::Table, path: &Path) -> Result<(), ConfigErro
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NotFound { path } => {
+                write!(f, "config file not found: {}", path.display())
+            }
+            Self::ExtendsNotFound { from, target } => write!(
+                f,
+                "{} extends {}, which does not exist",
+                from.display(),
+                target.display()
+            ),
+            Self::BadExtends { path } => {
+                write!(f, "`extends` in {} must be a path string", path.display())
+            }
+            Self::ExtendsCycle { chain } => write!(
+                f,
+                "`extends` loops back on itself: {}",
+                chain
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
+            ),
             Self::Read { path, source } => {
                 write!(f, "config file read failed ({}): {source}", path.display())
             }
@@ -435,7 +517,11 @@ impl std::error::Error for ConfigError {
         match self {
             Self::Read { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
-            Self::RemovedKey { .. } => None,
+            Self::RemovedKey { .. }
+            | Self::NotFound { .. }
+            | Self::ExtendsNotFound { .. }
+            | Self::BadExtends { .. }
+            | Self::ExtendsCycle { .. } => None,
         }
     }
 }
@@ -445,32 +531,22 @@ impl std::error::Error for ConfigError {
 /// `$XDG_CONFIG_HOME` 指定があればそちら、無ければ `$HOME/.config/hyoui/config.toml`。
 /// どちらの env も無ければ `None` (= config 読み込み不能、`Config::default` で動く)。
 pub fn resolve_path() -> Option<PathBuf> {
-    resolve_path_from(
-        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
-    )
+    resolve_path_in(&crate::paths::Env::current())
 }
 
-/// [`resolve_path`] の pure 関数化版 (= test で env mutation 不要にするため切り出し)。
+/// [`resolve_path`] の env を引数で受ける形 (= test で process env を触らない)。
+fn resolve_path_in(env: &crate::paths::Env) -> Option<PathBuf> {
+    env.config_dir().map(|dir| dir.join("config.toml"))
+}
+
+/// web の config の既定 path (`$XDG_CONFIG_HOME/hyoui/web/config.toml`、DR-0038 決定 4)。
 ///
-/// 引数 (xdg, home) は両方 `Option<&OsStr>` で受ける。`Some("")` は未設定扱い
-/// (= `var_os` が空文字を返す異常ケースに合わせる)。
-fn resolve_path_from(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
-    if let Some(x) = xdg
-        && !x.is_empty()
-    {
-        return Some(PathBuf::from(x).join("hyoui").join("config.toml"));
-    }
-    let h = home?;
-    if h.is_empty() {
-        return None;
-    }
-    Some(
-        PathBuf::from(h)
-            .join(".config")
-            .join("hyoui")
-            .join("config.toml"),
-    )
+/// 名前を省いた `hyoui web daemon run` が読む。登録簿の unit は任意 path を指せる
+/// ので、ここは既定の置き場であって強制ではない。
+pub fn default_web_path() -> Option<PathBuf> {
+    crate::paths::Env::current()
+        .web_config_dir()
+        .map(|dir| dir.join("config.toml"))
 }
 
 /// config を読み込む。
@@ -488,7 +564,7 @@ pub fn load() -> Result<Config, ConfigError> {
     load_from(&path)
 }
 
-/// 明示パスから config を読み込む (= unit test / 内部実装用)。
+/// 明示パスから config を読み込む (= unit test / 内部実装用)。ファイル不在は default。
 pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
     match std::fs::read_to_string(path) {
         Ok(s) => parse_str(s.as_str(), path),
@@ -499,6 +575,44 @@ pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
         }),
     }
 }
+
+/// web の config ファイルを読む (DR-0038 決定 1 / 3)。
+///
+/// 明示された path を読むので、無ければ [`ConfigError::NotFound`]。`extends` を辿り、
+/// `[web]` の `assets_dir` / `binary_path` の相対パスは**それを書いたファイルの隣**
+/// から解く (= 起動時の cwd で意味が変わらない)。
+pub fn load_web(path: &Path) -> Result<WebFile, ConfigError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ConfigError::NotFound {
+                path: path.to_path_buf(),
+            });
+        }
+        Err(e) => {
+            return Err(ConfigError::Read {
+                path: path.to_path_buf(),
+                source: e,
+            });
+        }
+    };
+    parse_web_str(&text, path)
+}
+
+/// TOML 文字列から [`WebFile`] を読む (= `path` は `extends` と相対パスの起点)。
+pub fn parse_web_str(s: &str, path: &Path) -> Result<WebFile, ConfigError> {
+    let env = crate::paths::Env::current();
+    let table = layered_table(s, path, WEB_PATH_KEYS, &env, &mut Vec::new())?;
+    toml::Value::Table(table)
+        .try_into()
+        .map_err(|e| ConfigError::Parse {
+            path: path.to_path_buf(),
+            source: e,
+        })
+}
+
+/// web の config で path として解く鍵 (= 書いたファイルの隣から解く対象)。
+const WEB_PATH_KEYS: &[&[&str]] = &[&["web", "assets_dir"], &["web", "binary_path"]];
 
 /// 実効設定を TOML 文字列にする (= `hyoui config show` の本体)。
 ///
@@ -511,18 +625,130 @@ pub fn to_toml(config: &Config) -> Result<String, toml::ser::Error> {
     toml::to_string(config)
 }
 
-/// TOML 文字列から Config を直接 deserialize する (= test 用、エラー時の path 付帯のため `path` を取る)。
+/// TOML 文字列から Config を deserialize する (= `path` は `extends` の起点とエラー表示)。
 ///
-/// 一度 [`toml::Table`] にしてから廃止 key を検査し (DR-0032 §1)、その後 `Config` へ
-/// deserialize する (= 廃止 key を unknown field として silent に無視しないため)。
+/// 一度 [`toml::Table`] にして `extends` を畳み、廃止 key を検査してから (DR-0032 §1)
+/// `Config` へ deserialize する (= 廃止 key を unknown field として silent に無視しないため)。
 pub fn parse_str(s: &str, path: &Path) -> Result<Config, ConfigError> {
-    let to_parse_err = |e: toml::de::Error| ConfigError::Parse {
+    let env = crate::paths::Env::current();
+    let table = layered_table(s, path, &[], &env, &mut Vec::new())?;
+    check_removed_keys(&table, path)?;
+    toml::Value::Table(table)
+        .try_into()
+        .map_err(|e| ConfigError::Parse {
+            path: path.to_path_buf(),
+            source: e,
+        })
+}
+
+/// `extends` を辿って 1 つの表に畳む (DR-0038 決定 3)。
+///
+/// `visited` は辿ったファイルの正規化済み実体 (= `./a.toml` / `a.toml` / symlink 越しの
+/// 同じファイルを同一と数える)。`path_keys` に挙げた鍵の相対パスは、そのファイルの
+/// 隣から解いてから重ねる (= 重ねた後では、どのファイルが書いたかが分からない)。
+fn layered_table(
+    s: &str,
+    path: &Path,
+    path_keys: &[&[&str]],
+    env: &crate::paths::Env,
+    visited: &mut Vec<PathBuf>,
+) -> Result<toml::Table, ConfigError> {
+    let identity = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if visited.contains(&identity) {
+        let mut chain = visited.clone();
+        chain.push(identity);
+        return Err(ConfigError::ExtendsCycle { chain });
+    }
+    visited.push(identity);
+
+    let mut table: toml::Table = toml::from_str(s).map_err(|e| ConfigError::Parse {
         path: path.to_path_buf(),
         source: e,
+    })?;
+    let base_dir = path.parent().unwrap_or(Path::new("."));
+    resolve_path_keys(&mut table, path_keys, base_dir, env);
+
+    let extends = match table.remove("extends") {
+        None => return Ok(table),
+        Some(toml::Value::String(target)) => target,
+        Some(_) => {
+            return Err(ConfigError::BadExtends {
+                path: path.to_path_buf(),
+            });
+        }
     };
-    let table: toml::Table = toml::from_str(s).map_err(to_parse_err)?;
-    check_removed_keys(&table, path)?;
-    toml::Value::Table(table).try_into().map_err(to_parse_err)
+    let target = resolve_relative(Path::new(&extends), base_dir, env);
+    let text = match std::fs::read_to_string(&target) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ConfigError::ExtendsNotFound {
+                from: path.to_path_buf(),
+                target,
+            });
+        }
+        Err(e) => {
+            return Err(ConfigError::Read {
+                path: target,
+                source: e,
+            });
+        }
+    };
+    let mut base = layered_table(&text, &target, path_keys, env, visited)?;
+    merge_tables(&mut base, table);
+    Ok(base)
+}
+
+/// `~` を開き、相対なら `base_dir` から解く。
+fn resolve_relative(path: &Path, base_dir: &Path, env: &crate::paths::Env) -> PathBuf {
+    let expanded = env.expand_tilde(path);
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        base_dir.join(expanded)
+    }
+}
+
+/// `path_keys` に挙げた鍵の文字列値を path として解き直す。
+fn resolve_path_keys(
+    table: &mut toml::Table,
+    path_keys: &[&[&str]],
+    base_dir: &Path,
+    env: &crate::paths::Env,
+) {
+    for keys in path_keys {
+        if let Some(toml::Value::String(value)) = value_at_mut(table, keys) {
+            let resolved = resolve_relative(Path::new(value.as_str()), base_dir, env);
+            *value = resolved.to_string_lossy().into_owned();
+        }
+    }
+}
+
+/// 鍵の列で表を潜った先の値。途中が表でなければ `None`。
+fn value_at_mut<'a>(table: &'a mut toml::Table, keys: &[&str]) -> Option<&'a mut toml::Value> {
+    let (first, rest) = keys.split_first()?;
+    let value = table.get_mut(*first)?;
+    if rest.is_empty() {
+        return Some(value);
+    }
+    value_at_mut(value.as_table_mut()?, rest)
+}
+
+/// `overlay` を `base` に重ねる: 表は鍵ごとに潜り、それ以外は丸ごと置き換える。
+///
+/// 配列を要素ごとに混ぜないのは、並びそのものが意味を持つ値 (優先順や除外の列) で
+/// 「土台の要素がどこに割り込むか」を予想しながら書く設定にしないため
+/// (llm-gateway DR-0013 と同じ規則)。
+fn merge_tables(base: &mut toml::Table, overlay: toml::Table) {
+    for (key, value) in overlay {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(base_table)), toml::Value::Table(overlay_table)) => {
+                merge_tables(base_table, overlay_table);
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -548,7 +774,6 @@ mod tests {
             c.session.on_child_suspend,
             OnChildSuspendSetting::AutoResumeOnAttached
         );
-        assert_eq!(c.web.listen, "127.0.0.1:43690");
     }
 
     /// DR-0032 §1: enum 3 値がすべて設定語彙 (snake_case) で読める。
@@ -693,19 +918,247 @@ ctrlz_guard_delay = "soon"
     }
 
     #[test]
-    fn parse_web_section_overrides_listen() {
+    fn web_file_overrides_listen() {
         let s = r#"
 [web]
 listen = "0.0.0.0:8080"
 "#;
-        let c = parse_str(s, &dummy_path()).unwrap();
-        assert_eq!(c.web.listen, "0.0.0.0:8080");
+        let w = parse_web_str(s, &dummy_path()).unwrap();
+        assert_eq!(w.web.listen, "0.0.0.0:8080");
     }
 
     #[test]
-    fn parse_web_missing_uses_default() {
-        let c = parse_str("", &dummy_path()).unwrap();
-        assert_eq!(c.web.listen, "127.0.0.1:43690");
+    fn web_file_missing_section_uses_default_listen() {
+        let w = parse_web_str("", &dummy_path()).unwrap();
+        assert_eq!(w.web.listen, "127.0.0.1:43690");
+        assert_eq!(w.web.binary_path, None);
+        assert_eq!(w.web.assets_dir, None);
+    }
+
+    /// web の設定は `config.toml` から web の config ファイルへ移った (DR-0038 決定 1)。
+    /// 書いてあれば黙って無視せず、移し先を案内して止まる。
+    #[test]
+    fn web_keys_in_the_main_config_point_to_the_web_config_file() {
+        for (s, key) in [
+            ("[web]\nlisten = \"127.0.0.1:1\"\n", "[web] listen"),
+            ("[web]\nassets_dir = \"/x\"\n", "[web] assets_dir"),
+        ] {
+            match parse_str(s, &dummy_path()) {
+                Err(e @ ConfigError::RemovedKey { .. }) => {
+                    let msg = e.to_string();
+                    assert!(msg.contains(key), "{msg}");
+                    assert!(msg.contains("hyoui web daemon add"), "{msg}");
+                }
+                other => panic!("`{key}` は RemovedKey で拒否されるべき: {other:?}"),
+            }
+        }
+    }
+
+    /// 書かれたファイルを置くための一時 dir。
+    fn dir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    fn write(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// 表は鍵ごとに潜り、手前 (= extends を書いた側) が勝つ (DR-0038 決定 3)。
+    #[test]
+    fn extends_merges_tables_key_by_key() {
+        let d = dir();
+        write(
+            d.path(),
+            "base.toml",
+            "[web]\nlisten = \"127.0.0.1:1\"\nbinary_path = \"/opt/hyoui\"\n",
+        );
+        let unit = write(
+            d.path(),
+            "unit.toml",
+            "extends = \"base.toml\"\n[web]\nlisten = \"127.0.0.1:2\"\n",
+        );
+        let w = load_web(&unit).unwrap();
+        assert_eq!(w.web.listen, "127.0.0.1:2");
+        assert_eq!(w.web.binary_path, Some(PathBuf::from("/opt/hyoui")));
+    }
+
+    /// 配列は要素ごとに混ぜず丸ごと置き換える (= 並びが意味を持つ値を壊さない)。
+    #[test]
+    fn extends_replaces_arrays_whole() {
+        let d = dir();
+        write(
+            d.path(),
+            "base.toml",
+            "[scrub_env.targets.claude]\nkill_glob = [\"A\", \"B\"]\nkeep_glob = [\"K\"]\n",
+        );
+        let top = write(
+            d.path(),
+            "config.toml",
+            "extends = \"base.toml\"\n[scrub_env.targets.claude]\nkill_glob = [\"C\"]\n",
+        );
+        let c = load_from(&top).unwrap();
+        let t = c.scrub_env.targets.get("claude").unwrap();
+        assert_eq!(t.kill_glob, vec!["C"]);
+        // 書かなかった鍵は土台のまま残る (= 表は鍵ごと)。
+        assert_eq!(t.keep_glob, vec!["K"]);
+    }
+
+    /// 何段でも重ねられ、手前ほど勝つ。
+    #[test]
+    fn extends_chains_through_several_files() {
+        let d = dir();
+        write(
+            d.path(),
+            "a.toml",
+            "[web]\nlisten = \"a:1\"\nassets_dir = \"/a\"\n",
+        );
+        write(
+            d.path(),
+            "b.toml",
+            "extends = \"a.toml\"\n[web]\nlisten = \"b:1\"\n",
+        );
+        let c = write(d.path(), "c.toml", "extends = \"b.toml\"\n");
+        let w = load_web(&c).unwrap();
+        assert_eq!(w.web.listen, "b:1");
+        assert_eq!(w.web.assets_dir, Some(PathBuf::from("/a")));
+    }
+
+    /// `extends` の相対パスは書いたファイルの隣から解く (= cwd を見ない)。
+    #[test]
+    fn extends_is_resolved_next_to_the_file_that_wrote_it() {
+        let d = dir();
+        write(
+            d.path(),
+            "shared/base.toml",
+            "[web]\nlisten = \"127.0.0.1:9\"\n",
+        );
+        // 下の段から上の段を指す相対パス。
+        write(d.path(), "shared/mid.toml", "extends = \"./base.toml\"\n");
+        let unit = write(
+            d.path(),
+            "units/stable.toml",
+            "extends = \"../shared/mid.toml\"\n",
+        );
+        assert_eq!(load_web(&unit).unwrap().web.listen, "127.0.0.1:9");
+    }
+
+    /// path の値 (`assets_dir` / `binary_path`) も、それを書いたファイルの隣から解く。
+    /// 重ねた後で解くと、土台に書いた相対パスが派生側の位置で解かれてしまう。
+    #[test]
+    fn path_values_are_resolved_next_to_the_file_that_wrote_them() {
+        let d = dir();
+        write(
+            d.path(),
+            "shared/base.toml",
+            "[web]\nassets_dir = \"assets\"\nbinary_path = \"bin/hyoui\"\n",
+        );
+        let unit = write(
+            d.path(),
+            "units/unstable.toml",
+            "extends = \"../shared/base.toml\"\n",
+        );
+        // `..` は字面で畳まない (= symlink を挟むと OS の解決と食い違う)。指している
+        // 実体が同じかで見るため、指される側を実在させて正規化して比べる。
+        std::fs::create_dir_all(d.path().join("shared/assets")).unwrap();
+        let shared_bin = write(d.path(), "shared/bin/hyoui", "");
+        let units_bin = write(d.path(), "units/hyoui", "");
+        let real = |p: Option<PathBuf>| std::fs::canonicalize(p.expect("set")).unwrap();
+
+        let w = load_web(&unit).unwrap();
+        assert_eq!(
+            real(w.web.assets_dir),
+            std::fs::canonicalize(d.path().join("shared/assets")).unwrap()
+        );
+        assert_eq!(
+            real(w.web.binary_path),
+            std::fs::canonicalize(&shared_bin).unwrap()
+        );
+
+        // 派生側が書けば、派生側の隣から解く。
+        let unit = write(
+            d.path(),
+            "units/own.toml",
+            "extends = \"../shared/base.toml\"\n[web]\nbinary_path = \"hyoui\"\n",
+        );
+        assert_eq!(
+            real(load_web(&unit).unwrap().web.binary_path),
+            std::fs::canonicalize(&units_bin).unwrap()
+        );
+    }
+
+    /// 自分自身・A→B→A・symlink 越しの同じファイルは循環として止める。
+    #[test]
+    fn extends_cycles_stop_where_they_loop() {
+        let d = dir();
+        let selfish = write(d.path(), "self.toml", "extends = \"self.toml\"\n");
+        assert!(matches!(
+            load_web(&selfish),
+            Err(ConfigError::ExtendsCycle { .. })
+        ));
+
+        write(d.path(), "a.toml", "extends = \"b.toml\"\n");
+        let b = write(d.path(), "b.toml", "extends = \"./a.toml\"\n");
+        match load_web(&b) {
+            Err(e @ ConfigError::ExtendsCycle { .. }) => {
+                let msg = e.to_string();
+                assert!(msg.contains("a.toml") && msg.contains("b.toml"), "{msg}");
+            }
+            other => panic!("A→B→A は循環: {other:?}"),
+        }
+
+        let real = write(d.path(), "real.toml", "extends = \"link.toml\"\n");
+        std::os::unix::fs::symlink(&real, d.path().join("link.toml")).unwrap();
+        assert!(matches!(
+            load_web(&real),
+            Err(ConfigError::ExtendsCycle { .. })
+        ));
+    }
+
+    /// 指した先が無ければ、どのファイルがどのパスを指したかを言う。
+    #[test]
+    fn a_missing_extends_target_names_the_file_that_pointed_at_it() {
+        let d = dir();
+        let unit = write(d.path(), "unit.toml", "extends = \"nowhere.toml\"\n");
+        match load_web(&unit) {
+            Err(ConfigError::ExtendsNotFound { from, target }) => {
+                assert_eq!(from, unit);
+                assert_eq!(target, d.path().join("nowhere.toml"));
+            }
+            other => panic!("ExtendsNotFound のはず: {other:?}"),
+        }
+        let bad = write(d.path(), "bad.toml", "extends = 1\n");
+        assert!(matches!(
+            load_web(&bad),
+            Err(ConfigError::BadExtends { .. })
+        ));
+    }
+
+    /// web の config は明示された path を読むので、無ければ default ではなくエラー。
+    #[test]
+    fn a_missing_web_file_is_an_error() {
+        let d = dir();
+        assert!(matches!(
+            load_web(&d.path().join("absent.toml")),
+            Err(ConfigError::NotFound { .. })
+        ));
+    }
+
+    /// `config.toml` も同じ規則で `extends` を辿り、廃止 key の検査は畳んだ後に行う
+    /// (= 土台に書かれた廃止 key も見逃さない)。
+    #[test]
+    fn the_main_config_follows_extends_and_checks_removed_keys_after_merging() {
+        let d = dir();
+        write(d.path(), "base.toml", "[session]\nauto_resume = true\n");
+        let top = write(d.path(), "config.toml", "extends = \"base.toml\"\n");
+        assert!(matches!(
+            load_from(&top),
+            Err(ConfigError::RemovedKey { .. })
+        ));
     }
 
     #[test]
@@ -909,10 +1362,6 @@ ctrlz_guard_delay = "1.5s"
 
 [session]
 on_child_suspend = "show_child_action_menu"
-
-[web]
-listen = "0.0.0.0:9999"
-assets_dir = "/tmp/assets"
 "#;
         let c = parse_str(s, &dummy_path()).unwrap();
         let rendered = to_toml(&c).unwrap();
@@ -934,8 +1383,6 @@ assets_dir = "/tmp/assets"
             "ctrlz_x1_action",
             "[session]",
             "on_child_suspend",
-            "[web]",
-            "listen",
         ] {
             assert!(s.contains(key), "to_toml output missing {key}:\n{s}");
         }
@@ -950,36 +1397,44 @@ assets_dir = "/tmp/assets"
         );
     }
 
+    /// 実効設定は PTY session 側の設定だけで、web の設定は含まない (DR-0038 決定 1)。
     #[test]
-    fn to_toml_omits_unset_assets_dir() {
-        // TOML に「値なし」は書けないので None は key ごと省略する。
+    fn to_toml_has_no_web_section() {
         let s = to_toml(&Config::default()).unwrap();
-        assert!(!s.contains("assets_dir"), "unexpected assets_dir:\n{s}");
+        assert!(!s.contains("[web]"), "unexpected [web]:\n{s}");
+    }
+
+    fn env(xdg: Option<&str>, home: Option<&str>) -> crate::paths::Env {
+        crate::paths::Env::from_lookup(|name| match name {
+            "XDG_CONFIG_HOME" => xdg.map(std::ffi::OsString::from),
+            "HOME" => home.map(std::ffi::OsString::from),
+            _ => None,
+        })
     }
 
     #[test]
-    fn resolve_path_from_uses_xdg_when_present() {
-        let p = resolve_path_from(Some(OsStr::new("/custom/xdg")), None).unwrap();
+    fn resolve_path_uses_xdg_when_present() {
+        let p = resolve_path_in(&env(Some("/custom/xdg"), None)).unwrap();
         assert_eq!(p, PathBuf::from("/custom/xdg/hyoui/config.toml"));
     }
 
     #[test]
-    fn resolve_path_from_falls_back_to_home_when_xdg_unset() {
-        let p = resolve_path_from(None, Some(OsStr::new("/custom/home"))).unwrap();
+    fn resolve_path_falls_back_to_home_when_xdg_unset() {
+        let p = resolve_path_in(&env(None, Some("/custom/home"))).unwrap();
         assert_eq!(p, PathBuf::from("/custom/home/.config/hyoui/config.toml"));
     }
 
     #[test]
-    fn resolve_path_from_falls_back_to_home_when_xdg_empty() {
+    fn resolve_path_falls_back_to_home_when_xdg_empty() {
         // 異常ケース: XDG=空文字は未設定扱い。
-        let p = resolve_path_from(Some(OsStr::new("")), Some(OsStr::new("/h"))).unwrap();
+        let p = resolve_path_in(&env(Some(""), Some("/h"))).unwrap();
         assert_eq!(p, PathBuf::from("/h/.config/hyoui/config.toml"));
     }
 
     #[test]
-    fn resolve_path_from_returns_none_when_both_missing() {
-        assert!(resolve_path_from(None, None).is_none());
-        assert!(resolve_path_from(Some(OsStr::new("")), None).is_none());
-        assert!(resolve_path_from(None, Some(OsStr::new(""))).is_none());
+    fn resolve_path_returns_none_when_both_missing() {
+        assert!(resolve_path_in(&env(None, None)).is_none());
+        assert!(resolve_path_in(&env(Some(""), None)).is_none());
+        assert!(resolve_path_in(&env(None, Some(""))).is_none());
     }
 }

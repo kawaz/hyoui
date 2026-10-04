@@ -52,22 +52,19 @@ use contract::{ErrorEnvelope, ErrorInfo, InputRequest, InputResponse, ResizeRequ
 
 /// リリースビルドに埋め込む静的アセット (= `crates/hyoui-web/assets/`)。
 ///
-/// 開発モードで `--web-assets-dir <path>` (or config `[web].assets_dir`) を
-/// 指定すると、ここではなくローカルディレクトリを都度読む (= DR-0027 §4)。
+/// unit の config で `[web].assets_dir` を指定すると、ここではなくローカル
+/// ディレクトリを都度読む (= DR-0027 §4 の開発モード)。
 static EMBEDDED_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/assets");
 
 /// axum の shared state。
 ///
-/// `Config` は `hyoui::config::Config` の owned copy を持ち回る (= Arc は不要な size、
-/// でも handler 内で clone 増やしすぎない用に Arc に包む)。
+/// gateway は PTY session の設定 (`config.toml`) を持ち回らない (DR-0038 決定 1)。
+/// 受け取るのは unit の config から解いた値だけ (**認証は config を持たない** —
+/// DR-0036 決定 9 で `[web].auth` を設けない)。
 #[derive(Clone)]
 pub(crate) struct AppState {
-    #[allow(dead_code)]
-    // 将来 `[web]` セクションから rate limit を読む余地。現時点では未使用
-    // (**認証は config を持たない** — DR-0036 決定 9 で `[web].auth` を設けない)。
-    config: Arc<hyoui::config::Config>,
-    /// 開発モードで指定されたローカル assets ディレクトリ (= `--web-assets-dir` /
-    /// config `[web].assets_dir`)。`Some` の時は都度ファイル読み込み、`None` なら
+    /// 開発モードで指定されたローカル assets ディレクトリ (= unit の config
+    /// `[web].assets_dir`)。`Some` の時は都度ファイル読み込み、`None` なら
     /// `EMBEDDED_ASSETS` から返す。
     assets_dir: Option<Arc<PathBuf>>,
     /// 認証 state の置き場と `/auth/*` の rate limit (DR-0036)。
@@ -89,20 +86,15 @@ type SessionResolveFlight =
 /// そのディレクトリから都度読む。`None` なら埋め込みアセットを返す。
 ///
 /// **認証は常に有効である** (DR-0036 決定 9 — `auth = "none"` を設けない)。登録簿は
-/// `$XDG_STATE_HOME/hyoui-web/` から読む。test は `XDG_STATE_HOME` を隔離して
+/// `$XDG_STATE_HOME/hyoui/web/` から読む。test は `XDG_STATE_HOME` を隔離して
 /// 登録 fixture を置く (= 本番 record に対して test を走らせない)。
-pub fn router(config: hyoui::config::Config, assets_dir: Option<PathBuf>) -> Router {
-    router_with_auth(config, assets_dir, auth::AuthContext::new())
+pub fn router(assets_dir: Option<PathBuf>) -> Router {
+    router_with_auth(assets_dir, auth::AuthContext::new())
 }
 
 /// 認証 state の置き場を明示して Router を組む (= test の隔離 `XDG_STATE_HOME`)。
-pub fn router_with_auth(
-    config: hyoui::config::Config,
-    assets_dir: Option<PathBuf>,
-    auth: auth::AuthContext,
-) -> Router {
+pub fn router_with_auth(assets_dir: Option<PathBuf>, auth: auth::AuthContext) -> Router {
     let state = AppState {
-        config: Arc::new(config),
         assets_dir: assets_dir.map(Arc::new),
         auth: auth.clone(),
         list_flight: single_flight::SingleFlight::new(),
@@ -134,7 +126,7 @@ pub fn router_with_auth(
 
 /// listen アドレスに bind して axum server を回す。
 ///
-/// `hyoui web` subcommand から呼ばれる本体。Ctrl+C で graceful shutdown。
+/// `hyoui web daemon run` から呼ばれる本体。Ctrl+C で graceful shutdown。
 ///
 /// **iframe 埋め込み方針** (= ccmsg webui の Terminal タブ等が `?embed=1` で iframe に
 /// 貼るユースケース): `X-Frame-Options` / `Content-Security-Policy: frame-ancestors`
@@ -142,12 +134,8 @@ pub fn router_with_auth(
 /// clickjacking / CSRF リスクは network 側 (= tailnet ACL) で担保している。もし
 /// public network で serve する運用が出てきたら、その時点で reverse proxy 側で
 /// header を付けるか、`[web]` config に flag を追加する (= 現時点では yagni)。
-pub async fn serve(
-    listen: &str,
-    config: hyoui::config::Config,
-    assets_dir: Option<PathBuf>,
-) -> std::io::Result<()> {
-    let app = router(config, assets_dir);
+pub async fn serve(listen: &str, assets_dir: Option<PathBuf>) -> std::io::Result<()> {
+    let app = router(assets_dir);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!("hyoui web: listening on http://{}", listener.local_addr()?);
     axum::serve(listener, app.into_make_service())
@@ -1016,7 +1004,7 @@ mod tests {
                 })
                 .expect("fixture の family を置く");
             Self {
-                app: router_with_auth(hyoui::config::Config::default(), None, context),
+                app: router_with_auth(None, context),
                 token,
                 _state: state,
             }
@@ -1037,7 +1025,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_returns_ok() {
-        let response = router(hyoui::config::Config::default(), None)
+        let response = router(None)
             .oneshot(
                 Request::builder()
                     .uri("/healthz")
@@ -1053,7 +1041,7 @@ mod tests {
 
     #[tokio::test]
     async fn version_returns_build_identity() {
-        let response = router(hyoui::config::Config::default(), None)
+        let response = router(None)
             .oneshot(
                 Request::builder()
                     .uri("/version")
@@ -1138,7 +1126,7 @@ mod tests {
     /// endpoint 構成が増えるたびに preflight の設計が付いてくる (裁定 Q1)。
     #[tokio::test]
     async fn no_response_header_announces_the_protocol() {
-        let app = router(hyoui::config::Config::default(), None);
+        let app = router(None);
         for uri in ["/version", "/api/sessions", "/healthz"] {
             let resp = app
                 .clone()
@@ -1361,7 +1349,7 @@ mod tests {
     #[tokio::test]
     async fn index_page_serves_html_with_xterm_ref() {
         // 埋め込みモードで / が index.html を返す (= session.html は xterm.js を参照)。
-        let app = router(hyoui::config::Config::default(), None);
+        let app = router(None);
         let resp = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
@@ -1381,7 +1369,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_page_returns_html_and_references_xterm() {
-        let app = router(hyoui::config::Config::default(), None);
+        let app = router(None);
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1404,7 +1392,7 @@ mod tests {
     async fn session_page_loads_web_links_addon_before_session_code() {
         // 素の http/https URL は vendored WebLinksAddon が担当する。session.js の
         // 初期化より先に addon の UMD global が存在し、runtime CDN に依存しない。
-        let app = router(hyoui::config::Config::default(), None);
+        let app = router(None);
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1430,7 +1418,7 @@ mod tests {
     async fn embedded_asset_web_links_addon_served() {
         // DR-0027 の runtime CDN 禁止を守り、素 URL provider の UMD build を
         // release binary に埋め込んで JavaScript として配信する。
-        let app = router(hyoui::config::Config::default(), None);
+        let app = router(None);
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1457,7 +1445,7 @@ mod tests {
 
     #[tokio::test]
     async fn embedded_asset_xterm_js_served() {
-        let app = router(hyoui::config::Config::default(), None);
+        let app = router(None);
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1482,7 +1470,7 @@ mod tests {
     async fn session_asset_requests_scrollback_for_every_full_restore() {
         // fetchScreen は xterm を reset して全画面を書き直すため、初期表示だけでなく
         // refresh / fallback polling / 文字幅設定変更でも daemon の履歴を含む `both` を選ぶ。
-        let app = router(hyoui::config::Config::default(), None);
+        let app = router(None);
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1549,7 +1537,7 @@ mod tests {
 
     #[tokio::test]
     async fn asset_traversal_is_rejected() {
-        let app = router(hyoui::config::Config::default(), None);
+        let app = router(None);
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1575,10 +1563,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let custom_body = "<!doctype html><title>custom-index</title>DEVMODE";
         std::fs::write(tmp.path().join("index.html"), custom_body).unwrap();
-        let app = router(
-            hyoui::config::Config::default(),
-            Some(tmp.path().to_path_buf()),
-        );
+        let app = router(Some(tmp.path().to_path_buf()));
         let resp = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
@@ -1593,7 +1578,7 @@ mod tests {
         // iframe 埋め込み (?embed=1) を tailnet 前提で許容する方針の regression guard。
         // 将来 middleware で X-Frame-Options / frame-ancestors を default で付けたく
         // なった場合、この test が失敗して意思決定を強制する (= 気付かず制限が入るのを防ぐ)。
-        let app = router(hyoui::config::Config::default(), None);
+        let app = router(None);
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1622,7 +1607,7 @@ mod tests {
     #[tokio::test]
     async fn manifest_and_icon_served() {
         // PWA 用の manifest / icon が embedded 経路で正しい content-type で配信されること。
-        let app = router(hyoui::config::Config::default(), None);
+        let app = router(None);
         let resp = app
             .clone()
             .oneshot(
@@ -1669,7 +1654,7 @@ mod tests {
     #[tokio::test]
     async fn hackgen_font_served_as_woff2() {
         // vendored HackGen Console NF が embedded 経路で配信されて font/woff2 で返ること。
-        let app = router(hyoui::config::Config::default(), None);
+        let app = router(None);
         let resp = app
             .oneshot(
                 Request::builder()

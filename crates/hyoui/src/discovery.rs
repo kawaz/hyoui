@@ -99,32 +99,15 @@ pub struct LiveInfo {
 /// 走査する base socket dir 候補を優先順で返す (= `hyoui-cli::socket_path::existing_base_dirs`
 /// 相当)。実在する dir のみ返す。
 pub fn existing_base_dirs() -> Vec<PathBuf> {
+    let env = crate::paths::Env::current();
     let mut out = Vec::new();
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR")
-        && !runtime.is_empty()
-    {
-        let dir = PathBuf::from(runtime).join("hyoui");
+    if let Some(runtime) = env.runtime_dir() {
+        let dir = runtime.join("hyoui");
         if dir.is_dir() {
             out.push(dir);
         }
     }
-    let state = if let Some(v) = std::env::var_os("XDG_STATE_HOME")
-        && !v.is_empty()
-    {
-        Some(PathBuf::from(v).join("hyoui"))
-    } else if let Some(home) = std::env::var_os("HOME")
-        && !home.is_empty()
-    {
-        Some(
-            PathBuf::from(home)
-                .join(".local")
-                .join("state")
-                .join("hyoui"),
-        )
-    } else {
-        None
-    };
-    if let Some(s) = state
+    if let Some(s) = env.state_dir()
         && s.is_dir()
         && !out.contains(&s)
     {

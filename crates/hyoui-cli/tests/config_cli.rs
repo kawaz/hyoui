@@ -106,11 +106,8 @@ fn config_show_without_file_prints_defaults_as_valid_toml() {
         parsed["session"]["on_child_suspend"].as_str(),
         Some("auto_resume_on_attached")
     );
-    assert_eq!(
-        parsed["web"]["listen"].as_str(),
-        Some("127.0.0.1:43690"),
-        "defaults must be printed even with no config file"
-    );
+    // web の設定は unit ごとの config ファイルにあり、ここには出ない (DR-0038 決定 1)。
+    assert!(parsed.get("web").is_none(), "{text}");
     // builtin は config key ではなくコメントとして出る。
     assert!(text.contains("# builtin env scrub defaults"), "{text}");
     assert!(text.contains("#     CLAUDECODE"), "{text}");
@@ -123,7 +120,7 @@ fn config_show_with_file_prints_effective_values_including_untouched_defaults() 
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("config.toml"),
-        "[web]\nlisten = \"0.0.0.0:1234\"\n\n[scrub_env.targets.claude]\nkill_glob = [\"FOO_*\"]\n",
+        "[attach]\nctrlz_guard_delay = \"250ms\"\n\n[scrub_env.targets.claude]\nkill_glob = [\"FOO_*\"]\n",
     )
     .unwrap();
 
@@ -133,7 +130,10 @@ fn config_show_with_file_prints_effective_values_including_untouched_defaults() 
     let parsed: toml::Value = toml::from_str(&text).expect("output must be valid TOML");
 
     // 設定した値。
-    assert_eq!(parsed["web"]["listen"].as_str(), Some("0.0.0.0:1234"));
+    assert_eq!(
+        parsed["attach"]["ctrlz_guard_delay"].as_str(),
+        Some("250ms")
+    );
     assert_eq!(
         parsed["scrub_env"]["targets"]["claude"]["kill_glob"][0].as_str(),
         Some("FOO_*")

@@ -1,9 +1,11 @@
 //! `hyoui web daemon supervise` — 子 gateway を抱える監督者 (= DR-0034 決定 3)。
 //!
 //! 監督者は「登録簿の `enabled` を見て起こし、落ちたら上げ直す」だけの役に閉じる。
-//! unit の `listen` / `web_assets_dir` を argv に展開せず、渡すのは unit 名だけで、
-//! 値を読むのは子 (`hyoui web daemon run <name>`) 。監督者が読んだ値と子が使う値の
-//! 2 系統を作らないため (決定 3)。
+//! unit の config を argv に展開せず、渡すのは unit 名だけで、config を解釈して
+//! 起動するのは子 (`hyoui web daemon run <name>`)。監督者が読んだ値と子が使う値の
+//! 2 系統を作らないため (DR-0034 決定 3)。監督者が config から引くのは問い合わせ先
+//! (`listen`) だけで、`status` の表示と `restart --all` の `/healthz` 待ちに使う
+//! (DR-0038 決定 6)。
 //!
 //! ## 待ち方
 //!
@@ -305,7 +307,7 @@ impl Supervisor {
         if runtime.is_running() {
             return;
         }
-        let binary = runtime.unit.binary.clone();
+        let binary = runtime.unit.binary_path.clone();
         let log_path = self.log_path(name);
 
         let mut command = Command::new(&binary);
@@ -621,10 +623,12 @@ impl Supervisor {
             }
             self.tick();
 
+            // 問い合わせ先は今の config から引く (= 子が bind したのと同じ値)。
             let listen = self
                 .units
                 .get(&name)
-                .map(|runtime| runtime.unit.listen.clone())
+                .and_then(|runtime| runtime.unit.load_config().ok())
+                .map(|config| config.listen)
                 .unwrap_or_default();
             if !self.wait_for_healthz(&listen) {
                 notes.push(format!(
@@ -727,22 +731,33 @@ impl Supervisor {
             units,
             supervisor: SupervisorInfo {
                 pid: std::process::id(),
-                binary: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("hyoui")),
+                binary_path: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("hyoui")),
                 version: VersionInfo::current(),
+                locations: super::protocol::current_locations(),
             },
             notes,
         }
     }
 
     fn describe(&self, name: &str, runtime: &Runtime, versions: Versions) -> UnitStatus {
+        // listen は登録簿に持たないので、聞かれるたびに config から引く (DR-0038 決定 2)。
+        // 読めなければ推し量らず `None` と理由を返す。
+        let (listen, config_error) = match runtime.unit.load_config() {
+            Ok(config) => (Some(config.listen), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
         let (running_version, on_disk) = match versions {
             Versions::Skip => (None, None),
             Versions::Ask => (
                 runtime
                     .is_running()
-                    .then(|| self.probe.running(&runtime.unit.listen))
+                    .then(|| {
+                        listen
+                            .as_deref()
+                            .and_then(|listen| self.probe.running(listen))
+                    })
                     .flatten(),
-                self.probe.on_disk(&runtime.unit.binary),
+                self.probe.on_disk(&runtime.unit.binary_path),
             ),
         };
         UnitStatus {
@@ -751,9 +766,11 @@ impl Supervisor {
             running: runtime.is_running(),
             pid: runtime.pid(),
             started_at: runtime.started_at(),
-            listen: runtime.unit.listen.clone(),
-            binary: runtime.unit.binary.clone(),
-            binary_exists: runtime.unit.binary.exists(),
+            config: runtime.unit.config.clone(),
+            listen,
+            config_error,
+            binary_path: runtime.unit.binary_path.clone(),
+            binary_exists: runtime.unit.binary_path.exists(),
             version: VersionPair::new(running_version, on_disk),
             restarts: runtime.restarts,
             last_exit: runtime.last_exit.clone(),
@@ -992,11 +1009,15 @@ mod tests {
         }
     }
 
+    /// `binary` の隣 (= test の一時 dir) に listen だけを書いた config を置き、それを
+    /// 指す unit を返す。
     fn unit(listen: &str, binary: &Path, enabled: bool) -> Unit {
+        let dir = binary.parent().expect("binary lives in a test directory");
+        let config = dir.join(format!("unit-{}.toml", listen.replace([':', '.'], "_")));
+        std::fs::write(&config, format!("[web]\nlisten = \"{listen}\"\n")).unwrap();
         Unit {
-            listen: listen.to_string(),
-            binary: binary.to_path_buf(),
-            web_assets_dir: None,
+            config,
+            binary_path: binary.to_path_buf(),
             enabled,
             added_at: super::super::registry::now_iso8601(),
         }
@@ -1007,7 +1028,12 @@ mod tests {
     fn backoff_doubles_up_to_the_ceiling() {
         let timings = timings();
         let mut runtime = Runtime::new(
-            unit("127.0.0.1:1", Path::new("/nonexistent"), true),
+            Unit {
+                config: PathBuf::from("/nonexistent/unit.toml"),
+                binary_path: PathBuf::from("/nonexistent/hyoui"),
+                enabled: true,
+                added_at: super::super::registry::now_iso8601(),
+            },
             timings.initial_backoff,
         );
 

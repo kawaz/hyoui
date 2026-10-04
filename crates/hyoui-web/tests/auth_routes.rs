@@ -32,11 +32,7 @@ impl Harness {
         let state = tempfile::tempdir().expect("tempdir");
         let context = AuthContext::at(StateDir::at(state.path()));
         Self {
-            app: hyoui_web::router_with_auth(
-                hyoui::config::Config::default(),
-                None,
-                context.clone(),
-            ),
+            app: hyoui_web::router_with_auth(None, context.clone()),
             context,
             _state: state,
         }
