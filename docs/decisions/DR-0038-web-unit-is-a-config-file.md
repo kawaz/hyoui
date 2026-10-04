@@ -94,9 +94,9 @@ llm-gateway DR-0013 の規則をそのまま採る。`config.toml` と web の c
 
 #### 移行: 移動して古い置き場に symlink を残し、後で必ず消す
 
-1. **状態 dir は丸ごと新しい置き場へ移し、古い dir 名を symlink にする。** `$XDG_STATE_HOME/hyoui-web` → `$XDG_STATE_HOME/hyoui/web` へ移動し、`$XDG_STATE_HOME/hyoui-web` を `hyoui/web` への symlink にする。古いバイナリも同じ実体 (passkey の `auth.json` を含む) を見るので、新旧が混在する間も登録済みの passkey が失効しない
+1. **状態 dir は丸ごと新しい置き場へ移し、古い dir 名を symlink にする。** `$XDG_STATE_HOME/hyoui-web` → `$XDG_STATE_HOME/hyoui/web` へ移動し、`$XDG_STATE_HOME/hyoui-web` を `hyoui/web` への symlink にする。古いバイナリも同じ実体 (passkey の `auth.json` を含む) を見るので、新旧が混在する間も登録済みの passkey が失効しない。監督者のログ dir も同じで、`~/Library/Logs/hyoui-web` の中身を `$XDG_STATE_HOME/hyoui/web/logs/` へ移し、`~/Library/Logs/hyoui-web` をそこへの symlink にする
 2. **新しいバイナリは新しい置き場だけを見る。** symlink は古いバイナリのためだけにあり、新しいバイナリは古い名前を読まない (= 同じ実体を二重に拾わない)
-3. **新しいバイナリは、古い置き場が残っていれば `hyoui web ...` の起動時に stderr へ警告する。** symlink なら「古いバイナリ用の symlink が残っている、後で消す」、実体の dir なら「移行していない (このバイナリは読まない)」と言い分ける
+3. **新しいバイナリは、古い置き場 (状態 dir とログ dir) が残っていれば `hyoui web ...` の起動時に stderr へ警告する。** 全 verb の入口で見るので、監督者と子の `daemon run` も警告し、それは監督者のログに残る。symlink なら「古いバイナリ用の symlink が残っている、後で消す」、実体の dir なら「移行していない (このバイナリは読まない)」と言い分ける
 4. **symlink を消す条件は版で決める:** 本 DR を含む版より前の hyoui (= 古い置き場を読む版) が手元で 1 つも動いていない (brew 版・repo build・監督者・その子の全部が本 DR 以降の版) こと。消したら (3) の警告は黙る。警告のコードは、その次の版で外す
 
 **移動と symlink の作成を自動で行うコードは書かない。** v1.0 前で利用者は kawaz だけなので、移行は人が 1 回行う。一度通ったら二度と通らないコードを製品に残さない (DR-0034 決定 11 と同じ理由)。古い登録簿 (`units/*.toml`) は形が変わったので、移した後に新しい形で `daemon add` し直す。
@@ -144,7 +144,7 @@ llm-gateway DR-0028 決定 6 と同じ。監督者の `status` (`/version`)・`r
 - `config.toml` に `[web] listen` / `[web] assets_dir` を書いていると、全コマンドの config 読み込みが廃止 key で止まる。移し先は案内に出る
 - 移行 (状態 dir の移動 + 古い名前の symlink) をするまで、新しいバイナリから見た登録簿と passkey は空で、`hyoui web ...` は古い置き場が残っていると警告する。移行は人が手で 1 回行う
 - 既存の plist は場所の env を固定していないので、最初の `service register` は差分で止まり `--force` が要る
-- `hyoui-web` の名を持つものは crate 名 / ログの接頭辞と OS 登録の label (`jp.kawaz.hyoui-web.supervise`) だけになる。label は OS に登録した契約名なので変えない
+- `hyoui-web` の名を持つものは crate 名 / ログの接頭辞、古い置き場を検知するための名前、OS 登録名 (`jp.kawaz.hyoui-web.supervise` / `hyoui-web-supervise`) だけになる。OS 登録名は `hyoui` の名前空間の下へ移す方針だが、逆引き domain の接頭辞が kawaz 製ツール横断で裁定待ちのため値は変えず、組み立てを 1 か所 (`web_service.rs` の部品) に寄せた。変えれば移行は「旧 label を unregister → 新 label で register」になる
 - systemd 経路は DR-0034 と同じく書けるが未検証
 
 ## 参照した素材
