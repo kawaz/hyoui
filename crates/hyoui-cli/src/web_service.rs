@@ -24,10 +24,40 @@ macro_rules! label_namespace {
     };
 }
 
-/// 監督者の OS 登録名 (`<namespace>.web.supervise`)。launchd の label と、systemd の
-/// user unit 名 (= これに `.service` を付けたもの) で同じ文字列を使い、OS ごとに
-/// 名前を分けない。
-pub const SERVICE_LABEL: &str = concat!(label_namespace!(), ".web.supervise");
+/// 監督者の OS 登録名の接頭辞。後ろに状態 root の hash が付く (= [`label_for_root`])。
+/// 登録の列挙はこの接頭辞で引ける。launchd の label と systemd の user unit 名
+/// (= これに `.service` を付けたもの) で同じ文字列を使い、OS ごとに名前を分けない。
+pub const SERVICE_LABEL_PREFIX: &str = concat!(label_namespace!(), ".web.supervise.");
+
+/// 状態 root (= realpath で正規化した絶対パス) から監督者の label を作る。
+///
+/// 面ごとに状態 root が違えば監督者も別の label になり、1 つの OS に並べて載せられる。
+/// 既定の面も含めて常に hash を付ける (= 既定かどうかの判定を持たない)。hash は
+/// sha256 の先頭 4 byte (16 進 8 桁) で、版をまたいで同じ値になる。
+pub fn label_for_root(root: &Path) -> String {
+    use sha2::Digest;
+    use std::os::unix::ffi::OsStrExt;
+    let digest = sha2::Sha256::digest(root.as_os_str().as_bytes());
+    let hash: String = digest[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{SERVICE_LABEL_PREFIX}{hash}")
+}
+
+/// 状態 root を realpath で正規化する。`create` なら無ければ作る (= register 前)。
+///
+/// root が無い (= 一度も登録していない面) 時は、正規化前の絶対 path で代える。
+/// 登録は `create` で root を作ってから label を決めるので、登録済みの面では常に
+/// 正規化した値になる。
+pub fn canonical_state_root(env: &hyoui::paths::Env, create: bool) -> Result<PathBuf, String> {
+    let root = env.state_root();
+    if create {
+        std::fs::create_dir_all(&root)
+            .map_err(|error| format!("cannot create {}: {error}", root.display()))?;
+    }
+    Ok(std::fs::canonicalize(&root).unwrap_or(root))
+}
 
 /// launchd / systemd user に共通するサービスの意味記述。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,11 +106,6 @@ impl ServiceDefinition {
     }
 }
 
-/// 組み込みの label (= どの OS でも [`SERVICE_LABEL`])。
-pub fn builtin_label() -> &'static str {
-    SERVICE_LABEL
-}
-
 /// 監督者の label。`HYOUI_WEB_SERVICE_LABEL` が与えられていればそれを使う。
 ///
 /// Design rationale: launchd の job は `gui/$UID/<label>` に属し、**隔離 HOME を
@@ -90,7 +115,8 @@ pub fn builtin_label() -> &'static str {
 /// で並べて確かめられる口を持つ。
 ///
 /// 値はファイル名に使うので `[A-Za-z0-9._-]` に限り、外れた値は無視して組み込みの
-/// label に戻る (= 黙って path を作らせない)。
+/// label (= 今の env の状態 root から作る [`label_for_root`]) に戻る (= 黙って path を
+/// 作らせない)。
 pub fn default_label() -> String {
     std::env::var("HYOUI_WEB_SERVICE_LABEL")
         .ok()
@@ -101,7 +127,11 @@ pub fn default_label() -> String {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
         })
-        .unwrap_or_else(|| builtin_label().to_string())
+        .unwrap_or_else(|| {
+            let env = hyoui::paths::Env::current();
+            let root = canonical_state_root(&env, false).unwrap_or_else(|_| env.state_root());
+            label_for_root(&root)
+        })
 }
 
 /// 定義に固定する env (DR-0038 決定 5)。
@@ -940,10 +970,14 @@ pub fn register_command(binary: Option<PathBuf>, force: bool) -> ExitCode {
         }
     };
 
+    // label は状態 root の realpath から作るので、決める前に root を作る (DR-0038 決定 4)。
+    let locations = hyoui::paths::Env::current();
+    if let Err(error) = canonical_state_root(&locations, true) {
+        return fail(context, &error);
+    }
     let label = default_label();
     // launchd は StandardOutPath でファイルに落とす、systemd は journald が拾うので
     // 定義に log path を書かない (決定 6)。
-    let locations = hyoui::paths::Env::current();
     let path_var = std::env::var_os("PATH");
     let definition = ServiceDefinition::for_supervisor(
         &program.to_string_lossy(),
@@ -1108,10 +1142,20 @@ pub fn status_command() -> ExitCode {
         })
     });
 
+    // label は人が覚える名前ではない (状態 root の hash が付く) ので、どの面の監督者
+    // かを読めるように、label を作った root と定義に固定した env を並べる
+    // (DR-0038 決定 4)。
+    let env = hyoui::paths::Env::current();
+    let root = canonical_state_root(&env, false).unwrap_or_else(|_| env.state_root());
+    let pinned = std::fs::read_to_string(&service.definition_path)
+        .ok()
+        .map(|text| env_in_definition(&text));
     let mut output = json!({
         "label": label,
+        "root": root,
         "path": service.definition_path,
         "registered": service.registered,
+        "env": pinned,
         "running": running,
         "pid": service.pid,
         "service": service_json(&service),
@@ -1242,6 +1286,9 @@ pub fn resolve_program(current_exe: &Path) -> Result<ResolvedProgram, String> {
 mod tests {
     use super::*;
 
+    /// golden / path の test に使う label (= 既定の面の hash 付き label の形)。
+    const TEST_LABEL: &str = "com.github.kawaz.hyoui.web.supervise.1303b83b";
+
     fn locations(pairs: &[(&str, &str)]) -> hyoui::paths::Env {
         let pairs: Vec<(String, std::ffi::OsString)> = pairs
             .iter()
@@ -1268,10 +1315,10 @@ mod tests {
 
     fn sample_definition() -> ServiceDefinition {
         ServiceDefinition::labelled(
-            SERVICE_LABEL,
+            TEST_LABEL,
             "/opt/homebrew/bin/hyoui",
             Some(
-                "/Users/test/.local/state/hyoui/web/logs/com.github.kawaz.hyoui.web.supervise.log"
+                "/Users/test/.local/state/hyoui/web/logs/com.github.kawaz.hyoui.web.supervise.1303b83b.log"
                     .to_string(),
             ),
             sample_env(),
@@ -1285,9 +1332,9 @@ mod tests {
     #[test]
     fn launchd_pure_helpers_run_cross_platform() {
         assert_eq!(
-            launchd_definition_path(Path::new("/home/test"), SERVICE_LABEL),
+            launchd_definition_path(Path::new("/home/test"), TEST_LABEL),
             PathBuf::from(
-                "/home/test/Library/LaunchAgents/com.github.kawaz.hyoui.web.supervise.plist"
+                "/home/test/Library/LaunchAgents/com.github.kawaz.hyoui.web.supervise.1303b83b.plist"
             )
         );
         assert_eq!(xml_escape("a&b<c>"), "a&amp;b&lt;c&gt;");
@@ -1300,32 +1347,73 @@ mod tests {
         );
     }
 
-    /// OS 登録名は `com.github.kawaz.<repo>` の下、CLI の階層と同じ並び (DR-0038 決定 4)。
-    /// systemd の unit 名は同じ文字列に `.service` を付けたもの。
+    /// OS 登録名は `com.github.kawaz.<repo>` の下、CLI の階層と同じ並びに状態 root の
+    /// hash (16 進 8 桁) を付ける。systemd の unit 名は同じ文字列に `.service` を付けた
+    /// もの (DR-0038 決定 4)。
     #[test]
-    fn the_service_label_lives_under_the_repo_namespace() {
-        assert_eq!(SERVICE_LABEL, "com.github.kawaz.hyoui.web.supervise");
-        assert_eq!(builtin_label(), SERVICE_LABEL);
+    fn the_service_label_is_the_namespace_plus_a_root_hash() {
         assert_eq!(
-            systemd_definition_path(Path::new("/c"), SERVICE_LABEL),
-            PathBuf::from("/c/systemd/user/com.github.kawaz.hyoui.web.supervise.service")
+            SERVICE_LABEL_PREFIX,
+            "com.github.kawaz.hyoui.web.supervise."
         );
-        assert!(!SERVICE_LABEL.contains("hyoui-web"));
+        let label = label_for_root(Path::new("/Users/test/.local/state/hyoui"));
+        let hash = label.strip_prefix(SERVICE_LABEL_PREFIX).expect("prefix");
+        assert_eq!(hash.len(), 8, "{label}");
+        assert!(
+            hash.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "{label}"
+        );
+        // 版をまたいで同じ値になる (= sha256 の先頭 4 byte を固定する。期待値は
+        // `printf %s /Users/test/.local/state/hyoui | shasum -a 256` の先頭 8 桁)。
+        assert_eq!(label, "com.github.kawaz.hyoui.web.supervise.1303b83b");
+        // root が違えば label も違う (= 面ごとに並べて載せられる)。
+        assert_ne!(
+            label,
+            label_for_root(Path::new("/Users/test/work/state/hyoui"))
+        );
+        assert_eq!(
+            systemd_definition_path(Path::new("/c"), &label),
+            PathBuf::from(format!("/c/systemd/user/{label}.service"))
+        );
+        assert!(!label.contains("hyoui-web"));
+    }
+
+    /// root は realpath で正規化してから hash する (= symlink 越しに同じ root を指せば
+    /// 同じ label)。register 前は root を作るので正規化できる。
+    #[test]
+    fn the_state_root_is_created_and_canonicalized() {
+        let home = tempfile::tempdir().unwrap();
+        let real = home.path().join("real-state");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, home.path().join("link-state")).unwrap();
+        let env_at = |state: &Path| {
+            let state = state.as_os_str().to_os_string();
+            hyoui::paths::Env::from_lookup(move |name| {
+                (name == "XDG_STATE_HOME").then(|| state.clone())
+            })
+        };
+        let via_link =
+            canonical_state_root(&env_at(&home.path().join("link-state")), true).unwrap();
+        let direct = canonical_state_root(&env_at(&real), true).unwrap();
+        assert_eq!(via_link, direct);
+        assert!(direct.is_dir());
+        assert_eq!(direct, std::fs::canonicalize(real.join("hyoui")).unwrap());
     }
 
     /// OS 名差は label だけで、各 backend の定義 basename と 1:1 に対応する。
     #[test]
     fn labels_and_definition_paths_are_deterministic() {
         assert_eq!(
-            launchd_definition_path(Path::new("/Users/test"), SERVICE_LABEL),
+            launchd_definition_path(Path::new("/Users/test"), TEST_LABEL),
             PathBuf::from(
-                "/Users/test/Library/LaunchAgents/com.github.kawaz.hyoui.web.supervise.plist"
+                "/Users/test/Library/LaunchAgents/com.github.kawaz.hyoui.web.supervise.1303b83b.plist"
             )
         );
         assert_eq!(
-            systemd_definition_path(Path::new("/home/test/.config"), SERVICE_LABEL),
+            systemd_definition_path(Path::new("/home/test/.config"), TEST_LABEL),
             PathBuf::from(
-                "/home/test/.config/systemd/user/com.github.kawaz.hyoui.web.supervise.service"
+                "/home/test/.config/systemd/user/com.github.kawaz.hyoui.web.supervise.1303b83b.service"
             )
         );
         assert_eq!(
@@ -1452,13 +1540,13 @@ mod tests {
     #[test]
     fn the_supervisor_log_lives_with_the_unit_logs() {
         assert_eq!(
-            log_path_for(&locations(&[("HOME", "/h")]), SERVICE_LABEL),
-            "/h/.local/state/hyoui/web/logs/com.github.kawaz.hyoui.web.supervise.log"
+            log_path_for(&locations(&[("HOME", "/h")]), TEST_LABEL),
+            "/h/.local/state/hyoui/web/logs/com.github.kawaz.hyoui.web.supervise.1303b83b.log"
         );
         assert_eq!(
             log_path_in_definition(&render_launchd_plist(&sample_definition())).as_deref(),
             Some(
-                "/Users/test/.local/state/hyoui/web/logs/com.github.kawaz.hyoui.web.supervise.log"
+                "/Users/test/.local/state/hyoui/web/logs/com.github.kawaz.hyoui.web.supervise.1303b83b.log"
             )
         );
     }
@@ -1594,7 +1682,7 @@ mod tests {
     #[test]
     fn launchd_plist_golden() {
         let mut def = sample_definition();
-        def.label = SERVICE_LABEL.to_string();
+        def.label = TEST_LABEL.to_string();
         assert_eq!(
             render_launchd_plist(&def),
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -1602,7 +1690,7 @@ mod tests {
 <plist version=\"1.0\">\n\
 <dict>\n\
 \t<key>Label</key>\n\
-\t<string>com.github.kawaz.hyoui.web.supervise</string>\n\
+\t<string>com.github.kawaz.hyoui.web.supervise.1303b83b</string>\n\
 \t<key>ProgramArguments</key>\n\
 \t<array>\n\
 \t\t<string>/opt/homebrew/bin/hyoui</string>\n\
@@ -1626,9 +1714,9 @@ mod tests {
 \t\t<string>/Users/test/.local/state</string>\n\
 \t</dict>\n\
 \t<key>StandardOutPath</key>\n\
-\t<string>/Users/test/.local/state/hyoui/web/logs/com.github.kawaz.hyoui.web.supervise.log</string>\n\
+\t<string>/Users/test/.local/state/hyoui/web/logs/com.github.kawaz.hyoui.web.supervise.1303b83b.log</string>\n\
 \t<key>StandardErrorPath</key>\n\
-\t<string>/Users/test/.local/state/hyoui/web/logs/com.github.kawaz.hyoui.web.supervise.log</string>\n\
+\t<string>/Users/test/.local/state/hyoui/web/logs/com.github.kawaz.hyoui.web.supervise.1303b83b.log</string>\n\
 </dict>\n\
 </plist>\n"
         );
@@ -1638,7 +1726,7 @@ mod tests {
     #[test]
     fn systemd_unit_golden() {
         let mut def = sample_definition();
-        def.label = SERVICE_LABEL.to_string();
+        def.label = TEST_LABEL.to_string();
         assert_eq!(
             render_systemd_unit(&def),
             "[Unit]\n\
@@ -1734,12 +1822,8 @@ WantedBy=default.target\n"
     /// 読むのは先頭 1 語だけで、unit の属性を定義から復元する経路は持たない。
     #[test]
     fn the_program_can_be_read_back_from_either_definition() {
-        let def = ServiceDefinition::labelled(
-            "com.github.kawaz.hyoui.web.supervise",
-            "/opt/homebrew/bin/hyoui",
-            None,
-            sample_env(),
-        );
+        let def =
+            ServiceDefinition::labelled(TEST_LABEL, "/opt/homebrew/bin/hyoui", None, sample_env());
         assert_eq!(
             program_in_definition(&render_launchd_plist(&def)).as_deref(),
             Some("/opt/homebrew/bin/hyoui")

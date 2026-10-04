@@ -58,20 +58,40 @@ fn status_reports_definition_state_in_isolated_home() {
 
     let label = status["label"].as_str().expect("label");
     let path = status["path"].as_str().expect("path");
-    // OS ごとに名前を分けない (DR-0038 決定 4)。
-    assert_eq!(label, "com.github.kawaz.hyoui.web.supervise");
+    // label は接頭辞 + 状態 root の hash (16 進 8 桁)。OS ごとに名前を分けない
+    // (DR-0038 決定 4)。どの root から作ったかを並べて出す。
+    let hash = label
+        .strip_prefix("com.github.kawaz.hyoui.web.supervise.")
+        .unwrap_or_else(|| panic!("unexpected label {label}"));
+    assert_eq!(hash.len(), 8, "{label}");
+    assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()), "{label}");
+    let root = status["root"].as_str().expect("root");
+    assert!(root.ends_with(".local/state/hyoui"), "{root}");
     if cfg!(target_os = "macos") {
         assert!(path.contains("Library/LaunchAgents"), "{path}");
-        assert!(
-            path.ends_with("com.github.kawaz.hyoui.web.supervise.plist"),
-            "{path}"
-        );
+        assert!(path.ends_with(&format!("{label}.plist")), "{path}");
     } else if cfg!(target_os = "linux") {
         assert!(
-            path.ends_with("systemd/user/com.github.kawaz.hyoui.web.supervise.service"),
+            path.ends_with(&format!("systemd/user/{label}.service")),
             "{path}"
         );
     }
+}
+
+/// 状態 root が違えば監督者の label も違う (= 面ごとに並べて載せられる)。
+#[test]
+fn each_state_root_gets_its_own_label() {
+    let first = tempfile::tempdir().expect("isolated HOME");
+    let second = tempfile::tempdir().expect("isolated HOME");
+    let label = |home: &Path| {
+        json(&hyoui(&["web", "service", "status"], home))["label"]
+            .as_str()
+            .expect("label")
+            .to_string()
+    };
+    assert_ne!(label(first.path()), label(second.path()));
+    // 同じ root なら同じ label。
+    assert_eq!(label(first.path()), label(first.path()));
 }
 
 /// 旧 label は引き取らない (= DR-0034 決定 11 / DR-0038 移行節、移行は人の手作業)。

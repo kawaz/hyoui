@@ -922,7 +922,10 @@ mod tests {
         let agents = home.path().join("Library/LaunchAgents");
         std::fs::create_dir_all(&agents).unwrap();
         std::fs::write(
-            agents.join(format!("{}.plist", crate::web_service::SERVICE_LABEL)),
+            agents.join(format!(
+                "{}.plist",
+                crate::web_service::label_for_root(&env.state_root())
+            )),
             "",
         )
         .unwrap();

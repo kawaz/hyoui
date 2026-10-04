@@ -41,6 +41,9 @@ stable-which = { workspace = true }
 toml = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
+# DR-0038 決定 4: 監督者の OS 登録名に付ける状態 root の hash (版をまたいで同じ値に
+# なる hash が要るので、std の `DefaultHasher` は使えない)。hyoui-web と同じ版。
+sha2 = "0.10"
 
 [dev-dependencies]
 # web e2e (tests/web_e2e_api.rs) が隔離した `XDG_STATE_HOME` に登録 fixture を

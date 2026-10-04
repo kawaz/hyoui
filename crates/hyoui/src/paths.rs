@@ -132,6 +132,15 @@ impl Env {
         self.state_home().map(|dir| dir.join("hyoui"))
     }
 
+    /// hyoui の状態の root (= [`Env::state_dir`]、どちらの env も無ければ相対 path
+    /// `.local/state/hyoui`)。監督者の OS 登録名の hash はこの root から作る
+    /// (DR-0038 決定 4)。
+    #[must_use]
+    pub fn state_root(&self) -> PathBuf {
+        self.state_dir()
+            .unwrap_or_else(|| PathBuf::from(".local/state/hyoui"))
+    }
+
     /// web の config の既定の置き場 (`<config_dir>/web`、DR-0038 決定 4)。
     #[must_use]
     pub fn web_config_dir(&self) -> Option<PathBuf> {
@@ -146,9 +155,7 @@ impl Env {
     /// 選ぶ (`$HOME` の無い環境はほぼ無い)。
     #[must_use]
     pub fn web_state_dir(&self) -> PathBuf {
-        self.state_dir()
-            .unwrap_or_else(|| PathBuf::from(".local/state/hyoui"))
-            .join("web")
+        self.state_root().join("web")
     }
 
     /// `~` / `~/...` を `$HOME` で開く。それ以外はそのまま返す。
