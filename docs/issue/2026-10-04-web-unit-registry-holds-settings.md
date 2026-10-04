@@ -35,8 +35,10 @@ reference の `cli-daemon-subcommands` (kawaz 製 CLI 共通の正本) は unit 
 - unit = 任意のパスの config ファイル 1 つ。`hyoui web daemon add [--name <name>] <config-path>` で登録し、name 省略時は config の basename (拡張子なし)。置き場所は利用者が決め、登録簿はパスを参照するだけ (llm-gateway の実例: `~/.config/llm-gateway/config-11302-stable.toml`)
 - 登録簿 `~/.local/state/hyoui-web/units/<name>.toml` は `{config, binary_path, enabled}` だけ。`listen` / `assets_dir` は config 側の `[web]`
 - binary は config 側の `binary_path` を正とし、無ければ登録時点の自分自身の絶対パスを焼き込む (llm-gateway と同じ)
-- unit の config は hyoui 全体の config (DR-0024 の `config.toml`) と同じ形式。共通部分は `extends` で土台を共有し、unit ごとには `[web] listen` 等だけを上書きする (llm-gateway の stable / unstable は listen だけが違う)。そのために hyoui の config 読み込みに `extends` (llm-gateway DR-0013: 表は鍵ごとに潜り他は置き換え、相対パスは書いたファイルの隣から、循環はその場で止める) を入れる
+- web の config の既定の置き場は `~/.config/hyoui/web/` (合意 2026-10-04。CLI に `web` サブコマンドが挟まる hyoui の構造に合わせ、config にも `web/` を付ける)。例: `web/stable.toml`、`web/unstable.toml`。`daemon add <path>` は任意パスを受けるので既定の置き場であって強制ではない
+- 共通部分は `extends` で土台を共有し、unit ごとには `[web] listen` 等だけを上書きする (llm-gateway の stable / unstable は listen だけが違う)。土台も `web/` の中に置く (例: `web/base.toml`)。gateway は PTY session の設定 (DR-0024 の `[session]`) を使わないので `~/.config/hyoui/config.toml` を土台にせず、web の設定は web の中で閉じる (推し)。そのために hyoui の config 読み込みに `extends` (llm-gateway DR-0013: 表は鍵ごとに潜り他は置き換え、相対パスは書いたファイルの隣から、循環はその場で止める) を入れる
 - 稼働中の gateway への問い合わせ先は、登録簿の unit から config を引いて listen で組み立てる (llm-gateway DR-0028 決定 6)
+- 状態の置き場も揃える (推し): 現在の `~/.local/state/hyoui-web/` (登録簿、passkey の `auth.json` / `pending.json`、logs、supervisor.sock) を `~/.local/state/hyoui/web/` に。移行手順が要るが v1.0 前なので互換は残さず同じ是正で動かす
 - 既存の stable / unstable 2 unit の移行 (v1.0 前なので互換を残さず置き換えてよい範囲)
 - DR-0034 の該当部分を新しい DR で置き換える
 
