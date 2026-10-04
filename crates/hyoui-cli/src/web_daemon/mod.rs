@@ -120,6 +120,41 @@ fn add_location_warnings(
     }
 }
 
+/// 置き場を移す前の web の状態 dir の名前 (= `$XDG_STATE_HOME/<これ>`、DR-0038 移行節)。
+///
+/// 新しいバイナリはここを読まない。残っているかを見て警告するためだけに名前を持つ。
+const LEGACY_STATE_DIR_NAME: &str = "hyoui-web";
+
+/// 古い置き場が残っていれば stderr に警告する (DR-0038 移行節 (3))。
+///
+/// symlink なら「移行済み、古いバイナリ用の symlink が残っている = 後で消す」、
+/// 実体の dir なら「移行していない = passkey も登録簿も新しい置き場に無い」。
+/// どちらも読まず、二重に拾わない。
+pub fn warn_legacy_state_dir() {
+    let env = hyoui::paths::Env::current();
+    if let Some(warning) = legacy_state_warning(&env) {
+        eprintln!("hyoui: warning: {warning}");
+    }
+}
+
+fn legacy_state_warning(env: &hyoui::paths::Env) -> Option<String> {
+    let legacy = env.state_home()?.join(LEGACY_STATE_DIR_NAME);
+    let meta = legacy.symlink_metadata().ok()?;
+    let current = env.web_state_dir();
+    Some(if meta.file_type().is_symlink() {
+        format!(
+            "{} is a symlink left for older hyoui binaries; remove it once none of them run (DR-0038)",
+            legacy.display()
+        )
+    } else {
+        format!(
+            "{} still holds web state that this hyoui does not read; move it to {} and leave a symlink in its place (DR-0038)",
+            legacy.display(),
+            current.display()
+        )
+    })
+}
+
 /// 監督者に届かない時、OS の定義に固定された場所が今の shell と違えば
 /// `warnings` に足す (DR-0038 決定 5)。場所が食い違えば socket の位置も食い違うので、
 /// 「届かない」の理由がそれである可能性を言う。
@@ -789,6 +824,30 @@ mod tests {
         let resolved = absolute(Path::new("web/stable.toml")).unwrap();
         assert!(resolved.is_absolute());
         assert!(resolved.ends_with("web/stable.toml"));
+    }
+
+    /// 古い置き場が symlink か実体かで警告を言い分け、無ければ黙る (DR-0038 移行節)。
+    #[test]
+    fn the_legacy_state_dir_is_reported_but_not_read() {
+        let home = tempfile::tempdir().unwrap();
+        let state = home.path().join("state");
+        let state_os = state.clone().into_os_string();
+        let env = hyoui::paths::Env::from_lookup(|name| {
+            (name == "XDG_STATE_HOME").then(|| state_os.clone())
+        });
+        std::fs::create_dir_all(&state).unwrap();
+        assert_eq!(legacy_state_warning(&env), None);
+
+        let legacy = state.join(LEGACY_STATE_DIR_NAME);
+        std::fs::create_dir(&legacy).unwrap();
+        let warning = legacy_state_warning(&env).expect("a real dir is reported");
+        assert!(warning.contains("does not read"), "{warning}");
+
+        std::fs::remove_dir(&legacy).unwrap();
+        std::fs::create_dir_all(env.web_state_dir()).unwrap();
+        std::os::unix::fs::symlink(env.web_state_dir(), &legacy).unwrap();
+        let warning = legacy_state_warning(&env).expect("a symlink is reported");
+        assert!(warning.contains("symlink"), "{warning}");
     }
 
     #[test]
