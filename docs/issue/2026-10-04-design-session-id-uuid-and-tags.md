@@ -40,7 +40,9 @@ blocked_by:
 ### socket をフラットに置く
 
 - session の socket は `hyoui/sessions/<uuid>.sock` に置く。`hyoui/` 直下は機能別のサブ dir (`sessions/`、`web/` ...) だけにする。これで web の状態の置き場 (`hyoui/web/`) と衝突しない (WR-Q1 の解消)
-- unix socket の長さの上限は bind / connect に渡す `sun_path` 引数の長さであって、ファイルシステム上のフルパスの長さではない。フルパスの長さで弾かない (現行の `check_sun_path_len` はフルパスで弾いており誤り)。相対パスを渡して開く。手段は実装時に決める: cwd はプロセス全体で 1 つなので、マルチスレッドのプロセス (gateway の tokio、daemon) では cwd を変える一瞬に他スレッドが巻き込まれる。macOS には dirfd 基準の `bindat` / `connectat` が無い (SDK ヘッダと libsystem_kernel の export で確認、2026-10-04)。候補はスレッドを立てる前の起動直後に cwd を変える / 開くためだけの子プロセスで開いて fd を渡す / 短い symlink 経由 (macOS は `/tmp` を掃除するので置き場に制約)
+- unix socket の長さの上限は bind / connect に渡す `sun_path` 引数の長さであって、ファイルシステム上のフルパスの長さではない。フルパスの長さで弾かない (現行の `check_sun_path_len` はフルパスで弾いており誤り)。相対パスを渡して開く。chdir はプロセス全体に効くので、マルチスレッドのプロセス (gateway の tokio、daemon) では使わない。macOS には dirfd 基準の `bindat` / `connectat` が無い (SDK ヘッダと libsystem_kernel の export で確認、2026-10-04)
+  - 推し: 共有 fd + fork した子だけが cwd を変える。親で socket を作ってから fork し、子は `fchdir(dirfd)` → 相対名で `bind` / `connect` → `_exit(結果)`、親は子の終了を待つ。fork 後の fd は親子で同じ open file description を指すので、子の bind / connect は親の fd にそのまま効き、SCM_RIGHTS での受け渡しも要らない。cwd が変わるのは子だけで親のスレッドは巻き込まれない。fork から `_exit` までは async-signal-safe な呼び出し (fchdir / bind / connect / _exit) だけなので、マルチスレッドのプロセスから fork しても POSIX の範囲で安全。fork するのはパスが `sun_path` の上限を超える時だけで、超えなければ今どおり直接開く
+  - 退けた候補: macOS の `pthread_fchdir_np` (スレッドごとの cwd) は libsystem_pthread が export しているがヘッダに公開宣言が無い (fts.h に「private」とあるだけ) 非公開 API。Linux の `/proc/self/fd/<dirfd>/<name>` は macOS に無い。短い symlink は置き場の制約 (macOS は `/tmp` を掃除する) と後始末を背負う
 
 ### 面の分離 (使うなら)
 
