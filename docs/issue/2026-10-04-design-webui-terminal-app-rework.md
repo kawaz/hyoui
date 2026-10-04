@@ -102,7 +102,9 @@ Window
 - 記憶単位は pane × 端末 (配置と同じ層)
 - alt screen 中の縦フリックは矢印キーに変換する (xterm 系の慣習)
 - xterm.js 6.0.0 で転送だけを止められることを PoC で確認 (`docs/research/poc/2026-10-04-xterm-mouse-mode-toggle/`、headless Chromium / WebKit)。オフ時は capture で mouse / wheel を止め、左 mousedown を修飾キー付き (Mac は Option + `macOptionClickForcesSelection`、他は Shift) で渡し直して xterm 自身の強制選択経路を使う。wheel は normal で `scrollLines`、alt で矢印キー列。touch の縦スワイプは自前、横は `scroll-snap` のカルーセル。DECSET は全 224 ケースで保持、遮断中の report は 0 byte。Mac の `altClickMovesCursor` (本物の mouseup の altKey を見る) は mouseup の altKey を外して渡し直す
-- 未決: 転送オン時のタッチ。xterm 6.0.0 は touch を扱わず、TUI に届くのは tap (互換 mouse) だけ。スワイプまで TUI に渡すなら touch → mouse report の変換を自前で持つ。touch でのドラッグ選択の操作 (長押し等) と iOS 実機も未確認
+- 転送オン時のタッチ: TUI に渡すのは tap だけ、スワイプはオン時もスクロールのまま (xterm 6.0.0 は touch を扱わず tap は互換 mouse で届く。touch → mouse report の自前変換は持たない)
+- タッチの選択: 長押しで選択モード (マウス転送のオン / オフによらず)。現行 `session.js` のテキスト層 (buffer を素のテキストにして `<pre>` で重ね、OS 標準の選択ハンドル・ルーペ・コピーメニューに任せる) を土台に、ターミナルのセルと同じ位置・フォント・行高でその場に重ねる。選択範囲の調整とコピーは OS 標準に任せ、自前は閉じる操作だけ
+- 未確認 (iOS 実機 PoC で確かめる): 長押しで層を出してそのまま OS 標準の選択が始まるか (間に合わなければ透明な層を常に重ねる案)、全角・曖昧幅・絵文字でテキスト層がセルとずれないか
 
 ### サイズ違い (1 session を大きさの違う複数 pane で見る)
 
