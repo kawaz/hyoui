@@ -18,15 +18,6 @@
 
 ## 裁定待ち
 
-### 👺WR-Q1: web の状態の置き場が session socket の木と衝突する
-
-`hyoui/web/` に置くと、macOS では session socket の base (`~/.local/state/hyoui/`、直下のサブ dir = namespace) と同居し、`web/supervisor.sock` が namespace `web` の session として discovery に拾われる ([issue](issue/2026-10-04-web-unit-registry-holds-settings.md)、DR-0018)。統括推しは d (同居そのものをやめる。予約語を作らず、機能を足す時も同じ形。ccmsg の hyoui 連携も同時に直す)。
-
-- [ ] a: 監督者 socket を `web/run/` に下げ、namespace 名 `web` を予約語にする
-- [ ] b: socket だけ 1 段下げる (予約語なし)
-- [ ] c: `hyoui-web/` のまま
-- [ ] d: session socket を `hyoui/sessions/<ns>/` に移し、`hyoui/` 直下は機能別サブ dir だけ
-
 ### 👺WR-Q2: 合成画面から出力する時、セル以外の端末状態をどう届けるか
 
 [DR-0040](decisions/DR-0040-daemon-own-cell-model-and-layer-composition.md) 決定 5 で素通しをやめると、DECSET (マウス / bracketed paste / kitty keyboard / application cursor) と BEL / OSC 52 / title が client に届かなくなる。[DR-0039](decisions/DR-0039-webui-terminal-app-rework.md) のマウス制御は xterm.js に DECSET が届く前提。統括推しは a (tmux と同じ。外から見えるのは今と同じ正しい TTY 出力のまま)。
