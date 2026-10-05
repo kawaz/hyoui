@@ -326,10 +326,12 @@ hyoui run --login --detached -- zsh -f       # コマンド明示 (rc を読ま�
 
 - shell は passwd (`getpwuid`) から引く。呼び出し元の `$SHELL` は見ない
 - argv[0] は `-<shell の basename>` (例: `-zsh`)。rc は shell が読む
-- 子の env は呼び出し元から引き継がず最小から始める: `HOME` / `USER` / `LOGNAME` / `SHELL` / 初期 `PATH` / `LANG` (呼び出し元に在れば) / `TERM=xterm-256color` (呼び出し元の値は引き継がず常にこの値。session は後から web など別の端末で見られるので、どこから見ても通じる値にする)。初期 `PATH` は macOS では `/etc/paths` と `/etc/paths.d/*` から、それ以外は `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`
+- 子の env は呼び出し元から引き継がず最小から始める: `HOME` / `USER` / `LOGNAME` / `SHELL` / 初期 `PATH` / `LANG` (呼び出し元に在れば) / `TERM` (下記)。初期 `PATH` は macOS では `/etc/paths` と `/etc/paths.d/*` から、それ以外は `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`
 - `HYOUI_SESSION_ID` / `HYOUI_NAMESPACE` は最小化しても子に残る
 - コマンドを明示した時は、そのコマンドを argv[0] の `-` 付けなしでそのまま起動し、env だけ最小にする
 - 最小化するのは子の env だけ。hyoui 自身がどの面の root (`XDG_*` / `HYOUI_NAMESPACE`) を使うかは呼び出し元の env のまま決まる
+
+子の `TERM` は `--login` の有無によらず呼び出し元の値を引き継ぐ。呼び出し元に無い (未設定 / 空) 時だけ config の `[session] term_fallback` (default `xterm-256color`) を設定する ([DR-0039](./decisions/DR-0039-webui-terminal-app-rework.md) 決定 1)。
 
 ### 11. 子が停止した時のふるまいと Ctrl+Z の action
 
@@ -343,6 +345,8 @@ on_child_suspend = "auto_resume_on_attached"
 #   auto_resume_always      — daemon が常に即 SIGCONT (attach の有無に関係なく)
 #   auto_resume_on_attached — rw attach client が居る間だけ起こす (無人時は停止を維持)
 #   show_child_action_menu  — 起こさず、attach client が child action menu を表示
+# 呼び出し元に TERM が無い時に子へ設定する端末種別。default: xterm-256color
+term_fallback = "xterm-256color"
 
 [attach]
 # 単発 Ctrl+Z が確定した後の action。default: client_suspend

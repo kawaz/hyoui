@@ -337,10 +337,12 @@ hyoui run --login --detached -- zsh -f       # explicit command (e.g. skip rc fi
 
 - The shell comes from passwd (`getpwuid`); the caller's `$SHELL` is ignored
 - argv[0] is `-<basename of the shell>` (e.g. `-zsh`); the shell reads its own rc files
-- The child env starts minimal instead of inheriting the caller's: `HOME` / `USER` / `LOGNAME` / `SHELL` / an initial `PATH` / `LANG` (if the caller has it) / `TERM=xterm-256color` (always this value, not the caller's: the session may later be viewed from another terminal such as the web UI, so it uses one every viewer understands). The initial `PATH` is built from `/etc/paths` and `/etc/paths.d/*` on macOS, and is `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` elsewhere
+- The child env starts minimal instead of inheriting the caller's: `HOME` / `USER` / `LOGNAME` / `SHELL` / an initial `PATH` / `LANG` (if the caller has it) / `TERM` (see below). The initial `PATH` is built from `/etc/paths` and `/etc/paths.d/*` on macOS, and is `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` elsewhere
 - `HYOUI_SESSION_ID` / `HYOUI_NAMESPACE` stay in the child even though the env is minimal
 - With an explicit command, that command runs as-is (no `-` prefix on argv[0]) and only the env is minimal
 - Only the child's env is minimized. Which surface root hyoui itself uses (`XDG_*` / `HYOUI_NAMESPACE`) is still decided by the caller's env
+
+The child's `TERM` is inherited from the caller, with or without `--login`. Only when the caller has none (unset / empty) does hyoui set `[session] term_fallback` from the config (default `xterm-256color`) ([DR-0039](./decisions/DR-0039-webui-terminal-app-rework.md) decision 1).
 
 ### 11. What happens when the child stops, and what Ctrl+Z does
 
@@ -354,6 +356,8 @@ on_child_suspend = "auto_resume_on_attached"
 #   auto_resume_always      — the daemon always sends SIGCONT immediately
 #   auto_resume_on_attached — resume only while an rw attach client is present
 #   show_child_action_menu  — do not resume; the attach client shows an action menu
+# TERM given to the child when the caller has none. default: xterm-256color
+term_fallback = "xterm-256color"
 
 [attach]
 # What a settled single Ctrl+Z does. default: client_suspend

@@ -262,6 +262,7 @@ mod tests {
         };
         let caller = LoginCaller {
             lang: Some("C".into()),
+            term: Some("xterm-256color".into()),
             path_for_lookup: None,
         };
         let env = minimal_env(&user, "/usr/bin:/bin", &caller);

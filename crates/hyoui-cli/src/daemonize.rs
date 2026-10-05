@@ -36,6 +36,7 @@ pub fn run_detached_parent(
     idle_timeout_ms: Option<u64>,
     scrub_env: Option<hyoui::sys::env_scrub::ScrubPlan>,
     login: bool,
+    term_fallback: String,
     cmd: Vec<String>,
 ) -> ExitCode {
     match spawn_detached_daemon_and_wait_ready(
@@ -51,6 +52,7 @@ pub fn run_detached_parent(
         idle_timeout_ms,
         scrub_env,
         login,
+        term_fallback,
         cmd,
     ) {
         Ok((session_id, _sock)) => {
@@ -86,6 +88,7 @@ pub fn spawn_detached_daemon_and_wait_ready(
     idle_timeout_ms: Option<u64>,
     scrub_env: Option<hyoui::sys::env_scrub::ScrubPlan>,
     login: bool,
+    term_fallback: String,
     cmd: Vec<String>,
 ) -> Result<(String, PathBuf), ExitCode> {
     let session_id = session_id_override.unwrap_or_else(socket_path::auto_session_id);
@@ -149,6 +152,8 @@ pub fn spawn_detached_daemon_and_wait_ready(
         // DR-0023: 親で解決した env scrub patterns を daemon child に渡す。
         scrub_env,
         login,
+        // DR-0039 決定 1: 呼び出し元に TERM が無い時に子へ設定する値 (config 由来)。
+        term_fallback: Some(term_fallback),
     };
     let init_json = match serde_json::to_string(&init) {
         Ok(s) => s,
@@ -371,6 +376,12 @@ struct DaemonizeInit {
     /// (= false) で skip。
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     login: bool,
+
+    /// DR-0039 決定 1: 呼び出し元に `TERM` が無い (未設定 / 空) 時に子へ設定する値
+    /// (= config `[session] term_fallback`)。旧 init JSON 互換のため `default` (= None)
+    /// で、None は builtin 既定値に倒す。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    term_fallback: Option<String>,
 }
 
 /// `DaemonizeInit.namespace` の serde default (= 旧 init JSON 互換)。
@@ -474,6 +485,23 @@ pub fn run_daemon_child() -> ExitCode {
     // なので unset しない。
     hyoui::sys::env::set_var_at_startup("HYOUI_SESSION_ID", &session_id);
 
+    // DR-0039 決定 1: 子の TERM は呼び出し元を引き継ぎ、無い (未設定 / 空) 時だけ
+    // config の既定値にする。`--login` も普通の run もここで決めた 1 つの値を使う
+    // (`--login` は下の最小 env に、普通の run は継承される daemon の environ に載る)。
+    // daemon の environ は呼び出し元の写しなので、ここで読む TERM が呼び出し元の値。
+    let term_fallback = init
+        .term_fallback
+        .clone()
+        .unwrap_or_else(hyoui::config::default_term_fallback);
+    let caller_term = std::env::var("TERM").ok();
+    let session_term =
+        hyoui::sys::login::resolve_session_term(caller_term.as_deref(), &term_fallback);
+    if let Some(t) = session_term.as_deref()
+        && caller_term.as_deref() != Some(t)
+    {
+        hyoui::sys::env::set_var_at_startup("TERM", t);
+    }
+
     // 子 cmd は argv `["run", "--detached", "--", cmd, args...]` の "--" 以降を取得。
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut cmd: Vec<String> = Vec::new();
@@ -521,7 +549,7 @@ pub fn run_daemon_child() -> ExitCode {
         let mut plan = hyoui::sys::login::plan(
             &user,
             &hyoui::sys::login::initial_path(),
-            &hyoui::sys::login::LoginCaller::from_env(),
+            &hyoui::sys::login::LoginCaller::from_env(session_term.clone()),
             &cmd,
         );
         plan.env

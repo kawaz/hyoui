@@ -426,7 +426,8 @@ pub struct RunConfig {
     pub no_scrub_env: bool,
     /// `--login` (DR-0039 決定 1): 通常のターミナルアプリと同じログイン shell として
     /// 起動する。shell は passwd から引き、argv[0] を `-<shell>` にし、子の env は
-    /// 最小 (`HOME` / `USER` / `LOGNAME` / `SHELL` / `PATH` / `TERM=xterm-256color` + 在れば `LANG`)
+    /// 最小 (`HOME` / `USER` / `LOGNAME` / `SHELL` / `PATH` / `TERM` + 在れば `LANG`。`TERM` は
+    /// 呼び出し元を引き継ぎ、無ければ config `[session] term_fallback`)
     /// から始める。`command` が空なら login shell、明示されていればそのコマンドを
     /// argv そのままで env だけ最小にする。
     pub login: bool,
@@ -5330,6 +5331,8 @@ fn usage_run() -> String {
             HYOUI_NAMESPACE        Session namespace (= --namespace の env 経路、flag 優先)\n    \
             HYOUI_SCROLLBACK_ROWS  --scrollback-rows と同じ値を env で渡す\n                                   \
                 (--scrollback-rows 指定時は flag 優先)\n    \
+            TERM                   子に引き継ぐ (--login でも同じ)。未設定 / 空なら\n                                   \
+                config の [session] term_fallback (default xterm-256color)\n    \
             HYOUI_SESSION_ID       (子へ注入) daemon が子プロセスへ常時 export する\n                                   \
                 自セッション id。中から `hyoui status` 等を session 省略で\n                                   \
                 叩くと自セッションに解決される (DR-0020)\n\

@@ -56,11 +56,32 @@ pub struct Config {
 ///
 /// `hyoui run` が daemon に渡す既定値を持つ。CLI flag (`--on-child-suspend`) が
 /// あればそちらが優先する (= DR-0024 の flag 最小化方針、config は default 提供)。
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct SessionConfig {
     /// 子が suspend (stopped) した時のふるまい (DR-0032 §1)。
     #[serde(default)]
     pub on_child_suspend: OnChildSuspendSetting,
+
+    /// 呼び出し元に `TERM` が無い (未設定 / 空) 時に子へ設定する端末種別
+    /// (DR-0039 決定 1)。default `"xterm-256color"`。呼び出し元に `TERM` があれば
+    /// `hyoui run` / `hyoui run --login` ともそれを引き継ぎ、この値は使わない。
+    #[serde(default = "default_term_fallback")]
+    pub term_fallback: String,
+}
+
+/// `[session] term_fallback` の既定値。
+#[must_use]
+pub fn default_term_fallback() -> String {
+    "xterm-256color".to_string()
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            on_child_suspend: OnChildSuspendSetting::default(),
+            term_fallback: default_term_fallback(),
+        }
+    }
 }
 
 /// 子 suspend 時のふるまい (= TOML `[session] on_child_suspend`、DR-0032 §1)。
@@ -774,6 +795,25 @@ mod tests {
             c.session.on_child_suspend,
             OnChildSuspendSetting::AutoResumeOnAttached
         );
+        assert_eq!(c.session.term_fallback, "xterm-256color");
+    }
+
+    /// DR-0039 決定 1: `[session] term_fallback` で呼び出し元に TERM が無い時の値を
+    /// 変えられる。書かなければ既定値 (= `[session]` に他の key だけ書いた時も)。
+    #[test]
+    fn parse_session_term_fallback() {
+        let c = parse_str(
+            "[session]\nterm_fallback = \"screen-256color\"\n",
+            &dummy_path(),
+        )
+        .unwrap();
+        assert_eq!(c.session.term_fallback, "screen-256color");
+        let c = parse_str(
+            "[session]\non_child_suspend = \"auto_resume_always\"\n",
+            &dummy_path(),
+        )
+        .unwrap();
+        assert_eq!(c.session.term_fallback, "xterm-256color");
     }
 
     /// DR-0032 §1: enum 3 値がすべて設定語彙 (snake_case) で読める。
@@ -1383,6 +1423,7 @@ on_child_suspend = "show_child_action_menu"
             "ctrlz_x1_action",
             "[session]",
             "on_child_suspend",
+            "term_fallback",
         ] {
             assert!(s.contains(key), "to_toml output missing {key}:\n{s}");
         }
