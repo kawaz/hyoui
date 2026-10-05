@@ -1,4 +1,5 @@
 //! DR-0019 §5 e2e: 非 tty stdin が子に届き、EOF で子が終わること (pipe-through)。
+//! attach (`hyoui run`) と `hyoui run --detached` で同じ結果になることを見る。
 //!
 //! 子は `cat` で、受け取った bytes を file に書き、終わったら exit code を FIFO に書く。
 //! 完了は FIFO の読みで観測する (= sleep で待たない)。FIFO は test 側が子の起動前に
@@ -21,6 +22,11 @@ fn hyoui_bin() -> PathBuf {
 
 /// 子が受け取った bytes と exit code を書く script (`$1` = 出力 file、`$2` = FIFO)。
 const CHILD_SCRIPT: &str = "cat > \"$1\"; printf '%s\\n' \"$?\" > \"$2\"";
+
+/// 1 行目を FIFO に返してから残りを `CHILD_SCRIPT` と同じく読む script (= 入力が逐次
+/// 届くことを、書き手を閉じる前に観測する)。
+const ECHO_FIRST_LINE_SCRIPT: &str =
+    "read l; printf '%s\\n' \"$l\" > \"$2\"; cat > \"$1\"; printf '%s\\n' \"$?\" > \"$2\"";
 
 /// 子の終了や run の戻りを待つ上限 (= 超えたら「終わらなかった」と判定する)。
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -67,10 +73,15 @@ impl Cell {
 
     /// `hyoui run [flags] -- sh -c CHILD_SCRIPT` の Command (stdin は呼び出し側が決める)。
     fn run_command(&self, flags: &[&str]) -> Command {
+        self.run_script(flags, CHILD_SCRIPT)
+    }
+
+    /// `hyoui run [flags] -- sh -c <script> sh <out> <fifo>` の Command。
+    fn run_script(&self, flags: &[&str], script: &str) -> Command {
         let mut c = Command::new(hyoui_bin());
         c.args(["run", &format!("--session={}", self.session)])
             .args(flags)
-            .args(["--", "sh", "-c", CHILD_SCRIPT, "sh"])
+            .args(["--", "sh", "-c", script, "sh"])
             .arg(self.out_path())
             .arg(self.fifo_path())
             .env("XDG_RUNTIME_DIR", self.dir.path())
@@ -82,7 +93,8 @@ impl Cell {
         c
     }
 
-    /// 子の exit code を FIFO から読む。期限内に書かれなければ `None` (= 子が終わらない)。
+    /// 子が FIFO に書いた次の 1 件 (= exit code / 返した行) を読む。期限内に書かれなければ
+    /// `None` (= 子が終わらない)。
     fn child_exit(&self, deadline: Instant) -> Option<String> {
         let fifo = &self.fifo;
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -184,4 +196,135 @@ fn fifo_deadline_reports_unfinished_child() {
     let cell = Cell::new("pipe-unused");
     let deadline = Instant::now() + Duration::from_millis(200);
     assert_eq!(cell.child_exit(deadline), None);
+}
+
+/// `--detached` でも改行で終わる 2 行の pipe が子に届き、EOF で子が終わる (= attach と同じ)。
+#[test]
+fn detached_pipe_two_lines_reaches_eof() {
+    let (status, rc, got) = run_with_pipe("pipe-det-2l", &["--detached"], b"l1\nl2\n");
+    assert_eq!(rc.as_deref(), Some("0"), "子が EOF で終わること");
+    assert_eq!(got, b"l1\nl2\n");
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "run の exit: {status:?}"
+    );
+}
+
+/// `--detached` でも改行で終わらない pipe は EOT 2 個で EOF になる (= attach と同じ)。
+#[test]
+fn detached_pipe_without_trailing_newline_reaches_eof() {
+    let (status, rc, got) = run_with_pipe("pipe-det-nonl", &["--detached"], b"hoge");
+    assert_eq!(rc.as_deref(), Some("0"), "子が EOF で終わること");
+    assert_eq!(got, b"hoge");
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "run の exit: {status:?}"
+    );
+}
+
+/// `--detached` に file を stdin で渡しても子に届き、EOF で終わる。
+#[test]
+fn detached_file_reaches_eof() {
+    let cell = Cell::new("pipe-det-file");
+    let input = cell.dir.path().join("in.txt");
+    std::fs::write(&input, b"f1\nf2\n").expect("write input");
+    let child = cell
+        .run_command(&["--detached"])
+        .stdin(std::fs::File::open(&input).expect("open input"))
+        .spawn()
+        .expect("spawn hyoui run");
+    let deadline = Instant::now() + DEADLINE;
+    let status = wait_with_deadline(child, deadline);
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "run の exit: {status:?}"
+    );
+    assert_eq!(cell.child_exit(deadline).as_deref(), Some("0"));
+    assert_eq!(cell.received(), b"f1\nf2\n");
+}
+
+/// `/dev/null` も他の非 tty と同じく扱う: attach も `--detached` も 0 byte を流して EOF で
+/// EOT を送り、子は EOF で終わる (= 両者で同じ結果)。
+#[test]
+fn dev_null_reaches_eof_in_attach_and_detached() {
+    for (session, flags) in [("null-attach", &[][..]), ("null-det", &["--detached"][..])] {
+        let cell = Cell::new(session);
+        let child = cell
+            .run_command(flags)
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn hyoui run");
+        let deadline = Instant::now() + DEADLINE;
+        let status = wait_with_deadline(child, deadline);
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "{flags:?} run の exit: {status:?}"
+        );
+        assert_eq!(cell.child_exit(deadline).as_deref(), Some("0"), "{flags:?}");
+        assert!(cell.received().is_empty(), "{flags:?}");
+    }
+}
+
+/// `--detached --stdin-eof=detach` は入力を流すが EOT は送らない (= 子は残る)。
+#[test]
+fn detached_stdin_eof_detach_sends_no_eot() {
+    let cell = Cell::new("pipe-det-noeot");
+    let mut child = cell
+        .run_script(
+            &["--detached", "--stdin-eof=detach"],
+            ECHO_FIRST_LINE_SCRIPT,
+        )
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn hyoui run");
+    {
+        let mut stdin = child.stdin.take().expect("stdin");
+        stdin.write_all(b"l1\nl2\n").expect("write stdin");
+    }
+    let deadline = Instant::now() + DEADLINE;
+    let status = wait_with_deadline(child, deadline);
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "run の exit: {status:?}"
+    );
+    assert_eq!(
+        cell.child_exit(deadline).as_deref(),
+        Some("l1"),
+        "入力は届く"
+    );
+    let window = Instant::now() + Duration::from_millis(1500);
+    assert_eq!(cell.child_exit(window), None, "EOT が届いてはいけない");
+}
+
+/// 終わらない pipe でも `run --detached` はすぐ戻り、入力は逐次子に届き、書き手が閉じたら
+/// 子は EOF で終わる。
+#[test]
+fn detached_returns_while_pipe_stays_open() {
+    let cell = Cell::new("pipe-det-open");
+    let mut child = cell
+        .run_script(&["--detached"], ECHO_FIRST_LINE_SCRIPT)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn hyoui run");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let deadline = Instant::now() + DEADLINE;
+    let status = wait_with_deadline(child, deadline);
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "書き手が開いたままでも run は戻ること: {status:?}"
+    );
+    stdin.write_all(b"one\n").expect("write one");
+    assert_eq!(
+        cell.child_exit(deadline).as_deref(),
+        Some("one"),
+        "逐次届く"
+    );
+    stdin.write_all(b"two\n").expect("write two");
+    drop(stdin);
+    assert_eq!(
+        cell.child_exit(deadline).as_deref(),
+        Some("0"),
+        "EOF で終わる"
+    );
+    assert_eq!(cell.received(), b"two\n");
 }

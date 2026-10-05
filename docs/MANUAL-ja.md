@@ -45,6 +45,19 @@ hyoui attach run-<pid>-<rand>
 # 接続を畳むなら hyoui detach run-<pid>-<rand>
 ```
 
+stdin を pipe / file にすると、`--detached` の有無によらず子に届き、入力の終わりで子に EOF (Ctrl-D) が伝わる ([DR-0019](./decisions/DR-0019-run-option-cleanup-and-suspend-policy-placement.md) §5)。`--detached` では daemon が読み続けるので、`tail -f` のような終わらない入力でも run はすぐ戻る。
+
+```sh
+echo "1+2" | hyoui run -- bc                  # attach したまま、bc が 3 を出して終わる
+hyoui run --detached -- claude <<<"prompt"    # detached でも prompt が子に届く
+printf 'hoge' | hyoui run --detached -- cat   # 改行で終わらない入力も EOF まで届く
+```
+
+- 子の stdin は PTY のままなので、EOF は Ctrl-D (0x04) として送る。行の途中で終わる入力は Ctrl-D を 2 個送る (1 個目で途中の行を確定、2 個目で EOF)
+- raw mode の TUI には Ctrl-D がただの入力として刺さる。pipe で流し込んだ後に attach で対話するなら `--stdin-eof=detach` で EOF を送らない
+- stdin が端末の時は読まない。`/dev/null` は他の非 tty と同じく、すぐ EOF になって Ctrl-D を送る (attach も `--detached` も同じ。子が Ctrl-D をどう扱うかは子次第で、`bash -i` などの対話 shell は終わる。残したいなら `--stdin-eof=detach`)
+- `while read l; do hyoui run --detached -- x; done < list` のように stdin を共有するループでは、子が stdin の残りを読み切る。`</dev/null` を付ければ残りは読まれない (子には EOF の Ctrl-D が届く)
+
 ### 2. read-only で観察する
 
 ```sh

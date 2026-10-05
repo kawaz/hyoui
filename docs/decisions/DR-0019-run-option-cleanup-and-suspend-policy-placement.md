@@ -159,6 +159,43 @@ attach で対話する」用途では `detach` が正しい。
 >
 > 実測 (macOS、PTY に直接書いた場合): `cat` / `head -1` / `wc -c` / `sh` の `read` / python の `sys.stdin.readline()` / `sys.stdin.read()` は 2 個で EOF を観測して終わる。python の `input()` は tty では独自の読み方をするため 2 個では終わらず、3 個で終わるが末尾 1 文字を落とす (CPython の挙動。直接実行の pipe では起きない)。hyoui 経由で `input()` が 2 個で終わることもあるが、0x04 と前の bytes が別の read に分かれるかどうかの時機に依存する。raw mode の子には 2 個とも入力 byte として刺さる点は上の注記のとおり。
 
+#### Update (2026-10-05): `--detached` でも非 tty stdin を子に届ける
+
+本節は attach client が stdin を読む経路だけを決めていたため、`hyoui run --detached` は呼び出し元の stdin に触れず (daemon の stdin は `/dev/null`)、`printf ... | hyoui run --detached -- cmd` や `claude <<<prompt` の子は何も受け取らなかった。**`--detached` の有無で子が受け取る入力と EOF が変わる** のは、本節が回復した透過性 ([[DR-0005]]) の取りこぼしなので、detached に広げる。
+
+決定:
+
+- 呼び出し元の stdin が tty でない (pipe / file / socket / `/dev/null` 等) 時、`run --detached` は **その fd を daemon に引き継ぎ、daemon が読んで子 PTY の master に書く**。子の stdin は PTY のまま (= 子の isatty も、外からの `hyoui input` / attach も保つ。子に fd を直接渡すとどちらも崩れる)
+- `run --detached` は今どおり daemon の ready 通知を待ってすぐ戻る。転送は daemon 側で続く (= `tail -f |` のような終わらない入力でも run は止まらない)
+- EOF は `--stdin-eof` (`send-eof` 既定 / `detach`) を attach と同じ意味で効かせる。EOT の個数も attach と同じ判定 (上の注記)
+- stdin が tty の時は今どおり触らない (= detached は端末を読まない)
+- **`/dev/null` も他の非 tty と同じく扱う** (kawaz 裁定 2026-10-05)。attach も detached も 0 byte を流して EOF で EOT を送る。子が EOT をどう解釈するか (raw mode の TUI に 0x04 が刺さる等) は hyoui の責務外で、attach と detached で同じ結果になることだけを保証する。`/dev/null` を「入力なし」として特別扱いする案は、attach と detached のどちらかを直接実行や他方とずらすことになるので採らない
+- 判定は `hyoui::stdin_eof` の pure 関数 (`attach_eof_action` / `detached_forward`、入力は stdin が tty かどうかと `--stdin-eof` の明示値だけ) に置き、CLI はそれを呼ぶだけ
+
+方式 (daemon 側、`daemon::stdin_forward`):
+
+- **fd の受け渡し**: daemon child は fd 0 として受け取り、`Session::start` の fork より前に `F_DUPFD_CLOEXEC` で別番号に移して fd 0 は `/dev/null` に戻す。fd 0 で持ち続けないのは、(1) upgrade の self-exec ([[DR-0028]]) は fd 0 を引き継ぐので、転送しない新プロセスが pipe を持ち続ける (子 PTY は fd 0 を slave で上書きするので漏れないが、upgrade には効かない)、(2) daemon が pipe を持ち続けると転送をやめた後も書き手に EPIPE が届かない、ため。CLOEXEC は複製した fd が子 PTY と upgrade の exec に漏れないためのもの。daemon に fd 0 を `/dev/null` 前提で読むコードは無い (grep で確認)。別の fd 番号で渡す案は `Command` の fd 指定に `unsafe` (pre_exec) が要り、`hyoui-cli` の `forbid(unsafe_code)` と相容れないので採らない
+- **読み**: 引き継いだ fd は専用の reader thread が blocking のまま読み、CLOEXEC 付きの内部 pipe に書く。serve loop は内部 pipe の読み側を nonblocking で poll する。引き継いだ fd 自体を nonblocking にして poll に入れる形は採らない。O_NONBLOCK は open file description 単位なので、同じ pipe を共有する呼び出し元側の読み手 (例: shell の `while read` ループ) にまで EAGAIN を見せる ([[DR-0037]] E-1 が継承 fd に O_NONBLOCK を付けない理由と同じ)。また通常ファイルは poll が常に ready を返すので、nonblocking にしても遅い fs で read が止まる ([[DR-0037]] I-2 の「blocking が本質の IO は loop の外」)
+- **書き**: serve loop は内部 pipe から 1 chunk (8 KiB) 読み、master に nonblocking で書く。書き切れない間は内部 pipe を poll から外して master の `POLLOUT` を待つ (= 読み続けて溜め込まない。滞留は chunk 1 個 + 内部 pipe の容量で頭打ち)。master への書き込みで serve loop が待つことは無い ([[DR-0037]] I-1)。子が読まない時は書き手側の pipe が詰まり、書き手が待つ (= 直接実行と同じ backpressure)
+- **lock**: lock を誰かが握っている間 ([[DR-0022]]) は書かずに止まり、解けたら再開する。attach の stdin は lock 中に `client.lock-not-held` で捨てられるが、daemon の転送は止まって待つ方を選ぶ (= 入力を捨てない。holder の入力列に割り込まない、の両方を満たすため)
+- **子 exit 後**: 転送をやめる (= 書く相手が居ない)。reader thread は daemon の終了で消える
+
+CLAUDE.md の介入判断 self-check への答え:
+
+- **既存 DR で justify されているか**: 本節の pipe-through (透過性の回復、[[DR-0005]]) の適用範囲を detached に広げるもの。新しい介入の種類は足していない (EOF の EOT は本節の既決)
+- **必然か**: detached の有無で子の挙動が変わるのは透過性の欠落で、`claude <<<prompt` を detached で起動すると prompt が届かない。回避策 (`hyoui input "$S" file:- key:C-d`) は存在するが、呼び出し方で子の入力が変わること自体を直す必然がある
+- **最小介入か**: 子の stdin・PTY・env は変えず、daemon が master に書くだけ。転送は stdin が非 tty の時だけ起き、tty は従来どおり何もしない
+- **kernel / PTY / shell の再発明でないか**: 入力は PTY master への write で、EOF は line discipline の VEOF に任せる。子に pipe を直接渡すのが kernel の素の形だが、PTY を通さないと isatty と外からの操作が崩れるので PTY を通す
+- **新 protocol message / cap flag**: 無し。daemon への受け渡しは既存の `HYOUI_DAEMONIZE_INIT` JSON に field 1 個 (`stdin_forward`) と fd 0 の継承のみ
+
+残る差・制約:
+
+- **`/dev/null` から起動する対話の子**: stdin を `/dev/null` にして `--detached` で `bash -i` / `zsh -i` / `--login` の shell を起動すると、EOF の EOT で shell は 2 秒以内に終わる (実測。stdin を開いたままの FIFO にすると残る)。attach でも同じ結果で、上の裁定どおり hyoui は子の解釈に関与しない。子を残したい起動元 (agent の Bash ツール、web gateway の `--login --detached` など stdin が `/dev/null` になる経路) は `--stdin-eof=detach` を付ける。既存の e2e で detached session を `/dev/null` から作るもの (`web_e2e_api` / `ctrlz_suspend_client`) もそうしている
+- **stdin を共有するループ**: `while read l; do hyoui run --detached -- x; done < list` は daemon が stdin の残りを読み切る (attach と `ssh` で既にある罠と同じ)。`</dev/null` を付ければ残りを読まれない (その場合も子には EOF の EOT が届く)
+- **record**: daemon が転送した bytes は record ([[DR-0016]]) の `in` event に載らない。`in` event は送信元 `client_id` を必須とし、daemon 自身の入力を表す送信元が record format に無いため。必要になったら record format 側で送信元の種類を足す
+- **upgrade**: 転送中に self-exec upgrade ([[DR-0028]]) すると、内部 pipe と reader thread は exec で消え、引き継いだ fd も CLOEXEC で閉じる (= 書き手は EPIPE を受ける)。upgrade 後の daemon は転送しない
+- **継承した無関係の fd**: daemon は呼び出し元から継承した fd 3 以降を閉じない。呼び出し元が stdin と同じ pipe の書き側を CLOEXEC 無しで持ったまま `hyoui run --detached` を起動すると、daemon 自身が書き側を持つことになり EOF が来ない (shell の `exec 3<>fifo` 等。転送が無かった時は stdin を読まないので表に出なかった)
+
 ### 6. `attach --exclusive` / `--detach-others` は parse 段で「未実装」エラー化
 
 silent no-op (= 指定が黙って無視される) の放置は [[DR-0014]] 検証主義違反のため、
@@ -291,6 +328,10 @@ worker 起動は 1 行)。多重定義 (`attach --mode` / `LockMode`) の解消�
   finalize escalation を共用)
 - `hyoui-cli::main` / attach: run → exec attach への `--stdin-eof` 伝搬、
   非 tty stdin の default `SendEof` 配線 (= `with_stdin_eof_action`)
+- §5 Update (2026-10-05): `hyoui::stdin_eof` (EOF 判定・EOT の個数・attach / detached の
+  方針)、`hyoui::daemon::stdin_forward` (reader thread + 内部 pipe + serve loop の
+  nonblocking 書き込み)、`hyoui-cli::daemonize` (`DaemonizeInit.stdin_forward`、fd 0 の
+  CLOEXEC 付け替え)
 
 ## 関連
 

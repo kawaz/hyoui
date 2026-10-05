@@ -36,7 +36,7 @@ Status 列は **ラベル + 最終判定日** だけを載せる。実装範囲�
 | [DR-0016](./DR-0016-tty-io-record.md) | 🟡 部分実装 | `hyoui record` — tty I/O timeline の永続録画 subcommand (= bug 解析の観測道具) |
 | [DR-0017](./DR-0017-session-anchor-and-suspend-policy.md) | ✅ 実装済 (2026-06-11) | session anchor 化 + suspend policy 改訂 (= TUI の Ctrl-Z を本来の意味論で動かす) |
 | [DR-0018](./DR-0018-session-namespace.md) | ✅ 実装済 (2026-06-11)。DR-0041 で置き換え予定 | session namespace — socket dir 分離で `hyoui list` の用途グループ混在を防止 |
-| [DR-0019](./DR-0019-run-option-cleanup-and-suspend-policy-placement.md) | ✅ 実装済 (2026-06-12) | run オプション棚卸し + suspend policy の daemon 配線 |
+| [DR-0019](./DR-0019-run-option-cleanup-and-suspend-policy-placement.md) | ✅ 実装済 (2026-06-12) | run オプション棚卸し + suspend policy の daemon 配線。§5 pipe-through は `--detached` でも非 tty stdin を daemon が子へ流す (2026-10-05) |
 | [DR-0020](./DR-0020-self-session-reference.md) | ✅ 実装済 (2026-06-12) | self-session 参照 (= 子へ `HYOUI_SESSION_ID` 注入 + session 引数の省略時解決規則) |
 | [DR-0021](./DR-0021-pty-drain-ack-for-bytes-input.md) | ✅ 実装済 (2026-06-16) | bytes 系 input spec の完了点を「PTY drain ack」に強化 |
 | [DR-0022](./DR-0022-input-invocation-auto-lock.md) | ✅ 実装済 (2026-06-16) | `hyoui input` invocation 全体で 1 lock を auto-acquire / release |

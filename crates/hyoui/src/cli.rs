@@ -384,8 +384,9 @@ pub struct RunConfig {
     pub until: Option<String>,
     /// Explicit socket path, or `None` to auto-generate.
     pub socket: Option<String>,
-    /// `--detached`: daemon を別 process で起動して親はすぐ exit。socket path を
+    /// `--detached`: daemon を別 process で起動して親はすぐ exit。session id を
     /// stdout に 1 行 print してから親が終わる。attach は別 process から行う。
+    /// 非 tty stdin は daemon が引き継いで子へ流す (DR-0019 §5)。
     pub detached: bool,
     /// `--session`: 自動採番 (`run-<pid>-<rand4hex>`) ではなく明示 session id を使う。
     /// socket path 自動解決にもこの値が入る。
@@ -416,9 +417,9 @@ pub struct RunConfig {
     /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。socket 配置先 dir と、
     /// 子プロセスへ常時注入する `HYOUI_NAMESPACE` env の値を決める。
     pub namespace: Option<String>,
-    /// `--stdin-eof=detach|send-eof` (DR-0019 §5)。`None` (= 未指定) なら exec attach
-    /// 側の tty 判定で解決 (= 非 tty で `SendEof`、tty で従来挙動)。`Some` のときは
-    /// 値をそのまま exec attach に伝搬する。
+    /// `--stdin-eof=detach|send-eof` (DR-0019 §5)。`None` (= 未指定) なら stdin の種類で
+    /// 解決する (`hyoui::stdin_eof`)。非 detached は exec attach に、`--detached` は
+    /// daemon の stdin 転送に渡す。
     pub stdin_eof: Option<StdinEofArg>,
     /// `--no-scrub-env` (DR-0024): env scrub を完全 disable (= debug / 互換目的)。
     /// config の `scrub_env_enabled = false` と等価。kill/keep の細かい制御は
@@ -5289,8 +5290,10 @@ fn usage_run() -> String {
             --until PATTERN               Terminate when PATTERN appears in output\n    \
             --socket PATH                 Unix socket path for input injection\n    \
             --detached                    daemon を別 process で起動して親はすぐ exit\n                                  \
-                (DR-0015)。socket path を stdout に 1 行 print してから\n                                  \
-                親が終わる。attach は別 process から行う\n    \
+                (DR-0015)。session id を stdout に 1 行 print してから\n                                  \
+                親が終わる。attach は別 process から行う。stdin が pipe /\n                                  \
+                file なら daemon が子に流し続け、EOF は --stdin-eof に従う\n                                  \
+                (tty は読まない、DR-0019)\n    \
             --session ID                  自動採番 (= run-<pid>-<rand4hex>) ではなく\n                                  \
                 明示 session id を使う。socket path 自動解決にも\n                                  \
                 この値が入る (DR-0015)\n    \

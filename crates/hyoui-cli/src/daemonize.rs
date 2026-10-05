@@ -37,6 +37,7 @@ pub fn run_detached_parent(
     scrub_env: Option<hyoui::sys::env_scrub::ScrubPlan>,
     login: bool,
     term_fallback: String,
+    stdin_forward: Option<hyoui::stdin_eof::StdinEofAction>,
     cmd: Vec<String>,
 ) -> ExitCode {
     match spawn_detached_daemon_and_wait_ready(
@@ -53,6 +54,7 @@ pub fn run_detached_parent(
         scrub_env,
         login,
         term_fallback,
+        stdin_forward,
         cmd,
     ) {
         Ok((session_id, _sock)) => {
@@ -89,6 +91,7 @@ pub fn spawn_detached_daemon_and_wait_ready(
     scrub_env: Option<hyoui::sys::env_scrub::ScrubPlan>,
     login: bool,
     term_fallback: String,
+    stdin_forward: Option<hyoui::stdin_eof::StdinEofAction>,
     cmd: Vec<String>,
 ) -> Result<(String, PathBuf), ExitCode> {
     let session_id = session_id_override.unwrap_or_else(socket_path::auto_session_id);
@@ -154,6 +157,8 @@ pub fn spawn_detached_daemon_and_wait_ready(
         login,
         // DR-0039 決定 1: 呼び出し元に TERM が無い時に子へ設定する値 (config 由来)。
         term_fallback: Some(term_fallback),
+        // DR-0019 §5: 引き継いだ stdin を子へ流すか (= EOF 挙動)。None なら流さない。
+        stdin_forward: stdin_forward.map(|a| stdin_eof_str(a).to_string()),
     };
     let init_json = match serde_json::to_string(&init) {
         Ok(s) => s,
@@ -175,10 +180,14 @@ pub fn spawn_detached_daemon_and_wait_ready(
     for c in cmd {
         child.arg(c);
     }
-    // 子の stdio: stdin は /dev/null (= 旧 stdin pipe size 経路は env 化で廃止)、
-    // stdout は /dev/null、stderr は inherit (= §2.3.5 採用パターン、daemon 起動
-    // 失敗時の error 文字列を parent / ユーザに伝える)。
-    child.stdin(Stdio::null());
+    // 子の stdio: stdin は転送する時だけ呼び出し元のものを引き継ぎ (DR-0019 §5、daemon が
+    // 読んで子 PTY へ流す)、それ以外は /dev/null。stdout は /dev/null、stderr は inherit
+    // (= §2.3.5 採用パターン、daemon 起動失敗時の error 文字列を parent / ユーザに伝える)。
+    if init.stdin_forward.is_some() {
+        child.stdin(Stdio::inherit());
+    } else {
+        child.stdin(Stdio::null());
+    }
     child.stdout(Stdio::null());
     child.stderr(Stdio::inherit());
 
@@ -377,6 +386,11 @@ struct DaemonizeInit {
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     login: bool,
 
+    /// DR-0019 §5: 引き継いだ stdin (fd 0) を子 PTY へ流す時の EOF 挙動 ("send-eof" /
+    /// "detach")。`None` (= 旧 init JSON / tty / attach 経路) なら流さない。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    stdin_forward: Option<String>,
+
     /// DR-0039 決定 1: 呼び出し元に `TERM` が無い (未設定 / 空) 時に子へ設定する値
     /// (= config `[session] term_fallback`)。旧 init JSON 互換のため `default` (= None)
     /// で、None は builtin 既定値に倒す。
@@ -397,6 +411,23 @@ fn child_suspend_str(p: hyoui::cli::OnChildSuspend) -> &'static str {
     match p {
         hyoui::cli::OnChildSuspend::AutoResume => "auto-resume",
         _ => "notify",
+    }
+}
+
+/// `StdinEofAction` を DaemonizeInit JSON で運ぶ文字列に変換 (DR-0019 §5)。
+/// `#[non_exhaustive]` の将来値は安全側の "detach" (= EOF を子に伝えない) に倒す。
+fn stdin_eof_str(a: hyoui::stdin_eof::StdinEofAction) -> &'static str {
+    match a {
+        hyoui::stdin_eof::StdinEofAction::SendEof => "send-eof",
+        _ => "detach",
+    }
+}
+
+/// DaemonizeInit JSON の文字列を EOF 挙動に解決。未知値は安全側の Detach。
+fn parse_stdin_eof(s: &str) -> hyoui::stdin_eof::StdinEofAction {
+    match s {
+        "send-eof" => hyoui::stdin_eof::StdinEofAction::SendEof,
+        _ => hyoui::stdin_eof::StdinEofAction::Detach,
     }
 }
 
@@ -526,6 +557,24 @@ pub fn run_daemon_child() -> ExitCode {
         std::path::PathBuf::from("/")
     });
 
+    // DR-0019 §5: 引き継いだ stdin (fd 0) を CLOEXEC 付きの別 fd に移し、fd 0 は
+    // /dev/null に戻す。`Session::start` の fork より前に行う (= 子 PTY にも upgrade の
+    // exec にも漏らさない。daemon の fd 0 を /dev/null 前提で読むコードは無いが、daemon が
+    // pipe を fd 0 で持ち続けると転送をやめた後も書き手に EPIPE が届かない)。
+    let stdin_source = match init.stdin_forward.as_deref() {
+        Some(eof) => match take_stdin_for_forward() {
+            Ok(fd) => Some(hyoui::daemon::StdinSource {
+                fd,
+                eof: parse_stdin_eof(eof),
+            }),
+            Err(e) => {
+                eprintln!("hyoui: stdin を引き継げません ({e})。子に stdin は届きません");
+                None
+            }
+        },
+        None => None,
+    };
+
     // setsid で新セッションリーダーになる (= controlling tty 切り離し)。
     // 既に session leader の場合は EPERM、無視。
     let _ = nix::unistd::setsid();
@@ -604,13 +653,16 @@ pub fn run_daemon_child() -> ExitCode {
         dcfg.debug_dump_path = Some(PathBuf::from(p));
     }
 
-    let session = match Session::start(dcfg) {
+    let mut session = match Session::start(dcfg) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("hyoui (daemon child): Session::start 失敗: {e}");
             return ExitCode::from(1);
         }
     };
+    if let Some(src) = stdin_source {
+        session.set_stdin_forward(src);
+    }
 
     // ready 通知: 親に 1 byte 書く。raw fd → OwnedFd 化は hyoui::sys 経由の
     // safe wrapper を使う (hyoui-cli は forbid(unsafe_code))。
@@ -625,6 +677,16 @@ pub fn run_daemon_child() -> ExitCode {
         Ok(_code) => ExitCode::SUCCESS,
         Err(_) => ExitCode::from(1),
     }
+}
+
+/// fd 0 を CLOEXEC 付きの新しい fd に複製して返し、fd 0 を /dev/null に置き換える
+/// (DR-0019 §5、daemon の stdin 転送用)。
+fn take_stdin_for_forward() -> Result<std::os::fd::OwnedFd, String> {
+    let raw = nix::fcntl::fcntl(std::io::stdin(), nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(3))
+        .map_err(|e| format!("fcntl(F_DUPFD_CLOEXEC): {e}"))?;
+    let fd = hyoui::sys::raw::own_raw_fd(raw);
+    hyoui::sys::raw::redirect_stdin_to_devnull().map_err(|e| format!("dup2(/dev/null, 0): {e}"))?;
+    Ok(fd)
 }
 
 /// DR-0028 Phase 1: self-exec upgrade で継承した fd から daemon serve を再開する。
@@ -888,6 +950,32 @@ mod tests {
         let decoded: DaemonizeInit = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded.timeout_ms, Some(60_000));
         assert_eq!(decoded.idle_timeout_ms, Some(5_000));
+    }
+
+    /// DR-0019 §5: stdin 転送の EOF 挙動が DaemonizeInit JSON を round-trip する。旧 init
+    /// JSON (= field 無し) は転送しない。未知値は安全側の Detach。
+    #[test]
+    fn daemonize_init_propagates_stdin_forward() {
+        use hyoui::stdin_eof::StdinEofAction;
+        for a in [StdinEofAction::SendEof, StdinEofAction::Detach] {
+            let init = DaemonizeInit {
+                socket: "/tmp/x.sock".into(),
+                session: "demo".into(),
+                ready_fd: 7,
+                stdin_forward: Some(stdin_eof_str(a).to_string()),
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&init).expect("serialize");
+            let decoded: DaemonizeInit = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(
+                decoded.stdin_forward.as_deref().map(parse_stdin_eof),
+                Some(a)
+            );
+        }
+        let legacy = r#"{"socket":"/tmp/x.sock","session":"demo","ready_fd":7}"#;
+        let decoded: DaemonizeInit = serde_json::from_str(legacy).expect("deserialize legacy");
+        assert_eq!(decoded.stdin_forward, None);
+        assert_eq!(parse_stdin_eof("bogus"), StdinEofAction::Detach);
     }
 
     /// 旧 init JSON (= timeout field 無し) は None に倒れる (= 無効、互換維持)。

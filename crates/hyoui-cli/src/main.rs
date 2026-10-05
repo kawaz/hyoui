@@ -578,6 +578,15 @@ fn resolve_scrollback_rows(cfg_value: Option<usize>) -> Option<usize> {
     }
 }
 
+/// `--stdin-eof` の明示値を EOF 挙動に写す (DR-0019 §5)。`StdinEofArg` は
+/// `#[non_exhaustive]` なので、将来の値は安全側の Detach (= EOF を子に伝えない) に倒す。
+fn stdin_eof_action(arg: hyoui::cli::StdinEofArg) -> hyoui::stdin_eof::StdinEofAction {
+    match arg {
+        hyoui::cli::StdinEofArg::SendEof => hyoui::stdin_eof::StdinEofAction::SendEof,
+        _ => hyoui::stdin_eof::StdinEofAction::Detach,
+    }
+}
+
 /// `hyoui run` の主要ロジック。
 ///
 /// 同 process 内で:
@@ -673,6 +682,12 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
             );
             return ExitCode::from(2);
         }
+        // DR-0019 §5: 非 tty stdin は daemon に引き継いで子へ流す (= `--detached` の有無で
+        // 子が受け取る入力と EOF が変わらない)。tty は今どおり読まない。
+        let stdin_forward = hyoui::stdin_eof::detached_forward(
+            is_tty(std::io::stdin().as_fd()),
+            cfg.stdin_eof.map(stdin_eof_action),
+        );
         return daemonize::run_detached_parent(
             cfg.session.clone(),
             cfg.socket.clone(),
@@ -687,6 +702,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
             scrub_env_plan,
             cfg.login,
             config.session.term_fallback.clone(),
+            stdin_forward,
             cfg.command,
         );
     }
@@ -713,6 +729,8 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
         scrub_env_plan,
         cfg.login,
         config.session.term_fallback.clone(),
+        // exec する attach client が stdin を読むので daemon には渡さない。
+        None,
         cfg.command,
     ) {
         Ok(pair) => pair,
@@ -1104,19 +1122,11 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         None => conn,
     };
 
-    // DR-0019 §5: pipe-through stdin EOF policy を解決して配線する。
-    // - 明示 `--stdin-eof=detach|send-eof` があればそれを使う
-    // - 未指定なら stdin が tty でない場合 SendEof (= pipe-through の透過性回復、
-    //   `echo "1+2" | hyoui run -- bc` で bc が自然 exit)、tty なら従来の Detach
-    //   (tty では EOF が通常来ないので実質影響なし)
-    let eof_action = match cfg.stdin_eof {
-        Some(hyoui::cli::StdinEofArg::SendEof) => hyoui::client::StdinEofAction::SendEof,
-        // 明示 `--stdin-eof=detach` (+ 将来 variant) は Detach。
-        Some(_) => hyoui::client::StdinEofAction::Detach,
-        // 未指定: 非 tty なら SendEof (= pipe-through 透過性回復)、tty なら Detach。
-        None if !stdin_is_tty => hyoui::client::StdinEofAction::SendEof,
-        None => hyoui::client::StdinEofAction::Detach,
-    };
+    // DR-0019 §5: pipe-through stdin EOF policy を解決して配線する (= 明示
+    // `--stdin-eof` が優先、未指定なら非 tty は SendEof、tty は Detach)。判定は
+    // `run --detached` の daemon 転送と同じ module に置く。
+    let eof_action =
+        hyoui::stdin_eof::attach_eof_action(stdin_is_tty, cfg.stdin_eof.map(stdin_eof_action));
     // DR-0029 §2: Ctrl+Z ガードは **tty stdin 経路だけ**に効かせる。pipe / `< file`
     // 経由の 0x1a は「アプリへのデータ」なので握らず素通しする (= `hyoui input
     // key:C-z` が常に子へ届くのと同じ理由)。

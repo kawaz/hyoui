@@ -33,6 +33,7 @@ mod record;
 mod reducer;
 mod screen;
 mod session;
+mod stdin_forward;
 mod tail;
 pub mod upgrade;
 
@@ -40,3 +41,4 @@ pub use config::{
     ChildLaunch, ChildSuspendPolicy, DaemonConfig, SIZE_MAX, SIZE_MIN, normalize_size,
 };
 pub use session::Session;
+pub use stdin_forward::StdinSource;

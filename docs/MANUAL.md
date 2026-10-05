@@ -47,6 +47,19 @@ hyoui attach run-<pid>-<rand>
 # To close the connection: hyoui detach run-<pid>-<rand>
 ```
 
+When stdin is a pipe or a file, it reaches the child with or without `--detached`, and the end of input is delivered to the child as EOF (Ctrl-D) ([DR-0019](./decisions/DR-0019-run-option-cleanup-and-suspend-policy-placement.md) §5). With `--detached` the daemon keeps reading, so `run` returns right away even for endless input such as `tail -f`.
+
+```sh
+echo "1+2" | hyoui run -- bc                  # stays attached; bc prints 3 and exits
+hyoui run --detached -- claude <<<"prompt"    # the prompt reaches the child even when detached
+printf 'hoge' | hyoui run --detached -- cat   # input without a trailing newline still reaches EOF
+```
+
+- The child's stdin stays a PTY, so EOF is sent as Ctrl-D (0x04). Input that ends mid-line gets two Ctrl-Ds (the first completes the pending line, the second is the EOF)
+- A raw-mode TUI receives Ctrl-D as plain input. If you pipe input in and then interact through attach, use `--stdin-eof=detach` so no EOF is sent
+- A terminal stdin is never read. `/dev/null` is treated like any other non-tty stdin: it hits EOF right away and Ctrl-D is sent (the same with and without `--detached`; how the child handles Ctrl-D is up to the child, and an interactive shell such as `bash -i` exits. Add `--stdin-eof=detach` to keep it)
+- In a loop that shares stdin, such as `while read l; do hyoui run --detached -- x; done < list`, the child reads the rest of stdin. Add `</dev/null` to keep the rest unread (the child still gets the EOF Ctrl-D)
+
 ### 2. Observe in read-only mode
 
 ```sh

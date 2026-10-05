@@ -983,7 +983,7 @@ _hyoui_run() {
         '--socket=[Unix socket path]:socket:_files' \
         '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
         '--session=[Explicit session id instead of auto-numbering (DR-0015)]:session:' \
-        '--detached[Fork the daemon and exit immediately (DR-0015)]' \
+        '--detached[Fork the daemon and exit immediately; piped stdin still reaches the child (DR-0015)]' \
         '--timeout=[Overall timeout (e.g. 30s / 1m / 1h30m)]:duration:' \
         '--idle-timeout=[Output idle timeout (e.g. 500ms / 5s)]:duration:' \
         '--until=[Terminate when PATTERN appears in output]:pattern:' \
@@ -1167,7 +1167,7 @@ complete -c hyoui -n '__hyoui_using_subcommand run' -l on-child-suspend  -x -a '
 complete -c hyoui -n '__hyoui_using_subcommand run' -l stdin-eof         -x -a 'detach send-eof'          -d 'stdin EOF action'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l scrollback-rows   -x                              -d 'vt100 scrollback ring max rows (default 1000)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l session           -x                              -d 'Explicit session id instead of auto-numbering (DR-0015)'
-complete -c hyoui -n '__hyoui_using_subcommand run' -l detached                                           -d 'Fork the daemon and exit immediately (DR-0015)'
+complete -c hyoui -n '__hyoui_using_subcommand run' -l detached                                           -d 'Fork the daemon and exit immediately; piped stdin still reaches the child (DR-0015)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l login                                              -d 'Start as a login shell with a minimal child env (DR-0039)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l no-scrub-env                                       -d 'Disable child env scrubbing (DR-0024 escape hatch)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l debug-dump-server -r -F                          -d 'Append child PTY raw bytes to a file'

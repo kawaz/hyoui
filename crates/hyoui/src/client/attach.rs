@@ -528,18 +528,9 @@ pub enum RunOutcome {
     BackpressureDisconnected,
 }
 
-/// `ClientConnection::run` で stdin EOF を検出したときの挙動 (R5-FB2)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum StdinEofAction {
-    /// 何もせず即 return (= 通常の attach。MVP 既定。stdin EOF は detach 同等)。
-    Detach,
-    /// EOT (= ASCII 0x04, Ctrl-D) を子 PTY に raw_data として送ってから return。
-    /// canonical mode の子 (例: bc / cat) は行頭の EOT を read EOF として
-    /// 解釈するため、`echo "1+2" | hyoui run -- bc` のような
-    /// pattern で子が自然終了する。
-    SendEof,
-}
+/// `ClientConnection::run` で stdin EOF を検出したときの挙動 (R5-FB2)。detached の daemon
+/// 転送と共有するため定義は [`crate::stdin_eof`] に置く。
+pub use crate::stdin_eof::StdinEofAction;
 
 /// daemon と確立した 1 接続。
 ///
