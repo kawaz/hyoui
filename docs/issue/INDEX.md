@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-10-05 | design | open | [pipe-stdin-pass-fd-to-child](./2026-10-05-design-pipe-stdin-pass-fd-to-child.md) | 非 tty の stdin は子の stdin にそのまま渡す (PTY に流し込まない) 方が直接実行と同じになる。`claude <<<X` が送信されない件の調査結果と DR-0019 §5 の見直し提案 (未裁定) |
 | 2026-10-05 | bug | open | [liveness-test-sleep-race](./2026-10-05-bug-liveness-test-sleep-race.md) | status_liveness_check_must_not_reap_exited_child が 50ms の sleep で子の exit を待っており負荷時に落ちうる (waitid WNOWAIT で観測して待つ形に) |
 | 2026-10-05 | task | open | [web-unit-config-state-dir-and-add-generates](./2026-10-05-web-unit-config-state-dir-and-add-generates.md) | web の unit config に state_dir を必須で持たせ、daemon add が `<unit>.toml` を生成、`daemon run --config` / `--no-config`、名前なしの run は help (DR-0038 の追補、合意済み・未実装) |
 | 2026-10-04 | bug | open | [web-supervisor-blocks-on-control-read](./2026-10-04-web-supervisor-blocks-on-control-read.md) | web の監督者が制御 socket の要求を main loop で 5 秒 timeout 付きで読み、改行を送らない client 1 つで止まる |
