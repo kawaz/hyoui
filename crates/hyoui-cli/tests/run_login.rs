@@ -36,16 +36,24 @@ fn run_login(runtime: &Path, sid: &str, extra: &[&str]) {
 /// (= 利用者の実 config を読まない)。
 fn run_detached(runtime: &Path, sid: &str, flags: &[&str], term: Option<&str>, extra: &[&str]) {
     let mut c = Command::new(hyoui_bin());
-    c.args(["run", "--detached", &format!("--session={sid}")])
-        .args(flags)
-        .args(extra)
-        .env("XDG_RUNTIME_DIR", runtime)
-        .env("XDG_CONFIG_HOME", runtime.join("config"))
-        .env("HYOUI_E2E_DUMMY", "must-not-leak")
-        .env("CLAUDE_CODE_SESSION_ID", "must-not-leak")
-        .env("LANG", "ja_JP.UTF-8")
-        .env_remove("HYOUI_SESSION_ID")
-        .env_remove("HYOUI_LOCK_TOKEN");
+    // stdin は /dev/null なので、EOF の EOT でログイン shell が終わらないよう送らせない
+    // (DR-0019 §5: /dev/null も他の非 tty と同じく EOT を送る)。子を生かしたまま
+    // `hyoui list` の PID と `ps` の argv を観測するのがこの helper の目的。
+    c.args([
+        "run",
+        "--detached",
+        "--stdin-eof=detach",
+        &format!("--session={sid}"),
+    ])
+    .args(flags)
+    .args(extra)
+    .env("XDG_RUNTIME_DIR", runtime)
+    .env("XDG_CONFIG_HOME", runtime.join("config"))
+    .env("HYOUI_E2E_DUMMY", "must-not-leak")
+    .env("CLAUDE_CODE_SESSION_ID", "must-not-leak")
+    .env("LANG", "ja_JP.UTF-8")
+    .env_remove("HYOUI_SESSION_ID")
+    .env_remove("HYOUI_LOCK_TOKEN");
     match term {
         Some(t) => c.env("TERM", t),
         None => c.env_remove("TERM"),
