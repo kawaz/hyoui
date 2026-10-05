@@ -874,6 +874,15 @@ impl ClientConnection {
         let _ = stdout.flush();
     }
 
+    /// `--stdin-eof=send-eof` の stdin EOF で、子 PTY に EOF を伝える EOT を送る
+    /// (DR-0019 §5)。個数は送り済み入力の末尾で決まる ([`crate::stdin_eof`]、daemon の
+    /// detached 転送と同じ判定)。送信失敗は無視する (= 直後の socket 読みで接続喪失を拾う)。
+    fn send_stdin_eof(&mut self, tracker: &crate::stdin_eof::EofTracker) {
+        let frame = Frame::raw_data(tracker.eof_bytes().to_vec());
+        let _ = frame.encode_to(&mut self.writer);
+        let _ = self.writer.flush();
+    }
+
     /// `Detach` message を daemon に送り、外側端末を reset して `Detached` を返す。
     ///
     /// 呼び出し元は stdin EOF (`--stdin-eof=detach`) と stdin read error (= 入力経路の
@@ -1130,6 +1139,9 @@ impl ClientConnection {
     ) -> Result<RunOutcome, Error> {
         let mut ctrlz = CtrlzGuard::default();
         let mut focus = InputFocus::Child;
+        // DR-0019 §5: 子 PTY に送った入力の末尾。stdin EOF で送る EOT の個数を決める
+        // (= 改行で終わらない入力は 2 個)。操作面が飲んだ入力は子に届かないので数えない。
+        let mut eof_tracker = crate::stdin_eof::EofTracker::new();
         // DR-0032 §2: handshake snapshot が stopped なら redraw を待たず menu と focus を
         // 即座に成立させる。DEC synchronized update 中は daemon が attach redraw を sync
         // 終了まで保留するため、redraw 待ちにすると停止中の子を起こす手段まで失う。
@@ -1220,6 +1232,7 @@ impl ClientConnection {
                     &self.attach_config,
                 );
                 if !outcome.forward.is_empty() {
+                    eof_tracker.observe(&outcome.forward);
                     let frame = Frame::raw_data(outcome.forward);
                     if frame.encode_to(&mut self.writer).is_err() {
                         return Ok(RunOutcome::ConnectionLost);
@@ -1489,9 +1502,7 @@ impl ClientConnection {
                 //   し続ける (= 即 return すると bc の出力が stdout に届く前に client が
                 //   抜けてしまう、DR-0019 §5 の透過性回復要件)。
                 if self.eof_action == StdinEofAction::SendEof {
-                    let frame = Frame::raw_data(vec![0x04]);
-                    let _ = frame.encode_to(&mut self.writer);
-                    let _ = self.writer.flush();
+                    self.send_stdin_eof(&eof_tracker);
                     stdin_done = true;
                     continue;
                 }
@@ -1509,9 +1520,7 @@ impl ClientConnection {
                         // (= 上の stdin_revents_is_eof で拾えなかった通常の pipe EOF)。
                         // 挙動は上と同じく eof_action で分岐する。
                         if self.eof_action == StdinEofAction::SendEof {
-                            let frame = Frame::raw_data(vec![0x04]);
-                            let _ = frame.encode_to(&mut self.writer);
-                            let _ = self.writer.flush();
+                            self.send_stdin_eof(&eof_tracker);
                             stdin_done = true;
                             continue;
                         }
@@ -1544,6 +1553,7 @@ impl ClientConnection {
                                 &self.attach_config,
                             );
                             if !outcome.forward.is_empty() {
+                                eof_tracker.observe(&outcome.forward);
                                 let frame = Frame::raw_data(outcome.forward);
                                 if frame.encode_to(&mut self.writer).is_err() {
                                     return Ok(RunOutcome::ConnectionLost);

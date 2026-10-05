@@ -155,6 +155,10 @@ attach で対話する」用途では `detach` が正しい。
 > (= 「子は正常だが時間がかかっているだけ」を false-positive で切り捨てる partial state
 > 介入であり、[[DR-0014]] の規律に反する。子が exit しない限り client が残るのは意図)。
 
+> **📌 注記 (2026-10-05、改行で終わらない入力の EOF)**: canonical mode の line discipline で 0x04 (VEOF) が EOF になるのは、未読の行が空 (= 行頭) の時だけである。それ以外の 0x04 は途中の行を区切りなしで読み手に渡すだけなので、`printf 'hoge' | hyoui run -- cat` のように入力の最後が改行で終わらないと、0x04 1 個では子が EOF を観測せず永久に read で止まっていた。**入力の最後の byte が改行 (LF / CR) でない時は 0x04 を 2 個送る** (1 個目で途中の行を確定、2 個目が行頭の EOF)。最後が改行、または何も送っていない時は 1 個のまま。CR を改行に数えるのは既定の ICRNL で LF に変換されて行を閉じるため。判定は `hyoui::stdin_eof::EofTracker` に置き、stdin を子へ送る経路はすべてこれを使う。
+>
+> 実測 (macOS、PTY に直接書いた場合): `cat` / `head -1` / `wc -c` / `sh` の `read` / python の `sys.stdin.readline()` / `sys.stdin.read()` は 2 個で EOF を観測して終わる。python の `input()` は tty では独自の読み方をするため 2 個では終わらず、3 個で終わるが末尾 1 文字を落とす (CPython の挙動。直接実行の pipe では起きない)。hyoui 経由で `input()` が 2 個で終わることもあるが、0x04 と前の bytes が別の read に分かれるかどうかの時機に依存する。raw mode の子には 2 個とも入力 byte として刺さる点は上の注記のとおり。
+
 ### 6. `attach --exclusive` / `--detach-others` は parse 段で「未実装」エラー化
 
 silent no-op (= 指定が黙って無視される) の放置は [[DR-0014]] 検証主義違反のため、

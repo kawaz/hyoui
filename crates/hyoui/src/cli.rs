@@ -5310,7 +5310,8 @@ fn usage_run() -> String {
             --stdin-eof=detach|send-eof\n                                  \
                 stdin EOF 時の挙動 (DR-0019)。default: 非 tty stdin なら\n                                  \
                 send-eof (= EOT を子に送り `echo ... | hyoui run -- bc` で\n                                  \
-                子が自然 exit)、tty なら detach。detach は EOF で切断のみ\n    \
+                子が自然 exit。入力が改行で終わらなければ EOT を 2 個)、\n                                  \
+                tty なら detach。detach は EOF で切断のみ\n    \
             --login                       通常のターミナルアプリと同じログイン shell として起動\n                                  \
                 (DR-0039)。shell は passwd から引き (呼び出し元の $SHELL は\n                                  \
                 見ない)、argv[0] を -<shell> にし、子の env は最小\n                                  \
@@ -5380,7 +5381,8 @@ fn usage_attach() -> String {
                 (state-based redraw / attach 復元込み = user の terminal 表示)\n    \
             --stdin-eof=detach|send-eof\n                          \
                 stdin EOF 時の挙動 (DR-0019)。default: 非 tty stdin なら\n                          \
-                send-eof (= EOT を子に送る)、tty なら detach\n    \
+                send-eof (= EOT を子に送る。入力が改行で終わらなければ\n                          \
+                2 個)、tty なら detach\n    \
             -h, --help            Show this help and exit\n\
         \n\
         SESSION SELECTOR:\n    \

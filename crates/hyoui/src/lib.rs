@@ -58,6 +58,10 @@ pub mod discovery;
 // 引き上げ、hyoui-web からも同じ変換を使う)。
 pub mod input_bytes;
 
+// 非 tty stdin の EOF を子 PTY に伝える byte 列 (DR-0019 §5)。attach client と daemon
+// (`run --detached` の stdin 転送) が同じ判定を使う。
+pub mod stdin_eof;
+
 pub mod version;
 
 // 置き場所 (config / state / runtime) を env から導く唯一の口 (DR-0038 決定 5)。
