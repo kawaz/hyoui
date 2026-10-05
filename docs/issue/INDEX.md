@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-10-05 | bug | open | [liveness-test-sleep-race](./2026-10-05-bug-liveness-test-sleep-race.md) | status_liveness_check_must_not_reap_exited_child が 50ms の sleep で子の exit を待っており負荷時に落ちうる (waitid WNOWAIT で観測して待つ形に) |
 | 2026-10-05 | task | open | [web-unit-config-state-dir-and-add-generates](./2026-10-05-web-unit-config-state-dir-and-add-generates.md) | web の unit config に state_dir を必須で持たせ、daemon add が `<unit>.toml` を生成、`daemon run --config` / `--no-config`、名前なしの run は help (DR-0038 の追補、合意済み・未実装) |
 | 2026-10-04 | bug | open | [web-supervisor-blocks-on-control-read](./2026-10-04-web-supervisor-blocks-on-control-read.md) | web の監督者が制御 socket の要求を main loop で 5 秒 timeout 付きで読み、改行を送らない client 1 つで止まる |
 | 2026-10-04 | design | open | [session-id-uuid-and-tags](./2026-10-04-design-session-id-uuid-and-tags.md) | session id を UUID に、namespace を廃止して tag に、socket を `hyoui/sessions/` にフラットに置く (DR-0018 を置き換える)。WR-Q1 の解消を含む。議論中 |
