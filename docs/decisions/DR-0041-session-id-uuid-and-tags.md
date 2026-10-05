@@ -101,18 +101,18 @@ DR-0038 決定 4 は web の状態の置き場を `hyoui/web/` にした。sessi
 ### 6. 面は状態の root を決める環境変数 1 つで決まり、面をまたぐ仕組みは持たない
 
 - 面は hyoui 専用の環境変数 `HYOUI_STATE_DIR` 1 つで決まる (2026-10-04 裁定、`CLAUDE_CONFIG_DIR` と同じ考え方)。hyoui の一式 (CLI、session の socket、web の監督者・unit・登録簿・auth.json・logs) はその root の中で完結する
-- 置き場の決め方 (先行の kawaz/ccmsg の `CCMSG_STATE_DIR` / `CCMSG_CONFIG_DIR` と同じ 3 段):
+- 状態の root の決め方 (先行の kawaz/ccmsg の `CCMSG_STATE_DIR` と同じ 3 段):
 
   | 何 | 1. 専用の変数 (空でなければ) | 2. XDG (絶対パスの時だけ) | 3. 既定 |
   |---|---|---|---|
   | 状態の root | `$HYOUI_STATE_DIR` (そのまま使う) | `$XDG_STATE_HOME/hyoui` | `$HOME/.local/state/hyoui` |
-  | config の root | `$HYOUI_CONFIG_DIR` (そのまま使う) | `$XDG_CONFIG_HOME/hyoui` | `$HOME/.config/hyoui` |
 
-  `XDG_STATE_HOME` / `XDG_CONFIG_HOME` は他のアプリと共有の変数なので、面を分けるために書き換えない (書き換えると同じ shell の他のツールの置き場まで動く)。面を分ける時は面の `.envrc` で `HYOUI_STATE_DIR` (と必要なら `HYOUI_CONFIG_DIR`) だけを設定する。`$HOME` も無い時はエラーにし、cwd 相対には倒さない
+  `XDG_STATE_HOME` / `XDG_CONFIG_HOME` は他のアプリと共有の変数なので、面を分けるために書き換えない (書き換えると同じ shell の他のツールの置き場まで動く)。面を分ける時は面の `.envrc` で `HYOUI_STATE_DIR` だけを設定する。`$HOME` も無い時はエラーにし、cwd 相対には倒さない
+- **config は面で分けない** (2026-10-05 裁定)。config の root は `$XDG_CONFIG_HOME/hyoui` (無ければ `$HOME/.config/hyoui`) 1 つで全部の面が共有し、専用の変数は持たない。面ごとに違うのは状態だけで、web の unit の config (listen 等) は登録簿が path で参照する (DR-0038)
 - `XDG_RUNTIME_DIR` は使わない (2026-10-04 裁定)。runtime dir はログインに紐づく寿命 (Linux の logind は最後のセッション終了で消す、再起動でも消える) で、ログインを越えて動き続ける hyoui の session と合わない。socket は状態の root に置く。長く生きる multiplexer の先例 (tmux は `$TMUX_TMPDIR` か `/tmp`、screen は `$SCREENDIR` か `/tmp/screens`) も runtime dir を使っていない
 - 面をどの変数で識別するかについて、ccmsg は Claude の config home (`CLAUDE_CONFIG_DIR` 等) から instance を自動で導くが、hyoui は Claude 以外 (vim や shell) も動かすので Claude 用の変数には結びつけず、専用の変数で選ぶ
 - **面をまたぐ仕組みは持たない。** 複数の面を横断する option、1 つの監督者で複数の面の unit を抱える等は作らない。複数の面を扱う時は、面ごとに環境変数を指定してそれぞれで実行して回る
-- web の監督者も面ごとに立つ。登録簿はその面の状態の root の中にあり、1 つの監督者が読むのは 1 つの面の登録簿だけである (ccmsg の監督者がホストに 1 つなのは 1 プロセスで複数の instance を抱える作りだからで、面をまたがない hyoui とは前提が違う)。面の `.envrc` が効いた状態で `hyoui web service register` すれば、その面の root (`HYOUI_STATE_DIR` / `HYOUI_CONFIG_DIR` を含む) が定義に固定される (DR-0038 決定 5 の env 固定)
+- web の監督者も面ごとに立つ。登録簿はその面の状態の root の中にあり、1 つの監督者が読むのは 1 つの面の登録簿だけである (ccmsg の監督者がホストに 1 つなのは 1 プロセスで複数の instance を抱える作りだからで、面をまたがない hyoui とは前提が違う)。面の `.envrc` が効いた状態で `hyoui web service register` すれば、その面の root (`HYOUI_STATE_DIR` を含む) が定義に固定される (DR-0038 決定 5 の env 固定)
 - 面ごとの監督者の label (`com.github.kawaz.hyoui.web.supervise.<hash>`、`<hash>` は状態 root から導く) は DR-0038 決定 4 が正本で、本 DR は参照するだけ
 - `hyoui run --login` は子の shell に渡す env を最小にするだけで、hyoui 自身の面は今の env で決まる (DR-0039 決定 1)
 
