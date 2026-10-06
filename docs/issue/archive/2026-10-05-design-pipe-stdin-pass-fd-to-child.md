@@ -1,18 +1,18 @@
 ---
 title: 非 tty の stdin は子の stdin にそのまま渡す (PTY に流し込まない) 方が直接実行と同じになる — DR-0019 §5 の見直し
-status: open
+status: resolved
 category: design
 created: 2026-10-05T13:30:00+09:00
-last_read: 2026-10-06T13:10:00+09:00
+last_read: 2026-10-06T15:45:00+09:00
 open_entered: 2026-10-05T13:30:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-06T15:45:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: DR-0042 として実装 (非 tty の stdin は子の fd 0 にそのまま渡す、--pty-stdin、attach は stdin を流さず制御端末の実体からキーを読む、配線に失敗したら起動・接続を拒否する)。DR-0019 §5 は置き換え
 blocked_by:
 ---
 

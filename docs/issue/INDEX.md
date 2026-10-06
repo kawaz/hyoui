@@ -6,7 +6,6 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 |---|---|---|---|---|
 | 2026-10-06 | design | open | [external-detach-reported-as-connection-lost](./2026-10-06-design-external-detach-reported-as-connection-lost.md) | 外から `hyoui detach` された attach client が「接続が失われました」で exit 9 になり、daemon の消滅と区別できない (DR-0042 の端末なし attach で主な終わり方になる) |
 | 2026-10-06 | design | open | [daemon-unaware-of-unlinked-socket](./2026-10-06-design-daemon-unaware-of-unlinked-socket.md) | session の socket file が消えても daemon は気付かず、誰も到達できないまま子と一緒に残り続ける (テストの残骸 49 個で観測) |
-| 2026-10-05 | design | open | [pipe-stdin-pass-fd-to-child](./2026-10-05-design-pipe-stdin-pass-fd-to-child.md) | 非 tty の stdin は子の stdin にそのまま渡す (PTY に流し込まない) 方が直接実行と同じになる。`claude <<<X` が送信されない件の調査結果と DR-0019 §5 の見直し (2026-10-06 裁定済み、未実装) |
 | 2026-10-04 | bug | open | [web-supervisor-blocks-on-control-read](./2026-10-04-web-supervisor-blocks-on-control-read.md) | web の監督者が制御 socket の要求を main loop で 5 秒 timeout 付きで読み、改行を送らない client 1 つで止まる |
 | 2026-10-04 | design | open | [session-id-uuid-and-tags](./2026-10-04-design-session-id-uuid-and-tags.md) | session id を UUID に、namespace を廃止して tag に、socket を `hyoui/sessions/` にフラットに置く (DR-0018 を置き換える)。WR-Q1 の解消を含む。議論中 |
 | 2026-10-04 | design | open | [web-unit-registry-holds-settings](./2026-10-04-web-unit-registry-holds-settings.md) | web の unit 登録簿が listen 等の設定値を持っている (DR-0034 が daemon / service パターンから逸脱)。unit = config ファイル 1 つに直し、登録簿は config 参照 + binary + enabled だけにする |
