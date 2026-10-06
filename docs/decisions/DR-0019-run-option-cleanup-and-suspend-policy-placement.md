@@ -1,6 +1,6 @@
 # DR-0019: run オプション棚卸しと suspend policy の配置 — `--mode` preset 廃止、auto-resume の daemon 配線
 
-- Status: Active
+- Status: Active。§5 (pipe-through、`--stdin-eof`、EOT の送出、2026-10-05 の注記と `--detached` への拡張) は [[DR-0042]] が置き換える。§5 以外は有効
 - Date: 2026-06-11
 - Related: DR-0001 (jobcontrol 2 軸 — 本 DR で preset 表を partially supersede), DR-0005 (思想 — pipe-through の透過性回復を justify), DR-0006 (CLI ground rules — `--exclusive` / `--detach-others` の原典), DR-0014 (検証主義 — silent no-op 禁止の根拠), DR-0015 (run = fork + exec attach — 軸 2 廃止、§2.2 の policy 配置を本 DR で変更), DR-0017 (notify-only default + AutoResume opt-in 温存 — 本 DR がその唯一実現可能な配置を確定), DR-0030 (§3 の client 側配置却下の射程を「無人時の policy」に限定 — 有人時は client 側 resume が担う)
 - Origin: docs/findings/2026-06-11-signal-suspend-interaction-audit.md (2 系統監査の正本)
@@ -124,6 +124,8 @@ semantics。client 側に置くと「attach している間しか効かない ti
   (= killpg(SIGTERM) → CONT+TERM → grace → KILL、`session.rs` 実装済経路) を共用する。
 
 ### 5. pipe-through: 非 tty stdin の EOF で default `SendEof` + `--stdin-eof` で override
+
+> **📌 本節は [[DR-0042]] が置き換える (2026-10-06)**: 非 tty の stdin は子の fd 0 にそのまま渡し、EOT は送らない。`--stdin-eof` は無い。以下は判断記録として残す。
 
 `stdin が tty でない場合`、attach client は stdin EOF 観測時に default で EOT (0x04) を
 子 PTY へ送出する (= 実装済 dead code `StdinEofAction::SendEof` の production 配線)。
