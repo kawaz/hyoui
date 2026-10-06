@@ -56,6 +56,23 @@ hyoui の spawn 構造 (`crates/hyoui/src/sys/raw.rs` の `openpty_fork_anchor_e
 
 現行の hyoui 0.11.0 での対照: `printf 'a\003b\000c\n' | hyoui run -- od -c` は 0x03 が ISIG で SIGINT になり rc=130 (直接実行は `a 003 b \0 c \n`)。`printf 'hi\nthere' | hyoui run -- cat` の出力には PTY の echo と EOT の痕跡 (`^D\b\b`) が混ざる。
 
+## シェルとの対応 (2026-10-06、kawaz の問い「tty を持つ bash が TUI を起動する時と同じではないか」)
+
+対話の bash が `cmd | tui` を起動する時、bash は fd を配線して端末を譲るだけで、stdin の bytes を端末に流し込まない:
+
+- pipe を作り、`tui` の fd 0 に dup2 する。fd 1 / 2 は bash の tty を継承する (here-string も `< file` も同じで、fd 0 が一時ファイルか pipe になるだけ)
+- pipeline を新しい process group にし (setpgid)、tty の foreground にする (tcsetpgrp)。子は bash と同じ session なので、制御端末は同じ tty
+- `tui` は stdin が tty でないので /dev/tty を開いてキーを読む。キーは端末から子へ直接届き、bash は介在しない
+
+hyoui の子に対して hyoui は bash の位置に立ち、hyoui の PTY が bash の tty に当たる。PoC の「直接実行」列はこの bash の配線そのもので、「PoC」列は hyoui の spawn 構造で同じ配線をしたもの。現行の「pipe の中身を PTY master に書く」は、bash で言えば pipe の中身を利用者がキーボードで打ったことにするのと同じで、シェルは決してそうしない。
+
+違いは 2 点ある:
+
+- **端末が 2 段になる。** 利用者の tty と hyoui の PTY の間を attach client が中継するので、bash で「キーが端末から子へ直接届く」部分を attach client が担う。stdin が pipe の時、attach client は stdin でなく /dev/tty からキーを読む必要がある (今は stdin しか見ていない)
+- **呼び出し元に端末が無くても PTY を作れる。** bash には無い、`tmux new-session -d` 側の振る舞い。tmux の detached session の子の stdin は呼び出し元の stdin ではなく pty で、STDIN-Q1β の a (子の stdin も PTY にする指定) はこれに当たる
+
+単独の `hyoui attach S` は bash の `fg` に当たる。`fg` は job の fd を差し替えず端末を譲り直すだけなので、STDIN-Q1γ の a (attach は非 tty の stdin を子に流さない) と同じ。
+
 ## 実装の当たり所 (PoC worker の所見、コード読解)
 
 - fd の受け渡しは継承 (SCM_RIGHTS なし)。`--detached` は `crates/hyoui-cli/src/daemonize.rs` で stdin を inherit し、daemon が `take_stdin_for_forward()` で `F_DUPFD_CLOEXEC` に移す。非 detached の run は daemon に stdin を渡さず、exec する attach client が pipe を読む
