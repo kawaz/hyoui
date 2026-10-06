@@ -291,6 +291,26 @@ tty I/O timeline の永続録画
 control plane (lock / resize / signal / handshake / screen.dump / screen.snapshot / ...)
 は同じ socket を type=0x01 CBOR frame で multiplex。
 
+### 3.1.0 子の fd と制御端末 ([[DR-0042]])
+
+プロセスには 2 種類の経路がある。fd 0 / 1 はプログラム同士がデータを受け渡す横の流れで、`|` や `<` / `>` で付け替えられる。制御端末は人や操作する側とつながる縦の軸で、キー・画面・`^C` の signal・foreground の切り替えが通る。`/dev/tty` を開くと、fd 0 がどこを指していても制御端末が開く。
+
+```
+              hyoui (PTY master を持つ。attach / hyoui input / screen dump)
+                       │ 縦: 子の制御端末 = hyoui の PTY
+          ┌────────────┼────────────┐
+          ▼            ▼            ▼
+ file ─▶ grep ─pipe─▶ sort ─pipe─▶ less ─▶ PTY (画面)
+          横: fd 0 → fd 1 (呼び出し元が決めた配線)
+```
+
+hyoui は縦の軸だけを握り、横の流れには手を出さない。
+
+- 子の制御端末と fd 1 / 2 は常に hyoui の PTY
+- 子の fd 0 は、呼び出し元の fd 0 が tty なら PTY、tty でなければ呼び出し元の fd 0 そのもの (シェルが `cmd | child` を起動する時と同じ配線)
+- `run --pty-stdin` は、呼び出し元の fd 0 を使わず、子の fd 0 も PTY にする (外から操作し続ける shell / REPL を、端末の無い起動元から作る時)
+- キーは PTY に届く。子が fd 0 から読むか `/dev/tty` から読むかに関わらず、`hyoui input` と attach のキーは子に届く
+
 ### 3.1.1 attach handshake の redraw 復元 ([[DR-0013]] §4 Phase A)
 
 ```

@@ -347,6 +347,26 @@ The control plane (lock / resize / signal / handshake / screen.dump /
 screen.snapshot / ...) is multiplexed on the same socket as `type=0x01` CBOR
 frames.
 
+### 3.1.0 The child's fds and controlling terminal ([[DR-0042]])
+
+A process has two kinds of paths. fds 0 / 1 are the horizontal flow through which programs hand data to each other; `|` and `<` / `>` rewire them. The controlling terminal is the vertical axis to the person or controller: keys, the screen, the `^C` signal and foreground switching travel along it. Opening `/dev/tty` opens the controlling terminal wherever fd 0 points.
+
+```
+              hyoui (holds the PTY master: attach / hyoui input / screen dump)
+                       │ vertical: the child's controlling terminal = hyoui's PTY
+          ┌────────────┼────────────┐
+          ▼            ▼            ▼
+ file ─▶ grep ─pipe─▶ sort ─pipe─▶ less ─▶ PTY (screen)
+          horizontal: fd 0 → fd 1 (wired by the caller)
+```
+
+hyoui holds only the vertical axis and leaves the horizontal flow alone.
+
+- The child's controlling terminal and fds 1 / 2 are always hyoui's PTY
+- The child's fd 0 is the PTY when the caller's fd 0 is a tty, and otherwise the caller's fd 0 itself (the same wiring a shell does when it starts `cmd | child`)
+- `run --pty-stdin` ignores the caller's fd 0 and makes the child's fd 0 the PTY too (for starting a shell / REPL that is driven from outside, from a launcher with no terminal)
+- Keys reach the PTY. Whether the child reads fd 0 or `/dev/tty`, `hyoui input` and keys from attach reach it
+
 ### 3.1.1 Attach handshake redraw restore ([[DR-0013]] §4 Phase A)
 
 ```
