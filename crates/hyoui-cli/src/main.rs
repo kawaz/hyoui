@@ -643,10 +643,6 @@ fn outer_terminal_size() -> Option<(u16, u16)> {
 /// 4. daemon thread を join、その exit code を返す
 fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     let scrollback_rows = resolve_scrollback_rows(cfg.scrollback_rows);
-    // DR-0018: namespace を解決 (= --namespace flag > HYOUI_NAMESPACE env > default)。
-    // 解決済 namespace は (1) socket 配置 dir の決定、(2) 子プロセスへの常時 env 注入、
-    // (3) 非 detached 経路で exec する `hyoui attach` への明示伝搬、に使う。
-    let namespace = socket_path::resolve_namespace(cfg.namespace.as_deref());
     // DR-0024: 子 PTY env scrub。config (= ~/.config/hyoui/config.toml) を load し、
     // target = argv basename で builtin + user 設定を merge して ScrubPlan を解決する。
     // `None` で完全 disable (= --no-scrub-env or config の scrub_env_enabled=false)、
@@ -733,13 +729,12 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
             return ExitCode::from(2);
         }
         return daemonize::run_detached_parent(
-            cfg.session.clone(),
+            cfg.session_id.clone(),
             cfg.socket.clone(),
             initial_size,
             cfg.until.clone(),
             scrollback_rows,
             cfg.debug_dump_server.clone(),
-            namespace,
             on_child_suspend,
             cfg.timeout_ms,
             cfg.idle_timeout_ms,
@@ -755,18 +750,17 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     // 1. detached daemon を spawn して ready 通知を待つ
     // 2. 親 process 自身を `hyoui attach <session>` に exec で置換
     // これにより:
-    // - `ps` で常に "hyoui run --detached --session=..." (daemon) + "hyoui attach <session>"
+    // - `ps` で常に "hyoui run --detached -- cmd" (daemon) + "hyoui attach <session>"
     //   (= 親) が並ぶ = role 一目了然
     // - memory image が完全に置換されるので、fork+thread の global static 競合事故ゼロ
     // - `hyoui attach` の既存 attach_command 実装をそのまま流用 (= コード重複ゼロ)
     let (session_id, _sock) = match daemonize::spawn_detached_daemon_and_wait_ready(
-        cfg.session.clone(),
+        cfg.session_id.clone(),
         cfg.socket.clone(),
         initial_size,
         cfg.until.clone(),
         scrollback_rows,
         cfg.debug_dump_server.clone(),
-        namespace.clone(),
         on_child_suspend,
         cfg.timeout_ms,
         cfg.idle_timeout_ms,
@@ -794,11 +788,6 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     attach_cmd.arg("attach").arg(&session_id);
     if let Some(socket) = cfg.socket.as_deref() {
         attach_cmd.arg(format!("--socket={socket}"));
-    } else {
-        // DR-0018: socket 明示なしのときは namespace を attach に伝える。run が
-        // --namespace flag で解決した場合 env に値が無いので、明示渡しが必須
-        // (= flag 経路と env 経路で attach の socket 解決を一致させる)。
-        attach_cmd.arg(format!("--namespace={namespace}"));
     }
     if let Some(p) = cfg.debug_dump_client.as_deref() {
         attach_cmd.arg(format!("--debug-dump-client={p}"));
@@ -823,11 +812,11 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
 ///
 /// stale socket は除外 (= attach 失敗確実のため index に含めない)。
 /// 範囲外 / 0 件 → `Err`。
-fn resolve_session_by_index(index: i32, namespace: &str) -> Result<String, String> {
+fn resolve_session_by_index(index: i32) -> Result<String, String> {
     if index == 0 {
         return Err("index 0 は不正です (= 1-based、1 が最古、-1 が最新)".to_string());
     }
-    let dirs = list_candidate_dirs(namespace);
+    let dirs = session_scan_dirs();
     let mut entries: Vec<(String, std::time::SystemTime)> = Vec::new();
     for dir in dirs {
         let read = match std::fs::read_dir(&dir) {
@@ -891,8 +880,6 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         }
     };
 
-    // DR-0018: namespace を解決 (= --namespace flag > HYOUI_NAMESPACE env > default)。
-    let namespace = socket_path::resolve_namespace(cfg.namespace.as_deref());
     let sock = if let Some(p) = cfg.socket.clone() {
         let p = std::path::PathBuf::from(p);
         // DR-0020 §3 (codex review 2026-06-12): `--socket` 明示経路でも self-attach
@@ -914,7 +901,7 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         // それ以外は cfg.session_id を使う (= parse_attach で同時指定は弾かれている)。
         let sid_owned: String;
         let sid = if let Some(index) = cfg.index {
-            match resolve_session_by_index(index, &namespace) {
+            match resolve_session_by_index(index) {
                 Ok(s) => {
                     sid_owned = s;
                     sid_owned.as_str()
@@ -934,11 +921,11 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
             }
         };
         // DR-0020 §3: attach 対象が自セッションならネスト防止エラー (= tmux $TMUX
-        // ネスト防止と同型)。明示引数でも index 解決結果でも、解決した sid + namespace
-        // が子へ注入された $HYOUI_SESSION_ID + $HYOUI_NAMESPACE と一致したら拒否する。
+        // ネスト防止と同型)。明示引数でも index 解決結果でも、解決した sid が子へ
+        // 注入された $HYOUI_SESSION_ID と一致したら拒否する。
         // self default は作らない (= session 省略は上の required エラー)、ro 観戦の
         // 例外も設けない (= DR-0020 §3、需要が出たら再検討)。
-        if attach_target_is_self(sid, &namespace) {
+        if attach_target_is_self(sid) {
             eprintln!(
                 "hyoui: attach: 自セッション ({sid}) への attach はできません \
                  (= hyoui in hyoui のネスト防止、DR-0020 §3)。"
@@ -948,12 +935,10 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
             );
             return ExitCode::from(2);
         }
-        match socket_path::resolve_in_namespace(None, sid, &namespace) {
+        match socket_path::resolve(None, sid) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "hyoui: attach: socket path 解決失敗: {e} (session: {sid}, namespace: {namespace})"
-                );
+                eprintln!("hyoui: attach: socket path 解決失敗: {e} (session: {sid})");
                 eprintln!("       起動中の session 一覧は `hyoui list` で確認してください。");
                 return ExitCode::from(1);
             }
@@ -1303,13 +1288,13 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
 /// kernel が SOCK_STREAM の listen backlog にいる場合は connect 成功するので、
 /// daemon process が alive かつ accept できる状態であることを確認できる。
 fn probe_socket_liveness(path: &std::path::Path) -> bool {
-    use std::os::unix::net::UnixStream;
     // Unix domain socket の connect は kernel level で即座に結果が返る (= TCP の
     // SYN 待ちのような network delay は存在しない)。listener が居なければ即
     // ECONNREFUSED、居れば即 success。timeout は listener queue が一杯で
     // 待たされるケースだけ意味を持つが、stale 判定用途では「即 success or
-    // 即 fail」だけ見えれば十分なので blocking `connect` で OK。
-    UnixStream::connect(path).is_ok()
+    // 即 fail」だけ見えれば十分なので blocking `connect` で OK。`sun_path` に
+    // 収まらないパスも届くよう hyoui の connect を通す (DR-0041 決定 5)。
+    hyoui::sys::socket::connect(path).is_ok()
 }
 
 /// `hyoui list` の主要ロジック (R5-H3 対応)。
@@ -1320,19 +1305,16 @@ fn probe_socket_liveness(path: &std::path::Path) -> bool {
 /// 接続を拒否する残骸 socket は削除し、接続後の無応答は no-response として表示する。
 /// 削除失敗は警告する。
 fn list_command(cfg: ListConfig) -> ExitCode {
-    // DR-0018: scan 対象 dir を namespace スコープで決める。
-    // - --all-namespaces → 全 namespace の (ns, dir) を列挙、NS 列を表示
-    // - それ以外 → 解決した単一 namespace の dir のみ (= 従来互換)
-    let dirs: Vec<(String, std::path::PathBuf)> = if cfg.all_namespaces {
-        list_candidate_dirs_all_namespaces()
-    } else {
-        let ns = socket_path::resolve_namespace(cfg.namespace.as_deref());
-        list_candidate_dirs(&ns)
-            .into_iter()
-            .map(|d| (ns.clone(), d))
-            .collect()
-    };
-    list_command_with_dirs(cfg, dirs)
+    let env = hyoui::paths::Env::current();
+    if let Err(e) = env.state_root() {
+        eprintln!("hyoui: list: {e}");
+        return ExitCode::from(2);
+    }
+    // DR-0041 決定 7: 古い置き場に残った session は読まない。在ることだけ警告する。
+    for warning in hyoui::discovery::legacy_session_warnings(&env) {
+        eprintln!("hyoui: warning: {warning}");
+    }
+    list_command_with_dirs(cfg, session_scan_dirs())
 }
 
 /// `hyoui list` で 1 session を表す internal 構造体。
@@ -1342,8 +1324,6 @@ fn list_command(cfg: ListConfig) -> ExitCode {
 /// 「1=最古 / -1=最新」と解釈する。
 struct ListEntry {
     session: String,
-    /// DR-0018: この entry が属する namespace (= NS 列表示用)。
-    namespace: String,
     socket_path: std::path::PathBuf,
     /// socket file mtime を epoch ms に換算した値 (= sort key + jsonl 出力用)。
     started_unix_ms: u64,
@@ -1391,12 +1371,12 @@ enum ListEntryStatus {
     Gone,
 }
 
-/// `list_command` の testable な内部実装。`(namespace, dir)` 一覧を引数で受けることで
-/// env (`XDG_RUNTIME_DIR` / `TMPDIR`) 依存を切り離し、unit test 可能にする (= DR-0018)。
-fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<(String, std::path::PathBuf)>) -> ExitCode {
+/// `list_command` の testable な内部実装。走査する dir を引数で受けることで
+/// env (`HYOUI_STATE_DIR` 等) 依存を切り離し、unit test 可能にする。
+fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<std::path::PathBuf>) -> ExitCode {
     let now = std::time::SystemTime::now();
     let mut entries: Vec<ListEntry> = Vec::new();
-    for (ns, dir) in dirs {
+    for dir in dirs {
         let read_entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
             Err(_) => continue, // dir 不存在は無視 (= 何も daemon 起動してない可能性)
@@ -1428,7 +1408,6 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<(String, std::path::PathBuf
             };
             entries.push(ListEntry {
                 session,
-                namespace: ns.clone(),
                 socket_path: path.clone(),
                 started_unix_ms,
                 dur,
@@ -1445,11 +1424,11 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<(String, std::path::PathBuf
     entries.retain(|e| !matches!(&e.status, ListEntryStatus::Gone));
 
     match cfg.format {
-        ListFormat::Plain => print_list_plain(&entries, cfg.all_namespaces),
+        ListFormat::Plain => print_list_plain(&entries),
         ListFormat::Jsonl => print_list_jsonl(&entries),
         // `ListFormat` is `#[non_exhaustive]`; fall back to plain
         // for unknown future variants.
-        _ => print_list_plain(&entries, cfg.all_namespaces),
+        _ => print_list_plain(&entries),
     }
 
     let found = entries.len();
@@ -1593,30 +1572,18 @@ fn fmt_argv(argv: &[String]) -> String {
 /// **設計判断 (kawaz 指摘 #2 対応)**: live entry は cwd / argv / clients を **必ず**
 /// concrete value で出す。無応答の場合は daemon PID を表示する。
 ///
-/// DR-0018: `show_ns = true` (= `--all-namespaces`) のとき先頭に NS 列を追加する。
-/// 単一 namespace 表示 (= default) では NS 列を出さず、従来の見え方を保つ。
-fn print_list_plain(entries: &[ListEntry], show_ns: bool) {
+/// SESSION 列は UUID (36 文字) を省略せずに出す (= id はコピペで渡す前提、DR-0041
+/// 決定 2)。UUID でない socket 名 (= `--socket` で置いた等) が来ても列幅で揃える。
+fn print_list_plain(entries: &[ListEntry]) {
     if entries.is_empty() {
         return;
     }
-    if show_ns {
-        println!(
-            "{:<16} {:<20} {:<7} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} ARGV",
-            "NS", "SESSION", "STATUS", "PID", "SUSPEND", "VERSION", "DUR", "CLIENTS", "CWD"
-        );
-    } else {
-        println!(
-            "{:<20} {:<7} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} ARGV",
-            "SESSION", "STATUS", "PID", "SUSPEND", "VERSION", "DUR", "CLIENTS", "CWD"
-        );
-    }
+    println!(
+        "{:<36} {:<7} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} ARGV",
+        "SESSION", "STATUS", "PID", "SUSPEND", "VERSION", "DUR", "CLIENTS", "CWD"
+    );
     for e in entries {
-        let session = truncate_to(&e.session, 20);
-        let ns_prefix = if show_ns {
-            format!("{:<16} ", truncate_to(&e.namespace, 16))
-        } else {
-            String::new()
-        };
+        let session = truncate_to(&e.session, hyoui::cli::SESSION_ID_LEN);
         match &e.status {
             ListEntryStatus::Live {
                 cwd,
@@ -1651,7 +1618,7 @@ fn print_list_plain(entries: &[ListEntry], show_ns: bool) {
                     daemon_version.as_str()
                 };
                 println!(
-                    "{ns_prefix}{session:<20} {status:<7} {pid_disp:<8} {suspend:<11} {ver:<8} {dur:<10} {clients:<8} {cwd_disp:<32} {argv_disp}"
+                    "{session:<36} {status:<7} {pid_disp:<8} {suspend:<11} {ver:<8} {dur:<10} {clients:<8} {cwd_disp:<32} {argv_disp}"
                 );
             }
             ListEntryStatus::Hung { daemon_pid, .. } => {
@@ -1659,7 +1626,7 @@ fn print_list_plain(entries: &[ListEntry], show_ns: bool) {
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| "-".into());
                 println!(
-                    "{ns_prefix}{session:<20} {:<7} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} -",
+                    "{session:<36} {:<7} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} -",
                     hyoui::discovery::NO_RESPONSE_STATUS,
                     pid,
                     "-",
@@ -1670,11 +1637,11 @@ fn print_list_plain(entries: &[ListEntry], show_ns: bool) {
                 );
             }
             ListEntryStatus::Error { .. } => println!(
-                "{ns_prefix}{session:<20} {:<11} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} -",
+                "{session:<36} {:<11} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} -",
                 "error", "-", "-", "-", "-", "-", "-"
             ),
             ListEntryStatus::Stale { .. } => println!(
-                "{ns_prefix}{session:<20} {:<7} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} -",
+                "{session:<36} {:<7} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} -",
                 "stale", "-", "-", "-", "-", "-", "-"
             ),
             ListEntryStatus::Gone => {}
@@ -1703,8 +1670,6 @@ fn print_list_jsonl(entries: &[ListEntry]) {
                 daemon_version,
             } => serde_json::json!({
                 "session": e.session,
-                // DR-0018: namespace を常時出力 (= default ns は "default")。
-                "namespace": e.namespace,
                 // DR-0017 §柱2: stopped child は status を "stopped" にして可観測化。
                 "status": if *child_stopped { "stopped" } else { "live" },
                 "child_stopped": child_stopped,
@@ -1730,7 +1695,6 @@ fn print_list_jsonl(entries: &[ListEntry]) {
                 "daemon_pid": daemon_pid,
                 "reason": reason,
                 "session": e.session,
-                "namespace": e.namespace,
                 "status": hyoui::discovery::NO_RESPONSE_STATUS,
                 "child_pid": serde_json::Value::Null,
                 "child_pgid": serde_json::Value::Null,
@@ -1742,10 +1706,10 @@ fn print_list_jsonl(entries: &[ListEntry]) {
                 "clients": serde_json::Value::Null,
             }),
             ListEntryStatus::Error { reason } => {
-                serde_json::json!({"session": e.session, "namespace": e.namespace, "status": "error", "reason": reason, "socket": e.socket_path.display().to_string(), "started_unix_ms": e.started_unix_ms})
+                serde_json::json!({"session": e.session, "status": "error", "reason": reason, "socket": e.socket_path.display().to_string(), "started_unix_ms": e.started_unix_ms})
             }
             ListEntryStatus::Stale { reason } => {
-                serde_json::json!({"session": e.session, "namespace": e.namespace, "status": "stale", "reason": reason, "socket": e.socket_path.display().to_string(), "started_unix_ms": e.started_unix_ms})
+                serde_json::json!({"session": e.session, "status": "stale", "reason": reason, "socket": e.socket_path.display().to_string(), "started_unix_ms": e.started_unix_ms})
             }
             ListEntryStatus::Gone => continue,
         };
@@ -1753,67 +1717,20 @@ fn print_list_jsonl(entries: &[ListEntry]) {
     }
 }
 
-/// hyoui base socket dir 候補 (= namespace を含めない `hyoui` まで) を返す。
+/// `hyoui list` 等で scan する dir (= `<状態の root>/sessions`、実在する時だけ)。
 ///
-/// resolver と同じ優先順位 (`XDG_RUNTIME_DIR` → XDG state fallback) で実在する
-/// dir だけを列挙する。起動 path と `hyoui list` の探索 path は必ず同期させる。
-fn base_socket_dirs() -> Vec<std::path::PathBuf> {
-    socket_path::existing_base_dirs()
-}
-
-/// `hyoui list` 等で scan する候補 dir を **namespace スコープ**で返す (= DR-0018)。
-///
-/// - `default` namespace → base dir をそのまま (= 互換、`<base>/*.sock` を直接 scan)
-/// - それ以外 → `<base>/<namespace>` (= 実在する場合のみ)
-fn list_candidate_dirs(namespace: &str) -> Vec<std::path::PathBuf> {
-    let bases = base_socket_dirs();
-    if namespace == hyoui::cli::DEFAULT_NAMESPACE {
-        return bases;
-    }
-    bases
-        .into_iter()
-        .map(|b| b.join(namespace))
-        .filter(|p| p.is_dir())
-        .collect()
-}
-
-/// 全 namespace 横断で scan する候補 dir を `(namespace, dir)` ペアで返す (= DR-0018)。
-///
-/// 各 base dir 直下を 1 段 read_dir し、`*.sock` (= default ns の socket) と
-/// サブ dir (= 非 default ns) を区別して列挙する:
-/// - base dir 自身 → namespace = `default`
-/// - base dir 配下の各サブ dir `<ns>` → namespace = `<ns>`
-fn list_candidate_dirs_all_namespaces() -> Vec<(String, std::path::PathBuf)> {
-    let mut out: Vec<(String, std::path::PathBuf)> = Vec::new();
-    for base in base_socket_dirs() {
-        // base dir 自身 = default namespace。
-        out.push((hyoui::cli::DEFAULT_NAMESPACE.to_string(), base.clone()));
-        // base 配下のサブ dir = 各 namespace。
-        let read = match std::fs::read_dir(&base) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        for entry in read.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            if let Some(ns) = path.file_name().and_then(|s| s.to_str()) {
-                // namespace 名として妥当なものだけ採用 (= 不正名の dir は無視)。
-                if hyoui::cli::validate_namespace(ns).is_ok() {
-                    out.push((ns.to_string(), path));
-                }
-            }
-        }
-    }
-    out
+/// 起動 path ([`socket_path::resolve`]) と同じ `hyoui::paths::Env` から導く (= 起動と
+/// 列挙の path が食い違わない)。古い置き場 (root 直下や他の dir) は見ない
+/// (DR-0041 決定 4)。
+fn session_scan_dirs() -> Vec<std::path::PathBuf> {
+    socket_path::existing_sessions_dir().into_iter().collect()
 }
 
 /// 全 live session の id を mtime 昇順で列挙する (= `--all` 用)。
 ///
 /// `resolve_session_by_index` と同じ scan logic だが index 解決ではなく全件返す。
-fn list_all_live_sessions(namespace: &str) -> Vec<String> {
-    let dirs = list_candidate_dirs(namespace);
+fn list_all_live_sessions() -> Vec<String> {
+    let dirs = session_scan_dirs();
     let mut entries: Vec<(String, std::time::SystemTime)> = Vec::new();
     for dir in dirs {
         let read = match std::fs::read_dir(&dir) {
@@ -1845,12 +1762,9 @@ fn list_all_live_sessions(namespace: &str) -> Vec<String> {
 
 /// `hyoui kill <session>` の主要ロジック。
 fn kill_command(cfg: KillConfig) -> ExitCode {
-    // DR-0018: namespace を解決。--all の列挙と各 session の socket 解決を同一
-    // namespace スコープに揃える。
-    let namespace = socket_path::resolve_namespace(cfg.namespace.as_deref());
     // --all は全 live session を順次 kill (= killall 相当)。
     if cfg.all {
-        let sessions = list_all_live_sessions(&namespace);
+        let sessions = list_all_live_sessions();
         if sessions.is_empty() {
             eprintln!("hyoui: kill --all: no live sessions found");
             return ExitCode::SUCCESS;
@@ -1871,7 +1785,6 @@ fn kill_command(cfg: KillConfig) -> ExitCode {
                 wait: cfg.wait,
                 wait_timeout_ms: cfg.wait_timeout_ms,
                 kill_on_timeout: cfg.kill_on_timeout,
-                namespace: cfg.namespace.clone(),
             };
             let exit = kill_command_single(sub_cfg);
             if exit != ExitCode::SUCCESS {
@@ -1891,7 +1804,6 @@ fn kill_command(cfg: KillConfig) -> ExitCode {
 
 /// 単一 session の kill 実行 (= `--all` で 1 件ずつ呼び出すための内部 helper)。
 fn kill_command_single(cfg: KillConfig) -> ExitCode {
-    let namespace = socket_path::resolve_namespace(cfg.namespace.as_deref());
     let sock = if let Some(p) = cfg.socket.clone() {
         std::path::PathBuf::from(p)
     } else {
@@ -1899,7 +1811,7 @@ fn kill_command_single(cfg: KillConfig) -> ExitCode {
         // それ以外は cfg.session_id を使う (= parse_kill で同時指定は弾かれている)。
         let sid_owned: String;
         let sid = if let Some(index) = cfg.index {
-            match resolve_session_by_index(index, &namespace) {
+            match resolve_session_by_index(index) {
                 Ok(s) => {
                     sid_owned = s;
                     sid_owned.as_str()
@@ -1915,7 +1827,7 @@ fn kill_command_single(cfg: KillConfig) -> ExitCode {
                 Some(s) => s,
                 // 省略時: $HYOUI_SESSION_ID を解決 (DR-0020 §2)。kill の self
                 // default は許容 (= `exit` 相当の意図的用途、DR-0020 §3)。
-                None => match resolve_session_from_env("kill", &namespace) {
+                None => match resolve_session_from_env("kill") {
                     Ok(Some(s)) => {
                         sid_owned = s;
                         sid_owned.as_str()
@@ -1928,12 +1840,10 @@ fn kill_command_single(cfg: KillConfig) -> ExitCode {
                 },
             }
         };
-        match socket_path::resolve_in_namespace(None, sid, &namespace) {
+        match socket_path::resolve(None, sid) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "hyoui: kill: socket path 解決失敗: {e} (session: {sid}, namespace: {namespace})"
-                );
+                eprintln!("hyoui: kill: socket path 解決失敗: {e} (session: {sid})");
                 eprintln!("       起動中の session 一覧は `hyoui list` で確認してください。");
                 return ExitCode::from(1);
             }
@@ -2204,7 +2114,6 @@ fn resolve_target_socket(
     socket: Option<&str>,
     session_id: Option<&str>,
     index: Option<i32>,
-    namespace: &str,
 ) -> Result<std::path::PathBuf, ExitCode> {
     if let Some(p) = socket {
         return Ok(std::path::PathBuf::from(p));
@@ -2212,7 +2121,7 @@ fn resolve_target_socket(
     let sid_owned: String;
     let sid: &str = if let Some(idx) = index {
         // 明示 index 解決 (= 外から使う既存挙動、env より優先、DR-0020 §2)。
-        match resolve_session_by_index(idx, namespace) {
+        match resolve_session_by_index(idx) {
             Ok(s) => {
                 sid_owned = s;
                 sid_owned.as_str()
@@ -2227,7 +2136,7 @@ fn resolve_target_socket(
             // 明示 session id (= 外から使う既存挙動、env より優先、DR-0020 §2)。
             Some(s) => s,
             // 省略時: $HYOUI_SESSION_ID (= 中から実行) を解決 (DR-0020 §2)。
-            None => match resolve_session_from_env(cmd, namespace)? {
+            None => match resolve_session_from_env(cmd)? {
                 Some(s) => {
                     sid_owned = s;
                     sid_owned.as_str()
@@ -2239,10 +2148,8 @@ fn resolve_target_socket(
             },
         }
     };
-    socket_path::resolve_in_namespace(None, sid, namespace).map_err(|e| {
-        eprintln!(
-            "hyoui: {cmd}: socket path 解決失敗: {e} (session: {sid}, namespace: {namespace})"
-        );
+    socket_path::resolve(None, sid).map_err(|e| {
+        eprintln!("hyoui: {cmd}: socket path 解決失敗: {e} (session: {sid})");
         eprintln!("       起動中の session 一覧は `hyoui list` で確認してください。");
         ExitCode::from(1)
     })
@@ -2260,20 +2167,27 @@ fn resolve_target_socket(
 /// - `Err(ExitCode)`: env は set だが socket が存在しない (= stale env)。既存
 ///   fallback に **落とさず明示エラー** にする (= 「自分を指したつもりが別 session」
 ///   の誤爆防止、DR-0020 §2)。
-fn resolve_session_from_env(cmd: &str, namespace: &str) -> Result<Option<String>, ExitCode> {
+fn resolve_session_from_env(cmd: &str) -> Result<Option<String>, ExitCode> {
     let sid = match std::env::var("HYOUI_SESSION_ID") {
         Ok(v) if !v.is_empty() => v,
         // unset / 空 → 中から実行ではない。caller の既存 fallback に委ねる。
         _ => return Ok(None),
     };
+    // UUID でない id は、id が UUID になる前の hyoui が注入した値 (DR-0041 決定 7:
+    // 動いている古い session は移行しない)。このバイナリはその session を扱えない。
+    if hyoui::cli::validate_session_id(&sid).is_err() {
+        eprintln!(
+            "hyoui: {cmd}: $HYOUI_SESSION_ID={sid:?} は UUID でない古い形式の id で、この hyoui は\n\
+             \x20      その session を扱えません (id が UUID になる前の hyoui の session)。\n\
+             \x20      その session を起動した版の hyoui で操作するか、session を明示してください。"
+        );
+        return Err(ExitCode::from(1));
+    }
     // stale env 検出のため socket path を解決して liveness を確認する。
-    let sock = match socket_path::resolve_in_namespace(None, &sid, namespace) {
+    let sock = match socket_path::resolve(None, &sid) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!(
-                "hyoui: {cmd}: $HYOUI_SESSION_ID={sid:?} の socket path 解決失敗: {e} \
-                 (namespace: {namespace})"
-            );
+            eprintln!("hyoui: {cmd}: $HYOUI_SESSION_ID={sid:?} の socket path 解決失敗: {e}");
             return Err(ExitCode::from(1));
         }
     };
@@ -2292,31 +2206,19 @@ fn resolve_session_from_env(cmd: &str, namespace: &str) -> Result<Option<String>
     Ok(Some(sid))
 }
 
-/// attach 対象 (`sid` + `namespace`) が自セッションかを判定する (DR-0020 §3)。
+/// attach 対象 `sid` が自セッションかを判定する (DR-0020 §3)。
 ///
-/// daemon が子へ注入する `$HYOUI_SESSION_ID` (DR-0020 §1) + `$HYOUI_NAMESPACE`
-/// (DR-0018) と照合する。両方が一致したときだけ self (= ネスト) と判定する。
-/// 子が別 namespace を明示して attach する場合は self ではない (= namespace まで
-/// 突き合わせる)。env が未 set (= 外から実行) なら常に false。
-fn attach_target_is_self(sid: &str, namespace: &str) -> bool {
-    let env_sid = match std::env::var("HYOUI_SESSION_ID") {
-        Ok(v) if !v.is_empty() => v,
-        _ => return false,
-    };
-    if env_sid != sid {
-        return false;
-    }
-    // namespace も一致して初めて self。子の namespace は resolve_namespace と同じ
-    // 解決順 (= HYOUI_NAMESPACE env > default) で引く。
-    let env_ns = socket_path::resolve_namespace(None);
-    env_ns == namespace
+/// daemon が子へ注入する `$HYOUI_SESSION_ID` (DR-0020 §1) と照合する。session id は
+/// 一意なので id が一致すれば self (= ネスト)。env が未 set (= 外から実行) なら常に false。
+fn attach_target_is_self(sid: &str) -> bool {
+    matches!(std::env::var("HYOUI_SESSION_ID"), Ok(v) if v == sid)
 }
 
 /// `--socket` 明示 path が自セッションの socket を指しているかを判定する
 /// (DR-0020 §3、codex review 2026-06-12)。
 ///
-/// `$HYOUI_SESSION_ID` + 子の namespace (= `$HYOUI_NAMESPACE` 解決順) から自セッション
-/// の socket path を解決し、与えられた path と canonical 比較する。
+/// `$HYOUI_SESSION_ID` から自セッションの socket path を解決し、与えられた path と
+/// canonical 比較する。
 ///
 /// **best-effort の UX ガード** であってセキュリティ境界ではない: symlink farm /
 /// bind mount / hardlink 等での path 偽装までは追わない (= `canonicalize` が解決できる
@@ -2327,8 +2229,7 @@ fn socket_path_is_self(p: &std::path::Path) -> bool {
         Ok(v) if !v.is_empty() => v,
         _ => return false,
     };
-    let env_ns = socket_path::resolve_namespace(None);
-    let self_sock = match socket_path::resolve_in_namespace(None, &env_sid, &env_ns) {
+    let self_sock = match socket_path::resolve(None, &env_sid) {
         Ok(s) => s,
         // 解決失敗 (= sid 不正等) は self 判定不能 → ガードしない (= 過剰 block 回避)。
         Err(_) => return false,
@@ -2436,7 +2337,6 @@ fn builtin_scrub_notes() -> String {
 fn detach_command(cfg: hyoui::cli::DetachConfig) -> ExitCode {
     use hyoui::protocol::messages::{Detach, DetachTarget};
 
-    let namespace = socket_path::resolve_namespace(cfg.namespace.as_deref());
     // session 解決: 明示 socket > 明示 session/index > $HYOUI_SESSION_ID (= 中から)。
     // detach の self default は許容 (= 中から TUI 脱出)。stale env は明示エラー。
     let sock = match resolve_target_socket(
@@ -2444,7 +2344,6 @@ fn detach_command(cfg: hyoui::cli::DetachConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
-        &namespace,
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -2530,13 +2429,11 @@ fn detach_command(cfg: hyoui::cli::DetachConfig) -> ExitCode {
 fn upgrade_command(cfg: hyoui::cli::UpgradeConfig) -> ExitCode {
     use hyoui::protocol::messages::{UpgradeAck, UpgradeRequest};
 
-    let namespace = socket_path::resolve_namespace(cfg.namespace.as_deref());
     let sock = match resolve_target_socket(
         "upgrade",
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
-        &namespace,
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -2751,7 +2648,6 @@ fn status_command(cfg: StatusConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
-        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -2813,7 +2709,6 @@ fn set_command(cfg: hyoui::cli::SetConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
-        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -3057,7 +2952,6 @@ fn tail_command(cfg: TailConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
-        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -3159,7 +3053,6 @@ fn wait_command(cfg: WaitConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
-        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -3229,7 +3122,6 @@ fn screen_dump_command(cfg: ScreenDumpConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
-        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -3392,7 +3284,6 @@ fn screen_snapshot_command(cfg: ScreenSnapshotConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
-        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -3603,7 +3494,6 @@ fn input_command(cmd: InputCommand) -> ExitCode {
         cmd.socket.as_deref(),
         cmd.session_id.as_deref(),
         cmd.index,
-        socket_path::resolve_namespace(cmd.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -3734,7 +3624,6 @@ fn lock_acquire_command(cfg: LockAcquireConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
-        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -4050,7 +3939,6 @@ fn lock_release_command(cmd_label: &str, cfg: LockReleaseConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
-        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -4228,7 +4116,6 @@ fn record_start_command(cfg: RecordStartConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
-        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -4327,7 +4214,6 @@ fn record_stop_command(cfg: RecordStopConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
-        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -4483,7 +4369,6 @@ fn record_list_command(cfg: RecordListConfig) -> ExitCode {
         cfg.socket.as_deref(),
         cfg.session_id.as_deref(),
         cfg.index,
-        socket_path::resolve_namespace(cfg.namespace.as_deref()).as_str(),
     ) {
         Ok(p) => p,
         Err(code) => return code,
@@ -4845,7 +4730,7 @@ mod tests {
 
     /// 残骸 socket を unlink し、応答する daemon は保持する。
     ///
-    /// `list_command` は env (`XDG_RUNTIME_DIR` / `XDG_STATE_HOME`) で dir を解決するが、
+    /// `list_command` は env (`HYOUI_STATE_DIR` 等) で dir を解決するが、
     /// edition 2024 では `env::set_var` が unsafe であり、`#![forbid(unsafe_code)]`
     /// と衝突する。代わりに dir 一覧を直接渡す内部関数 `list_command_with_dirs`
     /// を介してテストする。
@@ -4877,13 +4762,7 @@ mod tests {
 
         // dir 一覧を直接渡して env mutation を回避
         let cfg = ListConfig::default();
-        let _exit = list_command_with_dirs(
-            cfg,
-            vec![(
-                hyoui::cli::DEFAULT_NAMESPACE.to_string(),
-                sock_dir.path().to_path_buf(),
-            )],
-        );
+        let _exit = list_command_with_dirs(cfg, vec![sock_dir.path().to_path_buf()]);
 
         // 確認: stale は unlink された、live はまだ残っている
         assert!(!stale_path.exists(), "list should unlink stale socket");
@@ -4910,10 +4789,7 @@ mod tests {
         let dir = make_0700_dir();
         let path = dir.path().join("ordinary.sock");
         std::fs::write(&path, b"not a socket").unwrap();
-        let _ = list_command_with_dirs(
-            ListConfig::default(),
-            vec![("default".into(), dir.path().to_path_buf())],
-        );
+        let _ = list_command_with_dirs(ListConfig::default(), vec![dir.path().to_path_buf()]);
         assert!(path.exists());
     }
 
@@ -5044,7 +4920,6 @@ mod tests {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
             index: None,
-            namespace: None,
             format: ScreenDumpCliFormat::Ansi,
             layer: ScreenDumpCliLayer::Visible,
             rect: None,
@@ -5113,7 +4988,6 @@ mod tests {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
             index: None,
-            namespace: None,
             format: ScreenDumpCliFormat::TextPlain,
             layer: ScreenDumpCliLayer::Visible,
             rect: None,
@@ -5194,7 +5068,6 @@ mod tests {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
             index: None,
-            namespace: None,
             format: ScreenDumpCliFormat::TextPlain,
             layer: ScreenDumpCliLayer::Scrollback,
             rect: None,
@@ -5283,7 +5156,6 @@ mod tests {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
             index: None,
-            namespace: None,
             include: vec![
                 SnapshotCliComponent::Cursor,
                 SnapshotCliComponent::Mode,
@@ -5364,7 +5236,6 @@ mod tests {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
             index: None,
-            namespace: None,
             include: vec![
                 SnapshotCliComponent::Cursor,
                 SnapshotCliComponent::Mode,
@@ -5898,7 +5769,6 @@ mod tests {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
             index: None,
-            namespace: None,
             pattern: "READY".into(),
             timeout_ms: Some(5_000),
             poll_interval_ms: Some(50),
@@ -5964,7 +5834,6 @@ mod tests {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
             index: None,
-            namespace: None,
             pattern: "NEVER_SHOWS_UP".into(),
             timeout_ms: Some(300),
             poll_interval_ms: Some(50),
@@ -6034,7 +5903,6 @@ mod tests {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
             index: None,
-            namespace: None,
             specs: vec![InputSpec::Wait("GO".into())],
             timeout: std::time::Duration::from_secs(3),
             lock_token: None,
@@ -6097,7 +5965,6 @@ mod tests {
             socket: Some(sock_path.to_string_lossy().into_owned()),
             session_id: None,
             index: None,
-            namespace: None,
             specs: vec![InputSpec::WaitIdle(std::time::Duration::from_millis(200))],
             timeout: std::time::Duration::from_secs(3),
             lock_token: None,
@@ -6177,7 +6044,6 @@ mod tests {
         // listener bind 完了を待つ (= retry budget は connect_with_retry 経由で吸収)。
         let mut entries = vec![ListEntry {
             session: "live-enrich-test".into(),
-            namespace: hyoui::cli::DEFAULT_NAMESPACE.to_string(),
             socket_path: sock_path.clone(),
             started_unix_ms: 0,
             dur: std::time::Duration::ZERO,
@@ -6242,7 +6108,6 @@ mod tests {
         // listener を bind しない (= connect で ECONNREFUSED or ENOENT になる)。
         let mut entries = vec![ListEntry {
             session: "fake".into(),
-            namespace: hyoui::cli::DEFAULT_NAMESPACE.to_string(),
             socket_path: sock_path,
             started_unix_ms: 0,
             dur: std::time::Duration::ZERO,

@@ -186,11 +186,10 @@ fn spawn_detached(runner: &HyouiTestRunner, args: &[&str], env: &[(String, Strin
     }
     let status = cmd
         .args(args)
-        .env("XDG_RUNTIME_DIR", runner.runtime_dir())
+        .env("HYOUI_STATE_DIR", runner.runtime_dir())
         .env("TMPDIR", runner.runtime_dir())
         .env_remove("HYOUI_LOCK_TOKEN")
         .env_remove("HYOUI_SESSION_ID")
-        .env_remove("HYOUI_NAMESPACE")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -203,11 +202,10 @@ fn spawn_detached(runner: &HyouiTestRunner, args: &[&str], env: &[(String, Strin
 fn run_hyoui(runner: &HyouiTestRunner, args: &[&str]) -> std::process::Output {
     Command::new(hyoui_bin())
         .args(args)
-        .env("XDG_RUNTIME_DIR", runner.runtime_dir())
+        .env("HYOUI_STATE_DIR", runner.runtime_dir())
         .env("TMPDIR", runner.runtime_dir())
         .env_remove("HYOUI_LOCK_TOKEN")
         .env_remove("HYOUI_SESSION_ID")
-        .env_remove("HYOUI_NAMESPACE")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

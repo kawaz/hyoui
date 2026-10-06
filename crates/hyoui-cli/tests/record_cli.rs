@@ -34,10 +34,13 @@ fn run(args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// session id (= UUID の標準形、DR-0041 決定 2)。parse 段の reject を見る test なので daemon は居なくてよい。
+const SID: &str = "0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f";
+
 /// `--output ./relative.jsonl` は parse 段で reject (= exit 2、絶対 path 要求 hint)。
 #[test]
 fn record_start_relative_output_rejected() {
-    let (code, _stdout, stderr) = run(&["record", "start", "demo", "--output", "./rel.jsonl"]);
+    let (code, _stdout, stderr) = run(&["record", "start", SID, "--output", "./rel.jsonl"]);
     assert_eq!(code, 2, "relative path must exit 2; stderr={stderr}");
     assert!(
         stderr.contains("absolute"),
@@ -51,7 +54,7 @@ fn record_start_raw_both_rejected_integration() {
     let (code, _stdout, stderr) = run(&[
         "record",
         "start",
-        "demo",
+        SID,
         "--output",
         "/tmp/rec.bin",
         "--format=raw",
@@ -66,7 +69,7 @@ fn record_start_raw_both_rejected_integration() {
 /// `--id 1 --all` の排他指定は parse 段で reject (= exit 2)。
 #[test]
 fn record_stop_id_and_all_rejected_integration() {
-    let (code, _stdout, stderr) = run(&["record", "stop", "demo", "--id", "1", "--all"]);
+    let (code, _stdout, stderr) = run(&["record", "stop", SID, "--id", "1", "--all"]);
     assert_eq!(code, 2, "--id + --all must exit 2; stderr={stderr}");
     assert!(
         stderr.contains("--id") && stderr.contains("--all"),
@@ -77,7 +80,7 @@ fn record_stop_id_and_all_rejected_integration() {
 /// `record start` で `--output` 省略は parse 段で reject (= exit 2)。
 #[test]
 fn record_start_output_missing_rejected_integration() {
-    let (code, _stdout, stderr) = run(&["record", "start", "demo"]);
+    let (code, _stdout, stderr) = run(&["record", "start", SID]);
     assert_eq!(code, 2, "missing --output must exit 2; stderr={stderr}");
     assert!(
         stderr.contains("--output"),
@@ -88,7 +91,7 @@ fn record_start_output_missing_rejected_integration() {
 /// 未知 `record` subcommand は edit distance suggest 付き reject (= exit 2)。
 #[test]
 fn record_unknown_subcommand_rejected_integration() {
-    let (code, _stdout, stderr) = run(&["record", "startt", "demo"]);
+    let (code, _stdout, stderr) = run(&["record", "startt", SID]);
     assert_eq!(code, 2, "unknown subcommand must exit 2; stderr={stderr}");
     assert!(
         stderr.contains("unknown subcommand"),

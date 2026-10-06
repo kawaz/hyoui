@@ -67,6 +67,9 @@ pub enum Error {
         /// 原因。
         reason: String,
     },
+    /// 状態の root (= 面) を決められず、登録簿の置き場が無い (DR-0041 決定 6)。
+    #[error(transparent)]
+    StateRoot(#[from] hyoui::paths::StateRootError),
 }
 
 /// 登録簿の排他 lock。`Drop` で外れる。
@@ -92,8 +95,12 @@ impl Registry {
     }
 
     /// 既定の unit dir を開く。
-    pub fn open() -> Self {
-        Self::at(default_units_dir())
+    ///
+    /// # Errors
+    ///
+    /// 状態の root を決められない時 ([`Error::StateRoot`])。
+    pub fn open() -> Result<Self> {
+        Ok(Self::at(default_units_dir()?))
     }
 
     /// unit dir を返す。
@@ -289,29 +296,39 @@ impl Registry {
 }
 
 /// units / logs / 監督者 socket をまとめる root (= web の状態の置き場、DR-0038 決定 4)。
-pub fn default_root() -> PathBuf {
-    hyoui::paths::Env::current().web_state_dir()
+///
+/// # Errors
+///
+/// 状態の root を決められない時 (DR-0041 決定 6)。
+pub fn default_root() -> Result<PathBuf> {
+    Ok(hyoui::paths::Env::current().web_state_dir()?)
 }
 
 /// 既定の unit 登録簿 dir。
-pub fn default_units_dir() -> PathBuf {
-    default_root().join("units")
+///
+/// # Errors
+///
+/// [`default_root`] と同じ。
+pub fn default_units_dir() -> Result<PathBuf> {
+    Ok(default_root()?.join("units"))
 }
 
 /// root からの監督者の制御 socket の位置 (DR-0038 決定 4)。
 ///
-/// root 直下ではなく `run/` に 1 段下げる。root (`hyoui/web/`) は session socket の
-/// base (`hyoui/`) の直下にあり、discovery はその直下の dir を namespace とみなして
-/// 中の `*.sock` に hyoui protocol で問い合わせる (DR-0018)。root 直下に置くと、
-/// その問い合わせと監督者の 1 行読みが互いの応答を待ち合い、監督者の event loop が
-/// 1 回 5 秒止まる (実測)。discovery は 1 段しか潜らないので、`run/` の中は見ない。
+/// root 直下ではなく `run/` に置く (= web の状態の置き場の中で、socket を他のファイルと
+/// 分ける)。session の discovery は `<状態の root>/sessions/` しか見ないので、ここの
+/// socket に hyoui protocol で問い合わせることは無い (DR-0041 決定 4)。
 pub fn supervisor_socket_in(root: &Path) -> PathBuf {
     root.join("run").join("supervisor.sock")
 }
 
 /// 監督者の制御 socket (= DR-0034 決定 4)。
-pub fn supervisor_socket_path() -> PathBuf {
-    supervisor_socket_in(&default_root())
+///
+/// # Errors
+///
+/// [`default_root`] と同じ。
+pub fn supervisor_socket_path() -> Result<PathBuf> {
+    Ok(supervisor_socket_in(&default_root()?))
 }
 
 /// DR-0034 決定 2 の unit 名文法 (`[A-Za-z0-9_-]{1,32}`)。

@@ -1,24 +1,22 @@
 //! Session discovery — socket dir 走査 + status.query による live session 列挙 (DR-0027)。
 //!
 //! `hyoui-web` / 将来の外部 tool から「今 host に居る hyoui session 一覧」を取る
-//! 共通経路。`hyoui-cli` 内部の `list_command_with_dirs` と等価の走査を、format
+//! 共通経路。`hyoui-cli` 内部の `list_command` と等価の走査を、format
 //! 責務なし・純粋な `Vec<SessionEntry>` として提供する。
 //!
-//! ## 走査経路 (= DR-0018 の socket 配置と対称)
+//! ## 走査経路 (DR-0041 決定 4)
 //!
-//! 1. `$XDG_RUNTIME_DIR/hyoui/` (実在 dir のみ)
-//! 2. `${XDG_STATE_HOME:-$HOME/.local/state}/hyoui/` (実在 dir のみ)
+//! `<状態の root>/sessions/*.sock` だけを見る ([`crate::paths::Env::sessions_dir`])。
+//! root 直下や他の dir (古い置き場) は読まない。古い置き場に socket が残っているかは
+//! [`legacy_session_places`] が別に見る (= 警告のためだけで、session としては拾わない)。
 //!
-//! 各 base dir 直下: `*.sock` = default namespace の session。
-//! 各 base dir 配下のサブ dir `<ns>/*.sock` = 非 default namespace の session。
-//!
-//! 一覧 ([`list_sessions`]) は全 socket に status.query する。session 1 件を引く用途は [`find_session`] を使い、id から候補 path を直接組んで同名 socket だけに接続する。
+//! 一覧 ([`list_sessions`]) は全 socket に status.query する。session 1 件を引く用途は [`find_session`] を使い、`sessions/<id>.sock` を直接組んでその socket だけに接続する。
 //!
 //! ## 死活判定
 //!
 //! `query_status` が connect 拒否と接続後の応答失敗を区別する。接続拒否 socket は削除し、接続済みの daemon は無応答でも保持する。
 //!
-//! CLI と web gateway が同じ接続判定を利用する。socket 配置の走査と出力形式は各 caller が管理する。
+//! CLI と web gateway が同じ接続判定を利用する。出力形式は各 caller が管理する。
 
 use nix::fcntl::{Flock, FlockArg};
 use std::os::unix::fs::FileTypeExt;
@@ -35,9 +33,7 @@ use crate::protocol::{ControlMessage, MVP_CAPS, Mode};
 pub struct SessionEntry {
     /// session id (= socket file の `.sock` を除いた stem)。
     pub session_id: String,
-    /// このセッションが属する namespace (= default / user 指定)。
-    pub namespace: String,
-    /// socket file 実 path (= `<base>/[<ns>/]<session>.sock`)。
+    /// socket file 実 path (= `<状態の root>/sessions/<session>.sock`)。
     pub socket_path: PathBuf,
     /// socket file の mtime を epoch ms に換算した値。取得失敗時 0。
     pub started_unix_ms: u64,
@@ -96,24 +92,104 @@ pub struct LiveInfo {
     pub daemon_version: String,
 }
 
-/// 走査する base socket dir 候補を優先順で返す (= `hyoui-cli::socket_path::existing_base_dirs`
-/// 相当)。実在する dir のみ返す。
-pub fn existing_base_dirs() -> Vec<PathBuf> {
-    let env = crate::paths::Env::current();
-    let mut out = Vec::new();
-    if let Some(runtime) = env.runtime_dir() {
-        let dir = runtime.join("hyoui");
-        if dir.is_dir() {
-            out.push(dir);
+/// 今の env の session の置き場 (`<状態の root>/sessions`)。root を決められなければ
+/// `None` (= 列挙する場所が無い)。
+#[must_use]
+pub fn sessions_dir() -> Option<PathBuf> {
+    crate::paths::Env::current().sessions_dir().ok()
+}
+
+/// 古い置き場 (DR-0041 決定 7) に残っている session の socket の dir。
+///
+/// 新しいバイナリは `sessions/` だけを読む。ここで見るのは警告のためだけで、中の
+/// socket は session として拾わない (= 古い daemon とは id の形も置き場も違う)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacySessionPlace {
+    /// socket が残っている dir (= 状態の root 直下か、その下の古い namespace の dir)。
+    pub dir: PathBuf,
+    /// その dir に残っている socket の数。
+    pub sockets: usize,
+    /// dir 自体が symlink か (= 古いバイナリのために残した symlink)。
+    pub symlink: bool,
+}
+
+/// 古い置き場に socket が残っていないかを見る (DR-0041 決定 7)。
+///
+/// 見るのは状態の root 直下の `*.sock` と、root 直下の dir (機能別の `sessions/` /
+/// `web/` を除く) の直下の `*.sock`。どちらも新しいバイナリが session を置かない
+/// 場所なので、在れば古いバイナリの session か、移行で残した symlink である。
+#[must_use]
+pub fn legacy_session_places(env: &crate::paths::Env) -> Vec<LegacySessionPlace> {
+    let Ok(root) = env.state_root() else {
+        return Vec::new();
+    };
+    let mut places = Vec::new();
+    let count = |dir: &Path| {
+        std::fs::read_dir(dir)
+            .map(|read| {
+                read.flatten()
+                    .filter(|e| {
+                        e.path().extension().and_then(|x| x.to_str()) == Some("sock")
+                            && e.file_type().is_ok_and(|t| t.is_socket() || t.is_symlink())
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let in_root = count(&root);
+    if in_root > 0 {
+        places.push(LegacySessionPlace {
+            dir: root.clone(),
+            sockets: in_root,
+            symlink: false,
+        });
+    }
+    let Ok(read) = std::fs::read_dir(&root) else {
+        return places;
+    };
+    let mut dirs: Vec<PathBuf> = read
+        .flatten()
+        .filter(|e| !matches!(e.file_name().to_str(), Some("sessions" | "web")))
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    for dir in dirs {
+        let sockets = count(&dir);
+        if sockets > 0 {
+            let symlink = dir
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink());
+            places.push(LegacySessionPlace {
+                dir,
+                sockets,
+                symlink,
+            });
         }
     }
-    if let Some(s) = env.state_dir()
-        && s.is_dir()
-        && !out.contains(&s)
-    {
-        out.push(s);
-    }
-    out
+    places
+}
+
+/// [`legacy_session_places`] の警告文 (stderr に出す 1 行ずつ)。
+#[must_use]
+pub fn legacy_session_warnings(env: &crate::paths::Env) -> Vec<String> {
+    legacy_session_places(env)
+        .into_iter()
+        .map(|place| {
+            if place.symlink {
+                format!(
+                    "{} is a symlink left for older hyoui binaries; remove it once none of them run (DR-0041)",
+                    place.dir.display()
+                )
+            } else {
+                format!(
+                    "{} has {} session socket(s) in the old layout; this hyoui does not read them (sessions now live in <state root>/sessions). Operate them with the older hyoui, or let them finish (DR-0041)",
+                    place.dir.display(),
+                    place.sockets
+                )
+            }
+        })
+        .collect()
 }
 
 /// status.query の応答期限。RAW_ACK_TIMEOUT と同じ 5 秒を取り、一時的な遅延を即座に無応答と判定しない。
@@ -285,78 +361,40 @@ pub fn query_status(socket_path: &Path) -> StatusQueryResult {
     }
 }
 
-/// 全 namespace 横断で接続可能な session を列挙する。
+/// 接続可能な session を列挙する。
 ///
 /// 接続拒否 socket は削除して結果から除外し、接続後の応答失敗は PID を添えて保持する。なお各 socket の応答待ちは最大 5 秒。
 pub fn list_sessions() -> Vec<SessionEntry> {
-    list_sessions_in(&existing_base_dirs())
+    match sessions_dir() {
+        Some(dir) => list_sessions_in(&dir),
+        None => Vec::new(),
+    }
 }
 
-/// [`list_sessions`] の走査対象 base dir を caller が渡す版。
-pub fn list_sessions_in(bases: &[PathBuf]) -> Vec<SessionEntry> {
+/// [`list_sessions`] の走査対象 dir (= `sessions/`) を caller が渡す版。
+pub fn list_sessions_in(dir: &Path) -> Vec<SessionEntry> {
     let mut out: Vec<SessionEntry> = Vec::new();
-    for (ns, dir) in namespace_dirs(bases) {
-        collect_socks_in_dir(&dir, &ns, &mut out);
-    }
-    // mtime 昇順で安定化 (= hyoui-cli list と同じ順序)。
+    collect_socks_in_dir(dir, &mut out);
+    // 起動時刻 (= socket の mtime) の昇順 (= hyoui-cli list と同じ順序)。id の版に
+    // 依存しない (DR-0041 決定 2)。
     out.sort_by_key(|e| e.started_unix_ms);
     out.retain_mut(probe);
     out
 }
 
-/// session_id 1 件を DR-0018 の配置規則から直接解決し、その socket だけに status.query する。
+/// session_id 1 件を `sessions/<id>.sock` から直接解決し、その socket だけに status.query する。
 ///
-/// 候補は各 base dir の `<base>/<id>.sock` (default namespace) と `<base>/<ns>/<id>.sock`。他 session の socket には connect しない。
-///
-/// 同名が複数 namespace にある場合は [`list_sessions`] の結果から最初の一致を採る従来の解決と同じ選び方をする: mtime 昇順で並べ、接続拒否で消えた (= [`StatusQueryResult::Gone`]) 候補を飛ばして最初の 1 件を返す。応答しない候補もそこで確定して返す (= 後続の同名候補へは進まない)。
-///
-/// `session_id` が [`crate::cli::validate_session_id`] に反する場合と、候補が 1 つも残らない場合は `None`。
+/// 他 session の socket には connect しない。`session_id` が [`crate::cli::validate_session_id`] に反する場合と、socket が無い・接続拒否で消えた場合は `None`。
 pub fn find_session(session_id: &str) -> Option<SessionEntry> {
-    find_session_in(&existing_base_dirs(), session_id)
+    find_session_in(&sessions_dir()?, session_id)
 }
 
-/// [`find_session`] の走査対象 base dir を caller が渡す版。
-pub fn find_session_in(bases: &[PathBuf], session_id: &str) -> Option<SessionEntry> {
-    // path へ join する前に whitelist 検証する (= `..` / `/` による traversal 防止)。
+/// [`find_session`] の走査対象 dir (= `sessions/`) を caller が渡す版。
+pub fn find_session_in(dir: &Path, session_id: &str) -> Option<SessionEntry> {
+    // path へ join する前に検証する (= UUID 標準形以外を path にしない)。
     crate::cli::validate_session_id(session_id).ok()?;
-    let file_name = format!("{session_id}.sock");
-    let mut candidates: Vec<SessionEntry> = namespace_dirs(bases)
-        .into_iter()
-        .filter_map(|(ns, dir)| socket_entry(dir.join(&file_name), &ns))
-        .collect();
-    candidates.sort_by_key(|e| e.started_unix_ms);
-    candidates
-        .into_iter()
-        .find_map(|mut e| probe(&mut e).then_some(e))
-}
-
-/// 各 base dir について (namespace, socket dir) を走査順に返す。
-///
-/// base 直下が default namespace、直下のサブ dir が各 namespace。`default` という名前のサブ dir は base 直下と同じ namespace なので含めない。
-fn namespace_dirs(bases: &[PathBuf]) -> Vec<(String, PathBuf)> {
-    let mut out = Vec::new();
-    for base in bases {
-        out.push((crate::cli::DEFAULT_NAMESPACE.to_string(), base.clone()));
-        let read = match std::fs::read_dir(base) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        for entry in read.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let ns = match path.file_name().and_then(|s| s.to_str()) {
-                Some(v) => v.to_string(),
-                None => continue,
-            };
-            if ns == crate::cli::DEFAULT_NAMESPACE {
-                continue;
-            }
-            out.push((ns, path));
-        }
-    }
-    out
+    let mut entry = socket_entry(dir.join(format!("{session_id}.sock")))?;
+    probe(&mut entry).then_some(entry)
 }
 
 /// status.query を投げて `entry.status` を埋める。結果から外すべき (= 接続拒否で削除済み / 消えた) なら `false`。
@@ -382,7 +420,7 @@ fn probe(entry: &mut SessionEntry) -> bool {
     true
 }
 
-fn collect_socks_in_dir(dir: &Path, namespace: &str, out: &mut Vec<SessionEntry>) {
+fn collect_socks_in_dir(dir: &Path, out: &mut Vec<SessionEntry>) {
     let read = match std::fs::read_dir(dir) {
         Ok(r) => r,
         Err(_) => return,
@@ -392,14 +430,14 @@ fn collect_socks_in_dir(dir: &Path, namespace: &str, out: &mut Vec<SessionEntry>
         if path.extension().and_then(|s| s.to_str()) != Some("sock") {
             continue;
         }
-        if let Some(e) = socket_entry(path, namespace) {
+        if let Some(e) = socket_entry(path) {
             out.push(e);
         }
     }
 }
 
 /// `path` が socket file なら status 未確定の [`SessionEntry`] を作る (= symlink は辿らない)。
-fn socket_entry(path: PathBuf, namespace: &str) -> Option<SessionEntry> {
+fn socket_entry(path: PathBuf) -> Option<SessionEntry> {
     let meta = path.symlink_metadata().ok()?;
     if !meta.file_type().is_socket() {
         return None;
@@ -413,7 +451,6 @@ fn socket_entry(path: PathBuf, namespace: &str) -> Option<SessionEntry> {
         .unwrap_or(0);
     Some(SessionEntry {
         session_id,
-        namespace: namespace.to_string(),
         socket_path: path,
         started_unix_ms,
         status: SessionStatus::Hung {
@@ -426,13 +463,6 @@ fn socket_entry(path: PathBuf, namespace: &str) -> Option<SessionEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn existing_base_dirs_returns_only_existing() {
-        // 空 env でも panic しない (= 実在 dir 0 個で空 Vec)。
-        // ここでは env を弄らずに `is_dir` filter が効いていることだけ観測する。
-        let _ = existing_base_dirs();
-    }
 
     #[test]
     fn unresponsive_listener_is_no_response_and_kept() {
@@ -509,7 +539,7 @@ mod tests {
     /// accept 待ちのまま放置する listener。connect が来たかは [`assert_untouched`] で見る。
     fn idle_listener(path: &Path) -> std::os::unix::net::UnixListener {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        let listener = crate::sys::socket::bind_listener(path).unwrap();
         listener.set_nonblocking(true).unwrap();
         listener
     }
@@ -517,7 +547,7 @@ mod tests {
     /// accept 1 回で即 close する listener (= `query_status` が待たずに `Error` を返す)。
     fn closing_listener(path: &Path) -> std::thread::JoinHandle<()> {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        let listener = crate::sys::socket::bind_listener(path).unwrap();
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             drop(stream);
@@ -544,79 +574,178 @@ mod tests {
         .unwrap();
     }
 
+    const TARGET: &str = "0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f";
+    const OTHER: &str = "5c9d0e1f-2a3b-4c4d-8e5f-6a7b8c9d0e1f";
+
+    fn env_at(root: &Path) -> crate::paths::Env {
+        let root = root.as_os_str().to_os_string();
+        crate::paths::Env::from_lookup(|name| (name == "HYOUI_STATE_DIR").then(|| root.clone()))
+    }
+
     #[test]
     fn find_session_connects_only_to_the_named_socket() {
-        let base = private_dir();
-        let base_path = base.path().to_path_buf();
-        let target = base_path.join("ns1").join("target.sock");
-        // 他 session (default ns / 別 ns) は accept しない listener で置き、connect が来ないことを見る。
-        let other_default = idle_listener(&base_path.join("other.sock"));
-        let other_ns = idle_listener(&base_path.join("ns2").join("other.sock"));
+        let root = private_dir();
+        let sessions = root.path().join("sessions");
+        let target = sessions.join(format!("{TARGET}.sock"));
+        // 他 session は accept しない listener で置き、connect が来ないことを見る。
+        let other = idle_listener(&sessions.join(format!("{OTHER}.sock")));
         let worker = closing_listener(&target);
 
-        let found = find_session_in(&[base_path], "target").expect("target が見つかる");
+        let found = find_session_in(&sessions, TARGET).expect("target が見つかる");
         worker.join().unwrap();
-        assert_eq!(found.session_id, "target");
-        assert_eq!(found.namespace, "ns1");
+        assert_eq!(found.session_id, TARGET);
         assert_eq!(found.socket_path, target);
         assert!(matches!(found.status, SessionStatus::Error { .. }));
-        assert_untouched(&other_default, "default ns の別 session");
-        assert_untouched(&other_ns, "別 ns の別 session");
+        assert_untouched(&other, "別 session");
     }
 
+    /// discovery は `sessions/` の中だけを見る (DR-0041 決定 4)。root 直下や他の dir に
+    /// 同じ id の socket があっても、一覧にも 1 件の解決にも出さず、connect もしない。
     #[test]
-    fn find_session_picks_oldest_candidate_like_list_sessions() {
-        let base = private_dir();
-        let base_path = base.path().to_path_buf();
-        // 同名が default と ns1 にある。ns1 の方が古いので list_sessions の先頭一致と同じく ns1 を選ぶ。
-        let newer = idle_listener(&base_path.join("dup.sock"));
-        let older_path = base_path.join("ns1").join("dup.sock");
-        let worker = closing_listener(&older_path);
-        set_mtime(&base_path.join("dup.sock"), 2_000_000_000);
-        set_mtime(&older_path, 1_000_000_000);
+    fn discovery_reads_only_the_sessions_dir() {
+        let root = private_dir();
+        let sessions = root.path().join("sessions");
+        let in_root = idle_listener(&root.path().join(format!("{TARGET}.sock")));
+        let in_old_ns = idle_listener(&root.path().join("workers").join(format!("{TARGET}.sock")));
+        let in_web = idle_listener(&root.path().join("web").join(format!("{OTHER}.sock")));
+        std::fs::create_dir_all(&sessions).unwrap();
 
-        let found = find_session_in(&[base_path], "dup").expect("dup が見つかる");
+        assert!(find_session_in(&sessions, TARGET).is_none());
+        assert!(list_sessions_in(&sessions).is_empty());
+        assert_untouched(&in_root, "root 直下の socket");
+        assert_untouched(&in_old_ns, "古い namespace の dir の socket");
+        assert_untouched(&in_web, "web/ の socket");
+
+        let live = sessions.join(format!("{OTHER}.sock"));
+        let worker = closing_listener(&live);
+        let listed = list_sessions_in(&sessions);
         worker.join().unwrap();
-        assert_eq!(found.namespace, "ns1");
-        // 先頭候補で確定したので、後続の同名候補にも connect しない。
-        assert_untouched(&newer, "後続の同名候補");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|e| e.session_id.as_str())
+                .collect::<Vec<_>>(),
+            [OTHER]
+        );
+        assert_untouched(&in_root, "root 直下の socket");
+    }
+
+    /// 一覧は socket の mtime (= 起動時刻) の昇順で、id の並びに依らない。
+    #[test]
+    fn list_sessions_orders_by_start_time_not_by_id() {
+        let root = private_dir();
+        let sessions = root.path().join("sessions");
+        // id の辞書順は TARGET < OTHER。起動時刻は OTHER の方が古い。
+        let newer = sessions.join(format!("{TARGET}.sock"));
+        let older = sessions.join(format!("{OTHER}.sock"));
+        let w1 = closing_listener(&newer);
+        let w2 = closing_listener(&older);
+        set_mtime(&newer, 2_000_000_000);
+        set_mtime(&older, 1_000_000_000);
+        let listed = list_sessions_in(&sessions);
+        w1.join().unwrap();
+        w2.join().unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|e| e.session_id.as_str())
+                .collect::<Vec<_>>(),
+            [OTHER, TARGET]
+        );
     }
 
     #[test]
-    fn find_session_skips_pruned_candidate() {
-        let base = private_dir();
-        let base_path = base.path().to_path_buf();
-        // 古い候補は listener 不在 + lock 非保持 = 接続拒否で削除される残骸。
-        let dead = base_path.join("dup.sock");
-        drop(std::os::unix::net::UnixListener::bind(&dead).unwrap());
+    fn find_session_skips_a_pruned_socket() {
+        let root = private_dir();
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // listener 不在 + lock 非保持 = 接続拒否で削除される残骸。
+        let dead = sessions.join(format!("{TARGET}.sock"));
+        drop(crate::sys::socket::bind_listener(&dead).unwrap());
         std::fs::File::create(dead.with_extension("lock")).unwrap();
-        let live_path = base_path.join("ns1").join("dup.sock");
-        let worker = closing_listener(&live_path);
-        set_mtime(&dead, 1_000_000_000);
-        set_mtime(&live_path, 2_000_000_000);
 
-        let found = find_session_in(&[base_path], "dup").expect("残った候補が見つかる");
-        worker.join().unwrap();
-        assert_eq!(found.namespace, "ns1");
-        assert!(!dead.exists(), "残骸 socket は従来どおり削除される");
+        assert!(find_session_in(&sessions, TARGET).is_none());
+        assert!(!dead.exists(), "残骸 socket は削除される");
     }
 
     #[test]
     fn find_session_rejects_invalid_or_missing_id() {
-        let base = private_dir();
-        let base_path = base.path().to_path_buf();
-        let decoy = idle_listener(&base_path.join("x.sock"));
-        for id in ["", ".", "..", "../x", "ns/x", "missing"] {
-            assert!(
-                find_session_in(std::slice::from_ref(&base_path), id).is_none(),
-                "id={id:?}"
-            );
+        let root = private_dir();
+        let sessions = root.path().join("sessions");
+        let decoy = idle_listener(&sessions.join(format!("{TARGET}.sock")));
+        let upper = TARGET.to_ascii_uppercase();
+        let bare = TARGET.replace('-', "");
+        for id in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "ns/x",
+            &upper,
+            &bare,
+            &TARGET[..8],
+            OTHER,
+        ] {
+            assert!(find_session_in(&sessions, id).is_none(), "id={id:?}");
         }
-        // `default` サブ dir は base 直下と同じ namespace なので候補にしない (= list_sessions と同じ)。
-        let in_default_dir = idle_listener(&base_path.join("default").join("y.sock"));
-        assert!(find_session_in(std::slice::from_ref(&base_path), "y").is_none());
-        assert_untouched(&decoy, "無関係な session");
-        assert_untouched(&in_default_dir, "default サブ dir の socket");
+        assert_untouched(&decoy, "表記違いで同じ UUID の socket");
+    }
+
+    /// 古い置き場 (root 直下と古い namespace の dir) の socket は警告の対象になり、
+    /// `sessions/` と `web/` は対象にならない (DR-0041 決定 7)。
+    #[test]
+    fn legacy_places_are_the_root_and_old_namespace_dirs() {
+        let root = private_dir();
+        let env = env_at(root.path());
+        assert!(legacy_session_places(&env).is_empty());
+
+        let _s = idle_listener(&root.path().join("sessions").join(format!("{TARGET}.sock")));
+        let _w = idle_listener(&root.path().join("web").join("run").join("supervisor.sock"));
+        let _w2 = idle_listener(&root.path().join("web").join("x.sock"));
+        assert!(
+            legacy_session_places(&env).is_empty(),
+            "sessions/ と web/ は古い置き場ではない"
+        );
+
+        let _a = idle_listener(&root.path().join("run-1-abcd.sock"));
+        let _b = idle_listener(&root.path().join("workers").join("w1.sock"));
+        let _c = idle_listener(&root.path().join("workers").join("w2.sock"));
+        let real = root.path().join("real-ns");
+        let _d = idle_listener(&real.join("x.sock"));
+        std::os::unix::fs::symlink(&real, root.path().join("linked")).unwrap();
+
+        let places = legacy_session_places(&env);
+        let got: Vec<(String, usize, bool)> = places
+            .iter()
+            .map(|p| {
+                (
+                    p.dir
+                        .strip_prefix(root.path())
+                        .unwrap()
+                        .display()
+                        .to_string(),
+                    p.sockets,
+                    p.symlink,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (String::new(), 1, false),
+                ("linked".to_string(), 1, true),
+                ("real-ns".to_string(), 1, false),
+                ("workers".to_string(), 2, false),
+            ]
+        );
+        let warnings = legacy_session_warnings(&env);
+        assert_eq!(warnings.len(), 4);
+        assert!(
+            warnings[0].contains("does not read them"),
+            "{}",
+            warnings[0]
+        );
+        assert!(warnings[1].contains("symlink"), "{}", warnings[1]);
     }
 
     #[test]

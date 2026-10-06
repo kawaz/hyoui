@@ -1,8 +1,8 @@
 //! `hyoui run --detached` の daemonize 実装。
 //!
-//! 親 process は `current_exe` を `__daemonize-run --socket=PATH --session=ID --
-//! CMD ARGS...` で spawn し、子の socket bind 完了を待ってから **session 名**を
-//! stdout に 1 行出して exit する (= `hyoui attach <session>` にそのまま渡せる)。
+//! 親 process は `current_exe` を `run --detached -- CMD ARGS...` (init 情報は env
+//! `HYOUI_DAEMONIZE_INIT`) で spawn し、子の socket bind 完了を待ってから **session id**
+//! を stdout に 1 行出して exit する (= `hyoui attach <session>` にそのまま渡せる)。
 //!
 //! 子 ([`run_daemon_child`]) は setsid で controlling tty を切り、stdio を
 //! /dev/null に redirect、その後 `Session::start` → `Session::serve` を実行する。
@@ -30,7 +30,6 @@ pub fn run_detached_parent(
     until: Option<String>,
     scrollback_rows: Option<usize>,
     debug_dump: Option<String>,
-    namespace: String,
     on_child_suspend: hyoui::cli::OnChildSuspend,
     timeout_ms: Option<u64>,
     idle_timeout_ms: Option<u64>,
@@ -47,7 +46,6 @@ pub fn run_detached_parent(
         until,
         scrollback_rows,
         debug_dump,
-        namespace,
         on_child_suspend,
         timeout_ms,
         idle_timeout_ms,
@@ -58,11 +56,8 @@ pub fn run_detached_parent(
         cmd,
     ) {
         Ok((session_id, _sock)) => {
-            // 子は live + bind 完了。親は exit。stdout には **session 名** を出力する。
-            // (旧版は socket path を出していたが、socket path を session 引数として
-            // 渡すと `session_id too long` で弾かれ、README の Quickstart
-            // `S=$(hyoui run --detached ...)` → `hyoui attach $S` が動かなかった。
-            // breaking change だが v0.x なので OK。)
+            // 子は live + bind 完了。親は exit。stdout には **session id** を出力する
+            // (= `S=$(hyoui run --detached ...)` → `hyoui attach $S` にそのまま渡せる)。
             println!("{session_id}");
             ExitCode::SUCCESS
         }
@@ -88,7 +83,6 @@ pub fn spawn_detached_daemon_and_wait_ready(
     until: Option<String>,
     scrollback_rows: Option<usize>,
     debug_dump: Option<String>,
-    namespace: String,
     on_child_suspend: hyoui::cli::OnChildSuspend,
     timeout_ms: Option<u64>,
     idle_timeout_ms: Option<u64>,
@@ -99,14 +93,10 @@ pub fn spawn_detached_daemon_and_wait_ready(
     cmd: Vec<String>,
 ) -> Result<(String, PathBuf), ExitCode> {
     let session_id = session_id_override.unwrap_or_else(socket_path::auto_session_id);
-    let sock = match socket_path::resolve_in_namespace(
-        socket_override.as_deref(),
-        &session_id,
-        &namespace,
-    ) {
+    let sock = match socket_path::resolve(socket_override.as_deref(), &session_id) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("hyoui: socket path 解決失敗: {e} (namespace: {namespace})");
+            eprintln!("hyoui: socket path 解決失敗: {e} (session: {session_id})");
             return Err(ExitCode::from(1));
         }
     };
@@ -149,8 +139,6 @@ pub fn spawn_detached_daemon_and_wait_ready(
         until: until.filter(|s| !s.is_empty()),
         scrollback_rows,
         debug_dump: debug_dump.filter(|s| !s.is_empty()),
-        // DR-0018: 解決済 namespace を daemon child に伝える (= 子 PTY へ env 注入する値)。
-        namespace,
         // DR-0019: 子 STOPPED 時の daemon 挙動を伝える。
         on_child_suspend: Some(child_suspend_str(on_child_suspend).to_string()),
         // DR-0019 §4: overall / idle timeout を daemon に伝える (= --until と同経路)。
@@ -343,11 +331,6 @@ struct DaemonizeInit {
         default
     )]
     debug_dump: Option<String>,
-    /// DR-0018: 解決済 session namespace。daemon child が `Session::start` 前に
-    /// `HYOUI_NAMESPACE=<ns>` を自 env に set し、execvp される子 PTY が継承する。
-    /// 旧 daemon child との互換のため `default` で skip (= 未設定なら "default" 扱い)。
-    #[serde(default = "default_namespace_field")]
-    namespace: String,
 
     /// DR-0019: 子 STOPPED 時の daemon 挙動 (= `hyoui run --on-child-suspend`)。
     /// "notify" (default) または "auto-resume"。未設定 / 未知値は notify 扱い。
@@ -400,11 +383,6 @@ struct DaemonizeInit {
     /// で、None は builtin 既定値に倒す。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     term_fallback: Option<String>,
-}
-
-/// `DaemonizeInit.namespace` の serde default (= 旧 init JSON 互換)。
-fn default_namespace_field() -> String {
-    hyoui::cli::DEFAULT_NAMESPACE.to_string()
 }
 
 /// `cli::OnChildSuspend` を DaemonizeInit JSON で運ぶ文字列に変換。
@@ -475,7 +453,7 @@ pub fn run_daemon_child() -> ExitCode {
     let idle_timeout_ms = init.idle_timeout_ms;
 
     // DR-0024: 子 PTY 継承用 environ から親 Internal Context env (例: 親 Claude Code
-    // の `CLAUDE_CODE_SESSION_ID` 等) を scrub する。`HYOUI_NAMESPACE`/`HYOUI_SESSION_ID`
+    // の `CLAUDE_CODE_SESSION_ID` 等) を scrub する。`HYOUI_SESSION_ID`
     // 注入の **前** に実施するのは、user config の kill_glob が `HYOUI_*` を巻き添えに
     // してしまうのを protected guard で防ぐが、それでも順序として「漏れ削除 → 意図的注入」
     // が読みやすいため。daemon は single-threaded (= Session::start 前) なので `apply` の
@@ -486,21 +464,13 @@ pub fn run_daemon_child() -> ExitCode {
         // opt-in する (Future work)。_result は捨てるが apply は環境を実際に書き換え済。
     }
 
-    // DR-0018: 子 PTY に `HYOUI_NAMESPACE` を **常時注入** (= default でも注入)。
-    // daemon child 自身の env に set しておくと、`Session::start` が fork+execvp する
-    // 子 PTY がそれを継承する。ここはまだ single-threaded (= Session::start 前) なので
-    // set_var_at_startup の契約を満たす。`HYOUI_DAEMONIZE_INIT` (= 上で unset 済) と
-    // 違い、これは子に意図的に伝える env なので unset しない。
-    // 用途: ns 内でネスト起動した hyoui が指定なしで同 ns を引き継ぐ (= 自己検出にも使える)。
-    hyoui::sys::env::set_var_at_startup("HYOUI_NAMESPACE", &init.namespace);
-
     // DR-0020 §1: 子 PTY に `HYOUI_SESSION_ID` を **常時注入** (= 自己参照の必然、
     // tmux `$TMUX` / screen `$STY` 慣行と同枠の透過例外)。daemon child 自身の env に
     // set しておくと `Session::start` が fork+execvp する子 PTY がそれを継承する。
     // ここは `Session::start` 前で single-threaded なので set_var_at_startup の契約を
     // 満たす。子 process (= shell / AI agent) が自セッションを操作する省略時解決
-    // (DR-0020 §2) の入力になる。`HYOUI_NAMESPACE` と同じく、子に意図的に伝える env
-    // なので unset しない。
+    // (DR-0020 §2) の入力になる。`HYOUI_DAEMONIZE_INIT` (= 上で unset 済) と違い、
+    // 子に意図的に伝える env なので unset しない。
     hyoui::sys::env::set_var_at_startup("HYOUI_SESSION_ID", &session_id);
 
     // DR-0039 決定 1: 子の TERM は呼び出し元を引き継ぎ、無い (未設定 / 空) 時だけ
@@ -574,9 +544,9 @@ pub fn run_daemon_child() -> ExitCode {
     let _ = nix::unistd::chdir("/");
 
     // DR-0039 決定 1: `--login` は子の argv / exec 先 / environ を最小 env から組み直す。
-    // daemon 自身の environ (= 面の root を決める XDG_* / HYOUI_NAMESPACE 等) は触らない。
-    // 子に渡す environ だけを `child_exec` に持たせ、hyoui の常時注入 env (DR-0018 /
-    // DR-0020) は最小化しても残す。HYOUI_LOCK_TOKEN は最小 env に入らない (= 子に漏れない)。
+    // daemon 自身の environ (= 面の root を決める HYOUI_STATE_DIR / XDG_* 等) は触らない。
+    // 子に渡す environ だけを `child_exec` に持たせ、hyoui の常時注入 env (DR-0020) は
+    // 最小化しても残す。HYOUI_LOCK_TOKEN は最小 env に入らない (= 子に漏れない)。
     let (cmd, child_exec) = if init.login {
         let user = match hyoui::sys::login::current_user() {
             Ok(u) => u,
@@ -591,8 +561,6 @@ pub fn run_daemon_child() -> ExitCode {
             &hyoui::sys::login::LoginCaller::from_env(session_term.clone()),
             &cmd,
         );
-        plan.env
-            .push(("HYOUI_NAMESPACE".to_string(), init.namespace.clone()));
         plan.env
             .push(("HYOUI_SESSION_ID".to_string(), init.session.clone()));
         (
@@ -645,6 +613,10 @@ pub fn run_daemon_child() -> ExitCode {
 
     let session = match Session::start_with_child_stdin(dcfg, child_stdin) {
         Ok(s) => s,
+        Err(hyoui::Error::SocketExists(path)) => {
+            eprintln!("{}", session_exists_message(&init.session, &path));
+            return ExitCode::from(1);
+        }
         Err(e) => {
             eprintln!("hyoui (daemon child): Session::start 失敗: {e}");
             return ExitCode::from(1);
@@ -664,6 +636,20 @@ pub fn run_daemon_child() -> ExitCode {
         Ok(_code) => ExitCode::SUCCESS,
         Err(_) => ExitCode::from(1),
     }
+}
+
+/// 同じ id の socket が既にあって起動できなかった時の文言 (DR-0041 決定 3)。
+///
+/// run は相手の daemon の生死を判定しない (= 片付けの経路の責務) ので、原因は「同じ id
+/// の socket が既にある」だけを言い、対処に生きている時と死んで残った時の両方を書く。
+fn session_exists_message(session_id: &str, socket: &std::path::Path) -> String {
+    format!(
+        "hyoui: run: session id {session_id} の socket が既にあるため起動しません ({})\n\
+         \x20      別の id で起動するか (--session-id を外すと hyoui が振ります)、その session を\n\
+         \x20      片付けてから再実行してください: 動いていれば `hyoui kill {session_id}`、\n\
+         \x20      daemon が死んで socket だけ残っていれば `hyoui list` が片付けます。",
+        socket.display()
+    )
 }
 
 /// 呼び出し元の stdin を子に渡せなかった時の文言 (DR-0042 決定 6)。原因と次の行動を書く。

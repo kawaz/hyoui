@@ -19,7 +19,7 @@ use hyoui_web::auth::{
 use hyoui_web::contract::{ChallengePurpose, Endpoint};
 use tower::ServiceExt;
 
-/// 隔離した `XDG_STATE_HOME` 上の router 1 つ (決定 9)。
+/// 隔離した web の状態の置き場の上の router 1 つ (決定 9)。
 struct Harness {
     app: axum::Router,
     context: AuthContext,

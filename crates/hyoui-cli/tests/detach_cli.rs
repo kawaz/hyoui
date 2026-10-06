@@ -143,9 +143,12 @@ fn attach_emits_discovery_hint_for_ctrl_z_guard() {
     let session = "hint-emit";
 
     let mut leader = runner.spawn_hyoui(session, &["run", "--", "sh", "-c", "sleep 30"]);
+    // ヒントの行は `eprintln!` の書式片ごとに別の write(2) で届く (= 行頭だけ先に読める)
+    // ので、行末の案内 (`--mode=ro`) まで届くのを待ってから中身を見る。
     let out = leader
-        .wait_for("[hyoui] suspend", Duration::from_secs(10))
+        .wait_for("--mode=ro", Duration::from_secs(10))
         .expect("ヒントが PTY (stderr) に出るべき");
+    assert!(out.contains("[hyoui] suspend"), "out={out:?}");
     assert!(
         out.contains("Ctrl+Z"),
         "ヒントは Ctrl+Z ガードの操作を案内すべき。out={out:?}"

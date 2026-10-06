@@ -42,7 +42,10 @@ impl Supervisor {
     /// socket ファイルの存在では判定しない — 監督者が SIGKILL で消えた後に
     /// socket が残ることがあり、それを「居る」と読むと `list` が嘘をつく。
     fn probe() -> Self {
-        match std::os::unix::net::UnixStream::connect(registry::supervisor_socket_path()) {
+        let Ok(socket) = registry::supervisor_socket_path() else {
+            return Self::NotRunning;
+        };
+        match hyoui::sys::socket::connect(&socket) {
             Ok(_) => Self::Running,
             Err(_) => Self::NotRunning,
         }
@@ -57,8 +60,7 @@ impl Supervisor {
     /// 監督者が不在でも登録簿の変更は成立するので、送れなかった理由を返して
     /// 呼び出し側が出力に添える (決定 4 の表: 次に監督者が上がった時に起きる)。
     fn request(self, request: &Request) -> std::result::Result<Response, ErrorBody> {
-        protocol::request(&registry::supervisor_socket_path(), request)
-            .map(|(response, _)| response)
+        protocol::request_supervisor(request).map(|(response, _)| response)
     }
 }
 
@@ -88,7 +90,7 @@ pub fn list_command() -> ExitCode {
                     }))
                     .collect::<Vec<_>>(),
                 "supervisor": {"running": true},
-                "registry_dir": Registry::open().dir(),
+                "registry_dir": registry::default_units_dir().ok(),
             });
             add_location_warnings(&mut output, &supervisor.locations);
             emit(&output)
@@ -136,24 +138,32 @@ const LEGACY_SERVICE_LABELS: [&str; 2] = ["jp.kawaz.hyoui-web.supervise", "hyoui
 /// 古い置き場が残っていれば stderr に警告する (DR-0038 移行節 (3))。
 ///
 /// `hyoui web ...` の全 verb (= 監督者・子の `daemon run`・`status` 等) の入口で呼ぶ。
-/// 監督者と子の stderr は監督者のログに入るので、常駐側の痕跡にもなる。
+/// 監督者と子の stderr は監督者のログに入るので、常駐側の痕跡にもなる。gateway は
+/// session の一覧を出すので、session の古い置き場 (DR-0041 決定 7) も同じ入口で言う。
 pub fn warn_legacy_state_dir() {
-    for warning in legacy_warnings(&hyoui::paths::Env::current()) {
+    let env = hyoui::paths::Env::current();
+    for warning in legacy_warnings(&env)
+        .into_iter()
+        .chain(hyoui::discovery::legacy_session_warnings(&env))
+    {
         eprintln!("hyoui: warning: {warning}");
     }
 }
 
-/// 古い置き場と、それぞれの移し先。
+/// 古い置き場と、それぞれの移し先。状態の root を決められなければ移し先が無いので空。
 fn legacy_places(env: &hyoui::paths::Env) -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
     let mut places = Vec::new();
+    let Ok(web_state_dir) = env.web_state_dir() else {
+        return places;
+    };
     if let Some(state_home) = env.state_home() {
-        places.push((state_home.join(LEGACY_DIR_NAME), env.web_state_dir()));
+        places.push((state_home.join(LEGACY_DIR_NAME), web_state_dir.clone()));
     }
     // 監督者のログは state の `logs/` に移った (DR-0038 決定 4)。
     if let Some(home) = env.home() {
         places.push((
             home.join("Library/Logs").join(LEGACY_DIR_NAME),
-            env.web_state_dir().join("logs"),
+            web_state_dir.join("logs"),
         ));
     }
     places
@@ -228,7 +238,10 @@ fn add_registered_location_warnings(output: &mut Value) {
 /// 障害時に最初に打つコマンドが監督者の生死に依存すると、状態を見る入口ごと
 /// 失われる (決定 4)。listen は登録簿に無いので各 unit の config から引く。
 fn registry_view(name: Option<&str>) -> std::result::Result<Value, ExitCode> {
-    let registry = Registry::open();
+    let registry = match Registry::open() {
+        Ok(registry) => registry,
+        Err(error) => return Err(fail("web daemon status", &error.to_string(), None)),
+    };
     let units = match name {
         Some(name) => match registry.get(name) {
             Ok(unit) => vec![(name.to_owned(), unit)],
@@ -357,7 +370,9 @@ fn config_unreadable(context: &str, config: &Path, error: &hyoui::config::Config
 /// で捕まえられなくなる。比べる値は `web` (= `extends` を畳んだ後の値) から取るが、
 /// トップのファイルが書いた値は畳んでも土台に上書きされないので同じ値である。
 fn check_state_dir(web: &WebConfig, config: &Path, env: &Env) -> Result<(), Refusal> {
-    let current = env.state_root();
+    let current = env
+        .state_root()
+        .map_err(|error| Refusal::new(error.to_string()))?;
     let declared = declares_state_dir(config)?;
     let state_dir = match (&web.state_dir, declared) {
         (Some(state_dir), true) => state_dir,
@@ -433,7 +448,11 @@ fn declares_state_dir(config: &Path) -> Result<bool, Refusal> {
 /// `hyoui web daemon add <name> [--listen ..] [--binary ..] | --config <path>`
 /// (DR-0038 決定 2 / 9)。
 pub fn add_command(cfg: WebDaemonAddConfig) -> ExitCode {
-    match add(cfg, &Env::current(), &Registry::open()) {
+    let registry = match Registry::open() {
+        Ok(registry) => registry,
+        Err(error) => return fail("web daemon add", &error.to_string(), None),
+    };
+    match add(cfg, &Env::current(), &registry) {
         Ok(output) => emit(&output),
         Err(refusal) => refusal.fail("web daemon add"),
     }
@@ -641,7 +660,9 @@ fn add(
         ));
     }
 
-    let state_dir = env.state_root();
+    let state_dir = env
+        .state_root()
+        .map_err(|error| Refusal::new(error.to_string()))?;
     let written = if generated {
         let written = write_unit_config(&config_path, &state_dir, &listen, &binary_path)?;
         // 生成した config も、登録する前に `extends` を含めて読めることを確かめる
@@ -752,11 +773,6 @@ fn unit_config_text(
     listen: &str,
     binary_path: &Path,
 ) -> std::result::Result<String, Refusal> {
-    if !state_dir.is_absolute() {
-        return Err(Refusal::new(
-            "cannot determine the state root: neither XDG_STATE_HOME nor HOME is set",
-        ));
-    }
     let quote = |value: &str| toml::Value::String(value.to_owned()).to_string();
     let quote_path = |value: &Path| {
         value
@@ -838,7 +854,10 @@ fn absolute(path: &Path) -> std::result::Result<PathBuf, String> {
 /// 抱えたままになるのを避けるため (決定 4)。
 pub fn remove_command(name: &str) -> ExitCode {
     let context = "web daemon remove";
-    let registry = Registry::open();
+    let registry = match Registry::open() {
+        Ok(registry) => registry,
+        Err(error) => return fail(context, &error.to_string(), None),
+    };
     if let Err(error) = registry.get(name) {
         return fail(context, &error.to_string(), None);
     }
@@ -885,14 +904,18 @@ pub fn remove_command(name: &str) -> ExitCode {
 /// (決定 6)。
 pub fn supervise_command() -> ExitCode {
     let context = "web daemon supervise";
-    let root = registry::default_root();
+    let root = match registry::default_root() {
+        Ok(root) => root,
+        Err(error) => return fail(context, &error.to_string(), None),
+    };
+    let socket = registry::supervisor_socket_in(&root);
     let mut supervisor = supervisor::Supervisor::new(
-        Registry::open(),
+        Registry::at(root.join("units")),
         root,
         supervisor::Timings::default(),
         Box::new(probe::SystemProbe),
     );
-    match supervisor.run(&registry::supervisor_socket_path()) {
+    match supervisor.run(&socket) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => fail(context, &error.to_string(), None),
     }
@@ -967,11 +990,10 @@ pub fn log_command(name: Option<&str>, follow: bool) -> ExitCode {
     let target = name.map_or_else(Target::all, |name| Target::named(name.to_owned()));
     let request = Request::Log { target, follow };
 
-    let (response, mut reader) =
-        match protocol::request(&registry::supervisor_socket_path(), &request) {
-            Ok(pair) => pair,
-            Err(error) => return fail_with(context, &error),
-        };
+    let (response, mut reader) = match protocol::request_supervisor(&request) {
+        Ok(pair) => pair,
+        Err(error) => return fail_with(context, &error),
+    };
     match response {
         Response::Error(error) => return fail_with(context, &error),
         Response::Log { lines, follow } => {
@@ -1050,7 +1072,7 @@ pub fn version_command() -> ExitCode {
                 // OS への登録が無ければ「監督者」という対象自体が無い。
                 None => Value::Null,
             };
-            let units = match Registry::open().list() {
+            let units = match Registry::open().and_then(|registry| registry.list()) {
                 Ok(units) => units,
                 Err(error) => return fail("version", &error.to_string(), None),
             };
@@ -1081,7 +1103,11 @@ pub fn version_command() -> ExitCode {
 /// 経路で、手元で 1 台だけ確かめる時にも使う (DR-0034 決定 3)。
 pub fn run_command(source: &WebDaemonRunSource) -> ExitCode {
     let context = "web daemon run";
-    let web = match run_target(&Registry::open(), source, &Env::current()) {
+    let registry = match Registry::open() {
+        Ok(registry) => registry,
+        Err(error) => return fail(context, &error.to_string(), None),
+    };
+    let web = match run_target(&registry, source, &Env::current()) {
         Ok(web) => web,
         Err(refusal) => return refusal.fail(context),
     };
@@ -1248,7 +1274,7 @@ mod tests {
     fn run_reads_the_unit_or_the_given_config_or_nothing() {
         let directory = tempfile::tempdir().unwrap();
         let env = home_env(directory.path());
-        let root = env.state_root();
+        let root = env.state_root().unwrap();
         let registry = Registry::at(directory.path().join("units"));
         let config = write(
             directory.path(),
@@ -1329,7 +1355,7 @@ mod tests {
                 refusal.message.contains("/elsewhere/hyoui")
                     && refusal
                         .message
-                        .contains(&env.state_root().display().to_string()),
+                        .contains(&env.state_root().unwrap().display().to_string()),
                 "{source:?}: {}",
                 refusal.message
             );
@@ -1348,7 +1374,7 @@ mod tests {
     fn the_state_dir_is_compared_by_realpath() {
         let directory = tempfile::tempdir().unwrap();
         let env = home_env(directory.path());
-        let root = env.state_root();
+        let root = env.state_root().unwrap();
         std::fs::create_dir_all(&root).unwrap();
         let link = directory.path().join("link-to-root");
         std::os::unix::fs::symlink(&root, &link).unwrap();
@@ -1384,7 +1410,7 @@ mod tests {
     fn a_state_dir_inherited_from_the_base_is_refused() {
         let directory = tempfile::tempdir().unwrap();
         let env = home_env(directory.path());
-        let root = env.state_root();
+        let root = env.state_root().unwrap();
         write(
             directory.path(),
             "base.toml",
@@ -1466,7 +1492,7 @@ mod tests {
     /// add を呼ぶための隔離した env と登録簿 (= HOME だけを持つ)。
     fn isolated(directory: &Path) -> (Env, Registry) {
         let env = home_env(directory);
-        let registry = Registry::at(env.web_state_dir().join("units"));
+        let registry = Registry::at(env.web_state_dir().unwrap().join("units"));
         (env, registry)
     }
 
@@ -1576,7 +1602,7 @@ mod tests {
         let web_dir = env.web_config_dir().unwrap();
 
         // 生成したファイルの Drop で消える / keep で残る。
-        let state = env.state_root();
+        let state = env.state_root().unwrap();
         let generated = write_unit_config(
             &web_dir.join("a.toml"),
             &state,
@@ -1811,12 +1837,15 @@ mod tests {
 
         // 移して symlink にすれば「後で消す」になる。
         std::fs::remove_dir(&legacy_state).unwrap();
-        std::fs::create_dir_all(env.web_state_dir().join("logs")).unwrap();
-        std::os::unix::fs::symlink(env.web_state_dir(), &legacy_state).unwrap();
+        std::fs::create_dir_all(env.web_state_dir().unwrap().join("logs")).unwrap();
+        std::os::unix::fs::symlink(env.web_state_dir().unwrap(), &legacy_state).unwrap();
         let logs = home.path().join("Library/Logs");
         std::fs::create_dir_all(&logs).unwrap();
-        std::os::unix::fs::symlink(env.web_state_dir().join("logs"), logs.join(LEGACY_DIR_NAME))
-            .unwrap();
+        std::os::unix::fs::symlink(
+            env.web_state_dir().unwrap().join("logs"),
+            logs.join(LEGACY_DIR_NAME),
+        )
+        .unwrap();
         let warnings = legacy_warnings(&env);
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
@@ -1835,7 +1864,7 @@ mod tests {
         std::fs::write(
             agents.join(format!(
                 "{}.plist",
-                crate::web_service::label_for_root(&env.state_root())
+                crate::web_service::label_for_root(&env.state_root().unwrap())
             )),
             "",
         )

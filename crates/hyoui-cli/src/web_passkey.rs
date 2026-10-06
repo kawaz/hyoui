@@ -76,7 +76,10 @@ fn add(config: WebPasskeyAddConfig) -> ExitCode {
     };
 
     let now_ms = hyoui::time::now_unix_ms();
-    let dir = StateDir::default_root();
+    let dir = match StateDir::default_root() {
+        Ok(dir) => dir,
+        Err(e) => return fail("web passkey add", &e.to_string(), None),
+    };
     let existing: AuthFile = match dir.auth().read() {
         Ok(file) => file,
         Err(e) => return fail("web passkey add", &e.to_string(), None),
@@ -139,7 +142,10 @@ fn add(config: WebPasskeyAddConfig) -> ExitCode {
 // -----------------------------------------------------------------------------
 
 fn list() -> ExitCode {
-    let dir = StateDir::default_root();
+    let dir = match StateDir::default_root() {
+        Ok(dir) => dir,
+        Err(e) => return fail("web passkey list", &e.to_string(), None),
+    };
     let file: AuthFile = match dir.auth().read() {
         Ok(file) => file,
         Err(e) => return fail("web passkey list", &e.to_string(), None),
@@ -179,7 +185,10 @@ fn list() -> ExitCode {
 }
 
 fn remove(sub: &str) -> ExitCode {
-    let dir = StateDir::default_root();
+    let dir = match StateDir::default_root() {
+        Ok(dir) => dir,
+        Err(e) => return fail("web passkey remove", &e.to_string(), None),
+    };
     let now_ms = hyoui::time::now_unix_ms();
     let outcome = dir
         .auth()
@@ -208,7 +217,10 @@ fn remove(sub: &str) -> ExitCode {
 // -----------------------------------------------------------------------------
 
 fn session_list() -> ExitCode {
-    let dir = StateDir::default_root();
+    let dir = match StateDir::default_root() {
+        Ok(dir) => dir,
+        Err(e) => return fail("web session list", &e.to_string(), None),
+    };
     let file: AuthFile = match dir.auth().read() {
         Ok(file) => file,
         Err(e) => return fail("web session list", &e.to_string(), None),
@@ -237,7 +249,10 @@ fn session_list() -> ExitCode {
 }
 
 fn session_remove(id: &str) -> ExitCode {
-    let dir = StateDir::default_root();
+    let dir = match StateDir::default_root() {
+        Ok(dir) => dir,
+        Err(e) => return fail("web session remove", &e.to_string(), None),
+    };
     let now_ms = hyoui::time::now_unix_ms();
     let outcome = dir.auth().update::<AuthFile, _, _>(|file| {
         let mut revoked = 0;

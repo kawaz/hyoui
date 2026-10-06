@@ -51,7 +51,7 @@ pub fn label_for_root(root: &Path) -> String {
 /// 登録は `create` で root を作ってから label を決めるので、登録済みの面では常に
 /// 正規化した値になる。
 pub fn canonical_state_root(env: &hyoui::paths::Env, create: bool) -> Result<PathBuf, String> {
-    let root = env.state_root();
+    let root = env.state_root().map_err(|error| error.to_string())?;
     if create {
         std::fs::create_dir_all(&root)
             .map_err(|error| format!("cannot create {}: {error}", root.display()))?;
@@ -70,20 +70,12 @@ pub struct ServiceDefinition {
 }
 
 impl ServiceDefinition {
-    /// 監督者 1 つを載せる定義 (= 決定 6)。
+    /// 監督者 1 つを載せる定義 (= 決定 6)。label は [`default_label`] (= 隔離 label での
+    /// 実機確認と golden test では明示の値)。
     ///
     /// argv は `<binary> web daemon supervise` の 4 語で、unit の数や名前は入らない。
     /// unit を足しても消しても、この定義は 1 文字も変わらない。`env` は
     /// [`pinned_env`] が作る固定値 (DR-0038 決定 5)。
-    pub fn for_supervisor(
-        program: &str,
-        log_path: Option<String>,
-        env: BTreeMap<String, String>,
-    ) -> Self {
-        Self::labelled(&default_label(), program, log_path, env)
-    }
-
-    /// label を明示して組み立てる (= 隔離 label での実機確認と golden test 用)。
     pub fn labelled(
         label: &str,
         program: &str,
@@ -117,7 +109,11 @@ impl ServiceDefinition {
 /// 値はファイル名に使うので `[A-Za-z0-9._-]` に限り、外れた値は無視して組み込みの
 /// label (= 今の env の状態 root から作る [`label_for_root`]) に戻る (= 黙って path を
 /// 作らせない)。
-pub fn default_label() -> String {
+///
+/// # Errors
+///
+/// 組み込みの label を作るのに状態の root を決められない時 (DR-0041 決定 6)。
+pub fn default_label() -> Result<String, String> {
     std::env::var("HYOUI_WEB_SERVICE_LABEL")
         .ok()
         .filter(|label| {
@@ -127,11 +123,13 @@ pub fn default_label() -> String {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
         })
-        .unwrap_or_else(|| {
-            let env = hyoui::paths::Env::current();
-            let root = canonical_state_root(&env, false).unwrap_or_else(|_| env.state_root());
-            label_for_root(&root)
-        })
+        .map_or_else(
+            || {
+                let root = canonical_state_root(&hyoui::paths::Env::current(), false)?;
+                Ok(label_for_root(&root))
+            },
+            Ok,
+        )
 }
 
 /// 定義に固定する env (DR-0038 決定 5)。
@@ -209,12 +207,18 @@ pub struct LocationDifference {
 /// 子 gateway のログと同じ `logs/` に、label の名前で置く (= unit 名は `.` を含め
 /// ないので衝突しない。label を変えれば隔離 label の実機確認でも分かれる)。ここに
 /// 来るのは監督者自身が書いたものだけ。
-pub fn log_path_for(env: &hyoui::paths::Env, label: &str) -> String {
-    env.web_state_dir()
+///
+/// # Errors
+///
+/// 状態の root を決められない時 (DR-0041 決定 6)。
+pub fn log_path_for(env: &hyoui::paths::Env, label: &str) -> Result<String, String> {
+    Ok(env
+        .web_state_dir()
+        .map_err(|error| error.to_string())?
         .join("logs")
         .join(format!("{label}.log"))
         .to_string_lossy()
-        .into_owned()
+        .into_owned())
 }
 
 pub fn launchd_definition_path(home: &Path, label: &str) -> PathBuf {
@@ -619,9 +623,11 @@ impl Backend for LaunchdBackend {
             .ok()
             .and_then(|path| std::fs::read_to_string(path).ok())
             .and_then(|text| log_path_in_definition(&text));
-        Ok(LogSource::File(PathBuf::from(
-            from_definition.unwrap_or_else(|| log_path_for(&hyoui::paths::Env::current(), label)),
-        )))
+        let path = match from_definition {
+            Some(path) => path,
+            None => log_path_for(&hyoui::paths::Env::current(), label)?,
+        };
+        Ok(LogSource::File(PathBuf::from(path)))
     }
 }
 
@@ -879,7 +885,6 @@ pub struct ResolvedProgram {
 
 use crate::web_daemon::probe::{SystemProbe, VersionProbe};
 use crate::web_daemon::protocol::{self, Request, Response, Target, VersionPair};
-use crate::web_daemon::registry;
 use serde_json::{Value, json};
 use std::process::ExitCode;
 
@@ -899,7 +904,10 @@ pub fn registered_location_warnings() -> Vec<String> {
     let Ok(backend) = backend() else {
         return Vec::new();
     };
-    let Ok(path) = backend.definition_path(&default_label()) else {
+    let Ok(label) = default_label() else {
+        return Vec::new();
+    };
+    let Ok(path) = backend.definition_path(&label) else {
         return Vec::new();
     };
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -925,12 +933,9 @@ pub fn registered_location_warnings() -> Vec<String> {
 /// 焼かれた path の実行ファイルに `--version` を聞いたもの。登録が無ければ `None`。
 pub fn supervisor_version() -> Option<(VersionPair, PathBuf)> {
     let backend = backend().ok()?;
-    let label = default_label();
+    let label = default_label().ok()?;
     let binary = program_of_registered_definition(backend.as_ref(), &label)?;
-    let running = match protocol::request(
-        &registry::supervisor_socket_path(),
-        &Request::Status(Target::all()),
-    ) {
+    let running = match protocol::request_supervisor(&Request::Status(Target::all())) {
         Ok((Response::Units { supervisor, .. }, _)) => Some(supervisor.version),
         _ => None,
     };
@@ -976,13 +981,25 @@ pub fn register_command(binary: Option<PathBuf>, force: bool) -> ExitCode {
     if let Err(error) = canonical_state_root(&locations, true) {
         return fail(context, &error);
     }
-    let label = default_label();
+    let label = match default_label() {
+        Ok(label) => label,
+        Err(error) => return fail(context, &error),
+    };
     // launchd は StandardOutPath でファイルに落とす、systemd は journald が拾うので
     // 定義に log path を書かない (決定 6)。
+    let log_path = if cfg!(target_os = "macos") {
+        match log_path_for(&locations, &label) {
+            Ok(path) => Some(path),
+            Err(error) => return fail(context, &error),
+        }
+    } else {
+        None
+    };
     let path_var = std::env::var_os("PATH");
-    let definition = ServiceDefinition::for_supervisor(
+    let definition = ServiceDefinition::labelled(
+        &label,
         &program.to_string_lossy(),
-        cfg!(target_os = "macos").then(|| log_path_for(&locations, &label)),
+        log_path,
         pinned_env(&locations, path_var.as_deref()),
     );
 
@@ -1029,7 +1046,10 @@ pub fn unregister_command() -> ExitCode {
         Ok(backend) => backend,
         Err(error) => return fail(context, &error),
     };
-    let label = default_label();
+    let label = match default_label() {
+        Ok(label) => label,
+        Err(error) => return fail(context, &error),
+    };
     let path = backend.definition_path(&label).unwrap_or_default();
     let was_registered = path.is_file();
     if let Err(error) = backend.unregister(&label) {
@@ -1067,7 +1087,10 @@ pub fn control_command(verb: SupervisorVerb) -> ExitCode {
         Ok(backend) => backend,
         Err(error) => return fail(context, &error),
     };
-    let label = default_label();
+    let label = match default_label() {
+        Ok(label) => label,
+        Err(error) => return fail(context, &error),
+    };
     // 上げる側の verb は、定義が無ければ OS に頼む相手が居ない。backend ごとの
     // メッセージ (launchd は path、systemd は unit not found) に任せると何を
     // すればよいか伝わらないので、ここで register への道を示して断る。
@@ -1105,7 +1128,10 @@ pub fn status_command() -> ExitCode {
         Ok(backend) => backend,
         Err(error) => return fail(context, &error),
     };
-    let label = default_label();
+    let label = match default_label() {
+        Ok(label) => label,
+        Err(error) => return fail(context, &error),
+    };
     let service = match backend.status(&label) {
         Ok(service) => service,
         Err(error) => return fail(context, &error),
@@ -1113,10 +1139,7 @@ pub fn status_command() -> ExitCode {
 
     // top-level の `running` は **監督者の頼み口に届いたか**。OS が loaded と言って
     // いても頼み口が開いていなければ頼めないので、届いたかどうかを正とする。
-    let asked = protocol::request(
-        &registry::supervisor_socket_path(),
-        &Request::Status(Target::all()),
-    );
+    let asked = protocol::request_supervisor(&Request::Status(Target::all()));
     let (running, instances, supervisor_running_version, supervisor_locations) = match asked {
         Ok((
             Response::Units {
@@ -1146,8 +1169,10 @@ pub fn status_command() -> ExitCode {
     // label は人が覚える名前ではない (状態 root の hash が付く) ので、どの面の監督者
     // かを読めるように、label を作った root と定義に固定した env を並べる
     // (DR-0038 決定 4)。
-    let env = hyoui::paths::Env::current();
-    let root = canonical_state_root(&env, false).unwrap_or_else(|_| env.state_root());
+    let root = match canonical_state_root(&hyoui::paths::Env::current(), false) {
+        Ok(root) => root,
+        Err(error) => return fail(context, &error),
+    };
     let pinned = std::fs::read_to_string(&service.definition_path)
         .ok()
         .map(|text| env_in_definition(&text));
@@ -1185,7 +1210,11 @@ pub fn log_command(follow: bool) -> ExitCode {
         Ok(backend) => backend,
         Err(error) => return fail(context, &error),
     };
-    let source = match backend.log_source(&default_label()) {
+    let label = match default_label() {
+        Ok(label) => label,
+        Err(error) => return fail(context, &error),
+    };
+    let source = match backend.log_source(&label) {
         Ok(source) => source,
         Err(error) => return fail(context, &error),
     };
@@ -1436,8 +1465,13 @@ mod tests {
         );
         // 既定 label で組んでも同じ argv になる。
         assert_eq!(
-            ServiceDefinition::for_supervisor("/opt/homebrew/bin/hyoui", None, BTreeMap::new())
-                .program_args,
+            ServiceDefinition::labelled(
+                &default_label().expect("HOME is set in the test environment"),
+                "/opt/homebrew/bin/hyoui",
+                None,
+                BTreeMap::new()
+            )
+            .program_args,
             def.program_args
         );
     }
@@ -1450,7 +1484,7 @@ mod tests {
             &locations(&[
                 ("HOME", "/h"),
                 ("XDG_STATE_HOME", "/s"),
-                ("XDG_RUNTIME_DIR", ""),
+                ("HYOUI_STATE_DIR", ""),
             ]),
             Some(std::ffi::OsStr::new("/a:/b")),
         );
@@ -1497,7 +1531,7 @@ mod tests {
     fn pinned_env_round_trips_through_both_definitions() {
         let mut def = sample_definition();
         def.env
-            .insert("XDG_RUNTIME_DIR".into(), "/run/a&b<c>%d\"e".into());
+            .insert("HYOUI_STATE_DIR".into(), "/run/a&b<c>%d\"e".into());
         assert_eq!(env_in_definition(&render_launchd_plist(&def)), def.env);
         assert_eq!(env_in_definition(&render_systemd_unit(&def)), def.env);
         assert!(env_in_definition("nothing here").is_empty());
@@ -1513,6 +1547,8 @@ mod tests {
 
         current.insert("XDG_STATE_HOME".into(), "/other/state".into());
         current.remove("XDG_CONFIG_HOME");
+        current.insert("HYOUI_STATE_DIR".into(), "/face".into());
+        // 場所を導かない変数 (= DR-0041 で使わなくなった XDG_RUNTIME_DIR を含む) は比べない。
         current.insert("XDG_RUNTIME_DIR".into(), "/run/user/1".into());
         let drift = pinned_location_drift(&registered, &current);
         assert_eq!(
@@ -1529,9 +1565,9 @@ mod tests {
                     current: Some("/other/state".into()),
                 },
                 LocationDifference {
-                    name: "XDG_RUNTIME_DIR".into(),
+                    name: "HYOUI_STATE_DIR".into(),
                     registered: None,
-                    current: Some("/run/user/1".into()),
+                    current: Some("/face".into()),
                 },
             ]
         );
@@ -1541,9 +1577,19 @@ mod tests {
     #[test]
     fn the_supervisor_log_lives_with_the_unit_logs() {
         assert_eq!(
-            log_path_for(&locations(&[("HOME", "/h")]), TEST_LABEL),
-            "/h/.local/state/hyoui/web/logs/com.github.kawaz.hyoui.web.supervise.1303b83b.log"
+            log_path_for(&locations(&[("HOME", "/h")]), TEST_LABEL).as_deref(),
+            Ok("/h/.local/state/hyoui/web/logs/com.github.kawaz.hyoui.web.supervise.1303b83b.log")
         );
+        // 面を変えると監督者のログも面の中に置かれる (DR-0041 決定 6)。
+        assert_eq!(
+            log_path_for(
+                &locations(&[("HOME", "/h"), ("HYOUI_STATE_DIR", "/face")]),
+                TEST_LABEL
+            )
+            .as_deref(),
+            Ok("/face/web/logs/com.github.kawaz.hyoui.web.supervise.1303b83b.log")
+        );
+        assert!(log_path_for(&locations(&[]), TEST_LABEL).is_err());
         assert_eq!(
             log_path_in_definition(&render_launchd_plist(&sample_definition())).as_deref(),
             Some(

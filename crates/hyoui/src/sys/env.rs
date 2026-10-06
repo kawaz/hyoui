@@ -54,8 +54,8 @@ pub fn remove_var_at_startup(key: &str) {
 /// 冒頭 / daemon child 起動初期 (= thread spawn 前) なら risk は無い。
 ///
 /// 本 wrapper は daemon child (`run_daemon_child`) が `Session::start` (= 子 PTY を
-/// fork+execvp する) **前** に `HYOUI_NAMESPACE` を自 env に set し、execvp される
-/// 子 PTY がそれを継承する用途で使う (= DR-0018 namespace 継承)。
+/// fork+execvp する) **前** に `HYOUI_SESSION_ID` を自 env に set し、execvp される
+/// 子 PTY がそれを継承する用途で使う (= DR-0020 自己参照)。
 pub fn set_var_at_startup(key: &str, value: &str) {
     // SAFETY: caller が「daemon child 起動初期、thread spawn 前」を保証する前提。
     unsafe { std::env::set_var(key, value) }

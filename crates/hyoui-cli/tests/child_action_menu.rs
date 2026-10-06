@@ -321,11 +321,10 @@ fn wait_for_child_pid(runner: &HyouiTestRunner, session: &str) -> i32 {
                 "status",
                 &format!("--socket={}", runner.socket_path(session).display()),
             ])
-            .env("XDG_RUNTIME_DIR", runner.runtime_dir())
+            .env("HYOUI_STATE_DIR", runner.runtime_dir())
             .env("TMPDIR", runner.runtime_dir())
             .env_remove("HYOUI_LOCK_TOKEN")
             .env_remove("HYOUI_SESSION_ID")
-            .env_remove("HYOUI_NAMESPACE")
             .stdin(std::process::Stdio::null())
             .output()
             && let Some(pid) = String::from_utf8_lossy(&out.stdout)

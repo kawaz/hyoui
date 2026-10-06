@@ -1,6 +1,6 @@
 //! `auth.json` / `pending.json` の read-modify-write (DR-0036 決定 4)。
 //!
-//! 置き場は web の状態の置き場 (`$XDG_STATE_HOME/hyoui/web/`、DR-0038 決定 4) で、
+//! 置き場は web の状態の置き場 (`<状態の root>/web/`、DR-0038 決定 4) で、
 //! 登録簿の `units/` / `logs/` と同じ dir にこの 2 file を並べる。場所は
 //! [`hyoui::paths::Env::web_state_dir`] が導く (= `web service register` が固定する
 //! env と同じ一覧で導く)。
@@ -85,23 +85,34 @@ pub struct StateDir {
 
 impl StateDir {
     /// web の状態の置き場 (DR-0038 決定 4、登録簿と同じ dir)。
-    pub fn default_root() -> Self {
-        Self::at(hyoui::paths::Env::current().web_state_dir())
+    ///
+    /// # Errors
+    ///
+    /// 状態の root (= 面) を決められない時 (DR-0041 決定 6)。
+    pub fn default_root() -> std::result::Result<Self, hyoui::paths::StateRootError> {
+        Ok(Self::at(hyoui::paths::Env::current().web_state_dir()?))
     }
 
-    /// root を明示して開く (= test / 隔離 `XDG_STATE_HOME`)。
+    /// root を明示して開く (= test / 隔離 `HYOUI_STATE_DIR`)。
     pub fn at(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
 
-    /// `XDG_STATE_HOME` 相当の dir から導出する (= test が gateway と同じ計算で
-    /// 置き場に到達する口)。`hyoui/web/` の段を test 側に書き写させない。
-    pub fn under_state_home(state_home: impl AsRef<Path>) -> Self {
-        let state_home = state_home.as_ref().as_os_str().to_os_string();
+    /// 状態の root (= `HYOUI_STATE_DIR` に渡す dir) から導出する (= test が gateway と
+    /// 同じ計算で置き場に到達する口)。`web/` の段を test 側に書き写させない。
+    ///
+    /// # Panics
+    ///
+    /// `state_root` が相対パスの時 (= test の書き間違い)。
+    pub fn under_state_root(state_root: impl AsRef<Path>) -> Self {
+        let state_root = state_root.as_ref().as_os_str().to_os_string();
         let env = hyoui::paths::Env::from_lookup(|name| {
-            (name == hyoui::paths::LocationVar::XdgStateHome.name()).then(|| state_home.clone())
+            (name == hyoui::paths::LocationVar::HyouiStateDir.name()).then(|| state_root.clone())
         });
-        Self::at(env.web_state_dir())
+        Self::at(
+            env.web_state_dir()
+                .expect("under_state_root takes an absolute state root"),
+        )
     }
 
     /// root の path。
@@ -268,15 +279,12 @@ mod tests {
     /// auth.json / pending.json は登録簿と同じ web の状態の置き場に並ぶ (DR-0038 決定 4)。
     #[test]
     fn state_dir_is_the_web_state_dir() {
-        let dir = StateDir::under_state_home("/tmp/state");
-        assert_eq!(dir.root(), Path::new("/tmp/state/hyoui/web"));
-        assert_eq!(
-            dir.auth().path(),
-            Path::new("/tmp/state/hyoui/web/auth.json")
-        );
+        let dir = StateDir::under_state_root("/tmp/state");
+        assert_eq!(dir.root(), Path::new("/tmp/state/web"));
+        assert_eq!(dir.auth().path(), Path::new("/tmp/state/web/auth.json"));
         assert_eq!(
             dir.pending().path(),
-            Path::new("/tmp/state/hyoui/web/pending.json")
+            Path::new("/tmp/state/web/pending.json")
         );
     }
 

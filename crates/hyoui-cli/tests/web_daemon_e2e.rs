@@ -1,7 +1,7 @@
 //! `hyoui web daemon` CLI boundary の E2E (= DR-0034 P2 / DR-0038)。
 //!
-//! 登録簿は `XDG_STATE_HOME` 配下、unit の config は `XDG_CONFIG_HOME` 配下なので、
-//! 隔離した HOME を渡せば実機の登録を触らずに add / list / remove を通せる。add の
+//! 登録簿は状態の root (`HYOUI_STATE_DIR`) 配下、unit の config は `XDG_CONFIG_HOME`
+//! 配下なので、隔離した HOME と root を渡せば実機の登録を触らずに add / list / remove を通せる。add の
 //! bind 確認と `daemon run` の bind 観測は実 port を掴むので、他と衝突しない port を
 //! 使い、必ず子を落とす。
 
@@ -20,7 +20,7 @@ fn command(args: &[&str], home: &Path) -> Command {
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_STATE_HOME", home.join(".local/state"))
-        .env("XDG_RUNTIME_DIR", home.join("run"))
+        .env("HYOUI_STATE_DIR", home.join(".local/state/hyoui"))
         .stdin(Stdio::null());
     command
 }
@@ -47,7 +47,7 @@ fn write_config(home: &Path, name: &str, body: &str) -> std::path::PathBuf {
     path
 }
 
-/// 隔離 HOME の面の状態の root (= `XDG_STATE_HOME/hyoui`)。
+/// 隔離 HOME の面の状態の root (= `HYOUI_STATE_DIR`)。
 fn state_root(home: &Path) -> std::path::PathBuf {
     home.join(".local/state/hyoui")
 }

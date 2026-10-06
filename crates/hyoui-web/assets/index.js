@@ -59,7 +59,6 @@
   function sortValue(s, key) {
     switch (key) {
       case 'session_id': return String(s.session_id || '').toLowerCase();
-      case 'namespace': return String(s.namespace || '').toLowerCase();
       case 'status': return (s.status === 'stopped' || s.child_stopped)
         ? 'stopped' : String(s.status || '').toLowerCase();
       case 'uptime': return s.started_unix_ms ? Date.now() - s.started_unix_ms : -1;
@@ -156,7 +155,6 @@
       const cwdStr = s.cwd || '';
       tr.innerHTML = [
         `<td>${link}</td>`,
-        `<td>${esc(s.namespace)}</td>`,
         `<td>${statusCell}</td>`,
         `<td class="uptime" title="started ${esc(startedTitle)}">${esc(uptime)}</td>`,
         `<td>${clientsCell}</td>`,

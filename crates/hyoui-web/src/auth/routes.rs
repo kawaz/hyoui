@@ -75,12 +75,16 @@ pub struct AuthContext {
 }
 
 impl AuthContext {
-    /// 既定の置き場 (`$XDG_STATE_HOME/hyoui/web/`) で組む。
-    pub fn new() -> Self {
-        Self::at(StateDir::default_root())
+    /// 既定の置き場 (`<状態の root>/web/`) で組む。
+    ///
+    /// # Errors
+    ///
+    /// 状態の root (= 面) を決められない時 (DR-0041 決定 6)。
+    pub fn new() -> Result<Self, hyoui::paths::StateRootError> {
+        Ok(Self::at(StateDir::default_root()?))
     }
 
-    /// 置き場を明示して組む (= test の隔離 `XDG_STATE_HOME`、決定 9)。
+    /// 置き場を明示して組む (= test の隔離 `HYOUI_STATE_DIR`、決定 9)。
     pub fn at(state_dir: StateDir) -> Self {
         Self {
             state_dir: Arc::new(state_dir),
@@ -101,12 +105,6 @@ impl AuthContext {
 
     pub(crate) fn ws_auth_at(&self, identity: &Identity, now_ms: u64) -> WsAuth {
         WsAuth::new(self.state_dir.clone(), &self.revocations, identity, now_ms)
-    }
-}
-
-impl Default for AuthContext {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

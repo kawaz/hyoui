@@ -26,7 +26,7 @@ fn command(args: &[&str], home: &Path) -> Command {
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_STATE_HOME", home.join(".local/state"))
-        .env("XDG_RUNTIME_DIR", home.join("run"))
+        .env("HYOUI_STATE_DIR", home.join(".local/state/hyoui"))
         .stdin(Stdio::null());
     command
 }
@@ -180,6 +180,14 @@ fn the_supervisor_starts_units_and_restarts_them_when_they_die() {
         status["supervisor"]["locations"]["XDG_STATE_HOME"],
         supervisor.path().join(".local/state").to_str().unwrap()
     );
+    assert_eq!(
+        status["supervisor"]["locations"]["HYOUI_STATE_DIR"],
+        supervisor
+            .path()
+            .join(".local/state/hyoui")
+            .to_str()
+            .unwrap()
+    );
     assert!(status["warnings"].is_null(), "{status}");
     // 走っている本人が答えた版と、その実行ファイルが答えた版が並ぶ (= 決定 7a)。
     assert_eq!(unit["version"]["running"]["version"], hyoui_version());
@@ -222,17 +230,16 @@ fn the_supervisor_starts_units_and_restarts_them_when_they_die() {
     );
 }
 
-/// 監督者の socket は session の discovery に拾われない (DR-0038 決定 4)。
+/// 監督者の socket は session の discovery に拾われない (DR-0041 決定 4)。
 ///
-/// web の状態は session socket の base (`hyoui/`) の直下 (`hyoui/web/`) にあり、
-/// discovery はその直下の dir を namespace として `*.sock` に問い合わせる。拾われると
-/// 一覧に `web` の session として並ぶうえ、問い合わせと監督者の 1 行読みが待ち合って
-/// 監督者が止まる。
+/// discovery は状態の root の `sessions/` だけを見るので、`web/run/` の監督者の socket に
+/// hyoui protocol で問い合わせない。拾われると一覧に session として並ぶうえ、問い合わせと
+/// 監督者の 1 行読みが待ち合って監督者が止まる。
 #[test]
 fn the_supervisor_socket_is_not_a_session() {
     let supervisor = Supervised::start(tempfile::tempdir().expect("isolated HOME"));
     let started = Instant::now();
-    let output = supervisor.run(&["list", "--all-namespaces", "--format=jsonl"]);
+    let output = supervisor.run(&["list", "--format=jsonl"]);
     let took = started.elapsed();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

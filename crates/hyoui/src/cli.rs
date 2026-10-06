@@ -389,9 +389,9 @@ pub struct RunConfig {
     /// `--detached`: daemon を別 process で起動して親はすぐ exit。session id を
     /// stdout に 1 行 print してから親が終わる。attach は別 process から行う。
     pub detached: bool,
-    /// `--session`: 自動採番 (`run-<pid>-<rand4hex>`) ではなく明示 session id を使う。
-    /// socket path 自動解決にもこの値が入る。
-    pub session: Option<String>,
+    /// `--session-id`: 起動側が決めた session id (DR-0041 決定 2、UUID 標準形)。`None` なら
+    /// hyoui が振る。socket path 自動解決にもこの値が入る。
+    pub session_id: Option<String>,
     /// `--on-child-suspend`: 子が stop したときの daemon 側 policy (DR-0019 §3)。
     ///
     /// `None` = flag 未指定。この場合 caller (= `run_command`) が config.toml の
@@ -415,9 +415,6 @@ pub struct RunConfig {
     /// redraw / DR-0013 state-based 翻訳の結果を含む = 「ユーザの terminal が
     /// 見ている形」が残る。
     pub debug_dump_client: Option<String>,
-    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。socket 配置先 dir と、
-    /// 子プロセスへ常時注入する `HYOUI_NAMESPACE` env の値を決める。
-    pub namespace: Option<String>,
     /// `--pty-stdin` (DR-0042 決定 3): 呼び出し元の stdin を子に渡さず、子の stdin も PTY に
     /// する。`false` (= 既定) では、呼び出し元の stdin が tty でない時その fd が子の fd 0 に
     /// なる (DR-0042 決定 1)。呼び出し元の stdin が tty ならどちらでも子の stdin は PTY。
@@ -460,9 +457,6 @@ pub struct AttachConfig {
     /// 存在しない場合は index 解釈、数字以外の session-id を強制したい場合は
     /// `--` セパレータか `--index=N` を使う。
     pub index: Option<i32>,
-    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。session / index 解決を
-    /// namespace スコープに絞る。
-    pub namespace: Option<String>,
     /// `--quiet` (DR-0020 §5)。attach 成立時の stderr ヒント (= detach/peek 案内) を
     /// 抑止する。非 tty stderr では flag に関わらずヒントを出さない。
     pub quiet: bool,
@@ -485,8 +479,6 @@ pub struct DetachConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
-    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
-    pub namespace: Option<String>,
 }
 
 /// `upgrade [session]` の設定 (DR-0028 §2 Phase 3)。
@@ -504,8 +496,6 @@ pub struct UpgradeConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
-    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
-    pub namespace: Option<String>,
     /// `--binary=<path>` — daemon が exec する新バイナリ。省略時は daemon 側の
     /// `current_exe()` が使われる (DR-0028 §2)。
     pub binary_path: Option<String>,
@@ -532,14 +522,6 @@ pub enum ListFormat {
 pub struct ListConfig {
     /// 出力 format (= default Plain、`--format=jsonl` で JSON Lines)。
     pub format: ListFormat,
-
-    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。表示対象を当該
-    /// namespace のみに絞る。`all_namespaces` 指定時は無視される。
-    pub namespace: Option<String>,
-
-    /// `--all-namespaces` (= DR-0018)。全 namespace を横断 scan し、出力に NS 列を
-    /// 追加する。
-    pub all_namespaces: bool,
 }
 
 /// `kill` subcommand configuration.
@@ -601,9 +583,6 @@ pub struct KillConfig {
     /// default `false` (= timeout 時はエラー終了、子は生かす)。`--wait` 無しでの
     /// 指定は parse エラー (= timeout 概念が無い経路に昇格指定は無意味)。
     pub kill_on_timeout: bool,
-    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。session / index / --all の
-    /// 解決を namespace スコープに絞る。
-    pub namespace: Option<String>,
 }
 
 /// 裸 `--wait` (= 値なし) のデフォルト timeout (ms)。
@@ -634,9 +613,6 @@ pub struct StatusConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
-    /// `--namespace=X` flag の生値 (= 未指定なら None、実行時に env / default へ fallback)。
-    /// DR-0018: session 解決を namespace スコープに絞る。
-    pub namespace: Option<String>,
     /// `--format=plain|json` (= default `Plain`、H5: scripting で grep/cut の罠回避)。
     pub format: StatusFormat,
 }
@@ -653,8 +629,6 @@ pub struct SetConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
-    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
-    pub namespace: Option<String>,
     /// 変更する設定 key (= `on-child-suspend` 等、`key=value` の左辺)。
     pub key: String,
     /// 設定 value (= `notify` / `auto-resume` 等、`key=value` の右辺)。
@@ -678,8 +652,6 @@ pub struct TailConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
-    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
-    pub namespace: Option<String>,
     /// `--follow` で daemon が live stream を継続送信。
     pub follow: bool,
     /// `--strip-ansi` (alias: `--strip`) で daemon 側で escape を strip 済の TailData を流す。
@@ -711,8 +683,6 @@ pub struct WaitConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
-    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
-    pub namespace: Option<String>,
     /// regex pattern (= visible state に対する正規表現)。空文字列は parser 段で
     /// reject。multiline mode は実行側 (= `wait_core::wait_for_pattern`) で default
     /// ON にする。
@@ -794,8 +764,6 @@ pub struct ScreenDumpConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
-    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
-    pub namespace: Option<String>,
     /// `--format=ansi|binary|cbor` (= default ansi)。
     pub format: ScreenDumpCliFormat,
     /// `--layer=visible|scrollback|both` (= default visible、MVP は visible のみ送信)。
@@ -847,8 +815,6 @@ pub struct ScreenSnapshotConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
-    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
-    pub namespace: Option<String>,
     /// `--include=Cells,Cursor,...` (= comma-separated)、default は全 component。
     /// Vec はそのまま wire の `include: Vec<SnapshotComponent>` に流す。
     pub include: Vec<SnapshotCliComponent>,
@@ -916,8 +882,6 @@ pub struct LockAcquireConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
-    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
-    pub namespace: Option<String>,
     /// `--mode=wait|fail` (= default Wait)。fail = 即時 fail、wait = polling retry。
     pub mode: LockMode,
     /// `--timeout=<dur>` (= acquire 全体 timeout、`None` なら無限 wait)。
@@ -935,8 +899,6 @@ pub struct LockReleaseConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
-    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
-    pub namespace: Option<String>,
     /// `--token=<T>` の値 (`HYOUI_LOCK_TOKEN` env fallback あり、parser 段では None 可、
     /// CLI dispatcher 側で env を読む)。CLI flag で空文字列は parser 段で reject。
     pub token: Option<String>,
@@ -1032,8 +994,6 @@ pub struct RecordStartConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
-    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
-    pub namespace: Option<String>,
     /// 録画 direction (= default `Both`、`Raw` format との組合せでは parse 段で reject)。
     pub direction: RecordDirectionArg,
     /// 出力 format (= default `Jsonl`)。
@@ -1071,8 +1031,6 @@ pub struct RecordStopConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
-    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
-    pub namespace: Option<String>,
     /// `--id <N>` で停止対象 record_id を明示。`None` の場合 main.rs 側で
     /// `record list` を先に query して single active のみ自動採用する
     /// (= multiple active なら error、none なら error)。
@@ -1090,8 +1048,6 @@ pub struct RecordListConfig {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
-    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
-    pub namespace: Option<String>,
     /// `--format=table|jsonl` (= default `Table`)。
     pub format: RecordListFormatArg,
 }
@@ -1272,27 +1228,6 @@ fn parse_list(args: &[String]) -> Command {
     for a in args {
         let (name, inline_value) = split_eq(a.as_str());
         match name.as_str() {
-            "--all-namespaces" => {
-                if inline_value.is_some() {
-                    return Command::Error(
-                        "list: --all-namespaces does not take a value".to_string(),
-                    );
-                }
-                cfg.all_namespaces = true;
-            }
-            "--namespace" => match inline_value.as_deref() {
-                Some(v) => {
-                    if let Err(e) = validate_namespace(v) {
-                        return Command::Error(format!("list: --namespace: {e}"));
-                    }
-                    cfg.namespace = Some(v.to_string());
-                }
-                None => {
-                    return Command::Error(
-                        "list: --namespace requires a value (= `--namespace=<ns>`)".to_string(),
-                    );
-                }
-            },
             "--format" => match inline_value.as_deref() {
                 Some("plain") => cfg.format = ListFormat::Plain,
                 Some("jsonl") => cfg.format = ListFormat::Jsonl,
@@ -1309,11 +1244,6 @@ fn parse_list(args: &[String]) -> Command {
             },
             other => return Command::Error(format!("list: unexpected argument: {other}")),
         }
-    }
-    if cfg.namespace.is_some() && cfg.all_namespaces {
-        return Command::Error(
-            "list: --namespace と --all-namespaces は同時に指定できません".to_string(),
-        );
     }
     Command::List(cfg)
 }
@@ -1406,15 +1336,6 @@ fn parse_kill(args: &[String]) -> Command {
             "--socket" => match value {
                 Some(v) => cfg.socket = Some(v),
                 None => return Command::Error("--socket requires a value".into()),
-            },
-            "--namespace" => match value {
-                Some(v) => {
-                    if let Err(e) = validate_namespace(&v) {
-                        return Command::Error(format!("kill: --namespace: {e}"));
-                    }
-                    cfg.namespace = Some(v);
-                }
-                None => return Command::Error("--namespace requires a value".into()),
             },
             // DR-0012: 旧 `--signum N` は完全廃止 (= --signal で数字も受ける)。
             // 数字 / 略名 / SIG-prefix 大文字 全部 normalize 経由で wire 形式に揃える。
@@ -1593,9 +1514,7 @@ fn parse_kill(args: &[String]) -> Command {
 /// `$HYOUI_SESSION_ID` が set + 非空か (= 中から実行されているか、DR-0020 §2)。
 ///
 /// parse 段では値の解決 / stale 検証はせず「中から実行か否か」の有無だけ見る
-/// (= 値解決と socket liveness 検証は main.rs の resolve 層が担う)。env を読むのは
-/// namespace 解決 (`HYOUI_NAMESPACE`) と同枠で、CLI parser が env を参照する既存の
-/// 流儀に揃える。
+/// (= 値解決と socket liveness 検証は main.rs の resolve 層が担う)。
 fn has_self_session_env() -> bool {
     // Design rationale: lib ユニットテスト (= `cfg(test)`) では常に false を返す。
     // 多数の parse テストが「session 省略 = required エラー」を期待しており、
@@ -1631,7 +1550,6 @@ where
 {
     let mut socket: Option<String> = None;
     let mut index: Option<i32> = None;
-    let mut namespace: Option<String> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut i = 0usize;
     while i < args.len() {
@@ -1656,19 +1574,6 @@ where
             "--socket" => match value {
                 Some(v) => socket = Some(v),
                 None => return Err(Command::Error(format!("{name}: --socket requires a value"))),
-            },
-            "--namespace" => match value {
-                Some(v) => {
-                    if let Err(e) = validate_namespace(&v) {
-                        return Err(Command::Error(format!("{name}: --namespace: {e}")));
-                    }
-                    namespace = Some(v);
-                }
-                None => {
-                    return Err(Command::Error(format!(
-                        "{name}: --namespace requires a value"
-                    )));
-                }
             },
             "--index" => match value {
                 Some(v) => match v.parse::<i32>() {
@@ -1747,20 +1652,14 @@ where
         socket,
         session_id,
         index,
-        namespace,
     })
 }
 
-/// [`parse_session_targeted`] が返す session 選択情報 (= DR-0018 で namespace 追加)。
-///
-/// 旧来の `(socket, session_id, index)` tuple を struct 化し、`namespace` を足した。
-/// `namespace` は `--namespace=X` flag の生値 (= 未指定なら `None`、実行時に env /
-/// default へ fallback される)。
+/// [`parse_session_targeted`] が返す session 選択情報。
 struct SessionTarget {
     socket: Option<String>,
     session_id: Option<String>,
     index: Option<i32>,
-    namespace: Option<String>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -1791,7 +1690,6 @@ fn parse_status(args: &[String]) -> Command {
             socket: t.socket,
             session_id: t.session_id,
             index: t.index,
-            namespace: t.namespace,
             format,
         }),
         Err(c) => c,
@@ -1800,7 +1698,7 @@ fn parse_status(args: &[String]) -> Command {
 
 /// `hyoui set <session> <key>=<value>` を parse する (DR-0019 Update)。
 ///
-/// session 選択は他 CLI と同流儀 (= 位置引数 / `--index` / `--socket`、`--namespace`)。
+/// session 選択は他 CLI と同流儀 (= 位置引数 / `--index` / `--socket`)。
 /// `set` は session 位置引数に加えて `key=value` 位置引数を取るため、共通の
 /// [`parse_session_targeted`] (= 位置引数 1 個前提) ではなく専用 loop で parse する。
 /// 位置引数のうち `=` を含むものを `key=value`、それ以外を session_id として扱う。
@@ -1809,7 +1707,6 @@ fn parse_set(args: &[String]) -> Command {
     let mut socket: Option<String> = None;
     let mut session_id: Option<String> = None;
     let mut index: Option<i32> = None;
-    let mut namespace: Option<String> = None;
     let mut kv: Option<(String, String)> = None;
     let mut positional_session: Option<String> = None;
 
@@ -1839,15 +1736,6 @@ fn parse_set(args: &[String]) -> Command {
             "--socket" => match value {
                 Some(v) => socket = Some(v),
                 None => return Command::Error("set: --socket requires a value".into()),
-            },
-            "--namespace" => match value {
-                Some(v) => {
-                    if let Err(e) = validate_namespace(&v) {
-                        return Command::Error(format!("set: --namespace: {e}"));
-                    }
-                    namespace = Some(v);
-                }
-                None => return Command::Error("set: --namespace requires a value".into()),
             },
             "--index" => match value {
                 Some(v) => match v.parse::<i32>() {
@@ -1930,7 +1818,6 @@ fn parse_set(args: &[String]) -> Command {
         socket,
         session_id,
         index,
-        namespace,
         key,
         value,
     })
@@ -1986,7 +1873,6 @@ fn parse_tail(args: &[String]) -> Command {
                 socket: t.socket,
                 session_id: t.session_id,
                 index: t.index,
-                namespace: t.namespace,
                 follow,
                 strip_ansi,
                 since_ms,
@@ -2003,7 +1889,6 @@ fn parse_wait(args: &[String]) -> Command {
     let mut poll_interval_ms: Option<u64> = None;
     let mut socket: Option<String> = None;
     let mut index: Option<i32> = None;
-    let mut namespace: Option<String> = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut i = 0usize;
     while i < args.len() {
@@ -2034,15 +1919,6 @@ fn parse_wait(args: &[String]) -> Command {
             "--socket" => match value {
                 Some(v) => socket = Some(v),
                 None => return Command::Error("wait: --socket requires a value".into()),
-            },
-            "--namespace" => match value {
-                Some(v) => {
-                    if let Err(e) = validate_namespace(&v) {
-                        return Command::Error(format!("wait: --namespace: {e}"));
-                    }
-                    namespace = Some(v);
-                }
-                None => return Command::Error("wait: --namespace requires a value".into()),
             },
             "--timeout" => match value {
                 Some(v) => match parse_duration_ms(&v) {
@@ -2160,7 +2036,6 @@ fn parse_wait(args: &[String]) -> Command {
         socket,
         session_id,
         index,
-        namespace,
         pattern,
         timeout_ms,
         poll_interval_ms,
@@ -2470,7 +2345,6 @@ fn parse_attach(args: &[String]) -> Command {
         mode_str: None,
         debug_dump_client: None,
         index: None,
-        namespace: None,
         quiet: false,
     };
 
@@ -2503,15 +2377,6 @@ fn parse_attach(args: &[String]) -> Command {
             "--socket" => match value {
                 Some(v) => cfg.socket = Some(v),
                 None => return Command::Error("--socket requires a value".into()),
-            },
-            "--namespace" => match value {
-                Some(v) => {
-                    if let Err(e) = validate_namespace(&v) {
-                        return Command::Error(format!("attach: --namespace: {e}"));
-                    }
-                    cfg.namespace = Some(v);
-                }
-                None => return Command::Error("--namespace requires a value".into()),
             },
             "--mode" => match value {
                 Some(v) => cfg.mode_str = Some(v),
@@ -2664,7 +2529,7 @@ pub fn usage(topic: &HelpTopic) -> String {
 /// `hyoui upgrade` subcommand の usage (DR-0028 §2 Phase 3)。
 fn usage_upgrade() -> String {
     "\
-hyoui upgrade [session] [--socket=<path>] [--index=<N>] [--namespace=<NS>]
+hyoui upgrade [session] [--socket=<path>] [--index=<N>]
                [--binary=<path>] [--skip-version-check]
 
 Trigger daemon graceful self-exec upgrade (DR-0028 §2 Phase 3). The daemon
@@ -2677,7 +2542,6 @@ By default the daemon re-execs `current_exe()`, so the intended workflow is
 Options:
   --socket=<path>           Explicit socket path (alternative to session-id).
   --index=<N>               Session selector (= mtime 昇順、1=最古 / -1=最新)。
-  --namespace=<NS>          Session namespace (default \"default\").
   --binary=<path>           Override the daemon's execve target with the given
                             absolute path (must be regular file, executable, and
                             owned by the current euid). Client-side
@@ -2828,10 +2692,11 @@ hyoui web passkey <subcommand>
 Manage the passkeys that may open a web endpoint. Registration is issued here
 and nowhere else: there is no remote enrolment path and no recovery path.
 
-Every command reads and writes
-`${XDG_STATE_HOME:-~/.local/state}/hyoui/web/auth.json` (and `pending.json`)
-directly. No running gateway is required -- add works while every unit is
-stopped. No arguments prints this help.
+Every command reads and writes `<state root>/web/auth.json` (and
+`pending.json`) directly, where the state root is $HYOUI_STATE_DIR, else
+$XDG_STATE_HOME/hyoui, else ~/.local/state/hyoui. No running gateway is
+required -- add works while every unit is stopped. No arguments prints this
+help.
 
 SUBCOMMANDS:
   add --endpoint <url>           Issue an invite URL and a 6-digit code.
@@ -2973,7 +2838,7 @@ hyoui web daemon <subcommand>
 Manage gateway instances (units). A unit is one config file, anywhere you like
 (by default under `${XDG_CONFIG_HOME:-~/.config}/hyoui/web/`); its `[web]`
 section holds the bind address and the rest. The registry under
-`${XDG_STATE_HOME:-~/.local/state}/hyoui/web/units/` only records which config
+`<state root>/web/units/` only records which config
 each unit reads, the executable to start, and whether it should be running. No
 arguments prints this help.
 
@@ -3110,7 +2975,7 @@ fn usage_web_daemon_log() -> String {
 hyoui web daemon log [<name>] | --all [--follow]
 
 Print what units have written. The supervisor collects each child's output into
-`${XDG_STATE_HOME:-~/.local/state}/hyoui/web/logs/<name>.log` and hands the
+`<state root>/web/logs/<name>.log` and hands the
 same lines to anyone following, so --follow does not re-read the file.
 
 Rotation is left to the system (newsyslog or logrotate); hyoui only appends.
@@ -3163,7 +3028,7 @@ with.
 With --no-config, no config file is read: the gateway uses the built-in
 defaults (`127.0.0.1:43690`, embedded assets) and --listen. This is meant for
 tests, e.g.
-  XDG_STATE_HOME=<tmp> hyoui web daemon run --no-config --listen 127.0.0.1:0
+  HYOUI_STATE_DIR=<tmp> hyoui web daemon run --no-config --listen 127.0.0.1:0
 
 No arguments prints this help.
 
@@ -3293,7 +3158,7 @@ Install or replace the supervisor's definition and start it now. The installed
 command is `<path> web daemon supervise`, which holds every registered unit.
 
 The environment variables that decide where config and state live (HOME,
-XDG_CONFIG_HOME, XDG_STATE_HOME, XDG_RUNTIME_DIR) are written into the
+XDG_CONFIG_HOME, XDG_STATE_HOME, HYOUI_STATE_DIR) are written into the
 definition with this shell's values, together with PATH (duplicates removed),
 so the supervisor finds the same places this shell does. When a definition
 already pins different values, nothing is changed: the differences are printed
@@ -3460,8 +3325,7 @@ fn parse_run(args: &[String]) -> Command {
     let mut pty_stdin = false;
     let mut command: Vec<String> = Vec::new();
     let mut detached = false;
-    let mut session: Option<String> = None;
-    let mut namespace: Option<String> = None;
+    let mut session_id: Option<String> = None;
     let mut scrollback_rows: Option<usize> = None;
     let mut debug_dump_server: Option<String> = None;
     let mut debug_dump_client: Option<String> = None;
@@ -3604,23 +3468,14 @@ fn parse_run(args: &[String]) -> Command {
                 detached = true;
                 consumed_extra = false; // bool flag は次 arg を食わない
             }
-            "--session" => match value {
+            "--session-id" => match value {
                 Some(v) => {
                     if let Err(e) = validate_session_id(&v) {
-                        return Command::Error(format!("--session: {e}"));
+                        return Command::Error(format!("--session-id: {e}"));
                     }
-                    session = Some(v);
+                    session_id = Some(v);
                 }
-                None => return Command::Error("--session requires a value".into()),
-            },
-            "--namespace" => match value {
-                Some(v) => {
-                    if let Err(e) = validate_namespace(&v) {
-                        return Command::Error(format!("--namespace: {e}"));
-                    }
-                    namespace = Some(v);
-                }
-                None => return Command::Error("--namespace requires a value".into()),
+                None => return Command::Error("--session-id requires a value".into()),
             },
             "--scrollback-rows" => match value.as_deref() {
                 Some(v) => match v.parse::<usize>() {
@@ -3682,12 +3537,11 @@ fn parse_run(args: &[String]) -> Command {
         until,
         socket,
         detached,
-        session,
+        session_id,
         on_child_suspend,
         scrollback_rows,
         debug_dump_server,
         debug_dump_client,
-        namespace,
         pty_stdin,
         no_scrub_env,
         login,
@@ -3835,7 +3689,6 @@ fn parse_screen_dump(args: &[String]) -> Command {
             socket: t.socket,
             session_id: t.session_id,
             index: t.index,
-            namespace: t.namespace,
             format,
             layer,
             rect,
@@ -3950,7 +3803,6 @@ fn parse_screen_snapshot(args: &[String]) -> Command {
                 socket: t.socket,
                 session_id: t.session_id,
                 index: t.index,
-                namespace: t.namespace,
                 include,
                 format,
                 output,
@@ -4100,7 +3952,6 @@ fn parse_lock_acquire(args: &[String]) -> Command {
             socket: t.socket,
             session_id: t.session_id,
             index: t.index,
-            namespace: t.namespace,
             mode,
             timeout_ms,
         })),
@@ -4144,7 +3995,6 @@ fn parse_lock_release(args: &[String]) -> Command {
             socket: t.socket,
             session_id: t.session_id,
             index: t.index,
-            namespace: t.namespace,
             token,
         })),
         Err(c) => c,
@@ -4174,7 +4024,6 @@ fn parse_unlock(args: &[String]) -> Command {
             socket: t.socket,
             session_id: t.session_id,
             index: t.index,
-            namespace: t.namespace,
             token,
         }),
         Err(c) => c,
@@ -4196,7 +4045,6 @@ fn parse_detach(args: &[String]) -> Command {
             socket: t.socket,
             session_id: t.session_id,
             index: t.index,
-            namespace: t.namespace,
         }),
         Err(c) => c,
     }
@@ -4238,7 +4086,6 @@ fn parse_upgrade(args: &[String]) -> Command {
             socket: t.socket,
             session_id: t.session_id,
             index: t.index,
-            namespace: t.namespace,
             binary_path: binary_path.into_inner(),
             skip_version_check: skip_version_check.into_inner(),
         }),
@@ -4529,7 +4376,6 @@ fn parse_record_start(args: &[String]) -> Command {
         socket: t.socket,
         session_id: t.session_id,
         index: t.index,
-        namespace: t.namespace,
         direction,
         format,
         output_path,
@@ -4591,7 +4437,6 @@ fn parse_record_stop(args: &[String]) -> Command {
         socket: t.socket,
         session_id: t.session_id,
         index: t.index,
-        namespace: t.namespace,
         record_id,
         all,
     }))
@@ -4636,7 +4481,6 @@ fn parse_record_list(args: &[String]) -> Command {
         socket: t.socket,
         session_id: t.session_id,
         index: t.index,
-        namespace: t.namespace,
         format,
     }))
 }
@@ -5448,11 +5292,11 @@ fn usage_run() -> String {
                 attach で操作し続ける shell / REPL を、端末の無い起動元から\n                                  \
                 作る時に付ける (例: --detached --pty-stdin -- bash -i)。\n                                  \
                 stdin が端末なら付けなくても同じ\n    \
-            --session ID                  自動採番 (= run-<pid>-<rand4hex>) ではなく\n                                  \
-                明示 session id を使う。socket path 自動解決にも\n                                  \
-                この値が入る (DR-0015)\n    \
-            --namespace NS                Session namespace (default: \"default\";\n                                  \
-                env HYOUI_NAMESPACE で継承可、子に常時注入される)\n    \
+            --session-id UUID             session id を起動側が決める (DR-0041)。小文字・ハイフン付きの\n                                  \
+                UUID 標準形 (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) だけを\n                                  \
+                受け付ける (大文字やハイフン無しはエラー、正規化しない)。\n                                  \
+                省略すると hyoui が振る。同じ id の socket が既にあれば\n                                  \
+                (daemon が死んで残った socket も) 起動せずエラー\n    \
             --on-child-suspend=notify|auto-resume\n                                  \
                 Action when the child is stopped\n                                  \
                 (notify: tell the leader client; auto-resume: daemon\n                                  \
@@ -5485,10 +5329,9 @@ fn usage_run() -> String {
             読む)。stdin が端末なら子の stdin も PTY。--pty-stdin で常に PTY にできる\n\
         \n\
         ENVIRONMENT:\n    \
-            XDG_RUNTIME_DIR        Preferred base for the auto-generated socket path\n    \
-            XDG_STATE_HOME         Fallback base when XDG_RUNTIME_DIR is unavailable\n                                   \
-                (otherwise $HOME/.local/state/hyoui is used; TMPDIR is not consulted)\n    \
-            HYOUI_NAMESPACE        Session namespace (= --namespace の env 経路、flag 優先)\n    \
+            HYOUI_STATE_DIR        状態の root (= 面、DR-0041)。socket は <root>/sessions/<id>.sock\n    \
+            XDG_STATE_HOME         HYOUI_STATE_DIR が無い時の root の親 ($XDG_STATE_HOME/hyoui、\n                                   \
+                絶対パスの時だけ。無ければ $HOME/.local/state/hyoui)\n    \
             HYOUI_SCROLLBACK_ROWS  --scrollback-rows と同じ値を env で渡す\n                                   \
                 (--scrollback-rows 指定時は flag 優先)\n    \
             TERM                   子に引き継ぐ (--login でも同じ)。未設定 / 空なら\n                                   \
@@ -5529,7 +5372,6 @@ fn usage_attach() -> String {
         OPTIONS:\n    \
             --socket PATH         Explicit socket path (alternative to session-id)\n    \
             --index N             session を mtime 昇順の index で指定 (= 1=最古, -1=最新)\n    \
-            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --mode rw|ro|rw-no-leader\n                          \
                 Operating mode (default: rw)\n    \
             --quiet               attach 成立時の detach/peek ヒント (stderr) を抑止 (DR-0020 §5)\n    \
@@ -5604,7 +5446,6 @@ fn usage_status() -> String {
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
             --index N       Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
-            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             -h, --help      Show this help and exit\n\
         \n\
         SELF-SESSION (DR-0020 §2):\n    \
@@ -5657,7 +5498,6 @@ fn usage_set() -> String {
         OPTIONS:\n    \
             --socket PATH     Explicit socket path (alternative to session-id)\n    \
             --index N         Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
-            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             -h, --help        Show this help and exit\n\
         \n\
         EXIT CODE:\n    \
@@ -5686,7 +5526,6 @@ fn usage_tail() -> String {
         OPTIONS:\n    \
             --socket PATH        Explicit socket path (alternative to session-id)\n    \
             --index N            Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
-            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --follow             子 PTY exit / TailEnd まで stream を継続する\n    \
             --strip-ansi         ANSI escape を strip 済の bytes を受け取る (alias: `--strip`)\n    \
             --since DUR          過去 DUR 以内の chunk のみ流す。単位必須 (例: 500ms / 2s / 1m)\n    \
@@ -5748,7 +5587,6 @@ fn usage_wait() -> String {
         OPTIONS:\n    \
             --socket PATH         Explicit socket path (alternative to session-id)\n    \
             --index N             Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
-            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --timeout DUR         絶対 timeout。**指定なしは無限 wait**\n    \
             --poll-interval DUR   snapshot polling 周期 (default 100ms)。\n                      \
                                   環境変数 `HYOUI_WAIT_POLL_MS` でも override 可。\n    \
@@ -5778,22 +5616,19 @@ fn usage_list() -> String {
         "hyoui list — list daemon sessions (= socket dir scan + status query)\n\
         \n\
         USAGE:\n    \
-            hyoui list [--namespace=<ns>] [--all-namespaces] [--format=plain|jsonl]\n\
+            hyoui list [--format=plain|jsonl]\n\
         \n\
         OPTIONS:\n    \
-            --namespace NS      表示対象を指定 namespace に絞る (= default: env HYOUI_NAMESPACE\n                                \
-                                or \"default\")。`--all-namespaces` とは排他\n    \
-            --all-namespaces    全 namespace を横断表示 (= NS 列を追加)。\n    \
             --format=plain|jsonl  出力 format (= default plain)。jsonl は 1 session 1 行の JSON object\n    \
             -h, --help          Show this help and exit\n\
         \n\
         OUTPUT (plain, fixed-width columns, sorted by socket mtime ascending):\n    \
-            SESSION              STATUS  PID      DUR        CLIENTS  CWD                              ARGV\n    \
-            test-claude          live    12345    1h2m       2        kawaz/hyoui/main                 claude\n    \
-            waiting              no-response 12345    -          -        -                                -\n\
+            SESSION                               STATUS  PID      DUR        CLIENTS  CWD                              ARGV\n    \
+            0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f  live    12345    1h2m       2        kawaz/hyoui/main                 claude\n    \
+            5c9d0e1f-2a3b-4c4d-8e5f-6a7b8c9d0e1f  no-response 12345    -          -        -                                -\n\
         \n\
         COLUMNS (plain):\n    \
-            SESSION   session id (= socket file 名から拡張子を除いた値、20ch で truncate)\n    \
+            SESSION   session id (= UUID。socket file 名から拡張子を除いた値、省略しない)\n    \
             STATUS    live | stopped | no-response | stale | error (= stopped は子が ^Z/SIGSTOP で停止中)\n    \
             PID       live/stopped は子 PTY、no-response は daemon の PID\n    \
             DUR       socket mtime からの経過時間 (= 1h2m / 15m / 3d4h 形式)\n    \
@@ -5812,19 +5647,17 @@ fn usage_list() -> String {
             connect 拒否時は daemon lock の非保持を確認した残骸だけ socket と lock を削除する。lock 保持中は no-response、lock 不在は stale として socket を残す。\n    \
             接続後 5 秒以内に応答が無ければ no-response として daemon PID を表示する。backlog 飽和で connect を拒否された場合も no-response とするが、PID は不明。\n\
         \n\
-        SCAN ORDER (= socket_path::resolve_in_namespace と同順、最初に見つかった dir のみ):\n    \
-            default namespace: base dir 直下 (= 既存互換):\n    \
-            \x20 1. $XDG_RUNTIME_DIR/hyoui/\n    \
-            \x20 2. ${XDG_STATE_HOME:-$HOME/.local/state}/hyoui/  (= $TMPDIR は読まない)\n    \
-            その他 namespace: <base>/<ns>/。--all-namespaces は base 配下のサブ dir も走査。\n\
+        SCAN:\n    \
+            <状態の root>/sessions/*.sock だけを見る (= 全 session が並ぶ)。状態の root は\n    \
+            $HYOUI_STATE_DIR → $XDG_STATE_HOME/hyoui (絶対パスの時だけ) → $HOME/.local/state/hyoui。\n    \
+            root を変えた別の面の session は見えない。root 直下や他の dir に古い置き場の\n    \
+            socket が残っていれば stderr に警告する (読まない)。\n\
         \n\
         EXIT CODE:\n    \
             0   正常終了 (= 0 件でも成功扱い、stderr に `no sessions found` を 1 行)\n\
         \n\
         EXAMPLES:\n    \
-            hyoui list                              # 現在の namespace (default) の session 一覧\n    \
-            hyoui list --namespace=workers          # workers namespace のみ表示\n    \
-            hyoui list --all-namespaces             # 全 namespace 横断 (= NS 列付き)\n    \
+            hyoui list                              # session 一覧\n    \
             hyoui list --format=jsonl               # 機械可読 (1 session 1 行 JSON)\n    \
             hyoui list --format=jsonl | jq -r '.session'  # session id を抽出\n\
         \n\
@@ -5861,7 +5694,6 @@ fn usage_kill() -> String {
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
             --index N       session selector index (= mtime 昇順、1 最古 / -1 最新)\n    \
-            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --all           全 live session を順次 kill (= killall 相当)\n    \
             --signal SPEC   送信 signal (= default SIGTERM)。数字 / 略名 / SIG-prefix 大文字 OK\n    \
             --wait[=DUR]    子 exit + session 終了まで見届けて return。\n    \
@@ -5954,7 +5786,6 @@ fn usage_screen_dump() -> String {
         OPTIONS:\n    \
             --socket PATH       Explicit socket path (alternative to session-id)\n    \
             --index N           Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
-            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --format FMT        Output format (default: ansi)\n                        \
                 ansi       — raw ANSI bytes (= terminal で cat 再生可)\n                        \
                 binary     — 空白除去 + 改行 plaintext (= grep 用)\n                        \
@@ -6012,7 +5843,6 @@ fn usage_screen_snapshot() -> String {
         OPTIONS:\n    \
             --socket PATH       Explicit socket path (alternative to session-id)\n    \
             --index N           Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
-            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --include SET       Components (comma-separated, case-insensitive; default: all)\n                        \
                 Cells, Cursor, Mode, WindowSize, Buffer, SequenceNo\n    \
             --format FMT        Output format (default: cbor)\n                        \
@@ -6081,7 +5911,6 @@ fn usage_lock_acquire() -> String {
         OPTIONS:\n    \
             --socket PATH       Explicit socket path (alternative to session-id)\n    \
             --index N           Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
-            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --mode wait|fail    Behavior when another holder exists (default: wait)\n                        \
                 wait — keep polling until acquired or --timeout expires\n                        \
                 fail — exit 1 immediately when denied\n    \
@@ -6140,7 +5969,6 @@ fn usage_lock_release() -> String {
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
             --index N       Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
-            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --token TOKEN   Lock token to release (required; env HYOUI_LOCK_TOKEN fallback)\n    \
             -h, --help      Show this help and exit\n\
         \n\
@@ -6185,7 +6013,6 @@ fn usage_unlock() -> String {
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
             --index N       Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
-            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --token TOKEN   Lock token to release (required; env HYOUI_LOCK_TOKEN fallback)\n    \
             -h, --help      Show this help and exit\n\
         \n\
@@ -6231,7 +6058,6 @@ fn usage_detach() -> String {
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
             --index N       Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
-            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             -h, --help      Show this help and exit\n\
         \n\
         SELF-SESSION (DR-0020 §2):\n    \
@@ -6291,7 +6117,6 @@ fn usage_record_start() -> String {
         OPTIONS:\n    \
             --socket PATH               Explicit socket path (alternative to session-id)\n    \
             --index N                   Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
-            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --output PATH               出力 file path (= **絶対 path 必須**)\n    \
             --stdin                     録画 direction: 子 PTY 入力のみ\n    \
             --stdout                    録画 direction: 子 PTY 出力のみ\n    \
@@ -6350,7 +6175,6 @@ fn usage_record_stop() -> String {
         OPTIONS:\n    \
             --socket PATH    Explicit socket path (alternative to session-id)\n    \
             --index N        Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
-            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --id N           停止対象の record_id (= record start の戻り値、または\n                             \
                 record list で確認)\n    \
             --all            同 session の全 active record を一括停止 (= `--id` と排他)\n    \
@@ -6384,7 +6208,6 @@ fn usage_record_list() -> String {
         OPTIONS:\n    \
             --socket PATH       Explicit socket path (alternative to session-id)\n    \
             --index N           Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
-            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --format table|jsonl\n                                \
                                 Output format (default table)\n                                \
                                 table — 人間可読の固定長 column 1 行 1 record\n                                \
@@ -6500,8 +6323,6 @@ pub struct InputCommand {
     pub session_id: Option<String>,
     /// `--index=N` session selector (= mtime 昇順、1=最古 / -1=最新)。
     pub index: Option<i32>,
-    /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。
-    pub namespace: Option<String>,
     /// Spec list (= 出現順で送信、空 Vec は parser 段で reject)。
     pub specs: Vec<InputSpec>,
     /// Per-spec timeout (= default 5s、特に `wait:` / `wait-idle:` で意味を持つ)。
@@ -6655,7 +6476,6 @@ fn hex_nibble(b: u8) -> Option<u8> {
 fn parse_input(args: &[String]) -> Command {
     let mut socket: Option<String> = None;
     let mut index: Option<i32> = None;
-    let mut namespace: Option<String> = None;
     let mut timeout_ms: u64 = 5_000;
     let mut lock_token: Option<String> = None;
     // task #21: `file:` spec の 1 file あたり最大 bytes。
@@ -6696,15 +6516,6 @@ fn parse_input(args: &[String]) -> Command {
                     socket = Some(v);
                 }
                 None => return Command::Error("input: --socket requires a value".into()),
-            },
-            "--namespace" => match value {
-                Some(v) => {
-                    if let Err(e) = validate_namespace(&v) {
-                        return Command::Error(format!("input: --namespace: {e}"));
-                    }
-                    namespace = Some(v);
-                }
-                None => return Command::Error("input: --namespace requires a value".into()),
             },
             "--index" => match value {
                 Some(v) => match v.parse::<i32>() {
@@ -6897,7 +6708,6 @@ fn parse_input(args: &[String]) -> Command {
         socket,
         session_id,
         index,
-        namespace,
         specs,
         timeout: Duration::from_millis(timeout_ms),
         lock_token,
@@ -6928,7 +6738,6 @@ fn usage_input() -> String {
         OPTIONS:\n    \
             --socket PATH      Explicit socket path (alternative to session-id)\n    \
             --index N          Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
-            --namespace NS    Session namespace (default \"default\"; env HYOUI_NAMESPACE 経路)\n    \
             --timeout DUR      Per-spec timeout (default: 5s; DUR 形式は下記参照)\n    \
             --lock-token T     外側 lock tx の token を継承用 (DR-0022 = 継承時は\n                       \
                                auto-acquire skip、env HYOUI_LOCK_TOKEN より優先、DR-0006 §8.5)\n    \
@@ -7031,13 +6840,6 @@ fn split_eq(arg: &str) -> (String, Option<String>) {
     }
 }
 
-/// `session_id` の最大長 (= 64 chars、POSIX `NAME_MAX` の半分以下に抑える)。
-///
-/// socket file 名は `<session_id>.sock` なので、parent dir + name で
-/// `PATH_MAX` を割ることはまずないが、上限を切ることで CBOR / ANSI escape
-/// 等の異常入力経路を早期 reject する (R5-AUD-C2 path traversal 対策)。
-pub const MAX_SESSION_ID_LEN: usize = 64;
-
 /// `hyoui input <session> file:<path>` の 1 file あたり default 上限 (= 16 MiB)。
 ///
 /// DR-0006 §8.6 の「default 16MB」に従う (= MiB / MB を 1024^2 として扱う、
@@ -7060,73 +6862,60 @@ pub const DEFAULT_INPUT_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 /// ない。`--auto-lock-timeout-acquire DUR` で上書き可能。
 pub const DEFAULT_INPUT_AUTO_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// `session_id` を path traversal / 制御文字 / 過長から守る whitelist validator。
+/// session id の長さ (= UUID 標準形 `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` の 36 byte)。
+pub const SESSION_ID_LEN: usize = 36;
+
+/// hyoui が振る session id (= `run --session-id` が無い時、DR-0041 決定 2)。
 ///
-/// 許可: `[A-Za-z0-9._-]{1,64}`。さらに以下を明示 reject:
-///
-/// - 空 string (= "")
-/// - `.` 単独、`..` 単独 (= path 構成要素として親 dir 参照になる)
-/// - `/` / `\` を含む (= path separator、whitelist 外だが冗長 reject)
-///
-/// CLI argv parser 段階での早期 reject と、`socket_path::resolve` の前段
-/// 防御の **双方** で呼ばれる (= R5-AUD-C2 defense-in-depth)。
-///
-/// # Errors
-///
-/// validator に反する場合、人間可読な reason 文字列を返す。
-pub fn validate_session_id(session_id: &str) -> Result<(), String> {
-    if session_id.is_empty() {
-        return Err("session_id must not be empty".into());
-    }
-    if session_id.len() > MAX_SESSION_ID_LEN {
-        return Err(format!(
-            "session_id too long ({} bytes, max {MAX_SESSION_ID_LEN})",
-            session_id.len()
-        ));
-    }
-    if session_id == "." || session_id == ".." {
-        return Err(format!(
-            "session_id {session_id:?} is a path traversal component"
-        ));
-    }
-    for (idx, ch) in session_id.char_indices() {
-        let ok = ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-';
-        if !ok {
-            return Err(format!(
-                "session_id contains invalid character {ch:?} at byte {idx} \
-                 (allowed: [A-Za-z0-9._-])"
-            ));
-        }
-    }
-    Ok(())
+/// 乱数の UUID (v4) を標準形 (小文字・ハイフン付き) で返す。版は規定しないので、
+/// 呼び出し側は版に依存しない (= 並び順は起動時刻で決める)。
+#[must_use]
+pub fn new_session_id() -> String {
+    uuid::Uuid::new_v4().hyphenated().to_string()
 }
 
-/// session namespace の予約名 (= socket dir 直下にマップする default ns、DR-0018)。
+/// session id が UUID の標準形かを確かめる (DR-0041 決定 2)。
 ///
-/// `default` は「base socket dir 直下に socket を置く」ことを意味する
-/// 予約名。ユーザが `--namespace=default` を明示しても、namespace 未指定時と完全に
-/// 同じ dir 構造になる (= 既存 session との後方互換、dir 移動なし)。
-pub const DEFAULT_NAMESPACE: &str = "default";
-
-/// session `namespace` を path traversal / 制御文字 / 過長から守る whitelist validator
-/// (= DR-0018)。
+/// 受け付けるのは **小文字・ハイフン付き** の標準形だけ (`8-4-4-4-12` の 16 進、
+/// 例 `0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f`)。大文字・ハイフン無し・波括弧付き・
+/// 短縮 (先頭一致) はエラーにし、黙って正規化しない: 表記が違うと同じ UUID でも
+/// 別のファイル名になり、重複判定 (決定 3) をすり抜けるため、外から渡した値と socket
+/// のファイル名を常に一致させる。UUID の版は問わない。
 ///
-/// 許可: `session_id` と同等 (= `[A-Za-z0-9._-]{1,64}`)。さらに以下を明示 reject:
-///
-/// - 空 string (= "")
-/// - `.` 単独、`..` 単独 (= path 構成要素として親 dir 参照になる)
-/// - `/` を含む (= path separator。**将来の階層 namespace 用に予約**: DR-0018 で
-///   フラット ns を採用したが、`/` を区切りとして後方互換で階層化できるよう、現状は
-///   ns 名に `/` を含めること自体を禁止する)
-///
-/// `validate_session_id` と判定は同等だが、error 文言を `namespace` 文脈にして
-/// ユーザに分かりやすくする (= 同一実装に委譲しつつ文言だけ差し替え)。
+/// 許す文字は `[0-9a-f-]` だけなので、path traversal (`..` / `/`) や制御文字は
+/// ここで落ちる (= socket path に join する前の防御を兼ねる)。
 ///
 /// # Errors
 ///
-/// validator に反する場合、人間可読な reason 文字列を返す。
-pub fn validate_namespace(namespace: &str) -> Result<(), String> {
-    validate_session_id(namespace).map_err(|e| e.replace("session_id", "namespace"))
+/// 標準形でない時、何が違うか (と、正規化できる値なら直し方) を書いた文字列を返す。
+pub fn validate_session_id(session_id: &str) -> Result<(), String> {
+    const FORM: &str = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (lowercase hex, hyphenated)";
+    if session_id.is_empty() {
+        return Err(format!(
+            "session id must not be empty; give a UUID in canonical form {FORM}"
+        ));
+    }
+    let bytes = session_id.as_bytes();
+    let canonical = bytes.len() == SESSION_ID_LEN
+        && bytes.iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_digit() || (b'a'..=b'f').contains(b),
+        });
+    if canonical {
+        return Ok(());
+    }
+    let hint = if session_id.bytes().any(|b| b.is_ascii_uppercase())
+        && validate_session_id(&session_id.to_ascii_lowercase()).is_ok()
+    {
+        " (uppercase is not accepted; pass the lowercase form)"
+    } else if session_id.len() == 32 && session_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        " (the hyphens are required)"
+    } else {
+        ""
+    };
+    Err(format!(
+        "session id {session_id:?} is not a UUID in canonical form {FORM}{hint}"
+    ))
 }
 
 // =============================================================================
@@ -7400,6 +7189,9 @@ mod tests {
         xs.iter().map(|s| (*s).to_string()).collect()
     }
 
+    /// 位置引数・`--session-id` に渡す session id (= UUID 標準形、DR-0041 決定 2)。
+    const SID: &str = "0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f";
+
     // -------- Completion SSOT 定数 ↔ parse 実装の整合性検証 --------
     //
     // completion.rs はこれら定数を single source of truth として参照する。
@@ -7514,7 +7306,7 @@ mod tests {
     #[test]
     fn ssot_status_format_values_all_parse() {
         for v in STATUS_FORMAT_VALUES {
-            match parse_args(&args(&["status", "demo", "--format", v])) {
+            match parse_args(&args(&["status", SID, "--format", v])) {
                 Command::Status(_) => {}
                 other => panic!("status --format={v} rejected: {other:?}"),
             }
@@ -7534,13 +7326,13 @@ mod tests {
     #[test]
     fn ssot_screen_dump_enum_values_all_parse() {
         for v in SCREEN_DUMP_FORMAT_VALUES {
-            match parse_args(&args(&["screen", "dump", "demo", "--format", v])) {
+            match parse_args(&args(&["screen", "dump", SID, "--format", v])) {
                 Command::Screen(_) => {}
                 other => panic!("screen dump --format={v} rejected: {other:?}"),
             }
         }
         for v in SCREEN_DUMP_LAYER_VALUES {
-            match parse_args(&args(&["screen", "dump", "demo", "--layer", v])) {
+            match parse_args(&args(&["screen", "dump", SID, "--layer", v])) {
                 Command::Screen(_) => {}
                 other => panic!("screen dump --layer={v} rejected: {other:?}"),
             }
@@ -7550,7 +7342,7 @@ mod tests {
     #[test]
     fn ssot_screen_snapshot_format_values_all_parse() {
         for v in SCREEN_SNAPSHOT_FORMAT_VALUES {
-            match parse_args(&args(&["screen", "snapshot", "demo", "--format", v])) {
+            match parse_args(&args(&["screen", "snapshot", SID, "--format", v])) {
                 Command::Screen(_) => {}
                 other => panic!("screen snapshot --format={v} rejected: {other:?}"),
             }
@@ -7560,7 +7352,7 @@ mod tests {
     #[test]
     fn ssot_record_format_and_secrecy_values_all_parse() {
         for v in RECORD_LIST_FORMAT_VALUES {
-            match parse_args(&args(&["record", "list", "demo", "--format", v])) {
+            match parse_args(&args(&["record", "list", SID, "--format", v])) {
                 Command::Record(_) => {}
                 other => panic!("record list --format={v} rejected: {other:?}"),
             }
@@ -7570,7 +7362,7 @@ mod tests {
             match parse_args(&args(&[
                 "record",
                 "start",
-                "demo",
+                SID,
                 "--output",
                 "/tmp/r.out",
                 "--stdout",
@@ -7585,7 +7377,7 @@ mod tests {
             match parse_args(&args(&[
                 "record",
                 "start",
-                "demo",
+                SID,
                 "--output",
                 "/tmp/r.out",
                 "--input-secrecy",
@@ -7679,7 +7471,7 @@ mod tests {
             Command::Error(msg) => assert!(msg.contains("unknown option"), "msg: {msg}"),
             other => panic!("expected Error, got {other:?}"),
         }
-        match parse_args(&args(&["attach", "demo", "--stdin-eof=detach"])) {
+        match parse_args(&args(&["attach", SID, "--stdin-eof=detach"])) {
             Command::Error(msg) => assert!(msg.contains("unknown attach option"), "msg: {msg}"),
             other => panic!("expected Error, got {other:?}"),
         }
@@ -8176,9 +7968,9 @@ mod tests {
 
     #[test]
     fn parse_status_with_session_id() {
-        match parse_args(&args(&["status", "demo"])) {
+        match parse_args(&args(&["status", SID])) {
             Command::Status(cfg) => {
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
                 assert!(cfg.socket.is_none());
             }
             other => panic!("expected Status, got {other:?}"),
@@ -8199,9 +7991,9 @@ mod tests {
 
     #[test]
     fn parse_set_session_and_key_value() {
-        match parse_args(&args(&["set", "demo", "on-child-suspend=auto-resume"])) {
+        match parse_args(&args(&["set", SID, "on-child-suspend=auto-resume"])) {
             Command::Set(cfg) => {
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
                 assert_eq!(cfg.key, "on-child-suspend");
                 assert_eq!(cfg.value, "auto-resume");
             }
@@ -8212,9 +8004,9 @@ mod tests {
     #[test]
     fn parse_set_key_value_order_independent() {
         // key=value が session より前でも parse できる (= 位置非依存)。
-        match parse_args(&args(&["set", "on-child-suspend=notify", "demo"])) {
+        match parse_args(&args(&["set", "on-child-suspend=notify", SID])) {
             Command::Set(cfg) => {
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
                 assert_eq!(cfg.key, "on-child-suspend");
                 assert_eq!(cfg.value, "notify");
             }
@@ -8237,7 +8029,7 @@ mod tests {
     #[test]
     fn parse_set_value_can_contain_equals() {
         // value 側に `=` を含んでも、最初の `=` で key/value 分割する。
-        match parse_args(&args(&["set", "demo", "k=a=b"])) {
+        match parse_args(&args(&["set", SID, "k=a=b"])) {
             Command::Set(cfg) => {
                 assert_eq!(cfg.key, "k");
                 assert_eq!(cfg.value, "a=b");
@@ -8249,7 +8041,7 @@ mod tests {
     #[test]
     fn parse_set_requires_key_value() {
         // session だけで key=value が無ければ error。
-        match parse_args(&args(&["set", "demo"])) {
+        match parse_args(&args(&["set", SID])) {
             Command::Error(msg) => assert!(msg.contains("key") && msg.contains("value")),
             other => panic!("expected Error, got {other:?}"),
         }
@@ -8266,7 +8058,7 @@ mod tests {
 
     #[test]
     fn parse_set_rejects_two_key_values() {
-        match parse_args(&args(&["set", "demo", "a=1", "b=2"])) {
+        match parse_args(&args(&["set", SID, "a=1", "b=2"])) {
             Command::Error(msg) => assert!(msg.contains("key=value")),
             other => panic!("expected Error, got {other:?}"),
         }
@@ -8282,9 +8074,9 @@ mod tests {
 
     #[test]
     fn parse_tail_with_follow_and_since() {
-        match parse_args(&args(&["tail", "demo", "--follow", "--since=1s"])) {
+        match parse_args(&args(&["tail", SID, "--follow", "--since=1s"])) {
             Command::Tail(cfg) => {
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
                 assert!(cfg.follow);
                 assert_eq!(cfg.since_ms, Some(1_000));
                 assert!(!cfg.since_strict);
@@ -8296,7 +8088,7 @@ mod tests {
     #[test]
     fn parse_tail_with_since_strict() {
         // DR-0006 §11: `--since-strict` で scrollback 不足を検知 → exit 非 0
-        match parse_args(&args(&["tail", "demo", "--since=10s", "--since-strict"])) {
+        match parse_args(&args(&["tail", SID, "--since=10s", "--since-strict"])) {
             Command::Tail(cfg) => {
                 assert_eq!(cfg.since_ms, Some(10_000));
                 assert!(cfg.since_strict);
@@ -8308,7 +8100,7 @@ mod tests {
     #[test]
     fn parse_tail_since_strict_requires_since() {
         // `--since-strict` 単独は意味を成さない (= filter する範囲が無い)。error 推奨。
-        match parse_args(&args(&["tail", "demo", "--since-strict"])) {
+        match parse_args(&args(&["tail", SID, "--since-strict"])) {
             Command::Error(msg) => {
                 assert!(msg.contains("--since-strict"), "got msg={msg}");
             }
@@ -8319,11 +8111,11 @@ mod tests {
     #[test]
     fn parse_tail_strip_dr_alias() {
         // primary は `--strip-ansi`、`--last` 同様に短形 `--strip` も alias として受理する。
-        match parse_args(&args(&["tail", "demo", "--strip"])) {
+        match parse_args(&args(&["tail", SID, "--strip"])) {
             Command::Tail(cfg) => assert!(cfg.strip_ansi),
             other => panic!("expected Tail, got {other:?}"),
         }
-        match parse_args(&args(&["tail", "demo", "--strip-ansi"])) {
+        match parse_args(&args(&["tail", SID, "--strip-ansi"])) {
             Command::Tail(cfg) => assert!(cfg.strip_ansi),
             other => panic!("expected Tail, got {other:?}"),
         }
@@ -8332,11 +8124,11 @@ mod tests {
     #[test]
     fn parse_tail_last_dr_alias() {
         // primary は `--last-bytes N`、短形 `--last N` も alias として受理する。
-        match parse_args(&args(&["tail", "demo", "--last=4096"])) {
+        match parse_args(&args(&["tail", SID, "--last=4096"])) {
             Command::Tail(cfg) => assert_eq!(cfg.last_bytes, Some(4096)),
             other => panic!("expected Tail, got {other:?}"),
         }
-        match parse_args(&args(&["tail", "demo", "--last-bytes=4096"])) {
+        match parse_args(&args(&["tail", SID, "--last-bytes=4096"])) {
             Command::Tail(cfg) => assert_eq!(cfg.last_bytes, Some(4096)),
             other => panic!("expected Tail, got {other:?}"),
         }
@@ -8346,9 +8138,9 @@ mod tests {
     fn parse_wait_regex_pattern() {
         // DR-0006 §9 改訂後: subcommand は <pattern> を直接 regex として扱う
         // (= 旧 `text:` / `pattern:` / `wait-idle:` prefix は廃止)
-        match parse_args(&args(&["wait", "demo", "READY", "--timeout=5s"])) {
+        match parse_args(&args(&["wait", SID, "READY", "--timeout=5s"])) {
             Command::Wait(cfg) => {
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
                 assert_eq!(cfg.pattern, "READY");
                 assert_eq!(cfg.timeout_ms, Some(5_000));
                 assert_eq!(cfg.poll_interval_ms, None);
@@ -8361,7 +8153,7 @@ mod tests {
     fn parse_wait_with_poll_interval() {
         match parse_args(&args(&[
             "wait",
-            "demo",
+            SID,
             "ITEM-\\d+",
             "--timeout=30s",
             "--poll-interval=50ms",
@@ -8389,7 +8181,7 @@ mod tests {
 
     #[test]
     fn parse_wait_rejects_empty_pattern() {
-        match parse_args(&args(&["wait", "demo", ""])) {
+        match parse_args(&args(&["wait", SID, ""])) {
             Command::Error(msg) => assert!(msg.contains("pattern"), "got msg={msg}"),
             other => panic!("expected Error, got {other:?}"),
         }
@@ -8398,7 +8190,7 @@ mod tests {
     #[test]
     fn parse_wait_rejects_legacy_strip_escapes_flag() {
         // DR-0006 §9 改訂で `--no-strip-escapes` は廃止 → unknown option として error
-        match parse_args(&args(&["wait", "demo", "READY", "--no-strip-escapes"])) {
+        match parse_args(&args(&["wait", SID, "READY", "--no-strip-escapes"])) {
             Command::Error(msg) => assert!(
                 msg.contains("--no-strip-escapes"),
                 "expected unknown option message, got {msg}"
@@ -8595,7 +8387,7 @@ mod tests {
         // 受け取られる)。意味としては「文字列 'wait-idle:500ms' が画面に出るまで
         // 待つ」になり、ユーザの意図とずれる可能性はあるが parse 層で弾く方針は
         // 取らない (= regex は任意文字列を許容する)。
-        match parse_args(&args(&["wait", "demo", "wait-idle:500ms"])) {
+        match parse_args(&args(&["wait", SID, "wait-idle:500ms"])) {
             Command::Wait(cfg) => {
                 assert_eq!(cfg.pattern, "wait-idle:500ms");
             }
@@ -8605,7 +8397,7 @@ mod tests {
 
     #[test]
     fn parse_wait_missing_pattern_errors() {
-        match parse_args(&args(&["wait", "demo"])) {
+        match parse_args(&args(&["wait", SID])) {
             Command::Error(msg) => assert!(msg.contains("pattern"), "got msg={msg}"),
             other => panic!("expected Error, got {other:?}"),
         }
@@ -8613,9 +8405,9 @@ mod tests {
 
     #[test]
     fn attach_with_session_id() {
-        match parse_args(&args(&["attach", "demo"])) {
+        match parse_args(&args(&["attach", SID])) {
             Command::Attach(cfg) => {
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
                 assert_eq!(cfg.socket, None);
                 assert_eq!(cfg.mode_str, None);
             }
@@ -8664,9 +8456,9 @@ mod tests {
 
     #[test]
     fn attach_with_mode_parses() {
-        match parse_args(&args(&["attach", "demo", "--mode", "ro"])) {
+        match parse_args(&args(&["attach", SID, "--mode", "ro"])) {
             Command::Attach(cfg) => {
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
                 assert_eq!(cfg.mode_str.as_deref(), Some("ro"));
             }
             other => panic!("got {other:?}"),
@@ -8678,7 +8470,7 @@ mod tests {
         // CLI-Q1 裁定 (2026-07-29): 占有 / 奪取は CLI から出さない。parse 段で
         // 代替手段を案内して弾く (= daemon まで到達させない)。
         for flag in ["--exclusive", "--detach-others"] {
-            match parse_args(&args(&["attach", "demo", flag])) {
+            match parse_args(&args(&["attach", SID, flag])) {
                 Command::Error(msg) => {
                     assert!(msg.contains(flag), "エラーは対象 flag 名を含むべき: {msg}");
                     assert!(
@@ -8709,7 +8501,7 @@ mod tests {
 
     #[test]
     fn attach_unknown_option_errors() {
-        match parse_args(&args(&["attach", "demo", "--bogus"])) {
+        match parse_args(&args(&["attach", SID, "--bogus"])) {
             Command::Error(msg) => assert!(msg.contains("bogus") || msg.contains("attach")),
             other => panic!("got {other:?}"),
         }
@@ -8762,7 +8554,7 @@ mod tests {
     /// `--index` と位置引数の session-id 同時指定はエラー (= 排他)。
     #[test]
     fn attach_index_and_session_id_conflict() {
-        match parse_args(&args(&["attach", "demo", "--index=1"])) {
+        match parse_args(&args(&["attach", SID, "--index=1"])) {
             Command::Error(msg) => assert!(msg.contains("--index") || msg.contains("session")),
             other => panic!("expected Error, got {other:?}"),
         }
@@ -8847,158 +8639,25 @@ mod tests {
     }
 
     // =========================================================================
-    // DR-0018: --namespace / --all-namespaces parse tests
+    // DR-0041: namespace の語彙は無い
     // =========================================================================
 
-    /// `run --namespace=t1` が `RunConfig.namespace = Some("t1")` を設定する。
+    /// `--namespace` / `--all-namespaces` は受け付けない (DR-0041 決定 1)。
     #[test]
-    fn run_namespace_flag_sets_config() {
-        match parse_args(&args(&["run", "--namespace=t1", "--", "cat"])) {
-            Command::Run(cfg) => assert_eq!(cfg.namespace.as_deref(), Some("t1")),
-            other => panic!("expected Run(namespace=t1), got {other:?}"),
-        }
-    }
-
-    /// `run` で `--namespace` 未指定なら `None` (= 実行時に env / default へ fallback)。
-    #[test]
-    fn run_namespace_default_is_none() {
-        match parse_args(&args(&["run", "--", "cat"])) {
-            Command::Run(cfg) => assert_eq!(cfg.namespace, None),
-            other => panic!("expected Run(namespace=None), got {other:?}"),
-        }
-    }
-
-    /// namespace の validate: `/` 入り / `..` / 空文字は parse 段で reject。
-    #[test]
-    fn run_namespace_rejects_invalid_values() {
-        for bad in ["a/b", "..", "../x", ""] {
-            match parse_args(&args(&["run", &format!("--namespace={bad}"), "--", "cat"])) {
-                Command::Error(msg) => {
-                    assert!(
-                        msg.contains("namespace"),
-                        "error should mention namespace (bad={bad:?}): {msg}"
-                    );
-                }
-                other => panic!("expected Error for namespace {bad:?}, got {other:?}"),
+    fn namespace_options_are_unknown() {
+        for argv in [
+            &["run", "--namespace=t1", "--", "cat"][..],
+            &["list", "--namespace=t1"][..],
+            &["list", "--all-namespaces"][..],
+            &["status", SID, "--namespace=t1"][..],
+            &["kill", SID, "--namespace=t1"][..],
+            &["attach", SID, "--namespace=t1"][..],
+        ] {
+            match parse_args(&args(argv)) {
+                Command::Error(msg) => assert!(msg.contains("namespace"), "{argv:?}: {msg}"),
+                other => panic!("{argv:?}: expected Error, got {other:?}"),
             }
         }
-    }
-
-    /// `default` という名前は予約 (= 直下マッピング) だが parse は通常通り通す。
-    #[test]
-    fn run_namespace_default_name_is_accepted() {
-        match parse_args(&args(&["run", "--namespace=default", "--", "cat"])) {
-            Command::Run(cfg) => assert_eq!(cfg.namespace.as_deref(), Some("default")),
-            other => panic!("expected Run(namespace=default), got {other:?}"),
-        }
-    }
-
-    /// session-targeted 系 (= parse_session_targeted 経由) でも `--namespace` が効く。
-    #[test]
-    fn session_targeted_commands_accept_namespace() {
-        match parse_args(&args(&["status", "demo", "--namespace=t1"])) {
-            Command::Status(cfg) => assert_eq!(cfg.namespace.as_deref(), Some("t1")),
-            other => panic!("expected Status(namespace=t1), got {other:?}"),
-        }
-        match parse_args(&args(&["tail", "demo", "--namespace=t1"])) {
-            Command::Tail(cfg) => assert_eq!(cfg.namespace.as_deref(), Some("t1")),
-            other => panic!("expected Tail(namespace=t1), got {other:?}"),
-        }
-        match parse_args(&args(&["wait", "demo", "READY", "--namespace=t1"])) {
-            Command::Wait(cfg) => assert_eq!(cfg.namespace.as_deref(), Some("t1")),
-            other => panic!("expected Wait(namespace=t1), got {other:?}"),
-        }
-        match parse_args(&args(&["kill", "demo", "--namespace=t1"])) {
-            Command::Kill(cfg) => assert_eq!(cfg.namespace.as_deref(), Some("t1")),
-            other => panic!("expected Kill(namespace=t1), got {other:?}"),
-        }
-        match parse_args(&args(&["attach", "demo", "--namespace=t1"])) {
-            Command::Attach(cfg) => assert_eq!(cfg.namespace.as_deref(), Some("t1")),
-            other => panic!("expected Attach(namespace=t1), got {other:?}"),
-        }
-        match parse_args(&args(&["input", "demo", "text:hi", "--namespace=t1"])) {
-            Command::Input(cmd) => assert_eq!(cmd.namespace.as_deref(), Some("t1")),
-            other => panic!("expected Input(namespace=t1), got {other:?}"),
-        }
-        match parse_args(&args(&["screen", "dump", "demo", "--namespace=t1"])) {
-            Command::Screen(ScreenCommand::Dump(cfg)) => {
-                assert_eq!(cfg.namespace.as_deref(), Some("t1"));
-            }
-            other => panic!("expected ScreenDump(namespace=t1), got {other:?}"),
-        }
-        match parse_args(&args(&["record", "list", "demo", "--namespace=t1"])) {
-            Command::Record(RecordCommand::List(cfg)) => {
-                assert_eq!(cfg.namespace.as_deref(), Some("t1"));
-            }
-            other => panic!("expected RecordList(namespace=t1), got {other:?}"),
-        }
-    }
-
-    /// `list --namespace=t1` / `--all-namespaces` の設定値と排他チェック。
-    #[test]
-    fn list_namespace_and_all_namespaces() {
-        match parse_args(&args(&["list", "--namespace=t1"])) {
-            Command::List(cfg) => {
-                assert_eq!(cfg.namespace.as_deref(), Some("t1"));
-                assert!(!cfg.all_namespaces);
-            }
-            other => panic!("expected List(namespace=t1), got {other:?}"),
-        }
-        match parse_args(&args(&["list", "--all-namespaces"])) {
-            Command::List(cfg) => {
-                assert!(cfg.all_namespaces);
-                assert_eq!(cfg.namespace, None);
-            }
-            other => panic!("expected List(all_namespaces), got {other:?}"),
-        }
-        // 排他: 同時指定は error。
-        match parse_args(&args(&["list", "--namespace=t1", "--all-namespaces"])) {
-            Command::Error(msg) => {
-                assert!(
-                    msg.contains("--namespace") && msg.contains("--all-namespaces"),
-                    "error should mention both flags: {msg}"
-                );
-            }
-            other => panic!("expected Error for exclusive flags, got {other:?}"),
-        }
-        // `--all-namespaces` は値を取らない。
-        match parse_args(&args(&["list", "--all-namespaces=yes"])) {
-            Command::Error(_) => {}
-            other => panic!("expected Error for valued --all-namespaces, got {other:?}"),
-        }
-        // list の `--namespace` で validate 違反は reject。
-        match parse_args(&args(&["list", "--namespace=a/b"])) {
-            Command::Error(msg) => {
-                assert!(msg.contains("namespace"), "got: {msg}");
-            }
-            other => panic!("expected Error for invalid ns, got {other:?}"),
-        }
-    }
-
-    /// `validate_namespace`: session_id と同等の whitelist + 文言が namespace 文脈。
-    #[test]
-    fn validate_namespace_whitelist_and_wording() {
-        // 正常系: フラットな一意名。
-        for ok in ["default", "t1", "workers", "task-12.x_y"] {
-            validate_namespace(ok).unwrap_or_else(|e| panic!("{ok:?} should pass: {e}"));
-        }
-        // 異常系: `/` (= 将来の階層 ns 用に予約) / traversal / 空 / 制御文字。
-        for bad in ["a/b", "/abs", "..", ".", "", "a\nb", "a b"] {
-            let err = validate_namespace(bad).expect_err(&format!("{bad:?} must err"));
-            assert!(
-                err.contains("namespace"),
-                "error should use namespace wording (bad={bad:?}): {err}"
-            );
-            assert!(
-                !err.contains("session_id"),
-                "error must not leak session_id wording (bad={bad:?}): {err}"
-            );
-        }
-        // 過長 (= MAX_SESSION_ID_LEN 同等の 64 bytes 上限)。
-        let too_long = "a".repeat(MAX_SESSION_ID_LEN + 1);
-        assert!(validate_namespace(&too_long).is_err(), "65 bytes must err");
-        let max_ok = "a".repeat(MAX_SESSION_ID_LEN);
-        assert!(validate_namespace(&max_ok).is_ok(), "64 bytes must pass");
     }
 
     /// `--format=plain` は `ListFormat::Plain` を設定する (= default と同等だが明示)。
@@ -9075,7 +8734,7 @@ mod tests {
                 "hyoui attach",
                 &["CTRL+Z GUARD", "/dev/tty"],
             ),
-            (HelpTopic::List, "hyoui list", &["SCAN ORDER"]),
+            (HelpTopic::List, "hyoui list", &["SCAN:"]),
             (HelpTopic::Kill, "hyoui kill", &["--signal", "SIGTERM"]),
             (HelpTopic::Status, "hyoui status", &["OUTPUT", "child-pid"]),
             (HelpTopic::Tail, "hyoui tail", &["--follow", "--since"]),
@@ -9117,57 +8776,75 @@ mod tests {
 
     #[test]
     fn parse_run_rejects_invalid_session_id() {
-        // `hyoui run --session=<bad>` で path traversal / 制御文字 等を早期 reject。
+        // `hyoui run --session-id=<bad>` は UUID 標準形以外を早期 reject (DR-0041 決定 2)。
+        let upper = SID.to_ascii_uppercase();
+        let bare = SID.replace('-', "");
+        let braced = format!("{{{SID}}}");
         let bad = [
             "../../.ssh/control", // path traversal
             "../etc",
-            "a/b",           // separator
-            "a\\b",          // windows separator
-            "..",            // dot-dot literal
-            ".",             // dot literal
-            "",              // empty (--session= 等で来る)
-            "a\nb",          // newline (control char)
-            "a\x1b[31mhack", // ANSI escape
-            "name with space",
+            "a/b",
+            "..",
+            ".",
+            "",     // empty (--session-id= 等で来る)
+            "a\nb", // newline (control char)
+            "a\x1b[31mhack",
+            "demo",           // 名前
+            "run-12345-abcd", // 旧形式の自動 id
+            &upper,           // 大文字
+            &bare,            // ハイフン無し
+            &braced,          // 波括弧
+            &SID[..8],        // 短縮 (先頭一致)
+            &SID[..35],
         ];
         for sid in bad {
-            let arg = format!("--session={sid}");
+            let arg = format!("--session-id={sid}");
             match parse_args(&args(&["run", &arg, "--", "true"])) {
                 Command::Error(msg) => {
                     assert!(
-                        msg.contains("--session") || msg.contains("session_id"),
-                        "error for {sid:?} should mention --session/session_id, got: {msg}"
+                        msg.contains("--session-id") && msg.contains("canonical form"),
+                        "error for {sid:?} should mention --session-id and the form, got: {msg}"
                     );
                 }
-                other => panic!("expected Error for invalid session_id {sid:?}, got {other:?}"),
+                other => panic!("expected Error for invalid session id {sid:?}, got {other:?}"),
             }
-        }
-
-        // 過長 (65 chars) も reject。
-        let too_long = "a".repeat(MAX_SESSION_ID_LEN + 1);
-        let arg = format!("--session={too_long}");
-        match parse_args(&args(&["run", &arg, "--", "true"])) {
-            Command::Error(msg) => {
-                assert!(
-                    msg.contains("too long"),
-                    "error for too-long should mention 'too long', got: {msg}"
-                );
-            }
-            other => panic!("expected Error for too-long session_id, got {other:?}"),
         }
     }
 
+    /// 正規化できる表記違いには直し方を添える (= 黙って直さない)。
     #[test]
-    fn parse_run_accepts_normal_session_id() {
-        // 正常系: 一般的な session 名は通る (= 回帰時に既存ユーザを巻き込まない確認)。
-        for sid in ["demo", "run-12345", "session_01", "build.2025-05-27"] {
-            let arg = format!("--session={sid}");
-            match parse_args(&args(&["run", &arg, "--", "true"])) {
-                Command::Run(cfg) => {
-                    assert_eq!(cfg.session.as_deref(), Some(sid));
+    fn invalid_session_id_errors_hint_the_fix() {
+        let upper = validate_session_id(&SID.to_ascii_uppercase()).unwrap_err();
+        assert!(upper.contains("lowercase"), "{upper}");
+        let bare = validate_session_id(&SID.replace('-', "")).unwrap_err();
+        assert!(bare.contains("hyphens"), "{bare}");
+    }
+
+    #[test]
+    fn parse_run_accepts_a_canonical_uuid_session_id() {
+        // 版は問わない (v4 / v7 / nil)。
+        for sid in [
+            SID,
+            "01890a5d-ac96-774b-bcce-b302099a8057",
+            "00000000-0000-0000-0000-000000000000",
+        ] {
+            for arg in [
+                vec![format!("--session-id={sid}")],
+                vec!["--session-id".to_string(), sid.to_string()],
+            ] {
+                let mut argv = vec!["run".to_string()];
+                argv.extend(arg);
+                argv.extend(["--".to_string(), "true".to_string()]);
+                match parse_args(&argv) {
+                    Command::Run(cfg) => assert_eq!(cfg.session_id.as_deref(), Some(sid)),
+                    other => panic!("expected Run for {sid:?}, got {other:?}"),
                 }
-                other => panic!("expected Run for valid session_id {sid:?}, got {other:?}"),
             }
+        }
+        // 旧 flag 名は受け付けない。
+        match parse_args(&args(&["run", &format!("--session={SID}"), "--", "true"])) {
+            Command::Error(_) => {}
+            other => panic!("--session must be unknown, got {other:?}"),
         }
     }
 
@@ -9214,7 +8891,7 @@ mod tests {
             Command::Error(msg) => {
                 assert!(msg.contains("kill"), "error should mention 'kill': {msg}");
                 assert!(
-                    msg.contains("invalid character") || msg.contains("path traversal"),
+                    msg.contains("canonical form"),
                     "error should explain why, got: {msg}"
                 );
             }
@@ -9226,11 +8903,11 @@ mod tests {
     /// `--signal` と併用できる (= stopped child を CONT で起こす経路)。
     #[test]
     fn parse_kill_no_terminate_with_signal() {
-        match parse_args(&args(&["kill", "demo", "--signal=CONT", "--no-terminate"])) {
+        match parse_args(&args(&["kill", SID, "--signal=CONT", "--no-terminate"])) {
             Command::Kill(cfg) => {
                 assert!(cfg.no_terminate, "--no-terminate must set no_terminate");
                 assert_eq!(cfg.signal.as_deref(), Some("SIGCONT"));
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
             }
             other => panic!("expected Kill(no_terminate, signal=SIGCONT), got {other:?}"),
         }
@@ -9253,11 +8930,11 @@ mod tests {
     /// 即時応答化: `--wait` 未指定なら cfg.wait=false (= default 即時 return)。
     #[test]
     fn parse_kill_default_is_immediate() {
-        match parse_args(&args(&["kill", "demo"])) {
+        match parse_args(&args(&["kill", SID])) {
             Command::Kill(cfg) => {
                 assert!(!cfg.wait, "default kill must be immediate (wait=false)");
                 assert!(!cfg.no_terminate, "default kill must not be no_terminate");
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
             }
             other => panic!("expected Kill(wait=false), got {other:?}"),
         }
@@ -9266,15 +8943,15 @@ mod tests {
     /// 即時応答化: `--wait` が cfg.wait=true で格納される (= 従来挙動)。
     #[test]
     fn parse_kill_wait_flag() {
-        match parse_args(&args(&["kill", "demo", "--wait"])) {
+        match parse_args(&args(&["kill", SID, "--wait"])) {
             Command::Kill(cfg) => {
                 assert!(cfg.wait, "--wait must set wait=true");
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
             }
             other => panic!("expected Kill(wait=true), got {other:?}"),
         }
         // --signal との併用 OK。
-        match parse_args(&args(&["kill", "demo", "--signal=KILL", "--wait"])) {
+        match parse_args(&args(&["kill", SID, "--signal=KILL", "--wait"])) {
             Command::Kill(cfg) => {
                 assert!(cfg.wait);
                 assert_eq!(cfg.signal.as_deref(), Some("SIGKILL"));
@@ -9286,7 +8963,7 @@ mod tests {
     /// 2 軸の整理: `--wait` は `--no-terminate` と併用不可。
     #[test]
     fn parse_kill_wait_rejects_no_terminate() {
-        match parse_args(&args(&["kill", "demo", "--wait", "--no-terminate"])) {
+        match parse_args(&args(&["kill", SID, "--wait", "--no-terminate"])) {
             Command::Error(msg) => {
                 assert!(
                     msg.contains("wait") && msg.contains("no-terminate"),
@@ -9296,7 +8973,7 @@ mod tests {
             other => panic!("expected Error for --wait --no-terminate, got {other:?}"),
         }
         // 順序を入れ替えても同じ。
-        match parse_args(&args(&["kill", "demo", "--no-terminate", "--wait"])) {
+        match parse_args(&args(&["kill", SID, "--no-terminate", "--wait"])) {
             Command::Error(_) => {}
             other => panic!("expected Error for --no-terminate --wait, got {other:?}"),
         }
@@ -9317,7 +8994,7 @@ mod tests {
     /// 裸 `--wait` (= 値なし) は default timeout 10s が入る。
     #[test]
     fn parse_kill_bare_wait_sets_default_timeout() {
-        match parse_args(&args(&["kill", "demo", "--wait"])) {
+        match parse_args(&args(&["kill", SID, "--wait"])) {
             Command::Kill(cfg) => {
                 assert!(cfg.wait);
                 assert_eq!(
@@ -9333,19 +9010,19 @@ mod tests {
     /// `--wait=<DUR>` は既存 DUR 形式で timeout を上書きする。
     #[test]
     fn parse_kill_wait_with_duration() {
-        match parse_args(&args(&["kill", "demo", "--wait=2s"])) {
+        match parse_args(&args(&["kill", SID, "--wait=2s"])) {
             Command::Kill(cfg) => {
                 assert!(cfg.wait);
                 assert_eq!(cfg.wait_timeout_ms, Some(2_000));
             }
             other => panic!("expected Kill(wait=2s), got {other:?}"),
         }
-        match parse_args(&args(&["kill", "demo", "--wait=500ms"])) {
+        match parse_args(&args(&["kill", SID, "--wait=500ms"])) {
             Command::Kill(cfg) => assert_eq!(cfg.wait_timeout_ms, Some(500)),
             other => panic!("expected Kill(wait=500ms), got {other:?}"),
         }
         // 不正 DUR は parse error。
-        match parse_args(&args(&["kill", "demo", "--wait=abc"])) {
+        match parse_args(&args(&["kill", SID, "--wait=abc"])) {
             Command::Error(msg) => assert!(msg.contains("--wait"), "msg: {msg}"),
             other => panic!("expected Error for --wait=abc, got {other:?}"),
         }
@@ -9354,11 +9031,11 @@ mod tests {
     /// `--wait demo` の `demo` は session-id (= 次 arg を timeout として消費しない)。
     #[test]
     fn parse_kill_bare_wait_does_not_consume_next_arg() {
-        match parse_args(&args(&["kill", "--wait", "demo"])) {
+        match parse_args(&args(&["kill", "--wait", SID])) {
             Command::Kill(cfg) => {
                 assert!(cfg.wait);
                 assert_eq!(cfg.wait_timeout_ms, Some(KILL_WAIT_DEFAULT_TIMEOUT_MS));
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
             }
             other => panic!("expected Kill(wait, session=demo), got {other:?}"),
         }
@@ -9367,7 +9044,7 @@ mod tests {
     /// `--kill-on-timeout` は `--wait` 必須 (= 単独指定は parse error)。
     #[test]
     fn parse_kill_kill_on_timeout_requires_wait() {
-        match parse_args(&args(&["kill", "demo", "--kill-on-timeout"])) {
+        match parse_args(&args(&["kill", SID, "--kill-on-timeout"])) {
             Command::Error(msg) => {
                 assert!(
                     msg.contains("--kill-on-timeout") && msg.contains("--wait"),
@@ -9377,7 +9054,7 @@ mod tests {
             other => panic!("expected Error for --kill-on-timeout without --wait, got {other:?}"),
         }
         // --wait と併用すれば OK。
-        match parse_args(&args(&["kill", "demo", "--wait=2s", "--kill-on-timeout"])) {
+        match parse_args(&args(&["kill", SID, "--wait=2s", "--kill-on-timeout"])) {
             Command::Kill(cfg) => {
                 assert!(cfg.wait);
                 assert!(cfg.kill_on_timeout);
@@ -9390,15 +9067,15 @@ mod tests {
     /// DR-0012: `--signal=SIGTERM` が cfg.signal に正規表記文字列で格納される。
     #[test]
     fn parse_kill_signal_flag_accepts_sigterm() {
-        match parse_args(&args(&["kill", "demo", "--signal=SIGTERM"])) {
+        match parse_args(&args(&["kill", SID, "--signal=SIGTERM"])) {
             Command::Kill(cfg) => {
                 assert_eq!(cfg.signal.as_deref(), Some("SIGTERM"));
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
             }
             other => panic!("expected Kill(signal=SIGTERM), got {other:?}"),
         }
         // 空白区切り形式 (= `--signal SIGKILL`) も同じ
-        match parse_args(&args(&["kill", "demo", "--signal", "SIGKILL"])) {
+        match parse_args(&args(&["kill", SID, "--signal", "SIGKILL"])) {
             Command::Kill(cfg) => {
                 assert_eq!(cfg.signal.as_deref(), Some("SIGKILL"));
             }
@@ -9410,7 +9087,7 @@ mod tests {
     /// `--signal NAME` への誘導メッセージを返す。
     #[test]
     fn parse_kill_rejects_legacy_signum_flag() {
-        match parse_args(&args(&["kill", "demo", "--signum=15"])) {
+        match parse_args(&args(&["kill", SID, "--signum=15"])) {
             Command::Error(msg) => {
                 assert!(
                     msg.contains("--signum"),
@@ -9446,7 +9123,7 @@ mod tests {
             ("SIGINT", "SIGINT"),
         ];
         for (input, expected_wire) in cases {
-            match parse_args(&args(&["kill", "demo", "--signal", input])) {
+            match parse_args(&args(&["kill", SID, "--signal", input])) {
                 Command::Kill(cfg) => {
                     assert_eq!(
                         cfg.signal.as_deref(),
@@ -9463,7 +9140,7 @@ mod tests {
     #[test]
     fn parse_kill_rejects_truly_invalid_signal() {
         for bogus in &["SIG", "sig_term", "FOOBAR", "999"] {
-            match parse_args(&args(&["kill", "demo", "--signal", bogus])) {
+            match parse_args(&args(&["kill", SID, "--signal", bogus])) {
                 Command::Error(msg) => {
                     assert!(
                         msg.contains("invalid --signal"),
@@ -9488,14 +9165,14 @@ mod tests {
             ("-sigterm", "SIGTERM"),
         ];
         for (input, expected_wire) in cases {
-            match parse_args(&args(&["kill", input, "demo"])) {
+            match parse_args(&args(&["kill", input, SID])) {
                 Command::Kill(cfg) => {
                     assert_eq!(
                         cfg.signal.as_deref(),
                         Some(expected_wire),
                         "short flag {input:?} should normalize to {expected_wire}"
                     );
-                    assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                    assert_eq!(cfg.session_id.as_deref(), Some(SID));
                 }
                 other => panic!("expected Kill cfg for `{input} demo`, got {other:?}"),
             }
@@ -9514,7 +9191,7 @@ mod tests {
             other => panic!("expected Kill(all=true), got {other:?}"),
         }
         // session-id と排他
-        match parse_args(&args(&["kill", "--all", "demo"])) {
+        match parse_args(&args(&["kill", "--all", SID])) {
             Command::Error(msg) => assert!(msg.contains("--all") || msg.contains("排他")),
             other => panic!("expected Error for --all+positional, got {other:?}"),
         }
@@ -9528,36 +9205,33 @@ mod tests {
     /// 位置引数の正数は index 解釈 (= 1 番古い session を指す)、負数は signal。
     #[test]
     fn parse_kill_positional_semantics() {
-        // 位置引数の数字も session-id 扱い (kawaz 方針: index は --index 専用)
+        // 位置引数の数字も session-id 扱い (kawaz 方針: index は --index 専用)。数字は
+        // UUID ではないので session id のエラーになる (= index に読み替えない)。
         match parse_args(&args(&["kill", "2"])) {
-            Command::Kill(cfg) => {
-                assert_eq!(cfg.session_id.as_deref(), Some("2"));
-                assert_eq!(cfg.index, None);
-                assert_eq!(cfg.signal, None);
-            }
-            other => panic!("expected Kill(session=\"2\"), got {other:?}"),
+            Command::Error(msg) => assert!(msg.contains("session id \"2\""), "got: {msg}"),
+            other => panic!("expected Error(session id \"2\"), got {other:?}"),
         }
         // `-9` 等の short flag は signal 解釈 (POSIX kill 慣習)
-        match parse_args(&args(&["kill", "-9", "demo"])) {
+        match parse_args(&args(&["kill", "-9", SID])) {
             Command::Kill(cfg) => {
                 assert_eq!(cfg.signal.as_deref(), Some("SIGKILL"));
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
                 assert_eq!(cfg.index, None);
             }
             other => panic!("expected Kill(signal=SIGKILL, session=demo), got {other:?}"),
         }
     }
 
-    /// `--` セパレータで `-` 始まる session-id を escape できる。
+    /// `--` セパレータの後ろは位置引数 (= session id) として読む。
     #[test]
     fn parse_kill_dashdash_escape() {
-        match parse_args(&args(&["kill", "--", "-dash-id"])) {
+        match parse_args(&args(&["kill", "--", SID])) {
             Command::Kill(cfg) => {
-                assert_eq!(cfg.session_id.as_deref(), Some("-dash-id"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
                 assert_eq!(cfg.index, None);
                 assert_eq!(cfg.signal, None);
             }
-            other => panic!("expected Kill(session=\"-dash-id\"), got {other:?}"),
+            other => panic!("expected Kill(session=SID), got {other:?}"),
         }
     }
 
@@ -9638,9 +9312,9 @@ mod tests {
 
     #[test]
     fn parse_screen_snapshot_default_include_and_format() {
-        match parse_args(&args(&["screen", "snapshot", "demo"])) {
+        match parse_args(&args(&["screen", "snapshot", SID])) {
             Command::Screen(ScreenCommand::Snapshot(cfg)) => {
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
                 assert!(cfg.socket.is_none());
                 // default include: Cells, Cursor, Mode, WindowSize, Buffer, SequenceNo
                 // (Scrollback は意図的に除外)
@@ -9669,12 +9343,7 @@ mod tests {
 
     #[test]
     fn parse_screen_snapshot_include_subset() {
-        match parse_args(&args(&[
-            "screen",
-            "snapshot",
-            "demo",
-            "--include=Cursor,Mode",
-        ])) {
+        match parse_args(&args(&["screen", "snapshot", SID, "--include=Cursor,Mode"])) {
             Command::Screen(ScreenCommand::Snapshot(cfg)) => {
                 assert_eq!(
                     cfg.include,
@@ -9691,7 +9360,7 @@ mod tests {
         match parse_args(&args(&[
             "screen",
             "snapshot",
-            "demo",
+            SID,
             "--include=cells,WINDOW-SIZE,sequenceno",
         ])) {
             Command::Screen(ScreenCommand::Snapshot(cfg)) => {
@@ -9713,7 +9382,7 @@ mod tests {
         match parse_args(&args(&[
             "screen",
             "snapshot",
-            "demo",
+            SID,
             "--include=Cells,Cells,cursor,CELLS",
         ])) {
             Command::Screen(ScreenCommand::Snapshot(cfg)) => {
@@ -9731,7 +9400,7 @@ mod tests {
         match parse_args(&args(&[
             "screen",
             "snapshot",
-            "demo",
+            SID,
             "--include=Cells,foobar",
         ])) {
             Command::Error(msg) => {
@@ -9746,7 +9415,7 @@ mod tests {
 
     #[test]
     fn parse_screen_snapshot_include_empty_errors() {
-        match parse_args(&args(&["screen", "snapshot", "demo", "--include="])) {
+        match parse_args(&args(&["screen", "snapshot", SID, "--include="])) {
             Command::Error(msg) => {
                 assert!(
                     msg.contains("empty") || msg.contains("include"),
@@ -9766,7 +9435,7 @@ mod tests {
         match parse_args(&args(&[
             "screen",
             "snapshot",
-            "demo",
+            SID,
             "--include=Cells,,Cursor",
         ])) {
             Command::Error(msg) => {
@@ -9783,7 +9452,7 @@ mod tests {
         match parse_args(&args(&[
             "screen",
             "snapshot",
-            "demo",
+            SID,
             "--include=window_size,sequence_no",
         ])) {
             Command::Screen(ScreenCommand::Snapshot(cfg)) => {
@@ -9801,7 +9470,7 @@ mod tests {
 
     #[test]
     fn parse_screen_snapshot_format_cbor_default() {
-        match parse_args(&args(&["screen", "snapshot", "demo", "--format=cbor"])) {
+        match parse_args(&args(&["screen", "snapshot", SID, "--format=cbor"])) {
             Command::Screen(ScreenCommand::Snapshot(cfg)) => {
                 assert_eq!(cfg.format, ScreenSnapshotCliFormat::Cbor);
             }
@@ -9811,7 +9480,7 @@ mod tests {
 
     #[test]
     fn parse_screen_snapshot_format_json_accepted() {
-        match parse_args(&args(&["screen", "snapshot", "demo", "--format=json"])) {
+        match parse_args(&args(&["screen", "snapshot", SID, "--format=json"])) {
             Command::Screen(ScreenCommand::Snapshot(cfg)) => {
                 assert_eq!(cfg.format, ScreenSnapshotCliFormat::Json);
             }
@@ -9821,7 +9490,7 @@ mod tests {
 
     #[test]
     fn parse_screen_snapshot_format_invalid_errors() {
-        match parse_args(&args(&["screen", "snapshot", "demo", "--format=xml"])) {
+        match parse_args(&args(&["screen", "snapshot", SID, "--format=xml"])) {
             Command::Error(msg) => assert!(msg.contains("xml")),
             other => panic!("expected Error, got {other:?}"),
         }
@@ -9832,7 +9501,7 @@ mod tests {
         match parse_args(&args(&[
             "screen",
             "snapshot",
-            "demo",
+            SID,
             "--output=/tmp/snap.cbor",
         ])) {
             Command::Screen(ScreenCommand::Snapshot(cfg)) => {
@@ -9844,7 +9513,7 @@ mod tests {
 
     #[test]
     fn parse_screen_snapshot_timeout_option() {
-        match parse_args(&args(&["screen", "snapshot", "demo", "--timeout=2s"])) {
+        match parse_args(&args(&["screen", "snapshot", SID, "--timeout=2s"])) {
             Command::Screen(ScreenCommand::Snapshot(cfg)) => {
                 assert_eq!(cfg.timeout_ms, 2_000);
             }
@@ -9875,7 +9544,7 @@ mod tests {
 
     #[test]
     fn parse_screen_snapshot_unknown_option_errors() {
-        match parse_args(&args(&["screen", "snapshot", "demo", "--bogus"])) {
+        match parse_args(&args(&["screen", "snapshot", SID, "--bogus"])) {
             Command::Error(msg) => {
                 assert!(msg.contains("bogus") || msg.contains("screen snapshot"))
             }
@@ -9915,9 +9584,9 @@ mod tests {
 
     #[test]
     fn parse_screen_dump_default_format_and_layer() {
-        match parse_args(&args(&["screen", "dump", "demo"])) {
+        match parse_args(&args(&["screen", "dump", SID])) {
             Command::Screen(ScreenCommand::Dump(cfg)) => {
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
                 assert!(cfg.socket.is_none());
                 assert_eq!(cfg.format, ScreenDumpCliFormat::Ansi);
                 assert_eq!(cfg.layer, ScreenDumpCliLayer::Visible);
@@ -9945,7 +9614,7 @@ mod tests {
             ("cbor", ScreenDumpCliFormat::Cbor),
         ] {
             let arg = format!("--format={s}");
-            match parse_args(&args(&["screen", "dump", "demo", &arg])) {
+            match parse_args(&args(&["screen", "dump", SID, &arg])) {
                 Command::Screen(ScreenCommand::Dump(cfg)) => {
                     assert_eq!(&cfg.format, want, "format {s}");
                 }
@@ -9957,7 +9626,7 @@ mod tests {
     #[test]
     fn parse_screen_dump_format_text_plain() {
         // primary name = MIME 風の "text/plain"
-        match parse_args(&args(&["screen", "dump", "demo", "--format=text/plain"])) {
+        match parse_args(&args(&["screen", "dump", SID, "--format=text/plain"])) {
             Command::Screen(ScreenCommand::Dump(cfg)) => {
                 assert_eq!(cfg.format, ScreenDumpCliFormat::TextPlain);
             }
@@ -9968,7 +9637,7 @@ mod tests {
     #[test]
     fn parse_screen_dump_format_text_alias() {
         // alias = "text" 短縮
-        match parse_args(&args(&["screen", "dump", "demo", "--format=text"])) {
+        match parse_args(&args(&["screen", "dump", SID, "--format=text"])) {
             Command::Screen(ScreenCommand::Dump(cfg)) => {
                 assert_eq!(cfg.format, ScreenDumpCliFormat::TextPlain);
             }
@@ -9979,7 +9648,7 @@ mod tests {
     #[test]
     fn parse_screen_dump_format_plain_alias() {
         // alias = "plain" 短縮
-        match parse_args(&args(&["screen", "dump", "demo", "--format=plain"])) {
+        match parse_args(&args(&["screen", "dump", SID, "--format=plain"])) {
             Command::Screen(ScreenCommand::Dump(cfg)) => {
                 assert_eq!(cfg.format, ScreenDumpCliFormat::TextPlain);
             }
@@ -9989,7 +9658,7 @@ mod tests {
 
     #[test]
     fn parse_screen_dump_format_json_rejected() {
-        match parse_args(&args(&["screen", "dump", "demo", "--format=json"])) {
+        match parse_args(&args(&["screen", "dump", SID, "--format=json"])) {
             Command::Error(msg) => {
                 assert!(msg.contains("MVP") || msg.contains("json") || msg.contains("scope"))
             }
@@ -9999,7 +9668,7 @@ mod tests {
 
     #[test]
     fn parse_screen_dump_format_invalid_errors() {
-        match parse_args(&args(&["screen", "dump", "demo", "--format=xml"])) {
+        match parse_args(&args(&["screen", "dump", SID, "--format=xml"])) {
             Command::Error(msg) => assert!(msg.contains("xml")),
             other => panic!("expected Error, got {other:?}"),
         }
@@ -10013,7 +9682,7 @@ mod tests {
             ("both", ScreenDumpCliLayer::Both),
         ] {
             let arg = format!("--layer={s}");
-            match parse_args(&args(&["screen", "dump", "demo", &arg])) {
+            match parse_args(&args(&["screen", "dump", SID, &arg])) {
                 Command::Screen(ScreenCommand::Dump(cfg)) => {
                     assert_eq!(&cfg.layer, want, "layer {s}");
                 }
@@ -10024,7 +9693,7 @@ mod tests {
 
     #[test]
     fn parse_screen_dump_rect_ok() {
-        match parse_args(&args(&["screen", "dump", "demo", "--rect=0,1,80,24"])) {
+        match parse_args(&args(&["screen", "dump", SID, "--rect=0,1,80,24"])) {
             Command::Screen(ScreenCommand::Dump(cfg)) => {
                 let r = cfg.rect.expect("rect should be set");
                 assert_eq!(r.x, 0);
@@ -10039,12 +9708,7 @@ mod tests {
     #[test]
     fn parse_screen_dump_rect_with_spaces_ok() {
         // 余白 trim する
-        match parse_args(&args(&[
-            "screen",
-            "dump",
-            "demo",
-            "--rect= 0 , 0 , 10 , 5 ",
-        ])) {
+        match parse_args(&args(&["screen", "dump", SID, "--rect= 0 , 0 , 10 , 5 "])) {
             Command::Screen(ScreenCommand::Dump(cfg)) => {
                 let r = cfg.rect.expect("rect should be set");
                 assert_eq!((r.x, r.y, r.w, r.h), (0, 0, 10, 5));
@@ -10055,7 +9719,7 @@ mod tests {
 
     #[test]
     fn parse_screen_dump_rect_wrong_count_errors() {
-        match parse_args(&args(&["screen", "dump", "demo", "--rect=0,1,80"])) {
+        match parse_args(&args(&["screen", "dump", SID, "--rect=0,1,80"])) {
             Command::Error(msg) => assert!(msg.contains("4")),
             other => panic!("expected Error, got {other:?}"),
         }
@@ -10063,7 +9727,7 @@ mod tests {
 
     #[test]
     fn parse_screen_dump_rect_invalid_int_errors() {
-        match parse_args(&args(&["screen", "dump", "demo", "--rect=0,1,abc,24"])) {
+        match parse_args(&args(&["screen", "dump", SID, "--rect=0,1,abc,24"])) {
             Command::Error(msg) => assert!(msg.contains("u16") || msg.contains("invalid")),
             other => panic!("expected Error, got {other:?}"),
         }
@@ -10073,7 +9737,7 @@ mod tests {
     /// forward-compat 動作確認 (= daemon 側 ignore が想定挙動、CLI 段では reject しない)。
     #[test]
     fn parse_screen_dump_rect_all_zero_ok() {
-        match parse_args(&args(&["screen", "dump", "demo", "--rect=0,0,0,0"])) {
+        match parse_args(&args(&["screen", "dump", SID, "--rect=0,0,0,0"])) {
             Command::Screen(ScreenCommand::Dump(cfg)) => {
                 let r = cfg.rect.expect("rect should be set");
                 assert_eq!((r.x, r.y, r.w, r.h), (0, 0, 0, 0));
@@ -10086,7 +9750,7 @@ mod tests {
     /// 確認しておく (= 黙って wrap-around しない安全網)。
     #[test]
     fn parse_screen_dump_rect_overflow_u16_errors() {
-        match parse_args(&args(&["screen", "dump", "demo", "--rect=0,0,80,99999"])) {
+        match parse_args(&args(&["screen", "dump", SID, "--rect=0,0,80,99999"])) {
             Command::Error(msg) => {
                 assert!(msg.contains("u16") || msg.contains("invalid"), "msg: {msg}");
             }
@@ -10097,7 +9761,7 @@ mod tests {
     /// QA edge: 負の値は u16 parse で reject される (= 符号付きにしていない確認)。
     #[test]
     fn parse_screen_dump_rect_negative_errors() {
-        match parse_args(&args(&["screen", "dump", "demo", "--rect=-1,0,80,24"])) {
+        match parse_args(&args(&["screen", "dump", SID, "--rect=-1,0,80,24"])) {
             Command::Error(msg) => {
                 assert!(msg.contains("u16") || msg.contains("invalid"), "msg: {msg}");
             }
@@ -10107,12 +9771,7 @@ mod tests {
 
     #[test]
     fn parse_screen_dump_output_option() {
-        match parse_args(&args(&[
-            "screen",
-            "dump",
-            "demo",
-            "--output=/tmp/screen.ans",
-        ])) {
+        match parse_args(&args(&["screen", "dump", SID, "--output=/tmp/screen.ans"])) {
             Command::Screen(ScreenCommand::Dump(cfg)) => {
                 assert_eq!(cfg.output.as_deref(), Some("/tmp/screen.ans"));
             }
@@ -10122,7 +9781,7 @@ mod tests {
 
     #[test]
     fn parse_screen_dump_timeout_option() {
-        match parse_args(&args(&["screen", "dump", "demo", "--timeout=2s"])) {
+        match parse_args(&args(&["screen", "dump", SID, "--timeout=2s"])) {
             Command::Screen(ScreenCommand::Dump(cfg)) => {
                 assert_eq!(cfg.timeout_ms, 2_000);
             }
@@ -10153,7 +9812,7 @@ mod tests {
 
     #[test]
     fn parse_screen_dump_unknown_option_errors() {
-        match parse_args(&args(&["screen", "dump", "demo", "--bogus"])) {
+        match parse_args(&args(&["screen", "dump", SID, "--bogus"])) {
             Command::Error(msg) => assert!(msg.contains("bogus") || msg.contains("screen dump")),
             other => panic!("expected Error, got {other:?}"),
         }
@@ -10432,9 +10091,9 @@ mod tests {
 
     #[test]
     fn parse_input_basic_session_and_spec() {
-        match parse_args(&args(&["input", "demo", "text:hello"])) {
+        match parse_args(&args(&["input", SID, "text:hello"])) {
             Command::Input(cmd) => {
-                assert_eq!(cmd.session_id.as_deref(), Some("demo"));
+                assert_eq!(cmd.session_id.as_deref(), Some(SID));
                 assert_eq!(cmd.socket, None);
                 assert_eq!(cmd.specs, vec![InputSpec::Text("hello".into())]);
                 assert_eq!(cmd.timeout, Duration::from_secs(5));
@@ -10447,7 +10106,7 @@ mod tests {
     fn parse_input_multiple_specs_preserve_order() {
         match parse_args(&args(&[
             "input",
-            "demo",
+            SID,
             "text:ls -la",
             "key:Enter",
             "wait:^\\$",
@@ -10491,7 +10150,7 @@ mod tests {
 
     #[test]
     fn parse_input_empty_spec_list_errors() {
-        match parse_args(&args(&["input", "demo"])) {
+        match parse_args(&args(&["input", SID])) {
             Command::Error(msg) => {
                 assert!(msg.contains("spec list が空"), "got: {msg}");
             }
@@ -10525,7 +10184,7 @@ mod tests {
 
     #[test]
     fn parse_input_timeout_option() {
-        match parse_args(&args(&["input", "demo", "--timeout=2s", "text:x"])) {
+        match parse_args(&args(&["input", SID, "--timeout=2s", "text:x"])) {
             Command::Input(cmd) => {
                 assert_eq!(cmd.timeout, Duration::from_secs(2));
             }
@@ -10536,7 +10195,7 @@ mod tests {
     #[test]
     fn parse_input_timeout_bare_number_errors() {
         // 単位なしは parse_duration_ms で reject される
-        match parse_args(&args(&["input", "demo", "--timeout=5", "text:x"])) {
+        match parse_args(&args(&["input", SID, "--timeout=5", "text:x"])) {
             Command::Error(msg) => {
                 assert!(msg.contains("--timeout"), "got: {msg}");
             }
@@ -10546,7 +10205,7 @@ mod tests {
 
     #[test]
     fn parse_input_unknown_option_errors() {
-        match parse_args(&args(&["input", "demo", "--bogus=1", "text:x"])) {
+        match parse_args(&args(&["input", SID, "--bogus=1", "text:x"])) {
             Command::Error(msg) => {
                 assert!(msg.contains("unknown option"), "got: {msg}");
             }
@@ -10558,7 +10217,7 @@ mod tests {
 
     #[test]
     fn parse_input_lock_token_inline() {
-        match parse_args(&args(&["input", "demo", "--lock-token=tok-abc", "text:x"])) {
+        match parse_args(&args(&["input", SID, "--lock-token=tok-abc", "text:x"])) {
             Command::Input(cmd) => {
                 assert_eq!(cmd.lock_token.as_deref(), Some("tok-abc"));
             }
@@ -10569,13 +10228,7 @@ mod tests {
     #[test]
     fn parse_input_lock_token_separated() {
         // `--lock-token VALUE` (= space-separated) も accept する
-        match parse_args(&args(&[
-            "input",
-            "demo",
-            "--lock-token",
-            "tok-xyz",
-            "text:x",
-        ])) {
+        match parse_args(&args(&["input", SID, "--lock-token", "tok-xyz", "text:x"])) {
             Command::Input(cmd) => {
                 assert_eq!(cmd.lock_token.as_deref(), Some("tok-xyz"));
             }
@@ -10585,7 +10238,7 @@ mod tests {
 
     #[test]
     fn parse_input_lock_token_default_is_none() {
-        match parse_args(&args(&["input", "demo", "text:x"])) {
+        match parse_args(&args(&["input", SID, "text:x"])) {
             Command::Input(cmd) => {
                 assert_eq!(cmd.lock_token, None);
             }
@@ -10595,7 +10248,7 @@ mod tests {
 
     #[test]
     fn parse_input_lock_token_empty_value_errors() {
-        match parse_args(&args(&["input", "demo", "--lock-token=", "text:x"])) {
+        match parse_args(&args(&["input", SID, "--lock-token=", "text:x"])) {
             Command::Error(msg) => {
                 assert!(msg.contains("--lock-token"), "got: {msg}");
                 assert!(msg.contains("non-empty"), "got: {msg}");
@@ -10607,7 +10260,7 @@ mod tests {
     // DR-0022: auto-lock timeout flag のパーステスト群
     #[test]
     fn parse_input_auto_lock_timeout_default() {
-        match parse_args(&args(&["input", "demo", "text:x"])) {
+        match parse_args(&args(&["input", SID, "text:x"])) {
             Command::Input(cmd) => {
                 assert_eq!(
                     cmd.auto_lock_timeout_acquire,
@@ -10622,7 +10275,7 @@ mod tests {
     fn parse_input_auto_lock_timeout_explicit() {
         match parse_args(&args(&[
             "input",
-            "demo",
+            SID,
             "--auto-lock-timeout-acquire=10s",
             "text:x",
         ])) {
@@ -10637,7 +10290,7 @@ mod tests {
     fn parse_input_auto_lock_timeout_invalid_errors() {
         match parse_args(&args(&[
             "input",
-            "demo",
+            SID,
             "--auto-lock-timeout-acquire=bogus",
             "text:x",
         ])) {
@@ -10652,7 +10305,7 @@ mod tests {
     fn parse_input_auto_lock_timeout_missing_value_errors() {
         match parse_args(&args(&[
             "input",
-            "demo",
+            SID,
             "text:x",
             "--auto-lock-timeout-acquire",
         ])) {
@@ -10667,7 +10320,7 @@ mod tests {
     #[test]
     fn parse_input_lock_token_missing_value_errors() {
         // 末尾に flag だけ置いて value 候補がない → error
-        match parse_args(&args(&["input", "demo", "text:x", "--lock-token"])) {
+        match parse_args(&args(&["input", SID, "text:x", "--lock-token"])) {
             Command::Error(msg) => {
                 assert!(msg.contains("--lock-token"), "got: {msg}");
                 assert!(msg.contains("requires a value"), "got: {msg}");
@@ -10686,7 +10339,7 @@ mod tests {
         let _g = MAX_FILE_BYTES_ENV_GUARD.lock().unwrap();
         // env 操作は test 内のみ、guard で並列 test と直列化
         crate::sys::env::remove_var("HYOUI_MAX_FILE_BYTES");
-        match parse_args(&args(&["input", "demo", "text:x"])) {
+        match parse_args(&args(&["input", SID, "text:x"])) {
             Command::Input(cmd) => {
                 assert_eq!(cmd.max_file_bytes, DEFAULT_INPUT_MAX_FILE_BYTES);
             }
@@ -10697,7 +10350,7 @@ mod tests {
     /// `--max-file-bytes=N` で override。
     #[test]
     fn parse_input_max_file_bytes_flag() {
-        match parse_args(&args(&["input", "demo", "--max-file-bytes=4096", "text:x"])) {
+        match parse_args(&args(&["input", SID, "--max-file-bytes=4096", "text:x"])) {
             Command::Input(cmd) => {
                 assert_eq!(cmd.max_file_bytes, 4096);
             }
@@ -10709,7 +10362,7 @@ mod tests {
     /// 0 を「無制限」として扱う)。
     #[test]
     fn parse_input_max_file_bytes_zero_unlimited() {
-        match parse_args(&args(&["input", "demo", "--max-file-bytes=0", "text:x"])) {
+        match parse_args(&args(&["input", SID, "--max-file-bytes=0", "text:x"])) {
             Command::Input(cmd) => {
                 assert_eq!(cmd.max_file_bytes, 0);
             }
@@ -10720,14 +10373,14 @@ mod tests {
     /// 非数値 / 負値は parse error (= u64 範囲外)。
     #[test]
     fn parse_input_max_file_bytes_invalid_errors() {
-        match parse_args(&args(&["input", "demo", "--max-file-bytes=abc", "text:x"])) {
+        match parse_args(&args(&["input", SID, "--max-file-bytes=abc", "text:x"])) {
             Command::Error(msg) => {
                 assert!(msg.contains("--max-file-bytes"), "got: {msg}");
                 assert!(msg.contains("invalid u64"), "got: {msg}");
             }
             other => panic!("expected Error, got {other:?}"),
         }
-        match parse_args(&args(&["input", "demo", "--max-file-bytes=-1", "text:x"])) {
+        match parse_args(&args(&["input", SID, "--max-file-bytes=-1", "text:x"])) {
             Command::Error(msg) => {
                 assert!(msg.contains("--max-file-bytes"), "got: {msg}");
             }
@@ -10742,7 +10395,7 @@ mod tests {
         let _g = MAX_FILE_BYTES_ENV_GUARD.lock().unwrap();
         // env 操作は test 内のみ、guard で並列 test と直列化
         crate::sys::env::set_var("HYOUI_MAX_FILE_BYTES", "65536");
-        let res = parse_args(&args(&["input", "demo", "text:x"]));
+        let res = parse_args(&args(&["input", SID, "text:x"]));
         // 後始末を確実に
         crate::sys::env::remove_var("HYOUI_MAX_FILE_BYTES");
         match res {
@@ -10758,7 +10411,7 @@ mod tests {
     fn parse_input_max_file_bytes_flag_overrides_env() {
         let _g = MAX_FILE_BYTES_ENV_GUARD.lock().unwrap();
         crate::sys::env::set_var("HYOUI_MAX_FILE_BYTES", "99999");
-        let res = parse_args(&args(&["input", "demo", "--max-file-bytes=4096", "text:x"]));
+        let res = parse_args(&args(&["input", SID, "--max-file-bytes=4096", "text:x"]));
         crate::sys::env::remove_var("HYOUI_MAX_FILE_BYTES");
         match res {
             Command::Input(cmd) => {
@@ -10773,7 +10426,7 @@ mod tests {
     fn parse_input_max_file_bytes_env_invalid_falls_back_to_default() {
         let _g = MAX_FILE_BYTES_ENV_GUARD.lock().unwrap();
         crate::sys::env::set_var("HYOUI_MAX_FILE_BYTES", "not-a-number");
-        let res = parse_args(&args(&["input", "demo", "text:x"]));
+        let res = parse_args(&args(&["input", SID, "text:x"]));
         crate::sys::env::remove_var("HYOUI_MAX_FILE_BYTES");
         match res {
             Command::Input(cmd) => {
@@ -10789,7 +10442,7 @@ mod tests {
 
     #[test]
     fn parse_input_unknown_spec_prefix_errors() {
-        match parse_args(&args(&["input", "demo", "bogus:value"])) {
+        match parse_args(&args(&["input", SID, "bogus:value"])) {
             Command::Error(msg) => {
                 assert!(msg.contains("unknown spec prefix"), "got: {msg}");
             }
@@ -10803,7 +10456,7 @@ mod tests {
         // validate_session_id で reject される
         match parse_args(&args(&["input", "..", "text:x"])) {
             Command::Error(msg) => {
-                assert!(msg.contains("path traversal"), "got: {msg}");
+                assert!(msg.contains("canonical form"), "got: {msg}");
             }
             other => panic!("expected Error, got {other:?}"),
         }
@@ -10811,7 +10464,7 @@ mod tests {
 
     #[test]
     fn parse_input_hex_invalid_propagates_to_command_error() {
-        match parse_args(&args(&["input", "demo", "hex:zz"])) {
+        match parse_args(&args(&["input", SID, "hex:zz"])) {
             Command::Error(msg) => {
                 assert!(
                     msg.contains("non-hex") || msg.contains("hex:"),
@@ -10916,8 +10569,8 @@ mod tests {
             Command::Error(msg) => assert!(msg.contains("--format=json"), "unexpected: {msg}"),
             other => panic!("expected Error, got {other:?}"),
         }
-        match parse_args(&args(&["config", "path", "demo"])) {
-            Command::Error(msg) => assert!(msg.contains("demo"), "unexpected: {msg}"),
+        match parse_args(&args(&["config", "path", SID])) {
+            Command::Error(msg) => assert!(msg.contains(SID), "unexpected: {msg}"),
             other => panic!("expected Error, got {other:?}"),
         }
     }
@@ -10978,9 +10631,9 @@ mod tests {
 
     #[test]
     fn parse_lock_acquire_basic() {
-        match parse_args(&args(&["lock", "acquire", "demo"])) {
+        match parse_args(&args(&["lock", "acquire", SID])) {
             Command::Lock(LockCommand::Acquire(cfg)) => {
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
                 assert!(cfg.socket.is_none());
                 assert_eq!(cfg.mode, LockMode::Wait); // default
                 assert_eq!(cfg.timeout_ms, None);
@@ -10991,7 +10644,7 @@ mod tests {
 
     #[test]
     fn parse_lock_acquire_mode_fail() {
-        match parse_args(&args(&["lock", "acquire", "demo", "--mode=fail"])) {
+        match parse_args(&args(&["lock", "acquire", SID, "--mode=fail"])) {
             Command::Lock(LockCommand::Acquire(cfg)) => {
                 assert_eq!(cfg.mode, LockMode::Fail);
             }
@@ -11001,7 +10654,7 @@ mod tests {
 
     #[test]
     fn parse_lock_acquire_mode_wait_explicit() {
-        match parse_args(&args(&["lock", "acquire", "demo", "--mode=wait"])) {
+        match parse_args(&args(&["lock", "acquire", SID, "--mode=wait"])) {
             Command::Lock(LockCommand::Acquire(cfg)) => {
                 assert_eq!(cfg.mode, LockMode::Wait);
             }
@@ -11011,7 +10664,7 @@ mod tests {
 
     #[test]
     fn parse_lock_acquire_mode_invalid_errors() {
-        match parse_args(&args(&["lock", "acquire", "demo", "--mode=block"])) {
+        match parse_args(&args(&["lock", "acquire", SID, "--mode=block"])) {
             Command::Error(msg) => assert!(msg.contains("--mode"), "got: {msg}"),
             other => panic!("expected Error, got {other:?}"),
         }
@@ -11019,7 +10672,7 @@ mod tests {
 
     #[test]
     fn parse_lock_acquire_timeout() {
-        match parse_args(&args(&["lock", "acquire", "demo", "--timeout=5s"])) {
+        match parse_args(&args(&["lock", "acquire", SID, "--timeout=5s"])) {
             Command::Lock(LockCommand::Acquire(cfg)) => {
                 assert_eq!(cfg.timeout_ms, Some(5_000));
             }
@@ -11030,7 +10683,7 @@ mod tests {
     #[test]
     fn parse_lock_acquire_timeout_bare_number_errors() {
         // 単位なしは parse_duration_ms で reject される
-        match parse_args(&args(&["lock", "acquire", "demo", "--timeout=5"])) {
+        match parse_args(&args(&["lock", "acquire", SID, "--timeout=5"])) {
             Command::Error(msg) => assert!(msg.contains("--timeout"), "got: {msg}"),
             other => panic!("expected Error, got {other:?}"),
         }
@@ -11049,7 +10702,7 @@ mod tests {
 
     #[test]
     fn parse_lock_acquire_unknown_option_errors() {
-        match parse_args(&args(&["lock", "acquire", "demo", "--bogus=1"])) {
+        match parse_args(&args(&["lock", "acquire", SID, "--bogus=1"])) {
             Command::Error(msg) => assert!(msg.contains("unknown option"), "got: {msg}"),
             other => panic!("expected Error, got {other:?}"),
         }
@@ -11057,9 +10710,9 @@ mod tests {
 
     #[test]
     fn parse_lock_release_basic() {
-        match parse_args(&args(&["lock", "release", "demo", "--token=abc123"])) {
+        match parse_args(&args(&["lock", "release", SID, "--token=abc123"])) {
             Command::Lock(LockCommand::Release(cfg)) => {
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
                 assert_eq!(cfg.token.as_deref(), Some("abc123"));
             }
             other => panic!("expected Lock(Release), got {other:?}"),
@@ -11070,7 +10723,7 @@ mod tests {
     fn parse_lock_release_token_missing_is_allowed_at_parse() {
         // token は parser 段では optional (= env fallback あり)。dispatcher 側で
         // env を読んでもなお None なら exit 2 で reject する。
-        match parse_args(&args(&["lock", "release", "demo"])) {
+        match parse_args(&args(&["lock", "release", SID])) {
             Command::Lock(LockCommand::Release(cfg)) => {
                 assert!(cfg.token.is_none());
             }
@@ -11080,7 +10733,7 @@ mod tests {
 
     #[test]
     fn parse_lock_release_empty_token_rejected() {
-        match parse_args(&args(&["lock", "release", "demo", "--token="])) {
+        match parse_args(&args(&["lock", "release", SID, "--token="])) {
             Command::Error(msg) => assert!(msg.contains("--token"), "got: {msg}"),
             other => panic!("expected Error, got {other:?}"),
         }
@@ -11089,7 +10742,7 @@ mod tests {
     #[test]
     fn parse_lock_release_separated_token() {
         // `--token VALUE` (= space-separated) も accept する
-        match parse_args(&args(&["lock", "release", "demo", "--token", "tok-xyz"])) {
+        match parse_args(&args(&["lock", "release", SID, "--token", "tok-xyz"])) {
             Command::Lock(LockCommand::Release(cfg)) => {
                 assert_eq!(cfg.token.as_deref(), Some("tok-xyz"));
             }
@@ -11100,7 +10753,7 @@ mod tests {
     #[test]
     fn parse_lock_unknown_subcommand_suggests() {
         // `lock acqire` (= typo) を `lock acquire` に suggest する
-        match parse_args(&args(&["lock", "acqire", "demo"])) {
+        match parse_args(&args(&["lock", "acqire", SID])) {
             Command::Error(msg) => {
                 assert!(msg.contains("acqire"), "got: {msg}");
                 assert!(
@@ -11114,9 +10767,9 @@ mod tests {
 
     #[test]
     fn parse_unlock_basic() {
-        match parse_args(&args(&["unlock", "demo", "--token=tok"])) {
+        match parse_args(&args(&["unlock", SID, "--token=tok"])) {
             Command::Unlock(cfg) => {
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
                 assert_eq!(cfg.token.as_deref(), Some("tok"));
             }
             other => panic!("expected Unlock, got {other:?}"),
@@ -11125,7 +10778,7 @@ mod tests {
 
     #[test]
     fn parse_unlock_token_missing_is_allowed_at_parse() {
-        match parse_args(&args(&["unlock", "demo"])) {
+        match parse_args(&args(&["unlock", SID])) {
             Command::Unlock(cfg) => {
                 assert!(cfg.token.is_none());
             }
@@ -11135,7 +10788,7 @@ mod tests {
 
     #[test]
     fn parse_unlock_empty_token_rejected() {
-        match parse_args(&args(&["unlock", "demo", "--token="])) {
+        match parse_args(&args(&["unlock", SID, "--token="])) {
             Command::Error(msg) => assert!(msg.contains("--token"), "got: {msg}"),
             other => panic!("expected Error, got {other:?}"),
         }
@@ -11143,7 +10796,7 @@ mod tests {
 
     #[test]
     fn parse_unlock_unknown_option_errors() {
-        match parse_args(&args(&["unlock", "demo", "--bogus"])) {
+        match parse_args(&args(&["unlock", SID, "--bogus"])) {
             Command::Error(msg) => assert!(msg.contains("unknown option"), "got: {msg}"),
             other => panic!("expected Error, got {other:?}"),
         }
@@ -11203,13 +10856,13 @@ mod tests {
         let cmd = parse_args(&args(&[
             "record",
             "start",
-            "demo",
+            SID,
             "--output",
             "/tmp/rec.jsonl",
         ]));
         match cmd {
             Command::Record(RecordCommand::Start(cfg)) => {
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
                 assert_eq!(cfg.direction, RecordDirectionArg::Both);
                 assert_eq!(cfg.format, RecordFormatArg::Jsonl);
                 // interim default は record-all (= redact-after-prompt は未実装で reject)。
@@ -11232,7 +10885,7 @@ mod tests {
         let cmd = parse_args(&args(&[
             "record",
             "start",
-            "demo",
+            SID,
             "--output",
             "/tmp/rec.bin",
             "--format=raw",
@@ -11254,7 +10907,7 @@ mod tests {
         let cmd = parse_args(&args(&[
             "record",
             "start",
-            "demo",
+            SID,
             "--output",
             "/tmp/out.bin",
             "--format=raw",
@@ -11275,7 +10928,7 @@ mod tests {
         let cmd = parse_args(&args(&[
             "record",
             "start",
-            "demo",
+            SID,
             "--output",
             "/tmp/in.bin",
             "--format=raw",
@@ -11296,7 +10949,7 @@ mod tests {
         let cmd = parse_args(&args(&[
             "record",
             "start",
-            "demo",
+            SID,
             "--output",
             "/tmp/x.bin",
             "--format=raw",
@@ -11312,7 +10965,7 @@ mod tests {
         let cmd = parse_args(&args(&[
             "record",
             "start",
-            "demo",
+            SID,
             "--output",
             "./relative.jsonl",
         ]));
@@ -11330,7 +10983,7 @@ mod tests {
     /// `--output` を省略すると error (= 必須 flag)。
     #[test]
     fn record_start_output_required() {
-        let cmd = parse_args(&args(&["record", "start", "demo"]));
+        let cmd = parse_args(&args(&["record", "start", SID]));
         assert!(matches!(cmd, Command::Error(ref m) if m.contains("--output")));
     }
 
@@ -11349,7 +11002,7 @@ mod tests {
             let cmd = parse_args(&args(&[
                 "record",
                 "start",
-                "demo",
+                SID,
                 "--output",
                 "/tmp/x.jsonl",
                 "--input-secrecy",
@@ -11373,7 +11026,7 @@ mod tests {
         let cmd = parse_args(&args(&[
             "record",
             "start",
-            "demo",
+            SID,
             "--output",
             "/tmp/x.jsonl",
             "--input-secrecy",
@@ -11404,7 +11057,7 @@ mod tests {
         let cmd = parse_args(&args(&[
             "record",
             "start",
-            "demo",
+            SID,
             "--output",
             "/tmp/x.jsonl",
             "--input-secrecy=bogus",
@@ -11420,7 +11073,7 @@ mod tests {
         let cmd = parse_args(&args(&[
             "record",
             "start",
-            "demo",
+            SID,
             "--output",
             "/tmp/x.jsonl",
             "--max-bytes",
@@ -11441,7 +11094,7 @@ mod tests {
         let cmd = parse_args(&args(&[
             "record",
             "start",
-            "demo",
+            SID,
             "--output",
             "/tmp/x.jsonl",
             "--max-bytes",
@@ -11462,7 +11115,7 @@ mod tests {
         let cmd = parse_args(&args(&[
             "record",
             "start",
-            "demo",
+            SID,
             "--output",
             "/tmp/x.jsonl",
             "--max-bytes=1g",
@@ -11481,7 +11134,7 @@ mod tests {
         let cmd = parse_args(&args(&[
             "record",
             "start",
-            "demo",
+            SID,
             "--output",
             "/tmp/x.jsonl",
             "--max-duration",
@@ -11502,7 +11155,7 @@ mod tests {
         let cmd = parse_args(&args(&[
             "record",
             "start",
-            "demo",
+            SID,
             "--output",
             "/tmp/x.jsonl",
             "--max-duration",
@@ -11522,7 +11175,7 @@ mod tests {
         let cmd = parse_args(&args(&[
             "record",
             "start",
-            "demo",
+            SID,
             "--output",
             "/tmp/x.jsonl",
             "--stdin",
@@ -11537,7 +11190,7 @@ mod tests {
         let cmd = parse_args(&args(&[
             "record",
             "start",
-            "demo",
+            SID,
             "--output",
             "/tmp/x.jsonl",
             "--prompt-pattern",
@@ -11557,7 +11210,7 @@ mod tests {
         let cmd = parse_args(&args(&[
             "record",
             "start",
-            "demo",
+            SID,
             "--output",
             "/tmp/x.jsonl",
             "--prompt-pattern",
@@ -11588,19 +11241,19 @@ mod tests {
     /// `record stop --id 1 --all` 両指定は error。
     #[test]
     fn record_stop_id_and_all_conflict() {
-        let cmd = parse_args(&args(&["record", "stop", "demo", "--id", "1", "--all"]));
+        let cmd = parse_args(&args(&["record", "stop", SID, "--id", "1", "--all"]));
         assert!(matches!(cmd, Command::Error(ref m) if m.contains("--id") && m.contains("--all")));
     }
 
     /// `record stop` で `--id` も `--all` も省略は OK (= main.rs 側 auto-select 経路)。
     #[test]
     fn record_stop_neither_id_nor_all_ok() {
-        let cmd = parse_args(&args(&["record", "stop", "demo"]));
+        let cmd = parse_args(&args(&["record", "stop", SID]));
         match cmd {
             Command::Record(RecordCommand::Stop(cfg)) => {
                 assert!(cfg.record_id.is_none());
                 assert!(!cfg.all);
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
             }
             other => panic!("expected Stop, got {other:?}"),
         }
@@ -11609,7 +11262,7 @@ mod tests {
     /// `record stop --id 42` で record_id が乗ること。
     #[test]
     fn record_stop_id_only() {
-        let cmd = parse_args(&args(&["record", "stop", "demo", "--id", "42"]));
+        let cmd = parse_args(&args(&["record", "stop", SID, "--id", "42"]));
         match cmd {
             Command::Record(RecordCommand::Stop(cfg)) => {
                 assert_eq!(cfg.record_id, Some(42));
@@ -11622,7 +11275,7 @@ mod tests {
     /// `record stop --all` で all=true。
     #[test]
     fn record_stop_all_only() {
-        let cmd = parse_args(&args(&["record", "stop", "demo", "--all"]));
+        let cmd = parse_args(&args(&["record", "stop", SID, "--all"]));
         match cmd {
             Command::Record(RecordCommand::Stop(cfg)) => {
                 assert!(cfg.all);
@@ -11635,18 +11288,18 @@ mod tests {
     /// `record stop --id <負数>` は u32 parse 失敗 → error。
     #[test]
     fn record_stop_negative_id_rejected() {
-        let cmd = parse_args(&args(&["record", "stop", "demo", "--id", "-1"]));
+        let cmd = parse_args(&args(&["record", "stop", SID, "--id", "-1"]));
         assert!(matches!(cmd, Command::Error(ref m) if m.contains("--id")));
     }
 
     /// `record list` default format は table。
     #[test]
     fn record_list_format_default_table() {
-        let cmd = parse_args(&args(&["record", "list", "demo"]));
+        let cmd = parse_args(&args(&["record", "list", SID]));
         match cmd {
             Command::Record(RecordCommand::List(cfg)) => {
                 assert_eq!(cfg.format, RecordListFormatArg::Table);
-                assert_eq!(cfg.session_id.as_deref(), Some("demo"));
+                assert_eq!(cfg.session_id.as_deref(), Some(SID));
             }
             other => panic!("expected List, got {other:?}"),
         }
@@ -11655,7 +11308,7 @@ mod tests {
     /// `record list --format=jsonl`。
     #[test]
     fn record_list_format_jsonl() {
-        let cmd = parse_args(&args(&["record", "list", "demo", "--format=jsonl"]));
+        let cmd = parse_args(&args(&["record", "list", SID, "--format=jsonl"]));
         match cmd {
             Command::Record(RecordCommand::List(cfg)) => {
                 assert_eq!(cfg.format, RecordListFormatArg::Jsonl);
@@ -11667,7 +11320,7 @@ mod tests {
     /// `record list --format=bad` は error。
     #[test]
     fn record_list_unknown_format_rejected() {
-        let cmd = parse_args(&args(&["record", "list", "demo", "--format=bad"]));
+        let cmd = parse_args(&args(&["record", "list", SID, "--format=bad"]));
         assert!(matches!(cmd, Command::Error(ref m) if m.contains("--format")));
     }
 
@@ -11698,7 +11351,7 @@ mod tests {
     /// 未知 record subcommand は edit distance suggest 付き error。
     #[test]
     fn record_unknown_subcommand_errors() {
-        let cmd = parse_args(&args(&["record", "startt", "demo"]));
+        let cmd = parse_args(&args(&["record", "startt", SID]));
         match cmd {
             Command::Error(msg) => {
                 assert!(msg.contains("unknown subcommand"), "got {msg}");

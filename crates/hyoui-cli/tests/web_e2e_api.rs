@@ -3,8 +3,9 @@
 //!
 //! ## test 内容
 //!
-//! 1. tempdir を `XDG_RUNTIME_DIR` として指定
-//! 2. `hyoui run --detached --session=<sid> -- sh -c "while read...; echo"` で daemon 起動
+//! 1. tempdir を状態の root (`HYOUI_STATE_DIR`) として指定 (= session の socket も web の
+//!    状態もその中、DR-0041 決定 6)
+//! 2. `hyoui run --detached --session-id=<uuid> -- sh -c "while read...; echo"` で daemon 起動
 //! 3. 同 env で `hyoui web daemon run` を起動
 //!    - 既定の config に listen = port 0 を書く (= kernel 割り振り)、bind した実 port を stderr 経由で拾う
 //! 4. TCP 直叩きで HTTP/1.1 request を組み立て、3 endpoint を叩く
@@ -13,7 +14,7 @@
 //! ## 認証と state dir の隔離 (DR-0036 決定 9)
 //!
 //! 認証には無認証 mode が無いので、`/api/*` と WS attach は登録 fixture で通す。
-//! **`XDG_STATE_HOME` は必ず tempdir を指す** — `env_remove` にすると gateway が
+//! **`HYOUI_STATE_DIR` は必ず tempdir を指す** — `env_remove` にすると gateway が
 //! 実利用の `~/.local/state/hyoui/web/auth.json` を読み、kawaz の本番 credential に
 //! 対して test が走る。record を直に置き、access token を `Authorization: Bearer`
 //! (WS は subprotocol `hyoui.token.<値>`) で提示する。
@@ -28,7 +29,6 @@ mod common;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -45,14 +45,9 @@ fn runtime_dir() -> SessionDir {
     SessionDir::new("hyoui-web-e2e-")
 }
 
-/// 隔離した `XDG_STATE_HOME` (= 認証登録簿の置き場、決定 9)。
-fn state_home() -> tempfile::TempDir {
-    let d = tempfile::Builder::new()
-        .prefix("hyoui-web-e2e-state-")
-        .tempdir()
-        .expect("tempdir");
-    std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
-    d
+/// test ごとの session id (= UUID、DR-0041 決定 2)。test process の寿命だけ持てばよいので leak する。
+fn new_sid() -> &'static str {
+    Box::leak(hyoui::cli::new_session_id().into_boxed_str())
 }
 
 /// 認証済みの API client (= bind した port と、その endpoint の access token)。
@@ -77,17 +72,17 @@ impl Api {
 ///
 /// endpoint は gateway が bind した `http://127.0.0.1:<port>/` の正規形。**この値が
 /// record の key と一致することが、正規形の扱い (決定 3) の test でもある。**
-fn seed_credential(state: &Path, port: u16) -> String {
-    seed_family(state, port, "fam-e2e").0
+fn seed_credential(root: &Path, port: u16) -> String {
+    seed_family(root, port, "fam-e2e").0
 }
 
 /// family を 1 本置き、(access, refresh) を返す。sub は全部 `e2e-1`。
-fn seed_family(state: &Path, port: u16, family_id: &str) -> (String, String) {
+fn seed_family(root: &Path, port: u16, family_id: &str) -> (String, String) {
     use hyoui_web::auth::{AuthFile, StateDir, token};
 
     let access = token::random_token();
     let refresh = token::random_token();
-    StateDir::under_state_home(state)
+    StateDir::under_state_root(root)
         .auth()
         .update::<AuthFile, _, _>(|file| {
             file.mint_family(
@@ -108,10 +103,9 @@ fn e2e_endpoint(port: u16) -> hyoui_web::contract::Endpoint {
         .expect("bind 先の endpoint は正規化できる")
 }
 
-fn spawn_detached(runtime: &Path, state: &Path, sid: &str) {
+fn spawn_detached(runtime: &Path, sid: &str) {
     spawn_detached_command(
         runtime,
-        state,
         sid,
         &[],
         // stdin を line 単位で echo back。POST /input の text が visible に反映される。
@@ -119,37 +113,24 @@ fn spawn_detached(runtime: &Path, state: &Path, sid: &str) {
     );
 }
 
-fn spawn_detached_command(
-    runtime: &Path,
-    state: &Path,
-    sid: &str,
-    run_options: &[&str],
-    command: &str,
-) {
+fn spawn_detached_command(runtime: &Path, sid: &str, run_options: &[&str], command: &str) {
     let mut args = vec![
         "run".to_string(),
         "--detached".to_string(),
         // stdin は /dev/null なので、そのまま子の stdin になると子の read ループが EOF で
         // 終わる (DR-0042 決定 1)。子の stdin も PTY にして入力を外から送れるようにする。
         "--pty-stdin".to_string(),
-        format!("--session={sid}"),
+        format!("--session-id={sid}"),
     ];
     args.extend(run_options.iter().map(|arg| (*arg).to_string()));
-    // DR-0018: `--namespace=<ns>` を渡したら socket は `<base>/<ns>/` に置かれる。
-    let namespace = run_options
-        .iter()
-        .find_map(|arg| arg.strip_prefix("--namespace="))
-        .filter(|ns| *ns != "default");
     args.extend(["--", "sh", "-c"].map(str::to_string));
     args.push(command.to_string());
 
     let status = Command::new(hyoui_bin())
         .args(args)
-        .env("XDG_RUNTIME_DIR", runtime)
-        .env("XDG_STATE_HOME", state)
+        .env("HYOUI_STATE_DIR", runtime)
         .env_remove("HYOUI_SESSION_ID")
         .env_remove("HYOUI_LOCK_TOKEN")
-        .env_remove("HYOUI_NAMESPACE")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -157,12 +138,7 @@ fn spawn_detached_command(
         .expect("spawn detached daemon");
     assert!(status.success(), "run --detached が成功すること");
 
-    let base = runtime.join("hyoui");
-    let sock = match namespace {
-        Some(ns) => base.join(ns),
-        None => base,
-    }
-    .join(format!("{sid}.sock"));
+    let sock = runtime.join("sessions").join(format!("{sid}.sock"));
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if sock.exists() {
@@ -176,7 +152,7 @@ fn spawn_detached_command(
 fn cleanup(runtime: &Path, sid: &str) {
     let _ = Command::new(hyoui_bin())
         .args(["kill", sid])
-        .env("XDG_RUNTIME_DIR", runtime)
+        .env("HYOUI_STATE_DIR", runtime)
         .env_remove("HYOUI_SESSION_ID")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -191,7 +167,7 @@ fn cleanup(runtime: &Path, sid: &str) {
 ///
 /// `hyoui_web::serve` は起動時に `hyoui web: listening on http://127.0.0.1:<port>`
 /// の 1 行を stderr に書く (= lib.rs)。stderr を pipe で読み、port を parse する。
-fn spawn_web(runtime: &Path, state: &Path) -> (Child, Api) {
+fn spawn_web(runtime: &Path) -> (Child, Api) {
     let mut child = Command::new(hyoui_bin())
         // config を読まない起動 (DR-0038 決定 9)。port 0 (= kernel に任せる) で、実際に
         // bind した port は gateway が stderr に書く 1 行から拾う。
@@ -203,11 +179,9 @@ fn spawn_web(runtime: &Path, state: &Path) -> (Child, Api) {
             "--listen",
             "127.0.0.1:0",
         ])
-        .env("XDG_RUNTIME_DIR", runtime)
-        .env("XDG_STATE_HOME", state)
+        .env("HYOUI_STATE_DIR", runtime)
         .env_remove("HYOUI_SESSION_ID")
         .env_remove("HYOUI_LOCK_TOKEN")
-        .env_remove("HYOUI_NAMESPACE")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -235,7 +209,7 @@ fn spawn_web(runtime: &Path, state: &Path) -> (Child, Api) {
                 let _ = reader.into_inner().read_to_end(&mut buf);
             });
             // 認証は常に有効なので (決定 9)、port が決まった時点で fixture を置く。
-            let token = seed_credential(state, port);
+            let token = seed_credential(runtime, port);
             return (child, Api { port, token });
         }
     }
@@ -310,16 +284,14 @@ fn http_request(
 #[test]
 fn e2e_screen_both_preserves_alternate_screen_mode() {
     let runtime = runtime_dir();
-    let state = state_home();
-    let sid = "web-e2e-alt-screen";
+    let sid = new_sid();
     spawn_detached_command(
         runtime.path(),
-        state.path(),
         sid,
         &["--size=80x24"],
         "printf '\\033[?1049h\\033[2J\\033[HWEB-ALT-PROBE'; exec sleep 60",
     );
-    let (mut web, api) = spawn_web(runtime.path(), state.path());
+    let (mut web, api) = spawn_web(runtime.path());
     let panic_guard = ChildGuard(&mut web);
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -357,16 +329,14 @@ fn e2e_screen_both_preserves_alternate_screen_mode() {
 #[test]
 fn e2e_screen_layer_query_selects_visible_scrollback_or_both() {
     let runtime = runtime_dir();
-    let state = state_home();
-    let sid = "web-e2e-screen-layer";
+    let sid = new_sid();
     spawn_detached_command(
         runtime.path(),
-        state.path(),
         sid,
         &["--size=80x10", "--scrollback-rows=100"],
         "i=1; while [ $i -le 40 ]; do printf 'WEB-HISTORY-%03d\\n' $i; i=$((i+1)); done; printf 'WEB-VISIBLE-END\\n'; exec sleep 60",
     );
-    let (mut web, api) = spawn_web(runtime.path(), state.path());
+    let (mut web, api) = spawn_web(runtime.path());
     let panic_guard = ChildGuard(&mut web);
 
     // query 省略時は既存 API と同じ visible layer。web UI は full reset 時に
@@ -426,11 +396,10 @@ fn e2e_screen_layer_query_selects_visible_scrollback_or_both() {
 #[test]
 fn e2e_sessions_screen_input() {
     let runtime = runtime_dir();
-    let state = state_home();
-    let sid = "web-e2e-1";
+    let sid = new_sid();
 
-    spawn_detached(runtime.path(), state.path(), sid);
-    let (mut web, api) = spawn_web(runtime.path(), state.path());
+    spawn_detached(runtime.path(), sid);
+    let (mut web, api) = spawn_web(runtime.path());
 
     let panic_guard = ChildGuard(&mut web);
 
@@ -514,53 +483,51 @@ fn e2e_sessions_screen_input() {
     cleanup(runtime.path(), sid);
 }
 
-/// `GET /api/sessions/:id` と session 単位 API は namespace を問わず id で引ける
-/// (= DR-0018 の配置規則で同名 socket を直接探す)。
+/// gateway が見るのは自分の面 (状態の root) の `sessions/` だけ (DR-0041 決定 4 / 6)。
+///
+/// 別の root で起こした session は、id を知っていても一覧にも 1 件 API にも出ない。UUID の
+/// 標準形でない id (大文字・短縮) は同じ session を指さない (= 404)。
 #[test]
-fn e2e_single_session_resolves_across_namespaces() {
+fn e2e_gateway_sees_only_its_own_state_root() {
     let runtime = runtime_dir();
-    let state = state_home();
-    let (sid_default, sid_ns, ns) = ("web-e2e-ns-a", "web-e2e-ns-b", "e2e-grp");
+    let other_face = SessionDir::new("hyoui-web-e2e-other-");
+    let (sid_here, sid_there) = (new_sid(), new_sid());
 
-    spawn_detached(runtime.path(), state.path(), sid_default);
-    spawn_detached_command(
-        runtime.path(),
-        state.path(),
-        sid_ns,
-        &["--namespace=e2e-grp"],
-        "while IFS= read -r line; do echo \"$line\"; done",
-    );
-    let (mut web, api) = spawn_web(runtime.path(), state.path());
+    spawn_detached(runtime.path(), sid_here);
+    spawn_detached(other_face.path(), sid_there);
+    let (mut web, api) = spawn_web(runtime.path());
     let panic_guard = ChildGuard(&mut web);
 
-    for (sid, expected_ns) in [(sid_default, "default"), (sid_ns, ns)] {
-        let r = api.request("GET", &format!("/api/sessions/{sid}"), None);
-        assert_eq!(
-            r.status,
-            200,
-            "{sid}: {:?}",
-            String::from_utf8_lossy(&r.body)
-        );
-        let one: serde_json::Value = serde_json::from_slice(&r.body).expect("json parse");
-        assert_eq!(one["session_id"].as_str(), Some(sid));
-        assert_eq!(one["namespace"].as_str(), Some(expected_ns));
-        assert_eq!(one["status"].as_str(), Some("live"));
-        // 同じ解決経路を通る screen も引ける。
-        let r = api.request("GET", &format!("/api/sessions/{sid}/screen"), None);
-        assert_eq!(r.status, 200, "{sid} screen");
+    let r = api.request("GET", "/api/sessions", None);
+    assert_eq!(r.status, 200);
+    let json: serde_json::Value = serde_json::from_slice(&r.body).expect("json parse");
+    let ids: Vec<&str> = json
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|e| e["session_id"].as_str())
+        .collect();
+    assert_eq!(ids, [sid_here], "{json}");
+    assert!(
+        json[0].get("namespace").is_none(),
+        "namespace field is gone: {json}"
+    );
+
+    let r = api.request("GET", &format!("/api/sessions/{sid_here}"), None);
+    assert_eq!(r.status, 200, "{:?}", String::from_utf8_lossy(&r.body));
+    let r = api.request("GET", &format!("/api/sessions/{sid_there}"), None);
+    assert_eq!(
+        r.status, 404,
+        "another state root's session must not resolve"
+    );
+    for alias in [sid_here.to_ascii_uppercase(), sid_here[..8].to_string()] {
+        let r = api.request("GET", &format!("/api/sessions/{alias}"), None);
+        assert_eq!(r.status, 404, "{alias} must not resolve to {sid_here}");
     }
 
     drop(panic_guard);
-    cleanup(runtime.path(), sid_default);
-    let _ = Command::new(hyoui_bin())
-        .args(["kill", "--namespace=e2e-grp", sid_ns])
-        .env("XDG_RUNTIME_DIR", runtime.path())
-        .env_remove("HYOUI_SESSION_ID")
-        .env_remove("HYOUI_NAMESPACE")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    cleanup(runtime.path(), sid_here);
+    cleanup(other_face.path(), sid_there);
 }
 
 /// DR-0022 auto-lock の web 側統合を検証する e2e。
@@ -574,21 +541,19 @@ fn e2e_single_session_resolves_across_namespaces() {
 #[test]
 fn e2e_input_returns_409_while_external_client_holds_lock() {
     let runtime = runtime_dir();
-    let state = state_home();
-    let sid = "web-e2e-lock-2";
+    let sid = new_sid();
 
-    spawn_detached(runtime.path(), state.path(), sid);
-    let (mut web, api) = spawn_web(runtime.path(), state.path());
+    spawn_detached(runtime.path(), sid);
+    let (mut web, api) = spawn_web(runtime.path());
     let panic_guard = ChildGuard(&mut web);
 
     // 外部 CLI で lock acquire → stdout に token が 1 行 print される。
     // acquire は blocking で socket が生きている限り保持する (= release まで)。
     let mut acquire_child = Command::new(hyoui_bin())
         .args(["lock", "acquire", sid])
-        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("HYOUI_STATE_DIR", runtime.path())
         .env_remove("HYOUI_SESSION_ID")
         .env_remove("HYOUI_LOCK_TOKEN")
-        .env_remove("HYOUI_NAMESPACE")
         // stdin は `Stdio::null()` にしない: `hyoui lock acquire` は token 出力後の
         // block phase で **stdin EOF を release trigger にする** ため (= main.rs
         // `wait_until_release_signal` の POLLHUP / read=0 path)。/dev/null からの
@@ -676,11 +641,10 @@ fn e2e_input_returns_409_while_external_client_holds_lock() {
 #[test]
 fn e2e_resize_endpoint() {
     let runtime = runtime_dir();
-    let state = state_home();
-    let sid = "web-e2e-resize";
+    let sid = new_sid();
 
-    spawn_detached(runtime.path(), state.path(), sid);
-    let (mut web, api) = spawn_web(runtime.path(), state.path());
+    spawn_detached(runtime.path(), sid);
+    let (mut web, api) = spawn_web(runtime.path());
     let panic_guard = ChildGuard(&mut web);
 
     // 未知 session → 404
@@ -733,10 +697,9 @@ fn e2e_resize_endpoint() {
                 "--include=WindowSize",
                 "--format=json",
             ])
-            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("HYOUI_STATE_DIR", runtime.path())
             .env_remove("HYOUI_SESSION_ID")
             .env_remove("HYOUI_LOCK_TOKEN")
-            .env_remove("HYOUI_NAMESPACE")
             .stdin(Stdio::null())
             .stderr(Stdio::piped())
             .output()
@@ -783,11 +746,10 @@ fn e2e_ws_attach_bridge_roundtrip() {
     use tungstenite::{Message, client, handshake::client::Request};
 
     let runtime = runtime_dir();
-    let state = state_home();
-    let sid = "web-e2e-wsattach";
+    let sid = new_sid();
 
-    spawn_detached(runtime.path(), state.path(), sid);
-    let (mut web, api) = spawn_web(runtime.path(), state.path());
+    spawn_detached(runtime.path(), sid);
+    let (mut web, api) = spawn_web(runtime.path());
     let port = api.port;
     let panic_guard = ChildGuard(&mut web);
 
@@ -1080,10 +1042,9 @@ fn e2e_ws_attach_bridge_roundtrip() {
             "--include=WindowSize",
             "--format=json",
         ])
-        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("HYOUI_STATE_DIR", runtime.path())
         .env_remove("HYOUI_SESSION_ID")
         .env_remove("HYOUI_LOCK_TOKEN")
-        .env_remove("HYOUI_NAMESPACE")
         .stdin(Stdio::null())
         .output()
         .expect("screen snapshot after WS resize");
@@ -1100,7 +1061,7 @@ fn e2e_ws_attach_bridge_roundtrip() {
     // 失効させると、**次の `auth.extend` でこの接続が切れる** (決定 4 の
     // 「失効はいつ効くか」)。CLI は gateway に通知しないので、確立済み接続に
     // 失効が反映される点はここだけである。
-    hyoui_web::auth::StateDir::under_state_home(state.path())
+    hyoui_web::auth::StateDir::under_state_root(runtime.path())
         .auth()
         .update::<hyoui_web::auth::AuthFile, _, _>(|file| {
             file.tombstone_sub("e2e-1", hyoui::time::now_unix_ms());
@@ -1165,15 +1126,14 @@ fn e2e_ws_attach_bridge_roundtrip() {
 #[test]
 fn e2e_ws_attach_closes_with_the_auth_code_when_its_family_ends() {
     let runtime = runtime_dir();
-    let state = state_home();
-    let sid = "web-e2e-wsauth";
+    let sid = new_sid();
 
-    spawn_detached(runtime.path(), state.path(), sid);
-    let (mut web, api) = spawn_web(runtime.path(), state.path());
+    spawn_detached(runtime.path(), sid);
+    let (mut web, api) = spawn_web(runtime.path());
     let port = api.port;
     let panic_guard = ChildGuard(&mut web);
     // 同じ sub の 2 本目の family (= 別のタブ / 端末でのサインイン相当)。
-    let (other_access, other_refresh) = seed_family(state.path(), port, "fam-other");
+    let (other_access, other_refresh) = seed_family(runtime.path(), port, "fam-other");
     let path = format!("/api/sessions/{sid}/attach");
 
     // (1) 別 family の有効な access では延ばせない。
@@ -1196,7 +1156,7 @@ fn e2e_ws_attach_closes_with_the_auth_code_when_its_family_ends() {
     let mut ws = ws_connect(port, &path, &format!("hyoui.token.{other_access}"));
     read_text_kind(&mut ws, "hello");
     assert_eq!(post_refresh(port, &other_refresh), 200, "1 度目は rotate");
-    hyoui_web::auth::StateDir::under_state_home(state.path())
+    hyoui_web::auth::StateDir::under_state_root(runtime.path())
         .auth()
         .update::<hyoui_web::auth::AuthFile, _, _>(|file| {
             for family in file.families.values_mut().flat_map(|f| f.values_mut()) {

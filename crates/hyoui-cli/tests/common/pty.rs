@@ -7,7 +7,7 @@
 //!   hyoui 本体を改造しない (= 既存 socket 解決 / TTY mode / WINCH 配送をそのまま使う)
 //! - **隔離**: 各 `HyouiTestRunner` は `SessionDir` (TempDir) を持ち、socket は
 //!   `<runtime_dir>/<session>.sock` に明示配置 (= `--socket=<path>` 経由)。
-//!   `XDG_RUNTIME_DIR` / `TMPDIR` 等 env を test 間で共有しない
+//!   状態の root (`HYOUI_STATE_DIR`) と `TMPDIR` も runtime_dir に向け、test 間で共有しない
 //! - **PTY size 等の default は hyoui 既存挙動と整合**: `Size::new(24, 80)` (=
 //!   24 行 80 列、hyoui-cli の `--cols` / `--rows` のデフォルトと一致)。
 //!   master 側の termios は触らない (= hyoui-cli が attach 時に raw 化する)
@@ -255,19 +255,18 @@ impl HyouiTestRunner {
             }
         }
 
-        // env: テストの独立性のため runtime_dir を override (= 万が一 hyoui-cli が
-        // env を読む経路があっても test の隔離を破らない)
+        // env: テストの独立性のため状態の root (= 面) を runtime_dir に向ける (= 万が一
+        // hyoui-cli が env から場所を導く経路があっても test の隔離を破らない)
         cmd = cmd
-            .env("XDG_RUNTIME_DIR", self.runtime_dir.path())
+            .env("HYOUI_STATE_DIR", self.runtime_dir.path())
             .env("TMPDIR", self.runtime_dir.path())
             // HYOUI_LOCK_TOKEN は test ごとに無効化したい (= 既存 hyoui-cli が
             // 環境変数から authenticate token を拾うので、隔離 dir でも干渉回避)
             .env_remove("HYOUI_LOCK_TOKEN")
             // DR-0020: test 自体が hyoui 配下で動いている環境 (= dogfooding) では
-            // HYOUI_SESSION_ID / HYOUI_NAMESPACE が継承され、session 省略形の解決や
-            // attach の self 判定が外側 session に向かう。test の隔離のため常に外す。
-            .env_remove("HYOUI_SESSION_ID")
-            .env_remove("HYOUI_NAMESPACE");
+            // HYOUI_SESSION_ID が継承され、session 省略形の解決や attach の self 判定が
+            // 外側 session に向かう。test の隔離のため常に外す。
+            .env_remove("HYOUI_SESSION_ID");
         if let Some(config_home) = config_home {
             cmd = cmd.env("XDG_CONFIG_HOME", config_home);
         }
@@ -650,7 +649,7 @@ impl SpawnedHyoui {
         let _ = std::process::Command::new(hyoui_bin())
             .args(["kill", &socket_arg])
             .env(
-                "XDG_RUNTIME_DIR",
+                "HYOUI_STATE_DIR",
                 self.socket.parent().unwrap_or(Path::new("/tmp")),
             )
             .output();

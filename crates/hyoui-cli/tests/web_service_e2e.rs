@@ -13,7 +13,7 @@ fn hyoui(args: &[&str], home: &Path) -> Output {
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_STATE_HOME", home.join(".local/state"))
-        .env("XDG_RUNTIME_DIR", home.join("run"))
+        .env("HYOUI_STATE_DIR", home.join(".local/state/hyoui"))
         .stdin(Stdio::null())
         .output()
         .expect("spawn hyoui")

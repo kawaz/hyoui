@@ -95,9 +95,9 @@ _hyoui() {
                     --format) COMPREPLY=( $(compgen -W "ansi binary cbor text/plain" -- "$cur") ); return 0 ;;
                     --layer) COMPREPLY=( $(compgen -W "visible scrollback both" -- "$cur") ); return 0 ;;
                     --output) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                    --namespace|--index|--rect|--timeout) return 0 ;;
+                    --index|--rect|--timeout) return 0 ;;
                 esac
-                COMPREPLY=( $(compgen -W "--socket --namespace --index --format --layer --rect --output --timeout --help -h" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--socket --index --format --layer --rect --output --timeout --help -h" -- "$cur") )
                 return 0 ;;
             snapshot)
                 case "$prev" in
@@ -105,9 +105,9 @@ _hyoui() {
                     --include) COMPREPLY=( $(compgen -W "cells cursor mode windowsize buffer sequenceno" -- "$cur") ); return 0 ;;
                     --format) COMPREPLY=( $(compgen -W "cbor json" -- "$cur") ); return 0 ;;
                     --output) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                    --namespace|--index|--timeout) return 0 ;;
+                    --index|--timeout) return 0 ;;
                 esac
-                COMPREPLY=( $(compgen -W "--socket --namespace --index --include --format --output --timeout --help -h" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--socket --index --include --format --output --timeout --help -h" -- "$cur") )
                 return 0 ;;
         esac
         return 0
@@ -126,16 +126,16 @@ _hyoui() {
                 case "$prev" in
                     --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
                     --mode) COMPREPLY=( $(compgen -W "wait fail" -- "$cur") ); return 0 ;;
-                    --namespace|--index|--timeout) return 0 ;;
+                    --index|--timeout) return 0 ;;
                 esac
-                COMPREPLY=( $(compgen -W "--socket --namespace --index --mode --timeout --help -h" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--socket --index --mode --timeout --help -h" -- "$cur") )
                 return 0 ;;
             release)
                 case "$prev" in
                     --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                    --namespace|--index|--token) return 0 ;;
+                    --index|--token) return 0 ;;
                 esac
-                COMPREPLY=( $(compgen -W "--socket --namespace --index --token --help -h" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--socket --index --token --help -h" -- "$cur") )
                 return 0 ;;
         esac
         return 0
@@ -155,24 +155,24 @@ _hyoui() {
                     --socket|--output) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
                     --format) COMPREPLY=( $(compgen -W "jsonl raw" -- "$cur") ); return 0 ;;
                     --input-secrecy) COMPREPLY=( $(compgen -W "record-all never-record-stdin" -- "$cur") ); return 0 ;;
-                    --namespace|--index|--max-bytes|--max-duration|--prompt-pattern) return 0 ;;
+                    --index|--max-bytes|--max-duration|--prompt-pattern) return 0 ;;
                 esac
-                COMPREPLY=( $(compgen -W "--socket --namespace --index --output --stdin --stdout --both --format --max-bytes --max-duration --input-secrecy --prompt-pattern --help -h" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--socket --index --output --stdin --stdout --both --format --max-bytes --max-duration --input-secrecy --prompt-pattern --help -h" -- "$cur") )
                 return 0 ;;
             stop)
                 case "$prev" in
                     --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                    --namespace|--index|--id) return 0 ;;
+                    --index|--id) return 0 ;;
                 esac
-                COMPREPLY=( $(compgen -W "--socket --namespace --index --id --all --help -h" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--socket --index --id --all --help -h" -- "$cur") )
                 return 0 ;;
             list)
                 case "$prev" in
                     --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
                     --format) COMPREPLY=( $(compgen -W "table jsonl" -- "$cur") ); return 0 ;;
-                    --namespace|--index) return 0 ;;
+                    --index) return 0 ;;
                 esac
-                COMPREPLY=( $(compgen -W "--socket --namespace --index --format --help -h" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--socket --index --format --help -h" -- "$cur") )
                 return 0 ;;
         esac
         return 0
@@ -315,7 +315,7 @@ _hyoui() {
     if [[ "$sub" == "input" ]]; then
         case "$prev" in
             --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-            --namespace|--index|--timeout|--lock-token|--max-file-bytes|--auto-lock-timeout-acquire) return 0 ;;
+            --index|--timeout|--lock-token|--max-file-bytes|--auto-lock-timeout-acquire) return 0 ;;
         esac
         # spec prefix の途中 (= "text:" / "key:" 等) に来たら value 部分は補完しない
         # (= 任意文字列 / regex / path)。ただし "file:" の場合は path 補完を提供。
@@ -338,7 +338,7 @@ _hyoui() {
                 done
                 return 0 ;;
         esac
-        COMPREPLY=( $(compgen -W "--socket --namespace --index --timeout --lock-token --max-file-bytes --auto-lock-timeout-acquire --help -h text: hex: file: paste: key: wait: wait-idle:" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--socket --index --timeout --lock-token --max-file-bytes --auto-lock-timeout-acquire --help -h text: hex: file: paste: key: wait: wait-idle:" -- "$cur") )
         return 0
     fi
 
@@ -349,14 +349,14 @@ _hyoui() {
                     COMPREPLY=( $(compgen -W "notify auto-resume" -- "$cur") ); return 0 ;;
                 --socket|--debug-dump-server|--debug-dump-client)
                     _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                --namespace|--session|--timeout|--idle-timeout|--until|--size|--cols|--rows|--scrollback-rows)
+                --session-id|--timeout|--idle-timeout|--until|--size|--cols|--rows|--scrollback-rows)
                     return 0 ;;
             esac
             case "$cur" in
                 --on-child-suspend=*)
                     COMPREPLY=( $(compgen -W "notify auto-resume" -- "${cur#*=}") ); return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --session --detached --pty-stdin --timeout --idle-timeout --until --on-child-suspend --scrollback-rows --login --no-scrub-env --debug-dump-server --debug-dump-client --size --cols --rows --help -h --" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --session-id --detached --pty-stdin --timeout --idle-timeout --until --on-child-suspend --scrollback-rows --login --no-scrub-env --debug-dump-server --debug-dump-client --size --cols --rows --help -h --" -- "$cur") )
             return 0 ;;
         completion)
             COMPREPLY=( $(compgen -W "bash zsh fish --help -h" -- "$cur") )
@@ -365,78 +365,78 @@ _hyoui() {
             case "$prev" in
                 --socket|--debug-dump-client) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
                 --mode) COMPREPLY=( $(compgen -W "rw ro rw-no-leader" -- "$cur") ); return 0 ;;
-                --namespace|--index) return 0 ;;
+                --index) return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --index --mode --quiet --debug-dump-client --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --index --mode --quiet --debug-dump-client --help -h" -- "$cur") )
             return 0 ;;
         list)
             case "$cur" in
                 --format=*)
                     COMPREPLY=( $(compgen -W "plain jsonl" -- "${cur#*=}") ); return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--namespace --all-namespaces --format --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--format --help -h" -- "$cur") )
             return 0 ;;
         kill)
             case "$prev" in
                 --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
                 --signal) COMPREPLY=( $(compgen -W "SIGHUP SIGINT SIGQUIT SIGABRT SIGKILL SIGUSR1 SIGUSR2 SIGTERM SIGCONT SIGTSTP SIGCHLD" -- "$cur") ); return 0 ;;
-                --namespace|--index) return 0 ;;
+                --index) return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --index --all --signal --wait --kill-on-timeout --no-terminate --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --index --all --signal --wait --kill-on-timeout --no-terminate --help -h" -- "$cur") )
             return 0 ;;
         status)
             case "$prev" in
                 --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
                 --format) COMPREPLY=( $(compgen -W "plain json" -- "$cur") ); return 0 ;;
-                --namespace|--index) return 0 ;;
+                --index) return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --index --format --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --index --format --help -h" -- "$cur") )
             return 0 ;;
         set)
             case "$prev" in
                 --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                --namespace|--index) return 0 ;;
+                --index) return 0 ;;
             esac
             # key=value 位置引数の補完: 既知 key を `key=` 形まで、値も候補に出す。
             case "$cur" in
                 on-child-suspend=*) COMPREPLY=( $(compgen -W "on-child-suspend=notify on-child-suspend=auto-resume" -- "$cur") ); return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --index --help -h on-child-suspend=" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --index --help -h on-child-suspend=" -- "$cur") )
             return 0 ;;
         tail)
             case "$prev" in
                 --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                --namespace|--index|--since|--last-bytes) return 0 ;;
+                --index|--since|--last-bytes) return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --index --follow --strip-ansi --since --since-strict --last-bytes --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --index --follow --strip-ansi --since --since-strict --last-bytes --help -h" -- "$cur") )
             return 0 ;;
         wait)
             case "$prev" in
                 --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                --namespace|--index|--timeout|--poll-interval) return 0 ;;
+                --index|--timeout|--poll-interval) return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --index --timeout --poll-interval --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --index --timeout --poll-interval --help -h" -- "$cur") )
             return 0 ;;
         unlock)
             case "$prev" in
                 --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                --namespace|--index|--token) return 0 ;;
+                --index|--token) return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --index --token --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --index --token --help -h" -- "$cur") )
             return 0 ;;
         detach)
             case "$prev" in
                 --socket) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                --namespace|--index) return 0 ;;
+                --index) return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --index --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --index --help -h" -- "$cur") )
             return 0 ;;
         upgrade)
             case "$prev" in
                 --socket|--binary) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                --namespace|--index) return 0 ;;
+                --index) return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --index --binary --skip-version-check --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --index --binary --skip-version-check --help -h" -- "$cur") )
             return 0 ;;
         *)
             return 0 ;;
@@ -475,7 +475,6 @@ _hyoui() {
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
-                        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '--mode=[Operating mode]:mode:(rw ro rw-no-leader)' \
                         '--quiet[Suppress the detach/peek hint on attach]' \
                         '--debug-dump-client=[Append daemon->client raw bytes to a file]:file:_files' \
@@ -484,8 +483,6 @@ _hyoui() {
                     ;;
                 list)
                     _arguments \
-                        '--namespace=[Show only this namespace]:namespace:' \
-                        '--all-namespaces[List sessions across all namespaces (adds NS column)]' \
                         '--format=[Output format]:format:(plain jsonl)' \
                         '(-h --help)'{-h,--help}'[Show help]'
                     ;;
@@ -493,7 +490,6 @@ _hyoui() {
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
-                        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '--all[Kill all live sessions]' \
                         '--signal=[Signal name (SIG-prefix uppercase, DR-0012)]:signal:(SIGHUP SIGINT SIGQUIT SIGABRT SIGKILL SIGUSR1 SIGUSR2 SIGTERM SIGCONT SIGTSTP SIGCHLD)' \
                         '--wait=[Wait for child exit (bare=10s default, =DUR to override)]:duration:' \
@@ -506,7 +502,6 @@ _hyoui() {
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
-                        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '--format=[Output format]:format:(plain json)' \
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:session id:'
@@ -515,7 +510,6 @@ _hyoui() {
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
-                        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:session id or key=value:(on-child-suspend=notify on-child-suspend=auto-resume)'
                     ;;
@@ -523,7 +517,6 @@ _hyoui() {
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
-                        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '--follow[Continue streaming live output]' \
                         '--strip-ansi[Strip ANSI escapes in output]' \
                         '--since=[Drop chunks older than DUR (e.g. 500ms / 2s / 1m)]:duration:' \
@@ -536,7 +529,6 @@ _hyoui() {
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
-                        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '--timeout=[Absolute timeout (e.g. 5s / 30s)]:duration:' \
                         '--poll-interval=[Snapshot polling interval (default 100ms)]:duration:' \
                         '(-h --help)'{-h,--help}'[Show help]' \
@@ -555,7 +547,6 @@ _hyoui() {
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
-                        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '--token=[Lock token to release]:token:' \
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:session id:'
@@ -564,7 +555,6 @@ _hyoui() {
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
-                        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:session id:'
                     ;;
@@ -572,7 +562,6 @@ _hyoui() {
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
-                        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '--binary=[Override the daemon exec target path]:binary:_files' \
                         '--skip-version-check[Skip <binary> --version pre-check (test only)]' \
                         '(-h --help)'{-h,--help}'[Show help]' \
@@ -631,7 +620,6 @@ _hyoui_screen() {
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
-                        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '--format=[Output format]:format:(ansi binary cbor text/plain)' \
                         '--layer=[Layer to dump]:layer:(visible scrollback both)' \
                         '--rect=[Sub-rectangle x,y,w,h]:rect:' \
@@ -644,7 +632,6 @@ _hyoui_screen() {
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
-                        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '--include=[Snapshot components to include]:component:(cells cursor mode windowsize buffer sequenceno)' \
                         '--format=[Output format]:format:(cbor json)' \
                         '--output=[Output file path]:file:_files' \
@@ -679,7 +666,6 @@ _hyoui_lock() {
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
-                        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '--mode=[Behavior when held]:mode:(wait fail)' \
                         '--timeout=[Acquire timeout]:duration:' \
                         '(-h --help)'{-h,--help}'[Show help]' \
@@ -689,7 +675,6 @@ _hyoui_lock() {
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
-                        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '--token=[Lock token to release]:token:' \
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:session id:'
@@ -721,7 +706,6 @@ _hyoui_record() {
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
-                        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '--output=[Output file path (absolute)]:file:_files' \
                         '--stdin[Record child PTY input only]' \
                         '--stdout[Record child PTY output only]' \
@@ -738,7 +722,6 @@ _hyoui_record() {
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
-                        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '--id=[record_id to stop]:id:' \
                         '--all[Stop all active records]' \
                         '(-h --help)'{-h,--help}'[Show help]' \
@@ -748,7 +731,6 @@ _hyoui_record() {
                     _arguments \
                         '--socket=[Explicit socket path]:socket:_files' \
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
-                        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '--format=[Output format]:format:(table jsonl)' \
                         '(-h --help)'{-h,--help}'[Show help]' \
                         '*:session id:'
@@ -974,7 +956,6 @@ _hyoui_input() {
     _arguments \
         '--socket=[Explicit socket path]:socket:_files' \
         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
-                        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
         '--timeout=[Per-spec timeout (e.g. 5s)]:duration:' \
         '--lock-token=[Explicit lock token (overrides HYOUI_LOCK_TOKEN)]:token:' \
         '--max-file-bytes=[Max bytes for file: spec (0 = unlimited)]:bytes:' \
@@ -1015,8 +996,7 @@ _hyoui_input_spec() {
 _hyoui_run() {
     _arguments \
         '--socket=[Unix socket path]:socket:_files' \
-        '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
-        '--session=[Explicit session id instead of auto-numbering (DR-0015)]:session:' \
+        '--session-id=[Session id chosen by the caller (canonical lowercase UUID, DR-0041)]:uuid:' \
         '--detached[Fork the daemon and exit immediately (DR-0015)]' \
         '--pty-stdin[Make the child stdin the PTY instead of passing the caller stdin (DR-0042)]' \
         '--timeout=[Overall timeout (e.g. 30s / 1m / 1h30m)]:duration:' \
@@ -1204,7 +1184,6 @@ complete -c hyoui -n __hyoui_no_subcommand -s V -l version -d 'Show version and 
 
 # `hyoui run` options.
 complete -c hyoui -n '__hyoui_using_subcommand run' -l socket            -r -F                          -d 'Unix socket path'
-complete -c hyoui -n '__hyoui_using_subcommand run' -l namespace         -x                              -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l timeout           -x                              -d 'Overall timeout (e.g. 30s / 1m / 1h30m)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l idle-timeout      -x                              -d 'Output idle timeout (e.g. 500ms / 5s)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l until             -x                              -d 'Terminate when PATTERN appears'
@@ -1213,7 +1192,7 @@ complete -c hyoui -n '__hyoui_using_subcommand run' -l cols              -x     
 complete -c hyoui -n '__hyoui_using_subcommand run' -l rows              -x                              -d 'Virtual screen rows'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l on-child-suspend  -x -a 'notify auto-resume'       -d 'Action when child is stopped'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l scrollback-rows   -x                              -d 'vt100 scrollback ring max rows (default 1000)'
-complete -c hyoui -n '__hyoui_using_subcommand run' -l session           -x                              -d 'Explicit session id instead of auto-numbering (DR-0015)'
+complete -c hyoui -n '__hyoui_using_subcommand run' -l session-id        -x                              -d 'Session id chosen by the caller (canonical lowercase UUID, DR-0041)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l detached                                           -d 'Fork the daemon and exit immediately (DR-0015)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l pty-stdin                                          -d 'Make the child stdin the PTY instead of passing the caller stdin (DR-0042)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l login                                              -d 'Start as a login shell with a minimal child env (DR-0039)'
@@ -1229,22 +1208,18 @@ complete -c hyoui -n '__hyoui_using_subcommand completion' -s h -l help         
 # `hyoui attach` options.
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l socket         -r -F                        -d 'Explicit socket path'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l index          -x                           -d 'Session selector (1=oldest, -1=newest)'
-complete -c hyoui -n '__hyoui_using_subcommand attach' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l mode           -x -a 'rw ro rw-no-leader'   -d 'Operating mode'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l quiet                                          -d 'Suppress the detach/peek hint on attach'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l debug-dump-client -r -F                        -d 'Append daemon->client raw bytes to a file'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -s h -l help                                    -d 'Show help and exit'
 
 # `hyoui list` options.
-complete -c hyoui -n '__hyoui_using_subcommand list' -l namespace -x         -d 'Show only this namespace'
-complete -c hyoui -n '__hyoui_using_subcommand list' -l all-namespaces       -d 'List sessions across all namespaces (adds NS column)'
 complete -c hyoui -n '__hyoui_using_subcommand list' -l format -x -a 'plain jsonl' -d 'Output format'
 complete -c hyoui -n '__hyoui_using_subcommand list' -s h -l help            -d 'Show help and exit'
 
 # `hyoui kill` options.
 complete -c hyoui -n '__hyoui_using_subcommand kill' -l socket -r -F -d 'Explicit socket path'
 complete -c hyoui -n '__hyoui_using_subcommand kill' -l index  -x    -d 'Session selector (1=oldest, -1=newest)'
-complete -c hyoui -n '__hyoui_using_subcommand kill' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand kill' -l all          -d 'Kill all live sessions'
 complete -c hyoui -n '__hyoui_using_subcommand kill' -l signal -x -a 'SIGHUP SIGINT SIGQUIT SIGABRT SIGKILL SIGUSR1 SIGUSR2 SIGTERM SIGCONT SIGTSTP SIGCHLD' -d 'Signal name (SIG-prefix uppercase, DR-0012)'
 complete -c hyoui -n '__hyoui_using_subcommand kill' -l wait -x      -d 'Wait for child exit (bare=10s default, =DUR to override)'
@@ -1255,21 +1230,18 @@ complete -c hyoui -n '__hyoui_using_subcommand kill' -s h -l help    -d 'Show he
 # `hyoui status` options.
 complete -c hyoui -n '__hyoui_using_subcommand status' -l socket -r -F -d 'Explicit socket path'
 complete -c hyoui -n '__hyoui_using_subcommand status' -l index  -x    -d 'Session selector (1=oldest, -1=newest)'
-complete -c hyoui -n '__hyoui_using_subcommand status' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand status' -l format -x -a 'plain json' -d 'Output format'
 complete -c hyoui -n '__hyoui_using_subcommand status' -s h -l help    -d 'Show help and exit'
 
 # `hyoui set` options + key=value 候補。
 complete -c hyoui -n '__hyoui_using_subcommand set' -l socket -r -F -d 'Explicit socket path'
 complete -c hyoui -n '__hyoui_using_subcommand set' -l index  -x    -d 'Session selector (1=oldest, -1=newest)'
-complete -c hyoui -n '__hyoui_using_subcommand set' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand set' -s h -l help    -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_using_subcommand set' -f -a 'on-child-suspend=notify on-child-suspend=auto-resume' -d 'Runtime setting key=value'
 
 # `hyoui tail` options.
 complete -c hyoui -n '__hyoui_using_subcommand tail' -l socket          -r -F  -d 'Explicit socket path'
 complete -c hyoui -n '__hyoui_using_subcommand tail' -l index           -x      -d 'Session selector (1=oldest, -1=newest)'
-complete -c hyoui -n '__hyoui_using_subcommand tail' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand tail' -l follow                  -d 'Continue streaming live output'
 complete -c hyoui -n '__hyoui_using_subcommand tail' -l strip-ansi              -d 'Strip ANSI escapes in output'
 complete -c hyoui -n '__hyoui_using_subcommand tail' -l since           -x      -d 'Drop chunks older than DUR (500ms / 2s / 1m)'
@@ -1280,7 +1252,6 @@ complete -c hyoui -n '__hyoui_using_subcommand tail' -s h -l help               
 # `hyoui wait` options.
 complete -c hyoui -n '__hyoui_using_subcommand wait' -l socket            -r -F  -d 'Explicit socket path'
 complete -c hyoui -n '__hyoui_using_subcommand wait' -l index             -x      -d 'Session selector (1=oldest, -1=newest)'
-complete -c hyoui -n '__hyoui_using_subcommand wait' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand wait' -l timeout           -x      -d 'Absolute timeout (5s / 30s)'
 complete -c hyoui -n '__hyoui_using_subcommand wait' -l poll-interval      -x      -d 'Snapshot polling interval (default 100ms)'
 complete -c hyoui -n '__hyoui_using_subcommand wait' -s h -l help                 -d 'Show help and exit'
@@ -1292,7 +1263,6 @@ complete -c hyoui -n __hyoui_screen_no_sub -f -a snapshot -d 'Take a structured 
 # `hyoui screen dump` options
 complete -c hyoui -n '__hyoui_screen_using_sub dump' -l socket  -r -F                          -d 'Explicit socket path'
 complete -c hyoui -n '__hyoui_screen_using_sub dump' -l index   -x                              -d 'Session selector (1=oldest, -1=newest)'
-complete -c hyoui -n '__hyoui_screen_using_sub dump' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_screen_using_sub dump' -l format  -x -a 'ansi binary cbor text/plain' -d 'Output format'
 complete -c hyoui -n '__hyoui_screen_using_sub dump' -l layer   -x -a 'visible scrollback both' -d 'Layer to dump'
 complete -c hyoui -n '__hyoui_screen_using_sub dump' -l rect    -x                              -d 'Sub-rectangle x,y,w,h'
@@ -1303,7 +1273,6 @@ complete -c hyoui -n '__hyoui_screen_using_sub dump' -s h -l help               
 # `hyoui screen snapshot` options
 complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l socket  -r -F                                -d 'Explicit socket path'
 complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l index   -x                                    -d 'Session selector (1=oldest, -1=newest)'
-complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l include -x -a 'cells cursor mode windowsize buffer sequenceno' -d 'Snapshot components to include'
 complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l format  -x -a 'cbor json'                     -d 'Output format'
 complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -l output  -r -F                                -d 'Output file path'
@@ -1313,7 +1282,6 @@ complete -c hyoui -n '__hyoui_screen_using_sub snapshot' -s h -l help           
 # `hyoui input` options + spec prefix
 complete -c hyoui -n '__hyoui_using_subcommand input' -l socket          -r -F  -d 'Explicit socket path'
 complete -c hyoui -n '__hyoui_using_subcommand input' -l index           -x      -d 'Session selector (1=oldest, -1=newest)'
-complete -c hyoui -n '__hyoui_using_subcommand input' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand input' -l timeout         -x      -d 'Per-spec timeout (e.g. 5s)'
 complete -c hyoui -n '__hyoui_using_subcommand input' -l lock-token      -x      -d 'Explicit lock token (overrides HYOUI_LOCK_TOKEN)'
 complete -c hyoui -n '__hyoui_using_subcommand input' -l max-file-bytes  -x      -d 'Max bytes for file: spec (0 = unlimited)'
@@ -1334,7 +1302,6 @@ complete -c hyoui -n __hyoui_lock_no_sub -f -a release -d 'Release a lock by tok
 # `hyoui lock acquire` options
 complete -c hyoui -n '__hyoui_lock_using_sub acquire' -l socket  -r -F           -d 'Explicit socket path'
 complete -c hyoui -n '__hyoui_lock_using_sub acquire' -l index   -x              -d 'Session selector (1=oldest, -1=newest)'
-complete -c hyoui -n '__hyoui_lock_using_sub acquire' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_lock_using_sub acquire' -l mode    -x -a 'wait fail' -d 'Behavior when held'
 complete -c hyoui -n '__hyoui_lock_using_sub acquire' -l timeout -x              -d 'Acquire timeout'
 complete -c hyoui -n '__hyoui_lock_using_sub acquire' -s h -l help               -d 'Show help and exit'
@@ -1342,21 +1309,18 @@ complete -c hyoui -n '__hyoui_lock_using_sub acquire' -s h -l help              
 # `hyoui lock release` options
 complete -c hyoui -n '__hyoui_lock_using_sub release' -l socket -r -F -d 'Explicit socket path'
 complete -c hyoui -n '__hyoui_lock_using_sub release' -l index  -x    -d 'Session selector (1=oldest, -1=newest)'
-complete -c hyoui -n '__hyoui_lock_using_sub release' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_lock_using_sub release' -l token  -x    -d 'Lock token to release'
 complete -c hyoui -n '__hyoui_lock_using_sub release' -s h -l help    -d 'Show help and exit'
 
 # `hyoui unlock` options
 complete -c hyoui -n '__hyoui_using_subcommand unlock' -l socket -r -F -d 'Explicit socket path'
 complete -c hyoui -n '__hyoui_using_subcommand unlock' -l index  -x    -d 'Session selector (1=oldest, -1=newest)'
-complete -c hyoui -n '__hyoui_using_subcommand unlock' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand unlock' -l token  -x    -d 'Lock token to release'
 complete -c hyoui -n '__hyoui_using_subcommand unlock' -s h -l help    -d 'Show help and exit'
 
 # `hyoui detach` (DR-0020 §4)
 complete -c hyoui -n '__hyoui_using_subcommand detach' -l socket -r -F -d 'Explicit socket path'
 complete -c hyoui -n '__hyoui_using_subcommand detach' -l index  -x    -d 'Session selector (1=oldest, -1=newest)'
-complete -c hyoui -n '__hyoui_using_subcommand detach' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand detach' -s h -l help    -d 'Show help and exit'
 
 # `hyoui web` の子 (= 名前空間、DR-0038 決定 2) + `web service` / `web passkey` /
@@ -1433,7 +1397,6 @@ complete -c hyoui -n '__hyoui_web_service_using_sub log' -s h -l help -d 'Show h
 # `hyoui upgrade` options (DR-0028)
 complete -c hyoui -n '__hyoui_using_subcommand upgrade' -l socket -r -F -d 'Explicit socket path'
 complete -c hyoui -n '__hyoui_using_subcommand upgrade' -l index  -x    -d 'Session selector (1=oldest, -1=newest)'
-complete -c hyoui -n '__hyoui_using_subcommand upgrade' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand upgrade' -l binary -r -F -d 'Override the daemon exec target path'
 complete -c hyoui -n '__hyoui_using_subcommand upgrade' -l skip-version-check -d 'Skip <binary> --version pre-check (test only)'
 complete -c hyoui -n '__hyoui_using_subcommand upgrade' -s h -l help    -d 'Show help and exit'
@@ -1452,7 +1415,6 @@ complete -c hyoui -n __hyoui_record_no_sub -f -a list  -d 'List active records f
 # `hyoui record start` options
 complete -c hyoui -n '__hyoui_record_using_sub start' -l socket        -r -F  -d 'Explicit socket path'
 complete -c hyoui -n '__hyoui_record_using_sub start' -l index         -x      -d 'Session selector (1=oldest, -1=newest)'
-complete -c hyoui -n '__hyoui_record_using_sub start' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_record_using_sub start' -l output        -r -F  -d 'Output file path (absolute)'
 complete -c hyoui -n '__hyoui_record_using_sub start' -l stdin                 -d 'Record child PTY input only'
 complete -c hyoui -n '__hyoui_record_using_sub start' -l stdout                -d 'Record child PTY output only'
@@ -1467,7 +1429,6 @@ complete -c hyoui -n '__hyoui_record_using_sub start' -s h -l help             -
 # `hyoui record stop` options
 complete -c hyoui -n '__hyoui_record_using_sub stop' -l socket -r -F -d 'Explicit socket path'
 complete -c hyoui -n '__hyoui_record_using_sub stop' -l index  -x    -d 'Session selector (1=oldest, -1=newest)'
-complete -c hyoui -n '__hyoui_record_using_sub stop' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_record_using_sub stop' -l id     -x    -d 'record_id to stop'
 complete -c hyoui -n '__hyoui_record_using_sub stop' -l all          -d 'Stop all active records'
 complete -c hyoui -n '__hyoui_record_using_sub stop' -s h -l help    -d 'Show help and exit'
@@ -1475,7 +1436,6 @@ complete -c hyoui -n '__hyoui_record_using_sub stop' -s h -l help    -d 'Show he
 # `hyoui record list` options
 complete -c hyoui -n '__hyoui_record_using_sub list' -l socket -r -F -d 'Explicit socket path'
 complete -c hyoui -n '__hyoui_record_using_sub list' -l index  -x    -d 'Session selector (1=oldest, -1=newest)'
-complete -c hyoui -n '__hyoui_record_using_sub list' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_record_using_sub list' -l format -x -a 'table jsonl' -d 'Output format'
 complete -c hyoui -n '__hyoui_record_using_sub list' -s h -l help    -d 'Show help and exit'
 
@@ -1795,7 +1755,7 @@ mod tests {
                 "run",
                 &[
                     "socket",
-                    "session",
+                    "session-id",
                     "detached",
                     "login",
                     "no-scrub-env",
@@ -2278,22 +2238,22 @@ mod tests {
         }
     }
 
-    /// DR-0018: `--namespace` selector and `list --all-namespaces` must be offered.
-    ///
-    /// `--namespace` is accepted by every session-targeted subcommand (run / attach /
-    /// list / kill / status / tail / wait / screen / input / lock / unlock / record),
-    /// so each shell script must offer it. `--all-namespaces` is list-only.
+    /// DR-0041: namespace の語彙は無く、run は `--session-id` を出す。
     #[test]
-    fn completion_all_shells_offer_namespace_selector() {
+    fn completion_all_shells_offer_session_id_and_no_namespace() {
         for sh in ALL_SHELLS {
             let s = script(sh);
             assert!(
-                offers_long_opt(&s, "namespace"),
-                "shell {sh:?} missing `--namespace` selector"
+                offers_long_opt(&s, "session-id"),
+                "shell {sh:?} missing run `--session-id`"
             );
             assert!(
-                offers_long_opt(&s, "all-namespaces"),
-                "shell {sh:?} missing list `--all-namespaces`"
+                !s.contains("namespace"),
+                "shell {sh:?} still offers a namespace option"
+            );
+            assert!(
+                !s.contains("HYOUI_NAMESPACE"),
+                "shell {sh:?} mentions HYOUI_NAMESPACE"
             );
         }
     }

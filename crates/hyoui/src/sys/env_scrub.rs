@@ -21,8 +21,8 @@
 use crate::config::{Config, TargetConfig};
 use crate::sys::env::remove_var_at_startup;
 
-/// 削除対象から強制的に除外する env 名 prefix (= hyoui 自身が DR-0018 / DR-0020
-/// 等で意図的に子へ注入する env を保護する)。
+/// 削除対象から強制的に除外する env 名 prefix (= hyoui 自身が DR-0020 等で意図的に
+/// 子へ注入する env を保護する)。
 pub const PROTECTED_PREFIX: &str = "HYOUI_";
 
 /// builtin kill/keep default を持つ target 名一覧。
@@ -500,7 +500,7 @@ mod tests {
     #[test]
     fn is_protected_hyoui_prefix() {
         assert!(is_protected("HYOUI_SESSION_ID"));
-        assert!(is_protected("HYOUI_NAMESPACE"));
+        assert!(is_protected("HYOUI_STATE_DIR"));
         assert!(is_protected("HYOUI_"));
         assert!(!is_protected("CLAUDECODE"));
         assert!(!is_protected("hyoui_lower"));

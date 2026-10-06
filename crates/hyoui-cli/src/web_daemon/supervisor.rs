@@ -933,13 +933,16 @@ enum Pump {
 }
 
 /// 制御 socket を開く。死んだ監督者の socket が残っていれば外して開き直す。
+///
+/// connect / bind は hyoui の socket helper を通す: 状態の root が深く、フルパスが
+/// `sun_path` に収まらない面でも開ける (DR-0041 決定 5)。
 fn bind_control_socket(socket: &Path) -> std::io::Result<UnixListener> {
     if let Some(parent) = socket.parent() {
         std::fs::create_dir_all(parent)?;
     }
     if socket.exists() {
         // 繋がるなら本物が走っている。繋がらないなら残骸なので外す。
-        if UnixStream::connect(socket).is_ok() {
+        if hyoui::sys::socket::connect(socket).is_ok() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AddrInUse,
                 format!(
@@ -950,7 +953,16 @@ fn bind_control_socket(socket: &Path) -> std::io::Result<UnixListener> {
         }
         std::fs::remove_file(socket)?;
     }
-    UnixListener::bind(socket)
+    hyoui::sys::socket::bind_listener(socket).map_err(sys_to_io)
+}
+
+/// hyoui の sys error を io::Error に寄せる (= 呼び出し側の error 型に合わせる)。
+fn sys_to_io(error: hyoui::Error) -> std::io::Error {
+    match error {
+        hyoui::Error::Errno(errno) => std::io::Error::from(errno),
+        hyoui::Error::Io(io) => io,
+        other => std::io::Error::other(other.to_string()),
+    }
 }
 
 fn send_signal(pid: u32, signal: Signal) {

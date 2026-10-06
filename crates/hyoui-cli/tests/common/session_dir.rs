@@ -1,4 +1,5 @@
-//! test 用 runtime dir (= socket 置き場) と、その寿命に結び付けた session 後始末。
+//! test 用の状態の root (= socket 置き場、`HYOUI_STATE_DIR` に渡す dir) と、その寿命に
+//! 結び付けた session 後始末。
 //!
 //! detached session の daemon は fork + setsid で test process から切り離されて
 //! init の子になる。test が自分で畳み損ねると (= setup 途中の panic、client が先に
@@ -15,7 +16,6 @@
 #![allow(dead_code)] // 各 test は subset しか使わないため
 
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -72,7 +72,7 @@ impl Drop for SessionDir {
 /// stderr に出すだけにする (= 黙って残さず、test 出力で見えるようにする)。
 pub fn reap_sessions_under(root: &Path) {
     for sock in sockets_under(root) {
-        if UnixStream::connect(&sock).is_err() {
+        if !connectable(&sock) {
             continue;
         }
         let daemon_pid = daemon_pid_of(root, &sock);
@@ -87,7 +87,7 @@ pub fn reap_sessions_under(root: &Path) {
             CLI_DEADLINE,
         );
         let Some(pid) = daemon_pid else {
-            if UnixStream::connect(&sock).is_ok() {
+            if connectable(&sock) {
                 eprintln!(
                     "test teardown: daemon pid を特定できず session が残っている可能性: {}",
                     sock.display()
@@ -112,7 +112,15 @@ pub fn reap_sessions_under(root: &Path) {
     }
 }
 
-/// `root` 配下の socket file を再帰で列挙する (= namespace 別 subdir も含む)。
+/// socket に connect できるか (= listen している daemon が居るか)。
+///
+/// `<root>/sessions/<uuid>.sock` は `sun_path` に収まらない長さになりうるので、hyoui の
+/// connect (= 長いパスは dir の fd 基準で開く、DR-0041 決定 5) を使う。
+fn connectable(sock: &Path) -> bool {
+    hyoui::sys::socket::connect(sock).is_ok()
+}
+
+/// `root` 配下の socket file を再帰で列挙する (= `sessions/` も `--socket` の直置きも含む)。
 fn sockets_under(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -172,11 +180,10 @@ fn daemon_pid_of(root: &Path, sock: &Path) -> Option<i32> {
 /// runtime dir に隔離した `hyoui` の Command (stdout / stderr は null、必要なら上書き)。
 fn hyoui_cmd(root: &Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_hyoui"));
-    c.env("XDG_RUNTIME_DIR", root)
+    c.env("HYOUI_STATE_DIR", root)
         .env("TMPDIR", root)
         .env_remove("HYOUI_LOCK_TOKEN")
         .env_remove("HYOUI_SESSION_ID")
-        .env_remove("HYOUI_NAMESPACE")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

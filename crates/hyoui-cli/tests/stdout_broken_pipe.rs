@@ -37,7 +37,6 @@ fn run_with_dead_stdout(args: &[&str]) -> (Option<i32>, Option<i32>, String) {
         .stderr(Stdio::piped())
         // test 自身が hyoui 配下で動いている場合 (= dogfooding) の干渉を避ける。
         .env_remove("HYOUI_SESSION_ID")
-        .env_remove("HYOUI_NAMESPACE")
         .spawn()
         .expect("spawn hyoui");
 

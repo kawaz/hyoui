@@ -22,9 +22,8 @@ use regex::bytes::Regex;
 ///    suffix も許容) → `<TIMESTAMP>`
 /// 2. **ユーザ HOME 絶対 path**: `/Users/<name>/...` / `/home/<name>/...` を
 ///    `<HOME>/...` に圧縮
-/// 3. **session_id の `run-<pid>-<rand4hex>` 形式**: 自動生成 session id は
-///    pid + rand なので run ごとに変わる → `run-<PID>-<RAND>` に圧縮。**ただし
-///    test 側が固定 session 名を渡すなら一致しないので影響なし**
+/// 3. **session id (UUID の標準形)**: 自動で振られる id は run ごとに変わる
+///    (DR-0041 決定 2) → `<SESSION-ID>` に圧縮
 /// 4. **本物のパス区切り内の数字 PID 系**: 過剰削除を避けるため、明示的な
 ///    pattern (= `pid=12345` / `pid 12345`) のみを `pid=<PID>` 化
 ///
@@ -60,11 +59,13 @@ fn rules() -> &'static [(Regex, &'static [u8])] {
                 Regex::new(r"(?-u)/(?:Users|home)/[A-Za-z0-9_.-]+(/|\b)").expect("regex 2"),
                 b"<HOME>$1" as &[u8],
             ),
-            // 3. `run-<pid>-<8hex>` 形式の auto session id。
-            //    `run-12345-9af3a17c` のような形式を一括で `run-<PID>-<RAND>` に。
+            // 3. session id (= 小文字・ハイフン付き UUID)。
             (
-                Regex::new(r"(?-u)\brun-\d+-[0-9a-f]{8}\b").expect("regex 3"),
-                b"run-<PID>-<RAND>" as &[u8],
+                Regex::new(
+                    r"(?-u)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+                )
+                .expect("regex 3"),
+                b"<SESSION-ID>" as &[u8],
             ),
             // 4. `pid=<N>` / `pid:<N>` のような明示 PID 表記。
             //    過剰削除しないよう **key=value** 形式のみ対象。
@@ -117,9 +118,9 @@ mod tests {
 
     #[test]
     fn normalize_auto_session_id() {
-        let input = b"session run-12345-9af3a17c started";
+        let input = b"session 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f started";
         let got = normalize_screen_dump(input);
-        assert_eq!(got, "session run-<PID>-<RAND> started");
+        assert_eq!(got, "session <SESSION-ID> started");
     }
 
     #[test]
@@ -145,11 +146,9 @@ mod tests {
 
     #[test]
     fn normalize_combined() {
-        let input = b"start 2026-05-27T12:34:56 in /Users/k/x session=run-1-abcdef01";
+        let input =
+            b"start 2026-05-27T12:34:56 in /Users/k/x session=5c9d0e1f-2a3b-4c4d-8e5f-6a7b8c9d0e1f";
         let got = normalize_screen_dump(input);
-        assert_eq!(
-            got,
-            "start <TIMESTAMP> in <HOME>/x session=run-<PID>-<RAND>"
-        );
+        assert_eq!(got, "start <TIMESTAMP> in <HOME>/x session=<SESSION-ID>");
     }
 }

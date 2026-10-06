@@ -5,7 +5,7 @@
 //! - stale env (= env が指す session が不存在) は既存 fallback に落とさず明示エラー。
 //! - 外から (= env なし) の省略実行は従来通り `session id が必要` エラー (= 挙動不変)。
 //!
-//! daemon socket は namespace 経路 (`$XDG_RUNTIME_DIR/hyoui/<sid>.sock`) に置く。
+//! daemon socket は既定の置き場 (`$HYOUI_STATE_DIR/sessions/<sid>.sock`) に置く。
 //! env 解決はこの path 規約で socket を引くため、`--socket` 明示の harness とは
 //! 別に自前 TempDir + Command を組む。
 
@@ -28,7 +28,12 @@ fn runtime_dir() -> SessionDir {
     SessionDir::new("hyoui-selfres-")
 }
 
-/// `run --detached --session=<sid>` で daemon を起こし、socket 出現を待つ。
+/// test ごとの session id (= UUID、DR-0041 決定 2)。test process の寿命だけ持てばよいので leak する。
+fn new_sid() -> &'static str {
+    Box::leak(hyoui::cli::new_session_id().into_boxed_str())
+}
+
+/// `run --detached --session-id=<sid>` で daemon を起こし、socket 出現を待つ。
 fn spawn_detached(runtime: &std::path::Path, sid: &str) {
     spawn_detached_cmd(runtime, sid, "sleep 30");
 }
@@ -41,13 +46,13 @@ fn spawn_detached_cmd(runtime: &std::path::Path, sid: &str, script: &str) {
             "run",
             "--detached",
             "--pty-stdin",
-            &format!("--session={sid}"),
+            &format!("--session-id={sid}"),
             "--",
             "sh",
             "-c",
             script,
         ])
-        .env("XDG_RUNTIME_DIR", runtime)
+        .env("HYOUI_STATE_DIR", runtime)
         .env_remove("HYOUI_SESSION_ID")
         .env_remove("HYOUI_LOCK_TOKEN")
         .stdin(Stdio::null())
@@ -57,8 +62,8 @@ fn spawn_detached_cmd(runtime: &std::path::Path, sid: &str, script: &str) {
         .expect("spawn detached daemon");
     assert!(status.success(), "run --detached が成功すること");
 
-    // socket 出現を待つ (= namespace=default なら <runtime>/hyoui/<sid>.sock)。
-    let sock = runtime.join("hyoui").join(format!("{sid}.sock"));
+    // socket 出現を待つ (= <runtime>/sessions/<sid>.sock)。
+    let sock = runtime.join("sessions").join(format!("{sid}.sock"));
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if sock.exists() {
@@ -85,7 +90,7 @@ fn attach_from_inside_then_detach(
     let cmd = pty_process::blocking::Command::new(hyoui_bin())
         .arg("attach")
         .args(attach_args)
-        .env("XDG_RUNTIME_DIR", runtime)
+        .env("HYOUI_STATE_DIR", runtime)
         .env("HYOUI_SESSION_ID", me)
         .env_remove("HYOUI_LOCK_TOKEN")
         .stdin(Stdio::null())
@@ -137,7 +142,7 @@ fn attach_from_inside_then_detach(
 fn cleanup(runtime: &std::path::Path, sid: &str) {
     let _ = Command::new(hyoui_bin())
         .args(["kill", sid])
-        .env("XDG_RUNTIME_DIR", runtime)
+        .env("HYOUI_STATE_DIR", runtime)
         .env_remove("HYOUI_SESSION_ID")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -148,13 +153,13 @@ fn cleanup(runtime: &std::path::Path, sid: &str) {
 #[test]
 fn status_resolves_self_session_from_env() {
     let runtime = runtime_dir();
-    let sid = "selfres-from-env";
+    let sid = new_sid();
     spawn_detached(runtime.path(), sid);
 
     // session 引数を省略し、$HYOUI_SESSION_ID で自セッションを指す。
     let out = Command::new(hyoui_bin())
         .args(["status"])
-        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("HYOUI_STATE_DIR", runtime.path())
         .env("HYOUI_SESSION_ID", sid)
         .env_remove("HYOUI_LOCK_TOKEN")
         .stdin(Stdio::null())
@@ -181,8 +186,8 @@ fn status_stale_env_errors_without_fallback() {
     // daemon を一切起こさない = env が指す session は不存在 (= stale)。
     let out = Command::new(hyoui_bin())
         .args(["status"])
-        .env("XDG_RUNTIME_DIR", runtime.path())
-        .env("HYOUI_SESSION_ID", "selfres-nonexistent")
+        .env("HYOUI_STATE_DIR", runtime.path())
+        .env("HYOUI_SESSION_ID", new_sid())
         .env_remove("HYOUI_LOCK_TOKEN")
         .stdin(Stdio::null())
         .output()
@@ -199,13 +204,34 @@ fn status_stale_env_errors_without_fallback() {
     );
 }
 
+/// UUID でない `$HYOUI_SESSION_ID` (= id が UUID になる前の hyoui の session から叩いた)
+/// は、その session をこのバイナリが扱えないことを言って失敗する (DR-0041 決定 7)。
+#[test]
+fn status_with_old_format_env_errors_with_reason() {
+    let runtime = runtime_dir();
+    let out = Command::new(hyoui_bin())
+        .args(["status"])
+        .env("HYOUI_STATE_DIR", runtime.path())
+        .env("HYOUI_SESSION_ID", "run-12345-abcdef01")
+        .env_remove("HYOUI_LOCK_TOKEN")
+        .stdin(Stdio::null())
+        .output()
+        .expect("status");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("run-12345-abcdef01") && stderr.contains("古い形式"),
+        "古い形式の id だと言うべき。stderr={stderr:?}"
+    );
+}
+
 #[test]
 fn status_without_env_keeps_required_error() {
     let runtime = runtime_dir();
     // env なし + 引数なし = 従来通り「session id が必要」エラー (= 外挙動不変)。
     let out = Command::new(hyoui_bin())
         .args(["status"])
-        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("HYOUI_STATE_DIR", runtime.path())
         .env_remove("HYOUI_SESSION_ID")
         .env_remove("HYOUI_LOCK_TOKEN")
         .stdin(Stdio::null())
@@ -225,13 +251,13 @@ fn status_without_env_keeps_required_error() {
 #[test]
 fn attach_self_session_via_explicit_arg_is_rejected() {
     let runtime = runtime_dir();
-    let sid = "selfres-attach-self";
+    let sid = new_sid();
     spawn_detached(runtime.path(), sid);
 
     // 中から (= $HYOUI_SESSION_ID set) 明示引数で自セッションに attach → 拒否。
     let out = Command::new(hyoui_bin())
         .args(["attach", sid])
-        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("HYOUI_STATE_DIR", runtime.path())
         .env("HYOUI_SESSION_ID", sid)
         .env_remove("HYOUI_LOCK_TOKEN")
         .stdin(Stdio::null())
@@ -254,14 +280,17 @@ fn attach_self_session_via_explicit_arg_is_rejected() {
 #[test]
 fn attach_other_session_from_inside_is_allowed() {
     let runtime = runtime_dir();
-    let me = "selfres-attach-me";
-    let other = "selfres-attach-other";
+    let me = new_sid();
+    let other = new_sid();
     spawn_detached(runtime.path(), me);
     spawn_detached(runtime.path(), other);
 
     // 中から ($HYOUI_SESSION_ID=me) 別セッション (other) への attach は self ではない。
     // 検証したいのは「self 拒否で即エラー終了しない」ことだけ (= 接続が成立したら detach)。
-    let other_sock = runtime.path().join("hyoui").join(format!("{other}.sock"));
+    let other_sock = runtime
+        .path()
+        .join("sessions")
+        .join(format!("{other}.sock"));
     let out =
         attach_from_inside_then_detach(runtime.path(), me, &other_sock, &[other, "--mode=ro"]);
 
@@ -288,14 +317,14 @@ fn attach_other_session_from_inside_is_allowed() {
 #[test]
 fn attach_self_session_via_explicit_socket_is_rejected() {
     let runtime = runtime_dir();
-    let sid = "selfres-attach-sock";
+    let sid = new_sid();
     spawn_detached(runtime.path(), sid);
 
     // 自セッションの socket path を --socket で直接指定して迂回を試みる。
-    let self_sock = runtime.path().join("hyoui").join(format!("{sid}.sock"));
+    let self_sock = runtime.path().join("sessions").join(format!("{sid}.sock"));
     let out = Command::new(hyoui_bin())
         .args(["attach", &format!("--socket={}", self_sock.display())])
-        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("HYOUI_STATE_DIR", runtime.path())
         .env("HYOUI_SESSION_ID", sid)
         .env_remove("HYOUI_LOCK_TOKEN")
         .stdin(Stdio::null())
@@ -319,12 +348,15 @@ fn attach_self_session_via_explicit_socket_is_rejected() {
 #[test]
 fn attach_other_socket_from_inside_is_allowed() {
     let runtime = runtime_dir();
-    let me = "selfres-sock-me";
-    let other = "selfres-sock-other";
+    let me = new_sid();
+    let other = new_sid();
     spawn_detached(runtime.path(), me);
     spawn_detached(runtime.path(), other);
 
-    let other_sock = runtime.path().join("hyoui").join(format!("{other}.sock"));
+    let other_sock = runtime
+        .path()
+        .join("sessions")
+        .join(format!("{other}.sock"));
     let socket_arg = format!("--socket={}", other_sock.display());
     let out = attach_from_inside_then_detach(
         runtime.path(),
@@ -359,15 +391,15 @@ fn attach_other_socket_from_inside_is_allowed() {
 #[test]
 fn wait_explicit_session_wins_over_env() {
     let runtime = runtime_dir();
-    let me = "c1-wait-me";
-    let target = "c1-wait-target";
+    let me = new_sid();
+    let target = new_sid();
     spawn_detached(runtime.path(), me);
     // target の画面に "hello" を出しておく (= wait の match 対象)。
     spawn_detached_cmd(runtime.path(), target, "echo hello; sleep 30");
 
     let out = Command::new(hyoui_bin())
         .args(["wait", target, "hello", "--timeout=5s"])
-        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("HYOUI_STATE_DIR", runtime.path())
         .env("HYOUI_SESSION_ID", me)
         .env_remove("HYOUI_LOCK_TOKEN")
         .stdin(Stdio::null())
@@ -389,12 +421,12 @@ fn wait_explicit_session_wins_over_env() {
 #[test]
 fn wait_single_positional_resolves_self_with_env() {
     let runtime = runtime_dir();
-    let me = "c1-wait-self";
+    let me = new_sid();
     spawn_detached_cmd(runtime.path(), me, "echo selfhello; sleep 30");
 
     let out = Command::new(hyoui_bin())
         .args(["wait", "selfhello", "--timeout=5s"])
-        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("HYOUI_STATE_DIR", runtime.path())
         .env("HYOUI_SESSION_ID", me)
         .env_remove("HYOUI_LOCK_TOKEN")
         .stdin(Stdio::null())
@@ -415,15 +447,15 @@ fn wait_single_positional_resolves_self_with_env() {
 #[test]
 fn input_explicit_session_wins_over_env() {
     let runtime = runtime_dir();
-    let me = "c1-input-me";
-    let target = "c1-input-target";
+    let me = new_sid();
+    let target = new_sid();
     spawn_detached(runtime.path(), me);
     // 入力を受ける子 (= cat で stdin を読む)。
     spawn_detached_cmd(runtime.path(), target, "cat >/dev/null; sleep 30");
 
     let out = Command::new(hyoui_bin())
         .args(["input", target, "text:hi"])
-        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("HYOUI_STATE_DIR", runtime.path())
         .env("HYOUI_SESSION_ID", me)
         .env_remove("HYOUI_LOCK_TOKEN")
         .stdin(Stdio::null())
@@ -444,12 +476,12 @@ fn input_explicit_session_wins_over_env() {
 #[test]
 fn input_spec_only_resolves_self_with_env() {
     let runtime = runtime_dir();
-    let me = "c1-input-self";
+    let me = new_sid();
     spawn_detached_cmd(runtime.path(), me, "cat >/dev/null; sleep 30");
 
     let out = Command::new(hyoui_bin())
         .args(["input", "text:hi"])
-        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("HYOUI_STATE_DIR", runtime.path())
         .env("HYOUI_SESSION_ID", me)
         .env_remove("HYOUI_LOCK_TOKEN")
         .stdin(Stdio::null())

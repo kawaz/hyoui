@@ -10,7 +10,7 @@
 //! - **片方の unit で登録した credential で、もう片方の unit の認証が通る**
 //!   (= HA endpoint の fallback で再認証を求められない)
 //!
-//! の 3 つ。どれも `$XDG_STATE_HOME` を tempdir に隔離して回す (決定 9)。
+//! の 3 つ。どれも状態の root (`$HYOUI_STATE_DIR`) を tempdir に隔離して回す (決定 9)。
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -27,7 +27,7 @@ fn hyoui_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_hyoui"))
 }
 
-fn state_home() -> tempfile::TempDir {
+fn state_root() -> tempfile::TempDir {
     let dir = tempfile::Builder::new()
         .prefix("hyoui-auth-concurrency-")
         .tempdir()
@@ -38,7 +38,7 @@ fn state_home() -> tempfile::TempDir {
 
 /// gateway (`hyoui web daemon run`) を 1 台起こし、bind した port を返す。
 ///
-/// 2 台に同じ `XDG_STATE_HOME` を渡すのがこの test の主眼である (= 2 unit が
+/// 2 台に同じ `HYOUI_STATE_DIR` を渡すのがこの test の主眼である (= 2 unit が
 /// 同一ホストで同じ file を読む、決定 4)。
 ///
 /// 返した `Child` は呼び出し側が `UnitGuard` に包んで kill + wait する
@@ -56,7 +56,7 @@ fn spawn_unit(state: &Path) -> (Child, u16) {
             "--listen",
             "127.0.0.1:0",
         ])
-        .env("XDG_STATE_HOME", state)
+        .env("HYOUI_STATE_DIR", state)
         .env_remove("HYOUI_SESSION_ID")
         .env_remove("HYOUI_LOCK_TOKEN")
         .stdin(Stdio::null())
@@ -155,7 +155,7 @@ impl Drop for UnitGuard {
 /// 別プロセスの `passkey add` を並行に打っても登録が落ちない (決定 4)。
 #[test]
 fn concurrent_passkey_add_processes_do_not_lose_registrations() {
-    let state = state_home();
+    let state = state_root();
     const WRITERS: usize = 6;
 
     let children: Vec<Child> = (0..WRITERS)
@@ -169,7 +169,7 @@ fn concurrent_passkey_add_processes_do_not_lose_registrations() {
                     // 同じ file の別 bucket への同時書き込みになる。
                     &format!("--endpoint=https://hyoui-{index}.example.jp/"),
                 ])
-                .env("XDG_STATE_HOME", state.path())
+                .env("HYOUI_STATE_DIR", state.path())
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -186,7 +186,7 @@ fn concurrent_passkey_add_processes_do_not_lose_registrations() {
         );
     }
 
-    let pending: PendingFile = StateDir::under_state_home(state.path())
+    let pending: PendingFile = StateDir::under_state_root(state.path())
         .pending()
         .read()
         .expect("pending を読む");
@@ -209,8 +209,8 @@ fn concurrent_passkey_add_processes_do_not_lose_registrations() {
 /// unit の数だけ緩む。
 #[test]
 fn wrong_code_attempts_are_counted_across_two_units() {
-    let state = state_home();
-    let dir = StateDir::under_state_home(state.path());
+    let state = state_root();
+    let dir = StateDir::under_state_root(state.path());
     let endpoint = Endpoint::parse("https://hyoui.example.jp/").unwrap();
     let now_ms = hyoui::time::now_unix_ms();
     let secret = token::random_secret();
@@ -286,8 +286,8 @@ fn wrong_code_attempts_are_counted_across_two_units() {
 /// どの unit が受けたかは関係しない (決定 3)。
 #[test]
 fn a_session_minted_once_is_accepted_by_either_unit() {
-    let state = state_home();
-    let dir = StateDir::under_state_home(state.path());
+    let state = state_root();
+    let dir = StateDir::under_state_root(state.path());
     // HA endpoint 宛の登録 1 本。
     let endpoint = Endpoint::parse("https://hyoui.example.jp/").unwrap();
     let access = token::random_token();

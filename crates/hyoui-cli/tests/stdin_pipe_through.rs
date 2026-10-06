@@ -66,6 +66,7 @@ const DEADLINE: Duration = Duration::from_secs(10);
 /// 持つ (= 配下の socket を走査して残った daemon を畳む)。
 struct Cell {
     dir: SessionDir,
+    /// session id (= UUID、DR-0041 決定 2)。`new` の引数はセルの名前で、dir の名前にだけ使う。
     session: String,
     fifo: std::fs::File,
     /// 子を解放する FIFO (`$3`)。子の起動前に O_RDWR で開いて持つ (= 子の open が止まらない)。
@@ -80,8 +81,8 @@ struct Running {
 }
 
 impl Cell {
-    fn new(session: &str) -> Self {
-        let dir = SessionDir::new("hyoui-pipe-");
+    fn new(name: &str) -> Self {
+        let dir = SessionDir::new(&format!("hyoui-pipe-{name}-"));
         nix::unistd::mkfifo(
             &dir.path().join("rc.fifo"),
             nix::sys::stat::Mode::from_bits_truncate(0o600),
@@ -104,7 +105,7 @@ impl Cell {
             .expect("open release fifo");
         Self {
             dir,
-            session: session.to_string(),
+            session: hyoui::cli::new_session_id(),
             fifo,
             release,
         }
@@ -128,7 +129,7 @@ impl Cell {
     /// `hyoui run [flags] -- sh -c <script> sh <out> <fifo> <release>` を専用の制御端末で起こす。
     /// stdout / stderr は捨てる。
     fn spawn(&self, flags: &[&str], script: &str, stdin: impl Into<Stdio>) -> Running {
-        let mut args: Vec<String> = vec!["run".into(), format!("--session={}", self.session)];
+        let mut args: Vec<String> = vec!["run".into(), format!("--session-id={}", self.session)];
         args.extend(flags.iter().map(|f| (*f).to_string()));
         args.extend(["--", "sh", "-c", script, "sh"].map(str::to_string));
         args.push(self.out_path().display().to_string());
@@ -136,11 +137,10 @@ impl Cell {
         args.push(self.dir.path().join("release.fifo").display().to_string());
         let cmd = PtyCommand::new(hyoui_bin())
             .args(args)
-            .env("XDG_RUNTIME_DIR", self.dir.path())
+            .env("HYOUI_STATE_DIR", self.dir.path())
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
             .env_remove("HYOUI_SESSION_ID")
             .env_remove("HYOUI_LOCK_TOKEN")
-            .env_remove("HYOUI_NAMESPACE")
             .stdin(stdin)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -153,11 +153,10 @@ impl Cell {
         common::pty::capture_with_deadline(
             Command::new(hyoui_bin())
                 .args(args)
-                .env("XDG_RUNTIME_DIR", self.dir.path())
+                .env("HYOUI_STATE_DIR", self.dir.path())
                 .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
                 .env_remove("HYOUI_SESSION_ID")
                 .env_remove("HYOUI_LOCK_TOKEN")
-                .env_remove("HYOUI_NAMESPACE")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()),
@@ -172,7 +171,7 @@ impl Cell {
         let sock = self
             .dir
             .path()
-            .join("hyoui")
+            .join("sessions")
             .join(format!("{}.sock", self.session));
         while Instant::now() < deadline {
             if sock.exists() {
@@ -569,11 +568,10 @@ fn attach_with_piped_stdout_emits_no_outer_tty_reset() {
 
     let cmd = PtyCommand::new(hyoui_bin())
         .args(["attach", &cell.session, "--quiet"])
-        .env("XDG_RUNTIME_DIR", cell.dir.path())
+        .env("HYOUI_STATE_DIR", cell.dir.path())
         .env("XDG_CONFIG_HOME", cell.dir.path().join("config"))
         .env_remove("HYOUI_SESSION_ID")
         .env_remove("HYOUI_LOCK_TOKEN")
-        .env_remove("HYOUI_NAMESPACE")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());

@@ -6,7 +6,7 @@
 //!
 //! ## Endpoints
 //!
-//! - `GET  /api/sessions` — 全 namespace 横断で live/no-response session を JSON list で返す
+//! - `GET  /api/sessions` — この gateway の面 (状態の root) の live/no-response session を JSON list で返す
 //! - `GET  /api/sessions/:id` — session 1 件の状態を一覧の 1 要素と同じ形で返す
 //! - `GET  /api/sessions/:id/screen` — `screen.dump.request` の ANSI payload を
 //!   `text/plain; charset=utf-8` で返す。`?layer=visible|scrollback|both` (default:
@@ -14,14 +14,12 @@
 //! - `POST /api/sessions/:id/input` — body `{"specs": ["text:...", "key:Enter"]}`
 //!   を hyoui input と同じ流儀で送信 (= `parse_input_spec` → `input_bytes` → raw_data frame)
 //!
-//! ## namespace の扱い (Phase 1)
+//! ## session の引き方
 //!
-//! path param `:id` は **session_id 名のみ**を受け付ける。`discovery::find_session` が
-//! DR-0018 の配置規則で全 namespace の同名 socket だけを候補にし、mtime 昇順で最初に
-//! 残ったものを採用する (= 一覧の先頭一致と同じ選び方。他 session の daemon には接続しない)。
-//! 名前衝突が起きる運用は現状想定していない (= namespace は運用グループ分離目的、
-//! 同名 session を複数 namespace で並走させる事故は list JSON で発覚する)。将来
-//! `?namespace=X` query の受理は必要になった段階で追加する。
+//! path param `:id` は session id (= UUID の標準形、DR-0041 決定 2) を受け付ける。
+//! `discovery::find_session` が `<状態の root>/sessions/<id>.sock` を直接組み、その socket
+//! だけに問い合わせる (= 他 session の daemon には接続しない)。gateway が見るのは自分の
+//! 面の session だけで、別の面 (別の `HYOUI_STATE_DIR`) の session は出ない。
 //!
 //! ## daemon への問い合わせの束ね方
 //!
@@ -86,13 +84,17 @@ type SessionResolveFlight =
 /// そのディレクトリから都度読む。`None` なら埋め込みアセットを返す。
 ///
 /// **認証は常に有効である** (DR-0036 決定 9 — `auth = "none"` を設けない)。登録簿は
-/// `$XDG_STATE_HOME/hyoui/web/` から読む。test は `XDG_STATE_HOME` を隔離して
+/// `<状態の root>/web/` から読む。test は `HYOUI_STATE_DIR` を隔離して
 /// 登録 fixture を置く (= 本番 record に対して test を走らせない)。
-pub fn router(assets_dir: Option<PathBuf>) -> Router {
-    router_with_auth(assets_dir, auth::AuthContext::new())
+///
+/// # Errors
+///
+/// 状態の root (= 面) を決められない時 (DR-0041 決定 6)。
+pub fn router(assets_dir: Option<PathBuf>) -> Result<Router, hyoui::paths::StateRootError> {
+    Ok(router_with_auth(assets_dir, auth::AuthContext::new()?))
 }
 
-/// 認証 state の置き場を明示して Router を組む (= test の隔離 `XDG_STATE_HOME`)。
+/// 認証 state の置き場を明示して Router を組む (= test の隔離 `HYOUI_STATE_DIR`)。
 pub fn router_with_auth(assets_dir: Option<PathBuf>, auth: auth::AuthContext) -> Router {
     let state = AppState {
         assets_dir: assets_dir.map(Arc::new),
@@ -135,7 +137,7 @@ pub fn router_with_auth(assets_dir: Option<PathBuf>, auth: auth::AuthContext) ->
 /// public network で serve する運用が出てきたら、その時点で reverse proxy 側で
 /// header を付けるか、`[web]` config に flag を追加する (= 現時点では yagni)。
 pub async fn serve(listen: &str, assets_dir: Option<PathBuf>) -> std::io::Result<()> {
-    let app = router(assets_dir);
+    let app = router(assets_dir)?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!("hyoui web: listening on http://{}", listener.local_addr()?);
     axum::serve(listener, app.into_make_service())
@@ -197,7 +199,6 @@ fn session_entry_to_json(e: &hyoui::discovery::SessionEntry) -> serde_json::Valu
     match &e.status {
         SessionStatus::Live(info) => serde_json::json!({
             "session_id": e.session_id,
-            "namespace": e.namespace,
             "socket_path": e.socket_path.display().to_string(),
             "started_unix_ms": e.started_unix_ms,
             "status": if info.child_stopped { "stopped" } else { "live" },
@@ -215,15 +216,14 @@ fn session_entry_to_json(e: &hyoui::discovery::SessionEntry) -> serde_json::Valu
             },
         }),
         SessionStatus::Stale { reason } => {
-            serde_json::json!({"session_id": e.session_id, "namespace": e.namespace, "socket_path": e.socket_path.display().to_string(), "status": "stale", "reason": reason})
+            serde_json::json!({"session_id": e.session_id, "socket_path": e.socket_path.display().to_string(), "status": "stale", "reason": reason})
         }
         SessionStatus::Error { reason } => {
-            serde_json::json!({"session_id": e.session_id, "namespace": e.namespace, "socket_path": e.socket_path.display().to_string(), "status": "error", "reason": reason})
+            serde_json::json!({"session_id": e.session_id, "socket_path": e.socket_path.display().to_string(), "status": "error", "reason": reason})
         }
         SessionStatus::Hung { daemon_pid, reason } => serde_json::json!({
             "daemon_pid": daemon_pid,
             "session_id": e.session_id,
-            "namespace": e.namespace,
             "socket_path": e.socket_path.display().to_string(),
             "started_unix_ms": e.started_unix_ms,
             "status": hyoui::discovery::NO_RESPONSE_STATUS,
@@ -805,7 +805,7 @@ impl ResolveSocketError {
     }
 }
 
-/// session_id 1 件を解決する (= 同名 socket だけに status.query、DR-0018 の配置規則)。
+/// session_id 1 件を解決する (= `sessions/<id>.sock` だけに status.query、DR-0041 決定 4)。
 ///
 /// 同じ session_id の解決が走行中なら相乗りする。
 async fn find_session(
@@ -1026,6 +1026,7 @@ mod tests {
     #[tokio::test]
     async fn healthz_returns_ok() {
         let response = router(None)
+            .unwrap()
             .oneshot(
                 Request::builder()
                     .uri("/healthz")
@@ -1042,6 +1043,7 @@ mod tests {
     #[tokio::test]
     async fn version_returns_build_identity() {
         let response = router(None)
+            .unwrap()
             .oneshot(
                 Request::builder()
                     .uri("/version")
@@ -1126,7 +1128,7 @@ mod tests {
     /// endpoint 構成が増えるたびに preflight の設計が付いてくる (裁定 Q1)。
     #[tokio::test]
     async fn no_response_header_announces_the_protocol() {
-        let app = router(None);
+        let app = router(None).unwrap();
         for uri in ["/version", "/api/sessions", "/healthz"] {
             let resp = app
                 .clone()
@@ -1349,7 +1351,7 @@ mod tests {
     #[tokio::test]
     async fn index_page_serves_html_with_xterm_ref() {
         // 埋め込みモードで / が index.html を返す (= session.html は xterm.js を参照)。
-        let app = router(None);
+        let app = router(None).unwrap();
         let resp = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
@@ -1369,7 +1371,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_page_returns_html_and_references_xterm() {
-        let app = router(None);
+        let app = router(None).unwrap();
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1392,7 +1394,7 @@ mod tests {
     async fn session_page_loads_web_links_addon_before_session_code() {
         // 素の http/https URL は vendored WebLinksAddon が担当する。session.js の
         // 初期化より先に addon の UMD global が存在し、runtime CDN に依存しない。
-        let app = router(None);
+        let app = router(None).unwrap();
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1418,7 +1420,7 @@ mod tests {
     async fn embedded_asset_web_links_addon_served() {
         // DR-0027 の runtime CDN 禁止を守り、素 URL provider の UMD build を
         // release binary に埋め込んで JavaScript として配信する。
-        let app = router(None);
+        let app = router(None).unwrap();
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1445,7 +1447,7 @@ mod tests {
 
     #[tokio::test]
     async fn embedded_asset_xterm_js_served() {
-        let app = router(None);
+        let app = router(None).unwrap();
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1470,7 +1472,7 @@ mod tests {
     async fn session_asset_requests_scrollback_for_every_full_restore() {
         // fetchScreen は xterm を reset して全画面を書き直すため、初期表示だけでなく
         // refresh / fallback polling / 文字幅設定変更でも daemon の履歴を含む `both` を選ぶ。
-        let app = router(None);
+        let app = router(None).unwrap();
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1537,7 +1539,7 @@ mod tests {
 
     #[tokio::test]
     async fn asset_traversal_is_rejected() {
-        let app = router(None);
+        let app = router(None).unwrap();
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1563,7 +1565,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let custom_body = "<!doctype html><title>custom-index</title>DEVMODE";
         std::fs::write(tmp.path().join("index.html"), custom_body).unwrap();
-        let app = router(Some(tmp.path().to_path_buf()));
+        let app = router(Some(tmp.path().to_path_buf())).unwrap();
         let resp = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
@@ -1578,7 +1580,7 @@ mod tests {
         // iframe 埋め込み (?embed=1) を tailnet 前提で許容する方針の regression guard。
         // 将来 middleware で X-Frame-Options / frame-ancestors を default で付けたく
         // なった場合、この test が失敗して意思決定を強制する (= 気付かず制限が入るのを防ぐ)。
-        let app = router(None);
+        let app = router(None).unwrap();
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1607,7 +1609,7 @@ mod tests {
     #[tokio::test]
     async fn manifest_and_icon_served() {
         // PWA 用の manifest / icon が embedded 経路で正しい content-type で配信されること。
-        let app = router(None);
+        let app = router(None).unwrap();
         let resp = app
             .clone()
             .oneshot(
@@ -1654,7 +1656,7 @@ mod tests {
     #[tokio::test]
     async fn hackgen_font_served_as_woff2() {
         // vendored HackGen Console NF が embedded 経路で配信されて font/woff2 で返ること。
-        let app = router(None);
+        let app = router(None).unwrap();
         let resp = app
             .oneshot(
                 Request::builder()

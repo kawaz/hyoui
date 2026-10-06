@@ -3,7 +3,7 @@
 //! config `[session] term_fallback`)。
 //!
 //! 子に `sh -c` を明示して env / argv を file に吐かせ、呼び出し元に置いたダミー env が
-//! 子に渡らないこと、hyoui 自身は呼び出し元の面 env (`XDG_RUNTIME_DIR`) で socket を
+//! 子に渡らないこと、hyoui 自身は呼び出し元の面 env (`HYOUI_STATE_DIR`) で socket を
 //! 置くことを実バイナリで観測する。
 
 mod common;
@@ -42,11 +42,11 @@ fn run_detached(runtime: &Path, sid: &str, flags: &[&str], term: Option<&str>, e
         "run",
         "--detached",
         "--pty-stdin",
-        &format!("--session={sid}"),
+        &format!("--session-id={sid}"),
     ])
     .args(flags)
     .args(extra)
-    .env("XDG_RUNTIME_DIR", runtime)
+    .env("HYOUI_STATE_DIR", runtime)
     .env("XDG_CONFIG_HOME", runtime.join("config"))
     .env("HYOUI_E2E_DUMMY", "must-not-leak")
     .env("CLAUDE_CODE_SESSION_ID", "must-not-leak")
@@ -68,7 +68,7 @@ fn run_detached(runtime: &Path, sid: &str, flags: &[&str], term: Option<&str>, e
         "run --login --detached が成功すること: {}",
         std::fs::read_to_string(runtime.join("run.stderr")).unwrap_or_default()
     );
-    let sock = runtime.join("hyoui").join(format!("{sid}.sock"));
+    let sock = runtime.join("sessions").join(format!("{sid}.sock"));
     wait_for(|| sock.exists(), "socket", &sock);
 }
 
@@ -86,7 +86,7 @@ fn wait_for(cond: impl Fn() -> bool, what: &str, p: &Path) {
 fn cleanup(runtime: &Path, sid: &str) {
     let _ = Command::new(hyoui_bin())
         .args(["kill", sid, "--signal=KILL"])
-        .env("XDG_RUNTIME_DIR", runtime)
+        .env("HYOUI_STATE_DIR", runtime)
         .env_remove("HYOUI_SESSION_ID")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -119,7 +119,7 @@ fn read_env(path: &Path) -> BTreeMap<String, String> {
 fn explicit_command_gets_minimal_env_and_injected_env() {
     let runtime = runtime_dir();
     let out = runtime.path().join("env.txt");
-    let sid = "login-explicit";
+    let sid = &hyoui::cli::new_session_id();
     let script = dump_script(&out);
     run_login(runtime.path(), sid, &["--", "sh", "-c", &script]);
     let env = read_env(&out);
@@ -128,20 +128,21 @@ fn explicit_command_gets_minimal_env_and_injected_env() {
     // 呼び出し元のダミー env は子に無い。
     assert!(!env.contains_key("HYOUI_E2E_DUMMY"), "{env:?}");
     assert!(!env.contains_key("CLAUDE_CODE_SESSION_ID"), "{env:?}");
-    // 面の env (XDG_RUNTIME_DIR) も子には渡らない (= hyoui 自身だけが使う)。
-    assert!(!env.contains_key("XDG_RUNTIME_DIR"), "{env:?}");
+    // 面の env (HYOUI_STATE_DIR) も子には渡らない (= hyoui 自身だけが使う)。
+    assert!(!env.contains_key("HYOUI_STATE_DIR"), "{env:?}");
     // 最小 env + 呼び出し元の LANG / TERM (xterm-ghostty をそのまま引き継ぐ)。
     for k in ["HOME", "USER", "LOGNAME", "SHELL", "PATH"] {
         assert!(env.contains_key(k), "{k} が無い: {env:?}");
     }
     assert_eq!(env.get("LANG").map(String::as_str), Some("ja_JP.UTF-8"));
     assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-ghostty"));
-    // 注入 env (DR-0018 / DR-0020) は残る。
-    assert_eq!(env.get("HYOUI_SESSION_ID").map(String::as_str), Some(sid));
+    // 注入 env (DR-0020) は残る。子へ常時注入するのは HYOUI_SESSION_ID だけ (DR-0041)。
     assert_eq!(
-        env.get("HYOUI_NAMESPACE").map(String::as_str),
-        Some("default")
+        env.get("HYOUI_SESSION_ID").map(String::as_str),
+        Some(sid.as_str())
     );
+    let injected: Vec<&String> = env.keys().filter(|k| k.starts_with("HYOUI_")).collect();
+    assert_eq!(injected, ["HYOUI_SESSION_ID"], "{env:?}");
     // 明示コマンドの argv[0] は `-` 付けなしでそのまま (sh の $0 = "sh")。
     let argv0 = std::fs::read_to_string(format!("{}.argv0", out.display())).unwrap();
     assert_eq!(argv0, "sh");
@@ -157,7 +158,7 @@ fn child_term(flags: &[&str], caller_term: Option<&str>, config: Option<&str>) -
         std::fs::write(dir.join("config.toml"), toml).expect("config");
     }
     let out = runtime.path().join("env.txt");
-    let sid = "term";
+    let sid = &hyoui::cli::new_session_id();
     let script = dump_script(&out);
     run_detached(
         runtime.path(),
@@ -219,7 +220,7 @@ fn term_fallback_comes_from_config() {
 #[test]
 fn login_without_command_runs_passwd_shell_as_login_shell() {
     let runtime = runtime_dir();
-    let sid = "login-shell";
+    let sid = &hyoui::cli::new_session_id();
     run_login(runtime.path(), sid, &[]);
 
     // 子の argv は `ps` で `-<shell basename>`、exec 先は passwd の shell。
@@ -237,14 +238,14 @@ fn login_without_command_runs_passwd_shell_as_login_shell() {
 
 #[test]
 fn socket_follows_callers_face_env_not_child_env() {
-    // 面の env (XDG_RUNTIME_DIR) は hyoui 自身の socket 置き場に効く。
+    // 面の env (HYOUI_STATE_DIR) は hyoui 自身の socket 置き場に効く。
     let runtime = runtime_dir();
-    let sid = "login-face";
+    let sid = &hyoui::cli::new_session_id();
     run_login(runtime.path(), sid, &["--", "sleep", "30"]);
     assert!(
         runtime
             .path()
-            .join("hyoui")
+            .join("sessions")
             .join(format!("{sid}.sock"))
             .exists()
     );
@@ -275,7 +276,7 @@ fn passwd_shell() -> String {
 fn status_child_pid(runtime: &Path, sid: &str) -> i32 {
     let out = Command::new(hyoui_bin())
         .args(["list"])
-        .env("XDG_RUNTIME_DIR", runtime)
+        .env("HYOUI_STATE_DIR", runtime)
         .env_remove("HYOUI_SESSION_ID")
         .stdin(Stdio::null())
         .output()

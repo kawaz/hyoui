@@ -286,6 +286,17 @@ pub fn read_line<T: for<'de> Deserialize<'de>>(
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
+/// 今の面の監督者へ 1 要求を送る ([`request`] の socket を今の env から導く版)。
+///
+/// 状態の root (= 面) を決められなければ、届かせようがないのでその理由を返す。
+pub fn request_supervisor(
+    request: &Request,
+) -> Result<(Response, BufReader<UnixStream>), ErrorBody> {
+    let socket = super::registry::supervisor_socket_path()
+        .map_err(|error| ErrorBody::failed(error.to_string()))?;
+    self::request(&socket, request)
+}
+
 /// 監督者へ 1 要求を送り、1 応答を読む。
 ///
 /// 監督者が居なければ [`ErrorBody::supervisor_not_running`] を `Err` で返す。
@@ -294,8 +305,10 @@ pub fn request(
     socket: &std::path::Path,
     request: &Request,
 ) -> Result<(Response, BufReader<UnixStream>), ErrorBody> {
-    let mut stream =
-        UnixStream::connect(socket).map_err(|_| ErrorBody::supervisor_not_running())?;
+    // `sun_path` に収まらない深い状態の root でも届くよう hyoui の connect を通す
+    // (DR-0041 決定 5)。
+    let mut stream = hyoui::sys::socket::connect_stream(socket)
+        .map_err(|_| ErrorBody::supervisor_not_running())?;
     write_line(&mut stream, request)
         .map_err(|error| ErrorBody::failed(format!("could not send the request: {error}")))?;
     let mut reader = BufReader::new(
