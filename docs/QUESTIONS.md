@@ -18,35 +18,6 @@
 
 ## 裁定待ち
 
-### 👺TAG-Q1: session の tag の CLI の形
-
-[DR-0041](decisions/DR-0041-session-id-uuid-and-tags.md) 決定 1 は「tag は session のメタデータとして daemon が持ち、status で返し、list で絞り込む、既定は全部見える」までで、CLI の形が決まっていない (tag 以外の決定 1〜7 は実装済み)。統括推しは a (DR は tag を「分類」と書いており key=value の意味論は持ち込んでいない。単語なら照合規則が要らず、AND は「指定した時だけ絞る」に素直に合う。key=value が欲しくなれば `env.prod` のような語で代用できる)。
-
-- [ ] a: `run --tag <word>` を繰り返して複数付け、`list --tag <word>` の繰り返しは AND で絞る。jsonl と web の API に `tags: [...]`、plain の一覧に TAGS 列。word は `[A-Za-z0-9._-]{1,64}`
-- [ ] b: key=value のラベル (`--tag key=value`、絞り込みは `--tag key=value` か `--tag key`)。表現力は高いが、照合規則と key の重複の扱いが要る
-- [ ] c: 付ける側は `--tags a,b`、絞る側は `list --tag a`
-
-### 👺TAG-Q2: `.envrc` から既定の tag を与える env を持つか
-
-今 `HYOUI_NAMESPACE` を `.envrc` で設定しているのは、業務の面などで session を分けるため。分離は DR-0041 決定 6 の面 (`HYOUI_STATE_DIR`) が担うようになったので、tag の既定値を env で配る必要は薄い。統括推しは a (必要になってから足す。env で暗黙に tag が付くと、付けた覚えの無い tag で一覧が分かれる)。
-
-- [ ] a: 持たない。`.envrc` の `HYOUI_NAMESPACE` は `HYOUI_STATE_DIR` (面) に置き換えるか、消す
-- [ ] b: `HYOUI_TAGS` のような env を持ち、`run` が既定で付ける
-
-### 👺SID-Q3: `run --login` の子に `HYOUI_STATE_DIR` を渡すか
-
-`--login` は子の shell に渡す env を最小にする (DR-0039 決定 1)。今は `HYOUI_SESSION_ID` だけを注入するので、既定でない面 (`HYOUI_STATE_DIR` を設定した面) で `--login` した子の中の `hyoui status` は既定の面を探しに行き、自分の session を見つけられない (コードからの推論、実機は未確認)。`--login` でない run は env をそのまま継承するので起きない。統括推しは a (`HYOUI_SESSION_ID` は「どの面の」session id かとセットで初めて自己参照になる。設定されている時だけ渡すので、既定の面では何も変わらない)。
-
-- [ ] a: `HYOUI_STATE_DIR` が設定されていれば、`--login` の子にもそのまま渡す (DR-0041 の「子へ常時注入する env は `HYOUI_SESSION_ID` だけ」に「面の変数は引き継ぐ」を足す)
-- [ ] b: 渡さない (login shell 側の rc や `.envrc` で面を設定してもらう)
-
-### 👺WR-Q5: DR-0005 の「範囲外」(window / pane UI、session グループ) との関係
-
-DR-0005 は window / pane UI と session グループを範囲外にしているが、[DR-0039](decisions/DR-0039-webui-terminal-app-rework.md) はタブグループ / タブ / pane を gateway と browser に持たせる。統括推しは a (DR-0005 が避けたのは daemon / TUI 側を multiplexer にすることで、web の表示層が並べ方を持つのは別物。1 session = 1 daemon と TUI へのキー割り当て無しは保たれる)。
-
-- [x] a: DR-0005 の範囲外は daemon / TUI の話と明記し直し、web の表示層は対象外と注記する
-- [ ] b: DR-0005 を改訂して範囲を広げる
-
 ### 👺NB-Q1: DR-0037 (daemon イベントループ非同期化) の runtime
 
 [DR-0037](decisions/DR-0037-daemon-nonblocking-event-loop.md) 「runtime の選択肢」節。統括推しは a (DR-0025 の単一 thread 同期 loop をそのまま nonblocking 化するだけで不変条件を満たせ、依存を増やさない。fd は最大 70 本程度で poll(2) の O(n) は問題にならない)。
