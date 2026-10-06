@@ -5,7 +5,7 @@
 //!
 //! - **介入しない**: harness は hyoui の挙動を **観測する目的のみ**。test 都合で
 //!   hyoui 本体を改造しない (= 既存 socket 解決 / TTY mode / WINCH 配送をそのまま使う)
-//! - **隔離**: 各 `HyouiTestRunner` は `tempfile::TempDir` を持ち、socket は
+//! - **隔離**: 各 `HyouiTestRunner` は `SessionDir` (TempDir) を持ち、socket は
 //!   `<runtime_dir>/<session>.sock` に明示配置 (= `--socket=<path>` 経由)。
 //!   `XDG_RUNTIME_DIR` / `TMPDIR` 等 env を test 間で共有しない
 //! - **PTY size 等の default は hyoui 既存挙動と整合**: `Size::new(24, 80)` (=
@@ -36,7 +36,8 @@ use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 use pty_process::Size;
 use pty_process::blocking::{Command as PtyCommand, Pty, open as pty_open};
-use tempfile::TempDir;
+
+use super::session_dir::SessionDir;
 
 /// `target/debug/hyoui-cli` の path を cargo 経由で取得。
 fn hyoui_bin() -> PathBuf {
@@ -102,25 +103,20 @@ pub fn join_with_deadline<T: Send + 'static>(
 /// test 用 hyoui-cli runner。runtime_dir (= socket / runtime files の隔離先)
 /// を 1 つ持ち、その下で複数 session を spawn / attach できる。
 ///
-/// `Drop` で runtime_dir が unlink される (= 各 test 終了で完全 cleanup)。
+/// `Drop` で runtime_dir 配下の session (daemon + 子) を畳んでから dir を消す
+/// (= [`SessionDir`]。setup 途中の panic や client が先に抜けた場合も daemon を残さない)。
 pub struct HyouiTestRunner {
     /// `<runtime_dir>/<session>.sock` で socket を切る base dir。
     /// mode 0700 で初期化される (= hyoui の `ensure_socket_dir` 要件と整合)。
-    runtime_dir: TempDir,
+    runtime_dir: SessionDir,
 }
 
 impl HyouiTestRunner {
-    /// 新規 runner。`tempfile::Builder` で `prefix="hyoui-test-"` の
-    /// `TempDir` を作り、mode 0700 を設定する。
+    /// 新規 runner。`prefix="hyoui-test-"` の [`SessionDir`] (mode 0700) を作る。
     pub fn new() -> Self {
-        use std::os::unix::fs::PermissionsExt;
-        let runtime_dir = tempfile::Builder::new()
-            .prefix("hyoui-test-")
-            .tempdir()
-            .expect("create runtime_dir");
-        let perm = std::fs::Permissions::from_mode(0o700);
-        std::fs::set_permissions(runtime_dir.path(), perm).expect("chmod 0700 on runtime_dir");
-        Self { runtime_dir }
+        Self {
+            runtime_dir: SessionDir::new("hyoui-test-"),
+        }
     }
 
     /// runtime_dir (= base path) を返す。test 内で socket path を組み立てる用。

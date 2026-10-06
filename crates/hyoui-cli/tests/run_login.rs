@@ -6,24 +6,23 @@
 //! 子に渡らないこと、hyoui 自身は呼び出し元の面 env (`XDG_RUNTIME_DIR`) で socket を
 //! 置くことを実バイナリで観測する。
 
+mod common;
+
 use std::collections::BTreeMap;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+use common::session_dir::SessionDir;
 
 fn hyoui_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_hyoui"))
 }
 
-/// mode 0700 の TempDir (= socket dir 要件)。
-fn runtime_dir() -> tempfile::TempDir {
-    let d = tempfile::Builder::new()
-        .prefix("hyoui-login-")
-        .tempdir()
-        .expect("tempdir");
-    std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    d
+/// mode 0700 の runtime dir (= socket dir 要件)。drop で配下の daemon を畳む
+/// (= 観測の途中で panic して `cleanup` に届かなくても session を残さない)。
+fn runtime_dir() -> SessionDir {
+    SessionDir::new("hyoui-login-")
 }
 
 /// ダミー env を掛けた呼び出し元から `hyoui run --login --detached <extra...>` を起こす。

@@ -24,6 +24,8 @@
 //! 実質メリット < コスト)。テスト目的では固定 4 行の HTTP/1.1 request を
 //! `TcpStream::write_all` するのがサイズ最小。
 
+mod common;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::fs::PermissionsExt;
@@ -31,17 +33,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use common::session_dir::SessionDir;
+
 fn hyoui_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_hyoui"))
 }
 
-fn runtime_dir() -> tempfile::TempDir {
-    let d = tempfile::Builder::new()
-        .prefix("hyoui-web-e2e-")
-        .tempdir()
-        .expect("tempdir");
-    std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
-    d
+/// mode 0700 の runtime dir。drop で配下の daemon を畳む (= 途中で panic して
+/// `cleanup` に届かなくても session を残さない)。
+fn runtime_dir() -> SessionDir {
+    SessionDir::new("hyoui-web-e2e-")
 }
 
 /// 隔離した `XDG_STATE_HOME` (= 認証登録簿の置き場、決定 9)。

@@ -6,14 +6,16 @@
 //! O_RDWR で開いて持ち続ける (= 子の書き込み側の open が読み手待ちで止まらない) ので、
 //! `poll` の期限で「子が終わらなかった」を判定できる。
 
+mod common;
+
 use std::io::Write;
 use std::os::fd::AsFd;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use common::session_dir::SessionDir;
 use nix::poll::{PollFd, PollFlags, PollTimeout};
 
 fn hyoui_bin() -> PathBuf {
@@ -31,21 +33,17 @@ const ECHO_FIRST_LINE_SCRIPT: &str =
 /// 子の終了や run の戻りを待つ上限 (= 超えたら「終わらなかった」と判定する)。
 const DEADLINE: Duration = Duration::from_secs(10);
 
-/// 1 セル分の作業場所 (runtime dir / 出力 file / FIFO) と、後始末。
+/// 1 セル分の作業場所 (runtime dir / 出力 file / FIFO)。後始末は `dir` の drop が
+/// 持つ (= 配下の socket を走査して残った daemon を畳む)。
 struct Cell {
-    dir: tempfile::TempDir,
+    dir: SessionDir,
     session: String,
     fifo: std::fs::File,
 }
 
 impl Cell {
     fn new(session: &str) -> Self {
-        let dir = tempfile::Builder::new()
-            .prefix("hyoui-pipe-")
-            .tempdir()
-            .expect("tempdir");
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
-            .expect("chmod");
+        let dir = SessionDir::new("hyoui-pipe-");
         nix::unistd::mkfifo(
             &dir.path().join("rc.fifo"),
             nix::sys::stat::Mode::from_bits_truncate(0o600),
@@ -113,19 +111,6 @@ impl Cell {
     /// 子が受け取った bytes。
     fn received(&self) -> Vec<u8> {
         std::fs::read(self.out_path()).unwrap_or_default()
-    }
-}
-
-impl Drop for Cell {
-    fn drop(&mut self) {
-        let _ = Command::new(hyoui_bin())
-            .args(["kill", &self.session, "--signal=KILL"])
-            .env("XDG_RUNTIME_DIR", self.dir.path())
-            .env_remove("HYOUI_SESSION_ID")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
     }
 }
 

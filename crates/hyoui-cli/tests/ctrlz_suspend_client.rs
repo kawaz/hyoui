@@ -29,6 +29,11 @@ fn hyoui_bin() -> std::path::PathBuf {
 }
 
 /// 入れ子環境 (= outer bash + inner cat) 一式。
+///
+/// detached session (outer / inner) の後始末は `runner` の drop が持つ (= runtime dir
+/// 配下の socket を走査して daemon を畳む)。`setup` 途中で panic して `Nested` が
+/// できなくても、local の `runner` が unwind で drop されるので先に起こした session は
+/// 残らない。
 struct Nested {
     runner: HyouiTestRunner,
     outer_sock: std::path::PathBuf,
@@ -192,26 +197,6 @@ fn spawn_detached(runner: &HyouiTestRunner, args: &[&str], env: &[(String, Strin
         .status()
         .expect("spawn detached session");
     assert!(status.success(), "run --detached が失敗: {status:?}");
-}
-
-impl Drop for Nested {
-    /// detached session は誰も待っていないので、test 終了時に正規経路で畳む
-    /// (= `runtime_dir` の TempDir を消すだけでは daemon / 子 / client が残る)。
-    fn drop(&mut self) {
-        for sock in [&self.inner_sock, &self.outer_sock] {
-            let _ = Command::new(hyoui_bin())
-                .args(["kill", &format!("--socket={}", sock.display())])
-                .env("XDG_RUNTIME_DIR", self.runner.runtime_dir())
-                .env("TMPDIR", self.runner.runtime_dir())
-                .env_remove("HYOUI_LOCK_TOKEN")
-                .env_remove("HYOUI_SESSION_ID")
-                .env_remove("HYOUI_NAMESPACE")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-    }
 }
 
 /// `hyoui <args>` を runner の runtime dir で実行する (= test 間の隔離を保つ)。

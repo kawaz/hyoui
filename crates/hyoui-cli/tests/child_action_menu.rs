@@ -31,10 +31,11 @@ const MENU_HEADER: &str = "子プロセスが停止中";
 
 /// menu が出ている状態の被験体一式。
 ///
-/// `runner` を field で持つのは **socket を生かすため**: runner が抱える TempDir が
-/// drop されると runtime dir ごと消えて daemon の socket が消滅する (= 実測で踏んだ)。
-/// `let Stopped { h, .. } = ...` のような destructuring は runner を即 drop するので
-/// 使わない。
+/// `runner` を field で持つのは **session を生かすため**: runner の drop は runtime dir
+/// 配下の daemon を畳んでから dir を消す。`let Stopped { h, .. } = ...` のような
+/// destructuring は runner を即 drop するので使わない。逆に test の最後は runner の
+/// drop が後始末を持つので、client が先に抜けた (= daemon が harness の subtree kill の
+/// 外に出た) 場合も daemon と子は残らない。
 struct Stopped {
     /// runtime dir (= socket 置き場) を握る runner。
     _runner: HyouiTestRunner,
@@ -198,7 +199,8 @@ fn menu_detach_closes_client_and_leaves_child_stopped() {
         "detach 後も子は停止したまま残る (= 無人なので停止維持、DR-0030 §3)"
     );
 
-    // 子は daemon 配下に残っているので、CLI から始末する。
+    // client は抜けており `h.kill()` は何もしない (= daemon は init の子になって
+    // client の subtree に居ない)。daemon と停止中の子は runner の drop が畳む。
     let _ = s.h.kill();
 }
 

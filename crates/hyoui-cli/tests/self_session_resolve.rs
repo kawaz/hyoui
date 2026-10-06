@@ -9,23 +9,22 @@
 //! env 解決はこの path 規約で socket を引くため、`--socket` 明示の harness とは
 //! 別に自前 TempDir + Command を組む。
 
-use std::os::unix::fs::PermissionsExt;
+mod common;
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+use common::session_dir::SessionDir;
 
 fn hyoui_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_hyoui"))
 }
 
-/// mode 0700 の TempDir を作る (= `ensure_socket_dir` 要件)。
-fn runtime_dir() -> tempfile::TempDir {
-    let d = tempfile::Builder::new()
-        .prefix("hyoui-selfres-")
-        .tempdir()
-        .expect("tempdir");
-    std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
-    d
+/// mode 0700 の runtime dir (= `ensure_socket_dir` 要件)。drop で配下の daemon を畳む
+/// (= assert の途中で panic して `cleanup` に届かなくても session を残さない)。
+fn runtime_dir() -> SessionDir {
+    SessionDir::new("hyoui-selfres-")
 }
 
 /// `run --detached --session=<sid>` で daemon を起こし、socket 出現を待つ。
