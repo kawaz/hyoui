@@ -30,6 +30,9 @@ hyoui の運用・障害対応 runbook 一覧。`docs-structure.md` ルールに
 - [web gateway を DR-0038 の形へ移す](./web-unit-migration-dr-0038.md) —
   状態 dir とログ dir を `hyoui/web/` へ移して古い名前を symlink に、旧 label を
   降ろして hash 付き label で register。ロールバックと symlink・警告を消す条件も含む
+- [session を DR-0041 の形へ移す](./session-uuid-migration-dr-0041.md) —
+  動いている session は移さず、古い版を残して新旧を並べる間の操作、web gateway の
+  起こし直し、古い版が居なくなった後の古い置き場の片付け
 
 ## Archived
 

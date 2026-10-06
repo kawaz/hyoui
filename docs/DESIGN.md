@@ -46,9 +46,8 @@ model is close to abduco / shpool.
   directory)
 - The daemon exits as soon as the child exits, even while all clients are
   detached
-- Socket placement: `$XDG_RUNTIME_DIR/hyoui/<session>.sock` when available,
-  otherwise `${XDG_STATE_HOME:-$HOME/.local/state}/hyoui/<session>.sock`. `$TMPDIR` is
-  not consulted; the completed path is checked against the platform `sun_path` limit.
+- Socket placement: `<state root>/sessions/<session>.sock` (DR-0041). The state root (the face) is `$HYOUI_STATE_DIR`, else `$XDG_STATE_HOME/hyoui` (only when absolute), else `$HOME/.local/state/hyoui`; with none of them it is an error. `$XDG_RUNTIME_DIR` / `$TMPDIR` are not consulted. A session id is a lowercase, hyphenated UUID, and a run whose id already has a socket is refused when binding / taking the name lock (liveness is not judged). When the path does not fit the `sun_path` limit, a forked child `fchdir`s to an fd of the directory and binds / connects with the relative name
+- Session listing: `hyoui list` shows every session of the face. Discovery looks only at `sessions/`
 - Directory mode 0700, socket mode 0600 (same-UID trust boundary)
 
 ## 2. Architecture
@@ -107,7 +106,7 @@ crates/
     src/
       main.rs       # entry point, dispatches the Command enum from cli.rs
       daemonize.rs  # double fork + setsid (--detached)
-      socket_path.rs # socket directory resolver (XDG runtime / state fallback)
+      socket_path.rs # socket path resolver (<state root>/sessions/<id>.sock)
       input_handlers.rs # subcommand handlers for the input family
       wait_core.rs  # state-based wait polling (snapshot trigger + cells → text)
       completion.rs # shell completion generation

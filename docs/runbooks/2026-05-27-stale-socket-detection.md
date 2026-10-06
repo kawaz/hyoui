@@ -10,8 +10,10 @@
   `Connection refused` / `ECONNREFUSED` を返すものがある
 - 過去に daemon が `SIGKILL` を受けた、または `panic = abort` で abort した
   履歴がある (OS のジョブ kill / OOM-killer / `kill -9` 等)
-- ホスト再起動後で `${XDG_RUNTIME_DIR}` ベースなら消えているはずだが、
-  `${XDG_STATE_HOME:-$HOME/.local/state}/hyoui` 配下に残骸が残っている
+- `<状態の root>/sessions/` (= `$HYOUI_STATE_DIR` か `$XDG_STATE_HOME/hyoui` か
+  `$HOME/.local/state/hyoui` の下、DR-0041) に残骸が残っている
+- 同じ id で `hyoui run --session-id=<id>` が「socket が既にある」で起動しない
+  (DR-0041 決定 3。run は生死を判定しないので、残骸の片付けはこの runbook の経路で行う)
 - `hyoui list --prune-stale` 未対応の旧版 (< v0.1.7) では「list に出るが
   status は失敗」が見分けられない
 
@@ -31,7 +33,7 @@
    ```
 3. `hyoui list --prune-stale` 未対応バージョンの場合は手動 `unlink`:
    ```bash
-   rm -- "$XDG_RUNTIME_DIR/hyoui/<session>.sock"  # or ${XDG_STATE_HOME:-$HOME/.local/state}/hyoui/<session>.sock
+   rm -- "<状態の root>/sessions/<session>.sock" "<状態の root>/sessions/<session>.lock"
    ```
 
 ## 対処
@@ -61,8 +63,8 @@
 
 ## 関連
 
-- [[DR-0006]] §socket-placement — `${XDG_RUNTIME_DIR}/hyoui/<session>.sock`
-  または `${XDG_STATE_HOME:-$HOME/.local/state}/hyoui` フォールバック
+- [[DR-0041]] 決定 3 / 4 / 6 — socket は `<状態の root>/sessions/<session>.sock`、
+  同じ id の socket が残っていれば run は起動しない
 - [[R5-H3]] — backlog の解消経緯 (= `list` 改修で live/stale 列追加 +
   `--prune-stale` flag)
 - [[R5-H12]] — `panic = abort` を維持する判断 (= 引き換えに stale socket

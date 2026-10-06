@@ -25,7 +25,7 @@ CLI).
   - [6. Read the screen (`screen dump` / `snapshot`)](#6-read-the-screen-screen-dump--snapshot)
   - [7. Exclusive automation (`lock`)](#7-exclusive-automation-lock)
   - [8. Record the tty I/O timeline (`record`)](#8-record-the-tty-io-timeline-record)
-  - [9. Group sessions with namespaces](#9-group-sessions-with-namespaces)
+  - [9. Session ids and faces (state roots)](#9-session-ids-and-faces-state-roots)
   - [10. Stop leaking parent env into the child (env scrub)](#10-stop-leaking-parent-env-into-the-child-env-scrub)
   - [11. Operate from a browser (`web`)](#11-operate-from-a-browser-web)
 - [Troubleshooting](#troubleshooting)
@@ -36,15 +36,15 @@ CLI).
 ### 1. Start a detached session and attach from another terminal
 
 ```sh
-# Terminal A: launch detached; the session id is printed on stdout
+# Terminal A: launch detached; the session id (a UUID) is printed on stdout
 hyoui run --detached -- claude
-# → run-<pid>-<rand>  (example)
+# → 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f  (example)
 
 # Terminal B: list, then attach
 hyoui list
-hyoui attach run-<pid>-<rand>
+hyoui attach 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f
 # A single Ctrl+Z suspends the client (back to the shell; `fg` to return)
-# To close the connection: hyoui detach run-<pid>-<rand>
+# To close the connection: hyoui detach 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f
 ```
 
 When stdin is a pipe or a file, that fd becomes the child's stdin, with or without `--detached`. The child's stdout / stderr and controlling terminal stay the PTY ([DR-0042](./decisions/DR-0042-non-tty-stdin-is-the-childs-fd.md)). The child sees the same stdin as when run directly, so it reads the pipe and exits on the pipe's EOF, and binary data arrives unchanged. hyoui does not read the pipe, so `run --detached` returns right away even for endless input such as `tail -f`.
@@ -65,15 +65,15 @@ printf 'a\003b\000c\n' | hyoui run -- od -c    # binary data is not altered
 ### 2. Observe in read-only mode
 
 ```sh
-hyoui attach --observer run-<pid>-<rand>
+hyoui attach --observer 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f
 # observer attach forwards no input; output is read-only
 ```
 
 ### 3. Stop a session
 
 ```sh
-hyoui kill run-<pid>-<rand>            # SIGTERM
-hyoui kill --signal KILL run-<pid>-<rand>  # SIGKILL
+hyoui kill 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f                 # SIGTERM
+hyoui kill --signal KILL 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f   # SIGKILL
 ```
 
 ## Automation
@@ -245,50 +245,32 @@ hyoui record stop "$SESS" --all
 > detected) is planned for Phase 5 and currently errors out
 > ([DR-0016](./decisions/DR-0016-tty-io-record.md) §6a).
 
-### 9. Group sessions with namespaces
+### 9. Session ids and faces (state roots)
 
-Use **namespaces** ([DR-0018](./decisions/DR-0018-session-namespace.md)) when
-unrelated session groups (e.g. your day-to-day `claude` and a temporary worker
-fleet) should not mix in `hyoui list`. Resolution is
-`--namespace` flag > env `HYOUI_NAMESPACE` > `default`, shared by every session
-command. The `default` namespace keeps the traditional socket layout, so
-existing sessions are unaffected.
+A session id is a lowercase, hyphenated UUID and nothing else ([DR-0041](./decisions/DR-0041-session-id-uuid-and-tags.md)). `hyoui list` shows every session of the current face, ordered by start time.
 
 ```sh
-# isolate a worker fleet
-hyoui run --detached --namespace=workers --session=w1 -- worker-cmd
-hyoui run --detached --namespace=workers --session=w2 -- worker-cmd
-
-hyoui list                            # default only — workers don't show up
-hyoui list --namespace=workers        # the fleet only
-hyoui list --all-namespaces           # everything, with a leading NS column
-hyoui list --all-namespaces --prune-stale  # sweep stale sockets in every namespace
-
-# every selector is namespace-scoped (session id, --index, kill --all, ...)
-hyoui attach w1 --namespace=workers
-hyoui input --namespace=workers w1 "text:ls" "key:Enter"
-hyoui kill --all --namespace=workers
+# choose the id up front (no need to read it back from stdout)
+SID=$(uuidgen | tr A-Z a-z)
+hyoui run --detached --pty-stdin --session-id="$SID" -- bash
+hyoui input "$SID" "text:ls" "key:Enter"
 ```
 
-**direnv recipe** — put this in a project `.envrc`:
+- Only the canonical form `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` is accepted. Uppercase, unhyphenated, braced, or prefix-only ids are errors and are never normalized silently (a different spelling of the same UUID would be a different socket). Any UUID version is fine
+- If a socket with the same id already exists, `hyoui run` ends with an error without starting the child, whether that daemon is alive or dead; run does not judge liveness. For a running session use `hyoui kill <id>`; if only the socket of a dead daemon is left, run `hyoui list` (it removes sockets that refuse connections while nobody holds the daemon lock) and try again. The check happens when the socket is bound and the name lock is taken, so of several concurrent runs with one id exactly one starts
+- `hyoui kill --wait` returns once the child and the session have ended, but the daemon exits and removes its socket after that (about 2 seconds later in measurements), so an immediate `run` with the same id reports that the socket exists
 
-```sh
-export HYOUI_NAMESPACE=myproj
-```
+**Faces** — sockets live at `<state root>/sessions/<id>.sock`. The state root is decided as follows, and everything hyoui keeps (session sockets, the web supervisor, units, registry, passkeys, logs) stays inside it.
 
-Every `hyoui run` / `list` / `attach` executed inside the project directory is
-then isolated automatically, with no flags.
+1. `HYOUI_STATE_DIR` (used as is when non-empty; a relative path is an error)
+2. `$XDG_STATE_HOME/hyoui` (only when absolute)
+3. `$HOME/.local/state/hyoui` (an error when `HOME` is also missing; never relative to the current directory)
 
-**Inheritance** — `hyoui run` always injects the resolved namespace into the
-child's environment as `HYOUI_NAMESPACE` (even `default`), the same convention
-as tmux's `TMUX` / screen's `STY`. A hyoui launched from inside a namespaced
-session therefore stays in the same namespace by default; pass
-`--namespace=<other>` (e.g. `--namespace=default`) to escape. The variable also
-lets a process detect "am I running under hyoui, and in which namespace?".
+To keep a separate face, set only `HYOUI_STATE_DIR` in that face's `.envrc` (`XDG_STATE_HOME` is shared with other applications, so leave it alone). Sessions of another face do not appear in `list` and cannot be reached by id. There is no option that spans faces: run hyoui once per face with that face's variable. The config (`~/.config/hyoui/`) is shared by every face. `XDG_RUNTIME_DIR` is not used (its lifetime is tied to the login, while sessions outlive logins).
 
-Namespace names share the session-id character set (`[A-Za-z0-9._-]`, max 64
-bytes); `/` is rejected today and reserved for possible future hierarchical
-namespaces. `default` is a reserved name that maps to the base socket dir.
+- The unix socket `sun_path` limit (104 bytes on macOS, 108 on Linux) is not checked against the full path. When the path does not fit, hyoui binds / connects with a name relative to an fd of the socket's directory, so deep roots work
+- The only variable always injected into the child is `HYOUI_SESSION_ID`. Without `--login` the child inherits the caller's env, `HYOUI_STATE_DIR` included, so a hyoui started inside it uses the same face
+- Sockets left outside `sessions/` (directly under the state root, or in a directory other than `sessions/` / `web/`) are not read. When there are any, `hyoui list` and `hyoui web ...` warn on stderr. See `docs/runbooks/session-uuid-migration-dr-0041.md`
 
 ### 10. Stop leaking parent env into the child (env scrub)
 
@@ -331,8 +313,8 @@ like `env` are not unwrapped — just write `hyoui run -- claude` directly
 ([DR-0024 §2](./decisions/DR-0024-env-scrub-config-file.md)).
 
 Env vars whose names start with `HYOUI_` are never removed even if a user
-`kill_glob` matches them (= hyoui itself injects `HYOUI_NAMESPACE` /
-`HYOUI_SESSION_ID` etc. on purpose).
+`kill_glob` matches them (= hyoui itself passes `HYOUI_SESSION_ID` to the child
+on purpose, and `HYOUI_STATE_DIR` keeps the child in the same face).
 
 If the config has a parse error (= invalid TOML / type mismatch) hyoui refuses
 to start (= booting with an unintended config risks leaking the parent's
@@ -354,9 +336,9 @@ hyoui run --login --detached --pty-stdin -- zsh -f     # explicit command (e.g. 
 - The shell comes from passwd (`getpwuid`); the caller's `$SHELL` is ignored
 - argv[0] is `-<basename of the shell>` (e.g. `-zsh`); the shell reads its own rc files
 - The child env starts minimal instead of inheriting the caller's: `HOME` / `USER` / `LOGNAME` / `SHELL` / an initial `PATH` / `LANG` (if the caller has it) / `TERM` (see below). The initial `PATH` is built from `/etc/paths` and `/etc/paths.d/*` on macOS, and is `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` elsewhere
-- `HYOUI_SESSION_ID` / `HYOUI_NAMESPACE` stay in the child even though the env is minimal
+- `HYOUI_SESSION_ID` stays in the child even though the env is minimal (`HYOUI_STATE_DIR` does not, so a hyoui started inside the child uses the face its own env decides)
 - With an explicit command, that command runs as-is (no `-` prefix on argv[0]) and only the env is minimal
-- Only the child's env is minimized. Which surface root hyoui itself uses (`XDG_*` / `HYOUI_NAMESPACE`) is still decided by the caller's env
+- Only the child's env is minimized. Which face root hyoui itself uses (`HYOUI_STATE_DIR` / `XDG_*`) is still decided by the caller's env
 
 The child's `TERM` is inherited from the caller, with or without `--login`. Only when the caller has none (unset / empty) does hyoui set `[session] term_fallback` from the config (default `xterm-256color`) ([DR-0039](./decisions/DR-0039-webui-terminal-app-rework.md) decision 1).
 
@@ -465,7 +447,7 @@ hyoui web daemon status
 - `daemon run <name>` reads the config the unit is registered with; `daemon run --config <path>` reads that file without the registry. Both read only that file and the files it reaches through `extends`, never `config.toml`. `daemon run --no-config [--listen <host:port>]` reads no config at all and starts from the built-in defaults and the command line (for tests)
 - The supervisor starts each unit as `<binary_path> web daemon run <name>`
 
-`extends` layers a file over another: tables merge key by key, other values replace. Relative paths are resolved next to the file that wrote them, and `~` expands to `$HOME`. `binary_path` is copied into the registry when the unit is added (to change it, `remove` and `add` again); `listen` and `assets_dir` are read from the file at every start. State (registry, logs, passkeys) lives in `${XDG_STATE_HOME:-~/.local/state}/hyoui/web/`. `service register` pins the location variables (`HOME`, `XDG_*`) into the OS definition and refuses to change them later without `--force`.
+`extends` layers a file over another: tables merge key by key, other values replace. Relative paths are resolved next to the file that wrote them, and `~` expands to `$HOME`. `binary_path` is copied into the registry when the unit is added (to change it, `remove` and `add` again); `listen` and `assets_dir` are read from the file at every start. State (registry, logs, passkeys) lives in `<state root>/web/`. `service register` pins the location variables (`HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `HYOUI_STATE_DIR`) into the OS definition and refuses to change them later without `--force`. Registering from a shell where a face's `.envrc` is in effect sets up that face's own supervisor.
 
 Open the keyboard FAB on a session page and select the Information tab to see the
 attach mode and leader state. If another browser is leader, click “Become leader”
@@ -476,7 +458,8 @@ browser's viewport. Failures are shown in the same Attach section.
 
 | Symptom | What to try |
 |---|---|
-| `hyoui list` shows nothing | Stale socket in `$XDG_RUNTIME_DIR/hyoui` / `${XDG_STATE_HOME:-$HOME/.local/state}/hyoui` (`docs/runbooks/2026-05-27-stale-socket-detection.md`) |
+| `hyoui list` shows nothing | Check that the face (`HYOUI_STATE_DIR` etc.) is the one the session was started with (sessions of another face are not visible). Sockets left in the old layout are reported on stderr by `hyoui list` (`docs/runbooks/session-uuid-migration-dr-0041.md`) |
+| `hyoui run` refuses with "socket already exists" | If a session with that id is running, `hyoui kill <id>`; if only the socket of a dead daemon is left, `hyoui list` cleans it up. Or start with another id |
 | Attach is closed immediately | The daemon may have rejected cap negotiation (`docs/runbooks/2026-05-27-handshake-cap-rejection.md`) |
 | Child process died but the daemon lingers | `docs/runbooks/2026-05-27-child-orphan-detection.md` |
 

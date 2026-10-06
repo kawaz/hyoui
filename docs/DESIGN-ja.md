@@ -38,7 +38,8 @@ escape なし）に振る舞いつつ、**外側から監視・自動操作す�
 - **screen 型** (1 daemon 1 socket 1 子) を採用。tmux 型 (1 server 多 session) は不採用 ([[DR-0006]] §1)
 - session の存在は **filesystem が source of truth** (`hyoui list` は socket dir 走査)
 - daemon は子 exit で即終了、全 client detach 中でも生存
-- socket 配置: `$XDG_RUNTIME_DIR/hyoui/<session>.sock` を優先し、利用できなければ `${XDG_STATE_HOME:-$HOME/.local/state}/hyoui/<session>.sock`。`$TMPDIR` は参照せず、完成 path を platform の `sun_path` 上限に対して検査する
+- socket 配置: `<状態の root>/sessions/<session>.sock` (DR-0041)。状態の root (= 面) は `$HYOUI_STATE_DIR` → `$XDG_STATE_HOME/hyoui` (絶対パスの時だけ) → `$HOME/.local/state/hyoui` で、どれも無ければエラー。`$XDG_RUNTIME_DIR` / `$TMPDIR` は参照しない。session id は小文字・ハイフン付きの UUID で、同じ id の socket が既にあれば bind / name lock の時点で起動を断る (生死は判定しない)。path が `sun_path` の上限に収まらない時は、dir の fd を基準に fork した子が `fchdir` して相対名で bind / connect する
+- session の一覧: `hyoui list` は面の全 session を出す。discovery は `sessions/` だけを見る
 - dir mode 0700 / sock mode 0600（同 UID 信頼境界）
 
 ## 2. アーキテクチャ
@@ -96,7 +97,7 @@ crates/
     src/
       main.rs       # entry point、cli.rs の Command を dispatch
       daemonize.rs  # double fork + setsid (--detached)
-      socket_path.rs # socket dir resolver (XDG runtime / state fallback)
+      socket_path.rs # socket path resolver (<状態の root>/sessions/<id>.sock)
       input_handlers.rs # input family の subcommand handler
       wait_core.rs  # state-based wait polling (= snapshot 発火 + cells → text 構築)
       completion.rs # shell completion 生成

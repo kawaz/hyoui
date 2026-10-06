@@ -43,7 +43,7 @@
 
 - 独自 client 実装時は `protocol/messages/handshake.rs` の上限定数を参照
   して同等の preflight check を入れる
-- daemon socket は同 UID 限定 (= `0600` + `${XDG_RUNTIME_DIR}` 配下)。
+- daemon socket は同 UID 限定 (= `0600` + mode 0700 の `<状態の root>/sessions/` 配下)。
   cross-UID 攻撃面を増やさないため `chmod` で広げない
 - 認証前メモリ消費を増やす変更 (= MAX_* 上限拡大、handshake schema 拡張) は
   DR で「攻撃時の transient peak」も明記する

@@ -178,46 +178,28 @@ hyoui tail "$SESS" --last-bytes=4096
 hyoui tail "$SESS" --since=10s --since-strict
 ```
 
-### Session namespaces
+### Session ids and faces
 
-Sessions can be grouped into **namespaces** so that unrelated groups never mix
-in `hyoui list` ([DR-0018](./docs/decisions/DR-0018-session-namespace.md)). The
-namespace resolves as `--namespace` flag > env `HYOUI_NAMESPACE` > `default`,
-and every session command (run / attach / list / kill / input / ...) shares the
-same resolution. The `default` namespace keeps the traditional socket layout,
-so existing sessions are untouched.
+A session id is a lowercase, hyphenated UUID (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`), and `hyoui list` shows every session by default ([DR-0041](./docs/decisions/DR-0041-session-id-uuid-and-tags.md)). The caller can choose the id up front with `--session-id`; without it, hyoui assigns one.
 
 ```bash
-# day-to-day session (default namespace; behaves exactly as before)
-hyoui run --detached -- claude
-
-# a worker fleet isolated under its own namespace
-hyoui run --detached --namespace=workers --session=w1 -- worker-cmd
-hyoui run --detached --namespace=workers --session=w2 -- worker-cmd
-
-hyoui list                          # default only — no worker noise
-hyoui list --namespace=workers      # the fleet only
-hyoui list --all-namespaces         # everything, with an NS column
-hyoui attach w1 --namespace=workers # all selectors are namespace-scoped
-hyoui kill --all --namespace=workers  # killall scoped to the fleet
-
-# direnv-friendly: put `export HYOUI_NAMESPACE=myproj` in a project .envrc and
-# every run/list/attach inside that project is isolated automatically.
+SID=$(uuidgen | tr A-Z a-z)              # choose the id yourself (only the canonical form is accepted)
+hyoui run --detached --session-id="$SID" -- claude
+hyoui attach "$SID"                      # no need to read the id back from stdout
 ```
 
-`hyoui run` always injects the resolved namespace into the child's environment
-as `HYOUI_NAMESPACE` (even for `default`), so a hyoui nested inside a namespace
-inherits it — the same convention as tmux's `TMUX` / screen's `STY`. To launch
-into a different namespace from inside one, pass `--namespace=<other>`
-explicitly (e.g. `--namespace=default`).
+- Uppercase, unhyphenated, or prefix-only ids are rejected (nothing is normalized; ids are meant to be copied and pasted)
+- If a socket with the same id already exists, `run` fails without starting anything, whether its daemon is alive or dead. `hyoui list` cleans up the socket of a dead daemon
+- Sockets live at `<state root>/sessions/<id>.sock`. The state root (the "face") is `HYOUI_STATE_DIR`, else `$XDG_STATE_HOME/hyoui` (only when absolute), else `$HOME/.local/state/hyoui`. To keep a separate face, set only `HYOUI_STATE_DIR` in that face's `.envrc`. Sessions of another face are not visible
+- The only variable injected into the child is `HYOUI_SESSION_ID`
 
 ### Main subcommands
 
 | Command | Purpose |
 |---|---|
-| `hyoui run [--detached] [--session=ID] [--size=COLSxROWS] -- cmd args...` | Start a PTY and daemonize |
+| `hyoui run [--detached] [--session-id=UUID] [--size=COLSxROWS] -- cmd args...` | Start a PTY and daemonize |
 | `hyoui attach <session> [--mode=rw\|ro\|rw-no-leader]` | I/O bridge (repaints from screen state on attach) |
-| `hyoui list [--namespace=NS\|--all-namespaces]` | Enumerate active sessions (namespace-scoped) |
+| `hyoui list [--format=plain\|jsonl]` | Enumerate active sessions (every session of the current face) |
 | `hyoui kill <session> [--signal=NUM_OR_NAME]` | Send a signal to the child (default SIGTERM; name or number, e.g. `--signal KILL` / `--signal 9`) |
 | `hyoui status <session>` | Print session status (clients / leader / lock / scrollback) |
 | `hyoui set <session> <key>=<value>` | Change a runtime setting (e.g. `on-child-suspend=notify\|auto-resume`) |

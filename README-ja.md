@@ -169,45 +169,28 @@ hyoui tail "$SESS" --last-bytes=4096
 hyoui tail "$SESS" --since=10s --since-strict
 ```
 
-### session namespace
+### session id と面
 
-session を **namespace** でグループ分けして、無関係なグループが `hyoui list` で
-混ざらないようにできる ([DR-0018](./docs/decisions/DR-0018-session-namespace.md))。
-namespace は `--namespace` flag > env `HYOUI_NAMESPACE` > `default` の順で解決され、
-全 session 系コマンド (run / attach / list / kill / input / ...) が同じ解決を共有する。
-`default` namespace は従来の socket 配置そのままなので、既存 session には影響しない。
+session id は小文字・ハイフン付きの UUID (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) で、`hyoui list` は既定で全 session を並べる ([DR-0041](./docs/decisions/DR-0041-session-id-uuid-and-tags.md))。id は `--session-id` で起動側が先に決められ、無ければ hyoui が振る。
 
 ```bash
-# 普段使いの session (= default namespace、従来と完全に同じ挙動)
-hyoui run --detached -- claude
-
-# worker 群を専用 namespace に隔離
-hyoui run --detached --namespace=workers --session=w1 -- worker-cmd
-hyoui run --detached --namespace=workers --session=w2 -- worker-cmd
-
-hyoui list                          # default のみ — worker のノイズが混ざらない
-hyoui list --namespace=workers      # worker 群のみ
-hyoui list --all-namespaces         # 全部 (= NS 列付き)
-hyoui attach w1 --namespace=workers # selector は全部 namespace スコープ
-hyoui kill --all --namespace=workers  # killall も worker 群だけに効く
-
-# direnv 連携: プロジェクトの .envrc に `export HYOUI_NAMESPACE=myproj` を書けば、
-# そのプロジェクト内の run/list/attach が全部自動で分離される。
+SID=$(uuidgen | tr A-Z a-z)              # 起動側で id を決める (標準形だけ受け付ける)
+hyoui run --detached --session-id="$SID" -- claude
+hyoui attach "$SID"                      # stdout を読まずに後続の操作を組める
 ```
 
-`hyoui run` は解決済 namespace を子プロセスの env に `HYOUI_NAMESPACE` として
-**常時注入**する (= `default` でも入れる)。namespace 内でネスト起動した hyoui は
-指定なしで同じ namespace を引き継ぐ — tmux の `TMUX` / screen の `STY` と同じ慣行。
-namespace 内から別 namespace で起動したい場合は `--namespace=<別ns>` を明示する
-(例: `--namespace=default`)。
+- 大文字やハイフン無し・先頭だけの短縮は受け付けない (= 正規化しない、id はコピペで渡す)
+- 同じ id の socket が既にあれば、相手の daemon が生きていても死んでいても run はエラーで起動しない。死んで残った socket は `hyoui list` が片付ける
+- socket は `<状態の root>/sessions/<id>.sock` に置く。状態の root (= 面) は `HYOUI_STATE_DIR` → `$XDG_STATE_HOME/hyoui` (絶対パスの時だけ) → `$HOME/.local/state/hyoui` の順に決まる。面を分けたい時は面の `.envrc` で `HYOUI_STATE_DIR` だけを設定する。別の面の session は見えない
+- 子プロセスには `HYOUI_SESSION_ID` だけを注入する
 
 ### 主な subcommand
 
 | コマンド | 用途 |
 |---|---|
-| `hyoui run [--detached] [--session=ID] [--size=COLSxROWS] -- cmd args...` | PTY 起動・daemon 化 |
+| `hyoui run [--detached] [--session-id=UUID] [--size=COLSxROWS] -- cmd args...` | PTY 起動・daemon 化 |
 | `hyoui attach <session> [--mode=rw\|ro\|rw-no-leader]` | 入出力中継 (= screen state から画面復元) |
-| `hyoui list [--namespace=NS\|--all-namespaces]` | アクティブ session を列挙 (= namespace スコープ) |
+| `hyoui list [--format=plain\|jsonl]` | アクティブ session を列挙 (= 今の面の全 session) |
 | `hyoui kill <session> [--signal=NUM_OR_NAME]` | 子に signal 送出（default SIGTERM、name / number 両対応。例 `--signal KILL` / `--signal 9`） |
 | `hyoui status <session>` | session 状態表示 (= clients / leader / lock / scrollback) |
 | `hyoui set <session> <key>=<value>` | runtime 設定の変更 (例: `on-child-suspend=notify\|auto-resume`) |

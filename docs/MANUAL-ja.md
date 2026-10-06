@@ -23,7 +23,7 @@
   - [6. 画面を読む (`screen dump` / `snapshot`)](#6-画面を読む-screen-dump--snapshot)
   - [7. 排他自動操作 (`lock`)](#7-排他自動操作-lock)
   - [8. tty I/O timeline を録画する (`record`)](#8-tty-io-timeline-を録画する-record)
-  - [9. session を namespace でグループ分けする](#9-session-を-namespace-でグループ分けする)
+  - [9. session id と面 (状態の root)](#9-session-id-と面-状態の-root)
   - [10. 子プロセスへの env 漏洩を防ぐ (env scrub)](#10-子プロセスへの-env-漏洩を防ぐ-env-scrub)
   - [11. ブラウザから操作する (web)](#11-ブラウザから操作する-web)
 - [トラブルシューティング](#トラブルシューティング)
@@ -34,15 +34,15 @@
 ### 1. detached でセッションを起動して別端末から attach
 
 ```sh
-# 端末 A: detached でセッション起動 (session id が stdout に出る)
+# 端末 A: detached でセッション起動 (session id = UUID が stdout に出る)
 hyoui run --detached -- claude
-# → run-<pid>-<rand>  (例)
+# → 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f  (例)
 
 # 端末 B: list で確認 → attach
 hyoui list
-hyoui attach run-<pid>-<rand>
+hyoui attach 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f
 # Ctrl+Z 単発で client を suspend (= shell に戻る、fg で復帰)
-# 接続を畳むなら hyoui detach run-<pid>-<rand>
+# 接続を畳むなら hyoui detach 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f
 ```
 
 stdin を pipe / file にすると、その fd が `--detached` の有無によらず子の stdin になる。子の stdout / stderr と制御端末は PTY のまま ([DR-0042](./decisions/DR-0042-non-tty-stdin-is-the-childs-fd.md))。子から見た stdin は直接実行と同じなので、子は pipe を読み、pipe の EOF で終わる。バイナリもそのまま届く。hyoui は pipe を読まないので、`tail -f` のような終わらない入力でも `--detached` の run はすぐ戻る。
@@ -63,15 +63,15 @@ printf 'a\003b\000c\n' | hyoui run -- od -c    # バイナリも化けない
 ### 2. read-only で観察する
 
 ```sh
-hyoui attach --observer run-<pid>-<rand>
+hyoui attach --observer 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f
 # observer は入力を送らない読み取り専用 attach
 ```
 
 ### 3. 終了させる
 
 ```sh
-hyoui kill run-<pid>-<rand>            # SIGTERM
-hyoui kill --signal KILL run-<pid>-<rand>  # SIGKILL
+hyoui kill 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f                 # SIGTERM
+hyoui kill --signal KILL 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f   # SIGKILL
 ```
 
 ## 自動操作
@@ -236,50 +236,32 @@ hyoui record stop "$SESS" --all
 > 記録されない。`redact-after-prompt` (prompt 検出後のみ redact) は Phase 5 予定で
 > 現状は指定するとエラーになる ([DR-0016](./decisions/DR-0016-tty-io-record.md) §6a)。
 
-### 9. session を namespace でグループ分けする
+### 9. session id と面 (状態の root)
 
-普段使いの `claude` と一時的な worker 群のように、無関係な session グループが
-`hyoui list` で混ざるのが邪魔なときは **namespace**
-([DR-0018](./decisions/DR-0018-session-namespace.md)) を使う。解決順は
-`--namespace` flag > env `HYOUI_NAMESPACE` > `default` で、全 session 系コマンドが
-同じ解決を共有する。`default` namespace は従来の socket 配置そのままなので、
-既存 session には影響しない。
+session id は小文字・ハイフン付きの UUID だけ ([DR-0041](./decisions/DR-0041-session-id-uuid-and-tags.md))。`hyoui list` は今の面の全 session を起動時刻の順に並べる。
 
 ```sh
-# worker 群を隔離する
-hyoui run --detached --namespace=workers --session=w1 -- worker-cmd
-hyoui run --detached --namespace=workers --session=w2 -- worker-cmd
-
-hyoui list                            # default のみ — worker は混ざらない
-hyoui list --namespace=workers        # worker 群のみ
-hyoui list --all-namespaces           # 全部 (= 先頭に NS 列)
-hyoui list --all-namespaces --prune-stale  # 全 namespace の stale socket を掃除
-
-# selector は全部 namespace スコープ (session id / --index / kill --all / ...)
-hyoui attach w1 --namespace=workers
-hyoui input --namespace=workers w1 "text:ls" "key:Enter"
-hyoui kill --all --namespace=workers
+# id を起動側で決める (= stdout を読まずに後続の操作を組める)
+SID=$(uuidgen | tr A-Z a-z)
+hyoui run --detached --pty-stdin --session-id="$SID" -- bash
+hyoui input "$SID" "text:ls" "key:Enter"
 ```
 
-**direnv レシピ** — プロジェクトの `.envrc` に書く:
+- 受け付けるのは標準形 `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` だけ。大文字・ハイフン無し・波括弧付き・先頭だけの短縮はエラーで、黙って正規化しない (表記が違うと同じ UUID でも別の socket になるため)。UUID の版は問わない
+- 同じ id の socket が既にあると `hyoui run` は子を起こさずにエラーで終わる。相手の daemon が生きていても死んでいても同じで、run は生死を判定しない。動いている session なら `hyoui kill <id>`、daemon が死んで socket だけ残っていれば `hyoui list` (接続を断られ、daemon の lock を誰も持っていない socket を片付ける) の後に打ち直す。判定は socket の bind と name lock の時点で行うので、同じ id の run を並行に打っても起動するのは 1 つだけ
+- `hyoui kill --wait` は子と session の終了を見届けて戻るが、daemon が終わって socket を消すのはその後 (実測で約 2 秒後) なので、同じ id ですぐ `run` すると「既にある」になる
 
-```sh
-export HYOUI_NAMESPACE=myproj
-```
+**面** — socket は `<状態の root>/sessions/<id>.sock` に置く。状態の root は次の順に決まり、hyoui の一式 (session の socket、web の監督者・unit・登録簿・passkey・logs) はその中で完結する。
 
-これでそのプロジェクト dir 内で実行する `hyoui run` / `list` / `attach` が
-flag なしで全部自動分離される。
+1. `HYOUI_STATE_DIR` (空でなければそのまま。相対パスはエラー)
+2. `$XDG_STATE_HOME/hyoui` (絶対パスの時だけ)
+3. `$HOME/.local/state/hyoui` (`HOME` も無ければエラー。cwd 相対にはしない)
 
-**継承** — `hyoui run` は解決済 namespace を子プロセスの env に
-`HYOUI_NAMESPACE` として **常時注入**する (= `default` でも入れる)。tmux の
-`TMUX` / screen の `STY` と同じ慣行で、namespace 内の session からネスト起動した
-hyoui は指定なしで同じ namespace に入る。別 namespace で起動したい場合は
-`--namespace=<別ns>` (例: `--namespace=default`) を明示する。この env 変数は
-「自分は hyoui 配下か、どの namespace か」の自己検出にも使える。
+面を分けたい時は、面の `.envrc` で `HYOUI_STATE_DIR` だけを設定する (`XDG_STATE_HOME` は他のアプリと共有なので書き換えない)。別の面の session は `list` にも id 指定にも出ない。面をまたいで扱う option は無いので、面ごとに環境変数を変えて実行する。config (`~/.config/hyoui/`) は面で分けず共有する。`XDG_RUNTIME_DIR` は使わない (ログインに紐づく寿命で、ログインを越えて動く session と合わない)。
 
-namespace 名は session id と同じ文字集合 (`[A-Za-z0-9._-]`、最大 64 bytes)。
-`/` は現状 reject される (= 将来の階層 namespace 用に予約)。`default` は
-base socket dir 直下にマップされる予約名。
+- unix socket の `sun_path` の上限 (macOS 104 / Linux 108 bytes) はフルパスでは判定しない。収まらない時は socket の dir を開いた fd を基準に相対名で bind / connect するので、深い root でも使える
+- 子プロセスへ常時注入するのは `HYOUI_SESSION_ID` だけ。`--login` でない run の子は呼び出し元の env を引き継ぐので `HYOUI_STATE_DIR` も届き、子の中で起こす hyoui は同じ面を使う
+- `sessions/` の外 (状態の root 直下や、`sessions/` / `web/` 以外の dir) に残った socket は読まない。在れば `hyoui list` と `hyoui web ...` が stderr に警告する。手順は `docs/runbooks/session-uuid-migration-dr-0041.md`
 
 ### 10. 子プロセスへの env 漏洩を防ぐ (env scrub)
 
@@ -321,7 +303,7 @@ target は `hyoui run -- <cmd>` の `<cmd>` を basename した値で lookup。
 書く ([DR-0024 §2](./decisions/DR-0024-env-scrub-config-file.md))。
 
 `HYOUI_*` で始まる env は user の `kill_glob` が当たっても削除されない (= hyoui
-自身が `HYOUI_NAMESPACE` / `HYOUI_SESSION_ID` 等を意図的に子へ伝えるため)。
+自身が `HYOUI_SESSION_ID` を意図的に子へ伝え、`HYOUI_STATE_DIR` で面を引き継がせるため)。
 
 config パースエラー (= 不正 TOML / 型不一致) のときは hyoui の起動を拒否する
 (= 意図しない設定での起動は親 Internal Context 漏洩リスクがあるため)。一時的に
@@ -343,9 +325,9 @@ hyoui run --login --detached --pty-stdin -- zsh -f     # コマンド明示 (rc 
 - shell は passwd (`getpwuid`) から引く。呼び出し元の `$SHELL` は見ない
 - argv[0] は `-<shell の basename>` (例: `-zsh`)。rc は shell が読む
 - 子の env は呼び出し元から引き継がず最小から始める: `HOME` / `USER` / `LOGNAME` / `SHELL` / 初期 `PATH` / `LANG` (呼び出し元に在れば) / `TERM` (下記)。初期 `PATH` は macOS では `/etc/paths` と `/etc/paths.d/*` から、それ以外は `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`
-- `HYOUI_SESSION_ID` / `HYOUI_NAMESPACE` は最小化しても子に残る
+- `HYOUI_SESSION_ID` は最小化しても子に残る (`HYOUI_STATE_DIR` は残らないので、子の中で起こす hyoui は子の env が決める面を使う)
 - コマンドを明示した時は、そのコマンドを argv[0] の `-` 付けなしでそのまま起動し、env だけ最小にする
-- 最小化するのは子の env だけ。hyoui 自身がどの面の root (`XDG_*` / `HYOUI_NAMESPACE`) を使うかは呼び出し元の env のまま決まる
+- 最小化するのは子の env だけ。hyoui 自身がどの面の root (`HYOUI_STATE_DIR` / `XDG_*`) を使うかは呼び出し元の env のまま決まる
 
 子の `TERM` は `--login` の有無によらず呼び出し元の値を引き継ぐ。呼び出し元に無い (未設定 / 空) 時だけ config の `[session] term_fallback` (default `xterm-256color`) を設定する ([DR-0039](./decisions/DR-0039-webui-terminal-app-rework.md) 決定 1)。
 
@@ -449,7 +431,7 @@ hyoui web daemon status
 - `daemon run <name>` は登録簿が指す config を、`daemon run --config <path>` は登録簿を通さずそのファイルを読む。どちらもそのファイルと `extends` でたどれるファイルだけを読み、`config.toml` は読まない。`daemon run --no-config [--listen <host:port>]` は config を読まず、組み込みの既定値と CLI 引数だけで起動する (テスト向け)
 - 監督者は unit ごとに `<binary_path> web daemon run <name>` を子として起動する
 
-`extends` は土台のファイルに重ねる: 表は鍵ごとに潜り、それ以外は置き換える。相対パスは書いたファイルの隣から解き、`~` は `$HOME` で開く。`binary_path` は `daemon add` の時点で登録簿に写る (変えたら `remove` → `add`)。`listen` / `assets_dir` は起動のたびにファイルから読む。状態 (登録簿・ログ・passkey) は `${XDG_STATE_HOME:-~/.local/state}/hyoui/web/` に置く。`service register` は場所を決める env (`HOME` / `XDG_*`) を OS の定義に固定し、後から違う値で打つと `--force` 無しでは書き換えない。
+`extends` は土台のファイルに重ねる: 表は鍵ごとに潜り、それ以外は置き換える。相対パスは書いたファイルの隣から解き、`~` は `$HOME` で開く。`binary_path` は `daemon add` の時点で登録簿に写る (変えたら `remove` → `add`)。`listen` / `assets_dir` は起動のたびにファイルから読む。状態 (登録簿・ログ・passkey) は `<状態の root>/web/` に置く。`service register` は場所を決める env (`HOME` / `XDG_CONFIG_HOME` / `XDG_STATE_HOME` / `HYOUI_STATE_DIR`) を OS の定義に固定し、後から違う値で打つと `--force` 無しでは書き換えない。面の `.envrc` が効いた shell で register すれば、その面の監督者が面の root ごとに立つ。
 
 セッション画面のキーボード FAB を開いて「情報」タブへ切り替えると、attach の mode / leader
 を確認できる。leader が別 browser にある場合は「leader になる」を押すと接続を切らずに
@@ -460,7 +442,8 @@ hyoui web daemon status
 
 | 症状 | 対処 |
 |---|---|
-| `hyoui list` に session が出ない | `$XDG_RUNTIME_DIR/hyoui` / `${XDG_STATE_HOME:-$HOME/.local/state}/hyoui` の socket dir に stale socket が残っていないか確認 (`docs/runbooks/2026-05-27-stale-socket-detection.md`) |
+| `hyoui list` に session が出ない | 面 (`HYOUI_STATE_DIR` 等) が起動時と同じか確認する (別の面の session は見えない)。古い置き場の socket が残っていれば `hyoui list` が stderr に警告する (`docs/runbooks/session-uuid-migration-dr-0041.md`) |
+| `hyoui run` が「socket が既にある」で起動しない | 同じ id の session が動いていれば `hyoui kill <id>`、daemon が死んで socket だけ残っていれば `hyoui list` が片付ける。別の id で起動してもよい |
 | attach 直後に切られる | daemon が cap negotiation で reject した可能性 (`docs/runbooks/2026-05-27-handshake-cap-rejection.md`) |
 | 子プロセスが死んで daemon だけ残る | `docs/runbooks/2026-05-27-child-orphan-detection.md` |
 
