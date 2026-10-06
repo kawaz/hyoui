@@ -1,18 +1,18 @@
 ---
 title: status_liveness_check_must_not_reap_exited_child が 50ms の sleep で子の exit を待っており負荷時に落ちうる
-status: open
+status: resolved
 category: bug
 created: 2026-10-05T11:50:00+09:00
-last_read: 2026-10-05T11:50:00+09:00
+last_read: 2026-10-06T12:30:00+09:00
 open_entered: 2026-10-05T11:50:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-06T12:30:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: 50ms の sleep を waitid(WEXITED|WNOWAIT) での exit 待ちに置き換え (unsafe は sys/procstate.rs)。負荷下 (yes 10 並走) 30 回は修正前も 0 失敗で再現はしておらず、時間依存を取り除いた修正
 blocked_by:
 ---
 
