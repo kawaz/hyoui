@@ -173,5 +173,5 @@ DR-0038 決定 4 の移行と同じ方式を採る。
 
 ## 未決
 
-- 現行の `HYOUI_NAMESPACE` を使っている箇所の移行: 業務面の `.envrc`、ccmsg の hyoui terminal 連携 (`src/terminals/hyoui.ts` が base と namespace を直書きで discovery している。ccmsg 側の issue として起票が要る)
+- 現行の `HYOUI_NAMESPACE` を使っている箇所の移行: 業務面の `.envrc`、ccmsg の hyoui terminal 連携 (`src/terminals/hyoui.ts` が base と namespace を直書きで discovery している。ccmsg 側に起票済み: kawaz/ccmsg `docs/issue/2026-10-06-hyoui-namespace-removal-and-socket-dir.md`)
 
