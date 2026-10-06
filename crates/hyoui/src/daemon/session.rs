@@ -305,6 +305,7 @@ impl Session {
     /// * `cmd` が空、または argv に NUL を含む → [`Error::Invalid`]
     /// * forkpty / execvp が失敗 → [`Error::Errno`]
     /// * socket parent dir が mode 0700 でない → [`Error::Precondition`]
+    /// * 同じ path の socket が既にある (DR-0041 決定 3) → [`Error::SocketExists`]
     /// * bind / listen が失敗 → [`Error::Errno`]
     pub fn start(config: DaemonConfig) -> Result<Self, Error> {
         Self::start_with_child_stdin(config, None)
@@ -342,6 +343,10 @@ impl Session {
         if !core_dump_allowed_by_env() {
             crate::sys::raw::setrlimit_core_zero()?;
         }
+        // socket を子の spawn より先に bind する: 同じ id の socket が既にある時は
+        // (DR-0041 決定 3)、子を起こす前に起動を断る (= 起こしてから殺さない)。listener と
+        // name lock の fd は CLOEXEC なので、spawn する子には渡らない。
+        let listener = UnixSock::listen(&config.socket_path)?;
         let argv: Vec<&str> = config.cmd.iter().map(String::as_str).collect();
         // bug fix 2026-06-11: 子 PTY を `hyoui run` の起点 cwd で起動する (= 透過性回復、
         // DR-0005)。daemon 自身は daemonize 慣習で chdir("/") 済だが、子 (= claude 等)
@@ -364,7 +369,6 @@ impl Session {
         // master FD を nonblock にして、POLLHUP 偽陽性 (macOS) で read_some が
         // block するのを防ぐ。read_some は EAGAIN を返す → serve_loop で continue。
         pty.master_fd().set_nonblocking(true)?;
-        let listener = UnixSock::listen(&config.socket_path)?;
         Ok(Self {
             config,
             inner: Some(SessionInner {

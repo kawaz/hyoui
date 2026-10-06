@@ -20,6 +20,10 @@
 //!   async-signal-safe (no allocation, no locks, no Rust destructors;
 //!   `execvp` 失敗時は `_exit(127)`)。
 //!
+//! * `sockaddr_op_in_dir` — `sun_path` に収まらない unix socket のパスを、dir の fd を
+//!   基準にした相対名で bind / connect する (DR-0041 決定 5)。fork した子だけが
+//!   `fchdir` し、子の区間は async-signal-safe な syscall だけで `_exit` する。
+//!
 //! * [`borrow_raw_fd`] and [`own_raw_fd`] — thin wrappers around
 //!   `BorrowedFd::borrow_raw` / `OwnedFd::from_raw_fd` so the rest of the
 //!   crate never spells those operations directly.
@@ -511,6 +515,93 @@ pub fn getrlimit_core() -> Result<RlimitPair> {
         soft: rlim.rlim_cur,
         hard: rlim.rlim_max,
     })
+}
+
+// ---------------------------------------------------------------------------
+// bind / connect relative to a directory fd (DR-0041 決定 5)
+// ---------------------------------------------------------------------------
+
+/// [`sockaddr_op_in_dir`] が socket に行う操作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SockAddrOp {
+    /// `bind(2)`。
+    Bind,
+    /// `connect(2)`。
+    Connect,
+}
+
+/// `sock` を、`dir` を基準にした相対名 `addr` で bind / connect する。
+///
+/// `sun_path` に収まらないパスを開く時だけ使う (DR-0041 決定 5)。fork した子だけが
+/// `fchdir(dir)` してから相対名で bind / connect し、結果を終了 status で返す。fork 後の
+/// `sock` は親子で同じ open file description を指すので、子の bind / connect は親の fd
+/// にそのまま効く。cwd が変わるのは子だけで、親のスレッドは巻き込まれない。
+///
+/// 子の区間 (fork → `_exit`) は async-signal-safe な呼び出し (`fchdir` / `bind` /
+/// `connect` / errno の読み出し / `_exit`) だけで、allocation も lock も Rust の
+/// destructor も通らない。sockaddr は fork の前に親が組み立てる。なのでマルチスレッドの
+/// プロセス (web gateway の tokio、daemon) から呼んでも POSIX の範囲で安全。
+///
+/// 子は特定の pid で `waitpid` する (= 他の子の終了を横取りしない)。
+pub(crate) fn sockaddr_op_in_dir(
+    op: SockAddrOp,
+    sock: BorrowedFd<'_>,
+    dir: BorrowedFd<'_>,
+    addr: &nix::sys::socket::UnixAddr,
+) -> Result<()> {
+    use nix::sys::socket::SockaddrLike;
+
+    let sock_raw = sock.as_raw_fd();
+    let dir_raw = dir.as_raw_fd();
+    let addr_ptr = SockaddrLike::as_ptr(addr);
+    let addr_len = SockaddrLike::len(addr);
+    // SAFETY: fork(2) 自体は常に呼べる。子は下の block で async-signal-safe な syscall
+    // だけを呼んで `_exit` するので、マルチスレッドの親が fork 時点で持っていた lock や
+    // allocator の状態に触れない。親は返った pid を待つだけ。
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(Error::from(Errno::last()));
+    }
+    if pid == 0 {
+        // 子。終了 status の 0 が成功、1..=255 が errno (= 255 を超える errno は
+        // 255 に丸める。macOS / Linux の bind / connect / fchdir が返す errno は 255 未満)。
+        // SAFETY: fchdir / bind / connect / _exit は async-signal-safe。fd と sockaddr は
+        // fork 前に親が用意した値で、子はそれを読むだけ。
+        unsafe {
+            if libc::fchdir(dir_raw) != 0 {
+                libc::_exit(Errno::last_raw().clamp(1, 255));
+            }
+            let rc = match op {
+                SockAddrOp::Bind => libc::bind(sock_raw, addr_ptr, addr_len),
+                SockAddrOp::Connect => libc::connect(sock_raw, addr_ptr, addr_len),
+            };
+            if rc != 0 {
+                libc::_exit(Errno::last_raw().clamp(1, 255));
+            }
+            libc::_exit(0);
+        }
+    }
+    let mut status: libc::c_int = 0;
+    loop {
+        // SAFETY: 自分が fork した子の pid を待つ同期 syscall。status は local 変数。
+        let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if r == pid {
+            break;
+        }
+        let errno = Errno::last();
+        if errno != Errno::EINTR {
+            return Err(Error::from(errno));
+        }
+    }
+    if !libc::WIFEXITED(status) {
+        return Err(Error::Precondition(
+            "the child that binds / connects a long socket path did not exit normally",
+        ));
+    }
+    match libc::WEXITSTATUS(status) {
+        0 => Ok(()),
+        code => Err(Error::from(Errno::from_raw(code))),
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -68,31 +68,55 @@ fn acquire_name_lock(lock_path: &Path) -> Result<Flock<std::fs::File>> {
     Ok(lock)
 }
 
-/// `bind(2)` / `connect(2)` に渡せる socket path の最大バイト長 (= NUL 終端を除く)。
+/// `bind(2)` / `connect(2)` に渡せる `sun_path` 引数の最大バイト長 (= NUL 終端を除く)。
 ///
 /// `libc::sockaddr_un` 全体サイズから `sun_path` field の offset を引いて
 /// `sun_path` 配列のバイト数 (= macOS 104 / Linux 108) を求め、NUL 終端 1 byte を
-/// 引く。`UnixAddr::new` は超過時 `ENAMETOOLONG` を返すが文言が不親切なため、
-/// caller (= socket_path 解決 / [`check_sun_path_len`]) が事前チェックに使う。
+/// 引く。上限が効くのは `sun_path` に渡す引数の長さで、ファイルシステム上のフルパスの
+/// 長さではない (DR-0041 決定 5)。
 pub const fn sun_path_max() -> usize {
     let cap = std::mem::size_of::<libc::sockaddr_un>()
         - std::mem::offset_of!(libc::sockaddr_un, sun_path);
     cap - 1
 }
 
-/// `path` の byte 長が `sun_path` 上限に収まるか検証する (= bind/connect 直前の
-/// defense-in-depth、特に `--socket=<explicit>` で長い path が来た場合)。
-///
-/// 超過時は現在長 / 上限を含む `Error::Errno(ENAMETOOLONG)` ではなく、
-/// 人間可読の `Error::Precondition` 相当を返したいが、`Precondition` は
-/// `&'static str` 固定なので、ここでは `ENAMETOOLONG` をそのまま返す
-/// (= 上位の socket_path 層が friendly message を組む。本関数は last-resort guard)。
-fn check_sun_path_len(path: &Path) -> Result<()> {
+/// `path` をそのまま `sun_path` に渡せるか。
+fn fits_sun_path(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
-    if path.as_os_str().as_bytes().len() > sun_path_max() {
-        return Err(Error::Errno(nix::errno::Errno::ENAMETOOLONG));
+    path.as_os_str().as_bytes().len() <= sun_path_max()
+}
+
+/// `fd` を `path` に bind / connect する (DR-0041 決定 5)。
+///
+/// `path` が `sun_path` に収まれば直接渡す。収まらない時だけ、`path` の dir を開いた
+/// fd を基準に相対名 (= ファイル名) で行う (`raw::sockaddr_op_in_dir`、fork した子
+/// だけが `fchdir` する)。ファイル名自体が `sun_path` に収まらなければ
+/// `ENAMETOOLONG`。
+fn sockaddr_op(op: super::raw::SockAddrOp, fd: BorrowedFd<'_>, path: &Path) -> Result<()> {
+    use super::raw::SockAddrOp;
+    if fits_sun_path(path) {
+        let addr = UnixAddr::new(path).map_err(Error::from)?;
+        return match op {
+            SockAddrOp::Bind => socket::bind(fd.as_raw_fd(), &addr),
+            SockAddrOp::Connect => socket::connect(fd.as_raw_fd(), &addr),
+        }
+        .map_err(Error::from);
     }
-    Ok(())
+    let name = path
+        .file_name()
+        .ok_or(Error::Invalid("socket path has no file name"))?;
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let addr = UnixAddr::new(Path::new(name)).map_err(Error::from)?;
+    let dir_fd = nix::fcntl::open(
+        dir,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map_err(Error::from)?;
+    super::raw::sockaddr_op_in_dir(op, fd, dir_fd.as_fd(), &addr)
 }
 
 /// RAII wrapper around `umask(2)`. On Drop the previous mask is restored.
@@ -151,7 +175,7 @@ impl UnixSock {
         if mode != 0o700 {
             return Err(Error::Precondition(
                 "socket parent directory must be mode 0700 \
-                 (use $XDG_RUNTIME_DIR/hyoui or ${XDG_STATE_HOME:-$HOME/.local/state}/hyoui, or run `chmod 700 <parent>`)",
+                 (hyoui's own socket dir is <state root>/sessions, see HYOUI_STATE_DIR; or run `chmod 700 <parent>`)",
             ));
         }
         let euid = nix::unistd::geteuid();
@@ -159,7 +183,7 @@ impl UnixSock {
             return Err(Error::Precondition(
                 "socket parent directory must be owned by current euid \
                  (= 別 user 所有の dir を --socket で指定した可能性。\
-                 hyoui の自動 path ($XDG_RUNTIME_DIR/hyoui or ${XDG_STATE_HOME:-$HOME/.local/state}/hyoui) を使う)",
+                 hyoui の自動 path (<状態の root>/sessions、HYOUI_STATE_DIR 参照) を使う)",
             ));
         }
         Ok(())
@@ -167,19 +191,30 @@ impl UnixSock {
 
     /// Bind and listen on `path`. Backlog = 5. Sets `umask(0o077)` around
     /// `bind(2)` so the socket file is created mode `0600`.
+    ///
+    /// 同じ path の重複は bind / name lock の時点で原子的に失敗させる (DR-0041 決定 3)。
+    /// name lock (`<name>.lock`) を別のプロセスが持っている、または bind が既存の
+    /// socket file に当たる (= 死んだ daemon の socket を含む) と
+    /// [`Error::SocketExists`]。bind の前に既存の socket file を消さない
+    /// (= 確認してから作る 2 段にしない、生死を判定しない)。
+    ///
+    /// `path` が `sun_path` に収まらなければ dir の fd 基準の相対名で bind する
+    /// (DR-0041 決定 5)。
     pub fn listen<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        check_sun_path_len(&path)?;
         Self::check_parent_dir(&path)?;
 
         let _dir_lock = lock_socket_dir(&path)?;
         let lock_path = path.with_extension("lock");
-        let lock = acquire_name_lock(&lock_path)?;
+        let lock_existed = lock_path.symlink_metadata().is_ok();
+        let lock = match acquire_name_lock(&lock_path) {
+            Ok(lock) => lock,
+            Err(Error::Errno(nix::errno::Errno::EWOULDBLOCK)) => {
+                return Err(Error::SocketExists(path));
+            }
+            Err(e) => return Err(e),
+        };
 
-        match nix::unistd::unlink(&path) {
-            Ok(()) | Err(nix::errno::Errno::ENOENT) => {}
-            Err(e) => return Err(Error::from(e)),
-        }
         let mut bound = false;
         let result = (|| -> Result<OwnedFd> {
             let fd = socket::socket(
@@ -190,9 +225,8 @@ impl UnixSock {
             )
             .map_err(Error::from)?;
             set_cloexec(&fd)?;
-            let addr = UnixAddr::new(path.as_path()).map_err(Error::from)?;
             let _umask = UmaskGuard::set(nix::sys::stat::Mode::from_bits_truncate(0o077));
-            socket::bind(fd.as_raw_fd(), &addr).map_err(Error::from)?;
+            sockaddr_op(super::raw::SockAddrOp::Bind, fd.as_fd(), &path)?;
             bound = true;
             drop(_umask);
             socket::listen(&fd, Backlog::new(5).map_err(Error::from)?).map_err(Error::from)?;
@@ -204,8 +238,17 @@ impl UnixSock {
                 if bound {
                     let _ = nix::unistd::unlink(&path);
                 }
-                let _ = nix::unistd::unlink(&lock_path);
-                return Err(e);
+                // 自分が作った lock file だけを消す。先にあった lock file (= 死んだ
+                // daemon のもの) と、既にある socket の隣に作った lock file は残す:
+                // 片付けの経路 (discovery の prune) は「lock が在って誰も持っていない」
+                // ことで socket を死んだと判断するので、消すと片付けられなくなる。
+                if !lock_existed && path.symlink_metadata().is_err() {
+                    let _ = nix::unistd::unlink(&lock_path);
+                }
+                return Err(match e {
+                    Error::Errno(nix::errno::Errno::EADDRINUSE) => Error::SocketExists(path),
+                    other => other,
+                });
             }
         };
 
@@ -360,9 +403,10 @@ pub fn peer_pid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32>
 }
 
 /// Connect a fresh Unix-domain socket to `path`. Returns the connected fd.
+///
+/// `path` が `sun_path` に収まらなければ dir の fd 基準の相対名で connect する
+/// (DR-0041 決定 5)。
 pub fn connect<P: AsRef<Path>>(path: P) -> Result<OwnedFd> {
-    check_sun_path_len(path.as_ref())?;
-    let addr = UnixAddr::new(path.as_ref()).map_err(Error::from)?;
     let fd = socket::socket(
         AddressFamily::Unix,
         SockType::Stream,
@@ -372,7 +416,7 @@ pub fn connect<P: AsRef<Path>>(path: P) -> Result<OwnedFd> {
     .map_err(Error::from)?;
     // L6: set FD_CLOEXEC on client fd (portable).
     set_cloexec(&fd)?;
-    socket::connect(fd.as_raw_fd(), &addr).map_err(Error::from)?;
+    sockaddr_op(super::raw::SockAddrOp::Connect, fd.as_fd(), path.as_ref())?;
     Ok(fd)
 }
 
@@ -382,8 +426,6 @@ pub fn connect<P: AsRef<Path>>(path: P) -> Result<OwnedFd> {
 /// A full backlog is reported as `ECONNREFUSED` on macOS and `EAGAIN` on Linux
 /// (Linux blocks a blocking AF_UNIX connect until the peer accepts, with no timeout).
 pub fn connect_no_wait<P: AsRef<Path>>(path: P) -> Result<OwnedFd> {
-    check_sun_path_len(path.as_ref())?;
-    let addr = UnixAddr::new(path.as_ref()).map_err(Error::from)?;
     let fd = socket::socket(
         AddressFamily::Unix,
         SockType::Stream,
@@ -393,10 +435,44 @@ pub fn connect_no_wait<P: AsRef<Path>>(path: P) -> Result<OwnedFd> {
     .map_err(Error::from)?;
     set_cloexec(&fd)?;
     let flags = OFlag::from_bits_retain(fcntl(&fd, FcntlArg::F_GETFL).map_err(Error::from)?);
+    // O_NONBLOCK は open file description の flag なので、fork した子が connect する
+    // 経路 (`sockaddr_op`) でも効く。
     fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).map_err(Error::from)?;
-    socket::connect(fd.as_raw_fd(), &addr).map_err(Error::from)?;
+    sockaddr_op(super::raw::SockAddrOp::Connect, fd.as_fd(), path.as_ref())?;
     fcntl(&fd, FcntlArg::F_SETFL(flags)).map_err(Error::from)?;
     Ok(fd)
+}
+
+/// [`connect`] して `std::os::unix::net::UnixStream` にする (= 長いパスでも届く口)。
+///
+/// # Errors
+///
+/// [`connect`] と同じ。
+pub fn connect_stream<P: AsRef<Path>>(path: P) -> Result<std::os::unix::net::UnixStream> {
+    connect(path).map(std::os::unix::net::UnixStream::from)
+}
+
+/// `path` に bind して listen する `std::os::unix::net::UnixListener` を作る
+/// (= 長いパスでも bind できる口、DR-0041 決定 5)。
+///
+/// [`UnixSock::listen`] と違い、親 dir の検査・name lock・`umask` は持たない
+/// (= 呼び出し側が置き場と排他を持つ socket 用)。既にファイルがあれば `EADDRINUSE`。
+///
+/// # Errors
+///
+/// socket の作成・bind・listen が失敗した時。
+pub fn bind_listener<P: AsRef<Path>>(path: P) -> Result<std::os::unix::net::UnixListener> {
+    let fd = socket::socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::empty(),
+        None,
+    )
+    .map_err(Error::from)?;
+    set_cloexec(&fd)?;
+    sockaddr_op(super::raw::SockAddrOp::Bind, fd.as_fd(), path.as_ref())?;
+    socket::listen(&fd, Backlog::new(128).map_err(Error::from)?).map_err(Error::from)?;
+    Ok(std::os::unix::net::UnixListener::from(fd))
 }
 
 #[cfg(test)]
@@ -525,13 +601,182 @@ mod tests {
         );
         // hint: 推奨 dir + 直し方
         assert!(
-            msg.contains("XDG_RUNTIME_DIR") && msg.contains("XDG_STATE_HOME"),
-            "error must hint at XDG runtime and cache socket dirs; got: {msg}"
+            msg.contains("<state root>/sessions") && msg.contains("HYOUI_STATE_DIR"),
+            "error must hint at hyoui's own socket dir; got: {msg}"
         );
         assert!(
             msg.contains("chmod 700"),
             "error must hint at `chmod 700`; got: {msg}"
         );
+    }
+
+    /// 同じ path で 2 つ目の listen は name lock の時点で失敗し、1 つ目の socket と
+    /// lock には触らない (DR-0041 決定 3)。
+    #[test]
+    fn second_listen_on_the_same_path_fails_and_leaves_the_first_alone() {
+        let dir = make_0700_dir();
+        let path = dir.path().join("dup.sock");
+        let first = UnixSock::listen(&path).expect("first listen");
+        let err = UnixSock::listen(&path).expect_err("second listen must fail");
+        assert!(
+            matches!(&err, Error::SocketExists(p) if p == &path),
+            "err: {err:?}"
+        );
+        assert!(path.exists(), "the first socket must stay");
+        assert!(name_lock_is_held_elsewhere(&path.with_extension("lock")));
+        let _client = connect(&path).expect("the first listener still accepts connections");
+        drop(first);
+    }
+
+    /// daemon が死んで socket file だけ残っている (= lock は誰も持っていない) 場合も、
+    /// listen は既存の socket file を消さずに失敗する (DR-0041 決定 3)。片付けの経路が
+    /// 死んだと判断できるよう、lock file は残す。
+    #[test]
+    fn listen_on_a_dead_socket_fails_without_removing_it() {
+        let dir = make_0700_dir();
+        let path = dir.path().join("dead.sock");
+        let lock_path = path.with_extension("lock");
+        drop(std::os::unix::net::UnixListener::bind(&path).expect("leave a dead socket"));
+        std::fs::File::create(&lock_path).expect("dead daemon's lock file");
+        let ino = std::fs::metadata(&path).unwrap().ino();
+
+        let err = UnixSock::listen(&path).expect_err("must fail on the dead socket");
+        assert!(matches!(err, Error::SocketExists(_)), "err: {err:?}");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            ino,
+            "the dead socket must not be replaced"
+        );
+        assert!(
+            lock_path.exists(),
+            "the lock file must stay for the cleanup path"
+        );
+        assert!(!name_lock_is_held_elsewhere(&lock_path));
+    }
+
+    /// lock file の無い残骸 socket に当たった時も消さずに失敗し、片付けの経路が判断
+    /// できるよう lock file を残す。
+    #[test]
+    fn listen_on_a_lockless_socket_fails_and_leaves_a_lock_file() {
+        let dir = make_0700_dir();
+        let path = dir.path().join("orphan.sock");
+        drop(std::os::unix::net::UnixListener::bind(&path).expect("leave an orphan socket"));
+        let err = UnixSock::listen(&path).expect_err("must fail on the orphan socket");
+        assert!(matches!(err, Error::SocketExists(_)), "err: {err:?}");
+        assert!(path.exists());
+        assert!(path.with_extension("lock").exists());
+    }
+
+    /// bind が重複以外の理由で失敗した時、自分が作った lock file は残さない。
+    #[test]
+    fn a_failed_listen_removes_only_its_own_lock_file() {
+        let dir = make_0700_dir();
+        // ファイル名だけで sun_path を超える = bind が ENAMETOOLONG で失敗する。
+        let name = format!("{}.sock", "n".repeat(sun_path_max()));
+        let path = dir.path().join(name);
+        let err = UnixSock::listen(&path).expect_err("too long a file name");
+        assert!(
+            matches!(err, Error::Errno(nix::errno::Errno::ENAMETOOLONG)),
+            "err: {err:?}"
+        );
+        assert!(!path.exists());
+        assert!(!path.with_extension("lock").exists());
+    }
+
+    /// `sun_path` に収まらない深い dir を作る (= フルパスが上限を超える)。
+    fn deep_0700_dir() -> (TempDir, PathBuf) {
+        let base = make_0700_dir();
+        let mut deep = base.path().to_path_buf();
+        while deep.as_os_str().len() <= sun_path_max() + 8 {
+            deep.push("deep-directory-segment");
+        }
+        std::fs::create_dir_all(&deep).expect("mkdir deep");
+        std::fs::set_permissions(&deep, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (base, deep)
+    }
+
+    /// フルパスが `sun_path` の上限を超えても、dir の fd 基準の相対名で bind / connect
+    /// できる (DR-0041 決定 5)。親の cwd は変わらない。
+    #[test]
+    fn a_path_longer_than_sun_path_binds_and_connects() {
+        let (_base, deep) = deep_0700_dir();
+        let path = deep.join("long.sock");
+        assert!(!fits_sun_path(&path), "the test path must exceed sun_path");
+        let cwd_before = std::env::current_dir().unwrap();
+
+        let server = UnixSock::listen(&path).expect("listen on a long path");
+        assert!(path.exists(), "the socket file is created at the full path");
+        let mode = std::fs::symlink_metadata(&path).unwrap().mode() & 0o777;
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "umask 077 applies in the forked child: {mode:o}"
+        );
+        let client = connect(&path).expect("connect to a long path");
+        let accepted = server.accept().expect("accept the long-path client");
+        assert_eq!(std::env::current_dir().unwrap(), cwd_before);
+
+        // 繋がった 2 つの fd の間で bytes が通る。
+        nix::unistd::write(&client, b"x").expect("write");
+        let mut buf = [0u8; 1];
+        assert_eq!(nix::unistd::read(&accepted, &mut buf).expect("read"), 1);
+        assert_eq!(&buf, b"x");
+
+        // 重複判定も長いパスで効く。
+        let err = UnixSock::listen(&path).expect_err("duplicate on a long path");
+        assert!(matches!(err, Error::SocketExists(_)), "err: {err:?}");
+
+        let _ = connect_no_wait(&path).expect("connect_no_wait to a long path");
+        drop(server);
+        assert!(!path.exists());
+        let err = connect(&path).expect_err("nothing listens any more");
+        assert!(
+            matches!(err, Error::Errno(nix::errno::Errno::ENOENT)),
+            "err: {err:?}"
+        );
+    }
+
+    /// 長いパスの `bind_listener` / `connect_stream` も届く (= 監督者の制御 socket 用)。
+    #[test]
+    fn std_wrappers_reach_a_long_path() {
+        use std::io::{Read, Write};
+        let (_base, deep) = deep_0700_dir();
+        let path = deep.join("std.sock");
+        let listener = bind_listener(&path).expect("bind_listener");
+        let mut client = connect_stream(&path).expect("connect_stream");
+        let (mut accepted, _) = listener.accept().expect("accept");
+        client.write_all(b"ok").unwrap();
+        let mut buf = [0u8; 2];
+        accepted.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ok");
+        let err = bind_listener(&path).expect_err("the file already exists");
+        assert!(
+            matches!(err, Error::Errno(nix::errno::Errno::EADDRINUSE)),
+            "err: {err:?}"
+        );
+    }
+
+    /// 長いパスの bind を複数スレッドから同時に行っても、各スレッドが自分の socket を
+    /// bind する (= fork した子だけが cwd を変え、親のスレッドの相対パス解決を巻き込まない)。
+    #[test]
+    fn long_path_binds_from_many_threads_do_not_interfere() {
+        let (_base, deep) = deep_0700_dir();
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let path = deep.join(format!("t{i}.sock"));
+                std::thread::spawn(move || {
+                    let sock = UnixSock::listen(&path).expect("listen");
+                    let _c = connect(&path).expect("connect");
+                    sock.accept().expect("accept");
+                    drop(sock);
+                    path
+                })
+            })
+            .collect();
+        for h in handles {
+            let path = h.join().expect("thread");
+            assert!(!path.exists());
+        }
     }
 
     #[test]
