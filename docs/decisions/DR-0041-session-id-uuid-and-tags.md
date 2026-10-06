@@ -1,6 +1,6 @@
 # DR-0041: session id を UUID にし、namespace を廃止して tag にし、socket を `hyoui/sessions/` にフラットに置く
 
-- Status: ⬜ 未実装 (2026-10-04)。決定 1〜7 は裁定済みで着手してよい。「未決」節の項目は本 DR では確定させない
+- Status: 🟡 部分実装 (2026-10-06)。決定 1〜7 は tag 以外を実装済み。tag (決定 1 の分類と絞り込み、実装の当たり所の最終項) は CLI の形 (付ける option、複数 tag、list の絞り込み) が決まっておらず未実装。「未決」節の項目は本 DR では確定させない
 - Date: 2026-10-04
 - Supersedes: DR-0018 (session namespace)
 - Related: DR-0020 (`HYOUI_SESSION_ID` による自己参照。値が UUID になる), DR-0015 (`hyoui run --detached`。起動側が id を先に決められるようになる), DR-0006 (CLI ground rules。session 引数と `--index`), DR-0038 (web の置き場 `hyoui/web/`、監督者 label `com.github.kawaz.hyoui.web.supervise.<hash>`、場所を決める env の固定、移行の symlink 方式), DR-0039 決定 1 (`hyoui run --login` と面の root), DR-0005 / DR-0014 (透過原則と介入 self-check)

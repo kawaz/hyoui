@@ -1,6 +1,6 @@
 # DR-0018: session namespace — socket dir 分離による list 混在防止
 
-- Status: Active。DR-0041 で置き換える (DR-0041 の実装が入った時点で Superseded by DR-0041)
+- Status: Superseded by DR-0041 (2026-10-06)
 - Date: 2026-06-11
 - Related: DR-0005 (思想 — 透明性最優先), DR-0006 (CLI ground rules), DR-0014 (透過原則 + self-check — 本 DR の env 注入 justify), DR-0004 (subcommand 設計)
 - Origin: docs/issue/2026-06-11-feature-namespace.md (kawaz 提案 + 合意 2026-06-11)
