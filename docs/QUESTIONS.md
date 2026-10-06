@@ -18,27 +18,6 @@
 
 ## 裁定待ち
 
-### 👺STDIN-Q1α: run の非 tty の stdin を子にどう渡すか
-
-[issue](issue/2026-10-05-design-pipe-stdin-pass-fd-to-child.md)。`claude <<<X` が hyoui 経由だと送信されない件の根っこ。今は呼び出し元の pipe の中身を daemon が PTY にキー入力として流しており、子から見ると「stdin が tty」になって直接実行と環境が変わる。PoC (issue の「PoC の結果」) で、fd 0 を pipe・制御端末を PTY にすると claude / fzf / less / cat / python / bash の 6 つとも直接実行と同じになり、PTY master に書いたキーも claude / fzf / less に届いた。統括推しは a (透過。EOT 送出・ICRNL・バイナリ不可 (今は 0x03 で子が SIGINT で死ぬ) が全部消える)。
-
-- [ ] a: stdin が tty でない時はその fd を子の fd 0 にそのまま渡し、PTY は制御端末と出力にだけ使う (DR-0019 §5 と `--stdin-eof` を置き換え)
-- [ ] b: 今の形 (PTY に流し込む) を保ち、here-string の代わりに argv / `hyoui input` を使う書き方を MANUAL に書く
-
-### 👺STDIN-Q1β: (α=a の時) 呼び出し元の stdin を子に渡さない指定
-
-agent の Bash ツールや web gateway の `--login --detached` は stdin が `/dev/null` で、a では `bash -i` 等が EOF で即終了する (直接実行と同じ)。外から操作する session を作るのが目的の起動元には、子の stdin も PTY にする手段が要る (今は `--stdin-eof=detach` が担っている)。統括推しは a (起動元が意図を明示する。`/dev/null` を特別扱いしない DR-0019 の裁定 (2026-10-05) と両立する)。
-
-- [ ] a: `run` に「呼び出し元の stdin を使わず、子の stdin を PTY にする」option を足す (名前は実装時に決める)
-- [ ] b: option は足さず、起動元が開いたままの pipe / FIFO を stdin に渡す
-
-### 👺STDIN-Q1γ: (α=a の時) 単独の `hyoui attach S` が非 tty の stdin を受けた時
-
-稼働中の session の子の fd 0 は後から差し替えられないので、run と同じ扱いはできない。統括推しは a (attach は覗き窓で、入力の経路を `/dev/tty` のキーと `hyoui input` に揃える。b は EOT 処理と `--stdin-eof` が attach にだけ残る)。
-
-- [ ] a: attach は非 tty の stdin を読まない (キーは `/dev/tty` から、流し込みは `hyoui input`)。読まないことを help に書く
-- [ ] b: attach だけは今どおり stdin を PTY に流し込む
-
 ### 👺WR-Q5: DR-0005 の「範囲外」(window / pane UI、session グループ) との関係
 
 DR-0005 は window / pane UI と session グループを範囲外にしているが、[DR-0039](decisions/DR-0039-webui-terminal-app-rework.md) はタブグループ / タブ / pane を gateway と browser に持たせる。統括推しは a (DR-0005 が避けたのは daemon / TUI 側を multiplexer にすることで、web の表示層が並べ方を持つのは別物。1 session = 1 daemon と TUI へのキー割り当て無しは保たれる)。

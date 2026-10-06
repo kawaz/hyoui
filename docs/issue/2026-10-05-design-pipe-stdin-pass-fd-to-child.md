@@ -3,7 +3,7 @@ title: 非 tty の stdin は子の stdin にそのまま渡す (PTY に流し込
 status: open
 category: design
 created: 2026-10-05T13:30:00+09:00
-last_read: 2026-10-06T11:40:00+09:00
+last_read: 2026-10-06T13:10:00+09:00
 open_entered: 2026-10-05T13:30:00+09:00
 wip_entered:
 blocked_entered:
@@ -18,7 +18,13 @@ blocked_by:
 
 # 非 tty の stdin は子の stdin にそのまま渡す (PTY に流し込まない) 方が直接実行と同じになる — DR-0019 §5 の見直し
 
-議論の素材 (2026-10-05)。未裁定。v0.11.0 で入れた「--detached でも非 tty の stdin を daemon が PTY に流す」(DR-0019 §5 の拡張) を見直す提案。
+議論の素材 (2026-10-05)。**裁定済み (2026-10-06、kawaz)**: STDIN-Q1 の α / β / γ とも a。
+
+- α: 呼び出し元の stdin が tty でない時はその fd を子の fd 0 にそのまま渡し、PTY は制御端末と出力にだけ使う (hyoui は bash の位置に立ち、bash と同じように fd を配線する。kawaz「難しいことは考える必要がない」)
+- β: 呼び出し元の stdin を使わず子の stdin も PTY にする指定を `run` に持つ (`tmux new -d` に当たる。kawaz「bash を継続操作で使いたいなら -i で起動すりゃ良いとかそのレベルの話」= 操作し続ける使い方は起動側が明示する)
+- γ: 単独の `hyoui attach S` は非 tty の stdin を子に流さない (bash の `fg` と同じく子の fd を差し替えない。キーは /dev/tty から、流し込みは `hyoui input`)
+
+v0.11.0 で入れた「--detached でも非 tty の stdin を daemon が PTY に流す」(DR-0019 §5 の拡張) を見直す提案。
 
 ## 発端
 
