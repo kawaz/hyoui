@@ -351,6 +351,116 @@ fn concurrent_runs_with_the_same_id_only_one_wins() {
     kill_session(root.path(), &sid);
 }
 
+/// `kill --wait` は daemon の終了 (= socket の片付け) まで見届けるので、戻った直後に同じ
+/// id で起動し直せる。
+#[test]
+fn the_same_id_can_be_reused_right_after_kill_wait() {
+    let root = SessionDir::new("hyoui-reuse-");
+    let sid = hyoui::cli::new_session_id();
+    for round in 0..3 {
+        let out = run_detached(root.path(), Some(&sid), "sleep 30");
+        assert!(out.status.success(), "round {round}: {}", text(&out.stderr));
+        let out = output(in_root(root.path(), &["kill", &sid, "--wait"]));
+        assert!(out.status.success(), "round {round}: {}", text(&out.stderr));
+        assert!(
+            text(&out.stdout).contains("daemon 終了"),
+            "{}",
+            text(&out.stdout)
+        );
+        assert!(
+            !sock_of(root.path(), &sid).exists(),
+            "round {round}: the socket is gone when kill --wait returns"
+        );
+    }
+}
+
+/// daemon が socket を片付けずに終わった (= SIGKILL) 時、`kill --wait` は子の終了を
+/// 見届けても exit 1 で、片付けの経路を案内する。
+#[test]
+fn kill_wait_reports_a_socket_left_by_a_daemon_that_died() {
+    let root = SessionDir::new("hyoui-killdie-");
+    let sid = hyoui::cli::new_session_id();
+    assert!(
+        run_detached(root.path(), Some(&sid), "sleep 30")
+            .status
+            .success()
+    );
+    let (daemon, child) = pids(root.path(), &sid);
+    // kill --wait が子の終了通知を待っている間に daemon を SIGKILL する。子は SIGTERM を
+    // 無視しないので、daemon が先に死ねば client は EOF を「子 exit」として受ける。
+    let mut c = in_root(root.path(), &["kill", &sid, "--wait", "--signal=STOP"]);
+    c.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let waiting = c.spawn().expect("spawn kill --wait");
+    // daemon は STOP を子に送るだけで session は続く。client が KillAck 後の待ちに入った
+    // ことは daemon の client 数で観測する。
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let st = output(in_root(root.path(), &["status", &sid]));
+        if text(&st.stdout).matches("id=").count() >= 2 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "kill --wait never connected");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    kill(Pid::from_raw(daemon), Signal::SIGKILL).expect("kill daemon");
+    let _ = kill(Pid::from_raw(child), Signal::SIGKILL);
+    let out = waiting.wait_with_output().expect("wait kill");
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("片付けずに終わりました"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(sock_of(root.path(), &sid).exists());
+}
+
+/// 古い版が namespace `sessions` として置いた UUID でない socket は、一覧・index 解決・
+/// `kill --all` のどれにも混ざらず、file 単位で古い置き場として警告される。
+#[test]
+fn non_uuid_sockets_in_sessions_are_left_alone() {
+    let root = SessionDir::new("hyoui-nonuuid-");
+    let sid = hyoui::cli::new_session_id();
+    assert!(
+        run_detached(root.path(), Some(&sid), "sleep 30")
+            .status
+            .success()
+    );
+    let legacy = root.path().join("sessions").join("legacy.sock");
+    let out = output(in_root(
+        root.path(),
+        &[
+            "run",
+            "--detached",
+            "--pty-stdin",
+            &format!("--socket={}", legacy.display()),
+            "--",
+            "sleep",
+            "30",
+        ],
+    ));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+
+    let (ids, stderr) = list_ids(root.path());
+    assert_eq!(ids, [sid.as_str()]);
+    assert!(
+        stderr.contains(&legacy.display().to_string()) && stderr.contains("not a UUID"),
+        "{stderr}"
+    );
+    let out = output(in_root(root.path(), &["status", "--index=1"]));
+    assert!(text(&out.stdout).contains(&sid), "{}", text(&out.stdout));
+    let out = output(in_root(
+        root.path(),
+        &["kill", "--all", "--signal=KILL", "--wait"],
+    ));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("1/1"), "{}", text(&out.stderr));
+    assert!(
+        legacy.exists(),
+        "kill --all must not reach the non-UUID socket"
+    );
+    kill_session(root.path(), &format!("--socket={}", legacy.display()));
+}
+
 // ── 決定 4: socket は sessions/ にフラット、discovery は sessions/ だけ ──────
 
 /// root 直下や古い namespace の dir にある socket は一覧に出ず、古い置き場として警告される。

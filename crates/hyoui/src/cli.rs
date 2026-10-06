@@ -5686,8 +5686,11 @@ fn usage_kill() -> String {
             \x20                              (= stopped child を CONT で起こす等)\n    \
             [wait 軸]       既定 (即時)  : signal 送信受理で即 return (= `kill(1)` と同じ。\n    \
             \x20                              子が 1 発で死なない app でも無応答にならない)\n    \
-            \x20               --wait        : 子 exit + session 終了を見届けてから return\n    \
-            \x20                              (= 既定 timeout 10s。超過で exit 3 = エラー、子は生存)\n    \
+            \x20               --wait        : 子 exit + session 終了 + daemon 終了 (= socket の\n    \
+            \x20                              片付け) を見届けてから return (= 戻った直後に同じ id\n    \
+            \x20                              で run できる。子の終了後 daemon は遅れて来る attach\n    \
+            \x20                              のため約 2 秒残るので、その分も待つ)\n    \
+            \x20                              (= 子の終了の既定 timeout 10s。超過で exit 3 = エラー、子は生存)\n    \
             \x20               --wait=DUR    : timeout を明示 (= 既存 DUR 形式)\n    \
             \x20               --kill-on-timeout : timeout 後 SIGKILL 昇格して見届け (= 確実に殺す)\n\
         \n\
@@ -5696,9 +5699,14 @@ fn usage_kill() -> String {
             --index N       session selector index (= mtime 昇順、1 最古 / -1 最新)\n    \
             --all           全 live session を順次 kill (= killall 相当)\n    \
             --signal SPEC   送信 signal (= default SIGTERM)。数字 / 略名 / SIG-prefix 大文字 OK\n    \
-            --wait[=DUR]    子 exit + session 終了まで見届けて return。\n    \
-            \x20               裸 --wait は既定 timeout 10s、--wait=DUR で指定 (= 既存 DUR 形式)。\n    \
-            \x20               timeout 超過は exit 3 (= エラー、子は生かす)。\n    \
+            --wait[=DUR]    子 exit + session 終了 + daemon 終了 (= socket の片付け) まで\n    \
+            \x20               見届けて return。\n    \
+            \x20               裸 --wait は子の終了の既定 timeout 10s、--wait=DUR で指定 (= 既存 DUR 形式)。\n    \
+            \x20               timeout 超過は exit 3 (= エラー、子は生かす)。子の終了後、daemon の\n    \
+            \x20               終了は別に最大 10s 待ち、超えれば exit 3 (= socket が残っている)。\n    \
+            \x20               daemon が socket を片付けずに終わった (= 異常終了) 時は exit 1\n    \
+            \x20               (= 同じ id で起動し直す前に `hyoui list` で片付ける)。daemon が\n    \
+            \x20               name lock を持たない時は daemon の終了を見届けず、stderr に言って exit 0\n    \
             \x20               既定 (= 省略時) は signal 送信受理で即 return。`--no-terminate` 不可\n    \
             --kill-on-timeout  --wait の timeout 超過時に SIGKILL 昇格して見届ける\n    \
             \x20               (= 確実に殺す)。`--wait` と併用必須\n    \
@@ -5724,10 +5732,11 @@ fn usage_kill() -> String {
             `-` で始まる session-id は `--` セパレータで escape (e.g. `kill -- -foo`)\n\
         \n\
         EXIT CODE:\n    \
-            0   既定: signal 送信受理を確認 / --wait: session 終了を見届けた\n    \
-            1   connect / send 失敗 / daemon が reject\n    \
+            0   既定: signal 送信受理を確認 / --wait: session と daemon の終了を見届けた\n    \
+            1   connect / send 失敗 / daemon が reject / --wait: daemon が socket を残して終わった\n    \
             2   引数不足 / 排他違反\n    \
-            3   --wait の timeout 超過 (= 子が終了せず、子は生存。--kill-on-timeout で SIGKILL 昇格可)\n\
+            3   --wait の timeout 超過 (= 子が終了せず、子は生存。--kill-on-timeout で SIGKILL 昇格可。\n    \
+            \x20   または子は終わったが daemon が上限までに終わらない)\n\
         \n\
         EXAMPLES:\n    \
             hyoui kill demo                          # session_id=demo に SIGTERM (= 即時 return)\n    \

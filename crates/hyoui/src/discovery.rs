@@ -99,95 +99,183 @@ pub fn sessions_dir() -> Option<PathBuf> {
     crate::paths::Env::current().sessions_dir().ok()
 }
 
-/// 古い置き場 (DR-0041 決定 7) に残っている session の socket の dir。
+/// `sessions/` の中の socket の名前から session id を取る。UUID の標準形でなければ
+/// `None` (= session として扱わない、DR-0041 決定 2)。
 ///
-/// 新しいバイナリは `sessions/` だけを読む。ここで見るのは警告のためだけで、中の
-/// socket は session として拾わない (= 古い daemon とは id の形も置き場も違う)。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LegacySessionPlace {
-    /// socket が残っている dir (= 状態の root 直下か、その下の古い namespace の dir)。
-    pub dir: PathBuf,
-    /// その dir に残っている socket の数。
-    pub sockets: usize,
-    /// dir 自体が symlink か (= 古いバイナリのために残した symlink)。
-    pub symlink: bool,
+/// `sessions/` には古い版が namespace `sessions` として置いた UUID でない socket が
+/// 混ざりうる (古い版は `<root>/<ns>/` を namespace とみなすため)。一覧・index 解決・
+/// `kill --all` が同じ規則で拾うよう、走査はすべてこの関数を通す。
+#[must_use]
+pub fn session_id_of(path: &Path) -> Option<String> {
+    if path.extension().and_then(|s| s.to_str()) != Some("sock") {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    crate::cli::validate_session_id(stem).ok()?;
+    Some(stem.to_string())
 }
 
-/// 古い置き場に socket が残っていないかを見る (DR-0041 決定 7)。
+/// 古い置き場 (DR-0041 決定 7) に残っているもの。警告のためだけに見て、session と
+/// しては拾わない (= 古い daemon とは id の形も置き場も違う)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacySessionPlace {
+    /// 古い置き場の dir (状態の root 直下、その下の古い namespace の dir、旧版の
+    /// runtime dir) に残っている socket の数。
+    Sockets {
+        /// socket が残っている dir。
+        dir: PathBuf,
+        /// その dir に残っている socket の数。
+        count: usize,
+    },
+    /// `sessions/` の中にある、id が UUID でない socket (= 古い版が namespace
+    /// `sessions` として置いたもの)。同じ dir に新しい session と混ざるので file 単位。
+    NonUuidSocket {
+        /// socket の path。
+        path: PathBuf,
+    },
+    /// 古いバイナリのために残した symlink。指す先の socket の数に関わらず残っている
+    /// こと自体を言う (DR-0041 決定 7 (3))。
+    Symlink {
+        /// symlink の path。
+        path: PathBuf,
+    },
+}
+
+fn is_symlink(path: &Path) -> bool {
+    path.symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// `dir` の直下の `*.sock` (socket) を数え、`*.sock` の symlink は [`LegacySessionPlace::Symlink`]
+/// として `places` に足す。
+fn sockets_in(dir: &Path, places: &mut Vec<LegacySessionPlace>) -> usize {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut entries: Vec<PathBuf> = read
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("sock"))
+        .collect();
+    entries.sort();
+    let mut count = 0;
+    for path in entries {
+        match path.symlink_metadata() {
+            Ok(m) if m.file_type().is_symlink() => {
+                places.push(LegacySessionPlace::Symlink { path });
+            }
+            Ok(m) if m.file_type().is_socket() => count += 1,
+            _ => {}
+        }
+    }
+    count
+}
+
+/// 古い置き場の base (= 古い版が session socket を置いていた dir) を見る。
 ///
-/// 見るのは状態の root 直下の `*.sock` と、root 直下の dir (機能別の `sessions/` /
-/// `web/` を除く) の直下の `*.sock`。どちらも新しいバイナリが session を置かない
-/// 場所なので、在れば古いバイナリの session か、移行で残した symlink である。
-#[must_use]
-pub fn legacy_session_places(env: &crate::paths::Env) -> Vec<LegacySessionPlace> {
-    let Ok(root) = env.state_root() else {
-        return Vec::new();
-    };
-    let mut places = Vec::new();
-    let count = |dir: &Path| {
-        std::fs::read_dir(dir)
-            .map(|read| {
-                read.flatten()
-                    .filter(|e| {
-                        e.path().extension().and_then(|x| x.to_str()) == Some("sock")
-                            && e.file_type().is_ok_and(|t| t.is_socket() || t.is_symlink())
-                    })
-                    .count()
-            })
-            .unwrap_or(0)
-    };
-    let in_root = count(&root);
-    if in_root > 0 {
-        places.push(LegacySessionPlace {
-            dir: root.clone(),
-            sockets: in_root,
-            symlink: false,
+/// base 直下の `*.sock` と、`skip` 以外の直下の dir の `*.sock` を数える。dir が symlink
+/// なら socket の数に関わらず symlink として言う。
+fn scan_legacy_base(base: &Path, skip: &[&str], places: &mut Vec<LegacySessionPlace>) {
+    if is_symlink(base) {
+        places.push(LegacySessionPlace::Symlink {
+            path: base.to_path_buf(),
+        });
+        return;
+    }
+    let count = sockets_in(base, places);
+    if count > 0 {
+        places.push(LegacySessionPlace::Sockets {
+            dir: base.to_path_buf(),
+            count,
         });
     }
-    let Ok(read) = std::fs::read_dir(&root) else {
-        return places;
+    let Ok(read) = std::fs::read_dir(base) else {
+        return;
     };
     let mut dirs: Vec<PathBuf> = read
         .flatten()
-        .filter(|e| !matches!(e.file_name().to_str(), Some("sessions" | "web")))
+        .filter(|e| !e.file_name().to_str().is_some_and(|n| skip.contains(&n)))
         .map(|e| e.path())
         .filter(|p| p.is_dir())
         .collect();
     dirs.sort();
     for dir in dirs {
-        let sockets = count(&dir);
-        if sockets > 0 {
-            let symlink = dir
-                .symlink_metadata()
-                .is_ok_and(|m| m.file_type().is_symlink());
-            places.push(LegacySessionPlace {
-                dir,
-                sockets,
-                symlink,
-            });
+        if is_symlink(&dir) {
+            places.push(LegacySessionPlace::Symlink { path: dir });
+            continue;
+        }
+        let count = sockets_in(&dir, places);
+        if count > 0 {
+            places.push(LegacySessionPlace::Sockets { dir, count });
+        }
+    }
+}
+
+/// 古い置き場に残っているものを見る (DR-0041 決定 7)。
+///
+/// - 状態の root 直下の `*.sock` と、root 直下の dir (機能別の `sessions/` / `web/` を
+///   除く) の `*.sock`。新しいバイナリが session を置かない場所
+/// - `sessions/` の中の、id が UUID でない `*.sock` (file 単位)
+/// - 旧版の runtime dir `<runtime_dir>/hyoui` (`runtime_dir` は呼び出し側が渡す
+///   `$XDG_RUNTIME_DIR`)。旧版は `$XDG_RUNTIME_DIR` が実在すると socket をそこに
+///   置いていた。新しいバイナリは runtime dir を読み書きしないので、全部が古い置き場
+/// - 上のどこかに残っている symlink (socket の数に関わらない)
+///
+/// `$XDG_RUNTIME_DIR` を [`crate::paths::Env`] に入れないのは、場所の導出に効く変数
+/// ではない (= `service register` が定義に固定する一覧に入れない) ため。
+#[must_use]
+pub fn legacy_session_places(
+    env: &crate::paths::Env,
+    runtime_dir: Option<&Path>,
+) -> Vec<LegacySessionPlace> {
+    let mut places = Vec::new();
+    if let Ok(root) = env.state_root() {
+        scan_legacy_base(&root, &["sessions", "web"], &mut places);
+        let sessions = root.join("sessions");
+        if let Ok(read) = std::fs::read_dir(&sessions) {
+            let mut paths: Vec<PathBuf> = read
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("sock"))
+                .filter(|p| session_id_of(p).is_none())
+                .collect();
+            paths.sort();
+            places.extend(
+                paths
+                    .into_iter()
+                    .map(|path| LegacySessionPlace::NonUuidSocket { path }),
+            );
+        }
+    }
+    if let Some(runtime) = runtime_dir.filter(|d| !d.as_os_str().is_empty()) {
+        let base = runtime.join("hyoui");
+        if base.symlink_metadata().is_ok() {
+            scan_legacy_base(&base, &[], &mut places);
         }
     }
     places
 }
 
-/// [`legacy_session_places`] の警告文 (stderr に出す 1 行ずつ)。
+/// 今の process の env で [`legacy_session_places`] を見て、警告文 (stderr に出す 1 行
+/// ずつ) にする。
 #[must_use]
 pub fn legacy_session_warnings(env: &crate::paths::Env) -> Vec<String> {
-    legacy_session_places(env)
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    legacy_session_places(env, runtime.as_deref())
         .into_iter()
-        .map(|place| {
-            if place.symlink {
-                format!(
-                    "{} is a symlink left for older hyoui binaries; remove it once none of them run (DR-0041)",
-                    place.dir.display()
-                )
-            } else {
-                format!(
-                    "{} has {} session socket(s) in the old layout; this hyoui does not read them (sessions now live in <state root>/sessions). Operate them with the older hyoui, or let them finish (DR-0041)",
-                    place.dir.display(),
-                    place.sockets
-                )
-            }
+        .map(|place| match place {
+            LegacySessionPlace::Symlink { path } => format!(
+                "{} is a symlink left for older hyoui binaries; remove it once none of them run (DR-0041)",
+                path.display()
+            ),
+            LegacySessionPlace::Sockets { dir, count } => format!(
+                "{} has {count} session socket(s) in the old layout; this hyoui does not read them (sessions now live in <state root>/sessions). Operate them with the older hyoui, or let them finish (DR-0041)",
+                dir.display()
+            ),
+            LegacySessionPlace::NonUuidSocket { path } => format!(
+                "{} is a session socket whose id is not a UUID (left by an older hyoui); this hyoui does not read it. Operate it with the older hyoui, or let it finish (DR-0041)",
+                path.display()
+            ),
         })
         .collect()
 }
@@ -427,7 +515,8 @@ fn collect_socks_in_dir(dir: &Path, out: &mut Vec<SessionEntry>) {
     };
     for entry in read.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("sock") {
+        // UUID でない socket (= 古い版が置いたもの) は session として拾わない。
+        if session_id_of(&path).is_none() {
             continue;
         }
         if let Some(e) = socket_entry(path) {
@@ -697,13 +786,13 @@ mod tests {
     fn legacy_places_are_the_root_and_old_namespace_dirs() {
         let root = private_dir();
         let env = env_at(root.path());
-        assert!(legacy_session_places(&env).is_empty());
+        assert!(legacy_session_places(&env, None).is_empty());
 
         let _s = idle_listener(&root.path().join("sessions").join(format!("{TARGET}.sock")));
         let _w = idle_listener(&root.path().join("web").join("run").join("supervisor.sock"));
         let _w2 = idle_listener(&root.path().join("web").join("x.sock"));
         assert!(
-            legacy_session_places(&env).is_empty(),
+            legacy_session_places(&env, None).is_empty(),
             "sessions/ と web/ は古い置き場ではない"
         );
 
@@ -714,28 +803,24 @@ mod tests {
         let _d = idle_listener(&real.join("x.sock"));
         std::os::unix::fs::symlink(&real, root.path().join("linked")).unwrap();
 
-        let places = legacy_session_places(&env);
-        let got: Vec<(String, usize, bool)> = places
+        let rel = |p: &Path| p.strip_prefix(root.path()).unwrap().display().to_string();
+        let got: Vec<String> = legacy_session_places(&env, None)
             .iter()
-            .map(|p| {
-                (
-                    p.dir
-                        .strip_prefix(root.path())
-                        .unwrap()
-                        .display()
-                        .to_string(),
-                    p.sockets,
-                    p.symlink,
-                )
+            .map(|p| match p {
+                LegacySessionPlace::Sockets { dir, count } => {
+                    format!("sockets {} {count}", rel(dir))
+                }
+                LegacySessionPlace::Symlink { path } => format!("symlink {}", rel(path)),
+                LegacySessionPlace::NonUuidSocket { path } => format!("non-uuid {}", rel(path)),
             })
             .collect();
         assert_eq!(
             got,
             [
-                (String::new(), 1, false),
-                ("linked".to_string(), 1, true),
-                ("real-ns".to_string(), 1, false),
-                ("workers".to_string(), 2, false),
+                "sockets  1",
+                "symlink linked",
+                "sockets real-ns 1",
+                "sockets workers 2",
             ]
         );
         let warnings = legacy_session_warnings(&env);
@@ -746,6 +831,179 @@ mod tests {
             warnings[0]
         );
         assert!(warnings[1].contains("symlink"), "{}", warnings[1]);
+    }
+
+    /// 古い版が namespace `sessions` として `sessions/` に置いた UUID でない socket は、
+    /// 一覧にも 1 件の解決にも出さず、file 単位で古い置き場として言う (DR-0041 決定 2 / 7)。
+    #[test]
+    fn non_uuid_sockets_in_sessions_are_not_sessions_but_legacy() {
+        let root = private_dir();
+        let env = env_at(root.path());
+        let sessions = root.path().join("sessions");
+        let legacy = idle_listener(&sessions.join("legacy.sock"));
+        let upper = idle_listener(&sessions.join(format!("{}.sock", OTHER.to_ascii_uppercase())));
+        let live = sessions.join(format!("{TARGET}.sock"));
+        let worker = closing_listener(&live);
+
+        let listed = list_sessions_in(&sessions);
+        worker.join().unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|e| e.session_id.as_str())
+                .collect::<Vec<_>>(),
+            [TARGET]
+        );
+        assert_untouched(&legacy, "UUID でない socket");
+        assert_untouched(&upper, "大文字の UUID の socket");
+        assert_eq!(session_id_of(&sessions.join("legacy.sock")), None);
+        assert_eq!(
+            session_id_of(&sessions.join(format!("{TARGET}.sock"))).as_deref(),
+            Some(TARGET)
+        );
+
+        let places = legacy_session_places(&env, None);
+        assert_eq!(
+            places,
+            [
+                LegacySessionPlace::NonUuidSocket {
+                    path: sessions.join(format!("{}.sock", OTHER.to_ascii_uppercase()))
+                },
+                LegacySessionPlace::NonUuidSocket {
+                    path: sessions.join("legacy.sock")
+                },
+            ]
+        );
+        let warnings = legacy_session_warnings(&env);
+        assert!(
+            warnings.iter().all(|w| w.contains("not a UUID")),
+            "{warnings:?}"
+        );
+    }
+
+    /// 旧版の runtime dir (`$XDG_RUNTIME_DIR/hyoui`) に残った socket と symlink も古い置き場
+    /// (DR-0041 決定 7)。新しいバイナリは runtime dir を session として読まない。
+    #[test]
+    fn the_old_runtime_dir_is_a_legacy_place() {
+        let root = private_dir();
+        let env = env_at(root.path());
+        let runtime = private_dir();
+        let base = runtime.path().join("hyoui");
+        assert!(
+            legacy_session_places(&env, Some(runtime.path())).is_empty(),
+            "no base, nothing"
+        );
+
+        let _a = idle_listener(&base.join("run-1-abcd.sock"));
+        let _b = idle_listener(&base.join("sessions").join("x.sock"));
+        let places = legacy_session_places(&env, Some(runtime.path()));
+        assert_eq!(
+            places,
+            [
+                LegacySessionPlace::Sockets {
+                    dir: base.clone(),
+                    count: 1
+                },
+                LegacySessionPlace::Sockets {
+                    dir: base.join("sessions"),
+                    count: 1
+                },
+            ],
+            "every dir of the runtime base is old, sessions/ included"
+        );
+        assert!(legacy_session_places(&env, Some(Path::new(""))).is_empty());
+    }
+
+    /// 古い置き場の symlink は、指す先に socket が 1 つも無くても言う (DR-0041 決定 7 (3))。
+    #[test]
+    fn a_legacy_symlink_is_reported_even_without_sockets() {
+        let root = private_dir();
+        let env = env_at(root.path());
+        let empty = root.path().join("empty-ns");
+        std::fs::create_dir(&empty).unwrap();
+        std::os::unix::fs::symlink(&empty, root.path().join("linked")).unwrap();
+        let elsewhere = private_dir();
+        std::os::unix::fs::symlink(
+            elsewhere.path().join("gone.sock"),
+            root.path().join("dangling.sock"),
+        )
+        .unwrap();
+        let runtime = private_dir();
+        std::os::unix::fs::symlink(&empty, runtime.path().join("hyoui")).unwrap();
+
+        let places = legacy_session_places(&env, Some(runtime.path()));
+        assert_eq!(
+            places,
+            [
+                LegacySessionPlace::Symlink {
+                    path: root.path().join("dangling.sock")
+                },
+                LegacySessionPlace::Symlink {
+                    path: root.path().join("linked")
+                },
+                LegacySessionPlace::Symlink {
+                    path: runtime.path().join("hyoui")
+                },
+            ]
+        );
+    }
+
+    /// lock を持たない生きた socket と同じ id の listen が失敗しても、その socket は
+    /// 接続が拒否される瞬間 (backlog 飽和) に片付けの経路から消されない。失敗した listen
+    /// は自分の作った lock を残さないので、lock の無い socket は Stale に留まる。
+    #[test]
+    fn a_failed_listen_does_not_let_list_remove_a_live_lockless_socket() {
+        use nix::sys::socket::{AddressFamily, Backlog, SockFlag, SockType, UnixAddr};
+        let dir = private_dir();
+        let path = dir.path().join(format!("{TARGET}.sock"));
+        // lock を持たない生きた listener (backlog を小さくして飽和させやすくする)。
+        let listener = nix::sys::socket::socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+        let addr = UnixAddr::new(path.as_path()).unwrap();
+        nix::sys::socket::bind(std::os::fd::AsRawFd::as_raw_fd(&listener), &addr).unwrap();
+        nix::sys::socket::listen(&listener, Backlog::new(1).unwrap()).unwrap();
+
+        let err = crate::sys::UnixSock::listen(&path).expect_err("same path must fail");
+        assert!(matches!(err, crate::sys::Error::SocketExists(_)), "{err:?}");
+        assert!(
+            !path.with_extension("lock").exists(),
+            "the failed listen must not leave a lock behind"
+        );
+
+        let mut connections = Vec::new();
+        let mut saturated = false;
+        for _ in 0..32 {
+            match crate::sys::socket::connect_no_wait(&path) {
+                Ok(fd) => connections.push(fd),
+                Err(crate::sys::Error::Errno(
+                    nix::errno::Errno::ECONNREFUSED | nix::errno::Errno::EAGAIN,
+                )) => {
+                    saturated = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected connect error: {e}"),
+            }
+        }
+        assert!(saturated, "backlog must saturate within 32 connections");
+        let result = query_status(&path);
+        assert!(
+            !matches!(result, StatusQueryResult::Gone),
+            "a live socket must not be pruned: {result:?}"
+        );
+        assert!(path.exists(), "the live socket must stay");
+        assert!(
+            list_sessions_in(dir.path())
+                .iter()
+                .any(|e| e.session_id == TARGET)
+        );
+        assert!(path.exists(), "list must not remove the live socket either");
+        drop(connections);
+        drop(listener);
     }
 
     #[test]

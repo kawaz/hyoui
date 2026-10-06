@@ -238,13 +238,16 @@ impl UnixSock {
                 if bound {
                     let _ = nix::unistd::unlink(&path);
                 }
-                // 自分が作った lock file だけを消す。先にあった lock file (= 死んだ
-                // daemon のもの) と、既にある socket の隣に作った lock file は残す:
+                // 自分が作った lock file は必ず消す (flock と dir lock を持ったまま)。
                 // 片付けの経路 (discovery の prune) は「lock が在って誰も持っていない」
-                // ことで socket を死んだと判断するので、消すと片付けられなくなる。
-                if !lock_existed && path.symlink_metadata().is_err() {
+                // ことを socket の持ち主が死んだ根拠にするので、socket を作っていない者が
+                // 作った lock を残すと、lock を持たない生きた daemon の socket (= 接続が
+                // 拒否される瞬間がある) を死んだと誤って消させてしまう。先にあった lock
+                // file (= その socket を作った daemon のもの) は残す。
+                if !lock_existed {
                     let _ = nix::unistd::unlink(&lock_path);
                 }
+                drop(lock);
                 return Err(match e {
                     Error::Errno(nix::errno::Errno::EADDRINUSE) => Error::SocketExists(path),
                     other => other,
@@ -654,17 +657,17 @@ mod tests {
         assert!(!name_lock_is_held_elsewhere(&lock_path));
     }
 
-    /// lock file の無い残骸 socket に当たった時も消さずに失敗し、片付けの経路が判断
-    /// できるよう lock file を残す。
+    /// lock file の無い socket に当たった時も消さずに失敗し、自分が作った lock file は
+    /// 残さない (= lock を持たない生きた daemon を、片付けの経路に死んだと読ませない)。
     #[test]
-    fn listen_on_a_lockless_socket_fails_and_leaves_a_lock_file() {
+    fn listen_on_a_lockless_socket_fails_without_leaving_a_lock_file() {
         let dir = make_0700_dir();
         let path = dir.path().join("orphan.sock");
         drop(std::os::unix::net::UnixListener::bind(&path).expect("leave an orphan socket"));
         let err = UnixSock::listen(&path).expect_err("must fail on the orphan socket");
         assert!(matches!(err, Error::SocketExists(_)), "err: {err:?}");
         assert!(path.exists());
-        assert!(path.with_extension("lock").exists());
+        assert!(!path.with_extension("lock").exists());
     }
 
     /// bind が重複以外の理由で失敗した時、自分が作った lock file は残さない。

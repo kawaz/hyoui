@@ -825,17 +825,14 @@ fn resolve_session_by_index(index: i32) -> Result<String, String> {
         };
         for entry in read.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("sock") {
+            // UUID でない socket (= 古い版が置いたもの) は session として拾わない
+            // (DR-0041 決定 2、一覧と同じ規則)。
+            let Some(session) = hyoui::discovery::session_id_of(&path) else {
                 continue;
-            }
+            };
             if !probe_socket_liveness(&path) {
                 continue;
             }
-            let session = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("?")
-                .to_string();
             let mtime = std::fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
@@ -1383,14 +1380,11 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<std::path::PathBuf>) -> Exi
         };
         for entry in read_entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("sock") {
+            // UUID でない socket (= 古い版が置いたもの) は session として拾わず、
+            // 古い置き場の警告に回す (DR-0041 決定 2 / 7)。
+            let Some(session) = hyoui::discovery::session_id_of(&path) else {
                 continue;
-            }
-            let session = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("?")
-                .to_string();
+            };
             let (started_unix_ms, dur) = match std::fs::metadata(&path).and_then(|m| m.modified()) {
                 Ok(mtime) => {
                     let started_ms = mtime
@@ -1739,17 +1733,14 @@ fn list_all_live_sessions() -> Vec<String> {
         };
         for entry in read.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("sock") {
+            // UUID でない socket (= 古い版が置いたもの) は session として拾わない
+            // (DR-0041 決定 2、一覧と同じ規則)。
+            let Some(session) = hyoui::discovery::session_id_of(&path) else {
                 continue;
-            }
+            };
             if !probe_socket_liveness(&path) {
                 continue;
             }
-            let session = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("?")
-                .to_string();
             let mtime = std::fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
@@ -1881,6 +1872,9 @@ fn kill_command_single(cfg: KillConfig) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // `--wait` は daemon の終了 (= socket の片付け) まで見届ける。daemon は終わる時に
+    // name lock (`<id>.lock`) を消すので、消される前 (= kill を送る前) に開いておく。
+    let daemon_watch = cfg.wait.then(|| DaemonExitWatch::open(&sock));
 
     // DR-0017 §柱2: `--no-terminate` 指定時は session を畳まず signal だけ送る
     // (= `ControlMessage::Signal` 経路、stopped child を CONT で起こす用途等)。
@@ -2014,11 +2008,108 @@ fn kill_command_single(cfg: KillConfig) -> ExitCode {
         }
     }
     drop(conn);
+    // 子の終了を見届けた後も、daemon は遅れて来る attach のために少し残る (linger)。
+    // その間は socket が在り、同じ id の run は「既にある」で失敗するので (DR-0041
+    // 決定 3)、daemon の終了まで待ってから戻る。
+    match daemon_watch.map(|watch| watch.wait(DAEMON_EXIT_BUDGET)) {
+        Some(DaemonExit::Clean) => {}
+        Some(DaemonExit::Unobservable) => {
+            eprintln!(
+                "hyoui: kill --wait: daemon の name lock が無いので daemon の終了は見届けていません (子と session の終了は見届けた): {}",
+                sock.display()
+            );
+        }
+        Some(DaemonExit::SocketLeftBehind) => {
+            eprintln!(
+                "hyoui: kill --wait: 子と session は終わりましたが、daemon が socket を片付けずに終わりました (異常終了)。\n\
+                 \x20      同じ id で起動し直す前に `hyoui list` で片付けてください: {}",
+                sock.display()
+            );
+            return ExitCode::from(1);
+        }
+        Some(DaemonExit::TimedOut) => {
+            eprintln!(
+                "hyoui: kill --wait: 子と session は終わりましたが、daemon が {}s 以内に終わりませんでした (socket が残っています): {}",
+                DAEMON_EXIT_BUDGET.as_secs(),
+                sock.display()
+            );
+            return ExitCode::from(3);
+        }
+        None => {}
+    }
     println!(
-        "hyoui: kill 完了 (子 exit + session 終了を見届け): {}",
+        "hyoui: kill 完了 (子 exit + session 終了 + daemon 終了を見届け): {}",
         sock.display()
     );
     ExitCode::SUCCESS
+}
+
+/// 子の終了を見届けた後、daemon の終了を待つ上限 (= late attach の linger 2 秒に余裕を
+/// 足した値。子の終了を待つ `--wait` の timeout とは別に数える)。
+const DAEMON_EXIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `kill --wait` が daemon の終了を見届けるための name lock の監視。
+///
+/// daemon は生きている間 `<id>.lock` に flock を持ち、終わる時に socket と lock を
+/// unlink してから離す。kill を送る前に lock を開いておき、後で blocking の flock が
+/// 取れた瞬間 = daemon が lock を離した瞬間を、ポーリングせずに受け取る。
+struct DaemonExitWatch {
+    sock: std::path::PathBuf,
+    /// kill を送る前の socket の inode (= 待っている間に同じ id で起動し直された別の
+    /// socket を、片付け残りと取り違えない)。
+    sock_ino: Option<u64>,
+    lock: Option<std::fs::File>,
+}
+
+/// [`DaemonExitWatch::wait`] の結果。
+enum DaemonExit {
+    /// daemon が終わり、socket も消えた。
+    Clean,
+    /// name lock が無く daemon の終了を観測できない (= lock を持たない daemon)。
+    Unobservable,
+    /// daemon は lock を離したが socket が残っている (= Drop を通らずに終わった)。
+    SocketLeftBehind,
+    /// 上限までに daemon が lock を離さなかった。
+    TimedOut,
+}
+
+impl DaemonExitWatch {
+    fn open(sock: &std::path::Path) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            sock: sock.to_path_buf(),
+            sock_ino: std::fs::symlink_metadata(sock).ok().map(|m| m.ino()),
+            lock: std::fs::File::open(sock.with_extension("lock")).ok(),
+        }
+    }
+
+    fn wait(self, budget: std::time::Duration) -> DaemonExit {
+        use std::os::unix::fs::MetadataExt;
+        let Some(lock) = self.lock else {
+            return DaemonExit::Unobservable;
+        };
+        // blocking flock は timeout を持たないので別 thread で待ち、結果を期限付きで受ける。
+        // 期限切れの時は thread を残したまま戻る (= この process はすぐ終わる)。
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let held = nix::fcntl::Flock::lock(lock, nix::fcntl::FlockArg::LockExclusive);
+            let _ = tx.send(held.is_ok());
+        });
+        match rx.recv_timeout(budget) {
+            Ok(true) => {}
+            Ok(false) => return DaemonExit::Unobservable,
+            Err(_) => return DaemonExit::TimedOut,
+        }
+        let still_there = std::fs::symlink_metadata(&self.sock)
+            .ok()
+            .map(|m| m.ino())
+            .is_some_and(|ino| Some(ino) == self.sock_ino);
+        if still_there {
+            DaemonExit::SocketLeftBehind
+        } else {
+            DaemonExit::Clean
+        }
+    }
 }
 
 /// `recv_control` の `Error` が read timeout 由来 (= WouldBlock / TimedOut) か。
@@ -4742,7 +4833,9 @@ mod tests {
 
         // stale socket: bind して即 close、file だけ残す。std の UnixListener::drop は
         // unlink しないので file 残留 (= まさに daemon panic 後の状態)。
-        let stale_path = sock_dir.path().join("stale-sess.sock");
+        let stale_path = sock_dir
+            .path()
+            .join("0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f.sock");
         {
             let _l = UnixListener::bind(&stale_path).expect("bind stale");
         }
@@ -4750,9 +4843,11 @@ mod tests {
         std::fs::File::create(stale_path.with_extension("lock")).expect("stale daemon lock");
 
         // live socket: **本物の hyoui daemon を起動** する。
-        let live_path = sock_dir.path().join("live-sess.sock");
+        let live_path = sock_dir
+            .path()
+            .join("5c9d0e1f-2a3b-4c4d-8e5f-6a7b8c9d0e1f.sock");
         let mut cfg_live = DaemonConfig::new(
-            "live-sess",
+            "5c9d0e1f-2a3b-4c4d-8e5f-6a7b8c9d0e1f",
             live_path.clone(),
             vec!["/bin/sleep".into(), "30".into()],
         );
@@ -4787,7 +4882,7 @@ mod tests {
     #[test]
     fn list_preserves_regular_file() {
         let dir = make_0700_dir();
-        let path = dir.path().join("ordinary.sock");
+        let path = dir.path().join("0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f.sock");
         std::fs::write(&path, b"not a socket").unwrap();
         let _ = list_command_with_dirs(ListConfig::default(), vec![dir.path().to_path_buf()]);
         assert!(path.exists());

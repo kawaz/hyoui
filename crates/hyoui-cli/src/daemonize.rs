@@ -647,7 +647,9 @@ fn session_exists_message(session_id: &str, socket: &std::path::Path) -> String 
         "hyoui: run: session id {session_id} の socket が既にあるため起動しません ({})\n\
          \x20      別の id で起動するか (--session-id を外すと hyoui が振ります)、その session を\n\
          \x20      片付けてから再実行してください: 動いていれば `hyoui kill {session_id}`、\n\
-         \x20      daemon が死んで socket だけ残っていれば `hyoui list` が片付けます。",
+         \x20      daemon が死んで socket だけ残っていれば `hyoui list` が片付けます\n\
+         \x20      (`hyoui list` が stale と表示して残す socket は、daemon が居ないことを\n\
+         \x20      確かめてから手で消してください)。",
         socket.display()
     )
 }
