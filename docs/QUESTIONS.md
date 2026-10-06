@@ -18,6 +18,13 @@
 
 ## 裁定待ち
 
+### 👺STDIN-Q1: 非 tty の stdin を子にどう渡すか
+
+[issue](issue/2026-10-05-design-pipe-stdin-pass-fd-to-child.md)。`claude <<<X` が hyoui 経由だと送信されない件の根っこ。今は呼び出し元の pipe の中身を daemon が PTY にキー入力として流しており、子から見ると「stdin が tty」になって直接実行と環境が変わる。統括推しは a (直接実行と同じ環境になる = 透過。`--stdin-eof`・EOT 送出・ICRNL・バイナリ不可の制約が全部消える)。a の前提 (pipe を stdin に受けた子が制御端末の PTY からキーを読み、attach / `hyoui input` が届く) は PoC で確認中。
+
+- [ ] a: stdin が tty でない時はその fd を子の fd 0 にそのまま渡し、PTY は制御端末と出力にだけ使う (DR-0019 §5 と `--stdin-eof` を置き換え)
+- [ ] b: 今の形 (PTY に流し込む) を保ち、here-string の代わりに argv / `hyoui input` を使う書き方を MANUAL に書く
+
 ### 👺WR-Q5: DR-0005 の「範囲外」(window / pane UI、session グループ) との関係
 
 DR-0005 は window / pane UI と session グループを範囲外にしているが、[DR-0039](decisions/DR-0039-webui-terminal-app-rework.md) はタブグループ / タブ / pane を gateway と browser に持たせる。統括推しは a (DR-0005 が避けたのは daemon / TUI 側を multiplexer にすることで、web の表示層が並べ方を持つのは別物。1 session = 1 daemon と TUI へのキー割り当て無しは保たれる)。
