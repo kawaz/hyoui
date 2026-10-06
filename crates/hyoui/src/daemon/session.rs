@@ -1351,6 +1351,31 @@ fn defer_child_exit(
     }
 }
 
+/// 子の state transition を `waitpid` で 1 つ取り出し、全観測点で共通の処理に流す
+/// (= exit は drain 窓へ保留、stop は `notify_child_stopped`、continue は記録)。
+#[allow(clippy::too_many_arguments)]
+fn observe_child_transition(
+    lifecycle: &mut ChildLifecycle,
+    child: Pid,
+    clients: &mut [ClientHandle],
+    state: &SessionState,
+    deferred_exit: &mut Option<RelayOutcome>,
+    exit_drain_deadline: &mut Option<Instant>,
+    overflow_ids: &mut Vec<u64>,
+) {
+    let (child_state, transition) = lifecycle.poll_with_transition(child);
+    if let ChildState::Exited(code) = child_state {
+        defer_child_exit(deferred_exit, exit_drain_deadline, code);
+    }
+    match transition {
+        Some(ChildTransition::Stopped { sig }) => {
+            overflow_ids.extend(notify_child_stopped(child, clients, state, sig));
+        }
+        Some(ChildTransition::Continued) => record_child_continued(state, child),
+        _ => {}
+    }
+}
+
 /// serve loop の本体。`Session::serve` から切り出して所有権整理を平坦化。
 #[allow(clippy::too_many_arguments)]
 fn serve_loop(
@@ -1427,6 +1452,25 @@ fn serve_loop(
     // 読み切るまでは master を poll し続ける (= 子 exit 検出と master 読み切りは
     // 別事象)。
     let mut master_drained = false;
+    // 子の state 変化は SIGCHLD self-pipe で起きて拾うが、self-pipe の SIGCHLD handler は
+    // `Session::serve` 冒頭で install され、子はそれより前 (= `Session::start`) に spawn
+    // 済み。間に子が止まる / 死ぬと、その SIGCHLD は default disposition で捨てられ、
+    // poll を起こすものが無いまま transition が kernel の wait queue に残る (= 起動直後に
+    // self-stop した子が auto-resume でも起こされず止まり続け、status も running のまま)。
+    // upgrade の self-exec を跨いだ再開も同じ窓を持つ。handler install 後に 1 回だけ
+    // waitpid して取りこぼしを回収する。install 後の transition は SIGCHLD でも届くが、
+    // ここで先に消費しても後段の poll が StillAlive を返すだけで二重処理にはならない。
+    // 取り出した stop の通知で切れた client は最初の周回の overflow 処理に回す。
+    let mut startup_overflow: Vec<u64> = Vec::new();
+    observe_child_transition(
+        &mut lifecycle,
+        child,
+        clients,
+        state,
+        &mut deferred_exit,
+        &mut exit_drain_deadline,
+        &mut startup_overflow,
+    );
     loop {
         // DR-0028 §2 (Phase 3): upgrade.request 受理後は drain (= 同期 raw_data 経路の
         // 既完了性) を trivially 満たすので次回 iteration 冒頭で UpgradeRequested を返す。
@@ -1504,7 +1548,7 @@ fn serve_loop(
         };
 
         // backpressure overflow / writer dead で disconnect が必要な client_id を集める
-        let mut overflow_ids: Vec<u64> = Vec::new();
+        let mut overflow_ids: Vec<u64> = std::mem::take(&mut startup_overflow);
 
         // poll timeout の決定。デフォルトは無限 block (= 別 fd の POLLIN /
         // self-pipe wake で起きる) で、以下の cap を順に適用して頭打ちする:
@@ -1611,18 +1655,15 @@ fn serve_loop(
                         return outcome;
                     }
                 }
-                let (child_state, transition) = lifecycle.poll_with_transition(child);
-                if let ChildState::Exited(code) = child_state {
-                    defer_child_exit(&mut deferred_exit, &mut exit_drain_deadline, code);
-                }
-                match transition {
-                    Some(ChildTransition::Stopped { sig }) => {
-                        let overflow = notify_child_stopped(child, clients, state, sig);
-                        overflow_ids.extend(overflow);
-                    }
-                    Some(ChildTransition::Continued) => record_child_continued(state, child),
-                    _ => {}
-                }
+                observe_child_transition(
+                    &mut lifecycle,
+                    child,
+                    clients,
+                    state,
+                    &mut deferred_exit,
+                    &mut exit_drain_deadline,
+                    &mut overflow_ids,
+                );
                 continue;
             }
             Ok(PollOutcome::Timeout) => {
@@ -1636,18 +1677,15 @@ fn serve_loop(
                 // 送らないため self-pipe 経路では復帰を拾えない (= 上の
                 // poll timeout cap と対の措置)。
                 if sigchld_pipe.is_none() || lifecycle.is_stopped() {
-                    let (child_state, transition) = lifecycle.poll_with_transition(child);
-                    if let ChildState::Exited(code) = child_state {
-                        defer_child_exit(&mut deferred_exit, &mut exit_drain_deadline, code);
-                    }
-                    match transition {
-                        Some(ChildTransition::Stopped { sig }) => {
-                            let overflow = notify_child_stopped(child, clients, state, sig);
-                            overflow_ids.extend(overflow);
-                        }
-                        Some(ChildTransition::Continued) => record_child_continued(state, child),
-                        _ => {}
-                    }
+                    observe_child_transition(
+                        &mut lifecycle,
+                        child,
+                        clients,
+                        state,
+                        &mut deferred_exit,
+                        &mut exit_drain_deadline,
+                        &mut overflow_ids,
+                    );
                     // `waitpid` が continued を報告しない環境 (= macOS の self-stop
                     // した子) 向けの補完。kernel の process state を直読みして
                     // 「実は走っている」ことを確認できたら latch を下ろす。
@@ -1750,21 +1788,18 @@ fn serve_loop(
                     return outcome;
                 }
             }
-            let (child_state, transition) = lifecycle.poll_with_transition(child);
-            if let ChildState::Exited(code) = child_state {
-                // 即 return しない: 同一周回の listener / master / client frame
-                // (= 直前の process_pending_handshakes で登録された client の
-                // tail.request を含む) を後段で処理させる。
-                defer_child_exit(&mut deferred_exit, &mut exit_drain_deadline, code);
-            }
-            match transition {
-                Some(ChildTransition::Stopped { sig }) => {
-                    let overflow = notify_child_stopped(child, clients, state, sig);
-                    overflow_ids.extend(overflow);
-                }
-                Some(ChildTransition::Continued) => record_child_continued(state, child),
-                _ => {}
-            }
+            // 子 exit は即 return しない: 同一周回の listener / master / client frame
+            // (= 直前の process_pending_handshakes で登録された client の
+            // tail.request を含む) を後段で処理させる。
+            observe_child_transition(
+                &mut lifecycle,
+                child,
+                clients,
+                state,
+                &mut deferred_exit,
+                &mut exit_drain_deadline,
+                &mut overflow_ids,
+            );
         }
 
         // 1. listener: 新規 client accept (= handshake worker を spawn するだけ。
@@ -3165,6 +3200,53 @@ mod tests {
 
         let exit = handle.join().expect("daemon thread").expect("daemon serve");
         assert_eq!(exit, 1);
+    }
+
+    /// `Session::start` (= 子 spawn) と `serve` (= SIGCHLD handler install) の間に子が
+    /// 止まっても、auto-resume が子を起こす。間で止まった子の SIGCHLD は handler が無い
+    /// ので捨てられ、serve は transition を起動時の waitpid でしか拾えない。
+    ///
+    /// 子が止まったことを kernel の process state で確かめてから serve を始め、窓を
+    /// 確実に踏ませる。self-pipe の所有権は process 内で 1 serve だけなので、並走する
+    /// 他 test に取られると 500ms 周期の polling 経路で動き、本 test は窓を踏まずに通る
+    /// (= nextest の process 分離下でのみ回帰を検出する)。
+    #[test]
+    fn serve_auto_resumes_child_stopped_before_serve() {
+        let dir = make_temp_socket_dir();
+        let sock_path = dir.path().join("prestop.sock");
+        let cmd = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "kill -STOP $$; exit 7".into(),
+        ];
+        let mut cfg = DaemonConfig::new("prestop", sock_path, cmd);
+        cfg.on_child_suspend = ChildSuspendPolicy::AutoResume;
+        let session = Session::start(cfg).expect("start");
+        let child = session.child_pid();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while crate::sys::procstate::is_stopped(child.as_raw()) != Some(true) {
+            if std::time::Instant::now() >= deadline {
+                drop(session);
+                panic!("子が self-stop しなかった");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let handle = std::thread::spawn(move || session.serve());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                // test から起こして子を exit させ、serve を通常経路で終わらせてから落とす
+                // (= reap を serve に残す。test 側で reap すると serve が子を見失う)。
+                let _ = nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGCONT);
+                let _ = handle.join();
+                panic!("serve 開始前に止まった子が auto-resume で起こされなかった");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let exit = handle.join().expect("daemon thread").expect("daemon serve");
+        assert_eq!(exit, 7, "子は起こされて `exit 7` まで進むはず");
     }
 
     // ---- Phase 10 helper unit tests ----
