@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-10-06 | bug | open | [macos-ci-sigstop-not-observed-in-time](./2026-10-06-bug-macos-ci-sigstop-not-observed-in-time.md) | macOS CI で SIGSTOP した子の停止が約 1 秒以内に観測できず落ちた (真因未特定、待ち方を観測に変え次の失敗で原因が出るようにした) |
 | 2026-10-06 | design | open | [external-detach-reported-as-connection-lost](./2026-10-06-design-external-detach-reported-as-connection-lost.md) | 外から `hyoui detach` された attach client が「接続が失われました」で exit 9 になり、daemon の消滅と区別できない (DR-0042 の端末なし attach で主な終わり方になる) |
 | 2026-10-06 | design | open | [daemon-unaware-of-unlinked-socket](./2026-10-06-design-daemon-unaware-of-unlinked-socket.md) | session の socket file が消えても daemon は気付かず、誰も到達できないまま子と一緒に残り続ける (テストの残骸 49 個で観測) |
 | 2026-10-04 | bug | open | [web-supervisor-blocks-on-control-read](./2026-10-04-web-supervisor-blocks-on-control-read.md) | web の監督者が制御 socket の要求を main loop で 5 秒 timeout 付きで読み、改行を送らない client 1 つで止まる |
