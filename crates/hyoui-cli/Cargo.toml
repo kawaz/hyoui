@@ -13,11 +13,11 @@ name = "hyoui"
 path = "src/main.rs"
 
 [dependencies]
-hyoui = { path = "../hyoui", version = "0.12" }
+hyoui = { path = "../hyoui", version = "0.13" }
 # DR-0027 Phase 1: `hyoui web` subcommand が hyoui-web の axum server を起動する
 # ためのハブ。tokio / axum は hyoui-web に閉じるが、cli binary からは path dep で
 # 呼び出す (= 別 binary に切り出す設計コスト回避)。
-hyoui-web = { path = "../hyoui-web", version = "0.12" }
+hyoui-web = { path = "../hyoui-web", version = "0.13" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 nix = { workspace = true }
 # `screen snapshot` subcommand が `StateSnapshotResponse` を独立した CBOR root
@@ -49,7 +49,7 @@ sha2 = "0.10"
 # web e2e (tests/web_e2e_api.rs) が隔離した `XDG_STATE_HOME` に登録 fixture を
 # 置くために使う (= DR-0036 決定 9、本番 record に対して test を走らせない)。
 # integration test は lib の [dependencies] を継承しないのでここにも並べる。
-hyoui-web = { path = "../hyoui-web", version = "0.12" }
+hyoui-web = { path = "../hyoui-web", version = "0.13" }
 # integration tests (tests/lock_cli.rs) で nix::sys::signal::kill を使う
 nix = { workspace = true }
 # DR-0014 マトリクス検証用 PTY harness (tests/common/pty.rs)。
