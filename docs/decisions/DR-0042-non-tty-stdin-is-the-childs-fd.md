@@ -69,6 +69,7 @@ bash との違いは 2 つある。
 
 - attach client (単独の `hyoui attach` と、`hyoui run` が exec する attach) は stdin を子に流さない。単独の `hyoui attach S < file` は bash の `fg` と同じく子の fd を差し替えない。稼働中の子へ流し込む時は `hyoui input` を使う
 - attach client の入力端末は「stdin が tty なら stdin、そうでなければ `/dev/tty`」とする。raw 化、SIGWINCH、外側端末のサイズ、キーの読み取り、Ctrl+Z ガード (DR-0029) は全部この入力端末を対象にする
+- `/dev/tty` を開く時は、制御端末の実体 (`/dev/ttys005` 等、kernel が持つ制御端末の device 番号から引く) を `O_NOCTTY` で開いて入力端末にする。macOS の `/dev/tty` は `poll(2)` に `POLLNVAL` を返し、poll で入力を待つ attach client の入力端末にできない (実測 2026-10-06)。Linux の `/dev/tty` は poll できるのでそのまま開く
 - `/dev/tty` が開けない時 (制御端末が無い。Claude の Bash ツールでは ENXIO) は、キー入力なしで出力を中継する。エラーにしない。終わり方は子の exit (exit code を伝える) か `hyoui detach` か接続の喪失
 - stdin が tty でない attach client は、自分の fd 0 を `/dev/null` に置き換えてから中継を始める (`hyoui run` が exec した attach が pipe の読み手として残ると、決定 2 の EPIPE が書き手に届かない)
 - 入力端末の EOF / read error は今どおり自分から離脱する (detach)。子には何も送らない
@@ -111,6 +112,7 @@ bash との違いは 2 つある。
 - `crates/hyoui/src/sys/pty.rs` / `crates/hyoui/src/daemon/session.rs`: spawn に子の stdin を渡す口 (`Session::start_with_child_stdin`)。spawn 後に fd を閉じる
 - `crates/hyoui-cli/src/daemonize.rs`: `DaemonizeInit.child_stdin`、fd 0 の CLOEXEC 付き複製と `/dev/null` への置き換え
 - `crates/hyoui-cli/src/main.rs`: run は非 detached でも stdin を daemon に継承させる。attach は入力端末の選択 (stdin か `/dev/tty`)、無い時の出力だけの中継、fd 0 の `/dev/null` 化
+- `crates/hyoui/src/sys/procstate.rs`: 制御端末の実体のパス (macOS は `proc_pidinfo` の `e_tdev` を `devname(3)` で引く)
 - `crates/hyoui/src/client/attach.rs`: 入力の無い中継 (`run_output_only`)、EOF の EOT 経路の削除
 - `crates/hyoui/src/cli.rs` / `crates/hyoui-cli/src/completion.rs` / `docs/MANUAL*.md`: `--pty-stdin` の追加と `--stdin-eof` の削除を help / completion / manual で同時に
 
