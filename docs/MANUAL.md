@@ -78,7 +78,7 @@ hyoui kill --signal KILL run-<pid>-<rand>  # SIGKILL
 
 ## Automation
 
-These recipes assume `SESS` holds a session id (e.g. `SESS=$(hyoui run --detached -- bash)`; add `--pty-stdin` when the launcher has no terminal).
+These recipes assume `SESS` holds a session id (e.g. `SESS=$(hyoui run --detached --pty-stdin -- bash)`; the shell is operated from outside, so `--pty-stdin` makes its stdin the PTY as well).
 
 ### 4. Inject input (`input` family)
 
@@ -346,10 +346,11 @@ Starts the child like an ordinary terminal app does
 ([DR-0039](./decisions/DR-0039-webui-terminal-app-rework.md) decision 1).
 
 ```sh
-hyoui run --login --detached                 # the passwd shell, as a login shell
-hyoui run --login --detached -- zsh -f       # explicit command (e.g. skip rc files)
+hyoui run --login --detached --pty-stdin               # the passwd shell, as a login shell
+hyoui run --login --detached --pty-stdin -- zsh -f     # explicit command (e.g. skip rc files)
 ```
 
+- The shell is operated from outside, so `--pty-stdin` makes its stdin the PTY as well. Without it the caller's stdin becomes the child's stdin, and from a launcher without a terminal (a script or an agent) the shell exits right away on stdin EOF ([DR-0042](./decisions/DR-0042-non-tty-stdin-is-the-childs-fd.md))
 - The shell comes from passwd (`getpwuid`); the caller's `$SHELL` is ignored
 - argv[0] is `-<basename of the shell>` (e.g. `-zsh`); the shell reads its own rc files
 - The child env starts minimal instead of inheriting the caller's: `HOME` / `USER` / `LOGNAME` / `SHELL` / an initial `PATH` / `LANG` (if the caller has it) / `TERM` (see below). The initial `PATH` is built from `/etc/paths` and `/etc/paths.d/*` on macOS, and is `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` elsewhere

@@ -1,6 +1,6 @@
 # DR-0042: 非 tty の stdin は子の fd 0 にそのまま渡し、PTY は制御端末と出力にだけ使う
 
-- Status: 🚧 Active (2026-10-06)。決定 1〜5 は裁定済み (STDIN-Q1 の α / β / γ とも a、kawaz 2026-10-06)
+- Status: 🚧 Active (2026-10-06)。決定 1〜5 は裁定済み (STDIN-Q1 の α / β / γ とも a、kawaz 2026-10-06)。決定 6 (失敗時は起動・接続を拒否する) はレビュー指摘を受けた統括の方針 (2026-10-06)
 - Date: 2026-10-06
 - Supersedes (部分): DR-0019 §5 (pipe-through: 非 tty stdin の EOF で EOT を送る、`--stdin-eof`、2026-10-05 の注記と「Update: `--detached` でも非 tty stdin を子に届ける」)
 - Related: DR-0005 (透過原則), DR-0014 (介入 self-check と検証主義), DR-0015 (run = fork daemon + exec attach), DR-0017 (session anchor: daemon が制御端末を持ち、子を同 session の foreground にする), DR-0028 (upgrade の self-exec と継承 fd), DR-0029 (attach は覗き窓、Ctrl+Z ガード), DR-0016 (record の `in` event), DR-0039 決定 1 (gateway からログイン shell を作る)
@@ -32,6 +32,7 @@ bash との違いは 2 つある。
 - **必然か**: 子から見た stdin を直接実行と揃えるのが目的で、直接実行で `echo x | prog` とした時 prog の stdin は pipe である。PTY に変えて流し込む方が非透過で、`claude <<<prompt` が送信されない、バイナリが運べない、の実害が出ている
 - **最小介入か**: hyoui がするのは「子の fd 0 に何を dup2 するか」を選ぶことだけで、bytes に触れない。stdin が tty の時と `--pty-stdin` の時は今どおり PTY slave を dup2 する
 - **kernel / PTY / shell の再発明でないか**: EOF は pipe / file の EOF そのもの、書き手への EPIPE は kernel が返す。bash の pipeline と同じ配線で、EOT による EOF の模倣をやめる
+- **partial state を hyoui の裁量で破棄する介入か**: 該当しない。hyoui は子の bytes / signal / process state を読まず、「壊れている」と判定して捨てるものが無い (DR-0019 §5 の EOT の合成と転送の停止が無くなる)。配線に失敗した時も、別の配線に倒して状態を作り替えず、起動か接続を止めて利用者に返す (決定 6)
 - **新 protocol message / cap flag**: 無し。daemon への受け渡しは既存の `HYOUI_DAEMONIZE_INIT` JSON の field と fd 0 の継承で、`--stdin-eof` を attach に伝える経路は消える
 - **既存 DR の未実装**: 本 DR の対象範囲で DR が約束して未実装のものは無い。DR-0019 §5 は実装済みで、それを置き換える
 
@@ -69,9 +70,10 @@ bash との違いは 2 つある。
 
 - attach client (単独の `hyoui attach` と、`hyoui run` が exec する attach) は stdin を子に流さない。単独の `hyoui attach S < file` は bash の `fg` と同じく子の fd を差し替えない。稼働中の子へ流し込む時は `hyoui input` を使う
 - attach client の入力端末は「stdin が tty なら stdin、そうでなければ `/dev/tty`」とする。raw 化、SIGWINCH、外側端末のサイズ、キーの読み取り、Ctrl+Z ガード (DR-0029) は全部この入力端末を対象にする
-- `/dev/tty` を開く時は、制御端末の実体 (`/dev/ttys005` 等、kernel が持つ制御端末の device 番号から引く) を `O_NOCTTY` で開いて入力端末にする。macOS の `/dev/tty` は `poll(2)` に `POLLNVAL` を返し、poll で入力を待つ attach client の入力端末にできない (実測 2026-10-06)。Linux の `/dev/tty` は poll できるのでそのまま開く
-- `/dev/tty` が開けない時 (制御端末が無い。Claude の Bash ツールでは ENXIO) は、キー入力なしで出力を中継する。エラーにしない。終わり方は子の exit (exit code を伝える) か `hyoui detach` か接続の喪失
-- stdin が tty でない attach client は、自分の fd 0 を `/dev/null` に置き換えてから中継を始める (`hyoui run` が exec した attach が pipe の読み手として残ると、決定 2 の EPIPE が書き手に届かない)
+- 制御端末の有無は `/dev/tty` が開けるかで決める。開けない理由が「制御端末が無い」(ENXIO。Claude の Bash ツール等) の時だけ、キー入力なしで出力を中継する (エラーにしない)。終わり方は子の exit (exit code を伝える) か `hyoui detach` か接続の喪失
+- 制御端末がある時は、その実体 (`/dev/ttys005` 等、kernel が持つ制御端末の device 番号から引く) を `O_NOCTTY` の読み専用で開いて入力端末にする (入力端末に対して行うのは read / poll と raw 化・サイズの取得だけで、どれも読み専用の fd で効く)。macOS の `/dev/tty` は `poll(2)` に `POLLNVAL` を返し、poll で入力を待つ attach client の入力端末にできない (実測 2026-10-06)。Linux の `/dev/tty` は poll できるのでそのまま開く。制御端末があるのに実体を引けない・開けない時は出力だけの中継に倒さず、決定 6 で attach を終える
+- stdin が tty でない attach client は、自分の fd 0 を `/dev/null` に置き換えてから daemon に接続する (`hyoui run` が exec した attach が pipe の読み手として残ると、決定 2 の EPIPE が書き手に届かない)。置き換えられなければ決定 6 で attach を終える
+- 入力の配線 (fd 0 の置き換えと入力端末) は daemon に接続する前に確定させる
 - 入力端末の EOF / read error は今どおり自分から離脱する (detach)。子には何も送らない
 - `hyoui run` が子の初期サイズを外側端末から取る時も同じ規則で入力端末を選ぶ (stdin が pipe でも、`/dev/tty` があればそのサイズで子を起動する)
 
@@ -81,6 +83,16 @@ bash との違いは 2 つある。
 
 - `--stdin-eof` (run / attach)、EOF での EOT の送出 (改行で終わらない入力の 2 個を含む)、`hyoui::stdin_eof`、daemon の stdin 転送 (`daemon::stdin_forward`、reader thread と内部 pipe)、`DaemonizeInit.stdin_forward`、attach の `with_stdin_eof_action` / `send_stdin_eof`
 - v1.0 前なので互換は持たない (`--stdin-eof` は未知の option としてエラーになる)
+
+### 6. 失敗したら起動・接続を拒否する (fail closed)
+
+本 DR の配線に失敗した時は、別の配線に倒して黙って続けず、原因と次の行動を stderr に書いて非 0 で終わる。
+
+- daemon が呼び出し元の stdin を子に渡す準備 (CLOEXEC 付きの複製、自分の fd 0 の `/dev/null` 化) に失敗したら、子を spawn せず daemon の起動失敗にする。ready を通知しないので、`hyoui run` (`--detached` の有無とも) は起動失敗として非 0 で終わる。次の行動として、fd の上限と stdin を確かめるか、stdin を渡さないなら `--pty-stdin` で起動し直すことを書く
+- attach client が自分の fd 0 を `/dev/null` に置き換えられなければ、daemon に接続せずに非 0 で終わる
+- 制御端末があるのに入力端末を開けなければ (決定 4)、daemon に接続せずに非 0 で終わる。次の行動として、stdin を端末のまま実行し直すか、キー入力が要らないなら `hyoui tail` / `hyoui screen dump` で観測することを書く
+
+理由: 失敗時に PTY や入力無しに倒すと、利用者が選んでいない配線で子や attach が動き、pipe の中身が届かない・キーが効かない・書き手に EPIPE が届かない、が黙って起きる。どの配線で動いているかが利用者から見えなくなるのは透過原則 (DR-0005) に反する。
 
 ## Rejected alternatives
 
@@ -92,6 +104,7 @@ bash との違いは 2 つある。
 | `--pty-stdin` を既定にし、渡す方を指定にする | 直接実行と揃えるのが本 DR の目的で、既定が非透過になる。`tmux new -d` 相当は呼び出し元に端末が無い時の特殊な使い方 |
 | 単独の attach で非 tty stdin を子の PTY に流す | 稼働中の子の fd 0 は後から差し替えられず、PTY に流すのは本 DR が捨てる形そのもの。run と attach で意味が分かれる。流し込みは `hyoui input` が担う |
 | `/dev/tty` が無い attach をエラーにする | Claude の Bash ツールや CI から `hyoui run` / `attach` を使えなくなる。出力の中継と exit code の伝搬は端末が無くても成り立つ |
+| 配線に失敗したら PTY / 入力無しに倒して続ける (子の stdin を PTY にする、キー無しで中継する、pipe を持ったまま中継する) | 利用者が選んだ配線と違う形で黙って動く。pipe の中身が子に届かない、キーが効かない、書き手に EPIPE が届かない、が起きても利用者に見えない。違う配線で動かしたい時は利用者が `--pty-stdin` 等で明示する |
 | fd を SCM_RIGHTS で daemon に送る | daemon は run が spawn する子プロセスなので継承で足りる。protocol と後始末が増える |
 | daemon が fd を持ち続け、子の exec 後に閉じる | 子が先に stdin を閉じたり終わったりしても書き手に EPIPE が届かない。upgrade の self-exec にも漏れる |
 
@@ -110,8 +123,8 @@ bash との違いは 2 つある。
 
 - `crates/hyoui/src/sys/raw.rs`: `openpty_fork_anchor_exec` / `forkpty_then_exec_legacy` の子側で、fd が渡されていれば fd 0 にそれを dup2 する (無ければ slave)
 - `crates/hyoui/src/sys/pty.rs` / `crates/hyoui/src/daemon/session.rs`: spawn に子の stdin を渡す口 (`Session::start_with_child_stdin`)。spawn 後に fd を閉じる
-- `crates/hyoui-cli/src/daemonize.rs`: `DaemonizeInit.child_stdin`、fd 0 の CLOEXEC 付き複製と `/dev/null` への置き換え
-- `crates/hyoui-cli/src/main.rs`: run は非 detached でも stdin を daemon に継承させる。attach は入力端末の選択 (stdin か `/dev/tty`)、無い時の出力だけの中継、fd 0 の `/dev/null` 化
+- `crates/hyoui-cli/src/daemonize.rs`: `DaemonizeInit.child_stdin`、fd 0 の CLOEXEC 付き複製と `/dev/null` への置き換え。失敗したら子を spawn せずに終わる (決定 6)
+- `crates/hyoui-cli/src/main.rs`: run は非 detached でも stdin を daemon に継承させる。attach は接続前に、fd 0 の `/dev/null` 化と入力端末の選択 (stdin か制御端末の実体、制御端末が無い時だけ出力だけの中継) を行い、失敗したら接続せずに終わる (決定 6)
 - `crates/hyoui/src/sys/procstate.rs`: 制御端末の実体のパス (macOS は `proc_pidinfo` の `e_tdev` を `devname(3)` で引く)
 - `crates/hyoui/src/client/attach.rs`: 入力の無い中継 (`run_output_only`)、EOF の EOT 経路の削除
 - `crates/hyoui/src/cli.rs` / `crates/hyoui-cli/src/completion.rs` / `docs/MANUAL*.md`: `--pty-stdin` の追加と `--stdin-eof` の削除を help / completion / manual で同時に
@@ -124,6 +137,7 @@ bash との違いは 2 つある。
 - 子の `isatty(0)` が偽で `isatty(1)` が真、`--pty-stdin` では両方真で `hyoui input` が届く (`--detached` の有無の両方)
 - daemon が fd を持ち続けない: 子の終了前に書き手が閉じれば子は EOF、子が先に終われば書き手に EPIPE
 - `/dev/tty` の無い起動元からの `hyoui run` が出力を中継し、子の exit code を返す
+- 決定 6 の 3 つの失敗経路で、文言 (原因と次の行動) と非 0 の終了、子を spawn しない / daemon に接続しないこと
 
 ## 関連
 

@@ -101,7 +101,7 @@ brew install kawaz/tap/hyoui
 hyoui run -- bash
 
 # detached (= daemon だけ起動、stdout に session 名が出る)
-SESS=$(hyoui run --detached -- bash)
+SESS=$(hyoui run --detached --pty-stdin -- bash)
 echo "started: $SESS"
 ```
 

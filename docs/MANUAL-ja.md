@@ -76,7 +76,7 @@ hyoui kill --signal KILL run-<pid>-<rand>  # SIGKILL
 
 ## 自動操作
 
-以下のレシピは `SESS` に session id が入っている前提（例: `SESS=$(hyoui run --detached -- bash)`。端末の無い起動元から作るなら `--pty-stdin` を付ける）。
+以下のレシピは `SESS` に session id が入っている前提（例: `SESS=$(hyoui run --detached --pty-stdin -- bash)`。外から操作し続ける shell なので `--pty-stdin` で子の stdin も PTY にする）。
 
 ### 4. 入力注入 (`input` family)
 
@@ -335,10 +335,11 @@ config パースエラー (= 不正 TOML / 型不一致) のときは hyoui の�
 ([DR-0039](./decisions/DR-0039-webui-terminal-app-rework.md) 決定 1)。
 
 ```sh
-hyoui run --login --detached                 # passwd の shell を login shell で
-hyoui run --login --detached -- zsh -f       # コマンド明示 (rc を読ませない例)
+hyoui run --login --detached --pty-stdin               # passwd の shell を login shell で
+hyoui run --login --detached --pty-stdin -- zsh -f     # コマンド明示 (rc を読ませない例)
 ```
 
+- 外から操作し続ける shell なので `--pty-stdin` で子の stdin も PTY にする。付けないと呼び出し元の stdin がそのまま子の stdin になり、端末でない起動元 (script や agent) からだと shell が stdin の EOF ですぐ終わる ([DR-0042](./decisions/DR-0042-non-tty-stdin-is-the-childs-fd.md))
 - shell は passwd (`getpwuid`) から引く。呼び出し元の `$SHELL` は見ない
 - argv[0] は `-<shell の basename>` (例: `-zsh`)。rc は shell が読む
 - 子の env は呼び出し元から引き継がず最小から始める: `HOME` / `USER` / `LOGNAME` / `SHELL` / 初期 `PATH` / `LANG` (呼び出し元に在れば) / `TERM` (下記)。初期 `PATH` は macOS では `/etc/paths` と `/etc/paths.d/*` から、それ以外は `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`

@@ -110,7 +110,7 @@ is not supported).
 hyoui run -- bash
 
 # detached (daemon only; the session id is printed on stdout)
-SESS=$(hyoui run --detached -- bash)
+SESS=$(hyoui run --detached --pty-stdin -- bash)
 echo "started: $SESS"
 ```
 
