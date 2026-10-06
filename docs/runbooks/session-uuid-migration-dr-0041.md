@@ -12,8 +12,9 @@
 
 新しい版の `hyoui list` / `hyoui web ...` が stderr に次を出す:
 
-- `<path> has N session socket(s) in the old layout; this hyoui does not read them (sessions now live in <state root>/sessions). ...`
-- `<path> is a symlink left for older hyoui binaries; remove it once none of them run (DR-0041)`
+- `<path> has N session socket(s) in the old layout; this hyoui does not read them (sessions now live in <state root>/sessions). ...` (状態の root 直下、その下の dir、`$XDG_RUNTIME_DIR/hyoui` の下)
+- `<path> is a session socket whose id is not a UUID (left by an older hyoui); ...` (`sessions/` の中に古い版が置いた socket)
+- `<path> is a symlink left for older hyoui binaries; remove it once none of them run (DR-0041)` (socket が無くても symlink が残っていれば出る)
 
 または、古い版で起動した session が新しい版の `hyoui list` に出ず、id を指定しても見つからない。
 
@@ -22,6 +23,7 @@
 ```sh
 ls -la ~/.local/state/hyoui/
 find ~/.local/state/hyoui -maxdepth 2 -name '*.sock'
+[ -n "${XDG_RUNTIME_DIR:-}" ] && ls -la "$XDG_RUNTIME_DIR/hyoui"
 /opt/homebrew/bin/hyoui --version
 /opt/homebrew/bin/hyoui list --all-namespaces
 ```
@@ -29,6 +31,8 @@ find ~/.local/state/hyoui -maxdepth 2 -name '*.sock'
 確かめること:
 
 - 状態の root 直下に `*.sock` / `*.lock` / `.dir.lock` が、root 直下の dir (`web/` と `sessions/` 以外) に `*.sock` がある。これが古い置き場で、新しい版は読まない
+- `sessions/` が既にあれば、中の `*.sock` の名前が全部 UUID (小文字・ハイフン付き) か。古い版で `--namespace=sessions` を使って起こした session は UUID でない名前でここに居て、新しい版は読まない
+- `$XDG_RUNTIME_DIR` が設定されていれば (macOS では通常無い)、`$XDG_RUNTIME_DIR/hyoui` の下も古い置き場 (古い版はこの dir が在るとそこに socket を置いた)。新しい版はここを読み書きしない
 - 古い版の `list --all-namespaces` で、どの session が今動いているか (STATUS が live / stopped / no-response) を控える。新しい版からは見えなくなるので、ここが最後に一覧できる場所
 - `HYOUI_NAMESPACE` を設定している `.envrc` があるか (`grep -rl HYOUI_NAMESPACE ~/.local/share/repos --include=.envrc`)。新しい版はこの変数を読まない (下の「判断待ち」)
 
@@ -69,6 +73,7 @@ hyoui list
 | 古い session を操作する | 手順 1 で残した古い版で打つ: `~/hyoui-before-dr-0041 attach <id>` (dir にある session は `--namespace=<dir>`) |
 | 古い session を止める | 古い版で `kill <id>`。古い版が無ければ、古い版の `status` か `ps` で daemon の pid を引き、`kill <pid>` を送る (DR-0041 決定 7) |
 | 新しい session を古い版から見る | 古い版は `sessions/` を namespace `sessions` として読むので、`~/hyoui-before-dr-0041 list --namespace=sessions` / `attach --namespace=sessions <uuid>` で届く |
+| 古い版で session を起こす | `--namespace=sessions` は使わない。古い版はそこに UUID でない名前の socket を作り、新しい版はそれを session として読まずに警告だけ出す (届かないのは他の古い置き場と同じ) |
 
 ### 4. web gateway を新しい版で起こし直す
 
@@ -99,16 +104,19 @@ pgrep -fl hyoui
 確かめること:
 
 - `pgrep` に出る hyoui が全部新しい版である (`ps -o pid,lstart,command -p <pid>` で起動時刻と実行ファイルを見る。古い Cellar の path や手順 1 の写しが居ないこと)
-- 古い版の `list --all-namespaces` で、`sessions` 以外の namespace に live の session が無い (残っているのが stale だけなら、古い版の `list` が片付ける)
+- 古い版の `list --all-namespaces` で、`sessions` 以外の namespace に live の session が無く、namespace `sessions` に UUID でない名前の live の session が無い (残っているのが stale だけなら、古い版の `list` が片付ける)
 
-満たしたら、状態の root 直下の古いファイルと、`sessions/` / `web/` 以外の dir を消す:
+満たしたら、状態の root 直下の古いファイル、`sessions/` / `web/` 以外の dir、`sessions/` の中の UUID でない名前のファイル、旧版の runtime dir、残した symlink を消す:
 
 ```sh
 cd ~/.local/state/hyoui
 ls -la
 rm -f ./*.sock ./*.lock ./.dir.lock
-# sessions/ と web/ 以外の dir を 1 つずつ中身を見てから消す
+# sessions/ と web/ 以外の dir (symlink を含む) を 1 つずつ中身を見てから消す
 ls -la <dir> && rm -r <dir>
+# sessions/ の中の UUID でない名前の socket と lock (hyoui list の警告に出た path)
+ls -la sessions/ && rm -f sessions/<UUID でない名前>.sock sessions/<UUID でない名前>.lock
+[ -n "${XDG_RUNTIME_DIR:-}" ] && ls -la "$XDG_RUNTIME_DIR/hyoui" && rm -r "$XDG_RUNTIME_DIR/hyoui"
 rm ~/hyoui-before-dr-0041
 hyoui list
 ```

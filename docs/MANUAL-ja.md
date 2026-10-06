@@ -248,8 +248,8 @@ hyoui input "$SID" "text:ls" "key:Enter"
 ```
 
 - 受け付けるのは標準形 `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` だけ。大文字・ハイフン無し・波括弧付き・先頭だけの短縮はエラーで、黙って正規化しない (表記が違うと同じ UUID でも別の socket になるため)。UUID の版は問わない
-- 同じ id の socket が既にあると `hyoui run` は子を起こさずにエラーで終わる。相手の daemon が生きていても死んでいても同じで、run は生死を判定しない。動いている session なら `hyoui kill <id>`、daemon が死んで socket だけ残っていれば `hyoui list` (接続を断られ、daemon の lock を誰も持っていない socket を片付ける) の後に打ち直す。判定は socket の bind と name lock の時点で行うので、同じ id の run を並行に打っても起動するのは 1 つだけ
-- `hyoui kill --wait` は子と session の終了を見届けて戻るが、daemon が終わって socket を消すのはその後 (実測で約 2 秒後) なので、同じ id ですぐ `run` すると「既にある」になる
+- 同じ id の socket が既にあると `hyoui run` は子を起こさずにエラーで終わる。相手の daemon が生きていても死んでいても同じで、run は生死を判定しない。動いている session なら `hyoui kill <id>`、daemon が死んで socket だけ残っていれば `hyoui list` (接続を断られ、daemon の lock を誰も持っていない socket を片付ける) の後に打ち直す。lock の無い socket は `hyoui list` が stale と表示するだけで消さないので、daemon が居ないことを確かめてから手で消す。判定は socket の bind と name lock の時点で行うので、同じ id の run を並行に打っても起動するのは 1 つだけ
+- `hyoui kill --wait` は子と session の終了に加えて daemon の終了 (= socket の片付け) まで見届けて戻るので、戻った直後に同じ id で `run` できる。daemon が socket を片付けずに終わった時は exit 1 で、`hyoui list` での片付けを案内する
 
 **面** — socket は `<状態の root>/sessions/<id>.sock` に置く。状態の root は次の順に決まり、hyoui の一式 (session の socket、web の監督者・unit・登録簿・passkey・logs) はその中で完結する。
 
@@ -261,7 +261,7 @@ hyoui input "$SID" "text:ls" "key:Enter"
 
 - unix socket の `sun_path` の上限 (macOS 104 / Linux 108 bytes) はフルパスでは判定しない。収まらない時は socket の dir を開いた fd を基準に相対名で bind / connect するので、深い root でも使える
 - 子プロセスへ常時注入するのは `HYOUI_SESSION_ID` だけ。`--login` でない run の子は呼び出し元の env を引き継ぐので `HYOUI_STATE_DIR` も届き、子の中で起こす hyoui は同じ面を使う
-- `sessions/` の外 (状態の root 直下や、`sessions/` / `web/` 以外の dir) に残った socket は読まない。在れば `hyoui list` と `hyoui web ...` が stderr に警告する。手順は `docs/runbooks/session-uuid-migration-dr-0041.md`
+- 次は session として読まず、在れば `hyoui list` と `hyoui web ...` が stderr に警告する: `sessions/` の外 (状態の root 直下や、`sessions/` / `web/` 以外の dir) の socket、`sessions/` の中の id が UUID でない socket、`$XDG_RUNTIME_DIR/hyoui` の下の socket、それらの置き場に残った symlink。手順は `docs/runbooks/session-uuid-migration-dr-0041.md`
 
 ### 10. 子プロセスへの env 漏洩を防ぐ (env scrub)
 

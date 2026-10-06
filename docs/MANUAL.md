@@ -257,8 +257,8 @@ hyoui input "$SID" "text:ls" "key:Enter"
 ```
 
 - Only the canonical form `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` is accepted. Uppercase, unhyphenated, braced, or prefix-only ids are errors and are never normalized silently (a different spelling of the same UUID would be a different socket). Any UUID version is fine
-- If a socket with the same id already exists, `hyoui run` ends with an error without starting the child, whether that daemon is alive or dead; run does not judge liveness. For a running session use `hyoui kill <id>`; if only the socket of a dead daemon is left, run `hyoui list` (it removes sockets that refuse connections while nobody holds the daemon lock) and try again. The check happens when the socket is bound and the name lock is taken, so of several concurrent runs with one id exactly one starts
-- `hyoui kill --wait` returns once the child and the session have ended, but the daemon exits and removes its socket after that (about 2 seconds later in measurements), so an immediate `run` with the same id reports that the socket exists
+- If a socket with the same id already exists, `hyoui run` ends with an error without starting the child, whether that daemon is alive or dead; run does not judge liveness. For a running session use `hyoui kill <id>`; if only the socket of a dead daemon is left, run `hyoui list` (it removes sockets that refuse connections while nobody holds the daemon lock) and try again. A socket without a lock is only shown as stale by `hyoui list`, never removed; confirm that no daemon is behind it and remove it by hand. The check happens when the socket is bound and the name lock is taken, so of several concurrent runs with one id exactly one starts
+- `hyoui kill --wait` waits for the child and the session to end and also for the daemon to exit (removing its socket), so `run` with the same id works right after it returns. If the daemon ended without removing its socket, it exits with 1 and points to `hyoui list` for the cleanup
 
 **Faces** — sockets live at `<state root>/sessions/<id>.sock`. The state root is decided as follows, and everything hyoui keeps (session sockets, the web supervisor, units, registry, passkeys, logs) stays inside it.
 
@@ -270,7 +270,7 @@ To keep a separate face, set only `HYOUI_STATE_DIR` in that face's `.envrc` (`XD
 
 - The unix socket `sun_path` limit (104 bytes on macOS, 108 on Linux) is not checked against the full path. When the path does not fit, hyoui binds / connects with a name relative to an fd of the socket's directory, so deep roots work
 - The only variable always injected into the child is `HYOUI_SESSION_ID`. Without `--login` the child inherits the caller's env, `HYOUI_STATE_DIR` included, so a hyoui started inside it uses the same face
-- Sockets left outside `sessions/` (directly under the state root, or in a directory other than `sessions/` / `web/`) are not read. When there are any, `hyoui list` and `hyoui web ...` warn on stderr. See `docs/runbooks/session-uuid-migration-dr-0041.md`
+- The following are not read as sessions, and `hyoui list` and `hyoui web ...` warn on stderr when any are present: sockets outside `sessions/` (directly under the state root, or in a directory other than `sessions/` / `web/`), sockets in `sessions/` whose id is not a UUID, sockets under `$XDG_RUNTIME_DIR/hyoui`, and symlinks left in those places. See `docs/runbooks/session-uuid-migration-dr-0041.md`
 
 ### 10. Stop leaking parent env into the child (env scrub)
 
