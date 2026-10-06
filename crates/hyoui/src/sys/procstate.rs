@@ -53,6 +53,28 @@ mod imp {
     }
 }
 
+/// 子 `pid` が exit するまで block して待つ。`WNOWAIT` なので reap せず zombie の
+/// まま残す (= 後続の `waitpid` が exit を観測できる)。nix の `waitid` は macOS で
+/// 未提供のため libc を直接使う。test が「時間に依存せず zombie を作る」ための道具。
+#[cfg(test)]
+pub fn wait_exit_nowait(pid: i32) -> std::io::Result<()> {
+    // SAFETY: siginfo_t は全ビット 0 が有効な POD。waitid は有効な out ポインタに書くだけ。
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

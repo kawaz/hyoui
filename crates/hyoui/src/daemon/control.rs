@@ -2116,8 +2116,11 @@ mod tests {
             .spawn()
             .expect("spawn /usr/bin/true");
         let child = nix::unistd::Pid::from_raw(spawned.id() as i32);
-        // 子が exit して zombie になるのを少し待つ
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // 子が exit して zombie になるまで block して待つ。WNOWAIT なので reap
+        // せず zombie のまま残る (= 時間に依存せず「zombie を作ってから生死
+        // チェックする」前提を確定させる)。
+        crate::sys::procstate::wait_exit_nowait(child.as_raw())
+            .expect("waitid(WEXITED|WNOWAIT) must observe the child exit without reaping");
 
         // handle_status_query と同じ生死チェック (= kill(pid, 0))。zombie は
         // 「alive 扱い」(= kill 0 が成功) でよい — exit の観測は lifecycle の責務。
