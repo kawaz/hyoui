@@ -45,18 +45,20 @@ hyoui attach run-<pid>-<rand>
 # 接続を畳むなら hyoui detach run-<pid>-<rand>
 ```
 
-stdin を pipe / file にすると、`--detached` の有無によらず子に届き、入力の終わりで子に EOF (Ctrl-D) が伝わる ([DR-0019](./decisions/DR-0019-run-option-cleanup-and-suspend-policy-placement.md) §5)。`--detached` では daemon が読み続けるので、`tail -f` のような終わらない入力でも run はすぐ戻る。
+stdin を pipe / file にすると、その fd が `--detached` の有無によらず子の stdin になる。子の stdout / stderr と制御端末は PTY のまま ([DR-0042](./decisions/DR-0042-non-tty-stdin-is-the-childs-fd.md))。子から見た stdin は直接実行と同じなので、子は pipe を読み、pipe の EOF で終わる。バイナリもそのまま届く。hyoui は pipe を読まないので、`tail -f` のような終わらない入力でも `--detached` の run はすぐ戻る。
 
 ```sh
 echo "1+2" | hyoui run -- bc                  # attach したまま、bc が 3 を出して終わる
-hyoui run --detached -- claude <<<"prompt"    # detached でも prompt が子に届く
-printf 'hoge' | hyoui run --detached -- cat   # 改行で終わらない入力も EOF まで届く
+hyoui run --detached -- claude <<<"prompt"    # 直接実行と同じく prompt が最初の入力として送信される
+printf 'a\003b\000c\n' | hyoui run -- od -c    # バイナリも化けない
 ```
 
-- 子の stdin は PTY のままなので、EOF は Ctrl-D (0x04) として送る。行の途中で終わる入力は Ctrl-D を 2 個送る (1 個目で途中の行を確定、2 個目で EOF)
-- raw mode の TUI には Ctrl-D がただの入力として刺さる。pipe で流し込んだ後に attach で対話するなら `--stdin-eof=detach` で EOF を送らない
-- stdin が端末の時は読まない。`/dev/null` は他の非 tty と同じく、すぐ EOF になって Ctrl-D を送る (attach も `--detached` も同じ。子が Ctrl-D をどう扱うかは子次第で、`bash -i` などの対話 shell は終わる。残したいなら `--stdin-eof=detach`)
-- `while read l; do hyoui run --detached -- x; done < list` のように stdin を共有するループでは、子が stdin の残りを読み切る。`</dev/null` を付ければ残りは読まれない (子には EOF の Ctrl-D が届く)
+- pipe を読みつつキーボードを使う TUI (claude / fzf / less 等) は、直接実行と同じく `/dev/tty` (= hyoui の PTY) からキーを読む。attach のキーも `hyoui input` もそこに届く
+- stdin を読むプログラム (`cat` 等) に pipe を渡した後は、`hyoui input` はそのプログラムの stdin には届かない (直接実行で pipe を渡した時と同じ)
+- `/dev/null` も他の非 tty と同じく子の stdin になり、子はすぐ EOF を読む。`bash -i` などの対話 shell は終わる。端末の無い起動元 (agent や script) から外で操作し続ける shell / REPL を作る時は `--pty-stdin` を付けて子の stdin も PTY にする: `hyoui run --detached --pty-stdin -- bash -i`
+- stdin が端末の時は子の stdin も PTY (従来どおり)
+- attach client は stdin を子に流さない。キーは stdin が端末なら stdin、そうでなければ `/dev/tty` から読み、どちらも無ければ出力だけを中継して子の exit で終わる
+- `while read l; do hyoui run --detached -- x; done < list` のように stdin を共有するループでは、子が stdin の残りを読む (直接実行と同じ)。`</dev/null` を付ければ残りは読まれない
 
 ### 2. read-only で観察する
 
@@ -74,7 +76,7 @@ hyoui kill --signal KILL run-<pid>-<rand>  # SIGKILL
 
 ## 自動操作
 
-以下のレシピは `SESS` に session id が入っている前提（例: `SESS=$(hyoui run --detached -- bash)`）。
+以下のレシピは `SESS` に session id が入っている前提（例: `SESS=$(hyoui run --detached -- bash)`。端末の無い起動元から作るなら `--pty-stdin` を付ける）。
 
 ### 4. 入力注入 (`input` family)
 

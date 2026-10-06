@@ -7,12 +7,14 @@
 //! `[session] on_child_suspend` の値で与える (= `show_child_action_menu` が旧
 //! `resume_stopped_child = false` に相当)。
 
+mod common;
+
 use std::io;
 use std::os::unix::net::UnixListener;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
-use hyoui::protocol::messages::HandshakeResponse;
+use hyoui::protocol::messages::{HandshakeResponse, SessionExitNotify};
 use hyoui::protocol::{ControlMessage, Frame, Mode, TYPE_CBOR_CONTROL};
 use tempfile::TempDir;
 
@@ -54,36 +56,48 @@ fn run_case(mode: Mode, child_stopped: bool, on_child_suspend: Option<&str>) -> 
             .encode_to(&mut stream)
             .expect("send handshake response");
 
-        match Frame::decode_from(&mut stream) {
-            Ok(frame) => {
-                assert_eq!(frame.ty, TYPE_CBOR_CONTROL);
-                let resumed = matches!(
-                    ControlMessage::decode_from(frame.body.as_slice())
-                        .expect("decode post-handshake control"),
-                    ControlMessage::SessionChildResumeRequest(_)
-                );
-                if resumed {
-                    // client が stdin EOF で正常 detach するまで socket を保持する。ここで
-                    // mock daemon が先に close すると attach は ConnectionLost を正しく返す。
-                    let _ = Frame::decode_from(&mut stream);
+        // 子の exit を即座に通知して attach を終わらせる (= attach は stdin を子に流さず、
+        // stdin の EOF では終わらないので、終わり方は子の exit にする、DR-0042 決定 4)。
+        // client は handshake 直後 (= run loop の前) に resume.request を送るので、socket の
+        // 順序で exit 通知より前に必ず届く。client が閉じるまで読み、resume.request の有無を
+        // 返す。
+        let exit = ControlMessage::SessionExitNotify(SessionExitNotify {
+            exit_status: 0,
+            signal: None,
+        });
+        Frame::cbor_control(exit.encode_to_vec().expect("encode exit notify"))
+            .encode_to(&mut stream)
+            .expect("send exit notify");
+        let mut resumed = false;
+        loop {
+            match Frame::decode_from(&mut stream) {
+                Ok(frame) => {
+                    assert_eq!(frame.ty, TYPE_CBOR_CONTROL);
+                    if matches!(
+                        ControlMessage::decode_from(frame.body.as_slice())
+                            .expect("decode post-handshake control"),
+                        ControlMessage::SessionChildResumeRequest(_)
+                    ) {
+                        resumed = true;
+                    }
                 }
-                resumed
+                Err(hyoui::protocol::FrameError::Protocol(
+                    hyoui::protocol::ProtocolError::UnexpectedEof(_),
+                )) => break,
+                Err(hyoui::protocol::FrameError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("unexpected post-handshake read error: {error:?}"),
             }
-            Err(hyoui::protocol::FrameError::Protocol(
-                hyoui::protocol::ProtocolError::UnexpectedEof(_),
-            )) => false,
-            Err(hyoui::protocol::FrameError::Io(error))
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::UnexpectedEof
-                        | io::ErrorKind::ConnectionReset
-                        | io::ErrorKind::BrokenPipe
-                ) =>
-            {
-                false
-            }
-            Err(error) => panic!("unexpected post-handshake read error: {error:?}"),
         }
+        resumed
     });
 
     let xdg = temp.path().join("xdg");
@@ -103,12 +117,13 @@ fn run_case(mode: Mode, child_stopped: bool, on_child_suspend: Option<&str>) -> 
         Mode::RwNoLeader => "rw-no-leader",
         _ => panic!("unsupported mode in test"),
     };
-    let output = Command::new(hyoui_bin())
+    // attach は stdin が tty でないと /dev/tty を開いてキーを読むので、専用の PTY を制御端末に
+    // して起こす (= 端末から test を走らせても開発者の端末を奪わない、DR-0042 決定 4)。
+    let cmd = pty_process::blocking::Command::new(hyoui_bin())
         .args([
             "attach",
             &format!("--socket={}", socket.display()),
             &format!("--mode={mode_arg}"),
-            "--stdin-eof=detach",
             "--quiet",
         ])
         .env("XDG_CONFIG_HOME", &xdg)
@@ -116,9 +131,9 @@ fn run_case(mode: Mode, child_stopped: bool, on_child_suspend: Option<&str>) -> 
         .env_remove("HYOUI_SESSION_ID")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("run attach client");
+        .stderr(Stdio::piped());
+    let (_ctty, child) = common::pty::spawn_in_private_ctty(cmd);
+    let output = child.wait_with_output().expect("run attach client");
     assert!(
         output.status.success(),
         "attach should exit successfully: {}",

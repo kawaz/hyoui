@@ -1,7 +1,8 @@
 //! `hyoui attach` の中核 (daemon の relay と対称)。
 //!
 //! `ClientConnection::connect` で socket connect + handshake、
-//! `ClientConnection::run` で stdin/stdout を daemon と中継する。
+//! `ClientConnection::run` で入力端末 / stdout を daemon と中継する (入力端末が無ければ
+//! `ClientConnection::run_output_only` で出力だけを中継する、DR-0042 決定 4)。
 
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
@@ -39,7 +40,7 @@ impl Read for DeadlineReader<'_> {
     }
 }
 
-/// stdin read chunk の処理結果 (= `process_ctrlz_guard` の戻り値)。
+/// 入力端末の read chunk の処理結果 (= `process_ctrlz_guard` の戻り値)。
 ///
 /// forward と suspend は排他ではない (= chunk 内の入力を子へ届けてから、その chunk の
 /// 処理後に client 自身を suspend する)。
@@ -51,7 +52,7 @@ struct GuardOutcome {
     suspend: bool,
 }
 
-/// tty stdin の入力を誰が解釈するか (DR-0032 §2 / §3)。
+/// 入力端末の入力を誰が解釈するか (DR-0032 §2 / §3)。
 ///
 /// `Child` 以外は **hyoui の操作面が開いている状態**で、入力を client が飲み PTY へ
 /// 一切 forward しない。どちらも「ユーザが明示的に操作面を呼び出した / 子が入力を
@@ -89,7 +90,7 @@ struct CtrlzGuard {
     decoder: KeyDecoder,
 }
 
-/// tty stdin 経路の Ctrl+Z ガード state machine (DR-0029 §2)。
+/// 入力端末経路の Ctrl+Z ガード state machine (DR-0029 §2)。
 ///
 /// 規則は「**2 発ごとに 1 発だけ子へ届け、余った 1 発が client suspend タイマーを
 /// 起動する**」:
@@ -384,12 +385,13 @@ fn ctrlz_guard_poll_timeout(guard: &CtrlzGuard, now: std::time::Instant) -> Poll
     PollTimeout::from(millis)
 }
 
-/// stdin の `poll(2)` revents が「EOF 相当 (= もう読めない)」を意味するか判定する
-/// (= C-1: 非 tty stdin の POLLNVAL/POLLERR/POLLHUP 取りこぼし対策)。
+/// 入力の `poll(2)` revents が「EOF 相当 (= もう読めない)」を意味するか判定する
+/// (= C-1: POLLNVAL/POLLERR/POLLHUP 取りこぼし対策。入力端末が閉じた / hangup した時、
+/// library から pipe 等を入力に渡した時に効く)。
 ///
 /// `POLLIN` 単独は通常の読み取り readiness なので EOF 相当ではない (= read で 0 を
 /// 観測して初めて EOF。本関数では false を返し、呼び出し側の read 経路に進ませる)。
-/// 一方、以下は read に到達できない / read しても EOF なので、stdin EOF 経路に倒す:
+/// 一方、以下は read に到達できない / read しても EOF なので、入力 EOF 経路に倒す:
 ///
 /// - `POLLNVAL`: fd が poll 不可 (= macOS で `/dev/null` 等 chardev を `POLLIN` 要求
 ///   すると即時返る、実機確認: macOS=0x20)。read を試すべきでないので即 EOF 扱い。
@@ -400,7 +402,7 @@ fn ctrlz_guard_poll_timeout(guard: &CtrlzGuard, now: std::time::Instant) -> Poll
 /// ある) ことがあるため、`POLLIN` が立っているときは EOF と即断せず read 経路に
 /// 任せる (= read が残り byte を返し切ってから 0 で EOF を観測する)。`POLLNVAL` は
 /// fd 自体が無効なので `POLLIN` 有無に関わらず EOF 扱いにする。
-fn stdin_revents_is_eof(revents: PollFlags) -> bool {
+fn input_revents_is_eof(revents: PollFlags) -> bool {
     if revents.contains(PollFlags::POLLNVAL) {
         return true;
     }
@@ -505,8 +507,8 @@ pub enum RunOutcome {
         /// 子の exit code (signal 死は 128+signum)。
         exit_status: i32,
     },
-    /// client が **自分から** 接続を畳んだ (= `--stdin-eof=detach` での stdin EOF、
-    /// または stdin read error)。子は daemon 配下に残る。正常離脱なので CLI 層は exit 0。
+    /// client が **自分から** 接続を畳んだ (= 入力端末の EOF / read error、または操作面での
+    /// detach)。子は daemon 配下に残る。正常離脱なので CLI 層は exit 0。
     ///
     /// Ctrl+Z 単発は detach ではなく **client suspend** (DR-0029 §2) なので、この
     /// outcome にはならない (= 接続は維持され、`fg` で観測が続く)。
@@ -528,13 +530,9 @@ pub enum RunOutcome {
     BackpressureDisconnected,
 }
 
-/// `ClientConnection::run` で stdin EOF を検出したときの挙動 (R5-FB2)。detached の daemon
-/// 転送と共有するため定義は [`crate::stdin_eof`] に置く。
-pub use crate::stdin_eof::StdinEofAction;
-
 /// daemon と確立した 1 接続。
 ///
-/// `connect` で handshake 完了状態を持ち、`run` で stdin/stdout 中継に入る。
+/// `connect` で handshake 完了状態を持ち、`run` で入力端末 / stdout の中継に入る。
 #[derive(Debug)]
 pub struct ClientConnection {
     reader: UnixStream,
@@ -542,10 +540,6 @@ pub struct ClientConnection {
     read_deadline: Option<Instant>,
     /// daemon が返した handshake response (= 確定した cap / mode / leader / session_id)。
     pub response: HandshakeResponse,
-    /// stdin EOF 時の挙動 (R5-FB2)。default `Detach` (= MVP attach 挙動)。
-    /// `set_stdin_eof_action(SendEof)` で `hyoui run -- bc`
-    /// のような pipe-through pattern で子に EOF を伝える。
-    eof_action: StdinEofAction,
     /// 外側 stdout が tty で、client が raw mode 中か (= CLI 層が raw mode guard を
     /// 取得できたとき `true`)。
     ///
@@ -739,7 +733,6 @@ impl ClientConnection {
             writer,
             read_deadline: deadline,
             response,
-            eof_action: StdinEofAction::Detach,
             outer_tty_raw: false,
             outer_tty_guard: None,
             winch_source: None,
@@ -775,24 +768,6 @@ impl ClientConnection {
         self
     }
 
-    /// stdin EOF 時の挙動を設定 (R5-FB2 / DR-0019 §5)。
-    ///
-    /// `SendEof` を設定すると `run` が stdin EOF を検出した時点で EOT (= 0x04) を
-    /// 子 PTY に送り、stdin を poll 対象から外したまま loop を継続する (= 即 return
-    /// しない)。子 (= canonical mode の bc 等) は EOT を read EOF として解釈し、
-    /// 計算結果を出力してから exit する。その出力と `SessionExitNotify` を socket 経路で
-    /// 拾い切ってから抜けることで、pipe-through (`echo ... | hyoui run -- bc`) の
-    /// 透過性を回復する。`Detach` は EOF を検出した時点で即 return する (= 子は
-    /// daemon 配下に残る)。
-    ///
-    /// `run` / `attach` いずれも非 tty stdin (= pipe / `< /dev/null`) では default が
-    /// `SendEof`、tty stdin では `Detach` を CLI 層が選ぶ (DR-0019 §5)。
-    #[must_use]
-    pub fn with_stdin_eof_action(mut self, action: StdinEofAction) -> Self {
-        self.eof_action = action;
-        self
-    }
-
     /// attach client UX 設定 (= Ctrl+Z ガード等) を適用する (DR-0029)。
     #[must_use]
     pub fn with_attach_config(mut self, config: crate::config::AttachConfig) -> Self {
@@ -812,8 +787,8 @@ impl ClientConnection {
 
     /// SIGWINCH → Resize の中継元を設定する (DR-0019 §6)。設定すると `run` の poll
     /// loop が notify pipe を監視し、WINCH 観測時に外側端末サイズを取得して leader
-    /// なら `Resize` message を daemon に送る。CLI 層が raw mode guard 保持時 (= tty
-    /// stdin) に設定する。
+    /// なら `Resize` message を daemon に送る。CLI 層が raw mode guard 保持時 (= 入力端末が
+    /// tty) に設定する。
     #[must_use]
     pub fn with_winch_source(mut self, source: WinchSource) -> Self {
         self.winch_source = Some(source);
@@ -865,19 +840,10 @@ impl ClientConnection {
         let _ = stdout.flush();
     }
 
-    /// `--stdin-eof=send-eof` の stdin EOF で、子 PTY に EOF を伝える EOT を送る
-    /// (DR-0019 §5)。個数は送り済み入力の末尾で決まる ([`crate::stdin_eof`]、daemon の
-    /// detached 転送と同じ判定)。送信失敗は無視する (= 直後の socket 読みで接続喪失を拾う)。
-    fn send_stdin_eof(&mut self, tracker: &crate::stdin_eof::EofTracker) {
-        let frame = Frame::raw_data(tracker.eof_bytes().to_vec());
-        let _ = frame.encode_to(&mut self.writer);
-        let _ = self.writer.flush();
-    }
-
     /// `Detach` message を daemon に送り、外側端末を reset して `Detached` を返す。
     ///
-    /// 呼び出し元は stdin EOF (`--stdin-eof=detach`) と stdin read error (= 入力経路の
-    /// 故障)。どちらも「窓を閉じて子は残す」意味なので、socket の EOF 検出に任せず
+    /// 呼び出し元は入力端末の EOF と read error (= 入力経路の故障)、操作面での detach。
+    /// どれも「窓を閉じて子は残す」意味なので、socket の EOF 検出に任せず
     /// 明示的に `Detach` を送る (DR-0029 §Consequences: reset は全 detach 経路で共通)。
     fn finish_detach<W: Write>(&mut self, stdout: &mut W) -> RunOutcome {
         let detach = ControlMessage::Detach(Detach {
@@ -1101,15 +1067,16 @@ impl ClientConnection {
         let _ = stdout.flush();
     }
 
-    /// stdin / stdout を daemon と中継する。
+    /// 入力端末 (`input`) / stdout を daemon と中継する。
+    ///
+    /// `input` は利用者のキーを読む端末 (CLI 層は stdin が tty なら stdin、そうでなければ
+    /// `/dev/tty` を渡す、DR-0042 決定 4)。読んだ bytes は Ctrl+Z ガード (DR-0029) を通して
+    /// 子 PTY に送る。外側端末の行数 (= 通知行 / menu の描画位置) も `input` から引く。
     ///
     /// 終了条件 ([`RunOutcome`] で種別を返す、issue 2026-06-11 優先1):
     /// - 子 PTY exit (= `SessionExitNotify` 受信) → `Ok(RunOutcome::ChildExited)`
-    /// - 自発 detach (= `--stdin-eof=detach` での stdin EOF、または stdin read error)
-    ///   → `Ok(RunOutcome::Detached)`。tty stdin では通常 EOF は起きないが、
-    ///   pipe / `< /dev/null` 等の非 tty stdin では起きる。`eof_action` が `SendEof`
-    ///   の場合は EOT を送って子の出力を拾い切ってから抜ける (= `with_stdin_eof_action`
-    ///   参照、DR-0019 §5)。
+    /// - 自発 detach (= `input` の EOF / read error、操作面での detach)
+    ///   → `Ok(RunOutcome::Detached)`。子には何も送らない (= 子は daemon 配下に残る)
     /// - 予期しない socket 喪失 (= daemon の EOF / POLLHUP / POLLERR、socket 書き込み
     ///   失敗) → `Ok(RunOutcome::ConnectionLost)` (= daemon 消滅の疑い)
     /// - protocol violation → `Err`
@@ -1124,15 +1091,39 @@ impl ClientConnection {
     /// I/O / decode error は [`Error`] で返す。socket EOF は `Ok(RunOutcome::ConnectionLost)`
     /// で「予期しない切断」として返す (= Err ではない)。
     pub fn run<R: Read + AsFd, W: Write>(
+        self,
+        input: &mut R,
+        stdout: &mut W,
+    ) -> Result<RunOutcome, Error> {
+        self.relay(Some(input), stdout)
+    }
+
+    /// 入力端末無しで、daemon からの出力だけを stdout に中継する (DR-0042 決定 4)。
+    ///
+    /// 呼び出し元に制御端末が無い (= `/dev/tty` が開けない。agent の Bash ツール / CI 等)
+    /// 時の attach。キーは送らず、終了条件は [`ClientConnection::run`] から入力の EOF を
+    /// 除いたもの (= 子の exit、`hyoui detach`、接続の喪失)。
+    ///
+    /// # Errors
+    ///
+    /// [`ClientConnection::run`] と同じ。
+    pub fn run_output_only<W: Write>(self, stdout: &mut W) -> Result<RunOutcome, Error> {
+        self.relay(None::<&mut std::fs::File>, stdout)
+    }
+
+    /// [`ClientConnection::run`] / [`ClientConnection::run_output_only`] の本体。`input` が
+    /// `None` なら入力を poll せず、外側端末の行数も引かない (= 通知行 / menu を描かない)。
+    fn relay<R: Read + AsFd, W: Write>(
         mut self,
-        stdin: &mut R,
+        mut input: Option<&mut R>,
         stdout: &mut W,
     ) -> Result<RunOutcome, Error> {
         let mut ctrlz = CtrlzGuard::default();
         let mut focus = InputFocus::Child;
-        // DR-0019 §5: 子 PTY に送った入力の末尾。stdin EOF で送る EOT の個数を決める
-        // (= 改行で終わらない入力は 2 個)。操作面が飲んだ入力は子に届かないので数えない。
-        let mut eof_tracker = crate::stdin_eof::EofTracker::new();
+        // 外側端末の行数は入力端末から引く (= 入力が無ければ描画位置も無い)。
+        let input_rows = |input: &Option<&mut R>| -> Option<u16> {
+            input.as_deref().and_then(|i| outer_tty_rows(i.as_fd()))
+        };
         // DR-0032 §2: handshake snapshot が stopped なら redraw を待たず menu と focus を
         // 即座に成立させる。DEC synchronized update 中は daemon が attach redraw を sync
         // 終了まで保留するため、redraw 待ちにすると停止中の子を起こす手段まで失う。
@@ -1146,7 +1137,7 @@ impl ClientConnection {
             && stopped_child_action(self.response.mode, self.on_child_suspend)
                 == StoppedChildAction::Menu
         {
-            let rows = outer_tty_rows(stdin.as_fd());
+            let rows = input_rows(&input);
             if self.draw_child_action_menu(stdout, rows) {
                 focus = InputFocus::ChildMenu;
                 initial_attach_redraw_pending = true;
@@ -1156,30 +1147,18 @@ impl ClientConnection {
                 self.draw_child_stopped_notice(stdout, rows);
             }
         }
-        // DR-0019 §5: SendEof で stdin EOF 観測後、stdin はもう読まない (= EOT 送出
-        // 済) が、子の出力 (= bc の計算結果) と SessionExitNotify を拾い切るため
-        // loop は継続する。
-        //
-        // M-1: stdin_done になったら stdin fd を poll 配列から**完全に除外**する
-        // (= PollFlags::empty() で残す方式は不可)。理由は 2 つ:
-        //   1. Linux の poll(2) は POLLHUP/POLLERR を events マスク無視で revents に
-        //      報告するため、EOF 済み pipe を events=0 で poll し続けると即時 return の
-        //      busy loop になる。
-        //   2. events=0 で残すと、stdin pipe の EOF 後に POLLHUP が立ち、drain 継続中の
-        //      stdin EOF 判定経路が即 Ok(None) return して bc の出力を取りこぼす race が
-        //      残る (= DR-0019 §5 が直したはずの透過性回復が壊れる)。
-        // fd を見ない構造にすることで両方を断つ。
-        let mut stdin_done = false;
         // 新規二重防御: winch notify fd が POLLHUP/POLLERR を返したら監視を諦める
         // (= signal thread 起動失敗等で write 端が drop され read 端だけ残ると、
         // POLLIN しか処理しない loop が POLLHUP で idle busy loop になるのを防ぐ)。
         let mut winch_disabled = false;
         loop {
             let socket_fd = self.reader.as_fd();
-            // poll 配列を動的に組む。socket は常に index 0。stdin は stdin_done なら
-            // 除外、winch notify は winch_source があり winch_disabled でなければ末尾。
-            // 各 fd の index は変数で管理する (= 含めなかった fd の revents を誤読しない)。
-            let stdin_fd = stdin.as_fd();
+            // poll 配列を動的に組む。socket は常に index 0。入力は在る時だけ積む (= 入力の
+            // 無い中継では積まない。events=0 で積むと Linux は POLLHUP/POLLERR を mask 無視で
+            // 返し busy loop になる)。winch notify は winch_source があり winch_disabled で
+            // なければ末尾。各 fd の index は変数で管理する (= 含めなかった fd の revents を
+            // 誤読しない)。
+            let input_fd = input.as_deref().map(|i| i.as_fd());
             let winch_fd = if winch_disabled {
                 None
             } else {
@@ -1187,13 +1166,11 @@ impl ClientConnection {
             };
             let mut fds: Vec<PollFd> = Vec::with_capacity(3);
             fds.push(PollFd::new(socket_fd, PollFlags::POLLIN));
-            let stdin_idx = if stdin_done {
-                None
-            } else {
+            let input_idx = input_fd.map(|ifd| {
                 let idx = fds.len();
-                fds.push(PollFd::new(stdin_fd, PollFlags::POLLIN));
-                Some(idx)
-            };
+                fds.push(PollFd::new(ifd, PollFlags::POLLIN));
+                idx
+            });
             let winch_idx = winch_fd.map(|wfd| {
                 let idx = fds.len();
                 fds.push(PollFd::new(wfd, PollFlags::POLLIN));
@@ -1223,7 +1200,6 @@ impl ClientConnection {
                     &self.attach_config,
                 );
                 if !outcome.forward.is_empty() {
-                    eof_tracker.observe(&outcome.forward);
                     let frame = Frame::raw_data(outcome.forward);
                     if frame.encode_to(&mut self.writer).is_err() {
                         return Ok(RunOutcome::ConnectionLost);
@@ -1232,7 +1208,7 @@ impl ClientConnection {
                 if outcome.suspend {
                     // DR-0032 §3: 単発確定後の action は config で決まる
                     // (client suspend / detach / 選択プロンプト)。
-                    let rows = outer_tty_rows(stdin.as_fd());
+                    let rows = input_rows(&input);
                     if let Some(o) = self.run_ctrlz_x1_action(stdout, &mut focus, rows) {
                         return Ok(o);
                     }
@@ -1245,7 +1221,7 @@ impl ClientConnection {
             }
 
             let sock_revents = fds[0].revents().unwrap_or(PollFlags::empty());
-            let stdin_revents = stdin_idx.map_or(PollFlags::empty(), |i| {
+            let input_revents = input_idx.map_or(PollFlags::empty(), |i| {
                 fds[i].revents().unwrap_or(PollFlags::empty())
             });
             let winch_revents = winch_idx.map_or(PollFlags::empty(), |i| {
@@ -1326,7 +1302,7 @@ impl ClientConnection {
                             let _ = stdout.flush();
 
                             if is_initial_attach_redraw && focus == InputFocus::ChildMenu {
-                                let rows = outer_tty_rows(stdin.as_fd());
+                                let rows = input_rows(&input);
                                 // redraw 到着までに ModeChange が先行し得るため、handshake
                                 // snapshot の判定を使い回さず、描画直前の mode で再評価する。
                                 if stopped_child_action(self.response.mode, self.on_child_suspend)
@@ -1371,7 +1347,7 @@ impl ClientConnection {
                                     // DR-0032 §1: 起こす / menu を出す / 何もしないの 3 分岐は
                                     // `stopped_child_action` に集約 (= handshake snapshot 経路と
                                     // 同じ判定を共有する)。
-                                    let rows = outer_tty_rows(stdin.as_fd());
+                                    let rows = input_rows(&input);
                                     match stopped_child_action(
                                         self.response.mode,
                                         self.on_child_suspend,
@@ -1455,11 +1431,11 @@ impl ClientConnection {
                         }
                         TYPE_RAW_ACK => {
                             // DR-0021: daemon は raw_data write 完了ごとに RawAck を返す。
-                            // attach の stdin forward は fire-and-forget (= 完了点同期を
+                            // attach の入力 forward は fire-and-forget (= 完了点同期を
                             // 必要としない) ので読み捨てる。`recv_control` の silent skip
-                            // (DR-0021 改訂 m1) と同じ扱い。ここで捨てないと最初の打鍵 /
-                            // pipe 入力 / SendEof の EOT 送信直後に unknown frame 扱いで
-                            // client が異常終了する (= interactive 打鍵の全滅 bug)。
+                            // (DR-0021 改訂 m1) と同じ扱い。ここで捨てないと最初の打鍵の
+                            // 直後に unknown frame 扱いで client が異常終了する
+                            // (= interactive 打鍵の全滅 bug)。
                         }
                         _ => return Err(Error::Invalid("unknown frame type from daemon")),
                     },
@@ -1477,47 +1453,26 @@ impl ClientConnection {
                 return Ok(RunOutcome::ConnectionLost);
             }
 
-            // C-1: stdin の revents が EOF 相当 (= POLLNVAL/POLLERR/POLLHUP で read に
-            // 到達できない or read しても EOF) なら、read を試さず stdin EOF 経路へ倒す。
-            // 非 tty stdin (= `< /dev/null` など) で macOS が POLLNVAL を即時返す場合、
-            // POLLIN が立たないため従来は read に到達できず EOF を観測できなかった
-            // (= EOT 未送出 + poll 即 return の busy loop)。
-            if stdin_revents_is_eof(stdin_revents) {
-                // R5-FB2 / DR-0019 §5: stdin EOF の挙動は `eof_action` で分岐。
-                // - Detach (default): 即 return (= MVP attach 挙動。子は残る)
-                // - SendEof: EOT (0x04) を子 PTY に送り、stdin は閉じたまま loop を
-                //   継続する。子 (= canonical mode の bc 等) は EOT を read EOF として
-                //   解釈し、計算結果を出力してから exit する。その出力と
-                //   SessionExitNotify を socket 経路で拾い切るため、ここで return せず
-                //   stdin_done を立てて stdin fd を poll 配列から外し socket だけ poll
-                //   し続ける (= 即 return すると bc の出力が stdout に届く前に client が
-                //   抜けてしまう、DR-0019 §5 の透過性回復要件)。
-                if self.eof_action == StdinEofAction::SendEof {
-                    self.send_stdin_eof(&eof_tracker);
-                    stdin_done = true;
-                    continue;
-                }
-                // `--stdin-eof=detach`: stdin が閉じたので自分から離脱する (= 自発 detach、
-                // 子は daemon 配下に残す)。
+            let Some(input) = input.as_deref_mut() else {
+                continue;
+            };
+
+            // C-1: 入力の revents が EOF 相当 (= POLLNVAL/POLLERR/POLLHUP で read に
+            // 到達できない or read しても EOF) なら、read を試さず EOF 経路へ倒す
+            // (= POLLIN が立たないまま poll が即 return する busy loop を避ける)。
+            // 入力が閉じたので自分から離脱する (= 自発 detach、子には何も送らず daemon 配下に
+            // 残す)。
+            if input_revents_is_eof(input_revents) {
                 return Ok(self.finish_detach(stdout));
             }
 
-            // stdin → socket: raw data frame で送る
-            if stdin_revents.contains(PollFlags::POLLIN) {
+            // 入力 → socket: raw data frame で送る
+            if input_revents.contains(PollFlags::POLLIN) {
                 let mut buf = [0u8; 8192];
-                match stdin.read(&mut buf) {
-                    Ok(0) => {
-                        // read が 0 = EOF。revents が POLLIN だけ立っていたケース
-                        // (= 上の stdin_revents_is_eof で拾えなかった通常の pipe EOF)。
-                        // 挙動は上と同じく eof_action で分岐する。
-                        if self.eof_action == StdinEofAction::SendEof {
-                            self.send_stdin_eof(&eof_tracker);
-                            stdin_done = true;
-                            continue;
-                        }
-                        // `--stdin-eof=detach`: 自発 detach (= 子は残す)。
-                        return Ok(self.finish_detach(stdout));
-                    }
+                match input.read(&mut buf) {
+                    // read が 0 = EOF。revents が POLLIN だけ立っていたケース
+                    // (= 上の input_revents_is_eof で拾えなかった EOF)。自発 detach。
+                    Ok(0) => return Ok(self.finish_detach(stdout)),
                     Ok(n) => match focus {
                         // DR-0032 §2 / §3: 操作面が開いている間は入力を client が飲み、
                         // PTY へ一切 forward しない。表に無いキーは破棄する。
@@ -1544,7 +1499,6 @@ impl ClientConnection {
                                 &self.attach_config,
                             );
                             if !outcome.forward.is_empty() {
-                                eof_tracker.observe(&outcome.forward);
                                 let frame = Frame::raw_data(outcome.forward);
                                 if frame.encode_to(&mut self.writer).is_err() {
                                     return Ok(RunOutcome::ConnectionLost);
@@ -1554,7 +1508,7 @@ impl ClientConnection {
                                 // `ctrlz_guard_delay = 0` で即 suspend / detach / プロンプトへ
                                 // 遷移する経路 (= 保留窓を使わない設定)。入力は上で送り切って
                                 // から action を実行する。
-                                let rows = outer_tty_rows(stdin.as_fd());
+                                let rows = outer_tty_rows(input.as_fd());
                                 if let Some(o) = self.run_ctrlz_x1_action(stdout, &mut focus, rows)
                                 {
                                     return Ok(o);
@@ -1563,12 +1517,12 @@ impl ClientConnection {
                         }
                     },
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    // stdin read error: 入力経路が壊れた。子は daemon 配下に残せるので
+                    // 入力の read error: 入力経路が壊れた。子は daemon 配下に残せるので
                     // 自発 detach 相当 (= 接続喪失ではない)。
                     Err(_) => return Ok(self.finish_detach(stdout)),
                 }
             }
-            // POLLHUP/POLLERR/POLLNVAL は上の stdin_revents_is_eof 経路で処理済み。
+            // POLLHUP/POLLERR/POLLNVAL は上の input_revents_is_eof 経路で処理済み。
         }
     }
 
@@ -1868,58 +1822,52 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    // ---- C-1: stdin_revents_is_eof unit tests ----
+    // ---- C-1: input_revents_is_eof unit tests ----
 
     #[test]
-    fn stdin_revents_pollin_only_is_not_eof() {
+    fn input_revents_pollin_only_is_not_eof() {
         // POLLIN 単独は通常の readiness。read 経路に任せる (= EOF ではない)。
-        assert!(!stdin_revents_is_eof(PollFlags::POLLIN));
+        assert!(!input_revents_is_eof(PollFlags::POLLIN));
     }
 
     #[test]
-    fn stdin_revents_pollnval_is_eof_even_with_pollin() {
+    fn input_revents_pollnval_is_eof_even_with_pollin() {
         // POLLNVAL (= macOS の /dev/null 等) は fd 無効なので POLLIN 有無に関わらず EOF。
-        assert!(stdin_revents_is_eof(PollFlags::POLLNVAL));
-        assert!(stdin_revents_is_eof(
+        assert!(input_revents_is_eof(PollFlags::POLLNVAL));
+        assert!(input_revents_is_eof(
             PollFlags::POLLNVAL | PollFlags::POLLIN
         ));
     }
 
     #[test]
-    fn stdin_revents_pollhup_pollerr_are_eof_without_pollin() {
-        assert!(stdin_revents_is_eof(PollFlags::POLLHUP));
-        assert!(stdin_revents_is_eof(PollFlags::POLLERR));
+    fn input_revents_pollhup_pollerr_are_eof_without_pollin() {
+        assert!(input_revents_is_eof(PollFlags::POLLHUP));
+        assert!(input_revents_is_eof(PollFlags::POLLERR));
     }
 
     #[test]
-    fn stdin_revents_pollhup_with_pollin_defers_to_read() {
+    fn input_revents_pollhup_with_pollin_defers_to_read() {
         // POLLHUP + POLLIN は「まだ未読 byte がある」可能性 → read に任せる (= EOF 即断しない)。
-        assert!(!stdin_revents_is_eof(
+        assert!(!input_revents_is_eof(
             PollFlags::POLLHUP | PollFlags::POLLIN
         ));
-        assert!(!stdin_revents_is_eof(
+        assert!(!input_revents_is_eof(
             PollFlags::POLLERR | PollFlags::POLLIN
         ));
     }
 
     #[test]
-    fn stdin_revents_empty_is_not_eof() {
-        assert!(!stdin_revents_is_eof(PollFlags::empty()));
+    fn input_revents_empty_is_not_eof() {
+        assert!(!input_revents_is_eof(PollFlags::empty()));
     }
 
-    // ---- M-1: stdin EOF (POLLNVAL) で run が spin せず SendEof 経路に倒れる ----
+    // ---- 入力の EOF は子に何も送らず自発 detach (DR-0042 決定 4) ----
 
-    /// 非 tty stdin が即 POLLNVAL/EOF を返すケースで、SendEof 設定の run が EOT を 1 回
-    /// 送ってから stdin を poll 配列から外し (= 即時 return の busy loop にならず)、socket
-    /// EOF で正常終了することを検証する。stdin として「既に EOF な pipe (write 端を即
-    /// close)」を渡すと read=0 / POLLHUP 経路を踏む (= macOS の POLLNVAL と同じ EOF 経路に
-    /// 合流)。run が return することで「stdin_done 後に stdin fd を見続けて spin しない」
-    /// (= M-1 で poll 配列から除外した効果) を間接的に保証する。
-    #[test]
-    fn run_send_eof_on_already_eof_stdin_sends_single_eot_and_exits() {
-        use std::os::unix::net::UnixStream;
-
-        let (client_sock, daemon_sock) = UnixStream::pair().expect("socketpair");
+    /// テスト用の `ClientConnection` を socketpair の片側で組む (= daemon 役は返り値の
+    /// `UnixStream`)。
+    fn test_conn(mode: Mode) -> (ClientConnection, std::os::unix::net::UnixStream) {
+        let (client_sock, daemon_sock) =
+            std::os::unix::net::UnixStream::pair().expect("socketpair");
         let transport = UnixStreamTransport::new(client_sock);
         let (reader, writer) = transport.split().expect("split");
         let conn = ClientConnection {
@@ -1931,10 +1879,9 @@ mod tests {
                 session_id: "t".into(),
                 client_id: 1,
                 leader: false,
-                mode: Mode::Rw,
+                mode,
                 child_stopped: false,
             },
-            eof_action: StdinEofAction::SendEof,
             outer_tty_raw: false,
             outer_tty_guard: None,
             winch_source: None,
@@ -1943,29 +1890,61 @@ mod tests {
             on_child_suspend: crate::config::OnChildSuspendSetting::default(),
             poisoned: false,
         };
+        (conn, daemon_sock)
+    }
 
-        // 既に EOF な stdin: pipe の write 端を即 close。
-        let (stdin_rd, stdin_wr) = nix::unistd::pipe().expect("stdin pipe");
-        drop(stdin_wr);
-        let mut stdin_file = std::fs::File::from(stdin_rd);
+    /// 既に EOF な入力 (= write 端を閉じた pipe、read=0 / POLLHUP 経路。macOS の POLLNVAL も
+    /// 同じ EOF 経路に合流する) で、run は子に bytes を送らず `Detach` を 1 つ送って
+    /// `Detached` で戻る (= 子への入力を合成しない、spin もしない)。
+    #[test]
+    fn run_on_already_eof_input_detaches_without_sending_bytes() {
+        let (conn, daemon_sock) = test_conn(Mode::Rw);
+        let (input_rd, input_wr) = nix::unistd::pipe().expect("input pipe");
+        drop(input_wr);
+        let mut input = std::fs::File::from(input_rd);
         let mut stdout: Vec<u8> = Vec::new();
+        let res = conn.run(&mut input, &mut stdout);
+        assert_eq!(res.ok(), Some(RunOutcome::Detached));
 
-        let run_handle = std::thread::spawn(move || conn.run(&mut stdin_file, &mut stdout));
-
-        // daemon 役: EOT (= 0x04) frame を 1 つ受信できるはず。
         let mut daemon_reader = daemon_sock;
-        let frame = Frame::decode_from(&mut daemon_reader).expect("decode EOT frame");
-        assert_eq!(frame.ty, TYPE_RAW_DATA);
+        let frame = Frame::decode_from(&mut daemon_reader).expect("decode detach frame");
         assert_eq!(
-            frame.body,
-            vec![0x04],
-            "stdin EOF で EOT が 1 回送られるはず"
+            frame.ty, TYPE_CBOR_CONTROL,
+            "子へ bytes (raw_data) を送ってはいけない"
         );
+        assert!(matches!(
+            ControlMessage::decode_from(frame.body.as_slice()),
+            Ok(ControlMessage::Detach(_))
+        ));
+    }
 
-        // socket を close → run は socket EOF で正常終了する (= stdin spin で hang しない)。
-        drop(daemon_reader);
-        let res = run_handle.join().expect("run thread join");
-        assert!(res.is_ok(), "run は socket EOF で Ok 終了するはず: {res:?}");
+    /// 入力の無い中継 (`run_output_only`、DR-0042 決定 4): 子の出力を stdout に書き、
+    /// `SessionExitNotify` で子の exit code を返す。daemon へは何も送らない。
+    #[test]
+    fn run_output_only_relays_output_until_child_exit() {
+        use crate::protocol::messages::SessionExitNotify;
+        let (conn, daemon_sock) = test_conn(Mode::Rw);
+        let mut daemon = daemon_sock;
+        Frame::raw_data(b"hello\r\n".to_vec())
+            .encode_to(&mut daemon)
+            .expect("send output");
+        let notify = ControlMessage::SessionExitNotify(SessionExitNotify {
+            exit_status: 3,
+            signal: None,
+        });
+        Frame::cbor_control(notify.encode_to_vec().expect("encode"))
+            .encode_to(&mut daemon)
+            .expect("send exit notify");
+
+        let mut stdout: Vec<u8> = Vec::new();
+        let res = conn.run_output_only(&mut stdout);
+        assert_eq!(res.ok(), Some(RunOutcome::ChildExited { exit_status: 3 }));
+        assert_eq!(stdout, b"hello\r\n");
+
+        // client は何も送っていない。run の後 conn は drop 済みなので、read は送られた
+        // bytes を返さずに EOF (= 0) になる (= 残っていれば frame が読める)。
+        let mut buf = [0u8; 16];
+        assert_eq!(std::io::Read::read(&mut daemon, &mut buf).expect("read"), 0);
     }
 
     // ---- DR-0019 §6: SIGWINCH → Resize 配線 unit tests ----
@@ -1993,7 +1972,6 @@ mod tests {
                 mode: Mode::Ro,
                 child_stopped: false,
             },
-            eof_action: StdinEofAction::Detach,
             outer_tty_raw: false,
             outer_tty_guard: None,
             winch_source: Some(WinchSource::new(rd, size_fn)),
@@ -2028,7 +2006,6 @@ mod tests {
                 mode: Mode::Rw,
                 child_stopped: false,
             },
-            eof_action: StdinEofAction::Detach,
             outer_tty_raw: false,
             outer_tty_guard: None,
             winch_source: Some(WinchSource::new(rd, size_fn)),
@@ -2085,7 +2062,6 @@ mod tests {
                 mode: Mode::Rw,
                 child_stopped: false,
             },
-            eof_action: StdinEofAction::Detach,
             outer_tty_raw: false,
             outer_tty_guard: None,
             winch_source: Some(WinchSource::new(notify_rd, size_fn)),
@@ -2159,7 +2135,6 @@ mod tests {
                 mode: Mode::Rw,
                 child_stopped: false,
             },
-            eof_action: StdinEofAction::Detach,
             outer_tty_raw: false,
             outer_tty_guard: None,
             winch_source: Some(WinchSource::new(notify_rd, size_fn)),
@@ -2237,7 +2212,6 @@ mod tests {
                 mode: Mode::Rw,
                 child_stopped: false,
             },
-            eof_action: StdinEofAction::Detach,
             outer_tty_raw: false,
             outer_tty_guard: None,
             winch_source: Some(WinchSource::new(notify_rd, size_fn)),
@@ -2786,7 +2760,6 @@ mod tests {
                 mode: Mode::Rw,
                 child_stopped: true,
             },
-            eof_action: StdinEofAction::Detach,
             outer_tty_raw: true,
             outer_tty_guard: None,
             winch_source: None,
@@ -3096,81 +3069,6 @@ mod tests {
     /// に対し、connect 側が code-specific な next-action hint 付き文言を返すこと。
     /// 旧版はどの code でも `daemon error during handshake` 一律で、ユーザが
     /// 次に何をすればいいか分からなかった。
-    /// R5-FB2: `with_stdin_eof_action(SendEof)` を設定した ClientConnection で
-    /// stdin EOF を受けた瞬間に EOT (0x04) が socket に送られ、daemon の child
-    /// PTY (canonical mode) が EOF を見て自然終了することを確認する。
-    ///
-    /// 子 cmd は `cat` (= stdin を読み続け、EOF で exit する canonical-mode
-    /// reader)。stdin を 1 度も書かずに closure (= 即 EOF) させる pattern。
-    // R4-H5 で 3s→10s に緩和したが CI Linux で elapsed=10.02s で再 flaky。
-    // daemon → child exit observation の経路に CI 環境固有の遅延があると推測。
-    // event-based に書き換える (= daemon が ChildExited を broadcast したら client が
-    // 即終了する経路を直接観測する形) まで一旦 ignore。R5-FB2 production code 本体は
-    // 残るので機能としては動く。詳細は docs/REVIEW-BACKLOG.md の R5-FB2 annotate 参照。
-    #[ignore = "CI Linux flaky (elapsed > 10s); rewrite to event-based"]
-    #[test]
-    fn headless_stdin_eof_terminates_child_reading_bc() {
-        // 名前は要件ファイル準拠だが、portability のため bc ではなく cat を使う。
-        // canonical mode + read EOF → exit という挙動は両者で同じ。
-        let dir = make_temp_socket_dir();
-        let sock = dir.path().join("eof.sock");
-        let cat_path = if std::path::Path::new("/bin/cat").exists() {
-            "/bin/cat"
-        } else if std::path::Path::new("/usr/bin/cat").exists() {
-            "/usr/bin/cat"
-        } else {
-            return; // CI 環境で cat が無ければ skip
-        };
-        let cfg = DaemonConfig::new("eof-test", sock.clone(), vec![cat_path.into()]);
-        let session = Session::start(cfg).expect("daemon start");
-        let daemon_handle = std::thread::spawn(move || session.serve());
-
-        // client 接続 + with_stdin_eof_action(SendEof)
-        let mut conn: Option<ClientConnection> = None;
-        for _ in 0..50 {
-            match ClientConnection::connect(&sock, AttachOptions::default()) {
-                Ok(c) => {
-                    conn = Some(c);
-                    break;
-                }
-                Err(_) => std::thread::sleep(Duration::from_millis(10)),
-            }
-        }
-        let conn = conn
-            .expect("client connect should succeed")
-            .with_stdin_eof_action(StdinEofAction::SendEof);
-
-        // 即 EOF な stdin: pipe を作って write 端をすぐ drop する (= read 端は
-        // Ok(0) を即返す)。`ClientConnection::run` の `R: Read + AsFd` 制約を
-        // 満たすため、read 端は `std::fs::File::from(OwnedFd)` で File 化する。
-        let (rd, wr) = nix::unistd::pipe().expect("pipe");
-        drop(wr); // 即 EOF
-        let mut input = std::fs::File::from(rd);
-        let mut output: Vec<u8> = Vec::new();
-        let run_handle = std::thread::spawn(move || conn.run(&mut input, &mut output));
-
-        // daemon thread が 10s 以内に終了することを確認する (= cat が EOT で
-        // EOF を見て exit、master_fd 経由で daemon が ChildExited を観測)。
-        // R4-H5: timing-tight な threshold は CI 高負荷で flaky になるため、
-        // 旧 3s → 10s に緩和 (= 3x ルール準拠、event-based に書き換えは別)。
-        let start = std::time::Instant::now();
-        let mut daemon_done = false;
-        while start.elapsed() < Duration::from_secs(10) {
-            if daemon_handle.is_finished() {
-                daemon_done = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            daemon_done,
-            "daemon must terminate within 10s after stdin EOF + EOT propagation; elapsed={:?}",
-            start.elapsed()
-        );
-        let _ = daemon_handle.join();
-        let _ = run_handle.join();
-    }
-
     #[test]
     fn connect_token_mismatch_returns_specific_hint() {
         let dir = make_temp_socket_dir();
@@ -3270,9 +3168,9 @@ mod tests {
         }))
         .expect("send kill");
 
-        // stdin 側は pipe の read 端。本 test の終了条件は daemon 側なので、stdin EOF
+        // 入力側は pipe の read 端。本 test の終了条件は daemon 側なので、入力 EOF
         // (= Detached) が先に競合しないよう write 端を保持する (= issue 2026-06-11
-        // 優先1 で stdin EOF と socket EOF を別 outcome に分けたため)。
+        // 優先1 で入力 EOF と socket EOF を別 outcome に分けたため)。
         let (rd, wr_keep) = nix::unistd::pipe().expect("pipe");
         let mut stdin = std::fs::File::from(rd);
         let mut stdout = Vec::<u8>::new();
@@ -3327,7 +3225,6 @@ mod tests {
                 mode: Mode::Rw,
                 child_stopped: false,
             },
-            eof_action: StdinEofAction::Detach,
             outer_tty_raw: false,
             outer_tty_guard: None,
             winch_source: None,
@@ -3392,7 +3289,6 @@ mod tests {
                 mode: Mode::Rw,
                 child_stopped: false,
             },
-            eof_action: StdinEofAction::Detach,
             outer_tty_raw: false,
             outer_tty_guard: None,
             winch_source: None,
@@ -3460,7 +3356,6 @@ mod tests {
                 mode: Mode::Rw,
                 child_stopped: false,
             },
-            eof_action: StdinEofAction::Detach,
             outer_tty_raw: true,
             outer_tty_guard: None,
             winch_source: None,
@@ -3516,7 +3411,6 @@ mod tests {
                 mode: Mode::Rw,
                 child_stopped: false,
             },
-            eof_action: StdinEofAction::Detach,
             outer_tty_raw: false,
             outer_tty_guard: None,
             winch_source: None,
@@ -3573,7 +3467,6 @@ mod tests {
                 mode: Mode::Rw,
                 child_stopped: false,
             },
-            eof_action: StdinEofAction::Detach,
             outer_tty_raw: false,
             outer_tty_guard: None,
             winch_source: None,
@@ -3609,50 +3502,6 @@ mod tests {
         );
     }
 
-    /// stdin が EOF + `--stdin-eof=detach` (default Detach) なら自発 detach として
-    /// `RunOutcome::Detached` を返す。
-    #[test]
-    fn run_returns_detached_on_stdin_eof_with_detach_action() {
-        use std::os::unix::net::UnixStream;
-
-        let (client_sock, _daemon_sock) = UnixStream::pair().expect("socketpair");
-        let transport = UnixStreamTransport::new(client_sock);
-        let (reader, writer) = transport.split().expect("split");
-        let conn = ClientConnection {
-            reader,
-            writer,
-            read_deadline: None,
-            response: HandshakeResponse {
-                caps: vec![],
-                session_id: "t".into(),
-                client_id: 1,
-                leader: false,
-                mode: Mode::Rw,
-                child_stopped: false,
-            },
-            eof_action: StdinEofAction::Detach,
-            outer_tty_raw: false,
-            outer_tty_guard: None,
-            winch_source: None,
-            pending_frames: std::collections::VecDeque::new(),
-            attach_config: crate::config::AttachConfig::default(),
-            on_child_suspend: crate::config::OnChildSuspendSetting::default(),
-            poisoned: false,
-        };
-
-        // 即 EOF な stdin。
-        let (stdin_rd, stdin_wr) = nix::unistd::pipe().expect("stdin pipe");
-        drop(stdin_wr);
-        let mut stdin_file = std::fs::File::from(stdin_rd);
-        let mut stdout: Vec<u8> = Vec::new();
-
-        let res = conn.run(&mut stdin_file, &mut stdout);
-        assert!(
-            matches!(res, Ok(RunOutcome::Detached)),
-            "stdin EOF + Detach action は Detached を返すはず: {res:?}"
-        );
-    }
-
     /// daemon が `error` kind=`backpressure.disconnect` を送ってきたら
     /// `RunOutcome::BackpressureDisconnected` を返す (= CLI 層が exit 9 +
     /// backpressure 専用 stderr を出すための分離。socket EOF を待たず即 return)。
@@ -3677,7 +3526,6 @@ mod tests {
                 mode: Mode::Rw,
                 child_stopped: false,
             },
-            eof_action: StdinEofAction::Detach,
             outer_tty_raw: false,
             outer_tty_guard: None,
             winch_source: None,
@@ -3751,7 +3599,6 @@ mod tests {
                 mode: Mode::Rw,
                 child_stopped: false,
             },
-            eof_action: StdinEofAction::Detach,
             outer_tty_raw: false,
             outer_tty_guard: None,
             winch_source: None,
@@ -3801,7 +3648,6 @@ mod tests {
                 mode: Mode::Rw,
                 child_stopped: false,
             },
-            eof_action: StdinEofAction::Detach,
             outer_tty_raw: false,
             outer_tty_guard: None,
             winch_source: None,

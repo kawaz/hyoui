@@ -179,9 +179,9 @@ Control message body (type=0x01) = CBOR map { "kind": "<dotted.name>", ...payloa
 - handshake.response 受信、`session_id` / `client_id` / `leader` / `mode` を確定
 - attach handshake 直後に daemon から送られる **redraw bytes frame** ([[DR-0013]] §4) を
   stdout に書き出すだけで detach 時の画面を完全復元
-- stdin → frame writer (`type=0x00 raw data`)
+- 入力端末 → frame writer (`type=0x00 raw data`)。入力端末は stdin が tty なら stdin、そうでなければ `/dev/tty` で、どちらも無ければ出力だけを中継する (`run_output_only`)。stdin は子に流さない ([[DR-0042]] 決定 4)
 - frame reader → stdout
-- **Ctrl+Z ガード state machine** ([[DR-0029]] §2): tty stdin で 2 発ごとに子へ
+- **Ctrl+Z ガード state machine** ([[DR-0029]] §2): 入力端末のキーで 2 発ごとに子へ
   Ctrl+Z を 1 発届け、余った 1 発が `ctrlz_guard_delay` 後に確定する。確定後の action は
   `[attach] ctrlz_x1_action` ([[DR-0032]] §3) で選ぶ: **client 自身を suspend** (default、
   = 外側 shell に戻り `fg` で同じ接続に復帰) / **detach** / **選択プロンプト**

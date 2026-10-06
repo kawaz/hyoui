@@ -210,9 +210,9 @@ rejected because it cannot acquire a controlling terminal.
 - Right after the handshake, writes the daemon's **redraw bytes frame**
   ([[DR-0013]] §4) directly to stdout — that single frame fully restores the
   pre-detach screen
-- stdin → frame writer (`type=0x00` raw data)
+- input terminal → frame writer (`type=0x00` raw data). The input terminal is stdin when stdin is a tty, otherwise `/dev/tty`; with neither, only output is relayed (`run_output_only`). stdin is never forwarded to the child ([[DR-0042]] decision 4)
 - frame reader → stdout
-- **Ctrl+Z guard state machine** ([[DR-0029]] §2): on tty stdin, every second
+- **Ctrl+Z guard state machine** ([[DR-0029]] §2): on the input terminal's keys, every second
   Ctrl+Z is forwarded to the child and a leftover odd press settles after
   `ctrlz_guard_delay`. What that settled press does is chosen by
   `[attach] ctrlz_x1_action` ([[DR-0032]] §3): **suspend the client itself**

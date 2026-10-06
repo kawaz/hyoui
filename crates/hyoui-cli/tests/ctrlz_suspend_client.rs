@@ -80,9 +80,9 @@ impl Nested {
             &[
                 "run",
                 "--detached",
-                // stdin は /dev/null なので、EOF の EOT で bash / cat が終わらないよう
-                // 送らせない (DR-0019 §5: /dev/null も他の非 tty と同じく EOT を送る)。
-                "--stdin-eof=detach",
+                // stdin は /dev/null なので、そのまま子の stdin になると bash / cat は EOF で
+                // 終わる (DR-0042 決定 1)。子の stdin も PTY にする。
+                "--pty-stdin",
                 &format!("--socket={}", outer_sock.display()),
                 "--",
                 "/bin/bash",
@@ -97,9 +97,9 @@ impl Nested {
             &[
                 "run",
                 "--detached",
-                // stdin は /dev/null なので、EOF の EOT で bash / cat が終わらないよう
-                // 送らせない (DR-0019 §5: /dev/null も他の非 tty と同じく EOT を送る)。
-                "--stdin-eof=detach",
+                // stdin は /dev/null なので、そのまま子の stdin になると bash / cat は EOF で
+                // 終わる (DR-0042 決定 1)。子の stdin も PTY にする。
+                "--pty-stdin",
                 &format!("--socket={}", inner_sock.display()),
                 "--",
                 "/bin/cat",

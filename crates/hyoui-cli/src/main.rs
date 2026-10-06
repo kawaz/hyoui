@@ -578,12 +578,50 @@ fn resolve_scrollback_rows(cfg_value: Option<usize>) -> Option<usize> {
     }
 }
 
-/// `--stdin-eof` の明示値を EOF 挙動に写す (DR-0019 §5)。`StdinEofArg` は
-/// `#[non_exhaustive]` なので、将来の値は安全側の Detach (= EOF を子に伝えない) に倒す。
-fn stdin_eof_action(arg: hyoui::cli::StdinEofArg) -> hyoui::stdin_eof::StdinEofAction {
-    match arg {
-        hyoui::cli::StdinEofArg::SendEof => hyoui::stdin_eof::StdinEofAction::SendEof,
-        _ => hyoui::stdin_eof::StdinEofAction::Detach,
+/// attach client の入力端末を開く (DR-0042 決定 4)。
+///
+/// stdin が tty ならその複製、そうでなければ制御端末 (`/dev/tty`) を開く。制御端末が無い
+/// (= `/dev/tty` が開けない。Claude の Bash ツールでは ENXIO) 時は `None` で、呼び出し側は
+/// キー入力なしの中継にする (= エラーにしない)。tty の stdin を複製できない時だけ
+/// `Err` (= 端末はあるのに読めない、従来どおり起動を止める)。
+///
+/// 制御端末は poll できる実体のパスで開く (`hyoui::sys::procstate::controlling_tty_path`。
+/// macOS の `/dev/tty` は poll に POLLNVAL を返し、poll で待つ中継の入力にできない)。
+/// 実体のパスは `O_NOCTTY` で開く (= 制御端末の付け替えを起こさない)。
+fn open_input_terminal() -> std::io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let stdin = std::io::stdin();
+    if is_tty(stdin.as_fd()) {
+        return nix::unistd::dup(stdin.as_fd())
+            .map(|fd| Some(std::fs::File::from(fd)))
+            .map_err(std::io::Error::from);
+    }
+    // 制御端末があるかは /dev/tty が開けるかで決める (= kernel の判定に任せる)。
+    if std::fs::File::open("/dev/tty").is_err() {
+        return Ok(None);
+    }
+    let Some(path) = hyoui::sys::procstate::controlling_tty_path() else {
+        return Ok(None);
+    };
+    Ok(std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(nix::fcntl::OFlag::O_NOCTTY.bits())
+        .open(path)
+        .ok())
+}
+
+/// 外側端末のサイズ (cols, rows)。入力端末と同じ規則で端末を選ぶ (= stdin が tty なら
+/// stdin、そうでなければ `/dev/tty`、DR-0042 決定 4)。取れなければ `None`。
+fn outer_terminal_size() -> Option<(u16, u16)> {
+    let stdin = std::io::stdin();
+    if let Ok(Some(ws)) = hyoui::sys::tty_size(stdin.as_fd()) {
+        return Some((ws.cols, ws.rows));
+    }
+    let tty = std::fs::File::open("/dev/tty").ok()?;
+    match hyoui::sys::tty_size(tty.as_fd()) {
+        Ok(Some(ws)) => Some((ws.cols, ws.rows)),
+        _ => None,
     }
 }
 
@@ -641,7 +679,8 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
         .unwrap_or_else(|| config.session.on_child_suspend.daemon_policy());
     // size 解決 (= ユーザ指示 2026-05-29、stdin pipe 経由):
     // - 明示指定 (= --cols/--rows/--size) があればそれを使う
-    // - 非 detached + 明示なし → 外側 TTY size (= stdin) を継承
+    // - 非 detached + 明示なし → 外側 TTY size を継承 (= stdin が tty なら stdin、そうで
+    //   なければ /dev/tty。attach client の入力端末と同じ規則、DR-0042 決定 4)
     // - detached + 明示なし → None (= daemon 側 default 80x24 で起動、後で attach resize)
     // - 非 TTY (= pipe) + 明示なし → None (= daemon 側 default)
     //
@@ -653,9 +692,8 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
         match (explicit_c, explicit_r) {
             (Some(c), Some(r)) => Some((c, r)),
             _ if !cfg.detached => {
-                let stdin = std::io::stdin();
-                if let Ok(Some(ws)) = hyoui::sys::tty_size(stdin.as_fd()) {
-                    Some((explicit_c.unwrap_or(ws.cols), explicit_r.unwrap_or(ws.rows)))
+                if let Some((cols, rows)) = outer_terminal_size() {
+                    Some((explicit_c.unwrap_or(cols), explicit_r.unwrap_or(rows)))
                 } else {
                     // 部分指定は補完して送る、両方なしは None で daemon default
                     match (explicit_c, explicit_r) {
@@ -672,6 +710,9 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
             },
         }
     };
+    // DR-0042 決定 1 / 3: 呼び出し元の stdin が tty でなく `--pty-stdin` も無ければ、その fd を
+    // 子の fd 0 にする (= `--detached` の有無で同じ。daemon が受け取って spawn 時に渡す)。
+    let child_stdin = !cfg.pty_stdin && !is_tty(std::io::stdin().as_fd());
     if cfg.detached {
         if cfg.debug_dump_client.is_some() {
             // detached parent は client role を担わない (= 即 exit) ので
@@ -682,12 +723,6 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
             );
             return ExitCode::from(2);
         }
-        // DR-0019 §5: 非 tty stdin は daemon に引き継いで子へ流す (= `--detached` の有無で
-        // 子が受け取る入力と EOF が変わらない)。tty は今どおり読まない。
-        let stdin_forward = hyoui::stdin_eof::detached_forward(
-            is_tty(std::io::stdin().as_fd()),
-            cfg.stdin_eof.map(stdin_eof_action),
-        );
         return daemonize::run_detached_parent(
             cfg.session.clone(),
             cfg.socket.clone(),
@@ -702,7 +737,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
             scrub_env_plan,
             cfg.login,
             config.session.term_fallback.clone(),
-            stdin_forward,
+            child_stdin,
             cfg.command,
         );
     }
@@ -729,8 +764,9 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
         scrub_env_plan,
         cfg.login,
         config.session.term_fallback.clone(),
-        // exec する attach client が stdin を読むので daemon には渡さない。
-        None,
+        // 非 detached も daemon に stdin を継承させる (DR-0042 決定 2)。exec する attach
+        // client は stdin を読まず、fd 0 を /dev/null にしてから中継する (決定 4)。
+        child_stdin,
         cfg.command,
     ) {
         Ok(pair) => pair,
@@ -758,17 +794,6 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
     if let Some(p) = cfg.debug_dump_client.as_deref() {
         attach_cmd.arg(format!("--debug-dump-client={p}"));
     }
-    // DR-0019 §5: pipe-through。run --stdin-eof を明示指定時のみ exec attach に
-    // 伝搬する (= 未指定なら attach 側が stdin tty 判定で解決する)。
-    if let Some(eof) = cfg.stdin_eof {
-        let v = match eof {
-            hyoui::cli::StdinEofArg::SendEof => "send-eof",
-            // Detach + 将来追加 variant は detach 扱い (= 未指定時の安全側 fallback と
-            // 整合。新値が増えたら明示 arm を足す)。
-            _ => "detach",
-        };
-        attach_cmd.arg(format!("--stdin-eof={v}"));
-    }
     // CommandExt::exec で自プロセスを置換。成功時は戻らない、失敗時は io::Error を返す。
     use std::os::unix::process::CommandExt;
     let err = attach_cmd.exec();
@@ -778,7 +803,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
 
 /// `hyoui attach <session>` の主要ロジック。
 ///
-/// 既存 daemon に socket connect し、stdin/stdout を中継する。
+/// 既存 daemon に socket connect し、入力端末 / stdout を中継する。
 /// daemon は別 process / 別 hyoui run --detached 等で起動済みの想定。
 /// `--index=N` (or 位置引数の数字) から session id を解決する。
 ///
@@ -978,6 +1003,24 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    // DR-0042 決定 4: キーは入力端末 (= stdin が tty なら stdin、そうでなければ /dev/tty) から
+    // 読み、stdin は子に流さない。/dev/tty も無ければキー入力なしで出力だけを中継する。
+    let stdin_is_tty = is_tty(std::io::stdin().as_fd());
+    let input_terminal = match open_input_terminal() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("hyoui: stdin dup 失敗: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if !stdin_is_tty {
+        // stdin が端末でない時は fd 0 を手放す (= `hyoui run` が exec した attach が pipe の
+        // 読み手として残ると、子が閉じても書き手に EPIPE が届かない、DR-0042 決定 4)。
+        if let Err(e) = hyoui::sys::raw::redirect_stdin_to_devnull() {
+            eprintln!("hyoui: stdin を /dev/null に置き換えられません: {e} (続行)");
+        }
+    }
+
     // DR-0020 §5: attach 成立時に detach / peek の発見性ヒントを stderr へ 1 行出す。
     // 子の出力経路 (PTY/stdout) ではなく client の stderr なので透過性を壊さない
     // (= screen 慣行)。`--quiet` で抑止、非 tty stderr (= pipe) では出さない。
@@ -991,7 +1034,9 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
     // 文言は Ctrl+Z ガードの設定を反映する (= guard off なら detach 手段が無いので
     // 嘘の脱出方法を教えず peek だけ案内する、DR-0029 §2)。単発 Ctrl+Z が何をするかは
     // `ctrlz_x1_action` で変わるので、そこも設定どおりに案内する (DR-0032 §3)。
-    if !cfg.quiet && is_tty(std::io::stderr().as_fd()) {
+    //
+    // ヒントはキーを打てる時だけ出す (= 入力端末が無い中継では打つ手段が無い、DR-0042)。
+    if !cfg.quiet && input_terminal.is_some() && is_tty(std::io::stderr().as_fd()) {
         if app_config.attach.ctrlz_guard {
             let x1 = match app_config.attach.ctrlz_x1_action {
                 hyoui::config::CtrlzX1Action::ClientSuspend => "suspend (fg で復帰): Ctrl+Z",
@@ -1008,33 +1053,30 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         }
     }
 
-    let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
-    let stdin_is_tty = is_tty(stdin.as_fd());
-    let raw_guard: Option<std::sync::Arc<std::sync::Mutex<hyoui::sys::TtyGuard>>> = if stdin_is_tty
-    {
-        match nix::unistd::dup(stdin.as_fd()) {
-            Ok(dup_for_guard) => match enter_raw(dup_for_guard) {
-                Ok(g) => Some(std::sync::Arc::new(std::sync::Mutex::new(g))),
+    let raw_guard: Option<std::sync::Arc<std::sync::Mutex<hyoui::sys::TtyGuard>>> =
+        match input_terminal.as_ref() {
+            Some(term) => match nix::unistd::dup(term.as_fd()) {
+                Ok(dup_for_guard) => match enter_raw(dup_for_guard) {
+                    Ok(g) => Some(std::sync::Arc::new(std::sync::Mutex::new(g))),
+                    Err(e) => {
+                        eprintln!("hyoui: raw mode 失敗: {e} (続行)");
+                        None
+                    }
+                },
                 Err(e) => {
-                    eprintln!("hyoui: raw mode 失敗: {e} (続行)");
+                    eprintln!("hyoui: 入力端末の dup 失敗: {e} (raw mode skip)");
                     None
                 }
             },
-            Err(e) => {
-                eprintln!("hyoui: stdin dup 失敗: {e} (raw mode skip)");
-                None
-            }
-        }
-    } else {
-        None
-    };
+            None => None,
+        };
 
-    // DR-0019 §6: SIGWINCH → Resize 配線。tty stdin (= raw_guard あり) のとき、
+    // DR-0019 §6: SIGWINCH → Resize 配線。入力端末が tty (= raw_guard あり) のとき、
     // signal thread → run loop の連絡用 notify pipe を用意する。signal thread が
     // WINCH を受けて write 端に 1 byte、run loop が read 端 (= WinchSource) を poll。
     // read 端は non-blocking にして run loop の drain ループが EAGAIN で抜けられる
-    // ようにする。size 取得用に stdin を dup した独立 fd を closure に持たせる。
+    // ようにする。size 取得用に入力端末を dup した独立 fd を closure に持たせる。
     let mut winch_notify_wr: Option<std::os::fd::OwnedFd> = None;
     let winch_source: Option<hyoui::client::WinchSource> = if raw_guard.is_some() {
         match nix::unistd::pipe() {
@@ -1053,8 +1095,10 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
                         let _ = fcntl(fd, FcntlArg::F_SETFL(flags));
                     }
                 }
-                // size closure 用に stdin を dup (= run / signal と fd 所有を分離)。
-                let size_fd = nix::unistd::dup(stdin.as_fd()).ok();
+                // size closure 用に入力端末を dup (= run / signal と fd 所有を分離)。
+                let size_fd = input_terminal
+                    .as_ref()
+                    .and_then(|term| nix::unistd::dup(term.as_fd()).ok());
                 let size_fn: Box<dyn FnMut() -> Option<(u16, u16)> + Send> = Box::new(move || {
                     let fd = size_fd.as_ref()?;
                     match hyoui::sys::tty_size(fd.as_fd()) {
@@ -1104,14 +1148,6 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         None
     };
 
-    let mut stdin_file = match nix::unistd::dup(stdin.as_fd()) {
-        Ok(fd) => std::fs::File::from(fd),
-        Err(e) => {
-            eprintln!("hyoui: stdin dup 失敗: {e}");
-            return ExitCode::from(1);
-        }
-    };
-
     // 外側 stdout が raw mode の tty かを `run` に伝える (= detach 時の安全側 reset と
     // 子停止の通知行を出すかの判定に使う、issue 2026-07-24 H4 / DR-0029 §1)。
     let conn = conn.with_outer_tty_raw(raw_guard.is_some());
@@ -1122,25 +1158,11 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         None => conn,
     };
 
-    // DR-0019 §5: pipe-through stdin EOF policy を解決して配線する (= 明示
-    // `--stdin-eof` が優先、未指定なら非 tty は SendEof、tty は Detach)。判定は
-    // `run --detached` の daemon 転送と同じ module に置く。
-    let eof_action =
-        hyoui::stdin_eof::attach_eof_action(stdin_is_tty, cfg.stdin_eof.map(stdin_eof_action));
-    // DR-0029 §2: Ctrl+Z ガードは **tty stdin 経路だけ**に効かせる。pipe / `< file`
-    // 経由の 0x1a は「アプリへのデータ」なので握らず素通しする (= `hyoui input
-    // key:C-z` が常に子へ届くのと同じ理由)。
-    let attach_config = if stdin_is_tty {
-        app_config.attach.clone()
-    } else {
-        hyoui::config::AttachConfig {
-            ctrlz_guard: false,
-            ..app_config.attach.clone()
-        }
-    };
+    // DR-0029 §2: Ctrl+Z ガードは入力端末のキーに効かせる。入力端末は常に端末 (= stdin が
+    // tty か /dev/tty) なので、pipe のデータ (= アプリへの 0x1a) がガードを通ることは無い
+    // (DR-0042 決定 4。pipe は子の fd 0 に直接渡り、attach client を通らない)。
     let conn = conn
-        .with_stdin_eof_action(eof_action)
-        .with_attach_config(attach_config)
+        .with_attach_config(app_config.attach.clone())
         // DR-0032 §1: 子 stopped 検知時の 3 分岐 (resume / menu / 何もしない) を
         // run loop でも同じ設定から判定させる。
         .with_on_child_suspend(app_config.session.on_child_suspend);
@@ -1169,9 +1191,15 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
                 primary: stdout,
                 dump: dump_file,
             };
-            conn.run(&mut stdin_file, &mut tee)
+            match input_terminal {
+                Some(mut term) => conn.run(&mut term, &mut tee),
+                None => conn.run_output_only(&mut tee),
+            }
         }
-        None => conn.run(&mut stdin_file, &mut stdout),
+        None => match input_terminal {
+            Some(mut term) => conn.run(&mut term, &mut stdout),
+            None => conn.run_output_only(&mut stdout),
+        },
     };
     let exit_code = match run_result {
         // DR-0015 §2.1: session.exit.notify 受信時は exit-status をそのまま伝搬。
@@ -1179,7 +1207,7 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
             let masked = u8::try_from(exit_status & 0xFF).unwrap_or(255);
             ExitCode::from(masked)
         }
-        // 自発 detach (= `--stdin-eof=detach` の EOF / stdin read error) は正常離脱。子は
+        // 自発 detach (= 入力端末の EOF / read error、操作面での detach) は正常離脱。子は
         // daemon 配下に残る。スクリプトから見ても「意図通り離れた」なので exit 0。
         // Ctrl+Z 単発は suspend (= 接続維持) なのでここには来ない (DR-0029 §2)。
         Ok(RunOutcome::Detached) => ExitCode::SUCCESS,

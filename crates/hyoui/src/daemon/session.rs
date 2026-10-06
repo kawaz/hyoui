@@ -274,10 +274,6 @@ pub struct Session {
     /// 復元し、Scrollback ring にも push で seed する。通常 `Session::start` 経路
     /// では `None`。
     resume_scrollback: Option<Vec<u8>>,
-    /// DR-0019 §5: `run --detached` が引き継いだ呼び出し元の非 tty stdin。`serve` 開始時に
-    /// 転送を始める。`None` なら転送しない (= attach client が stdin を読む経路、tty、
-    /// upgrade-resume)。
-    stdin_forward: Option<super::stdin_forward::StdinSource>,
 }
 
 /// `Session` の本体リソース。`Option<SessionInner>` で包むことで `serve` が
@@ -311,6 +307,27 @@ impl Session {
     /// * socket parent dir が mode 0700 でない → [`Error::Precondition`]
     /// * bind / listen が失敗 → [`Error::Errno`]
     pub fn start(config: DaemonConfig) -> Result<Self, Error> {
+        Self::start_with_child_stdin(config, None)
+    }
+
+    /// [`Session::start`] に、子の stdin にする fd を渡す版 (DR-0042)。
+    ///
+    /// `child_stdin = Some(fd)` なら子の fd 0 を `fd` にする (= 呼び出し元の非 tty stdin を
+    /// そのまま渡す。fd 1 / 2 と controlling tty は PTY slave)。`fd` は spawn が返った直後に
+    /// 閉じる (= daemon は pipe を持ち続けず、書き手には子が閉じた時点で EPIPE が届く。
+    /// upgrade の self-exec にも漏れない)。`None` なら子の stdin も PTY slave。
+    ///
+    /// `DaemonConfig` に持たせないのは、fd が spawn の 1 回だけで消費される資源で、clone /
+    /// upgrade の state に載る設定値と寿命が違うため。
+    ///
+    /// # Errors
+    ///
+    /// [`Session::start`] と同じ。
+    pub fn start_with_child_stdin(
+        config: DaemonConfig,
+        child_stdin: Option<std::os::fd::OwnedFd>,
+    ) -> Result<Self, Error> {
+        use std::os::fd::AsFd as _;
         if config.cmd.is_empty() {
             return Err(Error::Invalid("DaemonConfig::cmd must not be empty"));
         }
@@ -340,7 +357,10 @@ impl Session {
             config.rows,
             config.cwd.as_deref(),
             child_exec.as_ref(),
+            child_stdin.as_ref().map(|fd| fd.as_fd()),
         )?;
+        // 子は fd 0 に dup2 済み。daemon の分はここで閉じる (DR-0042 決定 2)。
+        drop(child_stdin);
         // master FD を nonblock にして、POLLHUP 偽陽性 (macOS) で read_some が
         // block するのを防ぐ。read_some は EAGAIN を返す → serve_loop で continue。
         pty.master_fd().set_nonblocking(true)?;
@@ -353,7 +373,6 @@ impl Session {
                 listener,
             }),
             resume_scrollback: None,
-            stdin_forward: None,
         })
     }
 
@@ -392,7 +411,6 @@ impl Session {
                 listener,
             }),
             resume_scrollback: None,
-            stdin_forward: None,
         })
     }
 
@@ -402,12 +420,6 @@ impl Session {
     /// tail queries が pre-upgrade の履歴を見られる)。
     pub fn set_upgrade_scrollback(&mut self, bytes: Vec<u8>) {
         self.resume_scrollback = Some(bytes);
-    }
-
-    /// DR-0019 §5: `run --detached` で呼び出し元の非 tty stdin を子 PTY へ流す。`serve` が
-    /// 転送を始め、EOF では `src.eof` に従う。
-    pub fn set_stdin_forward(&mut self, src: super::stdin_forward::StdinSource) {
-        self.stdin_forward = Some(src);
     }
 
     /// `inner` を `Some` 前提で参照する内部ヘルパ。`start` 直後 〜 `serve` の
@@ -527,22 +539,6 @@ impl Session {
         // in concurrent test runs).
         let sigchld_owner = acquire_sigchld_selfpipe();
 
-        // DR-0019 §5: `run --detached` で引き継いだ非 tty stdin の転送を始める。始められ
-        // なければ入力は届かないが、session 自体は続ける (= 子は動いており、外から
-        // `hyoui input` で送れる)。
-        let mut stdin_forward =
-            self.stdin_forward.take().and_then(
-                |src| match super::stdin_forward::StdinForward::start(src) {
-                    Ok(f) => Some(f),
-                    Err(e) => {
-                        eprintln!(
-                            "hyoui: stdin の転送を始められません ({e})。子に stdin は届きません"
-                        );
-                        None
-                    }
-                },
-            );
-
         // Issue #1 + user request: `--debug-dump=<path>` で子 PTY からの raw bytes を
         // append-only で file に書き出す。daemon process が直接 open / write し、
         // failure 時は stderr に warn 1 行のみで dump を諦める (= session は止めない)。
@@ -584,7 +580,6 @@ impl Session {
                 &mut pending_redraws,
                 sigchld_owner.as_ref().map(|o| &o.pipe),
                 debug_dump_file.as_mut(),
-                &mut stdin_forward,
             );
             if !matches!(o, RelayOutcome::UpgradeRequested) {
                 break o;
@@ -1371,7 +1366,6 @@ fn serve_loop(
     pending_redraws: &mut Vec<u64>,
     sigchld_pipe: Option<&SelfPipe>,
     debug_dump: Option<&mut std::fs::File>,
-    stdin_forward: &mut Option<super::stdin_forward::StdinForward>,
 ) -> RelayOutcome {
     // debug_dump は loop 内で再借用するため局所変数に move する。
     let mut debug_dump = debug_dump;
@@ -1490,41 +1484,15 @@ fn serve_loop(
         // 100ms の drain budget を busy-spin で焼いてしまうため。読み切る前
         // (= SIGCHLD 経路で exit を先に観測した直後) は子の最後の出力が残って
         // いるので poll し続ける。
-        // DR-0019 §5: detached の stdin 転送が今周回で待つもの。lock を他 client が握って
-        // いる間 (DR-0022) と子 exit 後 (= 書く相手が居ない) は止める。
-        let forward_want = stdin_forward
-            .as_ref()
-            .map(|f| {
-                let paused = daemon_state.lock.holder().is_some() || deferred_exit.is_some();
-                f.want(paused)
-            })
-            .unwrap_or(super::stdin_forward::Want::Done);
-        let forward_write = forward_want == super::stdin_forward::Want::Write;
         let poll_master = !master_drained;
-        if poll_master || forward_write {
-            let mut events = PollFlags::empty();
-            if poll_master {
-                events |= PollFlags::POLLIN;
-            }
-            if forward_write {
-                events |= PollFlags::POLLOUT;
-            }
-            poll_fds.push(PollFd::new(master_fd, events));
+        if poll_master {
+            poll_fds.push(PollFd::new(master_fd, PollFlags::POLLIN));
         }
-        let master_slot = poll_master || forward_write;
         // client slot の開始 index (= master を外した周回では 1 つ手前にずれる)。
         let client_base = poll_fds.len();
         for ch in clients.iter() {
             poll_fds.push(PollFd::new(ch.reader.as_fd(), PollFlags::POLLIN));
         }
-        let forward_idx = if forward_want == super::stdin_forward::Want::Read {
-            stdin_forward.as_ref().and_then(|f| f.pipe_fd()).map(|fd| {
-                poll_fds.push(PollFd::new(fd, PollFlags::POLLIN));
-                poll_fds.len() - 1
-            })
-        } else {
-            None
-        };
         // R5-H6: SIGCHLD self-pipe slot is appended last so it does not shift
         // client indexing. Tracked separately by the `sigchld_idx` offset.
         let sigchld_idx = if let Some(sp) = sigchld_pipe {
@@ -1600,19 +1568,15 @@ fn serve_loop(
         // 解いてから check_wait_timeouts / process_pending_handshakes を呼ぶ。
         // Ready 経路では revents を集めてから drop する (= 通常処理に進む)。
         let outcome_kind = poll(&mut poll_fds, poll_timeout);
-        let mut forward_revents = PollFlags::empty();
         let (listener_revents, master_revents, client_revents, sigchld_ready) = match outcome_kind {
             Ok(PollOutcome::Ready(_)) => {
                 let lrev = poll_fds[0].revents().unwrap_or(PollFlags::empty());
                 // master を積まなかった周回 (= drain 窓) は revents 無しとして扱う。
-                let mrev = if master_slot {
+                let mrev = if poll_master {
                     poll_fds[1].revents().unwrap_or(PollFlags::empty())
                 } else {
                     PollFlags::empty()
                 };
-                if let Some(i) = forward_idx {
-                    forward_revents = poll_fds[i].revents().unwrap_or(PollFlags::empty());
-                }
                 let crev: Vec<PollFlags> = clients
                     .iter()
                     .enumerate()
@@ -1741,32 +1705,6 @@ fn serve_loop(
                 return RelayOutcome::Error(e);
             }
         };
-
-        // master の revents は転送の POLLOUT も含む。読むのは POLLIN を求めた周回だけ
-        // (= 転送の POLLOUT だけで積んだ周回の POLLHUP を、子 exit 後の読み切り判定に
-        // 混ぜない)。
-        let master_all_revents = master_revents;
-        let master_revents = if poll_master {
-            master_all_revents
-        } else {
-            PollFlags::empty()
-        };
-
-        // DR-0019 §5: detached の stdin 転送。内部 pipe から 1 chunk 読むか、master に
-        // 書けるだけ書く (= 書き切れない間は次周回も POLLOUT を待ち、内部 pipe は読まない)。
-        if let Some(f) = stdin_forward.as_mut() {
-            if forward_write
-                && master_all_revents
-                    .intersects(PollFlags::POLLOUT | PollFlags::POLLHUP | PollFlags::POLLERR)
-            {
-                f.on_master_writable(pty.master_fd());
-            }
-            if forward_revents
-                .intersects(PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR)
-            {
-                f.on_pipe_ready();
-            }
-        }
 
         // R4-C3: 完了済 pending handshake を取り込む (= 子 client として登録、
         // または timeout で破棄)。new client 登録による leader 昇格 + mode.change

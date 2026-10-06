@@ -91,18 +91,23 @@ impl Pty {
     /// 起点 dir で実コマンドを動かす透過性回復、bug fix 2026-06-11)。`None` なら
     /// 呼び出しプロセスの cwd を継承する (= 従来挙動)。
     pub fn spawn(argv: &[&str], cols: u16, rows: u16, cwd: Option<&Path>) -> Result<Spawned> {
-        Self::spawn_with(argv, cols, rows, cwd, None)
+        Self::spawn_with(argv, cols, rows, cwd, None, None)
     }
 
-    /// [`Pty::spawn`] の exec 先 / environ 明示版。`exec = Some` なら daemon の environ
-    /// を継承せず、[`raw::ChildExec`] の path / environ で `execve` する (= `--login`、
-    /// argv[0] は exec 先と独立)。
+    /// [`Pty::spawn`] の exec 先 / environ / stdin 明示版。
+    ///
+    /// - `exec = Some` なら daemon の environ を継承せず、[`raw::ChildExec`] の path /
+    ///   environ で `execve` する (= `--login`、argv[0] は exec 先と独立)
+    /// - `stdin = Some(fd)` なら子の fd 0 を `fd` にする (= 呼び出し元の非 tty stdin を
+    ///   そのまま渡す、DR-0042)。fd 1 / 2 と controlling tty は slave のまま。`fd` は
+    ///   caller が所有したまま (= spawn 後に閉じるのは caller)
     pub fn spawn_with(
         argv: &[&str],
         cols: u16,
         rows: u16,
         cwd: Option<&Path>,
         exec: Option<&raw::ChildExec>,
+        stdin: Option<BorrowedFd<'_>>,
     ) -> Result<Spawned> {
         if argv.is_empty() {
             return Err(Error::Invalid("argv must not be empty"));
@@ -122,8 +127,14 @@ impl Pty {
             }
             None => None,
         };
-        let forked = match raw::openpty_fork_anchor_exec(&argv_c, cols, rows, cwd_c.as_ref(), exec)
-        {
+        let forked = match raw::openpty_fork_anchor_exec(
+            &argv_c,
+            cols,
+            rows,
+            cwd_c.as_ref(),
+            exec,
+            stdin,
+        ) {
             Ok(f) => f,
             Err(Error::Precondition(_)) => {
                 // anchor 前提を満たさない (= TIOCSCTTY 失敗)。production の daemon は
@@ -135,7 +146,7 @@ impl Pty {
                      旧 forkpty 構造で child を起動します (= child が独立 session leader、^Z は効きません)。\
                      production の daemon は setsid 済のためこの経路には入りません (= テスト等の直接呼び出しのみ)。"
                 );
-                raw::forkpty_then_exec_legacy(&argv_c, cols, rows, cwd_c.as_ref(), exec)?
+                raw::forkpty_then_exec_legacy(&argv_c, cols, rows, cwd_c.as_ref(), exec, stdin)?
             }
             Err(e) => return Err(e),
         };

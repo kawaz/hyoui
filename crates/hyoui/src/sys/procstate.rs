@@ -17,8 +17,50 @@ pub fn is_stopped(pid: i32) -> Option<bool> {
     imp::is_stopped(pid)
 }
 
+/// 自プロセスの制御端末として開けるパス (DR-0042 決定 4、attach client の入力端末)。
+///
+/// 制御端末が無ければ `None`。macOS の `/dev/tty` は `poll(2)` に `POLLNVAL` を返し
+/// (実測 2026-10-06、PTY を制御端末に持つプロセスで `open("/dev/tty")` した fd を poll すると
+/// revents = 0x20)、poll で入力を待つ attach client の入力端末にできない。そこで kernel が
+/// 持つ制御端末の device 番号 (`proc_bsdinfo.e_tdev`) を `devname(3)` で実体のパス
+/// (`/dev/ttys005` 等) に直して返す。Linux の `/dev/tty` は poll できるのでそのまま返す。
+pub fn controlling_tty_path() -> Option<std::path::PathBuf> {
+    imp::controlling_tty_path()
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
+    pub(super) fn controlling_tty_path() -> Option<std::path::PathBuf> {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: info は生存中のローカルで、size ちょうどの領域を渡している。自分の pid。
+        let n = unsafe {
+            libc::proc_pidinfo(
+                std::process::id() as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&raw mut info).cast::<libc::c_void>(),
+                size,
+            )
+        };
+        // 制御端末が無いと e_tdev は NODEV (= -1)。
+        if n != size || info.e_tdev == u32::MAX {
+            return None;
+        }
+        // SAFETY: devname は static buffer への ptr か NULL を返す。NUL 終端の C 文字列として
+        // 直ちに複製し、ptr は保持しない (= 次の呼び出しで上書きされる buffer を残さない)。
+        let name = unsafe { libc::devname(info.e_tdev as libc::dev_t, libc::S_IFCHR) };
+        if name.is_null() {
+            return None;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_str().ok()?;
+        // 見つからない時の devname は "??" を返す。
+        if name.is_empty() || name.starts_with('?') {
+            return None;
+        }
+        Some(std::path::Path::new("/dev").join(name))
+    }
+
     pub(super) fn is_stopped(pid: i32) -> Option<bool> {
         // `proc_pidinfo(PROC_PIDTBSDINFO)` は read-only。対象が自分の子なので
         // 権限も要らない。`pbi_status` が SSTOP なら停止中。
@@ -43,6 +85,11 @@ mod imp {
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
+    pub(super) fn controlling_tty_path() -> Option<std::path::PathBuf> {
+        // Linux の /dev/tty は poll できる。開けるか (= 制御端末があるか) は開く側が判定する。
+        Some(std::path::PathBuf::from("/dev/tty"))
+    }
+
     pub(super) fn is_stopped(pid: i32) -> Option<bool> {
         // /proc/<pid>/stat の 3 番目のフィールドが state。comm は括弧で囲まれ空白を
         // 含みうるので、最後の `)` 以降を見る。

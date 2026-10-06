@@ -53,20 +53,6 @@ pub enum OnChildSuspend {
 // 新構成では attach client が外部 SIGTSTP を受けても daemon は無関係 (= 旧
 // `decouple` 相当の動作のみ、policy 選択肢自体が不要)。
 
-/// `--stdin-eof` flag の明示値 (DR-0019 §5)。attach / run 共通。
-///
-/// 未指定 (= `None`) のときの解決は呼出側 (= `attach_command`) が stdin の tty
-/// 判定で行う: 非 tty なら `SendEof` (= pipe-through の透過性回復)、tty なら従来
-/// 挙動 (= EOF が通常来ないので実質 `Detach`)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum StdinEofArg {
-    /// EOF 観測時にそのまま切断 (= 現行挙動。子は daemon 配下に残る)。
-    Detach,
-    /// EOF 観測時に EOT (0x04) を子 PTY へ送出 (= canonical mode の子が自然 exit)。
-    SendEof,
-}
-
 /// Shell whose completion script is being requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -402,7 +388,6 @@ pub struct RunConfig {
     pub socket: Option<String>,
     /// `--detached`: daemon を別 process で起動して親はすぐ exit。session id を
     /// stdout に 1 行 print してから親が終わる。attach は別 process から行う。
-    /// 非 tty stdin は daemon が引き継いで子へ流す (DR-0019 §5)。
     pub detached: bool,
     /// `--session`: 自動採番 (`run-<pid>-<rand4hex>`) ではなく明示 session id を使う。
     /// socket path 自動解決にもこの値が入る。
@@ -433,10 +418,10 @@ pub struct RunConfig {
     /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。socket 配置先 dir と、
     /// 子プロセスへ常時注入する `HYOUI_NAMESPACE` env の値を決める。
     pub namespace: Option<String>,
-    /// `--stdin-eof=detach|send-eof` (DR-0019 §5)。`None` (= 未指定) なら stdin の種類で
-    /// 解決する (`hyoui::stdin_eof`)。非 detached は exec attach に、`--detached` は
-    /// daemon の stdin 転送に渡す。
-    pub stdin_eof: Option<StdinEofArg>,
+    /// `--pty-stdin` (DR-0042 決定 3): 呼び出し元の stdin を子に渡さず、子の stdin も PTY に
+    /// する。`false` (= 既定) では、呼び出し元の stdin が tty でない時その fd が子の fd 0 に
+    /// なる (DR-0042 決定 1)。呼び出し元の stdin が tty ならどちらでも子の stdin は PTY。
+    pub pty_stdin: bool,
     /// `--no-scrub-env` (DR-0024): env scrub を完全 disable (= debug / 互換目的)。
     /// config の `scrub_env_enabled = false` と等価。kill/keep の細かい制御は
     /// `~/.config/hyoui/config.toml` で行う (= CLI flag は最小化)。
@@ -478,9 +463,6 @@ pub struct AttachConfig {
     /// `--namespace=X` flag の生値 (= DR-0018、未指定なら None)。session / index 解決を
     /// namespace スコープに絞る。
     pub namespace: Option<String>,
-    /// `--stdin-eof=detach|send-eof` (DR-0019 §5)。`None` (= 未指定) なら stdin の
-    /// tty 判定で解決 (= 非 tty で `SendEof`、tty で従来挙動の `Detach`)。
-    pub stdin_eof: Option<StdinEofArg>,
     /// `--quiet` (DR-0020 §5)。attach 成立時の stderr ヒント (= detach/peek 案内) を
     /// 抑止する。非 tty stderr では flag に関わらずヒントを出さない。
     pub quiet: bool,
@@ -2489,7 +2471,6 @@ fn parse_attach(args: &[String]) -> Command {
         debug_dump_client: None,
         index: None,
         namespace: None,
-        stdin_eof: None,
         quiet: false,
     };
 
@@ -2560,16 +2541,6 @@ fn parse_attach(args: &[String]) -> Command {
                 None => {
                     return Command::Error("--debug-dump-client requires a value".into());
                 }
-            },
-            "--stdin-eof" => match value.as_deref() {
-                Some("detach") => cfg.stdin_eof = Some(StdinEofArg::Detach),
-                Some("send-eof") => cfg.stdin_eof = Some(StdinEofArg::SendEof),
-                Some(other) => {
-                    return Command::Error(format!(
-                        "attach: invalid --stdin-eof value: {other} (= detach | send-eof)"
-                    ));
-                }
-                None => return Command::Error("--stdin-eof requires a value".into()),
             },
             "--index" => match value {
                 Some(v) => match v.parse::<i32>() {
@@ -3485,7 +3456,8 @@ fn parse_run(args: &[String]) -> Command {
     let mut until: Option<String> = None;
     let mut socket: Option<String> = None;
     let mut on_child_suspend: Option<OnChildSuspend> = None;
-    let mut stdin_eof: Option<StdinEofArg> = None;
+    // DR-0042 決定 3: 子の stdin も PTY にする (bool flag)
+    let mut pty_stdin = false;
     let mut command: Vec<String> = Vec::new();
     let mut detached = false;
     let mut session: Option<String> = None;
@@ -3582,16 +3554,14 @@ fn parse_run(args: &[String]) -> Command {
                 Some(v) => socket = Some(v),
                 None => return Command::Error("--socket requires a value".into()),
             },
-            "--stdin-eof" => match value.as_deref() {
-                Some("detach") => stdin_eof = Some(StdinEofArg::Detach),
-                Some("send-eof") => stdin_eof = Some(StdinEofArg::SendEof),
-                Some(other) => {
-                    return Command::Error(format!(
-                        "invalid --stdin-eof value: {other} (= detach | send-eof)"
-                    ));
+            // DR-0042 決定 3: 呼び出し元の stdin を子に渡さず、子の stdin も PTY にする。
+            "--pty-stdin" => {
+                if arg.contains('=') {
+                    return Command::Error("--pty-stdin does not take a value".into());
                 }
-                None => return Command::Error("--stdin-eof requires a value".into()),
-            },
+                pty_stdin = true;
+                consumed_extra = false;
+            }
             "--on-child-suspend" => match value.as_deref() {
                 Some("notify") => on_child_suspend = Some(OnChildSuspend::Notify),
                 Some("auto-resume") => on_child_suspend = Some(OnChildSuspend::AutoResume),
@@ -3718,7 +3688,7 @@ fn parse_run(args: &[String]) -> Command {
         debug_dump_server,
         debug_dump_client,
         namespace,
-        stdin_eof,
+        pty_stdin,
         no_scrub_env,
         login,
         command,
@@ -5472,9 +5442,12 @@ fn usage_run() -> String {
             --socket PATH                 Unix socket path for input injection\n    \
             --detached                    daemon を別 process で起動して親はすぐ exit\n                                  \
                 (DR-0015)。session id を stdout に 1 行 print してから\n                                  \
-                親が終わる。attach は別 process から行う。stdin が pipe /\n                                  \
-                file なら daemon が子に流し続け、EOF は --stdin-eof に従う\n                                  \
-                (tty は読まない、DR-0019)\n    \
+                親が終わる。attach は別 process から行う\n    \
+            --pty-stdin                   Make the child's stdin the PTY as well, instead of\n                                  \
+                passing the caller's stdin (DR-0042)。外から hyoui input /\n                                  \
+                attach で操作し続ける shell / REPL を、端末の無い起動元から\n                                  \
+                作る時に付ける (例: --detached --pty-stdin -- bash -i)。\n                                  \
+                stdin が端末なら付けなくても同じ\n    \
             --session ID                  自動採番 (= run-<pid>-<rand4hex>) ではなく\n                                  \
                 明示 session id を使う。socket path 自動解決にも\n                                  \
                 この値が入る (DR-0015)\n    \
@@ -5491,11 +5464,6 @@ fn usage_run() -> String {
                 (state 翻訳前の bytes、ANSI escape 込み)\n    \
             --debug-dump-client PATH      daemon → client の raw bytes を file に append\n                                  \
                 (state-based redraw / attach 復元込み = user の terminal 表示)\n    \
-            --stdin-eof=detach|send-eof\n                                  \
-                stdin EOF 時の挙動 (DR-0019)。default: 非 tty stdin なら\n                                  \
-                send-eof (= EOT を子に送り `echo ... | hyoui run -- bc` で\n                                  \
-                子が自然 exit。入力が改行で終わらなければ EOT を 2 個)、\n                                  \
-                tty なら detach。detach は EOF で切断のみ\n    \
             --login                       通常のターミナルアプリと同じログイン shell として起動\n                                  \
                 (DR-0039)。shell は passwd から引き (呼び出し元の $SHELL は\n                                  \
                 見ない)、argv[0] を -<shell> にし、子の env は最小\n                                  \
@@ -5508,6 +5476,13 @@ fn usage_run() -> String {
                 kill/keep glob の細かい制御は\n                                  \
                 ~/.config/hyoui/config.toml で設定する\n    \
             -h, --help                    Show this help and exit\n\
+        \n\
+        STDIN (DR-0042):\n    \
+            stdin が端末でない (pipe / file / /dev/null 等) 時は、その fd を子の stdin に\n    \
+            そのまま渡す (--detached の有無で同じ)。子の stdout / stderr と制御端末は PTY。\n    \
+            子は直接実行と同じく pipe を読み、pipe の EOF で終わる (バイナリもそのまま)。\n    \
+            キーは子の /dev/tty (= PTY) に届く (attach client は stdin でなく /dev/tty から\n    \
+            読む)。stdin が端末なら子の stdin も PTY。--pty-stdin で常に PTY にできる\n\
         \n\
         ENVIRONMENT:\n    \
             XDG_RUNTIME_DIR        Preferred base for the auto-generated socket path\n    \
@@ -5533,11 +5508,9 @@ fn usage_run() -> String {
             run は daemon を fork した後 exec で attach に化けるため、attach と同じ\n    \
             exit code が適用される。\n    \
             <子の exit code>      子 PTY が exit した (= SessionExitNotify)。\n                          \
-                signal 死は 128+signum (= 130=SIGINT, 137=SIGKILL, 143=SIGTERM)。\n                          \
-                非 tty stdin の default (= send-eof) では stdin EOF で子が\n                          \
-                自然 exit し、その子の code がここに伝搬する\n    \
-            0                     `--stdin-eof=detach` 時の stdin EOF で自分から離脱した\n                          \
-                (= 子は daemon 配下に残る)。Ctrl+Z 単発は suspend なので終了しない\n    \
+                signal 死は 128+signum (= 130=SIGINT, 137=SIGKILL, 143=SIGTERM)\n    \
+            0                     自分から離脱した (= 入力端末の EOF / Ctrl+Z の detach 設定 等。\n                          \
+                子は daemon 配下に残る)。Ctrl+Z 単発は suspend なので終了しない\n    \
             9                     daemon との接続が予期せず失われた (= daemon 消滅の疑い)\n    \
             1                     実行エラー (= protocol violation / 出力先への書き込み失敗 等)\n    \
             2                     usage / 引数エラー\n",
@@ -5563,10 +5536,6 @@ fn usage_attach() -> String {
             --debug-dump-client PATH\n                          \
                 daemon → client の raw bytes を file に append\n                          \
                 (state-based redraw / attach 復元込み = user の terminal 表示)\n    \
-            --stdin-eof=detach|send-eof\n                          \
-                stdin EOF 時の挙動 (DR-0019)。default: 非 tty stdin なら\n                          \
-                send-eof (= EOT を子に送る。入力が改行で終わらなければ\n                          \
-                2 個)、tty なら detach\n    \
             -h, --help            Show this help and exit\n\
         \n\
         SESSION SELECTOR:\n    \
@@ -5575,6 +5544,12 @@ fn usage_attach() -> String {
             session-id)。`--index=N` は `hyoui list` の mtime 昇順 sort 結果に対する\n    \
             1-based 指定で、`1` = 最古、`-1` = 最新、`2` = 2 番目に古い、...。\n    \
             stale socket は index 対象外。範囲外は error。session-id と --index は排他。\n\
+        \n\
+        INPUT (DR-0042):\n    \
+            stdin を子に流さない (= 稼働中の子の stdin は差し替えない。流し込みは\n    \
+            `hyoui input`)。キーは stdin が端末なら stdin、そうでなければ /dev/tty から\n    \
+            読む。/dev/tty も無い (制御端末の無い起動元) 時はキー入力なしで出力だけを\n    \
+            中継し、子の exit / `hyoui detach` / 接続の喪失で終わる\n\
         \n\
         CTRL+Z GUARD (= session も attach も生かしたまま shell に戻る、DR-0029):\n    \
             Ctrl+Z 単発           client 自身を suspend (= 外側 shell に戻る、`fg` で復帰)。\n                          \
@@ -5590,11 +5565,9 @@ fn usage_attach() -> String {
         \n\
         EXIT STATUS:\n    \
             <子の exit code>      子 PTY が exit した (= SessionExitNotify)。\n                          \
-                signal 死は 128+signum (= 130=SIGINT, 137=SIGKILL, 143=SIGTERM)。\n                          \
-                非 tty stdin の default (= send-eof) では stdin EOF で子が\n                          \
-                自然 exit し、その子の code がここに伝搬する\n    \
-            0                     `--stdin-eof=detach` 時の stdin EOF で自分から離脱した\n                          \
-                (= 子は daemon 配下に残る)。Ctrl+Z 単発は suspend なので終了しない\n    \
+                signal 死は 128+signum (= 130=SIGINT, 137=SIGKILL, 143=SIGTERM)\n    \
+            0                     自分から離脱した (= 入力端末の EOF / Ctrl+Z の detach 設定 等。\n                          \
+                子は daemon 配下に残る)。Ctrl+Z 単発は suspend なので終了しない\n    \
             9                     daemon との接続が予期せず失われた (= daemon 消滅の疑い)\n    \
             1                     attach 実行エラー (= protocol violation / 出力先への書き込み失敗 等)\n    \
             2                     usage / 引数エラー\n\
@@ -7668,44 +7641,47 @@ mod tests {
             Command::Run(cfg) => {
                 assert_eq!(cfg.command, vec!["echo".to_string(), "hello".to_string()]);
                 assert_eq!(cfg.on_child_suspend, None);
-                // DR-0019 §5: 未指定なら None (= exec attach 側で tty 判定して解決)。
-                assert_eq!(cfg.stdin_eof, None);
+                // DR-0042: 既定は呼び出し元の stdin を子に渡す側 (= --pty-stdin なし)。
+                assert!(!cfg.pty_stdin);
             }
             other => panic!("expected Run, got {other:?}"),
         }
     }
 
     #[test]
-    fn run_stdin_eof_send_eof_and_detach_parse() {
-        // DR-0019 §5: run --stdin-eof=send-eof|detach を明示値として保持する。
-        match parse_args(&args(&["run", "--stdin-eof=send-eof", "--", "bc"])) {
-            Command::Run(cfg) => assert_eq!(cfg.stdin_eof, Some(StdinEofArg::SendEof)),
+    fn run_pty_stdin_parses_as_bool_flag() {
+        // DR-0042 決定 3: --pty-stdin は値を取らない bool flag (--detached と併用可)。
+        match parse_args(&args(&[
+            "run",
+            "--detached",
+            "--pty-stdin",
+            "--",
+            "bash",
+            "-i",
+        ])) {
+            Command::Run(cfg) => {
+                assert!(cfg.pty_stdin);
+                assert!(cfg.detached);
+                assert_eq!(cfg.command, vec!["bash".to_string(), "-i".to_string()]);
+            }
             other => panic!("expected Run, got {other:?}"),
         }
-        match parse_args(&args(&["run", "--stdin-eof=detach", "--", "bc"])) {
-            Command::Run(cfg) => assert_eq!(cfg.stdin_eof, Some(StdinEofArg::Detach)),
-            other => panic!("expected Run, got {other:?}"),
-        }
+        assert!(matches!(
+            parse_args(&args(&["run", "--pty-stdin=1", "--", "cat"])),
+            Command::Error(_)
+        ));
     }
 
     #[test]
-    fn run_stdin_eof_invalid_value_is_error() {
-        match parse_args(&args(&["run", "--stdin-eof=bogus", "--", "bc"])) {
-            Command::Error(msg) => assert!(msg.contains("stdin-eof"), "msg: {msg}"),
+    fn stdin_eof_option_is_removed_from_run_and_attach() {
+        // DR-0042 決定 5: --stdin-eof は消えた (= 未知の option)。
+        match parse_args(&args(&["run", "--stdin-eof=detach", "--", "cat"])) {
+            Command::Error(msg) => assert!(msg.contains("unknown option"), "msg: {msg}"),
             other => panic!("expected Error, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn attach_stdin_eof_parse() {
-        // DR-0019 §5: attach --stdin-eof も同じ値を受ける (= run/attach 共通 flag)。
-        match parse_args(&args(&["attach", "demo", "--stdin-eof=send-eof"])) {
-            Command::Attach(cfg) => assert_eq!(cfg.stdin_eof, Some(StdinEofArg::SendEof)),
-            other => panic!("expected Attach, got {other:?}"),
-        }
-        match parse_args(&args(&["attach", "demo"])) {
-            Command::Attach(cfg) => assert_eq!(cfg.stdin_eof, None),
-            other => panic!("expected Attach, got {other:?}"),
+        match parse_args(&args(&["attach", "demo", "--stdin-eof=detach"])) {
+            Command::Error(msg) => assert!(msg.contains("unknown attach option"), "msg: {msg}"),
+            other => panic!("expected Error, got {other:?}"),
         }
     }
 
@@ -9097,7 +9073,7 @@ mod tests {
             (
                 HelpTopic::Attach,
                 "hyoui attach",
-                &["CTRL+Z GUARD", "--stdin-eof"],
+                &["CTRL+Z GUARD", "/dev/tty"],
             ),
             (HelpTopic::List, "hyoui list", &["SCAN ORDER"]),
             (HelpTopic::Kill, "hyoui kill", &["--signal", "SIGTERM"]),

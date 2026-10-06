@@ -75,6 +75,53 @@ pub fn capture_with_deadline(
     }
 }
 
+/// stdin / stdout / stderr を呼び出し側が決めたまま、**専用の PTY を制御端末にして**
+/// `cmd` を spawn する (DR-0042 決定 4)。
+///
+/// attach client (= 非 detached の `hyoui run` / `hyoui attach`) は stdin が tty でないと
+/// 制御端末 (`/dev/tty`) を開いて raw 化し、キーを読む。`std::process::Command` でそのまま
+/// 起こすと、test を端末から走らせた時に開発者の端末 (= test process の制御端末) を raw に
+/// してキーを奪う。ここで作る PTY を制御端末にすれば `/dev/tty` はこの PTY になり、外側の
+/// 端末に触れない (= 端末の無い CI / agent の Bash ツールと、端末から走らせた時とで
+/// 同じ状況を作る)。
+///
+/// 返す [`PrivateCtty`] は子の終了まで呼び出し側が持つ (= master を drop すると制御端末の
+/// hangup になる)。`master` に書けば attach client が制御端末から読むキーになる。
+pub fn spawn_in_private_ctty(cmd: PtyCommand) -> (PrivateCtty, Child) {
+    let (pty, pts) = pty_open().expect("pty_open");
+    pty.resize(Size::new(24, 80)).expect("pty resize");
+    // slave を 1 本持ち続ける (複製は CLOEXEC 付き = 並行に走る他の test の子へ漏らさない)。
+    // stdio を差し替えた子は slave を fd として持たないので、
+    // 誰も開いていない間の master への write は EIO になる (= attach client が開く前の打鍵を
+    // 入力 queue に積めない)。
+    let slave = pts.as_fd().try_clone_to_owned().expect("dup slave");
+    // master の出力 (= 制御端末への echo / attach client が端末に書く bytes) を読み捨て続ける
+    // (= 端末エミュレータの役)。読み手の居ない出力 queue が非空だと、macOS では制御端末への
+    // tcsetattr (= attach client の raw 化 / 復元) が block する (`sys/tty.rs` の test と同じ
+    // 観測)。slave を全員が閉じると read が EIO / 0 になって thread は終わる。
+    let drain = pty.as_fd().try_clone_to_owned().expect("dup master");
+    std::thread::spawn(move || {
+        let mut f = std::fs::File::from(drain);
+        let mut buf = [0u8; 4096];
+        while matches!(f.read(&mut buf), Ok(n) if n > 0) {}
+    });
+    let child = cmd.spawn(pts).expect("spawn in private ctty");
+    (
+        PrivateCtty {
+            master: pty,
+            _slave: slave,
+        },
+        child,
+    )
+}
+
+/// [`spawn_in_private_ctty`] が作った制御端末。
+pub struct PrivateCtty {
+    /// PTY master (= 書けば子側の制御端末への入力になる)。
+    pub master: Pty,
+    _slave: std::os::fd::OwnedFd,
+}
+
 /// deadline 付き thread join (= issue 2026-06-11)。
 ///
 /// daemon serve 等を `std::thread::spawn` した test が素の `JoinHandle::join` を

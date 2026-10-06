@@ -159,12 +159,21 @@ pub struct ForkedChild {
 /// async-signal-safe なので fork→exec 区間で呼べる。**chdir 失敗時は exec を中止して
 /// `_exit(127)`** する (= 起点 dir が消えている等。誤った cwd (= `/`) で起動するより
 /// 明確に失敗させる)。`cwd = None` なら従来挙動 (= chdir せず daemon の cwd を継承)。
+///
+/// # 子の stdin (DR-0042)
+///
+/// `stdin = Some(fd)` の場合、child は fd 0 に `fd` を dup2 する (= 呼び出し元の非 tty
+/// stdin をそのまま渡す。fd 1 / 2 と controlling tty は slave のまま)。`None` なら fd 0 も
+/// slave。`fd` が CLOEXEC 付きでも、dup2 で作った fd 0 は CLOEXEC を持たないので exec 後の
+/// 子に残り、元の fd は exec で閉じる。parent 側の `fd` は caller が所有したまま (= 本関数は
+/// 閉じない。spawn 後に閉じるのは caller の責務)。
 pub fn openpty_fork_anchor_exec(
     argv: &[CString],
     cols: u16,
     rows: u16,
     cwd: Option<&CString>,
     exec: Option<&ChildExec>,
+    stdin: Option<BorrowedFd<'_>>,
 ) -> Result<ForkedChild> {
     if argv.is_empty() {
         return Err(Error::Invalid("argv must not be empty"));
@@ -212,6 +221,8 @@ pub fn openpty_fork_anchor_exec(
         .as_ref()
         .map(|v| v.as_ptr())
         .unwrap_or(std::ptr::null());
+    // 子の fd 0 に dup2 する fd (DR-0042)。-1 なら slave。
+    let stdin_raw: RawFd = stdin.map_or(-1, |fd| fd.as_raw_fd());
 
     // 4. fork。
     // SAFETY: `fork(2)`。child path では async-signal-safe な操作のみ
@@ -253,8 +264,9 @@ pub fn openpty_fork_anchor_exec(
             let old_ttou = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
             libc::tcsetpgrp(slave_raw, libc::getpid());
             libc::signal(libc::SIGTTOU, old_ttou);
-            // slave を std fd 0/1/2 に複製。
-            libc::dup2(slave_raw, 0);
+            // slave を std fd 0/1/2 に複製。呼び出し元の stdin を渡す時は fd 0 だけ
+            // それにする (DR-0042)。
+            libc::dup2(if stdin_raw >= 0 { stdin_raw } else { slave_raw }, 0);
             libc::dup2(slave_raw, 1);
             libc::dup2(slave_raw, 2);
             // master は child では不要なので close。slave も >2 なら元 fd を close
@@ -346,6 +358,7 @@ pub fn forkpty_then_exec_legacy(
     rows: u16,
     cwd: Option<&CString>,
     exec: Option<&ChildExec>,
+    stdin: Option<BorrowedFd<'_>>,
 ) -> Result<ForkedChild> {
     if argv.is_empty() {
         return Err(Error::Invalid("argv must not be empty"));
@@ -369,6 +382,8 @@ pub fn forkpty_then_exec_legacy(
         .as_ref()
         .map(|v| v.as_ptr())
         .unwrap_or(std::ptr::null());
+    // 子の fd 0 に dup2 する fd (DR-0042、anchor 経路と同じ contract)。-1 なら slave のまま。
+    let stdin_raw: RawFd = stdin.map_or(-1, |fd| fd.as_raw_fd());
 
     // SAFETY: `nix::pty::forkpty` is documented `unsafe` because in the
     // child path only async-signal-safe code may run. Between fork and exec
@@ -396,9 +411,14 @@ pub fn forkpty_then_exec_legacy(
             // cwd 伝搬: 起動元 dir に chdir してから exec (= 透過性回復、本体は
             // openpty_fork_anchor_exec と同じ contract)。失敗時は exec を中止して
             // _exit(127)。
-            // SAFETY: `chdir` / `write` / `_exit` は async-signal-safe。`cwd_ptr` は
+            // SAFETY: `dup2` / `chdir` / `write` / `_exit` は async-signal-safe。`cwd_ptr` は
             // fork 前に取り出した有効な C 文字列 ptr (= 借用元が parent scope で生存)。
+            // `stdin_raw` は caller が spawn の間生かしている fd。
             unsafe {
+                // login_tty が slave にした fd 0 を、呼び出し元の stdin に差し替える (DR-0042)。
+                if stdin_raw >= 0 {
+                    libc::dup2(stdin_raw, 0);
+                }
                 if !cwd_ptr.is_null() && libc::chdir(cwd_ptr) == -1 {
                     const MSG: &[u8] =
                         b"hyoui: chdir to invoked cwd failed (start dir gone?), aborting exec\n";
@@ -564,7 +584,7 @@ mod anchor_tests {
             std::ffi::CString::new("/bin/sleep").unwrap(),
             std::ffi::CString::new("60").unwrap(),
         ];
-        let forked = match openpty_fork_anchor_exec(&argv, 80, 24, None, None) {
+        let forked = match openpty_fork_anchor_exec(&argv, 80, 24, None, None, None) {
             Ok(f) => f,
             // SAFETY: _exit は async-signal-safe。
             Err(_) => unsafe { libc::_exit(code::SPAWN_FAILED) },

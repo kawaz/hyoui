@@ -35,13 +35,13 @@ fn run_login(runtime: &Path, sid: &str, extra: &[&str]) {
 /// (= 利用者の実 config を読まない)。
 fn run_detached(runtime: &Path, sid: &str, flags: &[&str], term: Option<&str>, extra: &[&str]) {
     let mut c = Command::new(hyoui_bin());
-    // stdin は /dev/null なので、EOF の EOT でログイン shell が終わらないよう送らせない
-    // (DR-0019 §5: /dev/null も他の非 tty と同じく EOT を送る)。子を生かしたまま
+    // stdin は /dev/null なので、そのまま子の stdin になるとログイン shell は EOF で終わる
+    // (DR-0042 決定 1)。子の stdin も PTY にして (`--pty-stdin`) 子を生かしたまま
     // `hyoui list` の PID と `ps` の argv を観測するのがこの helper の目的。
     c.args([
         "run",
         "--detached",
-        "--stdin-eof=detach",
+        "--pty-stdin",
         &format!("--session={sid}"),
     ])
     .args(flags)

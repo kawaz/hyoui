@@ -47,18 +47,20 @@ hyoui attach run-<pid>-<rand>
 # To close the connection: hyoui detach run-<pid>-<rand>
 ```
 
-When stdin is a pipe or a file, it reaches the child with or without `--detached`, and the end of input is delivered to the child as EOF (Ctrl-D) ([DR-0019](./decisions/DR-0019-run-option-cleanup-and-suspend-policy-placement.md) §5). With `--detached` the daemon keeps reading, so `run` returns right away even for endless input such as `tail -f`.
+When stdin is a pipe or a file, that fd becomes the child's stdin, with or without `--detached`. The child's stdout / stderr and controlling terminal stay the PTY ([DR-0042](./decisions/DR-0042-non-tty-stdin-is-the-childs-fd.md)). The child sees the same stdin as when run directly, so it reads the pipe and exits on the pipe's EOF, and binary data arrives unchanged. hyoui does not read the pipe, so `run --detached` returns right away even for endless input such as `tail -f`.
 
 ```sh
 echo "1+2" | hyoui run -- bc                  # stays attached; bc prints 3 and exits
-hyoui run --detached -- claude <<<"prompt"    # the prompt reaches the child even when detached
-printf 'hoge' | hyoui run --detached -- cat   # input without a trailing newline still reaches EOF
+hyoui run --detached -- claude <<<"prompt"    # the prompt is submitted as the first input, as when run directly
+printf 'a\003b\000c\n' | hyoui run -- od -c    # binary data is not altered
 ```
 
-- The child's stdin stays a PTY, so EOF is sent as Ctrl-D (0x04). Input that ends mid-line gets two Ctrl-Ds (the first completes the pending line, the second is the EOF)
-- A raw-mode TUI receives Ctrl-D as plain input. If you pipe input in and then interact through attach, use `--stdin-eof=detach` so no EOF is sent
-- A terminal stdin is never read. `/dev/null` is treated like any other non-tty stdin: it hits EOF right away and Ctrl-D is sent (the same with and without `--detached`; how the child handles Ctrl-D is up to the child, and an interactive shell such as `bash -i` exits. Add `--stdin-eof=detach` to keep it)
-- In a loop that shares stdin, such as `while read l; do hyoui run --detached -- x; done < list`, the child reads the rest of stdin. Add `</dev/null` to keep the rest unread (the child still gets the EOF Ctrl-D)
+- A TUI that reads a pipe and still uses the keyboard (claude / fzf / less, ...) reads keys from `/dev/tty` (= hyoui's PTY), as when run directly. Keys from attach and `hyoui input` arrive there
+- Once a pipe is given to a program that reads stdin (`cat`, ...), `hyoui input` does not reach that program's stdin (the same as giving it a pipe when run directly)
+- `/dev/null` becomes the child's stdin like any other non-tty, and the child reads EOF right away; an interactive shell such as `bash -i` exits. To start a shell / REPL that you keep operating from outside, from a launcher without a terminal (an agent or a script), add `--pty-stdin` so the child's stdin is the PTY as well: `hyoui run --detached --pty-stdin -- bash -i`
+- When stdin is a terminal, the child's stdin is the PTY (unchanged)
+- The attach client never forwards stdin to the child. It reads keys from stdin when stdin is a terminal, otherwise from `/dev/tty`; with neither, it relays output only and ends when the child exits
+- In a loop that shares stdin, such as `while read l; do hyoui run --detached -- x; done < list`, the child reads the rest of stdin (the same as running it directly). Add `</dev/null` to keep the rest unread
 
 ### 2. Observe in read-only mode
 
@@ -76,7 +78,7 @@ hyoui kill --signal KILL run-<pid>-<rand>  # SIGKILL
 
 ## Automation
 
-These recipes assume `SESS` holds a session id (e.g. `SESS=$(hyoui run --detached -- bash)`).
+These recipes assume `SESS` holds a session id (e.g. `SESS=$(hyoui run --detached -- bash)`; add `--pty-stdin` when the launcher has no terminal).
 
 ### 4. Inject input (`input` family)
 

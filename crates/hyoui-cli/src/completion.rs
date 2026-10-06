@@ -347,8 +347,6 @@ _hyoui() {
             case "$prev" in
                 --on-child-suspend)
                     COMPREPLY=( $(compgen -W "notify auto-resume" -- "$cur") ); return 0 ;;
-                --stdin-eof)
-                    COMPREPLY=( $(compgen -W "detach send-eof" -- "$cur") ); return 0 ;;
                 --socket|--debug-dump-server|--debug-dump-client)
                     _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
                 --namespace|--session|--timeout|--idle-timeout|--until|--size|--cols|--rows|--scrollback-rows)
@@ -357,10 +355,8 @@ _hyoui() {
             case "$cur" in
                 --on-child-suspend=*)
                     COMPREPLY=( $(compgen -W "notify auto-resume" -- "${cur#*=}") ); return 0 ;;
-                --stdin-eof=*)
-                    COMPREPLY=( $(compgen -W "detach send-eof" -- "${cur#*=}") ); return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --session --detached --timeout --idle-timeout --until --on-child-suspend --stdin-eof --scrollback-rows --login --no-scrub-env --debug-dump-server --debug-dump-client --size --cols --rows --help -h --" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --namespace --session --detached --pty-stdin --timeout --idle-timeout --until --on-child-suspend --scrollback-rows --login --no-scrub-env --debug-dump-server --debug-dump-client --size --cols --rows --help -h --" -- "$cur") )
             return 0 ;;
         completion)
             COMPREPLY=( $(compgen -W "bash zsh fish --help -h" -- "$cur") )
@@ -369,14 +365,9 @@ _hyoui() {
             case "$prev" in
                 --socket|--debug-dump-client) _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
                 --mode) COMPREPLY=( $(compgen -W "rw ro rw-no-leader" -- "$cur") ); return 0 ;;
-                --stdin-eof) COMPREPLY=( $(compgen -W "detach send-eof" -- "$cur") ); return 0 ;;
                 --namespace|--index) return 0 ;;
             esac
-            case "$cur" in
-                --stdin-eof=*)
-                    COMPREPLY=( $(compgen -W "detach send-eof" -- "${cur#*=}") ); return 0 ;;
-            esac
-            COMPREPLY=( $(compgen -W "--socket --namespace --index --mode --stdin-eof --quiet --debug-dump-client --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --namespace --index --mode --quiet --debug-dump-client --help -h" -- "$cur") )
             return 0 ;;
         list)
             case "$cur" in
@@ -486,7 +477,6 @@ _hyoui() {
                         '--index=[Session selector (1=oldest, -1=newest)]:index:' \
                         '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
                         '--mode=[Operating mode]:mode:(rw ro rw-no-leader)' \
-                        '--stdin-eof=[stdin EOF action]:action:(detach send-eof)' \
                         '--quiet[Suppress the detach/peek hint on attach]' \
                         '--debug-dump-client=[Append daemon->client raw bytes to a file]:file:_files' \
                         '(-h --help)'{-h,--help}'[Show help]' \
@@ -1027,7 +1017,8 @@ _hyoui_run() {
         '--socket=[Unix socket path]:socket:_files' \
         '--namespace=[Session namespace (flag > env HYOUI_NAMESPACE > default)]:namespace:' \
         '--session=[Explicit session id instead of auto-numbering (DR-0015)]:session:' \
-        '--detached[Fork the daemon and exit immediately; piped stdin still reaches the child (DR-0015)]' \
+        '--detached[Fork the daemon and exit immediately (DR-0015)]' \
+        '--pty-stdin[Make the child stdin the PTY instead of passing the caller stdin (DR-0042)]' \
         '--timeout=[Overall timeout (e.g. 30s / 1m / 1h30m)]:duration:' \
         '--idle-timeout=[Output idle timeout (e.g. 500ms / 5s)]:duration:' \
         '--until=[Terminate when PATTERN appears in output]:pattern:' \
@@ -1035,7 +1026,6 @@ _hyoui_run() {
         '--cols=[Virtual screen columns]:cols:' \
         '--rows=[Virtual screen rows]:rows:' \
         '--on-child-suspend=[Action when child is stopped]:action:(notify auto-resume)' \
-        '--stdin-eof=[stdin EOF action]:action:(detach send-eof)' \
         '--scrollback-rows=[vt100 scrollback ring max rows (default 1000)]:rows:' \
         '--login[Start as a login shell with a minimal child env (DR-0039)]' \
         '--no-scrub-env[Disable child env scrubbing (DR-0024 escape hatch)]' \
@@ -1222,10 +1212,10 @@ complete -c hyoui -n '__hyoui_using_subcommand run' -l size              -x     
 complete -c hyoui -n '__hyoui_using_subcommand run' -l cols              -x                              -d 'Virtual screen columns'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l rows              -x                              -d 'Virtual screen rows'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l on-child-suspend  -x -a 'notify auto-resume'       -d 'Action when child is stopped'
-complete -c hyoui -n '__hyoui_using_subcommand run' -l stdin-eof         -x -a 'detach send-eof'          -d 'stdin EOF action'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l scrollback-rows   -x                              -d 'vt100 scrollback ring max rows (default 1000)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l session           -x                              -d 'Explicit session id instead of auto-numbering (DR-0015)'
-complete -c hyoui -n '__hyoui_using_subcommand run' -l detached                                           -d 'Fork the daemon and exit immediately; piped stdin still reaches the child (DR-0015)'
+complete -c hyoui -n '__hyoui_using_subcommand run' -l detached                                           -d 'Fork the daemon and exit immediately (DR-0015)'
+complete -c hyoui -n '__hyoui_using_subcommand run' -l pty-stdin                                          -d 'Make the child stdin the PTY instead of passing the caller stdin (DR-0042)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l login                                              -d 'Start as a login shell with a minimal child env (DR-0039)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l no-scrub-env                                       -d 'Disable child env scrubbing (DR-0024 escape hatch)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l debug-dump-server -r -F                          -d 'Append child PTY raw bytes to a file'
@@ -1241,7 +1231,6 @@ complete -c hyoui -n '__hyoui_using_subcommand attach' -l socket         -r -F  
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l index          -x                           -d 'Session selector (1=oldest, -1=newest)'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l namespace -x -d 'Session namespace (flag > env HYOUI_NAMESPACE > default)'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l mode           -x -a 'rw ro rw-no-leader'   -d 'Operating mode'
-complete -c hyoui -n '__hyoui_using_subcommand attach' -l stdin-eof      -x -a 'detach send-eof'        -d 'stdin EOF action'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l quiet                                          -d 'Suppress the detach/peek hint on attach'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -l debug-dump-client -r -F                        -d 'Append daemon->client raw bytes to a file'
 complete -c hyoui -n '__hyoui_using_subcommand attach' -s h -l help                                    -d 'Show help and exit'
@@ -2032,17 +2021,10 @@ mod tests {
                     let before = s[..i].chars().next_back();
                     let rest = &s[i + sub.len()..];
                     let after = rest.chars().next();
-                    // DR-0019 §5: `--stdin-eof` の値リスト `detach send-eof` に含まれる
-                    // `detach` は reserved subcommand `detach` と文字列衝突するが、値
-                    // 補完であって subcommand 候補ではない。直後が ` send-eof` なら値
-                    // リストの一部として除外する (= false positive 回避)。
-                    let is_stdin_eof_value = rest.trim_start().starts_with("send-eof");
-                    if !is_stdin_eof_value {
-                        assert!(
-                            !(is_boundary(before) && is_boundary(after)),
-                            "shell {sh:?} leaks reserved subcommand `{sub}` as a bare candidate"
-                        );
-                    }
+                    assert!(
+                        !(is_boundary(before) && is_boundary(after)),
+                        "shell {sh:?} leaks reserved subcommand `{sub}` as a bare candidate"
+                    );
                     start = i + 1;
                 }
             }
@@ -2058,6 +2040,7 @@ mod tests {
                 "--no-strip-escapes",   // 旧 wait flag (廃止)
                 "--newline-convert-lf", // 旧 wait flag (廃止)
                 "--on-parent-suspend",  // DR-0015 で run から廃止
+                "--stdin-eof",          // DR-0042 で run / attach から廃止
                 // CLI-Q1 裁定 (2026-07-29): attach の占有 / 奪取は parse 段で拒否する。
                 "--exclusive",
                 "--detach-others",

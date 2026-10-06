@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use common::pty::spawn_in_private_ctty;
 use common::session_dir::SessionDir;
 
 fn hyoui_bin() -> PathBuf {
@@ -32,12 +33,14 @@ fn spawn_detached(runtime: &std::path::Path, sid: &str) {
     spawn_detached_cmd(runtime, sid, "sleep 30");
 }
 
-/// 子 shell script を指定して detached daemon を起こす variant。
+/// 子 shell script を指定して detached daemon を起こす variant。stdin は `/dev/null` なので、
+/// 子の stdin も PTY にして (`--pty-stdin`、DR-0042) 子が stdin の EOF で終わらないようにする。
 fn spawn_detached_cmd(runtime: &std::path::Path, sid: &str, script: &str) {
     let status = Command::new(hyoui_bin())
         .args([
             "run",
             "--detached",
+            "--pty-stdin",
             &format!("--session={sid}"),
             "--",
             "sh",
@@ -64,6 +67,70 @@ fn spawn_detached_cmd(runtime: &std::path::Path, sid: &str, script: &str) {
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!("socket が出現しない: {}", sock.display());
+}
+
+/// 中から (= `$HYOUI_SESSION_ID=me`) `hyoui attach <attach_args...>` を起こし、attach が
+/// 接続を終えたら `hyoui detach` で接続を切って、attach の出力を返す。
+///
+/// attach は stdin を子に流さず、キーは入力端末 (stdin が tty でなければ `/dev/tty`) から
+/// 読む (DR-0042 決定 4)。stdin の EOF では終わらないので、接続の成立を `status` の client 数
+/// で待ってから外から detach する。attach は専用の PTY を制御端末にして起こす (= 端末から test
+/// を走らせても開発者の端末を奪わない)。self 拒否で接続前に終わった時はそのまま返す。
+fn attach_from_inside_then_detach(
+    runtime: &std::path::Path,
+    me: &str,
+    target_sock: &std::path::Path,
+    attach_args: &[&str],
+) -> std::process::Output {
+    let cmd = pty_process::blocking::Command::new(hyoui_bin())
+        .arg("attach")
+        .args(attach_args)
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env("HYOUI_SESSION_ID", me)
+        .env_remove("HYOUI_LOCK_TOKEN")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let (_ctty, mut child) = spawn_in_private_ctty(cmd);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut connected = false;
+    while Instant::now() < deadline {
+        if child.try_wait().expect("try_wait attach").is_some() {
+            break;
+        }
+        // status 自身の一時接続 + attach client で 2 以上 (= attach の接続が成立)。
+        let out = Command::new(hyoui_bin())
+            .args(["status", &format!("--socket={}", target_sock.display())])
+            .env_remove("HYOUI_SESSION_ID")
+            .env_remove("HYOUI_LOCK_TOKEN")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .expect("status");
+        if String::from_utf8_lossy(&out.stdout).matches("id=").count() >= 2 {
+            connected = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if connected {
+        let _ = Command::new(hyoui_bin())
+            .args(["detach", &format!("--socket={}", target_sock.display())])
+            .env_remove("HYOUI_SESSION_ID")
+            .env_remove("HYOUI_LOCK_TOKEN")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("attach が detach で終わること")
+        .expect("attach output")
 }
 
 /// daemon を kill して後始末する (= socket の daemon を畳む)。
@@ -193,20 +260,10 @@ fn attach_other_session_from_inside_is_allowed() {
     spawn_detached(runtime.path(), other);
 
     // 中から ($HYOUI_SESSION_ID=me) 別セッション (other) への attach は self ではない。
-    // attach は接続後 block するため、stdin 即 EOF (= /dev/null) で終了させる。
-    // `--stdin-eof=detach` の明示が必須: 非 tty stdin の default は send-eof で、
-    // EOF 後も attach を継続する (= ro 観戦の正規挙動) ため test が返ってこない。
-    // 検証したいのは「self 拒否で即エラー終了しない」ことだけ。
-    let out = Command::new(hyoui_bin())
-        .args(["attach", other, "--mode=ro", "--stdin-eof=detach"])
-        .env("XDG_RUNTIME_DIR", runtime.path())
-        .env("HYOUI_SESSION_ID", me)
-        .env_remove("HYOUI_LOCK_TOKEN")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("attach other");
+    // 検証したいのは「self 拒否で即エラー終了しない」ことだけ (= 接続が成立したら detach)。
+    let other_sock = runtime.path().join("hyoui").join(format!("{other}.sock"));
+    let out =
+        attach_from_inside_then_detach(runtime.path(), me, &other_sock, &[other, "--mode=ro"]);
 
     cleanup(runtime.path(), me);
     cleanup(runtime.path(), other);
@@ -215,6 +272,13 @@ fn attach_other_session_from_inside_is_allowed() {
     assert!(
         !stderr.contains("自セッション") && !stderr.contains("ネスト"),
         "別セッションへの attach は self 拒否されないべき。stderr={stderr:?}"
+    );
+    // 接続が成立した (= self 拒否の exit 2 ではない)。外からの `hyoui detach` は client 側から
+    // 見ると接続の喪失なので exit 9 (detach_cli と同じ、DR-0020 §4)。
+    assert_eq!(
+        out.status.code(),
+        Some(9),
+        "attach は接続後に detach で切れるはず: stderr={stderr:?}"
     );
 }
 
@@ -261,23 +325,13 @@ fn attach_other_socket_from_inside_is_allowed() {
     spawn_detached(runtime.path(), other);
 
     let other_sock = runtime.path().join("hyoui").join(format!("{other}.sock"));
-    // `--stdin-eof=detach` の明示が必須 (attach_other_session_from_inside_is_allowed
-    // と同じ理由: 非 tty stdin の default send-eof は EOF 後も attach を継続する)。
-    let out = Command::new(hyoui_bin())
-        .args([
-            "attach",
-            &format!("--socket={}", other_sock.display()),
-            "--mode=ro",
-            "--stdin-eof=detach",
-        ])
-        .env("XDG_RUNTIME_DIR", runtime.path())
-        .env("HYOUI_SESSION_ID", me)
-        .env_remove("HYOUI_LOCK_TOKEN")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("attach --socket other");
+    let socket_arg = format!("--socket={}", other_sock.display());
+    let out = attach_from_inside_then_detach(
+        runtime.path(),
+        me,
+        &other_sock,
+        &[&socket_arg, "--mode=ro"],
+    );
 
     cleanup(runtime.path(), me);
     cleanup(runtime.path(), other);
@@ -286,6 +340,13 @@ fn attach_other_socket_from_inside_is_allowed() {
     assert!(
         !stderr.contains("自セッション") && !stderr.contains("ネスト"),
         "別セッションの socket への attach は self 拒否されないべき。stderr={stderr:?}"
+    );
+    // 接続が成立した (= self 拒否の exit 2 ではない)。外からの `hyoui detach` は client 側から
+    // 見ると接続の喪失なので exit 9 (detach_cli と同じ、DR-0020 §4)。
+    assert_eq!(
+        out.status.code(),
+        Some(9),
+        "attach は接続後に detach で切れるはず: stderr={stderr:?}"
     );
 }
 

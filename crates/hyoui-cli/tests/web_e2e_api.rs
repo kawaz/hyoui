@@ -129,9 +129,9 @@ fn spawn_detached_command(
     let mut args = vec![
         "run".to_string(),
         "--detached".to_string(),
-        // stdin は /dev/null なので、EOF の EOT で子の read ループが終わらないよう送らせ
-        // ない (DR-0019 §5: /dev/null も他の非 tty と同じく EOT を送る)。
-        "--stdin-eof=detach".to_string(),
+        // stdin は /dev/null なので、そのまま子の stdin になると子の read ループが EOF で
+        // 終わる (DR-0042 決定 1)。子の stdin も PTY にして入力を外から送れるようにする。
+        "--pty-stdin".to_string(),
         format!("--session={sid}"),
     ];
     args.extend(run_options.iter().map(|arg| (*arg).to_string()));
