@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-10-06 | design | open | [external-detach-reported-as-connection-lost](./2026-10-06-design-external-detach-reported-as-connection-lost.md) | 外から `hyoui detach` された attach client が「接続が失われました」で exit 9 になり、daemon の消滅と区別できない (DR-0042 の端末なし attach で主な終わり方になる) |
 | 2026-10-06 | design | open | [daemon-unaware-of-unlinked-socket](./2026-10-06-design-daemon-unaware-of-unlinked-socket.md) | session の socket file が消えても daemon は気付かず、誰も到達できないまま子と一緒に残り続ける (テストの残骸 49 個で観測) |
 | 2026-10-05 | design | open | [pipe-stdin-pass-fd-to-child](./2026-10-05-design-pipe-stdin-pass-fd-to-child.md) | 非 tty の stdin は子の stdin にそのまま渡す (PTY に流し込まない) 方が直接実行と同じになる。`claude <<<X` が送信されない件の調査結果と DR-0019 §5 の見直し (2026-10-06 裁定済み、未実装) |
 | 2026-10-04 | bug | open | [web-supervisor-blocks-on-control-read](./2026-10-04-web-supervisor-blocks-on-control-read.md) | web の監督者が制御 socket の要求を main loop で 5 秒 timeout 付きで読み、改行を送らない client 1 つで止まる |
