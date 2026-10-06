@@ -124,9 +124,57 @@ pub fn wait_exit_nowait(pid: i32) -> std::io::Result<()> {
     }
 }
 
+/// 子 `pid` が停止するか終わるまで block して待ち、`si_code` (`CLD_STOPPED` /
+/// `CLD_EXITED` / `CLD_KILLED` 等) を返す。`WNOWAIT` なので停止・終了の報告を消費せず、
+/// 後続の `waitpid(WUNTRACED)` がそのまま観測できる。test が「signal を送ってから止まる
+/// までの時間」に合否を預けずに子の停止を待つための道具 (停止の完了は負荷で大きく遅れる)。
+#[cfg(test)]
+pub fn wait_stopped_nowait(pid: i32) -> std::io::Result<libc::c_int> {
+    // SAFETY: siginfo_t は全ビット 0 が有効な POD。waitid は有効な out ポインタに書くだけ。
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WSTOPPED | libc::WEXITED | libc::WNOWAIT,
+        )
+    };
+    if rc == 0 {
+        Ok(info.si_code)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `wait_stopped_nowait` は停止を待って `CLD_STOPPED` を返し、報告を消費しない
+    /// (= 直後の `waitpid(WNOHANG | WUNTRACED)` も Stopped を観測できる)。
+    #[test]
+    fn wait_stopped_nowait_leaves_stop_report() {
+        use nix::sys::signal::{Signal, kill};
+        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+        use nix::unistd::Pid;
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = Pid::from_raw(child.id() as i32);
+        kill(pid, Signal::SIGSTOP).expect("SIGSTOP");
+        let code = wait_stopped_nowait(pid.as_raw()).expect("waitid");
+        let after = waitpid(pid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(code, libc::CLD_STOPPED);
+        assert!(
+            matches!(after, Ok(WaitStatus::Stopped(_, Signal::SIGSTOP))),
+            "WNOWAIT なので停止の報告は残るはず: {after:?}"
+        );
+    }
 
     /// 自プロセスは走行中なので `Some(false)`。
     #[test]

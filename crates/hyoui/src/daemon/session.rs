@@ -2317,6 +2317,24 @@ mod tests {
         vec!["/bin/sleep".into(), "30".into()]
     }
 
+    /// SIGSTOP を送った子が止まりきるまで待ち、止まらずに終わっていたら落とす。
+    ///
+    /// 停止の完了は子が CPU を得て signal を処理した時点で、送ってからの時間は負荷で
+    /// 大きく変わる。待つ回数・時間で合否を決めず、kernel の停止報告を待つ。`WNOWAIT`
+    /// なので報告は消費せず、後続の `waitpid(WUNTRACED)` / `ChildLifecycle::poll` が
+    /// そのまま観測できる。
+    fn assert_child_stopped(pid: Pid) {
+        let code = crate::sys::procstate::wait_stopped_nowait(pid.as_raw())
+            .expect("waitid(WSTOPPED|WEXITED|WNOWAIT)");
+        assert_eq!(
+            code,
+            libc::CLD_STOPPED,
+            "子は止まらずに終わった (si_code = {code}、CLD_EXITED = {}、CLD_KILLED = {})",
+            libc::CLD_EXITED,
+            libc::CLD_KILLED
+        );
+    }
+
     fn cleanup_child(pid: Pid) {
         // 子 process が orphan で残らないように SIGKILL → wait。
         let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
@@ -2548,18 +2566,13 @@ mod tests {
 
         // 子を SIGSTOP で停止させる (= ^Z 相当の停止状態を作る)。
         nix::sys::signal::kill(child, Signal::SIGSTOP).expect("SIGSTOP");
+        assert_child_stopped(child);
         // WUNTRACED で stop transition を回収 (= notify_child_stopped が呼ばれる前提)。
-        let mut stopped = false;
-        for _ in 0..100 {
-            if let Ok(WaitStatus::Stopped(_, _)) =
-                waitpid(child, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED))
-            {
-                stopped = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(stopped, "child should be Stopped after SIGSTOP");
+        let reported = waitpid(child, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED));
+        assert!(
+            matches!(reported, Ok(WaitStatus::Stopped(_, _))),
+            "停止済みの子は WUNTRACED で Stopped を報告するはず: {reported:?}"
+        );
 
         // leader 不在 (= clients 空) で notify_child_stopped を呼ぶ。
         let state = SessionState::default();
@@ -2712,18 +2725,14 @@ mod tests {
             other => panic!("expected Alive initially, got {other:?}"),
         }
 
-        // SIGSTOP を送る → 次の poll で Stopped を観測
+        // SIGSTOP を送る → 止まりきってから poll すれば 1 回目で Stopped を観測
         nix::sys::signal::kill(child, Signal::SIGSTOP).expect("SIGSTOP");
-        // kernel が状態遷移を反映するまで短くリトライ
-        let mut saw_stopped = false;
-        for _ in 0..50 {
-            if matches!(lc.poll(child), ChildState::Stopped) {
-                saw_stopped = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(saw_stopped, "should observe Stopped after SIGSTOP");
+        assert_child_stopped(child);
+        let polled = lc.poll(child);
+        assert!(
+            matches!(polled, ChildState::Stopped),
+            "should observe Stopped after SIGSTOP: {polled:?}"
+        );
 
         // 続けて poll しても Stopped が latch されている (= state を保持)
         for _ in 0..3 {
@@ -2772,15 +2781,9 @@ mod tests {
         let spawned = Pty::spawn(&["cat"], 80, 24, None).expect("spawn cat");
         let child = spawned.child;
         nix::sys::signal::kill(child, Signal::SIGSTOP).expect("SIGSTOP");
+        assert_child_stopped(child);
 
         let mut lc = ChildLifecycle::default();
-        // Stop 観測まで待つ
-        for _ in 0..50 {
-            if matches!(lc.poll(child), ChildState::Stopped) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
 
         // 1 秒間連続で poll 結果が Stopped を返すこと
         let start = std::time::Instant::now();

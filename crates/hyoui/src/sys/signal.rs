@@ -401,9 +401,13 @@ mod tests {
 
         // SIGSTOP を送る → 子が stop → SIGCHLD が親に配信 → self-pipe に書き込まれる
         nix::sys::signal::kill(child, Signal::SIGSTOP).expect("SIGSTOP");
+        // 止まりきるまでは時間でなく kernel の停止報告で待つ (= 停止の完了は負荷で
+        // 大きく遅れる)。報告は消費しない (WNOWAIT)。
+        let stop_code = crate::sys::procstate::wait_stopped_nowait(child.as_raw()).expect("waitid");
+        assert_eq!(stop_code, libc::CLD_STOPPED, "子は止まらずに終わった");
 
-        // kernel が SIGCHLD 配信 + handler 実行 + write(2) 完了するまで
-        // 短いリトライで待つ。500ms 上限。
+        // 停止の待ちは上で済ませたので、ここは SIGCHLD 配信 + handler 実行 + write(2)
+        // 完了までを短いリトライで待つ。500ms 上限。
         let mut saw_sigchld = false;
         for _ in 0..50 {
             let drained = pipe.drain().expect("drain");
