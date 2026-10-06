@@ -1,8 +1,9 @@
 //! `sys` — the only layer in `hyoui` allowed to talk to the OS.
 //!
-//! Higher layers depend on the safe wrappers re-exported below. The two
-//! `unsafe`-containing modules ([`raw`] and [`signal`]) are pub so they can be
-//! invoked from the safe wrappers, but their `unsafe` bodies stay encapsulated.
+//! Higher layers depend on the safe wrappers re-exported below. The
+//! `unsafe`-containing modules ([`raw`], [`signal`], [`env`], [`procstate`]、
+//! `just lint-unsafe` が許す一覧と同じ) are pub so they can be invoked from the
+//! safe wrappers, but their `unsafe` bodies stay encapsulated.
 
 pub mod clock;
 pub mod env;

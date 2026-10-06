@@ -1,9 +1,11 @@
 //! `unsafe` boundary #1 — direct libc calls and `unsafe` `nix` calls that
 //! cannot be expressed through `nix`'s safe API alone.
 //!
-//! Every `unsafe` block in the crate (outside [`super::signal`]) lives here.
-//! Functions exported from this module are safe to call from elsewhere
-//! because each `unsafe` body is paired with a `SAFETY:` justification.
+//! `unsafe` は `sys/` 配下の 4 ファイルにだけ置く (= `just lint-unsafe` が許す一覧と同じ):
+//! 本 module (fd / PTY / fork+exec / rlimit)、[`super::signal`] (signal handler と mask)、
+//! [`super::env`] (起動直後の env 書き換え)、[`super::procstate`] (kernel のプロセス情報:
+//! stop 状態と制御端末)。Functions exported from these modules are safe to call from
+//! elsewhere because each `unsafe` body is paired with a `SAFETY:` justification.
 //!
 //! Contents:
 //!
@@ -167,6 +169,11 @@ pub struct ForkedChild {
 /// slave。`fd` が CLOEXEC 付きでも、dup2 で作った fd 0 は CLOEXEC を持たないので exec 後の
 /// 子に残り、元の fd は exec で閉じる。parent 側の `fd` は caller が所有したまま (= 本関数は
 /// 閉じない。spawn 後に閉じるのは caller の責務)。
+///
+/// **契約: `fd` は 3 以上であること。** 0〜2 は子側で slave を dup2 する宛先と重なり、
+/// 0 だと `dup2(0, 0)` が CLOEXEC を外さない、1 / 2 だと先に slave で上書きされた後の
+/// fd を渡すことになる。違反は fork の前に [`Error::Invalid`] で返す (= 子を作らない)。
+/// caller は `F_DUPFD_CLOEXEC` で 3 以上に複製してから渡す。
 pub fn openpty_fork_anchor_exec(
     argv: &[CString],
     cols: u16,
@@ -178,6 +185,7 @@ pub fn openpty_fork_anchor_exec(
     if argv.is_empty() {
         return Err(Error::Invalid("argv must not be empty"));
     }
+    let stdin_raw = child_stdin_raw(stdin)?;
     let ws = Winsize {
         ws_row: rows,
         ws_col: cols,
@@ -221,9 +229,6 @@ pub fn openpty_fork_anchor_exec(
         .as_ref()
         .map(|v| v.as_ptr())
         .unwrap_or(std::ptr::null());
-    // 子の fd 0 に dup2 する fd (DR-0042)。-1 なら slave。
-    let stdin_raw: RawFd = stdin.map_or(-1, |fd| fd.as_raw_fd());
-
     // 4. fork。
     // SAFETY: `fork(2)`。child path では async-signal-safe な操作のみ
     // (setpgid / tcsetpgrp / dup2 / close / execvp / _exit)。alloc / lock /
@@ -352,6 +357,9 @@ pub fn openpty_fork_anchor_exec(
 ///
 /// サイレントではなく、呼び出し側 ([`super::pty::Pty::spawn`]) が **明示 warning を
 /// stderr に出した上で** 本 fallback を使う。
+///
+/// `stdin` の契約は [`openpty_fork_anchor_exec`] と同じ (= 3 以上、違反は fork 前に
+/// [`Error::Invalid`])。
 pub fn forkpty_then_exec_legacy(
     argv: &[CString],
     cols: u16,
@@ -363,6 +371,7 @@ pub fn forkpty_then_exec_legacy(
     if argv.is_empty() {
         return Err(Error::Invalid("argv must not be empty"));
     }
+    let stdin_raw = child_stdin_raw(stdin)?;
     let ws = Winsize {
         ws_row: rows,
         ws_col: cols,
@@ -382,9 +391,6 @@ pub fn forkpty_then_exec_legacy(
         .as_ref()
         .map(|v| v.as_ptr())
         .unwrap_or(std::ptr::null());
-    // 子の fd 0 に dup2 する fd (DR-0042、anchor 経路と同じ contract)。-1 なら slave のまま。
-    let stdin_raw: RawFd = stdin.map_or(-1, |fd| fd.as_raw_fd());
-
     // SAFETY: `nix::pty::forkpty` is documented `unsafe` because in the
     // child path only async-signal-safe code may run. Between fork and exec
     // we only call `chdir` / `execvp` (async-signal-safe) and on failure
@@ -437,6 +443,18 @@ pub fn forkpty_then_exec_legacy(
             // must NOT run Rust destructors in the child.
             unsafe { libc::_exit(127) };
         }
+    }
+}
+
+/// 子の fd 0 に dup2 する fd を検査して raw fd にする (DR-0042)。`None` は -1 (= slave)。
+/// 0〜2 は子側の dup2 の宛先と重なるので拒否する (= 契約は [`openpty_fork_anchor_exec`])。
+fn child_stdin_raw(stdin: Option<BorrowedFd<'_>>) -> Result<RawFd> {
+    match stdin.map(|fd| fd.as_raw_fd()) {
+        None => Ok(-1),
+        Some(raw) if raw > 2 => Ok(raw),
+        Some(_) => Err(Error::Invalid(
+            "child stdin fd must be >= 3 (duplicate it with F_DUPFD_CLOEXEC before spawning)",
+        )),
     }
 }
 
@@ -546,6 +564,45 @@ pub fn redirect_stdin_to_devnull() -> Result<()> {
 // ---------------------------------------------------------------------------
 // DR-0017 session anchor PoC (Rust 版) — findings の C PoC の移植
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod child_stdin_contract_tests {
+    use super::*;
+
+    /// 0〜2 の stdin は fork の前に Invalid で拒否する (anchor / legacy の両方)。
+    /// anchor は openpty / TIOCSCTTY より前に検査するので、test process から呼んでも
+    /// fork も ctty の取得も起きない。
+    #[test]
+    fn stdin_fd_below_three_is_rejected_before_fork() {
+        let argv = [CString::new("/bin/true").unwrap()];
+        for raw in 0..=2 {
+            let fd = borrow_raw_fd(raw);
+            let anchor = openpty_fork_anchor_exec(&argv, 80, 24, None, None, Some(fd));
+            assert!(
+                matches!(anchor, Err(Error::Invalid(_))),
+                "anchor fd {raw}: {anchor:?}"
+            );
+            let legacy = forkpty_then_exec_legacy(&argv, 80, 24, None, None, Some(fd));
+            assert!(
+                matches!(legacy, Err(Error::Invalid(_))),
+                "legacy fd {raw}: {legacy:?}"
+            );
+        }
+    }
+
+    /// 3 以上と None は通す (= 検査だけを見る。spawn はしない)。
+    #[test]
+    fn stdin_fd_three_or_more_and_none_are_accepted() {
+        assert_eq!(child_stdin_raw(None).ok(), Some(-1));
+        let f = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let raw = f.as_raw_fd();
+        assert!(raw > 2);
+        assert_eq!(
+            child_stdin_raw(Some(std::os::fd::AsFd::as_fd(&f))).ok(),
+            Some(raw)
+        );
+    }
+}
 
 #[cfg(test)]
 mod anchor_tests {

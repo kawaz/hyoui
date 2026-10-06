@@ -548,14 +548,17 @@ pub fn run_daemon_child() -> ExitCode {
     // /dev/null に戻す。`Session::start_with_child_stdin` が子の fd 0 に dup2 し、spawn 直後に
     // 閉じる (= daemon は pipe を持ち続けない。fd 0 で持ったままだと upgrade の self-exec に
     // 漏れ、子が閉じた後も書き手に EPIPE が届かない)。
+    //
+    // 渡せない時は子を spawn せず daemon の起動失敗にする (DR-0042 決定 6、fail closed)。
+    // 子の stdin を PTY に倒して続けると、利用者が選んでいない配線 (= `--pty-stdin` 相当) で
+    // 子が動き、pipe の中身は届かないまま黙って進む。ready を書かずに終わるので、親 (run の
+    // CLI) は起動失敗として非 0 で終わる (stderr は親から継承しているので文言も届く)。
     let child_stdin = if init.child_stdin {
         match take_stdin_for_child() {
             Ok(fd) => Some(fd),
             Err(e) => {
-                // 渡せない時は子の stdin を PTY にして起動を続ける (= 子は動き、外から
-                // `hyoui input` で送れる)。
-                eprintln!("hyoui: stdin を子に渡せません ({e})。子の stdin は PTY になります");
-                None
+                eprintln!("{}", child_stdin_failure_message(&e));
+                return ExitCode::from(1);
             }
         }
     } else {
@@ -661,6 +664,15 @@ pub fn run_daemon_child() -> ExitCode {
         Ok(_code) => ExitCode::SUCCESS,
         Err(_) => ExitCode::from(1),
     }
+}
+
+/// 呼び出し元の stdin を子に渡せなかった時の文言 (DR-0042 決定 6)。原因と次の行動を書く。
+fn child_stdin_failure_message(cause: &str) -> String {
+    format!(
+        "hyoui: 呼び出し元の stdin を子に渡せないため、子を起動しません ({cause})。\n\
+         \x20      開ける fd の上限 (`ulimit -n`) と stdin を確かめて起動し直すか、stdin を子に渡さない\n\
+         \x20      なら `hyoui run --pty-stdin` で起動してください (子の stdin も PTY になります)。"
+    )
 }
 
 /// fd 0 を CLOEXEC 付きの新しい fd に複製して返し、fd 0 を /dev/null に置き換える

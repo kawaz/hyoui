@@ -19,7 +19,9 @@ pub fn is_stopped(pid: i32) -> Option<bool> {
 
 /// 自プロセスの制御端末として開けるパス (DR-0042 決定 4、attach client の入力端末)。
 ///
-/// 制御端末が無ければ `None`。macOS の `/dev/tty` は `poll(2)` に `POLLNVAL` を返し
+/// 制御端末が無い、または kernel から実体を引けなければ `None` (= どちらかは区別しない。
+/// 制御端末の有無は呼び出し側が `/dev/tty` の open で先に判定し、有るのに `None` なら
+/// エラーにする、DR-0042 決定 6)。macOS の `/dev/tty` は `poll(2)` に `POLLNVAL` を返し
 /// (実測 2026-10-06、PTY を制御端末に持つプロセスで `open("/dev/tty")` した fd を poll すると
 /// revents = 0x20)、poll で入力を待つ attach client の入力端末にできない。そこで kernel が
 /// 持つ制御端末の device 番号 (`proc_bsdinfo.e_tdev`) を `devname(3)` で実体のパス

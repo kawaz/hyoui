@@ -578,37 +578,46 @@ fn resolve_scrollback_rows(cfg_value: Option<usize>) -> Option<usize> {
     }
 }
 
-/// attach client の入力端末を開く (DR-0042 決定 4)。
+/// attach client の入力端末を開く (DR-0042 決定 4 / 6)。
 ///
-/// stdin が tty ならその複製、そうでなければ制御端末 (`/dev/tty`) を開く。制御端末が無い
-/// (= `/dev/tty` が開けない。Claude の Bash ツールでは ENXIO) 時は `None` で、呼び出し側は
-/// キー入力なしの中継にする (= エラーにしない)。tty の stdin を複製できない時だけ
-/// `Err` (= 端末はあるのに読めない、従来どおり起動を止める)。
+/// - stdin が tty: その複製
+/// - stdin が tty でなく、制御端末が無い (= `/dev/tty` の open が ENXIO。Claude の Bash
+///   ツールなど): `Ok(None)`。呼び出し側はキー入力なしの中継にする (決定 4 が認める唯一の
+///   入力無しの形)
+/// - stdin が tty でなく、制御端末がある: 制御端末の実体 (`/dev/ttys005` 等) を `O_NOCTTY` で
+///   読み専用で開いて返す。macOS の `/dev/tty` は poll に POLLNVAL を返し、poll で待つ中継の入力に
+///   できないため ([`hyoui::sys::procstate::controlling_tty_path`])
 ///
-/// 制御端末は poll できる実体のパスで開く (`hyoui::sys::procstate::controlling_tty_path`。
-/// macOS の `/dev/tty` は poll に POLLNVAL を返し、poll で待つ中継の入力にできない)。
-/// 実体のパスは `O_NOCTTY` で開く (= 制御端末の付け替えを起こさない)。
-fn open_input_terminal() -> std::io::Result<Option<std::fs::File>> {
+/// 制御端末があるのに開けない (= ENXIO 以外で `/dev/tty` が開けない、実体を特定できない、
+/// 実体を開けない) 時は `Err` (決定 6、fail closed)。キーの効かない attach にして黙って
+/// 続けない。
+fn open_input_terminal() -> Result<Option<std::fs::File>, String> {
     use std::os::unix::fs::OpenOptionsExt;
     let stdin = std::io::stdin();
     if is_tty(stdin.as_fd()) {
         return nix::unistd::dup(stdin.as_fd())
             .map(|fd| Some(std::fs::File::from(fd)))
-            .map_err(std::io::Error::from);
+            .map_err(|e| format!("stdin (端末) を複製できません: {e}"));
     }
-    // 制御端末があるかは /dev/tty が開けるかで決める (= kernel の判定に任せる)。
-    if std::fs::File::open("/dev/tty").is_err() {
-        return Ok(None);
-    }
-    let Some(path) = hyoui::sys::procstate::controlling_tty_path() else {
-        return Ok(None);
+    // 制御端末があるかは /dev/tty が開けるかで決める (= kernel の判定に任せる)。開けたものは
+    // 実体を開き終えるまで持つ (= 制御端末を確かめた状態のまま実体を引く)。
+    let probe = match std::fs::File::open("/dev/tty") {
+        Ok(f) => f,
+        Err(e) if e.raw_os_error() == Some(nix::libc::ENXIO) => return Ok(None),
+        Err(e) => return Err(format!("/dev/tty を開けません: {e}")),
     };
-    Ok(std::fs::OpenOptions::new()
+    let path = hyoui::sys::procstate::controlling_tty_path()
+        .ok_or_else(|| "制御端末はあるが、その実体 (device のパス) を特定できません".to_string())?;
+    // 読み専用で開く。入力端末に対して行うのは read / poll と、raw 化 (tcsetattr)・サイズ
+    // (TIOCGWINSZ) だけで、どれも読み専用の fd で効く (実測 2026-10-06、macOS)。書き込みを
+    // 要求すると、書き込み権の無い端末で開けずに失敗する。
+    let term = std::fs::OpenOptions::new()
         .read(true)
-        .write(true)
         .custom_flags(nix::fcntl::OFlag::O_NOCTTY.bits())
-        .open(path)
-        .ok())
+        .open(&path)
+        .map_err(|e| format!("制御端末の実体 {} を開けません: {e}", path.display()))?;
+    drop(probe);
+    Ok(Some(term))
 }
 
 /// 外側端末のサイズ (cols, rows)。入力端末と同じ規則で端末を選ぶ (= stdin が tty なら
@@ -962,6 +971,38 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
         }
     };
 
+    // DR-0042 決定 4 / 6: daemon に接続する前に入力の配線を確定する (= 失敗したら接続せずに
+    // 終わる)。
+    //
+    // 1. stdin が端末でない時は fd 0 を /dev/null に置き換えて手放す。`hyoui run` が exec した
+    //    attach が pipe の読み手として残ると、子が stdin を閉じても書き手に EPIPE が届かない
+    //    (決定 2)。置き換えられなければ中止する (= pipe を持ったまま続けない)
+    // 2. キーは入力端末 (= stdin が tty なら stdin、そうでなければ制御端末) から読み、stdin は
+    //    子に流さない。制御端末が無ければキー入力なしで出力だけを中継する。制御端末があるのに
+    //    開けなければ中止する
+    let stdin_is_tty = is_tty(std::io::stdin().as_fd());
+    if !stdin_is_tty && let Err(e) = hyoui::sys::raw::redirect_stdin_to_devnull() {
+        eprintln!(
+            "hyoui: attach: stdin を手放せないため中止します (stdin を /dev/null に置き換えられません: {e})。"
+        );
+        eprintln!(
+            "       stdin の pipe を持ったまま中継すると、子が stdin を閉じても書き手に EPIPE が届きません。\n\
+             \x20      開ける fd の上限 (`ulimit -n`) を確かめて実行し直してください。"
+        );
+        return ExitCode::from(1);
+    }
+    let input_terminal = match open_input_terminal() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("hyoui: attach: キー入力に使う端末を開けないため中止します ({e})。");
+            eprintln!(
+                "       stdin を端末のままにして実行し直すか (`< file` / pipe を外す)、キー入力が要らない\n\
+                 \x20      なら `hyoui tail` / `hyoui screen dump` で観測してください。"
+            );
+            return ExitCode::from(1);
+        }
+    };
+
     let token = std::env::var("HYOUI_LOCK_TOKEN").ok();
     let opts = AttachOptions {
         mode,
@@ -1001,24 +1042,6 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
     {
         eprintln!("hyoui: attach: stopped child の resume 要求送信失敗: {e}");
         return ExitCode::from(1);
-    }
-
-    // DR-0042 決定 4: キーは入力端末 (= stdin が tty なら stdin、そうでなければ /dev/tty) から
-    // 読み、stdin は子に流さない。/dev/tty も無ければキー入力なしで出力だけを中継する。
-    let stdin_is_tty = is_tty(std::io::stdin().as_fd());
-    let input_terminal = match open_input_terminal() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("hyoui: stdin dup 失敗: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    if !stdin_is_tty {
-        // stdin が端末でない時は fd 0 を手放す (= `hyoui run` が exec した attach が pipe の
-        // 読み手として残ると、子が閉じても書き手に EPIPE が届かない、DR-0042 決定 4)。
-        if let Err(e) = hyoui::sys::raw::redirect_stdin_to_devnull() {
-            eprintln!("hyoui: stdin を /dev/null に置き換えられません: {e} (続行)");
-        }
     }
 
     // DR-0020 §5: attach 成立時に detach / peek の発見性ヒントを stderr へ 1 行出す。
@@ -1149,8 +1172,12 @@ fn attach_command(cfg: AttachConfig) -> ExitCode {
     };
 
     // 外側 stdout が raw mode の tty かを `run` に伝える (= detach 時の安全側 reset と
-    // 子停止の通知行を出すかの判定に使う、issue 2026-07-24 H4 / DR-0029 §1)。
-    let conn = conn.with_outer_tty_raw(raw_guard.is_some());
+    // 子停止の通知行を出すかの判定に使う、issue 2026-07-24 H4 / DR-0029 §1)。入力端末を raw に
+    // できても stdout が tty でなければ (= `hyoui attach S </dev/null | consumer`) 偽にする。
+    // 入力端末は stdin が tty でない時に制御端末から取るので (DR-0042 決定 4)、raw_guard の
+    // 有無だけでは stdout が端末かを表さない。escape と通知行を pipe に混ぜない。
+    let outer_tty_raw = raw_guard.is_some() && is_tty(stdout.as_fd());
+    let conn = conn.with_outer_tty_raw(outer_tty_raw);
     // DR-0029 §2: Ctrl+Z 単発の client suspend で termios を戻す / 戻し直すため、signal
     // thread と同じ raw guard を run loop にも共有する。
     let conn = match raw_guard.as_ref() {
