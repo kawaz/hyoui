@@ -111,6 +111,7 @@ cat > ~/.config/hyoui/web/stable.toml <<'TOML'
 extends = "base.toml"
 
 [web]
+state_dir = "/Users/kawaz/.local/state/hyoui"
 listen = "127.0.0.1:43690"
 binary_path = "/opt/homebrew/bin/hyoui"
 TOML
@@ -118,6 +119,7 @@ cat > ~/.config/hyoui/web/unstable.toml <<'TOML'
 extends = "base.toml"
 
 [web]
+state_dir = "/Users/kawaz/.local/state/hyoui"
 listen = "127.0.0.1:43691"
 binary_path = "~/.local/share/repos/github.com/kawaz/hyoui/main/target/release/hyoui"
 TOML
@@ -126,19 +128,21 @@ TOML
 確かめること:
 
 - stable.toml に `binary_path` がある (無いと手順 5 で `add` を打った binary が焼かれ、repo build から打つと stable が repo build を指す)
+- 両方に `state_dir` (この面の状態の root) がある。無い config は `add` と `daemon run <name>` が断る (DR-0038 決定 9)。`base.toml` には書かない
 - listen が切り分けで見た旧登録簿の値と同じ (canddy が 43690 / 43691 を指しているので変えない)
 
 ### 5. unit を登録する
 
 ```sh
-hyoui web daemon add ~/.config/hyoui/web/stable.toml
-hyoui web daemon add ~/.config/hyoui/web/unstable.toml
+hyoui web daemon add stable     # 既にある stable.toml をそのまま登録する (書き換えない)
+hyoui web daemon add unstable
 hyoui web daemon list
 ```
 
 確かめること:
 
-- `add` の出力の `name` が `stable` / `unstable`、`listen` が 43690 / 43691、`binary_path` が brew 版 / repo build、`binary_exists: true`
+- `add` の出力の `name` が `stable` / `unstable`、`generated: false`、`listen` が 43690 / 43691、`binary_path` が brew 版 / repo build、`binary_exists: true`
+- 43690 / 43691 を旧監督者の子がまだ掴んでいると、`add` は使用中として断る。手順 1〜3 で旧監督者を止めてから打つ
 - `add` が `supervisor.running: false` と「次に監督者が上がった時に起きる」旨の note を出す (この時点では監督者が居ないので正しい)
 - `cat ~/.local/state/hyoui/web/units/stable.toml` が `config` / `binary_path` / `enabled` / `added_at` だけを持つ
 

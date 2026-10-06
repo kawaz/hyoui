@@ -53,6 +53,12 @@ pub enum Error {
         /// 既存の名前。
         name: String,
     },
+    /// 他の `add` が登録簿を書き換えている最中 (DR-0038 決定 9)。
+    #[error("another `hyoui web daemon add` is changing the registry at {}; run it again when that one has finished", path.display())]
+    Busy {
+        /// lock file。
+        path: PathBuf,
+    },
     /// 登録簿を読み書きできなかった。
     #[error("could not use the web gateway unit registry at {}: {reason}", path.display())]
     Storage {
@@ -61,6 +67,13 @@ pub enum Error {
         /// 原因。
         reason: String,
     },
+}
+
+/// 登録簿の排他 lock。`Drop` で外れる。
+#[derive(Debug)]
+pub struct RegistryLock {
+    path: PathBuf,
+    _held: nix::fcntl::Flock<std::fs::File>,
 }
 
 /// 登録簿操作の結果。
@@ -88,8 +101,69 @@ impl Registry {
         &self.dir
     }
 
-    /// 既存の登録を置き換えずに unit を足す。
+    /// 登録簿の排他 lock の置き場 (= unit dir の隣の `units.lock`)。
+    ///
+    /// lock は登録簿のファイルとは別のファイルに取る: 登録簿のファイルは tmp + rename で
+    /// 差し替えるので、それ自身に取ると rename を跨いだ書き手同士が別の inode の lock を
+    /// 掴む (DR-0036 決定 4 の auth store と同じ作法)。
+    pub fn lock_path(&self) -> PathBuf {
+        self.dir.with_file_name("units.lock")
+    }
+
+    /// 排他 lock を取る (他の保持者が離すまで待つ)。`remove` / `set_enabled` が使う。
+    pub fn lock(&self) -> Result<RegistryLock> {
+        self.open_lock(nix::fcntl::FlockArg::LockExclusive)
+    }
+
+    /// 排他 lock を待たずに取る。他の保持者が居れば [`Error::Busy`]。
+    ///
+    /// `add` は名前と listen の検査・config の生成・登録簿への書き込みをこの lock の中で
+    /// 行う (DR-0038 決定 9)。待たずに断るのは、人が打つ `add` 同士が重なった時に黙って
+    /// 待つより、重なったことを言って打ち直させる方が、後の add が前の add の結果を
+    /// 見て判断できるため。
+    pub fn try_lock(&self) -> Result<RegistryLock> {
+        self.open_lock(nix::fcntl::FlockArg::LockExclusiveNonblock)
+    }
+
+    fn open_lock(&self, mode: nix::fcntl::FlockArg) -> Result<RegistryLock> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let path = self.lock_path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|error| self.storage(dir, &error))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| self.storage(&path, &error))?;
+        match nix::fcntl::Flock::lock(file, mode) {
+            Ok(held) => Ok(RegistryLock { path, _held: held }),
+            Err((_, nix::errno::Errno::EWOULDBLOCK)) => Err(Error::Busy { path }),
+            Err((_, errno)) => Err(self.storage(&path, &errno)),
+        }
+    }
+
+    /// 既存の登録を置き換えずに unit を足す (lock を自分で取る、= test の組み立て用)。
+    #[cfg(test)]
     pub fn add(&self, name: &str, unit: &Unit) -> Result<()> {
+        let lock = self.lock()?;
+        self.add_locked(&lock, name, unit)
+    }
+
+    /// [`Registry::lock`] / [`Registry::try_lock`] で取った lock の中で unit を足す。
+    ///
+    /// 「無いことを確かめる → 書く」を lock の中で行うので、同じ名前の登録を上書き
+    /// しない。
+    pub fn add_locked(&self, lock: &RegistryLock, name: &str, unit: &Unit) -> Result<()> {
+        assert_eq!(
+            lock.path,
+            self.lock_path(),
+            "the lock belongs to another registry"
+        );
         validate_name(name)?;
         let path = self.path_of(name);
         if self.read(&path)?.is_some() {
@@ -103,6 +177,7 @@ impl Registry {
     /// 登録を外す。
     pub fn remove(&self, name: &str) -> Result<()> {
         validate_name(name)?;
+        let _lock = self.lock()?;
         let path = self.path_of(name);
         if self.read(&path)?.is_none() {
             return Err(Error::UnknownUnit {
@@ -157,6 +232,9 @@ impl Registry {
     /// これを書くのは監督者で、`add` / `remove` は CLI が書く。書き手が 2 者いる
     /// ことが tmp + rename の要件になっている (DR-0034 決定 2 / 4)。
     pub fn set_enabled(&self, name: &str, enabled: bool) -> Result<Unit> {
+        // 読む → 書くを lock の中で行う (= 並行する `remove` の後に消えた unit を
+        // 書き戻さない)。
+        let _lock = self.lock()?;
         let mut unit = self.get(name)?;
         if unit.enabled != enabled {
             unit.enabled = enabled;
@@ -337,7 +415,8 @@ pub fn find_listen_conflict(units: &[(String, String)], listen: &str) -> Option<
     overlapping
 }
 
-fn listen_is_ephemeral(listen: &str) -> bool {
+/// port 0 (= kernel に任せる) の listen か。どれとも取り合いにならない。
+pub fn listen_is_ephemeral(listen: &str) -> bool {
     listen
         .rsplit_once(':')
         .is_some_and(|(_, port)| port.parse::<u16>() == Ok(0))

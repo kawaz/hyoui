@@ -473,8 +473,8 @@ fn main() -> ExitCode {
         Command::Web(sub) => {
             web_daemon::warn_legacy_state_dir();
             match sub {
-                WebCommand::Daemon(WebDaemonCommand::Run { name }) => {
-                    web_daemon::run_command(name.as_deref())
+                WebCommand::Daemon(WebDaemonCommand::Run(source)) => {
+                    web_daemon::run_command(&source)
                 }
                 WebCommand::Daemon(WebDaemonCommand::Add(cfg)) => web_daemon::add_command(cfg),
                 WebCommand::Daemon(WebDaemonCommand::Remove { name }) => {
@@ -4649,8 +4649,11 @@ mod tests {
         for argv in [
             vec!["run", "--", "/bin/cat"],
             vec!["attach", "demo"],
-            // HTTP gateway の foreground 起動 (= DR-0038 決定 2 で 1 本化)。
-            vec!["web", "daemon", "run"],
+            // HTTP gateway の foreground 起動 (= DR-0038 決定 7 で 1 本化、形は決定 9)。
+            // 何も付けない `web daemon run` は help なので、起動する 3 形態を並べる。
+            vec!["web", "daemon", "run", "stable"],
+            vec!["web", "daemon", "run", "--config", "/c/stable.toml"],
+            vec!["web", "daemon", "run", "--no-config"],
         ] {
             let owned: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
             let cmd = parse_args(&owned);

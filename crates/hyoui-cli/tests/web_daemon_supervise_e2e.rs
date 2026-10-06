@@ -41,15 +41,17 @@ fn json(output: &Output) -> serde_json::Value {
     })
 }
 
-/// `<name>.toml` に listen を書き、それを unit として登録する (DR-0038 決定 2)。
+/// `add <name> --listen` で unit の config を生成して登録する (DR-0038 決定 9)。
 fn add_unit(home: &Path, name: &str, port: u16) -> Output {
-    let dir = home.join(".config/hyoui/web");
-    std::fs::create_dir_all(&dir).expect("config dir");
-    let config = dir.join(format!("{name}.toml"));
-    std::fs::write(&config, format!("[web]\nlisten = \"127.0.0.1:{port}\"\n"))
-        .expect("write config");
     hyoui(
-        &["web", "daemon", "add", config.to_str().expect("utf-8 path")],
+        &[
+            "web",
+            "daemon",
+            "add",
+            name,
+            "--listen",
+            &format!("127.0.0.1:{port}"),
+        ],
         home,
     )
 }
@@ -185,8 +187,21 @@ fn the_supervisor_starts_units_and_restarts_them_when_they_die() {
     assert_eq!(unit["version"]["restart_needed"], false);
     assert_eq!(unit["restarts"], 0);
 
-    // 子を外から殺すと、監督者が backoff を置いて上げ直す。
+    // 子の argv は `<binary_path> web daemon run <unit>` で、`--config` は渡さない
+    // (= config の path の正本は登録簿 1 か所、ps で unit 名が読める。DR-0038 決定 9)。
     let first_pid = unit["pid"].as_u64().expect("pid") as i32;
+    let ps = Command::new("ps")
+        .args(["-o", "command=", "-p", &first_pid.to_string()])
+        .output()
+        .expect("spawn ps");
+    let argv = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+    assert_eq!(
+        argv,
+        format!("{} web daemon run unstable", env!("CARGO_BIN_EXE_hyoui")),
+        "{unit}"
+    );
+
+    // 子を外から殺すと、監督者が backoff を置いて上げ直す。
     send(first_pid, Signal::SIGKILL);
 
     let after = supervisor.await_status("the unit to be restarted", |status| {

@@ -244,32 +244,48 @@ pub enum WebServiceCommand {
     },
 }
 
-/// `web daemon add` configuration (= DR-0038 決定 2)。
+/// `web daemon add` configuration (= DR-0038 決定 2 / 9)。
 ///
 /// unit = config ファイル 1 つ。登録簿は config の path を参照するだけで、
-/// `listen` 等の値は config の `[web]` が正本。
+/// `listen` 等の値は config の `[web]` が正本。`--config` が無ければ
+/// `<web の config の置き場>/<name>.toml` を使い、無ければ生成する。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WebDaemonAddConfig {
-    /// `--name=<name>` (`[A-Za-z0-9_-]{1,32}`)。省略時は config の basename から
-    /// 拡張子を除いたもの。
-    pub name: Option<String>,
-    /// 登録する config ファイルの path (= 任意の置き場)。
-    pub config: std::path::PathBuf,
+    /// unit 名 (`[A-Za-z0-9_-]{1,32}`)。既定値は持たない (決定 9)。
+    pub name: String,
+    /// `--config <path>`。既存の config をこの名前で登録する (= 生成しない)。
+    pub config: Option<std::path::PathBuf>,
+    /// `--listen <host:port>`。生成する config の `listen` (既定 `127.0.0.1:43690`)。
+    pub listen: Option<String>,
+    /// `--binary <path>`。生成する config の `binary_path` (既定 = この実行ファイル)。
+    pub binary: Option<std::path::PathBuf>,
+}
+
+/// `web daemon run` が起動に使う設定の出どころ (= DR-0038 決定 9)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebDaemonRunSource {
+    /// `run <unit>` — 登録簿が指す config。
+    Unit(String),
+    /// `run --config <path>` — 登録簿を通さずその config。
+    Config(std::path::PathBuf),
+    /// `run --no-config [--listen <host:port>]` — config を読まず、組み込みの既定値と
+    /// CLI 引数だけで起動する (= test 向け)。
+    NoConfig {
+        /// `--listen` (無ければ組み込みの既定)。
+        listen: Option<String>,
+    },
 }
 
 /// `web daemon` の leaf command (= DR-0034 決定 1)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WebDaemonCommand {
-    /// `hyoui web daemon run [name]` — この unit を foreground 起動する。
-    /// name 省略時は登録簿を見ず、web の config の既定 path を読む。
-    Run {
-        /// 起動する unit 名。
-        name: Option<String>,
-    },
+    /// `hyoui web daemon run <unit> | --config <path> | --no-config` — foreground 起動。
+    Run(WebDaemonRunSource),
     /// `hyoui web daemon supervise` — foreground の監督者 (= 決定 3)。
     Supervise,
-    /// `hyoui web daemon add [--name <name>] <config-path>` — 登録簿に足す。
+    /// `hyoui web daemon add <name> [--listen ..] [--binary ..] | --config <path>` —
+    /// config を生成 (または既存を確かめ) て登録簿に足す。
     Add(WebDaemonAddConfig),
     /// `hyoui web daemon remove <name>` — 登録簿から外す。
     Remove {
@@ -2785,9 +2801,10 @@ hyoui web session <subcommand>
 Manage the HTTP gateway: its instances, its per-user OS service, and who may
 open it. No arguments prints this help.
 
-A gateway is started by `hyoui web daemon run [<name>]` -- the only way to run
+A gateway is started by `hyoui web daemon run <name>` -- the only way to run
 one in the foreground. Each instance (unit) is one config file holding its
-`[web]` settings; register it with `hyoui web daemon add <config-path>`.
+`[web]` settings; `hyoui web daemon add <name>` writes that file and registers
+it.
 
 SUBCOMMANDS:
   daemon     Register, inspect, and run gateway instances (units).
@@ -2804,6 +2821,12 @@ Config (`[web]` in a unit's config file):
                              mode). Embedded assets when unset.
   binary_path = \"<path>\"     Executable the unit starts. Defaults to the one
                              that ran `daemon add`.
+  state_dir = \"<path>\"       Required, in the unit's config file itself (a
+                             value inherited through `extends` is refused).
+                             The state root this config belongs to; add and
+                             run refuse a config whose state_dir is not the
+                             state root they run with. Keep it out of a base
+                             file shared by several state roots.
   extends = \"<path>\"         (top level) Layer this file over another: tables
                              merge key by key, other values replace. Relative
                              paths are resolved next to the file that wrote
@@ -2984,9 +3007,10 @@ each unit reads, the executable to start, and whether it should be running. No
 arguments prints this help.
 
 SUBCOMMANDS:
-  run [<name>]                   Start one unit in the foreground.
+  run <name>                     Start one unit in the foreground.
   supervise                      Run the supervisor in the foreground.
-  add [--name <name>] <config>   Register a config file as a unit and start it.
+  add <name>                     Write the unit's config, register it, and
+                                 start it.
   remove <name>                  Stop the unit and drop its registration.
   list                           Print registered units (works without the
                                  supervisor).
@@ -3013,7 +3037,7 @@ fn usage_web_daemon_supervise() -> String {
 hyoui web daemon supervise
 
 Run the supervisor in the foreground: start every enabled unit as
-`<binary> web daemon run <name>`, restart it when it exits, and serve the
+`<binary_path> web daemon run <name>`, restart it when it exits, and serve the
 control socket that start, stop, restart, status, and log talk to.
 
 This is the one command the OS service manager loads (see
@@ -3152,48 +3176,80 @@ OPTIONS:
 
 fn usage_web_daemon_run() -> String {
     "\
-hyoui web daemon run [<name>]
+hyoui web daemon run <name>
+hyoui web daemon run --config <path>
+hyoui web daemon run --no-config [--listen <host:port>]
 
-Start one gateway in the foreground, reading the config file the unit is
-registered with. This is the same path the supervisor uses to start a child,
-so it is also how to try a single unit by hand.
+Start one gateway in the foreground.
 
-Without a name, the registry is not read at all: the config is
-`${XDG_CONFIG_HOME:-~/.config}/hyoui/web/config.toml`, and when that file does
-not exist the gateway binds `127.0.0.1:43690` with embedded assets. There is no
-\"default unit\" -- picking the only registered one would change what this
-command means the moment a second unit is added.
+With a name, the config is the file the unit is registered with. This is the
+command the supervisor runs for each child, so it is also how to try a single
+unit by hand. With --config, that file is read without going through the
+registry. Either way only that file and the files it reaches through `extends`
+are read, and its `[web].state_dir` must be the state root this command runs
+with.
+
+With --no-config, no config file is read: the gateway uses the built-in
+defaults (`127.0.0.1:43690`, embedded assets) and --listen. This is meant for
+tests, e.g.
+  XDG_STATE_HOME=<tmp> hyoui web daemon run --no-config --listen 127.0.0.1:0
+
+No arguments prints this help.
 
 OPTIONS:
-  --help, -h    Show this help.
+  --config <path>        Read this config file instead of a registered unit.
+  --no-config            Read no config file.
+  --listen <host:port>   Bind address, with --no-config only.
+  --help, -h             Show this help.
 "
     .to_string()
 }
 
 fn usage_web_daemon_add() -> String {
     "\
-hyoui web daemon add [--name <name>] <config-path>
+hyoui web daemon add <name> [--listen <host:port>] [--binary <path>]
+hyoui web daemon add <name> --config <path>
 
-Register a config file as a gateway unit and ask the supervisor to start it.
-The file may live anywhere; `${XDG_CONFIG_HOME:-~/.config}/hyoui/web/` is the
-usual place. The registry records the file's absolute path, not its contents,
-so later edits to the file take effect on the unit's next start.
+Register a gateway unit and ask the supervisor to start it.
 
-The executable the unit starts is `[web].binary_path` from the config, or, when
-unset, the executable running this command -- which is what makes a unit added
-from a repo build stay on that build. It is recorded now; to change it, remove
-and add the unit again.
+Without --config, the unit's config is
+`${XDG_CONFIG_HOME:-~/.config}/hyoui/web/<name>.toml`. When that file does not
+exist it is written with `extends = \"base.toml\"` (when base.toml exists next
+to it), `state_dir` (the state root this command runs with), `listen`, and
+`binary_path`. When it already exists it is not rewritten: it is registered as
+it is, after checking that its `state_dir` is this state root (a mismatch means
+another state root uses the same name). --listen and --binary only apply to a
+file being written.
 
-The config must be readable now. A bind address already held by another unit
-is refused. A missing executable is a warning, not an error, so a unit may be
-registered before its build exists.
+With --config, that existing file is registered under the name, after the same
+`state_dir` check.
+
+The registry records the file's absolute path, not its contents, so later
+edits to `listen` or `assets_dir` take effect on the unit's next start. The
+executable is copied into the registry now; to change it, remove and add the
+unit again.
+
+The bind address is checked now: an address another unit of this state root
+uses, or a port some process is listening on, is refused (no free port is
+picked for you). A missing executable is a warning, not an error, so a unit
+may be registered before its build exists.
+
+The checks, the new file, and the registration happen under a lock on this
+state root's registry; while another add holds it, this one refuses without
+writing anything. A written config that cannot be read with its `extends`
+(a broken base.toml, for example) is removed and nothing is registered.
+
+No arguments prints this help.
 
 OPTIONS:
-  --name <name>    Unit name: 1-32 characters from A-Z, a-z, 0-9, `_`, and `-`.
-                   Defaults to the file name without its extension.
-  --help, -h       Show this help.
+  --listen <host:port>   Bind address of a new config. Default `127.0.0.1:43690`.
+  --binary <path>        Executable of a new config. Default: the executable
+                         running this command.
+  --config <path>        Register this existing config file instead.
+  --help, -h             Show this help.
 
-A unit starts out enabled.
+Name: 1-32 characters from A-Z, a-z, 0-9, `_`, and `-`. A unit starts out
+enabled.
 "
     .to_string()
 }
@@ -4679,7 +4735,7 @@ fn parse_web(args: &[String]) -> Command {
             topic: HelpTopic::Web,
         },
         other if other.starts_with('-') => Command::Error(format!(
-            "web: unknown option: {other} (start a gateway with `hyoui web daemon run [<name>]`)"
+            "web: unknown option: {other} (start a gateway with `hyoui web daemon run <name>`)"
         )),
         other => Command::Error(format!(
             "web: unknown subcommand `{other}` (supported: daemon, service, passkey, session)"
@@ -4968,25 +5024,117 @@ fn parse_web_daemon_target(verb: &str, args: &[String]) -> Command {
     Command::Web(WebCommand::Daemon(command))
 }
 
+/// `--<flag> <value>` / `--<flag>=<value>` の値を取る (= 空の値は断る)。
+///
+/// `arg` が `--<flag>` 単独なら次の要素を消費して `i` を進める。`--<flag>` で
+/// 始まらなければ `None`。
+fn take_flag_value(
+    args: &[String],
+    i: &mut usize,
+    flag: &str,
+    context: &str,
+) -> Option<std::result::Result<String, Command>> {
+    let arg = args[*i].as_str();
+    let value = if arg == flag {
+        *i += 1;
+        args.get(*i).cloned()
+    } else {
+        Some(arg.strip_prefix(flag)?.strip_prefix('=')?.to_string())
+    };
+    Some(match value {
+        Some(value) if !value.is_empty() => Ok(value),
+        _ => Err(Command::Error(format!(
+            "{context}: {flag} requires a value"
+        ))),
+    })
+}
+
+/// `hyoui web daemon run <unit> | --config <path> | --no-config [--listen <addr>]`
+/// (DR-0038 決定 9)。何も付けなければ help。
 fn parse_web_daemon_run(args: &[String]) -> Command {
-    let mut name: Option<String> = None;
-    for arg in args {
-        match arg.as_str() {
-            "--help" | "-h" => {
+    const CONTEXT: &str = "web daemon run";
+    let mut unit: Option<String> = None;
+    let mut config: Option<std::path::PathBuf> = None;
+    let mut no_config = false;
+    let mut listen: Option<String> = None;
+    let mut positional_only = false;
+    let mut i = 0usize;
+
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if !positional_only {
+            if matches!(arg, "--help" | "-h") {
                 return Command::Help {
                     topic: HelpTopic::WebDaemonRun,
                 };
             }
-            other if other.starts_with('-') => {
-                return Command::Error(format!("web daemon run: unknown option: {other}"));
+            if arg == "--" {
+                positional_only = true;
+                i += 1;
+                continue;
             }
-            other if name.is_none() => name = Some(other.to_string()),
-            other => {
-                return Command::Error(format!("web daemon run: unexpected argument: {other}"));
+            if arg == "--no-config" {
+                no_config = true;
+                i += 1;
+                continue;
+            }
+            if arg.starts_with("--no-config=") {
+                return Command::Error(format!("{CONTEXT}: --no-config does not take a value"));
+            }
+            if let Some(value) = take_flag_value(args, &mut i, "--config", CONTEXT) {
+                match value {
+                    Ok(value) => config = Some(std::path::PathBuf::from(value)),
+                    Err(error) => return error,
+                }
+                i += 1;
+                continue;
+            }
+            if let Some(value) = take_flag_value(args, &mut i, "--listen", CONTEXT) {
+                match value {
+                    Ok(value) => listen = Some(value),
+                    Err(error) => return error,
+                }
+                i += 1;
+                continue;
+            }
+            if arg.starts_with('-') {
+                return Command::Error(format!("{CONTEXT}: unknown option: {arg}"));
             }
         }
+        if unit.is_some() {
+            return Command::Error(format!("{CONTEXT}: unexpected argument: {arg}"));
+        }
+        unit = Some(arg.to_string());
+        i += 1;
     }
-    Command::Web(WebCommand::Daemon(WebDaemonCommand::Run { name }))
+
+    let given =
+        usize::from(unit.is_some()) + usize::from(config.is_some()) + usize::from(no_config);
+    if given > 1 {
+        return Command::Error(format!(
+            "{CONTEXT}: give only one of a unit name, --config <path>, or --no-config"
+        ));
+    }
+    if listen.is_some() && !no_config {
+        // config を読む起動で listen だけを差し替えると、config の listen を見る
+        // `list` / `status` / 監督者の問い合わせ先と実際の bind 先が食い違う
+        // (DR-0038 決定 6)。
+        return Command::Error(format!(
+            "{CONTEXT}: --listen is only for --no-config; set `listen` in the unit's config instead"
+        ));
+    }
+    let source = match (unit, config) {
+        (Some(unit), _) => WebDaemonRunSource::Unit(unit),
+        (None, Some(config)) => WebDaemonRunSource::Config(config),
+        (None, None) if no_config => WebDaemonRunSource::NoConfig { listen },
+        // 何も付けない run は help (= unit の名前に既定値を持たせない、決定 9)。
+        (None, None) => {
+            return Command::Help {
+                topic: HelpTopic::WebDaemonRun,
+            };
+        }
+    };
+    Command::Web(WebCommand::Daemon(WebDaemonCommand::Run(source)))
 }
 
 fn parse_web_daemon_remove(args: &[String]) -> Command {
@@ -5016,49 +5164,82 @@ fn parse_web_daemon_remove(args: &[String]) -> Command {
     }
 }
 
+/// `hyoui web daemon add <name> [--listen <addr>] [--binary <path>]` /
+/// `hyoui web daemon add <name> --config <path>` (DR-0038 決定 9)。name を省けば help。
 fn parse_web_daemon_add(args: &[String]) -> Command {
+    const CONTEXT: &str = "web daemon add";
     let mut name: Option<String> = None;
     let mut config: Option<std::path::PathBuf> = None;
+    let mut listen: Option<String> = None;
+    let mut binary: Option<std::path::PathBuf> = None;
+    let mut positional_only = false;
     let mut i = 0usize;
 
     while i < args.len() {
         let arg = args[i].as_str();
-        match arg {
-            "--help" | "-h" => {
+        if !positional_only {
+            if matches!(arg, "--help" | "-h") {
                 return Command::Help {
                     topic: HelpTopic::WebDaemonAdd,
                 };
             }
-            _ if arg.starts_with("--name=") => {
-                let value = &arg["--name=".len()..];
-                if value.is_empty() {
-                    return Command::Error("web daemon add: --name requires a value".into());
-                }
-                name = Some(value.to_string());
-            }
-            "--name" => {
+            if arg == "--" {
+                positional_only = true;
                 i += 1;
-                match args.get(i) {
-                    Some(value) if !value.is_empty() => name = Some(value.clone()),
-                    _ => return Command::Error("web daemon add: --name requires a value".into()),
+                continue;
+            }
+            if let Some(value) = take_flag_value(args, &mut i, "--config", CONTEXT) {
+                match value {
+                    Ok(value) => config = Some(std::path::PathBuf::from(value)),
+                    Err(error) => return error,
                 }
+                i += 1;
+                continue;
             }
-            other if other.starts_with('-') => {
-                return Command::Error(format!("web daemon add: unknown option: {other}"));
+            if let Some(value) = take_flag_value(args, &mut i, "--listen", CONTEXT) {
+                match value {
+                    Ok(value) => listen = Some(value),
+                    Err(error) => return error,
+                }
+                i += 1;
+                continue;
             }
-            other if config.is_none() => config = Some(std::path::PathBuf::from(other)),
-            other => {
-                return Command::Error(format!("web daemon add: unexpected argument: {other}"));
+            if let Some(value) = take_flag_value(args, &mut i, "--binary", CONTEXT) {
+                match value {
+                    Ok(value) => binary = Some(std::path::PathBuf::from(value)),
+                    Err(error) => return error,
+                }
+                i += 1;
+                continue;
+            }
+            if arg.starts_with('-') {
+                return Command::Error(format!("{CONTEXT}: unknown option: {arg}"));
             }
         }
+        if name.is_some() {
+            return Command::Error(format!("{CONTEXT}: unexpected argument: {arg}"));
+        }
+        name = Some(arg.to_string());
         i += 1;
     }
 
-    match config {
-        Some(config) => Command::Web(WebCommand::Daemon(WebDaemonCommand::Add(
-            WebDaemonAddConfig { name, config },
+    if config.is_some() && (listen.is_some() || binary.is_some()) {
+        // 既存の config を登録する時は値をその config が持つ。CLI の値を黙って
+        // 捨てると、書いた人の意図が config の値に倒れる。
+        return Command::Error(format!(
+            "{CONTEXT}: --listen and --binary write a new config and cannot be combined with --config; edit that file instead"
+        ));
+    }
+    match name {
+        Some(name) => Command::Web(WebCommand::Daemon(WebDaemonCommand::Add(
+            WebDaemonAddConfig {
+                name,
+                config,
+                listen,
+                binary,
+            },
         ))),
-        // 必須引数を欠く verb は help (= reference の出力規約)。
+        // name に既定値は持たせない。省いた add は help (決定 9)。
         None => Command::Help {
             topic: HelpTopic::WebDaemonAdd,
         },
@@ -11835,23 +12016,113 @@ mod tests {
         );
     }
 
-    /// `run` の name は省略でき、省略時は既定の置き場の config を読む。
+    /// `run` は unit 名 / `--config <path>` / `--no-config` のどれか 1 つを取り、
+    /// 何も付けなければ help (DR-0038 決定 9)。
     #[test]
-    fn parse_web_daemon_run_takes_an_optional_name() {
+    fn parse_web_daemon_run_takes_a_unit_a_config_or_no_config() {
+        let run = |source| Command::Web(WebCommand::Daemon(WebDaemonCommand::Run(source)));
         assert_eq!(
             parse_args(&args(&["web", "daemon", "run"])),
-            Command::Web(WebCommand::Daemon(WebDaemonCommand::Run { name: None }))
+            Command::Help {
+                topic: HelpTopic::WebDaemonRun
+            }
         );
         assert_eq!(
             parse_args(&args(&["web", "daemon", "run", "unstable"])),
-            Command::Web(WebCommand::Daemon(WebDaemonCommand::Run {
-                name: Some("unstable".into())
-            }))
+            run(WebDaemonRunSource::Unit("unstable".into()))
         );
-        assert!(matches!(
-            parse_args(&args(&["web", "daemon", "run", "a", "b"])),
-            Command::Error(message) if message.contains("unexpected argument")
-        ));
+        for command in [
+            vec!["web", "daemon", "run", "--config", "/c/u.toml"],
+            vec!["web", "daemon", "run", "--config=/c/u.toml"],
+        ] {
+            assert_eq!(
+                parse_args(&args(&command)),
+                run(WebDaemonRunSource::Config("/c/u.toml".into())),
+                "{command:?}"
+            );
+        }
+        assert_eq!(
+            parse_args(&args(&["web", "daemon", "run", "--no-config"])),
+            run(WebDaemonRunSource::NoConfig { listen: None })
+        );
+        // option の位置は固定しない。
+        for command in [
+            vec![
+                "web",
+                "daemon",
+                "run",
+                "--no-config",
+                "--listen",
+                "127.0.0.1:0",
+            ],
+            vec![
+                "web",
+                "daemon",
+                "run",
+                "--listen=127.0.0.1:0",
+                "--no-config",
+            ],
+        ] {
+            assert_eq!(
+                parse_args(&args(&command)),
+                run(WebDaemonRunSource::NoConfig {
+                    listen: Some("127.0.0.1:0".into())
+                }),
+                "{command:?}"
+            );
+        }
+        // `--` の後は unit 名として読む。
+        assert_eq!(
+            parse_args(&args(&["web", "daemon", "run", "--", "-odd"])),
+            run(WebDaemonRunSource::Unit("-odd".into()))
+        );
+
+        for (command, needle) in [
+            (
+                vec!["web", "daemon", "run", "a", "b"],
+                "unexpected argument",
+            ),
+            (
+                vec!["web", "daemon", "run", "a", "--config", "/c/u.toml"],
+                "only one of",
+            ),
+            (
+                vec!["web", "daemon", "run", "a", "--no-config"],
+                "only one of",
+            ),
+            (
+                vec!["web", "daemon", "run", "--config=/c/u.toml", "--no-config"],
+                "only one of",
+            ),
+            // listen を差し替えるのは config を読まない起動だけ。
+            (
+                vec!["web", "daemon", "run", "a", "--listen", "127.0.0.1:1"],
+                "--listen is only for --no-config",
+            ),
+            (
+                vec!["web", "daemon", "run", "--listen=127.0.0.1:1"],
+                "--listen is only",
+            ),
+            (vec!["web", "daemon", "run", "--config"], "requires a value"),
+            (
+                vec!["web", "daemon", "run", "--no-config", "--listen="],
+                "requires a value",
+            ),
+            (vec!["web", "daemon", "run", "--name=a"], "unknown option"),
+            (
+                vec!["web", "daemon", "run", "--no-config=yes"],
+                "does not take a value",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    parse_args(&args(&command)),
+                    Command::Error(ref message) if message.contains(needle)
+                ),
+                "{command:?}: {:?}",
+                parse_args(&args(&command))
+            );
+        }
     }
 
     #[test]
@@ -11872,56 +12143,128 @@ mod tests {
         ));
     }
 
-    /// `add` は config の path を 1 つと、省略できる `--name` を取る (DR-0038 決定 2)。
+    /// `add` は unit 名を必須の位置引数に取り、生成する config の `--listen` /
+    /// `--binary`、または既存の config を指す `--config` を取る (DR-0038 決定 9)。
     #[test]
-    fn parse_web_daemon_add_takes_a_config_path_and_an_optional_name() {
+    fn parse_web_daemon_add_takes_a_name_and_generation_or_config_options() {
+        let add = |config: WebDaemonAddConfig| {
+            Command::Web(WebCommand::Daemon(WebDaemonCommand::Add(config)))
+        };
         assert_eq!(
-            parse_args(&args(&["web", "daemon", "add", "web/unstable.toml"])),
-            Command::Web(WebCommand::Daemon(WebDaemonCommand::Add(
-                WebDaemonAddConfig {
-                    name: None,
-                    config: std::path::PathBuf::from("web/unstable.toml"),
-                }
-            )))
+            parse_args(&args(&["web", "daemon", "add", "stable"])),
+            add(WebDaemonAddConfig {
+                name: "stable".into(),
+                ..WebDaemonAddConfig::default()
+            })
         );
-        // `--name` は separate 形でも `=` 形でも同じ、positional の前後を問わない。
+        // separate 形でも `=` 形でも同じ、位置引数の前後を問わない。
         for command in [
-            vec!["web", "daemon", "add", "--name", "stable", "/c/s.toml"],
-            vec!["web", "daemon", "add", "/c/s.toml", "--name=stable"],
+            vec![
+                "web",
+                "daemon",
+                "add",
+                "stable",
+                "--listen",
+                "127.0.0.1:43692",
+                "--binary",
+                "/opt/hyoui",
+            ],
+            vec![
+                "web",
+                "daemon",
+                "add",
+                "--binary=/opt/hyoui",
+                "--listen=127.0.0.1:43692",
+                "stable",
+            ],
         ] {
             assert_eq!(
                 parse_args(&args(&command)),
-                Command::Web(WebCommand::Daemon(WebDaemonCommand::Add(
-                    WebDaemonAddConfig {
-                        name: Some("stable".into()),
-                        config: std::path::PathBuf::from("/c/s.toml"),
-                    }
-                ))),
+                add(WebDaemonAddConfig {
+                    name: "stable".into(),
+                    config: None,
+                    listen: Some("127.0.0.1:43692".into()),
+                    binary: Some("/opt/hyoui".into()),
+                }),
+                "{command:?}"
+            );
+        }
+        assert_eq!(
+            parse_args(&args(&[
+                "web",
+                "daemon",
+                "add",
+                "stable",
+                "--config",
+                "/c/s.toml"
+            ])),
+            add(WebDaemonAddConfig {
+                name: "stable".into(),
+                config: Some("/c/s.toml".into()),
+                ..WebDaemonAddConfig::default()
+            })
+        );
+        // name を省いた add は help (= 既定値を持たない)。option だけでも同じ。
+        for command in [
+            vec!["web", "daemon", "add", "--listen", "127.0.0.1:1"],
+            vec!["web", "daemon", "add", "--config=/c/s.toml"],
+        ] {
+            assert_eq!(
+                parse_args(&args(&command)),
+                Command::Help {
+                    topic: HelpTopic::WebDaemonAdd
+                },
                 "{command:?}"
             );
         }
 
-        assert!(matches!(
-            parse_args(&args(&["web", "daemon", "add", "a.toml", "b.toml"])),
-            Command::Error(message) if message.contains("unexpected argument")
-        ));
-        assert!(matches!(
-            parse_args(&args(&["web", "daemon", "add", "a.toml", "--name"])),
-            Command::Error(message) if message.contains("requires")
-        ));
-        // 設定値は config 側が持つので、add は受けない。
-        for removed in [
-            "--port=1",
-            "--listen=127.0.0.1:1",
-            "--binary=/x",
-            "--web-assets-dir=/x",
+        for (command, needle) in [
+            (
+                vec!["web", "daemon", "add", "a", "b"],
+                "unexpected argument",
+            ),
+            (
+                vec!["web", "daemon", "add", "a", "--listen"],
+                "requires a value",
+            ),
+            (
+                vec!["web", "daemon", "add", "a", "--binary="],
+                "requires a value",
+            ),
+            // 既存の config を登録する時に生成用の値は混ぜない。
+            (
+                vec![
+                    "web",
+                    "daemon",
+                    "add",
+                    "a",
+                    "--config=/c",
+                    "--listen=127.0.0.1:1",
+                ],
+                "cannot be combined with --config",
+            ),
+            (
+                vec!["web", "daemon", "add", "a", "--config=/c", "--binary=/x"],
+                "cannot be combined with --config",
+            ),
+            // 名前は位置引数で渡す。
+            (vec!["web", "daemon", "add", "--name=a"], "unknown option"),
+            (
+                vec!["web", "daemon", "add", "a", "--port=1"],
+                "unknown option",
+            ),
+            (
+                vec!["web", "daemon", "add", "a", "--web-assets-dir=/x"],
+                "unknown option",
+            ),
         ] {
             assert!(
                 matches!(
-                    parse_args(&args(&["web", "daemon", "add", "a.toml", removed])),
-                    Command::Error(message) if message.contains("unknown option")
+                    parse_args(&args(&command)),
+                    Command::Error(ref message) if message.contains(needle)
                 ),
-                "{removed}"
+                "{command:?}: {:?}",
+                parse_args(&args(&command))
             );
         }
     }
@@ -12175,12 +12518,25 @@ mod tests {
             );
         }
         assert!(usage(&HelpTopic::WebDaemonRun).contains("foreground"));
-        // add は config の path と `--name` を取り、設定値は config の `[web]` が持つ
-        // (DR-0038 決定 2)。
-        assert!(usage(&HelpTopic::WebDaemonAdd).contains("--name"));
-        assert!(usage(&HelpTopic::WebDaemonAdd).contains("<config-path>"));
-        assert!(usage(&HelpTopic::WebDaemonAdd).contains("binary_path"));
+        // add は unit 名を取り、config を生成するか既存を登録する。生成した config の
+        // `state_dir` で面を確かめる (DR-0038 決定 9)。
+        for needle in [
+            "<name>",
+            "--listen",
+            "--binary",
+            "--config",
+            "state_dir",
+            "binary_path",
+        ] {
+            assert!(usage(&HelpTopic::WebDaemonAdd).contains(needle), "{needle}");
+        }
+        assert!(!usage(&HelpTopic::WebDaemonAdd).contains("--name"));
         assert!(!usage(&HelpTopic::WebDaemonAdd).contains("--port"));
+        for needle in ["--config", "--no-config", "--listen", "state_dir"] {
+            assert!(usage(&HelpTopic::WebDaemonRun).contains(needle), "{needle}");
+        }
+        assert!(!usage(&HelpTopic::WebDaemonRun).contains("config.toml"));
+        assert!(usage(&HelpTopic::Web).contains("state_dir"));
         // `hyoui web` は名前空間で、config の書き方 (`extends` 含む) を案内する。
         assert!(usage(&HelpTopic::Web).contains("hyoui web daemon run"));
         assert!(usage(&HelpTopic::Web).contains("extends"));

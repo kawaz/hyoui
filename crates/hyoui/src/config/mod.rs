@@ -142,7 +142,7 @@ pub enum CtrlzX1Action {
 
 /// web gateway の設定ファイル 1 つ (= unit の中身、DR-0038 決定 1)。
 ///
-/// `hyoui web daemon add <path>` が登録するのはこのファイルの path で、値は
+/// `hyoui web daemon add <name>` が登録するのはこのファイルの path で、値は
 /// 登録簿に写さない。`daemon run` / 監督者 / `list` が読むたびにここから引く。
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct WebFile {
@@ -173,6 +173,16 @@ pub struct WebConfig {
     /// `binary_path` に写す正本。無ければ `add` した時点の自分自身。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_path: Option<PathBuf>,
+
+    /// この config が属する面の状態の root (DR-0038 決定 9)。
+    ///
+    /// `daemon add` / `daemon run` は今の面の状態の root と realpath で比べ、食い違えば
+    /// 断る。面同士は互いの登録簿を見られないので、別の面の config を登録・起動した
+    /// 事故に気付ける場所は config 自身しかない。面をまたいで共有する土台
+    /// (`base.toml`) には書かない。値の要否は読み手 (= CLI の add / run) が判断し、
+    /// ここでは任意として読む (= `list` / `status` / 監督者は listen だけを使う)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_dir: Option<PathBuf>,
 }
 
 /// `[web]` の listen の既定値。
@@ -187,6 +197,7 @@ impl Default for WebConfig {
             listen: default_web_listen(),
             assets_dir: None,
             binary_path: None,
+            state_dir: None,
         }
     }
 }
@@ -471,8 +482,8 @@ const REMOVED_KEYS: &[RemovedKey] = &[
 
 /// `config.toml` の `[web]` が web の config ファイルへ移ったことの案内 (DR-0038 決定 1)。
 const WEB_MOVED_HINT: &str = "web gateway の設定は unit ごとの config ファイルに移りました。\
-     `$XDG_CONFIG_HOME/hyoui/web/<name>.toml` に `[web]` を書き、\
-     `hyoui web daemon add <path>` で登録してください";
+     `hyoui web daemon add <name>` が `$XDG_CONFIG_HOME/hyoui/web/<name>.toml` を\
+     書いて登録します";
 
 /// 廃止 key が書かれていないか検査する (DR-0032 §1 migration)。
 fn check_removed_keys(table: &toml::Table, path: &Path) -> Result<(), ConfigError> {
@@ -560,16 +571,6 @@ fn resolve_path_in(env: &crate::paths::Env) -> Option<PathBuf> {
     env.config_dir().map(|dir| dir.join("config.toml"))
 }
 
-/// web の config の既定 path (`$XDG_CONFIG_HOME/hyoui/web/config.toml`、DR-0038 決定 4)。
-///
-/// 名前を省いた `hyoui web daemon run` が読む。登録簿の unit は任意 path を指せる
-/// ので、ここは既定の置き場であって強制ではない。
-pub fn default_web_path() -> Option<PathBuf> {
-    crate::paths::Env::current()
-        .web_config_dir()
-        .map(|dir| dir.join("config.toml"))
-}
-
 /// config を読み込む。
 ///
 /// - パス解決不能 / ファイル不在 → `Ok(Config::default())`
@@ -600,8 +601,8 @@ pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
 /// web の config ファイルを読む (DR-0038 決定 1 / 3)。
 ///
 /// 明示された path を読むので、無ければ [`ConfigError::NotFound`]。`extends` を辿り、
-/// `[web]` の `assets_dir` / `binary_path` の相対パスは**それを書いたファイルの隣**
-/// から解く (= 起動時の cwd で意味が変わらない)。
+/// `[web]` の `assets_dir` / `binary_path` / `state_dir` の相対パスは**それを書いた
+/// ファイルの隣**から解く (= 起動時の cwd で意味が変わらない)。
 pub fn load_web(path: &Path) -> Result<WebFile, ConfigError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -633,7 +634,11 @@ pub fn parse_web_str(s: &str, path: &Path) -> Result<WebFile, ConfigError> {
 }
 
 /// web の config で path として解く鍵 (= 書いたファイルの隣から解く対象)。
-const WEB_PATH_KEYS: &[&[&str]] = &[&["web", "assets_dir"], &["web", "binary_path"]];
+const WEB_PATH_KEYS: &[&[&str]] = &[
+    &["web", "assets_dir"],
+    &["web", "binary_path"],
+    &["web", "state_dir"],
+];
 
 /// 実効設定を TOML 文字列にする (= `hyoui config show` の本体)。
 ///
@@ -1129,6 +1134,33 @@ listen = "0.0.0.0:8080"
             real(load_web(&unit).unwrap().web.binary_path),
             std::fs::canonicalize(&units_bin).unwrap()
         );
+    }
+
+    /// `state_dir` も path の鍵として読む: 書いたファイルの隣から解き、`~` は `$HOME`
+    /// で開く (DR-0038 決定 9)。書かなければ `None` (= 要否は読み手が判断する)。
+    #[test]
+    fn state_dir_is_a_path_value() {
+        let d = dir();
+        let unit = write(
+            d.path(),
+            "web/stable.toml",
+            "[web]\nstate_dir = \"state/hyoui\"\n",
+        );
+        assert_eq!(
+            load_web(&unit).unwrap().web.state_dir,
+            Some(d.path().join("web/state/hyoui"))
+        );
+        let absolute = write(
+            d.path(),
+            "web/abs.toml",
+            "[web]\nstate_dir = \"/s/hyoui\"\n",
+        );
+        assert_eq!(
+            load_web(&absolute).unwrap().web.state_dir,
+            Some(PathBuf::from("/s/hyoui"))
+        );
+        let bare = write(d.path(), "web/bare.toml", "[web]\n");
+        assert_eq!(load_web(&bare).unwrap().web.state_dir, None);
     }
 
     /// 自分自身・A→B→A・symlink 越しの同じファイルは循環として止める。

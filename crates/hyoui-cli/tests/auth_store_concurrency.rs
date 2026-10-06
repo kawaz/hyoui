@@ -36,18 +36,6 @@ fn state_home() -> tempfile::TempDir {
     dir
 }
 
-/// `hyoui web daemon run` (名前なし) が読む既定の config を、`XDG_STATE_HOME` の隣の
-/// 隔離 dir に置いて返す (DR-0038 決定 2)。listen は port 0 (= kernel に任せる) で、
-/// 実際に bind した port は gateway が stderr に書く 1 行から拾う。
-fn ephemeral_config_home(state: &Path) -> PathBuf {
-    let config_home = state.join("config-home");
-    let dir = config_home.join("hyoui/web");
-    std::fs::create_dir_all(&dir).expect("config dir");
-    std::fs::write(dir.join("config.toml"), "[web]\nlisten = \"127.0.0.1:0\"\n")
-        .expect("write config");
-    config_home
-}
-
 /// gateway (`hyoui web daemon run`) を 1 台起こし、bind した port を返す。
 ///
 /// 2 台に同じ `XDG_STATE_HOME` を渡すのがこの test の主眼である (= 2 unit が
@@ -58,8 +46,16 @@ fn ephemeral_config_home(state: &Path) -> PathBuf {
 #[allow(clippy::zombie_processes)]
 fn spawn_unit(state: &Path) -> (Child, u16) {
     let mut child = Command::new(hyoui_bin())
-        .args(["web", "daemon", "run"])
-        .env("XDG_CONFIG_HOME", ephemeral_config_home(state))
+        // config を読まない起動 (DR-0038 決定 9)。port 0 (= kernel に任せる) で、実際に
+        // bind した port は gateway が stderr に書く 1 行から拾う。
+        .args([
+            "web",
+            "daemon",
+            "run",
+            "--no-config",
+            "--listen",
+            "127.0.0.1:0",
+        ])
         .env("XDG_STATE_HOME", state)
         .env_remove("HYOUI_SESSION_ID")
         .env_remove("HYOUI_LOCK_TOKEN")

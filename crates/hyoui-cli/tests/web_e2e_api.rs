@@ -184,18 +184,6 @@ fn cleanup(runtime: &Path, sid: &str) {
         .status();
 }
 
-/// `hyoui web daemon run` (名前なし) が読む既定の config を、`XDG_STATE_HOME` の隣の
-/// 隔離 dir に置いて返す (DR-0038 決定 2)。listen は port 0 (= kernel に任せる) で、
-/// 実際に bind した port は gateway が stderr に書く 1 行から拾う。
-fn ephemeral_config_home(state: &Path) -> PathBuf {
-    let config_home = state.join("config-home");
-    let dir = config_home.join("hyoui/web");
-    std::fs::create_dir_all(&dir).expect("config dir");
-    std::fs::write(dir.join("config.toml"), "[web]\nlisten = \"127.0.0.1:0\"\n")
-        .expect("write config");
-    config_home
-}
-
 /// `hyoui web daemon run` を spawn し、bind した実 port を返す。
 ///
 /// child は panic path でも `ChildGuard` 経由で kill/wait される (= zombie 防止)。
@@ -205,8 +193,16 @@ fn ephemeral_config_home(state: &Path) -> PathBuf {
 /// の 1 行を stderr に書く (= lib.rs)。stderr を pipe で読み、port を parse する。
 fn spawn_web(runtime: &Path, state: &Path) -> (Child, Api) {
     let mut child = Command::new(hyoui_bin())
-        .args(["web", "daemon", "run"])
-        .env("XDG_CONFIG_HOME", ephemeral_config_home(state))
+        // config を読まない起動 (DR-0038 決定 9)。port 0 (= kernel に任せる) で、実際に
+        // bind した port は gateway が stderr に書く 1 行から拾う。
+        .args([
+            "web",
+            "daemon",
+            "run",
+            "--no-config",
+            "--listen",
+            "127.0.0.1:0",
+        ])
         .env("XDG_RUNTIME_DIR", runtime)
         .env("XDG_STATE_HOME", state)
         .env_remove("HYOUI_SESSION_ID")

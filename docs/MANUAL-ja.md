@@ -409,34 +409,44 @@ hyoui config show   # 実効設定を TOML で表示 (= 未設定項目も defau
 ### 11. ブラウザから操作する (`web`)
 
 ```sh
-hyoui web daemon run
+hyoui web daemon add stable     # ~/.config/hyoui/web/stable.toml を書いて登録する
+hyoui web daemon run stable
 # ブラウザで http://127.0.0.1:43690/ を開く
 ```
 
-gateway を foreground で起動する口は `hyoui web daemon run` 1 本。名前を省くと `${XDG_CONFIG_HOME:-~/.config}/hyoui/web/config.toml` を読む (無ければ `127.0.0.1:43690` で起動する)。`hyoui web` 自体は `daemon` / `service` / `passkey` / `session` を束ねる名前空間でしかない。
+gateway を foreground で起動する口は `hyoui web daemon run` 1 本で、起動する unit を必ず指定する (何も付けなければ help)。`hyoui web` 自体は `daemon` / `service` / `passkey` / `session` を束ねる名前空間でしかない。
 
-常駐させるには、インスタンス (unit) ごとに config ファイルを 1 つ書いて登録する。unit = config ファイル 1 つで、登録簿はどのファイルを読むかだけを覚える:
+インスタンス (unit) は config ファイル 1 つで、登録簿はどのファイルを読むかだけを覚える。`daemon add <name>` は `${XDG_CONFIG_HOME:-~/.config}/hyoui/web/<name>.toml` が無ければ書いて登録する。書く中身は、隣に `base.toml` があればそれへの `extends`、`state_dir` (今の面の状態の root)、`listen` (`--listen`、既定 `127.0.0.1:43690`)、`binary_path` (`--binary`、既定は `daemon add` を打った実行ファイル):
 
 ```toml
-# ~/.config/hyoui/web/base.toml — 全 unit の土台
+# ~/.config/hyoui/web/base.toml — 全 unit の土台 (面をまたいで共有する。state_dir は書かない)
 [web]
-listen = "127.0.0.1:43690"
+assets_dir = "~/src/hyoui/crates/hyoui-web/assets"
 
-# ~/.config/hyoui/web/unstable.toml
+# ~/.config/hyoui/web/unstable.toml — `daemon add unstable --listen 127.0.0.1:43691 --binary ~/src/hyoui/target/release/hyoui` が書く
 extends = "base.toml"            # このファイルの隣から解く
+
 [web]
+state_dir = "/Users/me/.local/state/hyoui"
 listen = "127.0.0.1:43691"
-binary_path = "~/src/hyoui/target/release/hyoui"
+binary_path = "/Users/me/src/hyoui/target/release/hyoui"
 ```
 
 ```sh
-hyoui web daemon add ~/.config/hyoui/web/unstable.toml     # unit 名は unstable
-hyoui web daemon add --name stable ~/.config/hyoui/web/base.toml
+hyoui web daemon add unstable --listen 127.0.0.1:43691 --binary ~/src/hyoui/target/release/hyoui
+hyoui web daemon add mine --config ~/dotfiles/hyoui-web.toml   # 既存のファイルをこの名前で登録する
 hyoui web service register   # 全 unit を抱える監督者を OS に載せる
 hyoui web daemon status
 ```
 
-`extends` は土台のファイルに重ねる: 表は鍵ごとに潜り、それ以外は置き換える。`[web].binary_path` は `daemon add` の時点で登録簿に写る (無ければ `daemon add` を打った実行ファイル)。`listen` / `assets_dir` は起動のたびにファイルから読む。状態 (登録簿・ログ・passkey) は `${XDG_STATE_HOME:-~/.local/state}/hyoui/web/` に置く。`service register` は場所を決める env (`HOME` / `XDG_*`) を OS の定義に固定し、後から違う値で打つと `--force` 無しでは書き換えない。
+- `<name>.toml` が既にあれば書き換えず、そのまま登録する (`--listen` / `--binary` を付けると断る)。`--config <path>` は任意の置き場の既存ファイルを登録する
+- `[web].state_dir` は unit の config ファイル自身に必須 (`extends` で土台から継いだ値は認めない。土台は面をまたいで共有するため)。`daemon add` / `daemon run` は今の面の状態の root と realpath で比べ、食い違えば「この config は面 X のもので、今は面 Y で実行している」と断る (別の面の config をコピーして登録・起動した事故はここでしか気付けない)
+- `daemon add` は面の登録簿の lock の中で検査・生成・登録を行い、別の add が実行中なら何も書かずに断る。生成した config が (壊れた `base.toml` 等で) 読めなければ、登録せずにそのファイルを消す
+- `daemon add` は、同じ面の登録簿に同じ宛先の unit があるか、そのポートを今ほかのプロセスが listen しているか (実際に bind を試す) を確かめ、当たれば断る。空いているポートを自動では選ばない
+- `daemon run <name>` は登録簿が指す config を、`daemon run --config <path>` は登録簿を通さずそのファイルを読む。どちらもそのファイルと `extends` でたどれるファイルだけを読み、`config.toml` は読まない。`daemon run --no-config [--listen <host:port>]` は config を読まず、組み込みの既定値と CLI 引数だけで起動する (テスト向け)
+- 監督者は unit ごとに `<binary_path> web daemon run <name>` を子として起動する
+
+`extends` は土台のファイルに重ねる: 表は鍵ごとに潜り、それ以外は置き換える。相対パスは書いたファイルの隣から解き、`~` は `$HOME` で開く。`binary_path` は `daemon add` の時点で登録簿に写る (変えたら `remove` → `add`)。`listen` / `assets_dir` は起動のたびにファイルから読む。状態 (登録簿・ログ・passkey) は `${XDG_STATE_HOME:-~/.local/state}/hyoui/web/` に置く。`service register` は場所を決める env (`HOME` / `XDG_*`) を OS の定義に固定し、後から違う値で打つと `--force` 無しでは書き換えない。
 
 セッション画面のキーボード FAB を開いて「情報」タブへ切り替えると、attach の mode / leader
 を確認できる。leader が別 browser にある場合は「leader になる」を押すと接続を切らずに

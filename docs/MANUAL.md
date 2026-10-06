@@ -425,34 +425,44 @@ defaults are appended as TOML comments (= they are not config keys).
 ### 11. Operate from a browser (`web`)
 
 ```sh
-hyoui web daemon run
+hyoui web daemon add stable     # write ~/.config/hyoui/web/stable.toml and register it
+hyoui web daemon run stable
 # Open http://127.0.0.1:43690/ in a browser.
 ```
 
-`hyoui web daemon run` is the one way to start a gateway in the foreground. Without a name it reads `${XDG_CONFIG_HOME:-~/.config}/hyoui/web/config.toml` (and binds `127.0.0.1:43690` when that file does not exist). `hyoui web` itself only groups the `daemon` / `service` / `passkey` / `session` commands.
+`hyoui web daemon run` is the one way to start a gateway in the foreground, and it always names what to start (no arguments prints help). `hyoui web` itself only groups the `daemon` / `service` / `passkey` / `session` commands.
 
-To keep gateways running, give each instance (unit) its own config file and register it. A unit is one config file; the registry only records which file each unit reads:
+An instance (unit) is one config file; the registry only records which file each unit reads. `daemon add <name>` writes `${XDG_CONFIG_HOME:-~/.config}/hyoui/web/<name>.toml` when it does not exist and registers it. The file gets `extends` pointing at `base.toml` (when one sits next to it), `state_dir` (the state root of the current environment), `listen` (`--listen`, default `127.0.0.1:43690`), and `binary_path` (`--binary`, default: the executable running `daemon add`):
 
 ```toml
-# ~/.config/hyoui/web/base.toml — shared by every unit
+# ~/.config/hyoui/web/base.toml — shared by every unit (and every state root; no state_dir here)
 [web]
-listen = "127.0.0.1:43690"
+assets_dir = "~/src/hyoui/crates/hyoui-web/assets"
 
-# ~/.config/hyoui/web/unstable.toml
+# ~/.config/hyoui/web/unstable.toml — written by `daemon add unstable --listen 127.0.0.1:43691 --binary ~/src/hyoui/target/release/hyoui`
 extends = "base.toml"            # resolved next to this file
+
 [web]
+state_dir = "/Users/me/.local/state/hyoui"
 listen = "127.0.0.1:43691"
-binary_path = "~/src/hyoui/target/release/hyoui"
+binary_path = "/Users/me/src/hyoui/target/release/hyoui"
 ```
 
 ```sh
-hyoui web daemon add ~/.config/hyoui/web/unstable.toml     # unit name: unstable
-hyoui web daemon add --name stable ~/.config/hyoui/web/base.toml
+hyoui web daemon add unstable --listen 127.0.0.1:43691 --binary ~/src/hyoui/target/release/hyoui
+hyoui web daemon add mine --config ~/dotfiles/hyoui-web.toml   # register an existing file under this name
 hyoui web service register   # load the supervisor that holds every unit
 hyoui web daemon status
 ```
 
-`extends` layers a file over another: tables merge key by key, other values replace. `[web].binary_path` is copied into the registry when the unit is added (without it, the executable running `daemon add`); `listen` and `assets_dir` are read from the file at every start. State (registry, logs, passkeys) lives in `${XDG_STATE_HOME:-~/.local/state}/hyoui/web/`. `service register` pins the location variables (`HOME`, `XDG_*`) into the OS definition and refuses to change them later without `--force`.
+- When `<name>.toml` already exists it is registered as it is, never rewritten (`--listen` / `--binary` are then refused). `--config <path>` registers an existing file from anywhere
+- `[web].state_dir` is required in the unit's config file itself (a value inherited from a base through `extends` is refused, since a base is shared by every state root). `daemon add` and `daemon run` compare it with the current state root (both resolved with realpath) and refuse a mismatch, saying which state root the config belongs to and which one is running. A config copied from another state root can only be caught here
+- `daemon add` checks, writes, and registers under a lock on the state root's registry, and refuses without writing anything while another add is running. When the generated config cannot be read (a broken `base.toml`, for example), the unit is not registered and the file is removed
+- `daemon add` refuses an address that another unit of the same state root uses, or a port some process is listening on (it tries to bind). It never picks a free port for you
+- `daemon run <name>` reads the config the unit is registered with; `daemon run --config <path>` reads that file without the registry. Both read only that file and the files it reaches through `extends`, never `config.toml`. `daemon run --no-config [--listen <host:port>]` reads no config at all and starts from the built-in defaults and the command line (for tests)
+- The supervisor starts each unit as `<binary_path> web daemon run <name>`
+
+`extends` layers a file over another: tables merge key by key, other values replace. Relative paths are resolved next to the file that wrote them, and `~` expands to `$HOME`. `binary_path` is copied into the registry when the unit is added (to change it, `remove` and `add` again); `listen` and `assets_dir` are read from the file at every start. State (registry, logs, passkeys) lives in `${XDG_STATE_HOME:-~/.local/state}/hyoui/web/`. `service register` pins the location variables (`HOME`, `XDG_*`) into the OS definition and refuses to change them later without `--force`.
 
 Open the keyboard FAB on a session page and select the Information tab to see the
 attach mode and leader state. If another browser is leader, click “Become leader”

@@ -1,10 +1,10 @@
 # DR-0038: web の unit を config ファイル 1 つにし、置き場を `hyoui/web/` に揃え、service に場所の env を固定する
 
-- Status: 🚧 Active (2026-10-04)。決定 1〜8 は実装済。既存 2 unit の移行は未実施
+- Status: 🚧 Active (2026-10-04)。決定 1〜9 は実装済。移行済みで、古い置き場の symlink の撤去 (決定 4 移行節の 4) が残っている
 - Date: 2026-10-04
 - Supersedes (部分): DR-0034 決定 1 の `add` の形と `hyoui web` 単体起動 / 決定 2 の unit の中身と置き場 / 決定 6 の環境と log の置き場 / 決定 9 の log の置き場 / 決定 11 の「`hyoui web` 自身は変わらない」、DR-0036 決定 4 の `auth.json` / `pending.json` の置き場
 - Related: DR-0034 (2 系統の体系と監督者、本 DR が置き換えない部分はすべて有効), DR-0024 (config ファイル機構), DR-0018 (session namespace と socket dir), DR-0036 (passkey の state file), DR-0014 (介入 self-check)
-- Origin: `docs/issue/2026-10-04-web-unit-registry-holds-settings.md` (kawaz と合意 2026-10-04)
+- Origin: `docs/issue/2026-10-04-web-unit-registry-holds-settings.md` (kawaz と合意 2026-10-04)、決定 9 は `docs/issue/2026-10-05-web-unit-config-state-dir-and-add-generates.md` (kawaz と合意 2026-10-05)
 
 ## Context
 
@@ -36,28 +36,24 @@ listen = "127.0.0.1:43690"
 # ~/.config/hyoui/web/unstable.toml
 extends = "base.toml"
 [web]
+state_dir = "~/.local/state/hyoui"   # この unit の面 (決定 9)。土台には書かない
 listen = "127.0.0.1:43691"
 binary_path = "~/src/hyoui/target/release/hyoui"
 ```
 
-`[web]` の鍵は `listen` (既定 `127.0.0.1:43690`) / `assets_dir` (無ければ埋め込み assets) / `binary_path` (決定 2)。
+`[web]` の鍵は `listen` (既定 `127.0.0.1:43690`) / `assets_dir` (無ければ埋め込み assets) / `binary_path` (決定 2) / `state_dir` (unit の config では必須、決定 9)。
 
-**web の設定は web の config の中で閉じる。** gateway は PTY session の設定 (`config.toml` の `[scrub_env]` / `[attach]` / `[session]`) を使わないので、`config.toml` を土台にせず、gateway の起動経路は `config.toml` を読まない。`config.toml` から `[web]` を外し、`[web] listen` / `[web] assets_dir` が書かれていれば移し先を案内して起動を断る (DR-0032 §1 の廃止 key と同じ扱い。黙って無視すると、書いた人の意図が既定値に倒れる)。
+**web の設定は web の config の中で閉じる。** gateway は PTY session の設定 (`config.toml` の `[scrub_env]` / `[attach]` / `[session]`) を使わないので、`config.toml` を土台にせず、gateway の起動経路は `config.toml` を読まない (`daemon run` が読むのは決定 9 の 3 形態だけ)。`config.toml` から `[web]` を外し、`[web] listen` / `[web] assets_dir` が書かれていれば移し先を案内して起動を断る (DR-0032 §1 の廃止 key と同じ扱い。黙って無視すると、書いた人の意図が既定値に倒れる)。
 
-### 2. 登録簿は `{config, binary_path, enabled, added_at}`。`add` は config の path を取る
+### 2. 登録簿は `{config, binary_path, enabled, added_at}`。登録簿が持つのは config の path
 
-```text
-hyoui web daemon add [--name <name>] <config-path>
-hyoui web daemon run [<name>]
-```
+`add` / `run` の形は決定 9。
 
-- `add` は config を絶対 path にして登録簿に書く。symlink は解かない (= 利用者が symlink の向き先を差し替えれば unit も追従する)。name を省けば config の basename から拡張子を除いたもの (llm-gateway と同じ)。登録の時点で config が読めることを確かめ、読めなければ断る (= 監督者が起こすたびに子が config で落ちる unit を作らない)
-- `binary_path` は config の `[web].binary_path` を正とし、無ければ `add` を打った自分自身 (`current_exe`) を焼く。`add` の時点で登録簿に写すので、config の `binary_path` を変えたら `remove` → `add` で入れ直す (llm-gateway DR-0028 決定 2 と同じ)。`resolve_stable_path` を通さない理由は DR-0034 決定 2 のまま
+- `add` は config を絶対 path にして登録簿に書く。symlink は解かない (= 利用者が symlink の向き先を差し替えれば unit も追従する)。登録の時点で config が読めることを確かめ、読めなければ断る (= 監督者が起こすたびに子が config で落ちる unit を作らない)
+- `binary_path` は config の `[web].binary_path` を正とし、無ければ `add` を打った自分自身 (`current_exe`) を焼く (`add` が生成する config には常に書く、決定 9)。`add` の時点で登録簿に写すので、config の `binary_path` を変えたら `remove` → `add` で入れ直す (llm-gateway DR-0028 決定 2 と同じ)。`resolve_stable_path` を通さない理由は DR-0034 決定 2 のまま
 - `listen` / `assets_dir` は登録簿に写さない。子の `daemon run <name>`・監督者・`list` / `status` が読むたびに config から引く。config を書き換えれば次の起動から効き、登録し直す必要が無い
-- `add` の listen 衝突の検査 (DR-0034 決定 2) は残す。既存 unit の listen は各 config から引き、読めない config の unit は比べず warning にする。port 0 (= kernel に任せる) はどれとも衝突しない
+- `add` の listen 衝突の検査 (DR-0034 決定 2) は残す。既存 unit の listen は各 config から引き、読めない config の unit は比べず warning にする。port 0 (= kernel に任せる) はどれとも衝突しない。登録簿に無いプロセスが掴んでいるポートの確認は決定 9
 - 登録簿は `deny_unknown_fields` のままにし、設定値を書いた古い形のファイルは読まない (= 一部の鍵だけを黙って使わない)
-
-**名前を省いた `daemon run` は web の config の既定 path (`$XDG_CONFIG_HOME/hyoui/web/config.toml`) を読み、無ければ組み込みの既定値で起動する。** 登録簿は見ない。reference の「未指定の場合はデフォルト」をここで満たし、DR-0034 決定 1 の「既定の unit は持たない」(= 登録簿に 1 つしか無い時それを選ぶ推測を入れない) も保つ。既定の置き場の `config.toml` は「名前なしで起動した時の設定」で、unit として登録する必要は無い。
 
 ### 3. config は `extends` で土台に重ねる
 
@@ -74,7 +70,7 @@ llm-gateway DR-0013 の規則をそのまま採る。`config.toml` と web の c
 
 | 置くもの | 置き場 |
 |---|---|
-| web の config の既定 | `${XDG_CONFIG_HOME:-~/.config}/hyoui/web/` (例 `base.toml` / `stable.toml` / `unstable.toml`、名前なし `run` は `config.toml`) |
+| web の config の既定 | `${XDG_CONFIG_HOME:-~/.config}/hyoui/web/` (土台 `base.toml`、unit ごとに `<unit>.toml`。`add <unit>` が生成する、決定 9) |
 | 登録簿 | `${XDG_STATE_HOME:-~/.local/state}/hyoui/web/units/<name>.toml` |
 | unit のログ | `${XDG_STATE_HOME:-~/.local/state}/hyoui/web/logs/<name>.log` |
 | 監督者自身のログ (launchd) | `${XDG_STATE_HOME:-~/.local/state}/hyoui/web/logs/<label>.log` |
@@ -129,13 +125,60 @@ llm-gateway DR-0028 決定 6 と同じ。監督者の `status` (`/version`)・`r
 
 ### 7. `hyoui web` は名前空間。foreground 起動は `daemon run` 1 本
 
-`hyoui web` は `daemon` / `service` / `passkey` / `session` を束ねるだけで、gateway を起動する口を持たない。引数なしと `--help` は help、`--listen` 等の option は `hyoui web daemon run` を案内して断る。DR-0034 決定 1 の「bind 先を明示した `hyoui web --listen=<host:port>`」は削除し、`daemon add` の `--port` / `--listen` / `--binary` / `--web-assets-dir` も削除する (= 値は config に書く)。
+`hyoui web` は `daemon` / `service` / `passkey` / `session` を束ねるだけで、gateway を起動する口を持たない。引数なしと `--help` は help、`--listen` 等の option は `hyoui web daemon run` を案内して断る。DR-0034 決定 1 の「bind 先を明示した `hyoui web --listen=<host:port>`」は削除する。`daemon add` の `--port` / `--web-assets-dir` も削除する (= 値は config に書く)。`daemon add` の `--listen` / `--binary` は、add が生成する config に書く値として持つ (決定 9)。
 
 ### 8. 出力の field
 
-- unit の行 (`list` / `status` / `add`) は `config` / `listen` (config から読んだ値、読めなければ `null`) / `config_error` (読めなかった理由) / `binary_path` / `binary_exists` を持つ。実行ファイルの path は reference の `daemon list` の語に合わせて `binary_path` と呼び、`hyoui version` の `supervisor` / `units[]` と `service status` の `version` も同じ名前にする (DR-0034 決定 7a の `binary` を置き換える)
+- unit の行 (`list` / `status` / `add`) は `config` / `listen` (config から読んだ値、読めなければ `null`) / `config_error` (読めなかった理由) / `binary_path` / `binary_exists` を持つ。`add` はさらに `generated` (config を書いたか) と `state_dir` (今の面の状態の root) を持つ。実行ファイルの path は reference の `daemon list` の語に合わせて `binary_path` と呼び、`hyoui version` の `supervisor` / `units[]` と `service status` の `version` も同じ名前にする (DR-0034 決定 7a の `binary` を置き換える)
 - 監督者の情報 (`supervisor`) に `binary_path` と `locations` (決定 5) が入る
 - `service register` の出力に固定した `env` が入る。差分で止まった時は `kind: "location_env_drift"` と `differences` を stderr の JSON に入れる
+
+### 9. unit の config は `<unit>.toml` で `state_dir` を必須に持ち、`add` が生成する。unit の名前に既定値は持たせない
+
+```text
+hyoui web daemon add <unit> [--listen <host:port>] [--binary <path>]
+hyoui web daemon add <unit> --config <path>
+hyoui web daemon run <unit>
+hyoui web daemon run --config <path>
+hyoui web daemon run --no-config [--listen <host:port>]
+```
+
+面と置き場の前提は DR-0041 決定 6 (面は状態の root を決める環境変数で決まる。config は面で分けず共有し、面ごとに違うのは状態だけ)。
+
+**unit の config は `<unit>.toml`。** ファイル名に面の key 等を入れない。面は中の `state_dir` で分かり、ファイル名にも入れると二重管理になる。
+
+**`state_dir` は unit の config ファイル自身の `[web]` に必須で書く。** `daemon add` と config を読む `daemon run` (`<unit>` / `--config`) は、config の `state_dir` と今の面の状態の root を realpath で正規化して比べ、食い違えば「この config は面 X のもので、今は面 Y で実行している」と断る。
+
+- 面同士は互いの登録簿を見られないので、別の面の config を (コピー等で) 登録・起動した事故に気付ける場所は config 自身しかない
+- **`extends` で土台から継いだ `state_dir` は認めない。** 確かめるのは、`extends` を畳む前の unit の config ファイル単体の `[web]` に `state_dir` が書かれていること。書かれていなければ (土台から継いでいても) 書くべき値を案内して断る。土台は面をまたいで共有するので、土台に書くと同じ土台を指す他の面の unit が全部それを継ぎ、面の食い違いを config で捕まえられなくなる。`--config` で登録・起動する config も同じ扱い
+- 土台 (`base.toml`) には `state_dir` を書かない。土台に書かれていること自体は機械的には断らない (unit の config ファイル自身が書いていれば、その値が勝つ)
+- 他の path の鍵と同じく、書いたファイルの隣から解き `~` を `$HOME` で開く (決定 3)
+- 監督者・`list` / `status` は `state_dir` を見ない (= listen だけを引く、決定 6)。起動するかを決めるのは子の `daemon run` で、食い違えば子が起動を断り、監督者の `last_exit` とログに理由が残る
+
+**`daemon add <unit>` が config を生成する。**
+
+- `--config` が無ければ `${XDG_CONFIG_HOME:-~/.config}/hyoui/web/<unit>.toml` を使う。無ければ書く: 隣に `base.toml` があれば `extends = "base.toml"`、`state_dir` (今の面の状態の root)、`listen` (`--listen`、既定 `127.0.0.1:43690`)、`binary_path` (`--binary`、既定は `add` を打った自分自身。相対 path は cwd から絶対 path にする)
+- 既にそのファイルがあれば生成せず、中の `state_dir` を確かめて登録する。食い違えば断る (= 別の面が同じ名前を使っている。黙って上書きしない)。既にあるファイルに `--listen` / `--binary` は書けないので、付いていれば断る (= 黙って捨てると、書いた人の意図が config の値に倒れる)
+- `--config <path>` は既存のファイルをその名前で登録するだけで、生成しない (同じく `state_dir` を確かめる)。`--listen` / `--binary` とは併用できない
+- **add 全体を面の登録簿の排他 lock の中で行う。** 名前と listen の検査、config の生成、登録簿への書き込みを 1 つの lock (`<web の状態の置き場>/units.lock`、登録簿のファイルとは別のファイルに `flock`) の中で行う。lock の外で検査すると、並行する add 同士が同じ名前・同じポートを通し合い、片方の後始末がもう片方の参照する config を消しうる。add は lock を待たずに取り、他の add が持っていれば何も書かずに断る (= 人が打つ add 同士が重なった時、後の add は前の add の結果を見て打ち直す)。`remove` と監督者の `enabled` の書き換えも同じ lock を取る (こちらは待つ)。監督者への通知は lock を離してから行う
+- 名前の重複・listen の衝突・使用中のポートは、ファイルを書く前に断る
+- 生成した config も、登録する前に `extends` を含めて読めることを確かめる (決定 2)。土台が壊れている (不正な TOML、`extends` の先が無い、循環する等) と読めないので、登録せず、生成したファイルを消して断る
+- 生成は隣の一時ファイルに書き切ってから、同名が無い時だけ `<unit>.toml` として公開する。書き込み途中で失敗しても半端なファイルは現れない。登録まで済まなかった add は、自分が生成したファイルだけを消す (既にあったファイルや土台は消さない)
+- config を読めなかった時・書けなかった時のエラーは、どのファイルをどう直してから打ち直すかを `hint` に書く
+
+**unit の名前に既定値は持たせない。** `default` という名前は既定値を管理しているように見える。名前を省いた `add` と、何も付けない `run` は help。reference `cli-daemon-subcommands` の `run [unit]` は名前の既定値を案件に委ねており、hyoui は持たない側を選ぶ。DR-0034 決定 1 の「既定の unit は持たない」(= 登録簿に 1 つしか無い時それを選ぶ推測を入れない) もこれで保たれる。
+
+**listen の既定値 (`127.0.0.1:43690`) は残す。** `add` の時点で、同じ面の登録簿に同じ宛先の unit が無いか (決定 2)、そのポートを今ほかのプロセスが listen していないか (実際に bind を試す) を確かめ、当たれば「使用中、`--listen` で指定する」と断る (既存の config を登録する時は「その config の `listen` を変える」)。空いているポートを自動で選ばない。port 0 は確かめない。bind が使用中以外の理由で失敗した時 (解決できない宛先等) は warning に留める。
+
+**`daemon run` は 3 形態のどれか 1 つを取る。**
+
+- `run <unit>`: 登録簿が指す config で起動する
+- `run --config <path>`: 登録簿を通さずその config で起動する
+- `run --no-config [--listen <host:port>]`: config を読まず、組み込みの既定値と CLI 引数だけで起動する (テスト向け、例: 状態の root を一時 dir に向けて `hyoui web daemon run --no-config --listen 127.0.0.1:0`)
+
+`<unit>` と `--config` は、その config ファイルと `extends` でたどれるファイルだけを読み、共通の `config.toml` は暗黙に読まない。`--listen` は `--no-config` とだけ併用できる (config を読む起動で listen だけを差し替えると、config の listen を問い合わせ先にする `list` / `status` / 監督者と実際の bind 先が食い違う、決定 6)。
+
+**監督者は unit ごとに `<binary_path> web daemon run <unit>` を子として起動する。** plist に載るのは `hyoui web daemon supervise` だけで、監督者は自分の面の登録簿を読む。子に `--config` は渡さない: config の path の正本を登録簿 1 か所に保ち、ps で unit 名が読める。
 
 ## 却下した案
 
@@ -146,13 +189,18 @@ llm-gateway DR-0028 決定 6 と同じ。監督者の `status` (`/version`)・`r
 | `binary_path` を起動のたびに config から引く | llm-gateway と食い違い、監督者が子を起こす直前に config を解釈することになる (= 解釈は子、DR-0034 決定 3)。変える時は `remove` → `add` |
 | `hyoui web --listen` を `daemon run` の別名として残す | 同じことをする口が 2 本になる。利用者は kawaz だけで、互換のために語彙を濁す相手が居ない |
 | 古い置き場からの自動移行 | 一度しか通らないコードが製品に残る。移行は人が 1 回行う |
+| unit の config のファイル名に面の key を入れる | 面は config の `state_dir` で分かる。ファイル名にも入れると二重管理になり、食い違った時にどちらが正か決められない |
+| unit の名前に既定値 (`default` 等) を持たせ、名前を省いた `run` / `add` をそれに向ける | `default` という名前は既定値を管理しているように見える。名前を省いた時に何を起こすかを推測させない |
+| `add` で使用中のポートを見つけたら空いているポートを自動で選ぶ | 選ばれたポートは利用者が書いた値ではなく、どこに居るかを config を開くまで知らないことになる。断って `--listen` で指定させる |
+| 監督者が子に `--config <path>` を渡す | config の path の正本が登録簿と子の argv の 2 か所になる。`run <unit>` なら ps で unit 名が読める |
 | `PATH` の違いでも re-register を止める | 場所を導かない変数で止めると、shell ごとに違う `PATH` のせいで毎回 `--force` を要る |
 | 固定する変数を unit 生成側で列挙する | 導出コードが読む変数と食い違っても気づけない。列挙は `hyoui::paths::LocationVar` 1 箇所 |
 
 ## Consequences
 
 - unit の設定は config ファイルを開けば読め、書き換えれば次の起動から効く。登録簿は「どの config を、どの実行ファイルで、動かしたいか」だけになる
-- `config.toml` に `[web] listen` / `[web] assets_dir` を書いていると、全コマンドの config 読み込みが廃止 key で止まる。移し先は案内に出る
+- `config.toml` に `[web] listen` / `[web] assets_dir` を書いていると、全コマンドの config 読み込みが廃止 key で止まる。移し先は案内に出る。gateway が `config.toml` を読む経路は無く、`[web]` 節は不要
+- unit の config に `state_dir` が無いと `add` と config を読む `run` が断る。既に登録した unit の config には、その面の状態の root を `state_dir` として書き足す必要がある (監督者が起こす子の `run <unit>` も断るため)
 - 移行 (状態 dir の移動 + 古い名前の symlink) をするまで、新しいバイナリから見た登録簿と passkey は空で、`hyoui web ...` は古い置き場が残っていると警告する。移行は人が手で 1 回行う
 - 既存の plist は場所の env を固定していないので、最初の `service register` は差分で止まり `--force` が要る
 - `hyoui-web` の名を持つものは crate 名 / ログの接頭辞と、古い置き場・旧 label を検知して警告するための名前だけになる

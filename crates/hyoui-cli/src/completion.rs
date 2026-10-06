@@ -209,12 +209,39 @@ _hyoui() {
             case "$daemon_sub" in
                 add)
                     case "$prev" in
-                        --name) return 0 ;;
+                        --listen) return 0 ;;
+                        --binary)
+                            _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") )
+                            return 0 ;;
+                        --config)
+                            _filedir toml 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") )
+                            return 0 ;;
                     esac
                     if [[ "$cur" == -* ]]; then
-                        COMPREPLY=( $(compgen -W "--name --help -h" -- "$cur") )
+                        # --config (既存を登録) と --listen / --binary (生成) は排他。
+                        if [[ " ${COMP_WORDS[*]} " == *" --config"* ]]; then
+                            COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
+                        elif [[ " ${COMP_WORDS[*]} " == *" --listen"* || " ${COMP_WORDS[*]} " == *" --binary"* ]]; then
+                            COMPREPLY=( $(compgen -W "--listen --binary --help -h" -- "$cur") )
+                        else
+                            COMPREPLY=( $(compgen -W "--listen --binary --config --help -h" -- "$cur") )
+                        fi
+                    fi
+                    return 0 ;;
+                run)
+                    case "$prev" in
+                        --listen) return 0 ;;
+                        --config)
+                            _filedir toml 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") )
+                            return 0 ;;
+                    esac
+                    # --listen は --no-config を選んだ時だけ。--config と --no-config は排他。
+                    if [[ " ${COMP_WORDS[*]} " == *" --no-config "* ]]; then
+                        COMPREPLY=( $(compgen -W "--listen --help -h" -- "$cur") )
+                    elif [[ " ${COMP_WORDS[*]} " == *" --config"* ]]; then
+                        COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
                     else
-                        _filedir toml 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") )
+                        COMPREPLY=( $(compgen -W "--config --no-config --help -h" -- "$cur") )
                     fi
                     return 0 ;;
                 start|stop|restart|status)
@@ -223,7 +250,7 @@ _hyoui() {
                 log)
                     COMPREPLY=( $(compgen -W "--all --follow --help -h" -- "$cur") )
                     return 0 ;;
-                run|supervise|remove|list)
+                supervise|remove|list)
                     COMPREPLY=( $(compgen -W "--help -h" -- "$cur") )
                     return 0 ;;
             esac
@@ -793,9 +820,26 @@ _hyoui_daemon() {
     case $leaf in
         add)
             _arguments \
-                '--name=[Unit name (default: the config file name without extension)]:unit name:' \
+                '(--config)--listen=[Bind address of a new config (default 127.0.0.1:43690)]:host\:port:' \
+                '(--config)--binary=[Executable of a new config (default: this executable)]:executable:_files' \
+                '(--listen --binary)--config=[Register this existing config file instead]:config file:_files -g "*.toml"' \
                 '(-h --help)'{-h,--help}'[Show help]' \
-                '1:config file:_files -g "*.toml"'
+                '1:unit name:'
+            ;;
+        run)
+            # --listen は --no-config を選んだ文脈でだけ出す (= config を読む起動は断る)。
+            if (( ${words[(I)--no-config]} )); then
+                _arguments \
+                    '--no-config[Read no config file (built-in defaults and --listen)]' \
+                    '--listen=[Bind address, with --no-config only]:host\:port:' \
+                    '(-h --help)'{-h,--help}'[Show help]'
+            else
+                _arguments \
+                    '(1 --no-config)--config=[Read this config file instead of a registered unit]:config file:_files -g "*.toml"' \
+                    '(1 --config)--no-config[Read no config file (built-in defaults and --listen)]' \
+                    '(-h --help)'{-h,--help}'[Show help]' \
+                    '1:unit name:'
+            fi
             ;;
         start|stop|restart|status)
             _arguments \
@@ -810,7 +854,7 @@ _hyoui_daemon() {
                 '(-h --help)'{-h,--help}'[Show help]' \
                 '1:unit name:'
             ;;
-        run|remove)
+        remove)
             _arguments \
                 '(-h --help)'{-h,--help}'[Show help]' \
                 '1:unit name:'
@@ -1035,6 +1079,20 @@ function __hyoui_no_subcommand
         end
     end
     return 0
+end
+
+# Has the command line already given any of the long options in $argv (`--name` /
+# `--name=value`)? Used to gate options that only make sense together or apart.
+function __hyoui_seen_opt
+    set -l cmd (commandline -opc)
+    for arg in $cmd
+        for name in $argv
+            if test "$arg" = "--$name"; or string match -q -- "--$name=*" $arg
+                return 0
+            end
+        end
+    end
+    return 1
 end
 
 # Generic helper: is the parent's child subcommand equal to $argv[2]?
@@ -1333,7 +1391,7 @@ complete -c hyoui -n '__hyoui_web_session_using_sub list' -s h -l help -d 'Show 
 complete -c hyoui -n '__hyoui_web_session_using_sub remove' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n __hyoui_daemon_no_sub -f -a run -d 'Start one unit in the foreground'
 complete -c hyoui -n __hyoui_daemon_no_sub -f -a supervise -d 'Run the supervisor in the foreground'
-complete -c hyoui -n __hyoui_daemon_no_sub -f -a add -d 'Register a unit and start it'
+complete -c hyoui -n __hyoui_daemon_no_sub -f -a add -d 'Write the unit config, register it, and start it'
 complete -c hyoui -n __hyoui_daemon_no_sub -f -a remove -d 'Stop the unit and drop its registration'
 complete -c hyoui -n __hyoui_daemon_no_sub -f -a list -d 'Print registered units'
 complete -c hyoui -n __hyoui_daemon_no_sub -f -a start -d 'Ask the supervisor to start units'
@@ -1353,9 +1411,15 @@ complete -c hyoui -n '__hyoui_daemon_using_sub log' -l all -d 'Read every unit l
 complete -c hyoui -n '__hyoui_daemon_using_sub log' -l follow -d 'Keep printing lines as they are written'
 complete -c hyoui -n '__hyoui_daemon_using_sub log' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_daemon_using_sub supervise' -s h -l help -d 'Show help and exit'
-complete -c hyoui -n '__hyoui_daemon_using_sub add' -l name -x -d 'Unit name (default: the config file name without extension)'
-complete -c hyoui -n '__hyoui_daemon_using_sub add' -r -F -d 'Config file of the unit'
+complete -c hyoui -n '__hyoui_daemon_using_sub add' -f
+complete -c hyoui -n '__hyoui_daemon_using_sub add; and not __hyoui_seen_opt config' -l listen -x -d 'Bind address of a new config (default 127.0.0.1:43690)'
+complete -c hyoui -n '__hyoui_daemon_using_sub add; and not __hyoui_seen_opt config' -l binary -r -F -d 'Executable of a new config (default: this executable)'
+complete -c hyoui -n '__hyoui_daemon_using_sub add; and not __hyoui_seen_opt listen binary' -l config -r -F -d 'Register this existing config file instead'
 complete -c hyoui -n '__hyoui_daemon_using_sub add' -s h -l help -d 'Show help and exit'
+complete -c hyoui -n '__hyoui_daemon_using_sub run' -f
+complete -c hyoui -n '__hyoui_daemon_using_sub run; and not __hyoui_seen_opt no-config' -l config -r -F -d 'Read this config file instead of a registered unit'
+complete -c hyoui -n '__hyoui_daemon_using_sub run; and not __hyoui_seen_opt config' -l no-config -d 'Read no config file (built-in defaults and --listen)'
+complete -c hyoui -n '__hyoui_daemon_using_sub run; and __hyoui_seen_opt no-config' -l listen -x -d 'Bind address, with --no-config only'
 complete -c hyoui -n '__hyoui_daemon_using_sub run' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_daemon_using_sub remove' -s h -l help -d 'Show help and exit'
 complete -c hyoui -n '__hyoui_daemon_using_sub list' -s h -l help -d 'Show help and exit'
@@ -1689,6 +1753,7 @@ mod tests {
             ("detach", &["detach"]),
             ("upgrade", &["upgrade"]),
             ("daemon add", &["web", "daemon", "add"]),
+            ("daemon run", &["web", "daemon", "run"]),
             ("screen dump", &["screen", "dump"]),
             ("screen snapshot", &["screen", "snapshot"]),
             ("lock acquire", &["lock", "acquire"]),
@@ -1752,9 +1817,17 @@ mod tests {
             ("attach", &["mode", "debug-dump-client"]),
             ("tail", &["strip-ansi", "last-bytes"]),
             ("input", &["auto-lock-timeout-acquire"]),
-            ("daemon add", &["name"]),
+            ("daemon add", &["listen", "binary", "config"]),
+            ("daemon run", &["config", "no-config", "listen"]),
             ("upgrade", &["binary", "skip-version-check"]),
         ];
+        // add の名前は位置引数で、`--name` は無い (DR-0038 決定 9)。
+        for sh in ALL_SHELLS {
+            assert!(
+                !flags_for(sh, "daemon add").contains("name"),
+                "shell {sh:?}: `daemon add` still completes `--name`"
+            );
+        }
         for sh in ALL_SHELLS {
             for (sub, flags) in expect {
                 let got = flags_for(sh, sub);
@@ -1912,13 +1985,15 @@ mod tests {
                     "shell {sh:?} missing `web daemon {sub}`"
                 );
             }
-            assert!(
-                offers_long_opt(&script, "name"),
-                "shell {sh:?} missing `web daemon add --name`"
-            );
-            // 設定値は unit の config が持つので、add も `hyoui web` も受けない
-            // (DR-0038 決定 1 / 2)。補完に残すと parser が断る flag を勧めることになる。
-            for removed in ["port", "listen", "web-assets-dir"] {
+            // add は unit 名を位置引数に取る (= `--name` は無い)。生成する config の値と
+            // 既存 config の指定、run の 3 形態を補完する (DR-0038 決定 9)。
+            for option in ["listen", "binary", "config", "no-config"] {
+                assert!(
+                    offers_long_opt(&script, option),
+                    "shell {sh:?} missing `web daemon --{option}`"
+                );
+            }
+            for removed in ["port", "web-assets-dir"] {
                 assert!(
                     !offers_long_opt(&script, removed),
                     "shell {sh:?} still offers `--{removed}`"
@@ -1993,6 +2068,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `run` の `--listen` は `--no-config` を選んだ文脈でだけ補完し、`add` の生成用
+    /// option (`--listen` / `--binary`) と `--config` は互いを選んだ後に出さない
+    /// (DR-0038 決定 9)。
+    #[test]
+    fn completion_gates_run_listen_on_no_config_and_add_options_on_each_other() {
+        let fish = script(Shell::Fish);
+        let line = |needle: &str, flag: &str| -> String {
+            fish.lines()
+                .find(|l| l.contains(needle) && l.contains(&format!("-l {flag} ")))
+                .unwrap_or_else(|| panic!("fish: no `{needle}` line for --{flag}"))
+                .to_string()
+        };
+        assert!(
+            line("__hyoui_daemon_using_sub run", "listen")
+                .contains("and __hyoui_seen_opt no-config")
+        );
+        assert!(
+            line("__hyoui_daemon_using_sub run", "config")
+                .contains("not __hyoui_seen_opt no-config")
+        );
+        for flag in ["listen", "binary"] {
+            assert!(
+                line("__hyoui_daemon_using_sub add", flag).contains("not __hyoui_seen_opt config"),
+                "{flag}"
+            );
+        }
+        assert!(
+            line("__hyoui_daemon_using_sub add", "config")
+                .contains("not __hyoui_seen_opt listen binary")
+        );
+
+        // bash: run の --listen を出す候補は --no-config を見た分岐の中だけにある。
+        let bash = script(Shell::Bash);
+        let run_block = bash_block(&bash, "run", Some("daemon")).join("\n");
+        for candidate in run_block.lines().filter(|l| l.contains("compgen -W")) {
+            if candidate.contains("--listen") {
+                assert!(!candidate.contains("--config"), "{candidate}");
+            }
+        }
+        assert!(run_block.contains("*\" --no-config \"*"), "{run_block}");
+
+        // zsh: --listen の spec は --no-config を見た分岐 (`${words[(I)--no-config]}`) の中。
+        let zsh = script(Shell::Zsh);
+        let start = zsh.find("_hyoui_daemon() {").expect("zsh daemon function");
+        let body = &zsh[start..];
+        let arm = &body[body.find("        run)").unwrap()..];
+        let arm = &arm[..arm.find(";;").unwrap()];
+        let (gated, rest) = arm.split_once("else").expect("zsh run has two branches");
+        assert!(gated.contains("${words[(I)--no-config]}") && gated.contains("--listen="));
+        assert!(!rest.contains("--listen="), "{rest}");
     }
 
     /// Does the script offer a long option `name` (without `--`)?
