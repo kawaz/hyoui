@@ -1,18 +1,18 @@
 ---
 title: web の unit config に state_dir を必須で持たせ、daemon add が config を生成する (DR-0038 の追補)
-status: open
+status: resolved
 category: task
 created: 2026-10-05T11:30:00+09:00
-last_read: 2026-10-05T11:30:00+09:00
+last_read: 2026-10-06T12:50:00+09:00
 open_entered: 2026-10-05T11:30:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-06T12:50:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: DR-0038 決定 9 として実装 (add の生成と state_dir の照合、run の 3 形態、add は登録簿の排他 lock の中、state_dir は unit の config ファイル自身に要求)。reference cli-daemon-subcommands の修正と実機 toml への state_dir 追記も済み
 blocked_by:
 ---
 
