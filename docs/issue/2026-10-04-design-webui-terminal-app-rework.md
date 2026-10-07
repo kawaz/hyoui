@@ -154,3 +154,16 @@ Window
   3. 値は番号でなく名前か id にする (番号だと並べ替えで他の session の値がずれる)。グループとタブは別の key (`webui.group` / `webui.tab`)、並び順も別の key (`webui.order`) にするのが統括推し
 - **方向 (2026-10-07、kawaz)**: 構造専用の仕組みは持たず、front が session の普通の tag から構造を導く。`webui.tabgroup` で session を group by してタブグループにし、選んだタブグループの session の `webui.tab` を集めてタブにする。値は名前 (index にしない。index だと並べ替え・削除で他の session の値を書き換えることになり、途中で失敗するとタブが黙って合流する)。並び順は front が決める (名前順・起動順、端末ごとの並べ替えは localStorage の配置)。空のタブ・タブグループは存在しない。tag の無い session は未アタッチ。タブの名前の変更はそのタブの session 全部の tag の書き換えになる (途中で失敗してもタブが分かれて見えるだけ)
 - 残る判断: session をタブ間で移せるか (= 起動後に tag を変える手段 `hyoui set --tag` と daemon への tag 更新要求を足すか)
+
+## view を呼び出し側が定義する形 (2026-10-07、kawaz 案、検討中)
+
+「タブ」「pane」を固定の構造にしない。tag と selector で session の集合を作り、見せ方はコンポーネント、並べ方は端末ごとのレイアウトにする。daemon は tag を解釈しない (kawaz「daemon 側では何も考えない」)。
+
+- **使い方の例 (ccmsg)**: claude の session に `claude.session_id` / `claude.project_dir` / `claude.config_dir` の tag を付ける (後付けでもよい)。ccmsg の Terminal タブは hyoui web を `?sessions=<selector の JSON>&embed=true` で iframe に埋め込む
+- **定義の置き場**: 呼び出す側が URL で渡す (session の scope と構造)。並べ方は localStorage。hyoui web は定義を保存しない
+- **selector** (配列は OR): `{ids?, tags?, in?, notIn?}`。例 `{}` = 全部、`{tags:["claude.session_id=UUID","claude.project_dir=PATH"]}`、`{notIn:[{tags:["claude.session_id"]}]}`。統括案: 空のリストは条件なしと同じ。1 つの selector は ids と tags の一致の和集合に `in` を掛け `notIn` を引く。tag の書き方は `list --tag` と同じ (`k` は key があれば、`k=v` は完全一致)。selector は見せ方の絞り込みで権限ではない
+- **新規 session** `new={cwd, tags}`: command は hyoui 側の設定 (URL から任意コマンドを起動させない)。統括案: `${key}` は操作を起こした pane の session (無ければ選択中の session) の tag と `hyoui.*` から展開し、値が無ければ作成を断る。作るのは利用者の操作の時だけ
+- **`hyoui.*` の予約 key**: `hyoui.pid` / `hyoui.session_id` 等を読み取り専用で template と selector に使う (procfs 的な写像)。利用者の tag では `hyoui.` を予約して拒否する案
+- **コンポーネント**: HyouiSessionList (sections ごとに name / session_name の template / selectors)、HyouiLayoutList (localStorage のレイアウト一覧。default の空レイアウト、pane の分割、pane と session の紐付け、新規 shell)、HyouiPanesContainer、HyouiSessionTabs。**タブはレイアウトとして見直す** (タブの見た目である必要はない)
+- 後付けの tag には、起動後に tag を変える手段 (汎用の `hyoui set --tag`) が要る (claude の SessionStart hook から `HYOUI_SESSION_ID` で自分の session に付ける等)
+- 未確認・未決: レイアウトは端末ごとで共有しない (DR-0039 の「構造は共有」からの転換)。localStorage の名前空間 (scope / view ごとか全体か)。iframe での cookie と storage の partition (同じ登録ドメインの下なら通る見込み、実機未確認)。埋め込める origin の指定 (`frame-ancestors`)
