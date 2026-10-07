@@ -594,6 +594,33 @@ fn a_bad_tag_key_fails_the_run() {
     assert!(!root.path().join("sessions").exists());
 }
 
+/// `hyoui.` で始まる tag の key は予約で、run は起動しない。絞り込みはエラーにせず、
+/// どの session にも一致しないだけ。
+#[test]
+fn hyoui_dot_tag_keys_are_reserved() {
+    let root = SessionDir::new("hyoui-rsvtag-");
+    for arg in ["hyoui.pid=1", "hyoui.x"] {
+        let out = output(in_root(
+            root.path(),
+            &["run", "--detached", "--tag", arg, "--", "true"],
+        ));
+        assert_eq!(out.status.code(), Some(2), "{arg}: {}", text(&out.stderr));
+        assert!(
+            text(&out.stderr).contains("reserves"),
+            "{}",
+            text(&out.stderr)
+        );
+    }
+    assert!(!root.path().join("sessions").exists(), "nothing is started");
+    let sid = run_tagged(root.path(), &["HYOUI.x=1"]);
+    assert_eq!(listed_with(root.path(), &["HYOUI.x"]), [sid.as_str()]);
+    assert_eq!(
+        listed_with(root.path(), &["hyoui.pid"]),
+        Vec::<String>::new()
+    );
+    kill_session(root.path(), &sid);
+}
+
 /// 廃止した namespace の option は受け付けて捨て、stderr に 1 行だけ注意を出す。stdout は
 /// option が無い時と同じ。`HYOUI_NAMESPACE` は読まない (注意も出ない)。
 #[test]

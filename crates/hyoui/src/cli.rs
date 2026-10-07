@@ -579,6 +579,29 @@ pub fn validate_tag_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// hyoui が予約している tag の key の接頭辞 (DR-0041 決定 1)。
+///
+/// hyoui が組み込みの読み取り専用の値 (`hyoui.pid` 等) を tag と同じ名前空間で見せる
+/// ために取っておく。大文字小文字は区別する (`HYOUI.x` は予約に当たらない)。
+pub const RESERVED_TAG_KEY_PREFIX: &str = "hyoui.";
+
+/// 利用者が付ける tag の key を確かめる: [`validate_tag_key`] に加え、予約された接頭辞
+/// ([`RESERVED_TAG_KEY_PREFIX`]) で始まる key を拒否する。付ける側 (`run --tag`) の検査は
+/// ここ 1 か所で行う。絞り込み (`list --tag`) は通す (= どの session にも一致しない)。
+///
+/// # Errors
+///
+/// [`validate_tag_key`] に反する時と、key が予約された接頭辞で始まる時。
+pub fn validate_settable_tag_key(key: &str) -> Result<(), String> {
+    validate_tag_key(key)?;
+    if key.starts_with(RESERVED_TAG_KEY_PREFIX) {
+        return Err(format!(
+            "tag key {key:?} starts with {RESERVED_TAG_KEY_PREFIX:?}, which hyoui reserves for its own read-only values; use another prefix"
+        ));
+    }
+    Ok(())
+}
+
 /// `--tag` の値を最初の `=` で key と value に分ける。`=` が無ければ value は `None`。
 ///
 /// # Errors
@@ -3562,7 +3585,9 @@ fn parse_run(args: &[String]) -> Command {
                 consumed_extra = false; // bool flag は次 arg を食わない
             }
             "--tag" => match value.as_deref() {
-                Some(v) => match parse_tag_arg(v) {
+                Some(v) => match parse_tag_arg(v)
+                    .and_then(|(key, value)| validate_settable_tag_key(&key).map(|()| (key, value)))
+                {
                     // `--tag <key>` (= `=` 無し) は value が空の tag (docker の `--label k` と同じ)。
                     Ok((key, value)) => {
                         tags.insert(key, value.unwrap_or_default());
@@ -5404,6 +5429,7 @@ fn usage_run() -> String {
             --tag KEY=VALUE               session に tag を付ける (DR-0041)。繰り返し可、同じ KEY は\n                                  \
                 後勝ち。KEY は [A-Za-z0-9._-]{1,256}、VALUE は任意の文字列\n                                  \
                 (最初の = で分ける、空も可)。--tag KEY は VALUE が空の tag。\n                                  \
+                hyoui. で始まる KEY は hyoui が予約しているので付けられない。\n                                  \
                 `hyoui list --tag` で絞り込み、status / list に出る。起動後は変えられない\n    \
             --on-child-suspend=notify|auto-resume\n                                  \
                 Action when the child is stopped\n                                  \
@@ -8904,6 +8930,35 @@ mod tests {
             Command::Run(cfg) => assert!(cfg.tags.is_empty()),
             other => panic!("expected Run, got {other:?}"),
         }
+    }
+
+    /// `hyoui.` で始まる key は予約で、付けられない (大文字小文字は区別)。絞り込みは通す。
+    #[test]
+    fn hyoui_dot_tag_keys_are_reserved_for_setting() {
+        for arg in ["hyoui.pid=1", "hyoui.x", "hyoui.="] {
+            match parse_args(&args(&["run", "--tag", arg, "--", "true"])) {
+                Command::Error(msg) => {
+                    assert!(
+                        msg.contains("--tag") && msg.contains("reserves"),
+                        "{arg}: {msg}"
+                    );
+                    assert!(msg.contains("another prefix"), "{arg}: {msg}");
+                }
+                other => panic!("{arg}: expected Error, got {other:?}"),
+            }
+        }
+        for ok in ["HYOUI.x=1", "hyoui=1", "hyouix.y=1", "my.hyoui.x=1"] {
+            match parse_args(&args(&["run", "--tag", ok, "--", "true"])) {
+                Command::Run(cfg) => assert_eq!(cfg.tags.len(), 1, "{ok}"),
+                other => panic!("{ok}: expected Run, got {other:?}"),
+            }
+        }
+        match parse_args(&args(&["list", "--tag", "hyoui.pid"])) {
+            Command::List(cfg) => assert_eq!(cfg.tags[0].key, "hyoui.pid"),
+            other => panic!("expected List, got {other:?}"),
+        }
+        assert!(validate_tag_key("hyoui.pid").is_ok());
+        assert!(validate_settable_tag_key("hyoui.pid").is_err());
     }
 
     /// tag の key は `[A-Za-z0-9._-]{1,256}`。value は何でもよい。

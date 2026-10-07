@@ -273,6 +273,7 @@ hyoui list --format=jsonl | jq 'select(.tags.team | startswith("in"))'   # finer
 ```
 
 - A key is `[A-Za-z0-9._-]{1,256}`; a value is any string (split at the first `=`, empty allowed). Repeating a key keeps the last value
+- Keys starting with `hyoui.` are reserved by hyoui and cannot be set (`run` fails; use another prefix). The check is case-sensitive. `list --tag hyoui.x` is not an error; it matches no session
 - `list --tag key` matches when the key exists, and `list --tag key=` matches an empty value exactly; they are different conditions. A session tagged `--tag key=` matches both, one tagged `--tag key=bar` matches only `--tag key`. There are no wildcards
 - The daemon keeps the tags and returns them in `status` (the `tags:` line / `tags` in json), `list` (the TAGS column / `tags` in jsonl) and the web `/api/sessions`. They survive a daemon upgrade and cannot be changed after start
 - With `--tag`, rows that do not respond (no-response / stale / error) are not shown, since their tags are unknown

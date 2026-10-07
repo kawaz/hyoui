@@ -56,6 +56,7 @@ DR-0038 決定 4 は web の状態の置き場を `hyoui/web/` にした。sessi
   - 付ける: `hyoui run --tag <key>=<value>` を繰り返す。同じ key は後勝ち。key は `[A-Za-z0-9._-]{1,256}`、value は任意の文字列 (最初の `=` で分ける、空も可)。`--tag <key>` は `--tag <key>=` (value が空の tag) の略
   - 絞る: `hyoui list --tag <key>=<value>` は value の完全一致、`hyoui list --tag <key>` は key があれば一致 (value は問わない)。`--tag <key>=` は value が空に完全一致で、`--tag <key>` とは別の条件。繰り返しは AND。ワイルドカードは持たない (CLI の絞り込みは簡単な用途のためで、細かい条件は jsonl を絞る)
   - 保持と出力: daemon が session のメタデータとして持ち、status 応答の field で返す (新しい protocol message / cap flag は無い)。daemon の upgrade (self-exec) をまたいで残る。`status` / `list` の jsonl / web の API は `tags: {key: value, ...}` を出し、plain の `list` は TAGS 列、`status` は `tags:` 行に出す
+  - **`hyoui.` で始まる key は hyoui が予約し、付けられない** (2026-10-07 裁定)。hyoui が組み込みの読み取り専用の値 (`hyoui.pid` 等) を tag と同じ名前空間で見せるために取っておく。大文字小文字は区別する (`HYOUI.x` は予約に当たらない)。絞り込み (`list --tag hyoui.x`) はエラーにせず、どの session にも一致しない (組み込みの値で絞れるようにする余地)
   - 起動後に変える手段は持たない (未決)
 - **既定の tag を env で与える仕組みは持たない。** `HYOUI_NAMESPACE` は読まず、子へ注入もしない (2026-10-07 裁定)
 - **namespace を指定する option (`--namespace` / `--namespace=<ns>` / `--all-namespaces`) は 2026-11 まで受け付けて値を捨てる** (既存の呼び出しを起動できなくしないため、2026-10-07 裁定)。help と completion には出さない。stdout は option が無い時と同じで、stderr に「廃止され無視される、2026-11 に削除する」を 1 行だけ出す (絞り込みを期待した呼び出しが、気づかずに全件を受け取らないように)。`run --session` (id の旧 option) はエラーのまま

@@ -264,6 +264,7 @@ hyoui list --format=jsonl | jq 'select(.tags.team | startswith("in"))'   # 細�
 ```
 
 - key は `[A-Za-z0-9._-]{1,256}`、value は任意の文字列 (最初の `=` で分ける、空も可)。同じ key を繰り返すと後勝ち
+- `hyoui.` で始まる key は hyoui が予約しているので付けられない (run がエラーになる。別の接頭辞を使う)。大文字小文字は区別する。`list --tag hyoui.x` はエラーにならず、どの session にも一致しない
 - `list --tag key` は key があれば一致、`list --tag key=` は value が空に完全一致で、別の条件。`--tag key=` で付けた session には両方が一致し、`--tag key=bar` で付けた session には `--tag key` だけが一致する。ワイルドカードは無い
 - tag は daemon が持ち、`status` (`tags:` 行 / json の `tags`)、`list` (TAGS 列 / jsonl の `tags`)、web の `/api/sessions` に出る。daemon の upgrade をまたいで残る。起動後には変えられない
 - `--tag` で絞ると、応答しない (no-response / stale / error) 行は tag が分からないので出ない
