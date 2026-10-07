@@ -1,6 +1,6 @@
 # DR-0041: session id を UUID にし、namespace を廃止して tag にし、socket を `hyoui/sessions/` にフラットに置く
 
-- Status: 🟡 部分実装 (2026-10-06)。決定 1〜7 は tag 以外を実装済み。tag (決定 1 の分類と絞り込み、実装の当たり所の最終項) は CLI の形 (付ける option、複数 tag、list の絞り込み) が決まっておらず未実装。「未決」節の項目は本 DR では確定させない
+- Status: ✅ 実装済 (2026-10-07)。決定 1〜7 を tag まで実装済み。廃止した namespace の option を受け付けて捨てる処理 (決定 1) は 2026-11 に削除する。「未決」節の項目は本 DR では確定させない
 - Date: 2026-10-04
 - Supersedes: DR-0018 (session namespace)
 - Related: DR-0020 (`HYOUI_SESSION_ID` による自己参照。値が UUID になる), DR-0015 (`hyoui run --detached`。起動側が id を先に決められるようになる), DR-0006 (CLI ground rules。session 引数と `--index`), DR-0038 (web の置き場 `hyoui/web/`、監督者 label `com.github.kawaz.hyoui.web.supervise.<hash>`、場所を決める env の固定、移行の symlink 方式), DR-0039 決定 1 (`hyoui run --login` と面の root), DR-0005 / DR-0014 (透過原則と介入 self-check)
@@ -40,7 +40,7 @@ DR-0038 決定 4 は web の状態の置き場を `hyoui/web/` にした。sessi
 
 ## 介入判断 self-check (CLAUDE.md / DR-0014)
 
-- **子 PTY への介入は減る。** namespace の継承のために子へ常時注入していた `HYOUI_NAMESPACE` (DR-0018 決定 4) は namespace と一緒に消える。`HYOUI_SESSION_ID` (DR-0020) は値が UUID になるだけで、注入の有無は変わらない
+- **子 PTY への介入は減る。** hyoui が子へ足す env は `HYOUI_SESSION_ID` (DR-0020) だけで、値が UUID になる。面の変数 `HYOUI_STATE_DIR` は hyoui が足すものではなく、呼び出し元の env に在る時だけ子に届く (`--login` で子の env を最小にする時も残す、決定 6)
 - **新しい protocol message / cap flag は無い。** tag は session のメタデータとして daemon が持ち、status 応答で返す (= DR-0018 の方式 (c) の形)。status 応答の field が増える
 - **fork する子は hyoui 自身の処理で、PTY の子には触れない。** `sun_path` に収まらないパスを開く時だけ、hyoui のプロセスが短命の子を fork する (決定 5)
 - **kernel 標準機能の再発明は無い。** 重複の判定は bind と name lock の失敗に任せ、生死を自前で判定しない (決定 3)
@@ -52,6 +52,13 @@ DR-0038 決定 4 は web の状態の置き場を `hyoui/web/` にした。sessi
 - session の分類と絞り込みは tag (session のメタデータ) で行う。**既定は全部見える。** 絞り込みは指定した時だけ効く
 - namespace の概念 (`--namespace`、`HYOUI_NAMESPACE`、`list --all-namespaces`、list の NS 列、jsonl の `namespace` field、子への `HYOUI_NAMESPACE` 注入) はすべて持たない
 - tag は分類であって、認証境界の分離には使わない (分離は面で行う、決定 6)
+- **tag は `key=value`。** 単語の集合 (label) は持たない (2026-10-07 裁定)
+  - 付ける: `hyoui run --tag <key>=<value>` を繰り返す。同じ key は後勝ち。key は `[A-Za-z0-9._-]{1,256}`、value は任意の文字列 (最初の `=` で分ける、空も可)。`--tag <key>` は `--tag <key>=` (value が空の tag) の略
+  - 絞る: `hyoui list --tag <key>=<value>` は value の完全一致、`hyoui list --tag <key>` は key があれば一致 (value は問わない)。`--tag <key>=` は value が空に完全一致で、`--tag <key>` とは別の条件。繰り返しは AND。ワイルドカードは持たない (CLI の絞り込みは簡単な用途のためで、細かい条件は jsonl を絞る)
+  - 保持と出力: daemon が session のメタデータとして持ち、status 応答の field で返す (新しい protocol message / cap flag は無い)。daemon の upgrade (self-exec) をまたいで残る。`status` / `list` の jsonl / web の API は `tags: {key: value, ...}` を出し、plain の `list` は TAGS 列、`status` は `tags:` 行に出す
+  - 起動後に変える手段は持たない (未決)
+- **既定の tag を env で与える仕組みは持たない。** `HYOUI_NAMESPACE` は読まず、子へ注入もしない (2026-10-07 裁定)
+- **namespace を指定する option (`--namespace` / `--namespace=<ns>` / `--all-namespaces`) は 2026-11 まで受け付けて値を捨てる** (既存の呼び出しを起動できなくしないため、2026-10-07 裁定)。help と completion には出さない。stdout は option が無い時と同じで、stderr に「廃止され無視される、2026-11 に削除する」を 1 行だけ出す (絞り込みを期待した呼び出しが、気づかずに全件を受け取らないように)。`run --session` (id の旧 option) はエラーのまま
 
 理由: 「見えなくする」を分類の副作用にしないため。分類は付けても付けなくても session の見え方と操作の届き方を変えない。
 
@@ -114,7 +121,7 @@ DR-0038 決定 4 は web の状態の置き場を `hyoui/web/` にした。sessi
 - **面をまたぐ仕組みは持たない。** 複数の面を横断する option、1 つの監督者で複数の面の unit を抱える等は作らない。複数の面を扱う時は、面ごとに環境変数を指定してそれぞれで実行して回る
 - web の監督者も面ごとに立つ。登録簿はその面の状態の root の中にあり、1 つの監督者が読むのは 1 つの面の登録簿だけである (ccmsg の監督者がホストに 1 つなのは 1 プロセスで複数の instance を抱える作りだからで、面をまたがない hyoui とは前提が違う)。面の `.envrc` が効いた状態で `hyoui web service register` すれば、その面の root (`HYOUI_STATE_DIR` を含む) が定義に固定される (DR-0038 決定 5 の env 固定)
 - 面ごとの監督者の label (`com.github.kawaz.hyoui.web.supervise.<hash>`、`<hash>` は状態 root から導く) は DR-0038 決定 4 が正本で、本 DR は参照するだけ
-- `hyoui run --login` は子の shell に渡す env を最小にするだけで、hyoui 自身の面は今の env で決まる (DR-0039 決定 1)
+- `hyoui run --login` は子の shell に渡す env を最小にする (DR-0039 決定 1) が、`HYOUI_STATE_DIR` が設定されていればそれは子に渡す (2026-10-07 裁定)。`HYOUI_SESSION_ID` はどの面の session id かとセットで初めて自己参照になるので、子の中で起こす hyoui が親と同じ面を使う。設定されていない時は何も渡さない (既定の面のまま)。hyoui 自身の面は今の env で決まる
 
 理由: 面の分離は認証境界の分離で、分類 (tag) とは目的が違う。面をまたぐ仕組みを入れると、一式が 1 つの root の中で完結する前提が崩れ、どの面の状態を読み書きしているかを env だけで判断できなくなる。
 
@@ -153,8 +160,8 @@ DR-0038 決定 4 の移行と同じ方式を採る。
 ## Consequences
 
 - `hyoui list` は既定で全 session を出す。分類は tag の絞り込みで行う
-- namespace に関わる CLI の語彙 (`--namespace`、`--all-namespaces`、NS 列、jsonl の `namespace` field) と env (`HYOUI_NAMESPACE`) が消える。v1.0 前で breaking を許容する方針の範囲
-- 子へ常時注入する env が `HYOUI_SESSION_ID` だけになる
+- namespace に関わる CLI の語彙 (`--namespace`、`--all-namespaces`、NS 列、jsonl の `namespace` field) と env (`HYOUI_NAMESPACE`) が消える。option は 2026-11 まで受け付けて捨て、その後は unknown option になる。v1.0 前で breaking を許容する方針の範囲
+- hyoui が子へ足す env は `HYOUI_SESSION_ID` だけになる。面の `HYOUI_STATE_DIR` は `--login` でも子に届く
 - `hyoui run` の id 指定は `--session-id <UUID>` になる (現行の flag 名は `--session`)
 - 起動側は id を先に決めて渡せるので、`--detached` の stdout を読まずに後続の操作を組める
 - 同じ id での起動は、相手が生きていても死んでいてもエラーになる。死んだ socket が残っている時は、片付けてから起動し直す
@@ -173,5 +180,6 @@ DR-0038 決定 4 の移行と同じ方式を採る。
 
 ## 未決
 
+- tag を起動後に変える手段 (`hyoui set` 等) を持つか
 - 現行の `HYOUI_NAMESPACE` を使っている箇所の移行: 業務面の `.envrc`、ccmsg の hyoui terminal 連携 (`src/terminals/hyoui.ts` が base と namespace を直書きで discovery している。ccmsg 側に起票済み: kawaz/ccmsg `docs/issue/2026-10-06-hyoui-namespace-removal-and-socket-dir.md`)
 

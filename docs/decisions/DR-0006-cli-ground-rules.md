@@ -26,7 +26,7 @@ CLI Design は `~/.claude-personal/rules/cli-design-preferences.md` (= subcomman
 
 ### 1. Architecture: screen 型 (1 daemon 1 socket 1 子)
 
-- `hyoui run --name X -- cmd` = `<XDG>/hyoui/X.sock` を持つ独立 daemon が 1 つ起動、子 = cmd
+- `hyoui run -- cmd` = `<状態の root>/sessions/<id>.sock` を持つ独立 daemon が 1 つ起動、子 = cmd (DR-0041)
 - tmux 型 (1 server 多 session) は採用しない (本 DR 末尾の Rejected alternatives 参照)
 - `hyoui list` は socket dir 走査 (registry ファイル持たない、ファイルシステムが source of truth)
 - daemon は子 exit で即終了、全 client detach 中でも生存
@@ -34,20 +34,19 @@ CLI Design は `~/.claude-personal/rules/cli-design-preferences.md` (= subcomman
 ### 2. Socket 配置
 
 ```
-$XDG_RUNTIME_DIR/hyoui/<name>.sock                      ($XDG_RUNTIME_DIR が実在 dir のとき)
-${XDG_STATE_HOME:-$HOME/.local/state}/hyoui/<name>.sock  (それ以外、macOS 含む)
+<状態の root>/sessions/<id>.sock   (状態の root と id の形は DR-0041)
 override: --socket /any/path.sock
 ```
 
-- `$TMPDIR` / `/tmp` は使わない (OS の掃除で daemon 生存中に socket が消えるのを避けるため、ユーザ管理下の state dir を使う)
+- `$TMPDIR` / `/tmp` / `$XDG_RUNTIME_DIR` は使わない (OS の掃除やログアウトで daemon 生存中に socket が消えるのを避けるため、ユーザ管理下の状態の root を使う、DR-0041 決定 6)
 - dir は新規作成時 mode 0700、既存 dir は所有者 = euid と mode 0700 を検証して不一致ならエラー。sock mode 0600
-- 完成 path は bind 前に `sun_path` 上限と照合する
-- `<name>.lock` (name lock) は `<name>.sock` と同じ dir、`.dir.lock` はその dir の直下に置く
-- `hyoui list` は connect 拒否時に daemon lock を非ブロック取得できた場合だけ socket と name lock を削除し表示しない。lock 保持中は `no-response` (PID 不明)、lock 不在は `stale` として socket を残す。接続後 5 秒間 handshake / status.query に応答しない daemon は `no-response` と daemon PID を表示する。bind・prune・Drop の name lock 削除はディレクトリ単位の永続 `.dir.lock` で直列化する。起動時も別 owner の socket は触らない
+- `sun_path` の上限はフルパスでなく bind / connect に渡す引数の長さで判定し、収まらない path は dir の fd 基準の相対名で開く (DR-0041 決定 5)
+- `<id>.lock` (name lock) は `<id>.sock` と同じ dir、`.dir.lock` はその dir の直下に置く
+- `hyoui list` は connect 拒否時に daemon lock (= 在って誰も持っていない lock) を非ブロック取得できた場合だけ socket と name lock を削除し表示しない。lock 保持中は `no-response` (PID 不明)、lock 不在は `stale` として socket を残す。接続後 5 秒間 handshake / status.query に応答しない daemon は `no-response` と daemon PID を表示する。bind・prune・Drop の name lock 削除はディレクトリ単位の永続 `.dir.lock` で直列化する。起動時も別 owner の socket は触らない
 
 ### 3. Name と起動形
 
-- default name = pid、`--name` 明示で override、衝突 = error
+- session id は UUID の標準形 (DR-0041 決定 2)。`run --session-id` で起動側が決め、無ければ hyoui が振る。同じ id の socket が既にあれば error (決定 3)
 - 起動 = daemon + 自動 attach (foreground)、`--detached` で初期 detach 起動
 - `--detached` 時は stdout に name 1 行印字 (`name=$(hyoui run --detached -- cmd)` で取れる)
 - `--exclusive` で起動時に「rw 1 個まで」を宣言 (= 後続 attach は ro or 蹴る)

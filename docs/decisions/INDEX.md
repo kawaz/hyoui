@@ -57,7 +57,7 @@ Status 列は **ラベル + 最終判定日** だけを載せる。実装範囲�
 | [DR-0038](./DR-0038-web-unit-is-a-config-file.md) | 🚧 Active (2026-10-04) | web の unit = 任意 path の config ファイル 1 つ (登録簿は `{config, binary_path, enabled}`、`extends` で土台を共有)、foreground 起動は `daemon run` 1 本、置き場を `hyoui/web/` に揃える、service に場所の env を固定し差分で止まる。unit の config は `<unit>.toml` で `state_dir` (面) を必須に持ち、`daemon add <unit>` が生成する。unit 名に既定値は持たせない |
 | [DR-0039](./DR-0039-webui-terminal-app-rework.md) | ⬜ 未実装 | web UI をブラウザ上のターミナルアプリとして作り直す (新規セッション作成、タブグループ / タブ / pane、web 専用アクション、構造は共有・配置は端末ごと、マウスモード切り替え、入力経路は WS 1 本、xterm.js 6.0.0)。裁定待ち WR-Q2〜Q5 |
 | [DR-0040](./DR-0040-daemon-own-cell-model-and-layer-composition.md) | ⬜ 未実装 | daemon の仮想スクリーンを vt100 から自前のセルモデル crate にし、rect 単位の層合成でオーバーレイを重ね、attach 出力は常に合成画面から作る (tmux 型)。裁定待ち WR-Q2 |
-| [DR-0041](./DR-0041-session-id-uuid-and-tags.md) | 🟡 部分実装 (2026-10-06) | session id を UUID にし、namespace を廃止して tag にし、socket を `hyoui/sessions/` にフラットに置く。面は状態の root を決める環境変数 1 つ (`HYOUI_STATE_DIR`) で決まる。tag (分類と絞り込み) は CLI の形が未定で未実装 |
+| [DR-0041](./DR-0041-session-id-uuid-and-tags.md) | ✅ 実装済 (2026-10-07) | session id を UUID にし、namespace を廃止して tag (`key=value`、`run --tag` / `list --tag`) にし、socket を `hyoui/sessions/` にフラットに置く。面は状態の root を決める環境変数 1 つ (`HYOUI_STATE_DIR`) で決まる。廃止した namespace の option は 2026-11 まで受け付けて捨てる |
 | [DR-0042](./DR-0042-non-tty-stdin-is-the-childs-fd.md) | 🚧 Active (2026-10-06) | 非 tty の stdin は子の fd 0 にそのまま渡し、PTY は制御端末と出力にだけ使う (DR-0019 §5 を置き換え)。子の stdin も PTY にする指定は `run --pty-stdin`、attach は stdin を子に流さずキーは入力端末 (stdin か `/dev/tty`) から読む。配線に失敗したら起動・接続を拒否する |
 ## Archived
 

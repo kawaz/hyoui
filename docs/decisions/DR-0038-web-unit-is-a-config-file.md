@@ -3,7 +3,7 @@
 - Status: 🚧 Active (2026-10-04)。決定 1〜9 は実装済。移行済みで、古い置き場の symlink の撤去 (決定 4 移行節の 4) が残っている
 - Date: 2026-10-04
 - Supersedes (部分): DR-0034 決定 1 の `add` の形と `hyoui web` 単体起動 / 決定 2 の unit の中身と置き場 / 決定 6 の環境と log の置き場 / 決定 9 の log の置き場 / 決定 11 の「`hyoui web` 自身は変わらない」、DR-0036 決定 4 の `auth.json` / `pending.json` の置き場
-- Related: DR-0034 (2 系統の体系と監督者、本 DR が置き換えない部分はすべて有効), DR-0024 (config ファイル機構), DR-0018 (session namespace と socket dir), DR-0036 (passkey の state file), DR-0014 (介入 self-check)
+- Related: DR-0034 (2 系統の体系と監督者、本 DR が置き換えない部分はすべて有効), DR-0024 (config ファイル機構), DR-0041 (session socket の置き場と面), DR-0036 (passkey の state file), DR-0014 (介入 self-check)
 - Origin: `docs/issue/2026-10-04-web-unit-registry-holds-settings.md` (kawaz と合意 2026-10-04)、決定 9 は `docs/issue/2026-10-05-web-unit-config-state-dir-and-add-generates.md` (kawaz と合意 2026-10-05)
 
 ## Context
@@ -93,7 +93,7 @@ llm-gateway DR-0013 の規則をそのまま採る。`config.toml` と web の c
 
 監督者のログを state の中に置くのは先行の llm-gateway / ccmsg と同じで、label の名前にするので unit のログ (unit 名は `.` を含まない) と衝突しない。
 
-**監督者の socket は `web/` 直下に置かず `run/` に 1 段下げる。** `${XDG_STATE_HOME}/hyoui/` は session socket の base (DR-0018) で、discovery (`crates/hyoui/src/discovery.rs`) は直下の dir をすべて namespace とみなし、その中の `*.sock` に hyoui protocol で問い合わせる。`web/supervisor.sock` に置くと、`hyoui list --all-namespaces` と web gateway の `/api/sessions` に namespace `web` の session `supervisor` として並ぶだけでなく、discovery の handshake と監督者の 1 行読み (JSON 1 行の制御 socket、DR-0034 決定 4) が互いの応答を待ち合い、**監督者の event loop が 1 回 5 秒止まる** (実測: `list --all-namespaces` が 5.05 秒、その最中の `web daemon list` が 4.95 秒)。gateway は `/api/sessions` のたびに discovery を回すので、常駐すれば監督者が繰り返し止まる。discovery は 1 段しか潜らないので `run/` の中は見ない。`units/` / `logs/` に `*.sock` は無いので同じ理由で拾われない。
+**監督者の socket は `web/` 直下に置かず `run/` に 1 段下げる。** `${XDG_STATE_HOME}/hyoui/` は session socket の base で、discovery (`crates/hyoui/src/discovery.rs`) は直下の dir をすべて namespace とみなし、その中の `*.sock` に hyoui protocol で問い合わせる。`web/supervisor.sock` に置くと、`hyoui list --all-namespaces` と web gateway の `/api/sessions` に namespace `web` の session `supervisor` として並ぶだけでなく、discovery の handshake と監督者の 1 行読み (JSON 1 行の制御 socket、DR-0034 決定 4) が互いの応答を待ち合い、**監督者の event loop が 1 回 5 秒止まる** (実測: `list --all-namespaces` が 5.05 秒、その最中の `web daemon list` が 4.95 秒)。gateway は `/api/sessions` のたびに discovery を回すので、常駐すれば監督者が繰り返し止まる。discovery は 1 段しか潜らないので `run/` の中は見ない。`units/` / `logs/` に `*.sock` は無いので同じ理由で拾われない。
 
 **`hyoui/web/` と session socket の木の衝突は session 側の別 DR で解消する (それまでは namespace `web` の session を作らない運用)。** session socket を `hyoui/sessions/<uuid>.sock` にフラット化し namespace を廃止する設計 (`docs/issue/2026-10-04-design-session-id-uuid-and-tags.md`) の範囲で、本 DR は session の socket の場所・namespace・discovery を変えない。予約語は足さない (namespace を廃止する設計の前に、消える概念へ例外を増やさない)。
 
@@ -112,7 +112,7 @@ llm-gateway DR-0013 の規則をそのまま採る。`config.toml` と web の c
 
 reference の節をそのまま入れる。
 
-- **固定する変数の一覧は、場所の導出コードが読む変数そのもの。** core に `hyoui::paths` を置き、`LocationVar` (`HOME` / `XDG_CONFIG_HOME` / `XDG_STATE_HOME` / `XDG_RUNTIME_DIR`) と、それを読んだ snapshot `Env` を唯一の導出口にする。config の path・web の state dir・session socket の base (DR-0018、gateway の discovery が使う) はすべて `Env` から導き、`service register` はこの列挙をそのまま定義に書く。unit 生成側に別のリストを持たない
+- **固定する変数の一覧は、場所の導出コードが読む変数そのもの。** core に `hyoui::paths` を置き、`LocationVar` (`HOME` / `XDG_CONFIG_HOME` / `XDG_STATE_HOME` / `HYOUI_STATE_DIR`) と、それを読んだ snapshot `Env` を唯一の導出口にする。config の path・web の state dir・session socket の置き場 (DR-0041、gateway の discovery が使う) はすべて `Env` から導き、`service register` はこの列挙をそのまま定義に書く。unit 生成側に別のリストを持たない
 - **値の無い変数は書かない** (= 「無い」ことも固定される。launchd / systemd は shell の env を継承しない)
 - **`PATH` も同じ枡で固定し、register 時に正規化する** (空要素と重複を落とし、最初に現れた位置を保つ)。register を繰り返しても積もらない
 - **re-register で、既存の定義に固定された場所の変数が今の値と違えば、差分 (`{name, registered, current}`) を示して何も書き換えずに止まる。** `--force` で置き換える。`PATH` の違いでは止めない (場所を導かず、shell ごとに違うのが普通)。固定値を持たない定義 (= 本 DR 以前に書かれたもの) は「すべて未設定で固定」と読み、同じく `--force` を要る
@@ -212,4 +212,4 @@ hyoui web daemon run --no-config [--listen <host:port>]
 - `docs/issue/2026-10-04-web-unit-registry-holds-settings.md`
 - reference `cli-daemon-subcommands` (claude-rules-personal、`daemon` / `service` 体系と「`service register` は場所を決める env を unit に固定し、変わったら止まる」の節)
 - llm-gateway `docs/decisions/DR-0028-daemon-service-subcommands.md` (決定 2 / 6) / `DR-0013-config-extends.md`、`crates/gateway-core/src/daemon/registry.rs`、`crates/llm-gateway-cli/src/daemon.rs` / `daemon/run.rs`
-- 本リポ: DR-0034 / DR-0031 / DR-0024 / DR-0036 / DR-0018、`crates/hyoui/src/discovery.rs`、`crates/hyoui-cli/src/socket_path.rs`、`docs/issue/2026-10-04-design-session-id-uuid-and-tags.md`
+- 本リポ: DR-0034 / DR-0031 / DR-0024 / DR-0036、`crates/hyoui/src/discovery.rs`、`crates/hyoui-cli/src/socket_path.rs`、`docs/issue/2026-10-04-design-session-id-uuid-and-tags.md`

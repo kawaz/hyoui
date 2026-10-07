@@ -72,8 +72,8 @@ client 側 flag は作らない。
   旧値 `follow` は `notify` に rename する (= daemon 視点では「leader に通知する」が
   正確な語。follow するかどうかは通知を受けた client の挙動 = §2 であり、daemon の
   policy 名に client の動詞を使うのは不正確)。
-- 経路: `RunConfig` → `DaemonizeInit` (= `HYOUI_DAEMONIZE_INIT` JSON、[[DR-0018]] の
-  namespace と同じ既存 env 伝搬経路に field 1 個) → `DaemonConfig` → daemon の
+- 経路: `RunConfig` → `DaemonizeInit` (= `HYOUI_DAEMONIZE_INIT` JSON、既存の env 伝搬
+  経路に field 1 個) → `DaemonConfig` → daemon の
   child stopped 処理。**新 protocol message / cap flag は不要**。
 - daemon の child stopped 観測時:
   - `notify` (default): 現行通り leader (cap `child-state-v1`) に
@@ -324,7 +324,7 @@ worker 起動は 1 行)。多重定義 (`attach --mode` / `LockMode`) の解消�
   `--detach-others` の未実装エラー、`usage_run()` の `--on-parent-suspend` 残骸除去、
   completion 追従
 - `hyoui-cli::daemonize`: `DaemonizeInit` に `on_child_suspend` / `timeout_ms` /
-  `idle_timeout_ms` (serde default で旧 JSON 互換、[[DR-0018]] と同流儀)
+  `idle_timeout_ms` (serde default で旧 JSON 互換)
 - `hyoui::daemon`: `DaemonConfig` に同 field、child stopped 処理に AutoResume 分岐
   (= killpg(SIGCONT) + notify 抑止)、timeout / idle watcher (= UntilWatcher と
   finalize escalation を共用)
@@ -343,5 +343,4 @@ worker 起動は 1 行)。多重定義 (`attach --mode` / `LockMode`) の解消�
 - [[DR-0014]] — 検証主義 (= silent no-op 禁止、実装後マトリクス要件)
 - [[DR-0015]] — run = fork + exec attach (= 軸 2 廃止の正本、§2.2 policy 配置を本 DR で変更)
 - [[DR-0017]] — notify-only default + AutoResume opt-in 温存 (= 本 DR §3 がその配置を確定)
-- [[DR-0018]] — DaemonizeInit 経由の field 伝搬の先例 (= namespace)
 - [docs/findings/2026-06-11-signal-suspend-interaction-audit.md](../findings/2026-06-11-signal-suspend-interaction-audit.md) — 2 系統監査の正本 (= no-op 棚卸し + 相互作用マトリクス)

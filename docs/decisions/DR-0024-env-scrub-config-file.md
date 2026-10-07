@@ -2,7 +2,7 @@
 
 - Status: Active
 - Date: 2026-06-22
-- Related: DR-0005 (透明性最優先), DR-0014 (介入判断 self-check / マトリクス検証), DR-0018 (`HYOUI_NAMESPACE` 注入 = 透過例外の先例), DR-0020 (`HYOUI_SESSION_ID` 注入 = 同上), DR-0023 (本 DR で **Superseded**)
+- Related: DR-0005 (透明性最優先), DR-0014 (介入判断 self-check / マトリクス検証), DR-0020 (`HYOUI_SESSION_ID` 注入 = 透過例外の先例), DR-0041 (面の `HYOUI_STATE_DIR`), DR-0023 (本 DR で **Superseded**)
 - Origin: kawaz feedback on DR-0023 CLI flag overdesign (= `--scrub-env-add` / `--scrub-env-keep` / `--scrub-env-target` は config の役割を CLI に出張させたもの、設定ファイル機構の方が筋)
 
 ## Context
@@ -122,7 +122,7 @@ builtin が無い target (例: `vim` / `cat` / `my-tool`) では true/false 同�
 
 `HYOUI_*` プレフィックスを持つ全 env は **強制的に削除されない**。
 
-- `HYOUI_NAMESPACE` (DR-0018 §1)
+- `HYOUI_STATE_DIR` (DR-0041 決定 6、面の変数。子の中で起こす hyoui が同じ面を使う)
 - `HYOUI_SESSION_ID` (DR-0020 §1)
 - `HYOUI_LOCK_TOKEN` (DR-0006 §12, DR-0022)
 - `HYOUI_SOCK` / `HYOUI_NAME` (DR-0006 §12 nest 検知)

@@ -2,7 +2,7 @@
 
 - Status: Active
 - Date: 2026-06-12
-- Related: DR-0018 (env 注入の透過例外の先例 = `HYOUI_NAMESPACE`), DR-0006 (CLI ground rules / `--detach-others` の原典), DR-0004 (`detach` は予約 subcommand), DR-0019 (`hyoui set` — 省略時解決の主要ユースケース)
+- Related: DR-0041 (session id は UUID、面の `HYOUI_STATE_DIR`), DR-0006 (CLI ground rules / `--detach-others` の原典), DR-0004 (`detach` は予約 subcommand), DR-0019 (`hyoui set` — 省略時解決の主要ユースケース)
 - Origin: kawaz ドッグフーディング 2 日目 (2026-06-12) の要望群
 
 ## Context
@@ -22,11 +22,12 @@
 
 ### 1. 子プロセスへ `HYOUI_SESSION_ID` を常時注入する
 
-daemon が child を spawn する際、`HYOUI_NAMESPACE` (DR-0018) と同様に
-`HYOUI_SESSION_ID=<session-id>` を常時注入する。
+daemon が child を spawn する際、`HYOUI_SESSION_ID=<session-id>` を常時注入する。
 
-justify: DR-0018 で確立した透過例外の同枠 (= tmux `$TMUX` / screen `$STY` 慣行)。
-セッション自己参照の必然があり、env 1 個の追加は DR-0018 と同じコスト構造。
+justify: ラッパーが管理下の子に自分の識別子を env で示すのは、tmux の `$TMUX` / screen の
+`$STY` と同じ確立した慣行で、透過原則の例外として扱う。セッション自己参照の必然があり
+(子が自分の session を操作する経路が env 以外に無い)、介入は env 変数 1 個に留まる
+(子の fd / signal / termios / 画面には触れない)。
 
 ### 2. session 引数の省略時解決規則 (全 session 系 subcommand 共通)
 
@@ -120,7 +121,7 @@ hyoui detach [session]
 
 ## Consequences
 
-- env が 1 個増える (`HYOUI_SESSION_ID`)。DR-0018 と同枠の透過例外として記録
+- env が 1 個増える (`HYOUI_SESSION_ID`)。tmux `$TMUX` / screen `$STY` と同じ慣行の透過例外として記録
 - `Detach{Others/All}` の完成により protocol の `DetachTargetPartial` エラーが消える
 - 将来の client スコープ操作 (leader 譲渡 / rw⇄ro 降格) は本 DR の射程外 —
   client addressing の設計が必要なため、multi-client 運用の実需が出てから別 DR
@@ -130,7 +131,7 @@ hyoui detach [session]
 
 ## 関連
 
-- [[DR-0018]] — env 注入の透過例外先例
+- [[DR-0041]] — session id の形 (UUID) と、自己参照が届く面 (`HYOUI_STATE_DIR`)
 - [[DR-0019]] — `hyoui set` / 汎用 key=value
 - [[DR-0006]] / [[DR-0004]] — detach / exclusive の原典と予約
 - attach --exclusive / --detach-others issue — §4 で統合実装し昇華済み (削除)
