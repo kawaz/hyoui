@@ -57,7 +57,7 @@ hyoui の存在価値は「外側からの透明な制御」に集中させた�
 
 ### 領域外と明示するもの
 
-以下は daemon と TUI (= `hyoui attach` が端末に出す画面) の話。web gateway と browser の表示層がタブ・pane・タブグループで session の並べ方を持つことは対象外で、1 session = 1 daemon と TUI へのキー割り当て無しが保たれる限り本節に反しない (DR-0039、2026-10-07 裁定)。
+以下は daemon と TUI (= `hyoui attach` が端末に出す画面) の話。web gateway と browser の表示層が持つもの (タブ・pane・タブグループによる session の並べ方、新規セッション作成、web 専用アクション) は対象外。web は既存の `hyoui run --detached` / attach の経路を呼ぶだけで、1 session = 1 daemon と、TUI へのキー割り当て・子への hyoui 由来の入力が無いことが保たれる限り本節に反しない (DR-0039、2026-10-07 裁定)。
 
 - prefix キーバインド (tmux: C-b, screen: C-a)
 - window / pane / copy-mode / scrollback の UI
