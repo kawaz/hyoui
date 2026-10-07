@@ -1,18 +1,18 @@
 ---
 title: session id を UUID に、namespace を廃止して tag に、socket をフラットに置く (DR-0018 を置き換える)
-status: open
+status: resolved
 category: design
 created: 2026-10-04T15:30:00+09:00
-last_read: 2026-10-04T15:30:00+09:00
+last_read: 2026-10-07T11:00:00+09:00
 open_entered: 2026-10-04T15:30:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-07T11:00:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: DR-0041 として実装 (session id は UUID、namespace を廃止して key=value の tag、sessions/ にフラット、面は HYOUI_STATE_DIR の 3 段、長い sun_path は fork + fchdir)。namespace の option の受け付けは remove-namespace-option-shim で 2026-11 に消す
 blocked_by:
 ---
 

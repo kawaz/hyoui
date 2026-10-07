@@ -4,11 +4,12 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-10-07 | task | open | [remove-namespace-option-shim](./2026-10-07-task-remove-namespace-option-shim.md) | 廃止した namespace の option を受け付けて捨てる処理を 2026-11 に消す |
+| 2026-10-07 | bug | open | [upgrade-ack-lost-before-self-exec](./2026-10-07-bug-upgrade-ack-lost-before-self-exec.md) | hyoui upgrade で daemon が upgrade.ack を送り終える前に self-exec し、client が exit 1 になることがある |
 | 2026-10-06 | bug | open | [macos-ci-sigstop-not-observed-in-time](./2026-10-06-bug-macos-ci-sigstop-not-observed-in-time.md) | macOS CI で SIGSTOP した子の停止が約 1 秒以内に観測できず落ちた (真因未特定、待ち方を観測に変え次の失敗で原因が出るようにした) |
 | 2026-10-06 | design | open | [external-detach-reported-as-connection-lost](./2026-10-06-design-external-detach-reported-as-connection-lost.md) | 外から `hyoui detach` された attach client が「接続が失われました」で exit 9 になり、daemon の消滅と区別できない (DR-0042 の端末なし attach で主な終わり方になる) |
 | 2026-10-06 | design | open | [daemon-unaware-of-unlinked-socket](./2026-10-06-design-daemon-unaware-of-unlinked-socket.md) | session の socket file が消えても daemon は気付かず、誰も到達できないまま子と一緒に残り続ける (テストの残骸 49 個で観測) |
 | 2026-10-04 | bug | open | [web-supervisor-blocks-on-control-read](./2026-10-04-web-supervisor-blocks-on-control-read.md) | web の監督者が制御 socket の要求を main loop で 5 秒 timeout 付きで読み、改行を送らない client 1 つで止まる |
-| 2026-10-04 | design | open | [session-id-uuid-and-tags](./2026-10-04-design-session-id-uuid-and-tags.md) | session id を UUID に、namespace を廃止して tag に、socket を `hyoui/sessions/` にフラットに置く (DR-0018 を置き換える)。WR-Q1 の解消を含む。議論中 |
 | 2026-10-04 | design | open | [web-unit-registry-holds-settings](./2026-10-04-web-unit-registry-holds-settings.md) | web の unit 登録簿が listen 等の設定値を持っている (DR-0034 が daemon / service パターンから逸脱)。unit = config ファイル 1 つに直し、登録簿は config 参照 + binary + enabled だけにする |
 | 2026-10-04 | design | open | [daemon-own-cell-model](./2026-10-04-design-daemon-own-cell-model.md) | daemon の仮想スクリーンを vt100 から自前のセルモデルにする (層の合成でオーバーレイ、attach 出力は常に合成画面から作る tmux 型)。議論中、web UI 作り直しとは別 track |
 | 2026-10-04 | design | open | [webui-terminal-app-rework](./2026-10-04-design-webui-terminal-app-rework.md) | web UI をブラウザ上のターミナルアプリとして作り直す (新規セッション作成 / タブグループ・タブ・pane / web 専用アクション / 構造は共有・配置は端末ごと / leader 優先 + content-fit / ソフトキー)。議論中、合意と未決を記録 |
