@@ -167,3 +167,9 @@ Window
 - **コンポーネント**: HyouiSessionList (sections ごとに name / session_name の template / selectors)、HyouiLayoutList (localStorage のレイアウト一覧。default の空レイアウト、pane の分割、pane と session の紐付け、新規 shell)、HyouiPanesContainer、HyouiSessionTabs。**タブはレイアウトとして見直す** (タブの見た目である必要はない)
 - 後付けの tag には、起動後に tag を変える手段 (汎用の `hyoui set --tag`) が要る (claude の SessionStart hook から `HYOUI_SESSION_ID` で自分の session に付ける等)
 - 未確認・未決: レイアウトは端末ごとで共有しない (DR-0039 の「構造は共有」からの転換)。localStorage の名前空間 (scope / view ごとか全体か)。iframe での cookie と storage の partition (同じ登録ドメインの下なら通る見込み、実機未確認)。埋め込める origin の指定 (`frame-ancestors`)
+- **裁定 (2026-10-07、kawaz)**:
+  - selector の空のリスト `[]` は条件なし (書かないのと同じ)
+  - `${key}` は選択中の hyoui session の tag から展開する。選択が無い時は embed の定義に書いた変数のデフォルト値、それも無ければ空文字 (cwd が空なら新規 session の既定 cwd)
+  - `hyoui.` は予約 key として利用者に付けさせない (v0.14.0 で実装)
+  - レイアウトは端末ごとで他の端末に出ない。export / import は今は考えない
+  - localStorage の名前空間は scope ごと。selector を正規化した hash (key を並べ替える、空のリストを落とす、OR のリストを並べ替える) を使う。統括案: URL に任意の `view=<名前>` があればそれを名前空間に使う (selector の形を変えてもレイアウトを引き継げる)
