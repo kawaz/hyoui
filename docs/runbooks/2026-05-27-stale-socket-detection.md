@@ -19,56 +19,38 @@
 
 ## 切り分け
 
-1. `hyoui list --prune-stale=false`(デフォルト) で **socket file の存在だけ**
-   を列挙する。live/stale 列があれば確認:
-   - `live` 列: connect + handshake 成功 (= daemon が生きている)
-   - `stale` 列: connect 失敗 (= ECONNREFUSED や timeout)
-2. stale が確認できたら、対応する PID が本当に死んでいるかを別経路でも
-   裏取りする (= socket 名と process の対応がローカル設計依存なので、
-   `ps -ef | grep hyoui` または `lsof -U` で socket file を握っている
-   プロセスの不在を確認):
+1. `hyoui list` で状態を見る。STATUS 列 (SESSION が `$1`、STATUS が `$2`、PID が `$3`) は次のどれか:
+   - `live` / `stopped`: daemon が応答した (stopped は子が ^Z / SIGSTOP で止まっている)
+   - `no-response`: 接続はできたが 5 秒以内に応答が無い、または daemon が lock を持ったまま接続を受け付けられない (backlog 飽和)。daemon は生きているので消さない
+   - `stale`: 接続が拒否され、lock (`<id>.lock`) が無いので daemon の生死を判断できない。`hyoui list` は消さずに表示だけする
+   - `error`: 接続後の明示的な失敗 (handshake の拒否等)
+   - 一覧から消えたもの: 接続が拒否され、lock が在って誰も持っていなかった socket。`hyoui list` が socket と lock を消した (= daemon は死んでいた)
+2. `stale` の socket は、daemon が本当に居ないかを別の経路で確かめる (= socket を開いている process が居ないか):
    ```bash
-   lsof -U 2>/dev/null | grep '<session-name>.sock'
-   # 何も出なければ holder 不在 = stale 確定
-   ```
-3. `hyoui list --prune-stale` 未対応バージョンの場合は手動 `unlink`:
-   ```bash
-   rm -- "<状態の root>/sessions/<session>.sock" "<状態の root>/sessions/<session>.lock"
+   lsof -U 2>/dev/null | grep '<id>.sock'
+   # 何も出なければ socket を持つ process は居ない
    ```
 
 ## 対処
 
-1. **推奨**: `hyoui list --prune-stale` で一括掃除
-   - 内部で connect 試行 → ECONNREFUSED 等を確定とみなして `unlink(2)`
-   - live と判定された socket は触らない (= 並走 daemon を誤殺しない)
-2. **個別削除** (= live が並走していて全削除が怖い場合):
+1. **lock が残っている残骸**: `hyoui list` を 1 回打つ。接続を拒否し、lock を誰も持っていない socket を、socket と lock ごと消す。lock を持っている (= daemon が生きている) socket と、lock の無い socket には触らない
+2. **`stale` と出る socket (lock が無い)**: 手順「切り分け 2」で daemon が居ないことを確かめてから、手で消す:
    ```bash
-   # まず stale を listing で特定
-   hyoui list
-   # 名前で個別に消す
-   rm -- "$(hyoui list | awk '$2 == "stale" {print $3}')"
+   hyoui list | awk '$2 == "stale" {print $1}'          # stale の session id
+   rm -- "<状態の root>/sessions/<id>.sock"
    ```
-3. **再起動経路**: stale 掃除 → `hyoui run <session> <command>` で再生成
+   lock の無い socket を自動で消さないのは、lock を持たない生きた daemon の socket が、backlog 飽和の瞬間に接続を拒否することがあるため (死んだと誤って消すと、その session に二度と届かない)
+3. **同じ id で起動し直す**: 片付けた後に `hyoui run --session-id=<id> -- <cmd>`。動いている session を止めてすぐ同じ id を使う時は `hyoui kill --wait <id>` (daemon の終了まで待つ) を使う
 
 ## 予防
 
-- daemon が落ちる原因を残さない:
-  - `panic = abort` の現行ビルドでは、daemon の Drop chain が走らないため
-    `UnixSock::Drop` の `unlink` が呼ばれない。これは仕様 (= R5-H12 で core
-    dump 抑止優先) なので、stale 化を覚悟して `--prune-stale` の運用を組む
-- CI 等で並列に daemon 起動 → 殺すパターンでは、ジョブ末尾で必ず
-  `hyoui list --prune-stale` を呼んで掃除する
-- 監視: `hyoui list` の出力を定期的にスナップショットして、stale 件数が
-  閾値超え → アラート (= 障害の predictor として有効)
+- `panic = abort` の build では daemon の Drop が走らず、`UnixSock::Drop` の unlink が呼ばれない (R5-H12 で core dump の抑止を優先した仕様)。この時も lock file は残るので、次の `hyoui list` が片付ける
+- CI 等で daemon を並列に起こして殺す時は、ジョブの末尾で `hyoui list` を打って片付ける
+- 監視: `hyoui list` の出力を定期的に見て、`stale` / `no-response` の件数が増えたら調べる
 
 ## 関連
 
-- [[DR-0041]] 決定 3 / 4 / 6 — socket は `<状態の root>/sessions/<session>.sock`、
-  同じ id の socket が残っていれば run は起動しない
-- [[R5-H3]] — backlog の解消経緯 (= `list` 改修で live/stale 列追加 +
-  `--prune-stale` flag)
-- [[R5-H12]] — `panic = abort` を維持する判断 (= 引き換えに stale socket
-  確定、unlink は手動 or `--prune-stale` で対応)
-- `crates/hyoui/src/sys/socket.rs:144` — `UnixSock::Drop` 実装 (graceful exit
-  時のみ unlink される)
-- `crates/hyoui/src/cli.rs:336` — `--prune-stale` parse
+- [[DR-0041]] 決定 3 / 4 / 6 — socket は `<状態の root>/sessions/<id>.sock`、同じ id の socket が残っていれば run は起動しない (生死は判定しない、片付けはこの runbook の経路)
+- [[R5-H12]] — `panic = abort` を維持する判断
+- `crates/hyoui/src/discovery.rs` の `query_status` — 接続拒否時の lock の確認と片付け
+- `crates/hyoui/src/sys/socket.rs` の `impl Drop for UnixSock` — graceful exit 時の unlink

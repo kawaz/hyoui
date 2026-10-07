@@ -189,17 +189,19 @@ hyoui attach "$SID"                      # no need to read the id back from stdo
 ```
 
 - Uppercase, unhyphenated, or prefix-only ids are rejected (nothing is normalized; ids are meant to be copied and pasted)
-- If a socket with the same id already exists, `run` fails without starting anything, whether its daemon is alive or dead. `hyoui list` cleans up the socket of a dead daemon
+- If a socket with the same id already exists, `run` fails without starting anything, whether its daemon is alive or dead. A socket left by a dead daemon is cleaned up by `list` when its lock is still there; if it shows as stale, confirm that no daemon is behind it and remove it by hand
 - Sockets live at `<state root>/sessions/<id>.sock`. The state root (the "face") is `HYOUI_STATE_DIR`, else `$XDG_STATE_HOME/hyoui` (only when absolute), else `$HOME/.local/state/hyoui`. To keep a separate face, set only `HYOUI_STATE_DIR` in that face's `.envrc`. Sessions of another face are not visible
-- The only variable injected into the child is `HYOUI_SESSION_ID`
+- The only variable hyoui adds to the child is `HYOUI_SESSION_ID` (the face variable `HYOUI_STATE_DIR` is passed on, `--login` included)
+- `run --tag key=value` tags a session (repeatable), and `list --tag key=value` (exact) / `list --tag key` (key present) filters; repeated filters are ANDed
+- `--namespace` / `--all-namespaces` are accepted and ignored until 2026-11 (with one notice line on stderr)
 
 ### Main subcommands
 
 | Command | Purpose |
 |---|---|
-| `hyoui run [--detached] [--session-id=UUID] [--size=COLSxROWS] -- cmd args...` | Start a PTY and daemonize |
+| `hyoui run [--detached] [--session-id=UUID] [--tag=KEY=VALUE]... [--size=COLSxROWS] -- cmd args...` | Start a PTY and daemonize |
 | `hyoui attach <session> [--mode=rw\|ro\|rw-no-leader]` | I/O bridge (repaints from screen state on attach) |
-| `hyoui list [--format=plain\|jsonl]` | Enumerate active sessions (every session of the current face) |
+| `hyoui list [--tag=KEY[=VALUE]]... [--format=plain\|jsonl]` | Enumerate active sessions (every session of the current face, filtered by `--tag`) |
 | `hyoui kill <session> [--signal=NUM_OR_NAME]` | Send a signal to the child (default SIGTERM; name or number, e.g. `--signal KILL` / `--signal 9`) |
 | `hyoui status <session>` | Print session status (clients / leader / lock / scrollback) |
 | `hyoui set <session> <key>=<value>` | Change a runtime setting (e.g. `on-child-suspend=notify\|auto-resume`) |

@@ -167,7 +167,7 @@ hyoui web service status
 hyoui web daemon status
 hyoui version
 hyoui web passkey list
-hyoui list --all-namespaces
+hyoui list
 curl -s http://127.0.0.1:43690/healthz; echo
 curl -s http://127.0.0.1:43691/healthz; echo
 ```
@@ -178,7 +178,7 @@ curl -s http://127.0.0.1:43691/healthz; echo
 - `daemon status`: 2 unit とも `enabled: true` / `running: true`、`config` が手順 4 のファイル、`listen` が 43690 / 43691
 - `version`: 監督者と 2 unit の `running` / `on_disk` が並び、`restart_needed: false`
 - `passkey list`: 移行前と同じ登録が並ぶ (失効していない)
-- `list --all-namespaces`: `supervisor` という session が出ない
+- `list`: `supervisor` という session が出ない
 - `/healthz` が両方 `ok`
 - stderr の警告は「`~/.local/state/hyoui-web` / `~/Library/Logs/hyoui-web` が symlink として残っている」の 2 件だけ。旧 label の定義の警告が出ない
 - 前段 (canddy) 経由でブラウザから開け、passkey でサインインできる

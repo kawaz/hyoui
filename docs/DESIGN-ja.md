@@ -38,8 +38,8 @@ escape なし）に振る舞いつつ、**外側から監視・自動操作す�
 - **screen 型** (1 daemon 1 socket 1 子) を採用。tmux 型 (1 server 多 session) は不採用 ([[DR-0006]] §1)
 - session の存在は **filesystem が source of truth** (`hyoui list` は socket dir 走査)
 - daemon は子 exit で即終了、全 client detach 中でも生存
-- socket 配置: `<状態の root>/sessions/<session>.sock` (DR-0041)。状態の root (= 面) は `$HYOUI_STATE_DIR` → `$XDG_STATE_HOME/hyoui` (絶対パスの時だけ) → `$HOME/.local/state/hyoui` で、どれも無ければエラー。`$XDG_RUNTIME_DIR` / `$TMPDIR` は参照しない。session id は小文字・ハイフン付きの UUID で、同じ id の socket が既にあれば bind / name lock の時点で起動を断る (生死は判定しない)。path が `sun_path` の上限に収まらない時は、dir の fd を基準に fork した子が `fchdir` して相対名で bind / connect する
-- session の一覧: `hyoui list` は面の全 session を出す。discovery は `sessions/` だけを見る
+- socket 配置: `<状態の root>/sessions/<session>.sock` (DR-0041)。状態の root (= 面) は `$HYOUI_STATE_DIR` → `$XDG_STATE_HOME/hyoui` (絶対パスの時だけ) → `$HOME/.local/state/hyoui` で、どれも無ければ (`HOME` が相対パスの時も) エラー。`$XDG_RUNTIME_DIR` / `$TMPDIR` は参照しない。session id は小文字・ハイフン付きの UUID で、同じ id の socket が既にあれば bind / name lock の時点で起動を断る (生死は判定しない)。path が `sun_path` の上限に収まらない時は、dir の fd を基準に fork した子が `fchdir` して相対名で bind / connect する
+- session の一覧: `hyoui list` は面の全 session を出す。discovery は `sessions/` だけを見る。分類は `key=value` の tag (`run --tag`、daemon が status で返す) で、`list --tag` の絞り込みは指定した時だけ効く
 - dir mode 0700 / sock mode 0600（同 UID 信頼境界）
 
 ## 2. アーキテクチャ

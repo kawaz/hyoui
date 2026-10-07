@@ -257,19 +257,38 @@ hyoui input "$SID" "text:ls" "key:Enter"
 ```
 
 - Only the canonical form `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` is accepted. Uppercase, unhyphenated, braced, or prefix-only ids are errors and are never normalized silently (a different spelling of the same UUID would be a different socket). Any UUID version is fine
-- If a socket with the same id already exists, `hyoui run` ends with an error without starting the child, whether that daemon is alive or dead; run does not judge liveness. For a running session use `hyoui kill <id>`; if only the socket of a dead daemon is left, run `hyoui list` (it removes sockets that refuse connections while nobody holds the daemon lock) and try again. A socket without a lock is only shown as stale by `hyoui list`, never removed; confirm that no daemon is behind it and remove it by hand. The check happens when the socket is bound and the name lock is taken, so of several concurrent runs with one id exactly one starts
+- If a socket with the same id already exists, `hyoui run` ends with an error without starting the child, whether that daemon is alive or dead; run does not judge liveness. For a running session use `hyoui kill <id>`; if only the socket of a dead daemon is left and its lock is still there, `hyoui list` cleans it up (it removes sockets that refuse connections while nobody holds the lock); if `hyoui list` shows it as stale (no lock), confirm that no daemon is behind it and remove it by hand. Then try again. The check happens when the socket is bound and the name lock is taken, so of several concurrent runs with one id exactly one starts
 - `hyoui kill --wait` waits for the child and the session to end and also for the daemon to exit (removing its socket), so `run` with the same id works right after it returns. If the daemon ended without removing its socket, it exits with 1 and points to `hyoui list` for the cleanup
+- `hyoui kill` without `--wait` returns once the signal is sent. After the child ends, the daemon stays for about 2 seconds for late attaches, and a `run` with the same id during that time fails with "socket already exists". Use `kill --wait` when you reuse the id right away
+
+**Tags** — a session can carry `key=value` tags, and `list` can filter by them. Everything is shown by default; a filter only applies when given.
+
+```sh
+hyoui run --detached --tag env=prod --tag team=infra -- claude
+hyoui run --detached --tag scratch -- bash          # `--tag scratch` is short for `--tag scratch=` (empty value)
+hyoui list --tag env=prod                           # exact value match
+hyoui list --tag team                               # matches when the key exists (any value)
+hyoui list --tag env=prod --tag team                # repeated filters are ANDed
+hyoui list --format=jsonl | jq 'select(.tags.team | startswith("in"))'   # finer conditions: filter the jsonl
+```
+
+- A key is `[A-Za-z0-9._-]{1,256}`; a value is any string (split at the first `=`, empty allowed). Repeating a key keeps the last value
+- `list --tag key` matches when the key exists, and `list --tag key=` matches an empty value exactly; they are different conditions. A session tagged `--tag key=` matches both, one tagged `--tag key=bar` matches only `--tag key`. There are no wildcards
+- The daemon keeps the tags and returns them in `status` (the `tags:` line / `tags` in json), `list` (the TAGS column / `tags` in jsonl) and the web `/api/sessions`. They survive a daemon upgrade and cannot be changed after start
+- With `--tag`, rows that do not respond (no-response / stale / error) are not shown, since their tags are unknown
+- There is no environment variable that supplies default tags. `HYOUI_NAMESPACE` is not read
+- `--namespace` / `--all-namespaces` are accepted and ignored until 2026-11 (stdout is the same as without them; one notice line goes to stderr). After that they become unknown options
 
 **Faces** — sockets live at `<state root>/sessions/<id>.sock`. The state root is decided as follows, and everything hyoui keeps (session sockets, the web supervisor, units, registry, passkeys, logs) stays inside it.
 
 1. `HYOUI_STATE_DIR` (used as is when non-empty; a relative path is an error)
 2. `$XDG_STATE_HOME/hyoui` (only when absolute)
-3. `$HOME/.local/state/hyoui` (an error when `HOME` is also missing; never relative to the current directory)
+3. `$HOME/.local/state/hyoui` (an error when `HOME` is missing or relative; never relative to the current directory)
 
 To keep a separate face, set only `HYOUI_STATE_DIR` in that face's `.envrc` (`XDG_STATE_HOME` is shared with other applications, so leave it alone). Sessions of another face do not appear in `list` and cannot be reached by id. There is no option that spans faces: run hyoui once per face with that face's variable. The config (`~/.config/hyoui/`) is shared by every face. `XDG_RUNTIME_DIR` is not used (its lifetime is tied to the login, while sessions outlive logins).
 
 - The unix socket `sun_path` limit (104 bytes on macOS, 108 on Linux) is not checked against the full path. When the path does not fit, hyoui binds / connects with a name relative to an fd of the socket's directory, so deep roots work
-- The only variable always injected into the child is `HYOUI_SESSION_ID`. Without `--login` the child inherits the caller's env, `HYOUI_STATE_DIR` included, so a hyoui started inside it uses the same face
+- The only variable hyoui adds to the child's env is `HYOUI_SESSION_ID`. The face variable `HYOUI_STATE_DIR` reaches the child when the caller has it (`--login` included), so a hyoui started inside it uses the same face
 - The following are not read as sessions, and `hyoui list` and `hyoui web ...` warn on stderr when any are present: sockets outside `sessions/` (directly under the state root, or in a directory other than `sessions/` / `web/`), sockets in `sessions/` whose id is not a UUID, sockets under `$XDG_RUNTIME_DIR/hyoui`, and symlinks left in those places. See `docs/runbooks/session-uuid-migration-dr-0041.md`
 
 ### 10. Stop leaking parent env into the child (env scrub)
@@ -336,7 +355,7 @@ hyoui run --login --detached --pty-stdin -- zsh -f     # explicit command (e.g. 
 - The shell comes from passwd (`getpwuid`); the caller's `$SHELL` is ignored
 - argv[0] is `-<basename of the shell>` (e.g. `-zsh`); the shell reads its own rc files
 - The child env starts minimal instead of inheriting the caller's: `HOME` / `USER` / `LOGNAME` / `SHELL` / an initial `PATH` / `LANG` (if the caller has it) / `TERM` (see below). The initial `PATH` is built from `/etc/paths` and `/etc/paths.d/*` on macOS, and is `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` elsewhere
-- `HYOUI_SESSION_ID` stays in the child even though the env is minimal (`HYOUI_STATE_DIR` does not, so a hyoui started inside the child uses the face its own env decides)
+- `HYOUI_SESSION_ID` stays in the child even though the env is minimal. `HYOUI_STATE_DIR` stays too when it is set (a hyoui started inside the child uses the parent's face, so self-reference works)
 - With an explicit command, that command runs as-is (no `-` prefix on argv[0]) and only the env is minimal
 - Only the child's env is minimized. Which face root hyoui itself uses (`HYOUI_STATE_DIR` / `XDG_*`) is still decided by the caller's env
 
@@ -459,7 +478,7 @@ browser's viewport. Failures are shown in the same Attach section.
 | Symptom | What to try |
 |---|---|
 | `hyoui list` shows nothing | Check that the face (`HYOUI_STATE_DIR` etc.) is the one the session was started with (sessions of another face are not visible). Sockets left in the old layout are reported on stderr by `hyoui list` (`docs/runbooks/session-uuid-migration-dr-0041.md`) |
-| `hyoui run` refuses with "socket already exists" | If a session with that id is running, `hyoui kill <id>`; if only the socket of a dead daemon is left, `hyoui list` cleans it up. Or start with another id |
+| `hyoui run` refuses with "socket already exists" | If a session with that id is running, `hyoui kill --wait <id>` (it waits for the daemon to exit). If only the socket of a dead daemon is left, `hyoui list` cleans it up when the lock is still there; if it shows as stale, confirm that no daemon is behind it and remove it by hand. Or start with another id |
 | Attach is closed immediately | The daemon may have rejected cap negotiation (`docs/runbooks/2026-05-27-handshake-cap-rejection.md`) |
 | Child process died but the daemon lingers | `docs/runbooks/2026-05-27-child-orphan-detection.md` |
 

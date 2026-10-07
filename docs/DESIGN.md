@@ -46,8 +46,8 @@ model is close to abduco / shpool.
   directory)
 - The daemon exits as soon as the child exits, even while all clients are
   detached
-- Socket placement: `<state root>/sessions/<session>.sock` (DR-0041). The state root (the face) is `$HYOUI_STATE_DIR`, else `$XDG_STATE_HOME/hyoui` (only when absolute), else `$HOME/.local/state/hyoui`; with none of them it is an error. `$XDG_RUNTIME_DIR` / `$TMPDIR` are not consulted. A session id is a lowercase, hyphenated UUID, and a run whose id already has a socket is refused when binding / taking the name lock (liveness is not judged). When the path does not fit the `sun_path` limit, a forked child `fchdir`s to an fd of the directory and binds / connects with the relative name
-- Session listing: `hyoui list` shows every session of the face. Discovery looks only at `sessions/`
+- Socket placement: `<state root>/sessions/<session>.sock` (DR-0041). The state root (the face) is `$HYOUI_STATE_DIR`, else `$XDG_STATE_HOME/hyoui` (only when absolute), else `$HOME/.local/state/hyoui`; with none of them (or a relative `HOME`) it is an error. `$XDG_RUNTIME_DIR` / `$TMPDIR` are not consulted. A session id is a lowercase, hyphenated UUID, and a run whose id already has a socket is refused when binding / taking the name lock (liveness is not judged). When the path does not fit the `sun_path` limit, a forked child `fchdir`s to an fd of the directory and binds / connects with the relative name
+- Session listing: `hyoui list` shows every session of the face. Discovery looks only at `sessions/`. Classification uses `key=value` tags (`run --tag`, returned by the daemon in status), and `list --tag` filters only when given
 - Directory mode 0700, socket mode 0600 (same-UID trust boundary)
 
 ## 2. Architecture

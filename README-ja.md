@@ -180,17 +180,19 @@ hyoui attach "$SID"                      # stdout を読まずに後続の操作
 ```
 
 - 大文字やハイフン無し・先頭だけの短縮は受け付けない (= 正規化しない、id はコピペで渡す)
-- 同じ id の socket が既にあれば、相手の daemon が生きていても死んでいても run はエラーで起動しない。死んで残った socket は `hyoui list` が片付ける
+- 同じ id の socket が既にあれば、相手の daemon が生きていても死んでいても run はエラーで起動しない。daemon が死んで残った socket は、lock が残っていれば `list` が片付ける。stale と出たら daemon が居ないことを確かめてから手で消す
 - socket は `<状態の root>/sessions/<id>.sock` に置く。状態の root (= 面) は `HYOUI_STATE_DIR` → `$XDG_STATE_HOME/hyoui` (絶対パスの時だけ) → `$HOME/.local/state/hyoui` の順に決まる。面を分けたい時は面の `.envrc` で `HYOUI_STATE_DIR` だけを設定する。別の面の session は見えない
-- 子プロセスには `HYOUI_SESSION_ID` だけを注入する
+- hyoui が子プロセスへ足す env は `HYOUI_SESSION_ID` だけ (面の `HYOUI_STATE_DIR` は `--login` でも引き継ぐ)
+- `run --tag key=value` で session に tag を付け (繰り返し可)、`list --tag key=value` (完全一致) / `list --tag key` (key があれば) で絞り込む。繰り返しは AND
+- `--namespace` / `--all-namespaces` は 2026-11 まで受け付けて捨てる (stderr に注意を 1 行)
 
 ### 主な subcommand
 
 | コマンド | 用途 |
 |---|---|
-| `hyoui run [--detached] [--session-id=UUID] [--size=COLSxROWS] -- cmd args...` | PTY 起動・daemon 化 |
+| `hyoui run [--detached] [--session-id=UUID] [--tag=KEY=VALUE]... [--size=COLSxROWS] -- cmd args...` | PTY 起動・daemon 化 |
 | `hyoui attach <session> [--mode=rw\|ro\|rw-no-leader]` | 入出力中継 (= screen state から画面復元) |
-| `hyoui list [--format=plain\|jsonl]` | アクティブ session を列挙 (= 今の面の全 session) |
+| `hyoui list [--tag=KEY[=VALUE]]... [--format=plain\|jsonl]` | アクティブ session を列挙 (= 今の面の全 session、`--tag` で絞る) |
 | `hyoui kill <session> [--signal=NUM_OR_NAME]` | 子に signal 送出（default SIGTERM、name / number 両対応。例 `--signal KILL` / `--signal 9`） |
 | `hyoui status <session>` | session 状態表示 (= clients / leader / lock / scrollback) |
 | `hyoui set <session> <key>=<value>` | runtime 設定の変更 (例: `on-child-suspend=notify\|auto-resume`) |

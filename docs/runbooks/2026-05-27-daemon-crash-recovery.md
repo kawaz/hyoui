@@ -15,8 +15,8 @@
 
 ## 切り分け
 
-1. **stale socket かどうか**を `hyoui list --prune-stale` で確認
-   (詳細は [[2026-05-27-stale-socket-detection]] runbook)
+1. **stale socket かどうか**を `hyoui list` で確認 (STATUS が stale / no-response か、一覧から
+   消えたか。詳細は [[2026-05-27-stale-socket-detection]] runbook)
 2. **どのように落ちたか**を OS ログから推測:
    ```bash
    # macOS
@@ -47,9 +47,12 @@
 
 1. **stale socket を掃除**:
    ```bash
-   hyoui list --prune-stale
+   hyoui list
    ```
-2. **新 daemon 起動**: 通常通り `hyoui run <session> <command>`
+   lock が残っている socket は `hyoui list` が片付ける。stale と出る (lock が無い) socket は
+   daemon が居ないことを確かめてから手で消す ([[2026-05-27-stale-socket-detection]])
+2. **新 daemon 起動**: 通常通り `hyoui run --session-id=<id> -- <cmd>` (同じ id を使うなら、
+   socket が片付いてから)
    - 落ちた session の child は親 daemon と一緒に死んでいる (= R5-H7 で
      `killpg` 化済、孫プロセスも道連れ)
 3. **client 側の再 attach**: 切断された client は手動で再 attach

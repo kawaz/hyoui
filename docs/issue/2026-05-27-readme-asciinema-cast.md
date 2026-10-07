@@ -38,11 +38,12 @@ R5-SAL-H5 の提案を踏襲する案 (約 30 秒):
 
 ```bash
 # Terminal A: claude セッションを detached で起動 (= demo の主役)
-hyoui run --detached --session=work -- claude
+SID=$(uuidgen | tr A-Z a-z)
+hyoui run --detached --session-id="$SID" -- claude
 
 # Terminal B (or 別 ssh / 別 device):
 hyoui list
-hyoui attach work
+hyoui attach "$SID"   # Terminal A で決めた id (list の SESSION 列からも拾える)
 # claude と数往復、Ctrl-A D で detach
 # detach 後も claude は生き続ける (= hyoui list で確認)
 hyoui list

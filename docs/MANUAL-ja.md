@@ -248,19 +248,38 @@ hyoui input "$SID" "text:ls" "key:Enter"
 ```
 
 - 受け付けるのは標準形 `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` だけ。大文字・ハイフン無し・波括弧付き・先頭だけの短縮はエラーで、黙って正規化しない (表記が違うと同じ UUID でも別の socket になるため)。UUID の版は問わない
-- 同じ id の socket が既にあると `hyoui run` は子を起こさずにエラーで終わる。相手の daemon が生きていても死んでいても同じで、run は生死を判定しない。動いている session なら `hyoui kill <id>`、daemon が死んで socket だけ残っていれば `hyoui list` (接続を断られ、daemon の lock を誰も持っていない socket を片付ける) の後に打ち直す。lock の無い socket は `hyoui list` が stale と表示するだけで消さないので、daemon が居ないことを確かめてから手で消す。判定は socket の bind と name lock の時点で行うので、同じ id の run を並行に打っても起動するのは 1 つだけ
+- 同じ id の socket が既にあると `hyoui run` は子を起こさずにエラーで終わる。相手の daemon が生きていても死んでいても同じで、run は生死を判定しない。動いている session なら `hyoui kill <id>`。daemon が死んで socket だけ残っている時は、lock が残っていれば `hyoui list` が片付ける (接続を断られ、lock を誰も持っていない socket を消す)。`hyoui list` に stale と出たら (lock が無い)、daemon が居ないことを確かめてから手で消す。判定は socket の bind と name lock の時点で行うので、同じ id の run を並行に打っても起動するのは 1 つだけ
 - `hyoui kill --wait` は子と session の終了に加えて daemon の終了 (= socket の片付け) まで見届けて戻るので、戻った直後に同じ id で `run` できる。daemon が socket を片付けずに終わった時は exit 1 で、`hyoui list` での片付けを案内する
+- `--wait` なしの `hyoui kill` は signal を送って戻る。子の終了後も daemon は遅れて来る attach のために約 2 秒残るので、その間に同じ id で `run` すると「socket が既にある」で失敗する。すぐ同じ id を使うなら `kill --wait` を使う
+
+**tag** — session に `key=value` の tag を付け、`list` で絞り込める。既定は全部見え、絞り込みは指定した時だけ効く。
+
+```sh
+hyoui run --detached --tag env=prod --tag team=infra -- claude
+hyoui run --detached --tag scratch -- bash          # `--tag scratch` は `--tag scratch=` (値が空) の略
+hyoui list --tag env=prod                           # value の完全一致
+hyoui list --tag team                               # key があれば一致 (value は問わない)
+hyoui list --tag env=prod --tag team                # 繰り返しは AND
+hyoui list --format=jsonl | jq 'select(.tags.team | startswith("in"))'   # 細かい条件は jsonl を絞る
+```
+
+- key は `[A-Za-z0-9._-]{1,256}`、value は任意の文字列 (最初の `=` で分ける、空も可)。同じ key を繰り返すと後勝ち
+- `list --tag key` は key があれば一致、`list --tag key=` は value が空に完全一致で、別の条件。`--tag key=` で付けた session には両方が一致し、`--tag key=bar` で付けた session には `--tag key` だけが一致する。ワイルドカードは無い
+- tag は daemon が持ち、`status` (`tags:` 行 / json の `tags`)、`list` (TAGS 列 / jsonl の `tags`)、web の `/api/sessions` に出る。daemon の upgrade をまたいで残る。起動後には変えられない
+- `--tag` で絞ると、応答しない (no-response / stale / error) 行は tag が分からないので出ない
+- 既定の tag を env で与える仕組みは無い。`HYOUI_NAMESPACE` は読まない
+- `--namespace` / `--all-namespaces` は 2026-11 まで受け付けて捨てる (stdout は付けない時と同じ、stderr に 1 行の注意)。その後は unknown option になる
 
 **面** — socket は `<状態の root>/sessions/<id>.sock` に置く。状態の root は次の順に決まり、hyoui の一式 (session の socket、web の監督者・unit・登録簿・passkey・logs) はその中で完結する。
 
 1. `HYOUI_STATE_DIR` (空でなければそのまま。相対パスはエラー)
 2. `$XDG_STATE_HOME/hyoui` (絶対パスの時だけ)
-3. `$HOME/.local/state/hyoui` (`HOME` も無ければエラー。cwd 相対にはしない)
+3. `$HOME/.local/state/hyoui` (`HOME` が無い時と、相対パスの時はエラー。cwd 相対にはしない)
 
 面を分けたい時は、面の `.envrc` で `HYOUI_STATE_DIR` だけを設定する (`XDG_STATE_HOME` は他のアプリと共有なので書き換えない)。別の面の session は `list` にも id 指定にも出ない。面をまたいで扱う option は無いので、面ごとに環境変数を変えて実行する。config (`~/.config/hyoui/`) は面で分けず共有する。`XDG_RUNTIME_DIR` は使わない (ログインに紐づく寿命で、ログインを越えて動く session と合わない)。
 
 - unix socket の `sun_path` の上限 (macOS 104 / Linux 108 bytes) はフルパスでは判定しない。収まらない時は socket の dir を開いた fd を基準に相対名で bind / connect するので、深い root でも使える
-- 子プロセスへ常時注入するのは `HYOUI_SESSION_ID` だけ。`--login` でない run の子は呼び出し元の env を引き継ぐので `HYOUI_STATE_DIR` も届き、子の中で起こす hyoui は同じ面を使う
+- hyoui が子プロセスへ足す env は `HYOUI_SESSION_ID` だけ。面の `HYOUI_STATE_DIR` は呼び出し元の env に在れば子に届き (`--login` でも)、子の中で起こす hyoui は同じ面を使う
 - 次は session として読まず、在れば `hyoui list` と `hyoui web ...` が stderr に警告する: `sessions/` の外 (状態の root 直下や、`sessions/` / `web/` 以外の dir) の socket、`sessions/` の中の id が UUID でない socket、`$XDG_RUNTIME_DIR/hyoui` の下の socket、それらの置き場に残った symlink。手順は `docs/runbooks/session-uuid-migration-dr-0041.md`
 
 ### 10. 子プロセスへの env 漏洩を防ぐ (env scrub)
@@ -325,7 +344,7 @@ hyoui run --login --detached --pty-stdin -- zsh -f     # コマンド明示 (rc 
 - shell は passwd (`getpwuid`) から引く。呼び出し元の `$SHELL` は見ない
 - argv[0] は `-<shell の basename>` (例: `-zsh`)。rc は shell が読む
 - 子の env は呼び出し元から引き継がず最小から始める: `HOME` / `USER` / `LOGNAME` / `SHELL` / 初期 `PATH` / `LANG` (呼び出し元に在れば) / `TERM` (下記)。初期 `PATH` は macOS では `/etc/paths` と `/etc/paths.d/*` から、それ以外は `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`
-- `HYOUI_SESSION_ID` は最小化しても子に残る (`HYOUI_STATE_DIR` は残らないので、子の中で起こす hyoui は子の env が決める面を使う)
+- `HYOUI_SESSION_ID` は最小化しても子に残る。`HYOUI_STATE_DIR` も設定されていれば残る (子の中で起こす hyoui が親と同じ面を使い、自己参照が届く)
 - コマンドを明示した時は、そのコマンドを argv[0] の `-` 付けなしでそのまま起動し、env だけ最小にする
 - 最小化するのは子の env だけ。hyoui 自身がどの面の root (`HYOUI_STATE_DIR` / `XDG_*`) を使うかは呼び出し元の env のまま決まる
 
@@ -443,7 +462,7 @@ hyoui web daemon status
 | 症状 | 対処 |
 |---|---|
 | `hyoui list` に session が出ない | 面 (`HYOUI_STATE_DIR` 等) が起動時と同じか確認する (別の面の session は見えない)。古い置き場の socket が残っていれば `hyoui list` が stderr に警告する (`docs/runbooks/session-uuid-migration-dr-0041.md`) |
-| `hyoui run` が「socket が既にある」で起動しない | 同じ id の session が動いていれば `hyoui kill <id>`、daemon が死んで socket だけ残っていれば `hyoui list` が片付ける。別の id で起動してもよい |
+| `hyoui run` が「socket が既にある」で起動しない | 同じ id の session が動いていれば `hyoui kill --wait <id>` (= daemon の終了まで待つ)。daemon が死んで socket だけ残っていれば、lock が残っていれば `hyoui list` が片付ける。stale と出たら daemon が居ないことを確かめてから手で消す。別の id で起動してもよい |
 | attach 直後に切られる | daemon が cap negotiation で reject した可能性 (`docs/runbooks/2026-05-27-handshake-cap-rejection.md`) |
 | 子プロセスが死んで daemon だけ残る | `docs/runbooks/2026-05-27-child-orphan-detection.md` |
 

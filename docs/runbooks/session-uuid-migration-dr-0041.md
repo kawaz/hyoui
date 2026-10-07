@@ -130,7 +130,7 @@ hyoui list
 
 DR-0041 の「未決」節にある次の 2 つは、この runbook の手順に入れない。
 
-- `HYOUI_NAMESPACE` を設定している `.envrc` の扱い。新しい版はこの変数を読まないので、その `.envrc` の dir で起こした session は既定の面 (`~/.local/state/hyoui/sessions/`) に入り、`hyoui list` で他の session と並ぶ。面を分けるなら `HYOUI_STATE_DIR` を設定する形になるが、どの面に分けるかは決まっていない
+- `HYOUI_NAMESPACE` を設定している `.envrc` の書き換え。新しい版はこの変数を読まず、既定の tag を env で与える仕組みも無いので、その `.envrc` の dir で起こした session は既定の面 (`~/.local/state/hyoui/sessions/`) に入り、`hyoui list` で他の session と並ぶ。面を分けるなら `HYOUI_STATE_DIR`、分類だけなら `run --tag` を使う形になるが、どちらにするかは決まっていない。`--namespace` を付けた既存の呼び出しは 2026-11 まで起動できる (option は捨てられ、stderr に注意が出る)
 - ccmsg の hyoui terminal 連携は、socket の置き場を直書きで discovery している (ccmsg 側に起票済み)。新しい版の session は、連携側が `sessions/` を読むまで ccmsg から見えない
 
 ## ロールバック
