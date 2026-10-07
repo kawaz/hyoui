@@ -352,6 +352,13 @@ fn main() -> ExitCode {
         return daemonize::run_upgrade_resume_child();
     }
 
+    // DR-0041 決定 1: 廃止した namespace の option は 2026-11 まで受け付けて捨てる
+    // (= 既存の呼び出しを起動できなくしない)。黙って捨てると絞り込みを期待した script が
+    // 気づかずに全件を受け取るので、stderr に 1 行だけ言う。
+    let (argv, namespace_ignored) = hyoui::cli::strip_removed_namespace_options(&argv);
+    if namespace_ignored {
+        eprintln!("{}", hyoui::cli::REMOVED_NAMESPACE_NOTICE);
+    }
     let cmd = parse_args(&argv);
 
     // stdout の読み手が先に去った場合 (= `hyoui status | head -5`) の扱い。
@@ -742,6 +749,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
             cfg.login,
             config.session.term_fallback.clone(),
             child_stdin,
+            cfg.tags.clone(),
             cfg.command,
         );
     }
@@ -770,6 +778,7 @@ fn run_command(cfg: hyoui::cli::RunConfig) -> ExitCode {
         // 非 detached も daemon に stdin を継承させる (DR-0042 決定 2)。exec する attach
         // client は stdin を読まず、fd 0 を /dev/null にしてから中継する (決定 4)。
         child_stdin,
+        cfg.tags.clone(),
         cfg.command,
     ) {
         Ok(pair) => pair,
@@ -1354,6 +1363,8 @@ enum ListEntryStatus {
         /// DR-0019 Update: daemon バイナリ version (= VERSION 列、
         /// 空文字なら旧 daemon で `-` 表示)。
         daemon_version: String,
+        /// DR-0041 決定 1: session の tag (= TAGS 列 / jsonl の `tags`)。
+        tags: std::collections::BTreeMap<String, String>,
     },
     /// 接続済み daemon が応答しない。socket は残して PID を表示する。
     Hung {
@@ -1416,6 +1427,14 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<std::path::PathBuf>) -> Exi
 
     enrich_entries_with_status(&mut entries);
     entries.retain(|e| !matches!(&e.status, ListEntryStatus::Gone));
+    // DR-0041 決定 1: `--tag` の絞り込み (AND、指定した時だけ効く)。tag は status 応答で
+    // 返るので、応答しない (= tag が分からない) 行は絞り込みを指定した時には出さない。
+    if !cfg.tags.is_empty() {
+        entries.retain(|e| match &e.status {
+            ListEntryStatus::Live { tags, .. } => cfg.tags.iter().all(|f| f.matches(tags)),
+            _ => false,
+        });
+    }
 
     match cfg.format {
         ListFormat::Plain => print_list_plain(&entries),
@@ -1430,6 +1449,30 @@ fn list_command_with_dirs(cfg: ListConfig, dirs: Vec<std::path::PathBuf>) -> Exi
         eprintln!("hyoui: no sessions found");
     }
     ExitCode::SUCCESS
+}
+
+/// TAGS 列の表記: `KEY=VALUE` を KEY 順に `,` で繋ぐ (無ければ `-`)。VALUE は任意の文字列
+/// なので、制御文字は escape して表の行を壊さない (DR-0041 決定 1)。
+fn fmt_tags(tags: &std::collections::BTreeMap<String, String>) -> String {
+    if tags.is_empty() {
+        return "-".to_string();
+    }
+    tags.iter()
+        .map(|(key, value)| {
+            let value: String = value
+                .chars()
+                .map(|c| {
+                    if c.is_control() {
+                        c.escape_debug().to_string()
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect();
+            format!("{key}={value}")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// `std::time::Duration` を human readable な短い表記に整形 (= `1h2m` / `15m` / `3d4h`)。
@@ -1483,6 +1526,7 @@ fn enrich_entries_with_status(entries: &mut [ListEntry]) {
                 child_pgid: sr.child_pgid,
                 on_child_suspend: sr.on_child_suspend,
                 daemon_version: sr.daemon_version,
+                tags: sr.tags,
             },
             hyoui::discovery::StatusQueryResult::Hung { daemon_pid, reason } => {
                 eprintln!(
@@ -1573,8 +1617,8 @@ fn print_list_plain(entries: &[ListEntry]) {
         return;
     }
     println!(
-        "{:<36} {:<7} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} ARGV",
-        "SESSION", "STATUS", "PID", "SUSPEND", "VERSION", "DUR", "CLIENTS", "CWD"
+        "{:<36} {:<7} {:<8} {:<11} {:<8} {:<10} {:<8} {:<24} {:<32} ARGV",
+        "SESSION", "STATUS", "PID", "SUSPEND", "VERSION", "DUR", "CLIENTS", "TAGS", "CWD"
     );
     for e in entries {
         let session = truncate_to(&e.session, hyoui::cli::SESSION_ID_LEN);
@@ -1587,9 +1631,11 @@ fn print_list_plain(entries: &[ListEntry]) {
                 child_pid,
                 on_child_suspend,
                 daemon_version,
+                tags,
                 ..
             } => {
                 let dur = fmt_dur(e.dur);
+                let tags_disp = truncate_to(&fmt_tags(tags), 24);
                 let cwd_disp = truncate_to(&shorten_cwd(cwd), 32);
                 let argv_disp = if argv.is_empty() {
                     "-".to_string()
@@ -1612,7 +1658,7 @@ fn print_list_plain(entries: &[ListEntry]) {
                     daemon_version.as_str()
                 };
                 println!(
-                    "{session:<36} {status:<7} {pid_disp:<8} {suspend:<11} {ver:<8} {dur:<10} {clients:<8} {cwd_disp:<32} {argv_disp}"
+                    "{session:<36} {status:<7} {pid_disp:<8} {suspend:<11} {ver:<8} {dur:<10} {clients:<8} {tags_disp:<24} {cwd_disp:<32} {argv_disp}"
                 );
             }
             ListEntryStatus::Hung { daemon_pid, .. } => {
@@ -1620,9 +1666,10 @@ fn print_list_plain(entries: &[ListEntry]) {
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| "-".into());
                 println!(
-                    "{session:<36} {:<7} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} -",
+                    "{session:<36} {:<7} {:<8} {:<11} {:<8} {:<10} {:<8} {:<24} {:<32} -",
                     hyoui::discovery::NO_RESPONSE_STATUS,
                     pid,
+                    "-",
                     "-",
                     "-",
                     "-",
@@ -1631,12 +1678,12 @@ fn print_list_plain(entries: &[ListEntry]) {
                 );
             }
             ListEntryStatus::Error { .. } => println!(
-                "{session:<36} {:<11} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} -",
-                "error", "-", "-", "-", "-", "-", "-"
+                "{session:<36} {:<11} {:<8} {:<11} {:<8} {:<10} {:<8} {:<24} {:<32} -",
+                "error", "-", "-", "-", "-", "-", "-", "-"
             ),
             ListEntryStatus::Stale { .. } => println!(
-                "{session:<36} {:<7} {:<8} {:<11} {:<8} {:<10} {:<8} {:<32} -",
-                "stale", "-", "-", "-", "-", "-", "-"
+                "{session:<36} {:<7} {:<8} {:<11} {:<8} {:<10} {:<8} {:<24} {:<32} -",
+                "stale", "-", "-", "-", "-", "-", "-", "-"
             ),
             ListEntryStatus::Gone => {}
         }
@@ -1662,6 +1709,7 @@ fn print_list_jsonl(entries: &[ListEntry]) {
                 child_pgid,
                 on_child_suspend,
                 daemon_version,
+                tags,
             } => serde_json::json!({
                 "session": e.session,
                 // DR-0017 §柱2: stopped child は status を "stopped" にして可観測化。
@@ -1684,6 +1732,8 @@ fn print_list_jsonl(entries: &[ListEntry]) {
                 "cwd": cwd,
                 "argv": argv,
                 "clients": clients,
+                // DR-0041 決定 1: tag (無ければ空の object)。
+                "tags": tags,
             }),
             ListEntryStatus::Hung { daemon_pid, reason } => serde_json::json!({
                 "daemon_pid": daemon_pid,
@@ -1698,6 +1748,7 @@ fn print_list_jsonl(entries: &[ListEntry]) {
                 "cwd": serde_json::Value::Null,
                 "argv": serde_json::Value::Null,
                 "clients": serde_json::Value::Null,
+                "tags": serde_json::Value::Null,
             }),
             ListEntryStatus::Error { reason } => {
                 serde_json::json!({"session": e.session, "status": "error", "reason": reason, "socket": e.socket_path.display().to_string(), "started_unix_ms": e.started_unix_ms})
@@ -2908,6 +2959,8 @@ fn print_status_plain(sr: &hyoui::protocol::messages::StatusResponse) {
         sr.daemon_version.as_str()
     };
     println!("daemon-version: {ver}");
+    // DR-0041 決定 1: tag (1 行に KEY=VALUE を , 区切り、無ければ `-`)。
+    println!("tags: {}", fmt_tags(&sr.tags));
     println!("scrollback-bytes: {}", sr.scrollback_bytes);
     if let Some(holder) = sr.lock_holder {
         println!("lock-holder: client {holder}");
@@ -2985,6 +3038,13 @@ fn print_status_json(sr: &hyoui::protocol::messages::StatusResponse) {
         )
         .ok();
     }
+    // DR-0041 決定 1: tag (無ければ空の object)。
+    write!(
+        &mut out,
+        ",\"tags\":{}",
+        serde_json::to_string(&sr.tags).unwrap_or_else(|_| "{}".to_string())
+    )
+    .ok();
     write!(&mut out, ",\"scrollback_bytes\":{}", sr.scrollback_bytes).ok();
     match sr.lock_holder {
         Some(h) => write!(&mut out, ",\"lock_holder\":{h}").ok(),
@@ -6151,6 +6211,7 @@ mod tests {
                 child_pgid: None,
                 on_child_suspend: None,
                 daemon_version: String::new(),
+                tags: std::collections::BTreeMap::new(),
             },
         }];
 
@@ -6215,6 +6276,7 @@ mod tests {
                 child_pgid: None,
                 on_child_suspend: None,
                 daemon_version: String::new(),
+                tags: std::collections::BTreeMap::new(),
             },
         }];
         enrich_entries_with_status(&mut entries);

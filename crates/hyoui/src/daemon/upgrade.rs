@@ -145,6 +145,10 @@ pub struct UpgradeStateV1 {
     pub timeout_ms: Option<u64>,
     /// DaemonConfig::idle_timeout_ms
     pub idle_timeout_ms: Option<u64>,
+    /// DaemonConfig::tags (DR-0041 決定 1、upgrade をまたいで同じ tag を返す)。
+    /// field の無い state file (= tag を持たない版が書いたもの) は空として読む。
+    #[serde(default)]
+    pub tags: std::collections::BTreeMap<String, String>,
     /// 引き継ぐ子 PID (= `Session::from_upgrade_inherited` に渡す)
     pub child_pid: i32,
     /// scrollback ring から export した raw bytes (= 新プロセスで vt100 parser に
@@ -378,6 +382,7 @@ pub fn perform_self_exec(
         on_child_suspend: config.on_child_suspend.as_str().to_string(),
         timeout_ms: config.timeout_ms,
         idle_timeout_ms: config.idle_timeout_ms,
+        tags: config.tags.clone(),
         child_pid: child.as_raw(),
         scrollback: scrollback_bytes,
     };
@@ -649,6 +654,7 @@ mod tests {
             on_child_suspend: "auto-resume".to_string(),
             timeout_ms: Some(60_000),
             idle_timeout_ms: None,
+            tags: std::collections::BTreeMap::from([("env".to_string(), "prod".to_string())]),
             child_pid: 12345,
             scrollback: b"hello scrollback".to_vec(),
         };
@@ -660,6 +666,7 @@ mod tests {
         assert_eq!(read.cols, orig.cols);
         assert_eq!(read.rows, orig.rows);
         assert_eq!(read.child_pid, orig.child_pid);
+        assert_eq!(read.tags, orig.tags);
         assert_eq!(read.scrollback, orig.scrollback);
         assert_eq!(read.on_child_suspend, "auto-resume");
         assert_eq!(read.format_version, STATE_FORMAT_VERSION_V1);
@@ -689,6 +696,7 @@ mod tests {
             on_child_suspend: "notify".into(),
             timeout_ms: None,
             idle_timeout_ms: None,
+            tags: std::collections::BTreeMap::new(),
             child_pid: 1,
             scrollback: vec![],
         };

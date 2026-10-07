@@ -176,6 +176,11 @@ pub struct StatusResponse {
     /// に倒れる (= それ自体が「古い daemon」のシグナル)。
     #[serde(default)]
     pub daemon_version: String,
+    /// session の tag (= `hyoui run --tag <key>=<value>`、DR-0041 決定 1)。
+    ///
+    /// 無ければ空 (= wire には載せない)。field を送らない daemon も空として読む。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tags: std::collections::BTreeMap<String, String>,
 }
 
 #[cfg(test)]

@@ -1170,6 +1170,8 @@ fn handle_status_query(
         }),
         // DR-0019 Update: daemon 自身のバイナリ version (= 人間の診断用)。
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+        // DR-0041 決定 1: tag は daemon が起動時に受け取ったまま返す。
+        tags: config.tags.clone(),
     };
     let _ = send_control(&clients[idx], ControlMessage::StatusResponse(resp));
     ClientFrameOutcome::Continue

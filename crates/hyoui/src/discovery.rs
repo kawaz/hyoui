@@ -90,6 +90,8 @@ pub struct LiveInfo {
     pub on_child_suspend: Option<OnChildSuspendPolicy>,
     /// daemon バイナリ version (= 空文字なら旧 daemon)。
     pub daemon_version: String,
+    /// session の tag (DR-0041 決定 1)。
+    pub tags: std::collections::BTreeMap<String, String>,
 }
 
 /// 今の env の session の置き場 (`<状態の root>/sessions`)。root を決められなければ
@@ -497,6 +499,7 @@ fn probe(entry: &mut SessionEntry) -> bool {
             child_pgid: sr.child_pgid,
             on_child_suspend: sr.on_child_suspend,
             daemon_version: sr.daemon_version,
+            tags: sr.tags,
         }),
         StatusQueryResult::Hung { daemon_pid, reason } => {
             SessionStatus::Hung { daemon_pid, reason }

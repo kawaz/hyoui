@@ -349,14 +349,14 @@ _hyoui() {
                     COMPREPLY=( $(compgen -W "notify auto-resume" -- "$cur") ); return 0 ;;
                 --socket|--debug-dump-server|--debug-dump-client)
                     _filedir 2>/dev/null || COMPREPLY=( $(compgen -f -- "$cur") ); return 0 ;;
-                --session-id|--timeout|--idle-timeout|--until|--size|--cols|--rows|--scrollback-rows)
+                --session-id|--tag|--timeout|--idle-timeout|--until|--size|--cols|--rows|--scrollback-rows)
                     return 0 ;;
             esac
             case "$cur" in
                 --on-child-suspend=*)
                     COMPREPLY=( $(compgen -W "notify auto-resume" -- "${cur#*=}") ); return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--socket --session-id --detached --pty-stdin --timeout --idle-timeout --until --on-child-suspend --scrollback-rows --login --no-scrub-env --debug-dump-server --debug-dump-client --size --cols --rows --help -h --" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--socket --session-id --tag --detached --pty-stdin --timeout --idle-timeout --until --on-child-suspend --scrollback-rows --login --no-scrub-env --debug-dump-server --debug-dump-client --size --cols --rows --help -h --" -- "$cur") )
             return 0 ;;
         completion)
             COMPREPLY=( $(compgen -W "bash zsh fish --help -h" -- "$cur") )
@@ -370,11 +370,14 @@ _hyoui() {
             COMPREPLY=( $(compgen -W "--socket --index --mode --quiet --debug-dump-client --help -h" -- "$cur") )
             return 0 ;;
         list)
+            case "$prev" in
+                --tag) return 0 ;;
+            esac
             case "$cur" in
                 --format=*)
                     COMPREPLY=( $(compgen -W "plain jsonl" -- "${cur#*=}") ); return 0 ;;
             esac
-            COMPREPLY=( $(compgen -W "--format --help -h" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--tag --format --help -h" -- "$cur") )
             return 0 ;;
         kill)
             case "$prev" in
@@ -483,6 +486,7 @@ _hyoui() {
                     ;;
                 list)
                     _arguments \
+                        '*--tag=[Only sessions with this tag (KEY=VALUE exact, KEY present; repeat = AND)]:tag:' \
                         '--format=[Output format]:format:(plain jsonl)' \
                         '(-h --help)'{-h,--help}'[Show help]'
                     ;;
@@ -997,6 +1001,7 @@ _hyoui_run() {
     _arguments \
         '--socket=[Unix socket path]:socket:_files' \
         '--session-id=[Session id chosen by the caller (canonical lowercase UUID, DR-0041)]:uuid:' \
+        '*--tag=[Tag the session with KEY=VALUE (repeatable, last wins for a KEY)]:tag:' \
         '--detached[Fork the daemon and exit immediately (DR-0015)]' \
         '--pty-stdin[Make the child stdin the PTY instead of passing the caller stdin (DR-0042)]' \
         '--timeout=[Overall timeout (e.g. 30s / 1m / 1h30m)]:duration:' \
@@ -1193,6 +1198,7 @@ complete -c hyoui -n '__hyoui_using_subcommand run' -l rows              -x     
 complete -c hyoui -n '__hyoui_using_subcommand run' -l on-child-suspend  -x -a 'notify auto-resume'       -d 'Action when child is stopped'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l scrollback-rows   -x                              -d 'vt100 scrollback ring max rows (default 1000)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l session-id        -x                              -d 'Session id chosen by the caller (canonical lowercase UUID, DR-0041)'
+complete -c hyoui -n '__hyoui_using_subcommand run' -l tag               -x                              -d 'Tag the session with KEY=VALUE (repeatable, last wins for a KEY)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l detached                                           -d 'Fork the daemon and exit immediately (DR-0015)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l pty-stdin                                          -d 'Make the child stdin the PTY instead of passing the caller stdin (DR-0042)'
 complete -c hyoui -n '__hyoui_using_subcommand run' -l login                                              -d 'Start as a login shell with a minimal child env (DR-0039)'
@@ -1214,6 +1220,7 @@ complete -c hyoui -n '__hyoui_using_subcommand attach' -l debug-dump-client -r -
 complete -c hyoui -n '__hyoui_using_subcommand attach' -s h -l help                                    -d 'Show help and exit'
 
 # `hyoui list` options.
+complete -c hyoui -n '__hyoui_using_subcommand list' -l tag -x -d 'Only sessions with this tag (KEY=VALUE exact, KEY present; repeat = AND)'
 complete -c hyoui -n '__hyoui_using_subcommand list' -l format -x -a 'plain jsonl' -d 'Output format'
 complete -c hyoui -n '__hyoui_using_subcommand list' -s h -l help            -d 'Show help and exit'
 
@@ -1756,6 +1763,7 @@ mod tests {
                 &[
                     "socket",
                     "session-id",
+                    "tag",
                     "detached",
                     "login",
                     "no-scrub-env",
@@ -1764,6 +1772,7 @@ mod tests {
                 ],
             ),
             ("attach", &["mode", "debug-dump-client"]),
+            ("list", &["tag", "format"]),
             ("tail", &["strip-ansi", "last-bytes"]),
             ("input", &["auto-lock-timeout-acquire"]),
             ("daemon add", &["listen", "binary", "config"]),

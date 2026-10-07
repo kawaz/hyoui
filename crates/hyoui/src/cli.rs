@@ -392,6 +392,9 @@ pub struct RunConfig {
     /// `--session-id`: 起動側が決めた session id (DR-0041 決定 2、UUID 標準形)。`None` なら
     /// hyoui が振る。socket path 自動解決にもこの値が入る。
     pub session_id: Option<String>,
+    /// `--tag <key>=<value>` (繰り返し可、同じ key は後勝ち、DR-0041 決定 1)。daemon が
+    /// session のメタデータとして持ち、status 応答で返す。
+    pub tags: std::collections::BTreeMap<String, String>,
     /// `--on-child-suspend`: 子が stop したときの daemon 側 policy (DR-0019 §3)。
     ///
     /// `None` = flag 未指定。この場合 caller (= `run_command`) が config.toml の
@@ -522,6 +525,72 @@ pub enum ListFormat {
 pub struct ListConfig {
     /// 出力 format (= default Plain、`--format=jsonl` で JSON Lines)。
     pub format: ListFormat,
+    /// `--tag <key>[=<value>]` の絞り込み (繰り返しは AND、DR-0041 決定 1)。空なら全部。
+    pub tags: Vec<TagFilter>,
+}
+
+/// `list --tag` の絞り込み 1 つ (DR-0041 決定 1)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagFilter {
+    /// tag の key。
+    pub key: String,
+    /// `Some(v)` なら value の完全一致、`None` (= `--tag <key>`) なら key があれば一致。
+    pub value: Option<String>,
+}
+
+impl TagFilter {
+    /// session の tags がこの絞り込みに合うか。ワイルドカードは持たない。
+    #[must_use]
+    pub fn matches(&self, tags: &std::collections::BTreeMap<String, String>) -> bool {
+        match (&self.value, tags.get(&self.key)) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(want), Some(got)) => want == got,
+        }
+    }
+}
+
+/// tag の key の最大長 (byte)。
+pub const MAX_TAG_KEY_LEN: usize = 256;
+
+/// tag の key を確かめる: `[A-Za-z0-9._-]{1,256}` (DR-0041 決定 1)。
+///
+/// # Errors
+///
+/// 空、長すぎる、許されない文字を含む時。
+pub fn validate_tag_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("tag key must not be empty (use --tag <key>=<value>)".into());
+    }
+    if key.len() > MAX_TAG_KEY_LEN {
+        return Err(format!(
+            "tag key is too long ({} bytes, max {MAX_TAG_KEY_LEN})",
+            key.len()
+        ));
+    }
+    if let Some(ch) = key
+        .chars()
+        .find(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')))
+    {
+        return Err(format!(
+            "tag key {key:?} contains {ch:?}; a key is made of A-Z a-z 0-9 . _ -"
+        ));
+    }
+    Ok(())
+}
+
+/// `--tag` の値を最初の `=` で key と value に分ける。`=` が無ければ value は `None`。
+///
+/// # Errors
+///
+/// key が [`validate_tag_key`] に反する時。
+pub fn parse_tag_arg(arg: &str) -> Result<(String, Option<String>), String> {
+    let (key, value) = match arg.split_once('=') {
+        Some((k, v)) => (k, Some(v.to_string())),
+        None => (arg, None),
+    };
+    validate_tag_key(key)?;
+    Ok((key.to_string(), value))
 }
 
 /// `kill` subcommand configuration.
@@ -1225,9 +1294,32 @@ fn parse_list(args: &[String]) -> Command {
         };
     }
     let mut cfg = ListConfig::default();
-    for a in args {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        i += 1;
         let (name, inline_value) = split_eq(a.as_str());
         match name.as_str() {
+            "--tag" => {
+                let value = match inline_value {
+                    Some(v) => v,
+                    None => match args.get(i) {
+                        Some(v) => {
+                            i += 1;
+                            v.clone()
+                        }
+                        None => {
+                            return Command::Error(
+                                "list: --tag requires <key> or <key>=<value>".to_string(),
+                            );
+                        }
+                    },
+                };
+                match parse_tag_arg(&value) {
+                    Ok((key, value)) => cfg.tags.push(TagFilter { key, value }),
+                    Err(e) => return Command::Error(format!("list: --tag: {e}")),
+                }
+            }
             "--format" => match inline_value.as_deref() {
                 Some("plain") => cfg.format = ListFormat::Plain,
                 Some("jsonl") => cfg.format = ListFormat::Jsonl,
@@ -3326,6 +3418,7 @@ fn parse_run(args: &[String]) -> Command {
     let mut command: Vec<String> = Vec::new();
     let mut detached = false;
     let mut session_id: Option<String> = None;
+    let mut tags: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     let mut scrollback_rows: Option<usize> = None;
     let mut debug_dump_server: Option<String> = None;
     let mut debug_dump_client: Option<String> = None;
@@ -3468,6 +3561,16 @@ fn parse_run(args: &[String]) -> Command {
                 detached = true;
                 consumed_extra = false; // bool flag は次 arg を食わない
             }
+            "--tag" => match value.as_deref() {
+                Some(v) => match parse_tag_arg(v) {
+                    // `--tag <key>` (= `=` 無し) は value が空の tag (docker の `--label k` と同じ)。
+                    Ok((key, value)) => {
+                        tags.insert(key, value.unwrap_or_default());
+                    }
+                    Err(e) => return Command::Error(format!("run: --tag: {e}")),
+                },
+                None => return Command::Error("--tag requires <key>=<value>".into()),
+            },
             "--session-id" => match value {
                 Some(v) => {
                     if let Err(e) = validate_session_id(&v) {
@@ -3538,6 +3641,7 @@ fn parse_run(args: &[String]) -> Command {
         socket,
         detached,
         session_id,
+        tags,
         on_child_suspend,
         scrollback_rows,
         debug_dump_server,
@@ -5297,6 +5401,10 @@ fn usage_run() -> String {
                 受け付ける (大文字やハイフン無しはエラー、正規化しない)。\n                                  \
                 省略すると hyoui が振る。同じ id の socket が既にあれば\n                                  \
                 (daemon が死んで残った socket も) 起動せずエラー\n    \
+            --tag KEY=VALUE               session に tag を付ける (DR-0041)。繰り返し可、同じ KEY は\n                                  \
+                後勝ち。KEY は [A-Za-z0-9._-]{1,256}、VALUE は任意の文字列\n                                  \
+                (最初の = で分ける、空も可)。--tag KEY は VALUE が空の tag。\n                                  \
+                `hyoui list --tag` で絞り込み、status / list に出る。起動後は変えられない\n    \
             --on-child-suspend=notify|auto-resume\n                                  \
                 Action when the child is stopped\n                                  \
                 (notify: tell the leader client; auto-resume: daemon\n                                  \
@@ -5330,14 +5438,14 @@ fn usage_run() -> String {
         \n\
         ENVIRONMENT:\n    \
             HYOUI_STATE_DIR        状態の root (= 面、DR-0041)。socket は <root>/sessions/<id>.sock\n    \
-            XDG_STATE_HOME         HYOUI_STATE_DIR が無い時の root の親 ($XDG_STATE_HOME/hyoui、\n                                   \
+            XDG_STATE_HOME         HYOUI_STATE_DIR が無い時の root の親 ($XDG_STATE_HOME/hyoui、\n                           \
                 絶対パスの時だけ。無ければ $HOME/.local/state/hyoui)\n    \
-            HYOUI_SCROLLBACK_ROWS  --scrollback-rows と同じ値を env で渡す\n                                   \
+            HYOUI_SCROLLBACK_ROWS  --scrollback-rows と同じ値を env で渡す\n                           \
                 (--scrollback-rows 指定時は flag 優先)\n    \
-            TERM                   子に引き継ぐ (--login でも同じ)。未設定 / 空なら\n                                   \
+            TERM                   子に引き継ぐ (--login でも同じ)。未設定 / 空なら\n                           \
                 config の [session] term_fallback (default xterm-256color)\n    \
-            HYOUI_SESSION_ID       (子へ注入) daemon が子プロセスへ常時 export する\n                                   \
-                自セッション id。中から `hyoui status` 等を session 省略で\n                                   \
+            HYOUI_SESSION_ID       (子へ注入) daemon が子プロセスへ常時 export する\n                           \
+                自セッション id。中から `hyoui status` 等を session 省略で\n                           \
                 叩くと自セッションに解決される (DR-0020)\n\
         \n\
         DURATION FORMAT (kawaz/timespec.mbt 仕様 + sub-ms 拡張):\n    \
@@ -5415,13 +5523,13 @@ fn usage_attach() -> String {
             2                     usage / 引数エラー\n\
         \n\
         EXAMPLES:\n    \
-            hyoui attach demo                       # session_id=demo に attach\n    \
-            hyoui attach 1                          # session_id=\"1\" に attach (= 数字も名前扱い)\n    \
-            hyoui attach --index=1                  # 1 番古い live session に attach\n    \
-            hyoui attach --index=-1                 # 1 番新しい live session に attach\n    \
-            hyoui attach --index=2                  # 2 番古い live session に attach\n    \
-            hyoui attach --socket=/tmp/x.sock       # 直接 socket 指定\n    \
-            hyoui attach demo --mode=ro             # 読み取り専用 attach\n    \
+            hyoui attach 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f            # その session に attach\n    \
+            hyoui attach 1                                               # session_id=\"1\" に attach (= 数字も名前扱い)\n    \
+            hyoui attach --index=1                                       # 1 番古い live session に attach\n    \
+            hyoui attach --index=-1                                      # 1 番新しい live session に attach\n    \
+            hyoui attach --index=2                                       # 2 番古い live session に attach\n    \
+            hyoui attach --socket=/tmp/x.sock                            # 直接 socket 指定\n    \
+            hyoui attach 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --mode=ro  # 読み取り専用 attach\n    \
         \n\
         RELATED:\n    \
             hyoui run --detached    daemon を background 起動\n    \
@@ -5446,6 +5554,7 @@ fn usage_status() -> String {
         OPTIONS:\n    \
             --socket PATH   Explicit socket path (alternative to session-id)\n    \
             --index N       Session selector (= mtime 昇順、1=最古, -1=最新)\n    \
+            --format plain|json  出力 format (= default plain、json は 1 object)\n    \
             -h, --help      Show this help and exit\n\
         \n\
         SELF-SESSION (DR-0020 §2):\n    \
@@ -5454,12 +5563,13 @@ fn usage_status() -> String {
             env が指す session が不在 (= stale) なら fallback せず明示エラー。\n\
         \n\
         OUTPUT (plaintext key:value 1 行ごと):\n    \
-            session-id: <name>\n    \
+            session-id: <uuid>\n    \
             daemon-pid: <pid>\n    \
             child-pid: <pid> pgid=<pgid>  または  child-pid: (exited)\n    \
             child-state: running | stopped | exited [(code N)]\n    \
             on-child-suspend: notify | auto-resume  (= 現在の policy、`hyoui set` で変更可)\n    \
             daemon-version: <version>  または  daemon-version: -  (= field 無しの古い daemon)\n    \
+            tags: <key>=<value>,...  または  tags: -  (= run --tag、DR-0041)\n    \
             scrollback-bytes: <N>\n    \
             lock-holder: client <id>  または  lock-holder: (none)\n    \
             clients:\n              \
@@ -5549,11 +5659,11 @@ fn usage_tail() -> String {
             1   connect / I/O 失敗、または --since-strict で since 範囲が evict 済\n\
         \n\
         EXAMPLES:\n    \
-            hyoui tail demo                       # 全 scrollback 1 度だけ流して exit\n    \
-            hyoui tail demo --follow              # live stream を継続\n    \
-            hyoui tail demo --since=10s           # 過去 10 秒分\n    \
-            hyoui tail demo --since=10s --since-strict   # 10 秒が evict 済なら exit 非 0\n    \
-            hyoui tail demo --last-bytes=8192     # 末尾 8 KiB\n\
+            hyoui tail 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f                             # 全 scrollback 1 度だけ流して exit\n    \
+            hyoui tail 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --follow                    # live stream を継続\n    \
+            hyoui tail 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --since=10s                 # 過去 10 秒分\n    \
+            hyoui tail 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --since=10s --since-strict  # 10 秒が evict 済なら exit 非 0\n    \
+            hyoui tail 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --last-bytes=8192           # 末尾 8 KiB\n\
         \n\
         RELATED:\n    \
             hyoui wait <id> ...       条件達成まで block (= state-based、画面 visible match)\n    \
@@ -5605,9 +5715,9 @@ fn usage_wait() -> String {
             3   regex compile / daemon error\n\
         \n\
         EXAMPLES:\n    \
-            hyoui wait demo 'READY' --timeout=5s\n    \
-            hyoui wait demo 'ITEM-\\d+' --timeout=30s\n    \
-            hyoui wait demo '(?m)^Continue\\?' --poll-interval=50ms\n",
+            hyoui wait 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f 'READY' --timeout=5s\n    \
+            hyoui wait 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f 'ITEM-\\d+' --timeout=30s\n    \
+            hyoui wait 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f '(?m)^Continue\\?' --poll-interval=50ms\n",
     )
 }
 
@@ -5616,28 +5726,36 @@ fn usage_list() -> String {
         "hyoui list — list daemon sessions (= socket dir scan + status query)\n\
         \n\
         USAGE:\n    \
-            hyoui list [--format=plain|jsonl]\n\
+            hyoui list [--tag KEY[=VALUE]]... [--format=plain|jsonl]\n\
         \n\
         OPTIONS:\n    \
+            --tag KEY=VALUE       tag の KEY が VALUE と完全一致する session だけを出す (DR-0041)\n    \
+            --tag KEY             tag に KEY がある session だけを出す (VALUE は問わない)\n    \
+            \x20                     繰り返しは AND。ワイルドカードは無い (細かい条件は jsonl を絞る)。\n    \
+            \x20                     tag を持たない no-response / stale / error の行は出ない\n    \
             --format=plain|jsonl  出力 format (= default plain)。jsonl は 1 session 1 行の JSON object\n    \
             -h, --help          Show this help and exit\n\
         \n\
         OUTPUT (plain, fixed-width columns, sorted by socket mtime ascending):\n    \
-            SESSION                               STATUS  PID      DUR        CLIENTS  CWD                              ARGV\n    \
-            0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f  live    12345    1h2m       2        kawaz/hyoui/main                 claude\n    \
-            5c9d0e1f-2a3b-4c4d-8e5f-6a7b8c9d0e1f  no-response 12345    -          -        -                                -\n\
+            SESSION                              STATUS  PID      SUSPEND     VERSION  DUR        CLIENTS  TAGS                     CWD                              ARGV\n    \
+            0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f live    12345    notify      0.14.0   1h2m       2        env=prod,team=a          kawaz/hyoui/main                 claude\n    \
+            5c9d0e1f-2a3b-4c4d-8e5f-6a7b8c9d0e1f no-response 12345    -           -        -          -        -                        -                                -\n\
         \n\
         COLUMNS (plain):\n    \
             SESSION   session id (= UUID。socket file 名から拡張子を除いた値、省略しない)\n    \
             STATUS    live | stopped | no-response | stale | error (= stopped は子が ^Z/SIGSTOP で停止中)\n    \
             PID       live/stopped は子 PTY、no-response は daemon の PID\n    \
             DUR       socket mtime からの経過時間 (= 1h2m / 15m / 3d4h 形式)\n    \
+            SUSPEND   on-child-suspend policy (notify / auto-resume)\n    \
+            VERSION   daemon バイナリの version\n    \
             CLIENTS   現在 attach 中の client 数 (= status.query の結果)\n    \
+            TAGS      tag を KEY=VALUE の , 区切りで (KEY 順、24ch truncate、無ければ -)。\n    \
+            \x20         制御文字は escape する。全部見るには --format=jsonl の tags\n    \
             CWD       daemon 起動時の cwd (= `repos/<host>/` 前カット、~ 前カット、32ch truncate)\n    \
             ARGV      daemon が起動した子 PTY の argv (= space-join、空白含む arg は \"...\" quote)\n\
         \n\
         OUTPUT (jsonl, 1 session = 1 line):\n    \
-            {\"session\":\"<id>\",\"status\":\"live|stopped|no-response|stale|error\",\"daemon_pid\":<n>|null,\"child_state\":\"running|stopped|null\",\"child_pid\":<n>|null,\"child_pgid\":<n>|null,\"started_unix_ms\":<ms>,\"dur_ms\":<ms>,\"socket\":\"<path>\",\"cwd\":\"<path>|null\",\"argv\":[...]|null,\"clients\":<n>|null}\n\
+            {\"session\":\"<id>\",\"status\":\"live|stopped|no-response|stale|error\",\"daemon_pid\":<n>|null,\"child_state\":\"running|stopped|null\",\"child_pid\":<n>|null,\"child_pgid\":<n>|null,\"started_unix_ms\":<ms>,\"dur_ms\":<ms>,\"socket\":\"<path>\",\"cwd\":\"<path>|null\",\"argv\":[...]|null,\"clients\":<n>|null,\"tags\":{\"<key>\":\"<value>\",...}|null}\n\
         \n\
         SORT ORDER:\n    \
             socket mtime ascending (= 古い session が上、新しい session が下)。\n    \
@@ -5658,6 +5776,7 @@ fn usage_list() -> String {
         \n\
         EXAMPLES:\n    \
             hyoui list                              # session 一覧\n    \
+            hyoui list --tag env=prod --tag team    # tag で絞る (AND)\n    \
             hyoui list --format=jsonl               # 機械可読 (1 session 1 行 JSON)\n    \
             hyoui list --format=jsonl | jq -r '.session'  # session id を抽出\n\
         \n\
@@ -5677,7 +5796,6 @@ fn usage_kill() -> String {
             hyoui kill --index=<N> [options]          # 1=最古, -1=最新\n    \
             hyoui kill --all [options]                # 全 live session を kill\n    \
             hyoui kill --socket=<path> [options]\n    \
-            hyoui kill -- <session-id> [options]      # `-` で始まる session-id を escape\n    \
             hyoui kill [options]                      # 中から: $HYOUI_SESSION_ID で自セッション (= exit 相当、DR-0020)\n\
         \n\
         2 軸モデル (= terminate するか / 終了を待つか は独立):\n    \
@@ -5726,10 +5844,10 @@ fn usage_kill() -> String {
             wire には正規 SIG-prefix 大文字を流す (DR-0012、daemon 側は SIG-prefix のみ解釈)\n\
         \n\
         SESSION SELECTOR:\n    \
-            位置引数 (e.g. `kill demo` / `kill 1`)  => session-id 名 (= 数字も名前扱い)\n    \
-            `-N` short flag (e.g. `kill -9 demo`)   => signal 解釈 (POSIX kill 慣習)\n    \
+            位置引数 (e.g. `kill <uuid>`)           => session id (= `kill 1` の数字も id として読み、UUID でないのでエラー)\n    \
+            `-N` short flag (e.g. `kill -9 <uuid>`) => signal 解釈 (POSIX kill 慣習)\n    \
             `--index=N`                              => mtime 昇順 1-based index (= 1 最古, -1 最新)\n    \
-            `-` で始まる session-id は `--` セパレータで escape (e.g. `kill -- -foo`)\n\
+            `--` の後ろは位置引数として読む\n\
         \n\
         EXIT CODE:\n    \
             0   既定: signal 送信受理を確認 / --wait: session と daemon の終了を見届けた\n    \
@@ -5739,24 +5857,23 @@ fn usage_kill() -> String {
             \x20   または子は終わったが daemon が上限までに終わらない)\n\
         \n\
         EXAMPLES:\n    \
-            hyoui kill demo                          # session_id=demo に SIGTERM (= 即時 return)\n    \
-            hyoui kill demo --signal=SIGKILL         # SIGKILL を送る (= 正規表記)\n    \
-            hyoui kill demo --signal=KILL            # SIGKILL を送る (= 略名)\n    \
-            hyoui kill demo --signal=9               # SIGKILL を送る (= 数字)\n    \
-            hyoui kill -9 demo                       # SIGKILL を送る (= 番号 短縮)\n    \
-            hyoui kill -KILL demo                    # SIGKILL を送る (= 略名 短縮)\n    \
-            hyoui kill -SIGTERM demo                 # SIGTERM を送る (= 正規 短縮)\n    \
-            hyoui kill demo --wait                   # 子 exit を最大 10s 待つ (超過で exit 3)\n    \
-            hyoui kill demo --wait=2s                 # timeout 2s で見届け (超過で exit 3、子生存)\n    \
-            hyoui kill demo --wait=2s --kill-on-timeout  # 2s 後 SIGKILL 昇格して確実に殺す\n    \
-            hyoui kill 1                             # session_id=\"1\" を SIGTERM (= 数字も名前)\n    \
-            hyoui kill --index=1                     # 1 番古い session を SIGTERM\n    \
-            hyoui kill --index=-1                    # 最新 session を SIGTERM\n    \
-            hyoui kill --all                         # 全 live session を SIGTERM\n    \
-            hyoui kill --all --signal=KILL           # 全 live session を SIGKILL\n    \
-            hyoui kill demo --signal=CONT --no-terminate  # stopped child を起こす (= session 継続)\n    \
-            hyoui kill -- -dash-id                   # session_id=\"-dash-id\" を kill (escape)\n    \
-            hyoui kill --socket=/tmp/x.sock          # socket 直指定で kill\n\
+            hyoui kill 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f                               # その session に SIGTERM (= 即時 return)\n    \
+            hyoui kill 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --signal=SIGKILL              # SIGKILL を送る (= 正規表記)\n    \
+            hyoui kill 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --signal=KILL                 # SIGKILL を送る (= 略名)\n    \
+            hyoui kill 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --signal=9                    # SIGKILL を送る (= 数字)\n    \
+            hyoui kill -9 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f                            # SIGKILL を送る (= 番号 短縮)\n    \
+            hyoui kill -KILL 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f                         # SIGKILL を送る (= 略名 短縮)\n    \
+            hyoui kill -SIGTERM 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f                      # SIGTERM を送る (= 正規 短縮)\n    \
+            hyoui kill 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --wait                        # 子 exit を最大 10s 待つ (超過で exit 3)\n    \
+            hyoui kill 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --wait=2s                     # timeout 2s で見届け (超過で exit 3、子生存)\n    \
+            hyoui kill 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --wait=2s --kill-on-timeout   # 2s 後 SIGKILL 昇格して確実に殺す\n    \
+            hyoui kill --index=1                                                          # 1 番古い session を SIGTERM\n    \
+            hyoui kill --index=-1                                                         # 最新 session を SIGTERM\n    \
+            hyoui kill --all                                                              # 全 live session を SIGTERM\n    \
+            hyoui kill --all --signal=KILL                                                # 全 live session を SIGKILL\n    \
+            hyoui kill 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --signal=CONT --no-terminate  # stopped child を起こす (= session 継続)\n    \
+            hyoui kill -- -dash-id                                                        # session_id=\"-dash-id\" を kill (escape)\n    \
+            hyoui kill --socket=/tmp/x.sock                                               # socket 直指定で kill\n\
         \n\
         RELATED:\n    \
             hyoui list          attach 可能な session 一覧 (= 対象選び)\n    \
@@ -5826,11 +5943,11 @@ fn usage_screen_dump() -> String {
             2   引数不足 / 未知 option\n\
         \n\
         EXAMPLES:\n    \
-            hyoui screen dump demo                      # 現在 visible の ANSI dump (stdout)\n    \
-            hyoui screen dump demo --format=ansi | cat  # terminal で再生\n    \
-            hyoui screen dump demo --output=screen.ans  # ファイルに保存\n    \
-            hyoui screen dump demo --format=cbor > s.cbor  # CBOR binary 保存\n    \
-            hyoui screen dump demo --format=binary | grep ERROR\n\
+            hyoui screen dump 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f                         # 現在 visible の ANSI dump (stdout)\n    \
+            hyoui screen dump 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --format=ansi | cat     # terminal で再生\n    \
+            hyoui screen dump 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --output=screen.ans     # ファイルに保存\n    \
+            hyoui screen dump 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --format=cbor > s.cbor  # CBOR binary 保存\n    \
+            hyoui screen dump 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --format=binary | grep ERROR\n\
         \n\
         RELATED:\n    \
             hyoui screen snapshot <id>   構造化 state query (= CBOR encoded StateSnapshotResponse)\n    \
@@ -5872,11 +5989,11 @@ fn usage_screen_snapshot() -> String {
             2   引数不足 / 未知 option / 未知 component\n\
         \n\
         EXAMPLES:\n    \
-            hyoui screen snapshot demo                                 # 全 component の CBOR snapshot\n    \
-            hyoui screen snapshot demo --include=Cursor,Mode           # cursor + mode のみ\n    \
-            hyoui screen snapshot demo --include=cells,window-size     # case-insensitive\n    \
-            hyoui screen snapshot demo --output=snap.cbor              # ファイル保存\n    \
-            hyoui screen snapshot demo --timeout=2s                    # response 待ち 2s\n\
+            hyoui screen snapshot 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f                              # 全 component の CBOR snapshot\n    \
+            hyoui screen snapshot 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --include=Cursor,Mode        # cursor + mode のみ\n    \
+            hyoui screen snapshot 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --include=cells,window-size  # case-insensitive\n    \
+            hyoui screen snapshot 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --output=snap.cbor           # ファイル保存\n    \
+            hyoui screen snapshot 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --timeout=2s                 # response 待ち 2s\n\
         \n\
         RELATED:\n    \
             hyoui screen dump <id>       visible bytes dump (ANSI / binary / CBOR)\n    \
@@ -5933,9 +6050,9 @@ fn usage_lock_acquire() -> String {
             シグナル受信 / stdin EOF で `LockRelease` を送って exit 0 する。\n    \
             \n    \
             wrap した子 process が exit するまで lock を保持するパターンは:\n              \
-                TOKEN=$(hyoui lock acquire demo & echo $! > /tmp/lockpid; \\\n                   \
+                TOKEN=$(hyoui lock acquire 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f & echo $! > /tmp/lockpid; \\\n                   \
                     wait $(cat /tmp/lockpid))      # ← stdin pipe + EOF 戦略\n              \
-                hyoui input demo --lock-token=$TOKEN text:hello\n              \
+                hyoui input 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --lock-token=$TOKEN text:hello\n              \
                 kill -TERM $(cat /tmp/lockpid)     # 解放\n    \
             \n    \
             将来 `hyoui tx <id> -- cmd...` (= 別 task) では子 process exit で\n    \
@@ -5955,9 +6072,9 @@ fn usage_lock_acquire() -> String {
             1   timeout / fail mode で denied / I/O / daemon error\n\
         \n\
         EXAMPLES:\n    \
-            hyoui lock acquire demo                          # block で取得 (Ctrl-C で release)\n    \
-            hyoui lock acquire demo --mode=fail              # 他者保持中なら即 fail\n    \
-            hyoui lock acquire demo --timeout=10s            # 10 秒以内に取れなければ timeout\n\
+            hyoui lock acquire 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f                # block で取得 (Ctrl-C で release)\n    \
+            hyoui lock acquire 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --mode=fail    # 他者保持中なら即 fail\n    \
+            hyoui lock acquire 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --timeout=10s  # 10 秒以内に取れなければ timeout\n\
         \n\
         RELATED:\n    \
             hyoui lock release <id> --token=<T>   Release the lock\n    \
@@ -6000,8 +6117,8 @@ fn usage_lock_release() -> String {
             2   引数不足 (token も env も無し / session id も socket も無し)\n\
         \n\
         EXAMPLES:\n    \
-            hyoui lock release demo --token=abcd1234...      # explicit token\n    \
-            HYOUI_LOCK_TOKEN=$TOKEN hyoui lock release demo  # env から token\n\
+            hyoui lock release 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --token=abcd1234...      # explicit token\n    \
+            HYOUI_LOCK_TOKEN=$TOKEN hyoui lock release 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f  # env から token\n\
         \n\
         RELATED:\n    \
             hyoui lock acquire <id>                Acquire a lock\n    \
@@ -6037,8 +6154,8 @@ fn usage_unlock() -> String {
             2   引数不足\n\
         \n\
         EXAMPLES:\n    \
-            hyoui unlock demo --token=abcd1234...            # explicit token\n    \
-            HYOUI_LOCK_TOKEN=$TOKEN hyoui unlock demo        # env から token\n\
+            hyoui unlock 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f --token=abcd1234...      # explicit token\n    \
+            HYOUI_LOCK_TOKEN=$TOKEN hyoui unlock 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f  # env から token\n\
         \n\
         RELATED:\n    \
             hyoui lock acquire <id>                Acquire a lock\n    \
@@ -6079,8 +6196,8 @@ fn usage_detach() -> String {
             2   引数不足 (session 指定なし + env なし 等)\n\
         \n\
         EXAMPLES:\n    \
-            hyoui detach demo    # demo の全 client を切断\n    \
-            hyoui detach         # 中から: 自セッションの全 client 切断 (= TUI 脱出)\n\
+            hyoui detach 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f  # その session の全 client を切断\n    \
+            hyoui detach                                       # 中から: 自セッションの全 client 切断 (= TUI 脱出)\n\
         \n\
         RELATED:\n    \
             hyoui kill <id>                    session ごと終了 (= 子に signal)\n",
@@ -6775,13 +6892,13 @@ fn usage_input() -> String {
             2   引数不足 / 未知 prefix / 未知 option\n\
         \n\
         EXAMPLES:\n    \
-            hyoui input demo text:hello key:Enter\n    \
-            hyoui input demo \"text:ls -la\" key:Enter\n    \
-            hyoui input demo \"paste:$(cat script.py)\"\n    \
-            hyoui input demo hex:1b5b41                # = ESC[A (= Up arrow)\n    \
-            hyoui input demo file:./payload.txt\n    \
-            hyoui input demo \"wait:^\\\\$\" \"text:export FOO=bar\" key:Enter\n    \
-            hyoui input demo key:C-c\n\
+            hyoui input 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f text:hello key:Enter\n    \
+            hyoui input 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f \"text:ls -la\" key:Enter\n    \
+            hyoui input 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f \"paste:$(cat script.py)\"\n    \
+            hyoui input 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f hex:1b5b41  # = ESC[A (= Up arrow)\n    \
+            hyoui input 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f file:./payload.txt\n    \
+            hyoui input 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f \"wait:^\\\\$\" \"text:export FOO=bar\" key:Enter\n    \
+            hyoui input 0f8b6c1e-3d2a-4c5b-9e7f-1a2b3c4d5e6f key:C-c\n\
         \n\
         NOTE:\n    \
             bytes 系 spec (text/hex/file/paste/key) は daemon の PTY drain ack で\n    \
@@ -6873,6 +6990,51 @@ pub const DEFAULT_INPUT_AUTO_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// session id の長さ (= UUID 標準形 `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` の 36 byte)。
 pub const SESSION_ID_LEN: usize = 36;
+
+/// 廃止した namespace の option (`--namespace` / `--namespace=<ns>` / `--all-namespaces`) を
+/// argv から取り除き、取り除いたかを返す (DR-0041 決定 1)。
+///
+/// **2026-11 に削除する。** namespace は廃止したが、既存の呼び出し (他のツールや手元の
+/// script) が unknown option で起動できなくならないよう、しばらく受け付けて値を捨てる。
+/// 受け付けて捨てる処理はこの関数 1 箇所だけにある (help / completion には出さない)。
+/// 呼び出し側は、取り除いた時に stderr へ 1 行の注意を出す
+/// ([`REMOVED_NAMESPACE_NOTICE`])。
+///
+/// `--` より後ろ (= `run` の子の argv 等) には触らない。`--namespace <ns>` は値の 1 語も
+/// 一緒に取り除く。
+#[must_use]
+pub fn strip_removed_namespace_options(args: &[String]) -> (Vec<String>, bool) {
+    let mut out = Vec::with_capacity(args.len());
+    let mut stripped = false;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            out.extend(args[i..].iter().cloned());
+            break;
+        }
+        if arg == "--namespace" {
+            stripped = true;
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("--namespace=")
+            || arg == "--all-namespaces"
+            || arg.starts_with("--all-namespaces=")
+        {
+            stripped = true;
+            i += 1;
+            continue;
+        }
+        out.push(args[i].clone());
+        i += 1;
+    }
+    (out, stripped)
+}
+
+/// [`strip_removed_namespace_options`] が option を取り除いた時に stderr へ出す 1 行。
+/// 2026-11 に [`strip_removed_namespace_options`] と一緒に削除する。
+pub const REMOVED_NAMESPACE_NOTICE: &str = "hyoui: warning: --namespace / --all-namespaces は廃止され無視されます (session は全部見え、絞り込みには --tag を使う)。この option の受け付けは 2026-11 に削除します";
 
 /// hyoui が振る session id (= `run --session-id` が無い時、DR-0041 決定 2)。
 ///
@@ -8651,21 +8813,176 @@ mod tests {
     // DR-0041: namespace の語彙は無い
     // =========================================================================
 
-    /// `--namespace` / `--all-namespaces` は受け付けない (DR-0041 決定 1)。
+    /// 廃止した namespace の option は受け付けて捨てる (2026-11 まで、DR-0041 決定 1)。
+    /// 捨てた後の argv は option が無かった時と同じ Command になり、help には出ない。
     #[test]
-    fn namespace_options_are_unknown() {
-        for argv in [
-            &["run", "--namespace=t1", "--", "cat"][..],
-            &["list", "--namespace=t1"][..],
-            &["list", "--all-namespaces"][..],
-            &["status", SID, "--namespace=t1"][..],
-            &["kill", SID, "--namespace=t1"][..],
-            &["attach", SID, "--namespace=t1"][..],
+    fn removed_namespace_options_are_accepted_and_ignored() {
+        for (with, without) in [
+            (
+                &["run", "--namespace=t1", "--", "cat"][..],
+                &["run", "--", "cat"][..],
+            ),
+            (
+                &["run", "--namespace", "t1", "--", "cat"][..],
+                &["run", "--", "cat"][..],
+            ),
+            (&["list", "--namespace=t1"][..], &["list"][..]),
+            (
+                &["list", "--all-namespaces", "--format=jsonl"][..],
+                &["list", "--format=jsonl"][..],
+            ),
+            (&["status", SID, "--namespace=t1"][..], &["status", SID][..]),
+            (&["kill", "--namespace", "t1", SID][..], &["kill", SID][..]),
+            (&["attach", SID, "--namespace=t1"][..], &["attach", SID][..]),
+            (
+                &["input", "--namespace=t1", SID, "text:x"][..],
+                &["input", SID, "text:x"][..],
+            ),
         ] {
-            match parse_args(&args(argv)) {
-                Command::Error(msg) => assert!(msg.contains("namespace"), "{argv:?}: {msg}"),
-                other => panic!("{argv:?}: expected Error, got {other:?}"),
+            let (stripped, ignored) = strip_removed_namespace_options(&args(with));
+            assert!(ignored, "{with:?}");
+            assert_eq!(stripped, args(without), "{with:?}");
+            assert_eq!(
+                parse_args(&stripped),
+                parse_args(&args(without)),
+                "{with:?}"
+            );
+        }
+        // `--` より後ろ (= 子の argv) には触らない。
+        let child = args(&["run", "--", "tool", "--namespace", "x", "--all-namespaces"]);
+        assert_eq!(
+            strip_removed_namespace_options(&child),
+            (child.clone(), false)
+        );
+        // 何も無ければ argv はそのまま。
+        let plain = args(&["list", "--format=jsonl"]);
+        assert_eq!(
+            strip_removed_namespace_options(&plain),
+            (plain.clone(), false)
+        );
+        assert!(REMOVED_NAMESPACE_NOTICE.contains("2026-11"));
+        // help には出ない。
+        for topic in [
+            HelpTopic::Run,
+            HelpTopic::List,
+            HelpTopic::Kill,
+            HelpTopic::Attach,
+            HelpTopic::Status,
+        ] {
+            assert!(!usage(&topic).contains("namespace"), "{topic:?}");
+        }
+    }
+
+    /// `run --tag` は繰り返せて、同じ key は後勝ち。`=` 無しは value が空 (DR-0041 決定 1)。
+    #[test]
+    fn run_tags_repeat_and_the_last_value_wins() {
+        match parse_args(&args(&[
+            "run",
+            "--tag",
+            "env=prod",
+            "--tag=team=a=b",
+            "--tag",
+            "env=stg",
+            "--tag",
+            "flag",
+            "--tag=empty=",
+            "--",
+            "true",
+        ])) {
+            Command::Run(cfg) => assert_eq!(
+                cfg.tags,
+                std::collections::BTreeMap::from([
+                    ("empty".to_string(), String::new()),
+                    ("env".to_string(), "stg".to_string()),
+                    ("flag".to_string(), String::new()),
+                    ("team".to_string(), "a=b".to_string()),
+                ])
+            ),
+            other => panic!("expected Run, got {other:?}"),
+        }
+        match parse_args(&args(&["run", "--", "true"])) {
+            Command::Run(cfg) => assert!(cfg.tags.is_empty()),
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    /// tag の key は `[A-Za-z0-9._-]{1,256}`。value は何でもよい。
+    #[test]
+    fn tag_keys_are_validated() {
+        let long_ok = "k".repeat(MAX_TAG_KEY_LEN);
+        let too_long = "k".repeat(MAX_TAG_KEY_LEN + 1);
+        for ok in ["a", "A.b_c-9", long_ok.as_str()] {
+            validate_tag_key(ok).unwrap_or_else(|e| panic!("{ok:?}: {e}"));
+        }
+        for bad in ["", "a b", "a/b", "日本", "a:b", too_long.as_str()] {
+            assert!(validate_tag_key(bad).is_err(), "{bad:?}");
+            match parse_args(&args(&["run", &format!("--tag={bad}=v"), "--", "true"])) {
+                Command::Error(msg) => assert!(msg.contains("--tag"), "{bad:?}: {msg}"),
+                other => panic!("{bad:?}: expected Error, got {other:?}"),
             }
+        }
+        assert_eq!(
+            parse_tag_arg("k=値 with spaces=x"),
+            Ok(("k".to_string(), Some("値 with spaces=x".to_string())))
+        );
+        match parse_args(&args(&["run", "--tag"])) {
+            Command::Error(msg) => assert!(msg.contains("--tag"), "{msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// `list --tag` は `<key>=<value>` が完全一致、`<key>` は key があれば一致、繰り返しは AND。
+    #[test]
+    fn list_tag_filters_are_and_and_exact() {
+        let cfg = match parse_args(&args(&["list", "--tag", "env=prod", "--tag=team"])) {
+            Command::List(cfg) => cfg,
+            other => panic!("expected List, got {other:?}"),
+        };
+        assert_eq!(
+            cfg.tags,
+            [
+                TagFilter {
+                    key: "env".into(),
+                    value: Some("prod".into())
+                },
+                TagFilter {
+                    key: "team".into(),
+                    value: None
+                },
+            ]
+        );
+        let tags = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        };
+        let all =
+            |t: &std::collections::BTreeMap<String, String>| cfg.tags.iter().all(|f| f.matches(t));
+        assert!(all(&tags(&[("env", "prod"), ("team", "")])));
+        assert!(!all(&tags(&[("env", "prod")])), "AND: team is missing");
+        assert!(
+            !all(&tags(&[("env", "production"), ("team", "a")])),
+            "no prefix match"
+        );
+        let star = TagFilter {
+            key: "env".into(),
+            value: Some("pro*".into()),
+        };
+        assert!(!star.matches(&tags(&[("env", "prod")])), "no wildcard");
+        let empty = TagFilter {
+            key: "flag".into(),
+            value: Some(String::new()),
+        };
+        assert!(empty.matches(&tags(&[("flag", "")])));
+        assert!(!empty.matches(&tags(&[("flag", "x")])));
+        match parse_args(&args(&["list", "--tag"])) {
+            Command::Error(msg) => assert!(msg.contains("--tag"), "{msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        match parse_args(&args(&["list", "--tag=bad key"])) {
+            Command::Error(msg) => assert!(msg.contains("--tag"), "{msg}"),
+            other => panic!("expected Error, got {other:?}"),
         }
     }
 

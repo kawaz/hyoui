@@ -37,6 +37,7 @@ pub fn run_detached_parent(
     login: bool,
     term_fallback: String,
     child_stdin: bool,
+    tags: std::collections::BTreeMap<String, String>,
     cmd: Vec<String>,
 ) -> ExitCode {
     match spawn_detached_daemon_and_wait_ready(
@@ -53,6 +54,7 @@ pub fn run_detached_parent(
         login,
         term_fallback,
         child_stdin,
+        tags,
         cmd,
     ) {
         Ok((session_id, _sock)) => {
@@ -90,6 +92,7 @@ pub fn spawn_detached_daemon_and_wait_ready(
     login: bool,
     term_fallback: String,
     child_stdin: bool,
+    tags: std::collections::BTreeMap<String, String>,
     cmd: Vec<String>,
 ) -> Result<(String, PathBuf), ExitCode> {
     let session_id = session_id_override.unwrap_or_else(socket_path::auto_session_id);
@@ -151,6 +154,8 @@ pub fn spawn_detached_daemon_and_wait_ready(
         term_fallback: Some(term_fallback),
         // DR-0042: 引き継いだ stdin を子の fd 0 にするか。
         child_stdin,
+        // DR-0041 決定 1: session の tag (daemon が status で返す)。
+        tags,
     };
     let init_json = match serde_json::to_string(&init) {
         Ok(s) => s,
@@ -383,6 +388,10 @@ struct DaemonizeInit {
     /// で、None は builtin 既定値に倒す。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     term_fallback: Option<String>,
+
+    /// DR-0041 決定 1: session の tag (`hyoui run --tag`)。field の無い init JSON は空。
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty", default)]
+    tags: std::collections::BTreeMap<String, String>,
 }
 
 /// `cli::OnChildSuspend` を DaemonizeInit JSON で運ぶ文字列に変換。
@@ -563,6 +572,14 @@ pub fn run_daemon_child() -> ExitCode {
         );
         plan.env
             .push(("HYOUI_SESSION_ID".to_string(), init.session.clone()));
+        // DR-0041 決定 6: 面の変数は最小 env でも引き継ぐ (= 子の中で起こす hyoui が親と
+        // 同じ面を使い、HYOUI_SESSION_ID の自己参照が届く)。設定されている時だけ渡す。
+        if let Some(face) = std::env::var_os("HYOUI_STATE_DIR").filter(|v| !v.is_empty()) {
+            plan.env.push((
+                "HYOUI_STATE_DIR".to_string(),
+                face.to_string_lossy().into_owned(),
+            ));
+        }
         (
             plan.argv,
             Some(hyoui::daemon::ChildLaunch {
@@ -602,6 +619,8 @@ pub fn run_daemon_child() -> ExitCode {
     // DR-0019 §4: overall / idle timeout を配線 (= daemon 側終了条件、--until と同経路)。
     dcfg.timeout_ms = timeout_ms;
     dcfg.idle_timeout_ms = idle_timeout_ms;
+    // DR-0041 決定 1: session の tag。
+    dcfg.tags = init.tags.clone();
     // DR-0013 §8 + §8 Update: scrollback rows 上限を daemon に配線。
     if let Some(n) = scrollback_rows {
         dcfg.screen_vt100_scrollback_rows = n;
@@ -774,6 +793,7 @@ pub fn run_upgrade_resume_child() -> ExitCode {
             dcfg.on_child_suspend = upgrade::parse_on_child_suspend(&state.on_child_suspend);
             dcfg.timeout_ms = state.timeout_ms;
             dcfg.idle_timeout_ms = state.idle_timeout_ms;
+            dcfg.tags = state.tags.clone();
             eprintln!(
                 "hyoui: upgrade-resume state file loaded (session={}, cmd={:?}, scrollback={} bytes, prev_boot_id={})",
                 state.session_id,

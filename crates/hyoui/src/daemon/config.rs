@@ -207,6 +207,10 @@ pub struct DaemonConfig {
     /// serve_loop 開始時刻を初期基準とする (= 起動後一度も出力が無くても発火する)。
     /// `None` なら idle timeout 無し (= default)。
     pub idle_timeout_ms: Option<u64>,
+
+    /// session の tag (= `hyoui run --tag <key>=<value>`、DR-0041 決定 1)。daemon は
+    /// 解釈せず、status 応答でそのまま返す。起動後は変えない。
+    pub tags: std::collections::BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for DaemonConfig {
@@ -235,6 +239,7 @@ impl std::fmt::Debug for DaemonConfig {
             .field("on_child_suspend", &self.on_child_suspend)
             .field("timeout_ms", &self.timeout_ms)
             .field("idle_timeout_ms", &self.idle_timeout_ms)
+            .field("tags", &self.tags)
             .finish()
     }
 }
@@ -271,6 +276,7 @@ impl DaemonConfig {
             // DR-0019 §4: 終了条件 (overall / idle timeout) は default 無効。
             timeout_ms: None,
             idle_timeout_ms: None,
+            tags: std::collections::BTreeMap::new(),
         }
     }
 }

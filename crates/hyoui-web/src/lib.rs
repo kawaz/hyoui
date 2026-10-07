@@ -214,6 +214,8 @@ fn session_entry_to_json(e: &hyoui::discovery::SessionEntry) -> serde_json::Valu
             } else {
                 serde_json::Value::String(info.daemon_version.clone())
             },
+            // DR-0041 決定 1: tag (無ければ空の object)。
+            "tags": info.tags,
         }),
         SessionStatus::Stale { reason } => {
             serde_json::json!({"session_id": e.session_id, "socket_path": e.socket_path.display().to_string(), "status": "stale", "reason": reason})

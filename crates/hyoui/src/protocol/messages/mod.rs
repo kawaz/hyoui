@@ -545,6 +545,10 @@ mod tests {
             argv: vec!["bash".into(), "-l".into()],
             on_child_suspend: Some(OnChildSuspendPolicy::AutoResume),
             daemon_version: "0.6.4".into(),
+            tags: std::collections::BTreeMap::from([
+                ("env".to_string(), "prod".to_string()),
+                ("empty".to_string(), String::new()),
+            ]),
         });
         assert_eq!(roundtrip(&msg), msg);
     }

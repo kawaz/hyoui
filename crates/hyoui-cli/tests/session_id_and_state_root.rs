@@ -461,6 +461,228 @@ fn non_uuid_sockets_in_sessions_are_left_alone() {
     kill_session(root.path(), &format!("--socket={}", legacy.display()));
 }
 
+// ── 決定 1: tag と、廃止した namespace の option ───────────────────────────
+
+fn run_tagged(root: &Path, tags: &[&str]) -> String {
+    let sid = hyoui::cli::new_session_id();
+    let sid_arg = format!("--session-id={sid}");
+    let mut args = vec!["run", "--detached", "--pty-stdin", sid_arg.as_str()];
+    for t in tags {
+        args.push("--tag");
+        args.push(t);
+    }
+    args.extend(["--", "sleep", "60"]);
+    let out = output(in_root(root, &args));
+    assert!(out.status.success(), "{tags:?}: {}", text(&out.stderr));
+    sid
+}
+
+fn listed_with(root: &Path, filters: &[&str]) -> Vec<String> {
+    let mut args = vec!["list", "--format=jsonl"];
+    for f in filters {
+        args.push("--tag");
+        args.push(f);
+    }
+    let out = output(in_root(root, &args));
+    assert!(out.status.success(), "{filters:?}: {}", text(&out.stderr));
+    let mut ids: Vec<String> = text(&out.stdout)
+        .lines()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).expect("jsonl");
+            v["session"].as_str().expect("session").to_string()
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// `run --tag` で付けた tag を daemon が持ち、status / list (jsonl / plain) に出し、
+/// `list --tag` で絞れる。`--tag foo` は `--tag foo=` の略。絞る側の `--tag foo` は key が
+/// あれば一致、`--tag foo=` は値が空に完全一致で、別の条件 (DR-0041 決定 1)。
+#[test]
+fn tags_are_returned_and_filtered() {
+    let root = SessionDir::new("hyoui-tags-");
+    let empty = run_tagged(root.path(), &["foo=", "env=prod"]);
+    let bare = run_tagged(root.path(), &["foo"]);
+    let bar = run_tagged(root.path(), &["foo=bar", "env=prod", "env=stg"]);
+    let none = run_tagged(root.path(), &[]);
+    let sorted = |mut v: Vec<&String>| {
+        v.sort();
+        v.into_iter().cloned().collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        listed_with(root.path(), &[]),
+        sorted(vec![&empty, &bare, &bar, &none])
+    );
+    assert_eq!(
+        listed_with(root.path(), &["foo"]),
+        sorted(vec![&empty, &bare, &bar])
+    );
+    assert_eq!(
+        listed_with(root.path(), &["foo="]),
+        sorted(vec![&empty, &bare])
+    );
+    assert_eq!(listed_with(root.path(), &["foo=bar"]), [bar.as_str()]);
+    assert_eq!(
+        listed_with(root.path(), &["foo=ba"]),
+        Vec::<String>::new(),
+        "no prefix match"
+    );
+    assert_eq!(
+        listed_with(root.path(), &["foo", "env=prod"]),
+        [empty.as_str()],
+        "AND"
+    );
+    assert_eq!(
+        listed_with(root.path(), &["env=stg"]),
+        [bar.as_str()],
+        "the last value wins"
+    );
+    assert_eq!(listed_with(root.path(), &["missing"]), Vec::<String>::new());
+
+    // status の json と plain に出る。
+    let out = output(in_root(root.path(), &["status", &bar, "--format=json"]));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("status json");
+    assert_eq!(v["tags"], serde_json::json!({"env": "stg", "foo": "bar"}));
+    let out = output(in_root(root.path(), &["status", &none, "--format=json"]));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("status json");
+    assert_eq!(v["tags"], serde_json::json!({}));
+    let out = output(in_root(root.path(), &["status", &bar]));
+    assert!(
+        text(&out.stdout).contains("tags: env=stg,foo=bar"),
+        "{}",
+        text(&out.stdout)
+    );
+    // jsonl の tags と plain の TAGS 列。
+    let out = output(in_root(
+        root.path(),
+        &["list", "--format=jsonl", "--tag=foo=bar"],
+    ));
+    let v: serde_json::Value = serde_json::from_str(text(&out.stdout).trim()).expect("jsonl");
+    assert_eq!(v["tags"], serde_json::json!({"env": "stg", "foo": "bar"}));
+    let out = output(in_root(root.path(), &["list"]));
+    let plain = text(&out.stdout);
+    assert!(
+        plain.lines().next().unwrap_or("").contains("TAGS"),
+        "{plain}"
+    );
+    let row = |id: &str| {
+        plain
+            .lines()
+            .find(|l| l.starts_with(id))
+            .unwrap_or("")
+            .to_string()
+    };
+    assert!(row(&bar).contains("env=stg,foo=bar"), "{plain}");
+    assert!(row(&bare).contains(" foo= "), "{plain}");
+    for sid in [&empty, &bare, &bar, &none] {
+        kill_session(root.path(), sid);
+    }
+}
+
+/// tag の key が規則に合わなければ run は起動しない。
+#[test]
+fn a_bad_tag_key_fails_the_run() {
+    let root = SessionDir::new("hyoui-badtag-");
+    let out = output(in_root(
+        root.path(),
+        &["run", "--detached", "--tag", "a b=c", "--", "true"],
+    ));
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("--tag"), "{}", text(&out.stderr));
+    assert!(!root.path().join("sessions").exists());
+}
+
+/// 廃止した namespace の option は受け付けて捨て、stderr に 1 行だけ注意を出す。stdout は
+/// option が無い時と同じ。`HYOUI_NAMESPACE` は読まない (注意も出ない)。
+#[test]
+fn removed_namespace_options_are_ignored_with_one_notice() {
+    let root = SessionDir::new("hyoui-ns-compat-");
+    let out = output(in_root(
+        root.path(),
+        &[
+            "run",
+            "--detached",
+            "--pty-stdin",
+            "--namespace",
+            "workers",
+            "--",
+            "sleep",
+            "60",
+        ],
+    ));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let sid = text(&out.stdout).trim().to_string();
+    assert!(is_canonical_uuid(&sid), "{sid:?}");
+    assert!(
+        sock_of(root.path(), &sid).exists(),
+        "namespace does not change the placement"
+    );
+    let notice = |stderr: &str| stderr.lines().filter(|l| l.contains("2026-11")).count();
+    assert_eq!(notice(&text(&out.stderr)), 1, "{}", text(&out.stderr));
+
+    let plain = output(in_root(root.path(), &["list", "--format=jsonl"]));
+    for args in [
+        &["list", "--namespace=other", "--format=jsonl"][..],
+        &["list", "--all-namespaces", "--format=jsonl"][..],
+    ] {
+        let out = output(in_root(root.path(), args));
+        assert!(out.status.success(), "{args:?}");
+        // started_unix_ms / dur_ms 以外は同じ (dur は時間で変わる)。
+        let ids = |b: &[u8]| {
+            text(b)
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["session"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&out.stdout), ids(&plain.stdout), "{args:?}");
+        assert_eq!(
+            notice(&text(&out.stderr)),
+            1,
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+    }
+    let mut c = in_root(root.path(), &["list", "--format=jsonl"]);
+    c.env("HYOUI_NAMESPACE", "other");
+    let out = output(c);
+    assert_eq!(notice(&text(&out.stderr)), 0, "HYOUI_NAMESPACE is not read");
+    assert_eq!(text(&out.stdout).lines().count(), 1);
+    let out = output(in_root(
+        root.path(),
+        &["kill", "--namespace=x", &sid, "--signal=KILL", "--wait"],
+    ));
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let out = output(in_root(root.path(), &["run", "--help"]));
+    assert!(!text(&out.stdout).contains("namespace"));
+}
+
+/// tag は daemon の upgrade (self-exec) をまたいで残る。
+#[test]
+fn tags_survive_a_daemon_upgrade() {
+    let root = SessionDir::new("hyoui-tagup-");
+    let sid = run_tagged(root.path(), &["env=prod"]);
+    let (before, _) = pids(root.path(), &sid);
+    let out = output(in_root(root.path(), &["upgrade", &sid]));
+    // Design rationale: `hyoui upgrade` の client は、daemon が upgrade.ack を書き出す前に
+    // self-exec して接続が閉じると「recv error before ack」で失敗することがある (ack の
+    // broadcast は writer thread への enqueue だけで、exec の前に flush を待たない。tag とは
+    // 別の、upgrade 経路にある race)。この test が確かめるのは upgrade をまたいだ tag の
+    // 保持なので、その 1 種類の失敗だけは許し、他の失敗は落とす。
+    let ack_lost = text(&out.stderr).contains("recv error before ack");
+    assert!(out.status.success() || ack_lost, "{}", text(&out.stderr));
+    let out = output(in_root(root.path(), &["status", &sid, "--format=json"]));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("status json");
+    assert_eq!(v["tags"], serde_json::json!({"env": "prod"}));
+    assert_eq!(
+        v["daemon_pid"].as_i64(),
+        Some(i64::from(before)),
+        "self-exec keeps the pid"
+    );
+    kill_session(root.path(), &sid);
+}
+
 // ── 決定 4: socket は sessions/ にフラット、discovery は sessions/ だけ ──────
 
 /// root 直下や古い namespace の dir にある socket は一覧に出ず、古い置き場として警告される。
