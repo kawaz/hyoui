@@ -152,3 +152,5 @@ Window
   1. tag を起動後に変える手段 (DR-0041 の未決にした `hyoui set --tag` 相当) が必須になる。daemon への tag の更新要求が protocol に加わるので、必然性を DR に書く
   2. 空のタブやタブグループは存在できない。名前・並び順・空のグループを残すなら別の置き場が要る (最後の session が抜けたら消える、と割り切るなら要らない)
   3. 値は番号でなく名前か id にする (番号だと並べ替えで他の session の値がずれる)。グループとタブは別の key (`webui.group` / `webui.tab`)、並び順も別の key (`webui.order`) にするのが統括推し
+- **方向 (2026-10-07、kawaz)**: 構造専用の仕組みは持たず、front が session の普通の tag から構造を導く。`webui.tabgroup` で session を group by してタブグループにし、選んだタブグループの session の `webui.tab` を集めてタブにする。値は名前 (index にしない。index だと並べ替え・削除で他の session の値を書き換えることになり、途中で失敗するとタブが黙って合流する)。並び順は front が決める (名前順・起動順、端末ごとの並べ替えは localStorage の配置)。空のタブ・タブグループは存在しない。tag の無い session は未アタッチ。タブの名前の変更はそのタブの session 全部の tag の書き換えになる (途中で失敗してもタブが分かれて見えるだけ)
+- 残る判断: session をタブ間で移せるか (= 起動後に tag を変える手段 `hyoui set --tag` と daemon への tag 更新要求を足すか)
