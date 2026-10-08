@@ -55,7 +55,7 @@ printf 'a\003b\000c\n' | hyoui run -- od -c    # バイナリも化けない
 
 - pipe を読みつつキーボードを使う TUI (claude / fzf / less 等) は、直接実行と同じく `/dev/tty` (= hyoui の PTY) からキーを読む。attach のキーも `hyoui input` もそこに届く
 - stdin を読むプログラム (`cat` 等) に pipe を渡した後は、`hyoui input` はそのプログラムの stdin には届かない (直接実行で pipe を渡した時と同じ)
-- `/dev/null` も他の非 tty と同じく子の stdin になり、子はすぐ EOF を読む。`bash -i` などの対話 shell は終わる。端末の無い起動元 (agent や script) から外で操作し続ける shell / REPL を作る時は `--pty-stdin` を付けて子の stdin も PTY にする: `hyoui run --detached --pty-stdin -- bash -i`
+- `/dev/null` も他の非 tty と同じく子の stdin になり、子はすぐ EOF を読む。`bash -i` などの対話 shell は終わる。端末の無い起動元 (agent や script) から外で操作し続ける shell / REPL を作る時は `--pty-stdin` を付けて子の stdin も PTY にする: `hyoui run --detached --pty-stdin -- bash -i` (詳しくは [`--pty-stdin` の説明](./manual/pty-stdin-ja.md))
 - stdin が端末の時は子の stdin も PTY (従来どおり)
 - attach client は stdin を子に流さない。キーは stdin が端末なら stdin、そうでなければ `/dev/tty` から読み、どちらも無ければ出力だけを中継して子の exit で終わる
 - `while read l; do hyoui run --detached -- x; done < list` のように stdin を共有するループでは、子が stdin の残りを読む (直接実行と同じ)。`</dev/null` を付ければ残りは読まれない

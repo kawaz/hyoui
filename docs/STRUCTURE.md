@@ -109,6 +109,7 @@ docs/
   STRUCTURE.md                 # 本ファイル (物理構造、翻訳ペア対象外)
   ROADMAP.md                   # scope 正本 (version 区切りは持たない)
   MANUAL-ja.md / MANUAL.md     # ユーザ向け操作マニュアル (翻訳ペア)
+  manual/                      # MANUAL の付随詳細 (1 機能 1 ファイル、<topic>-ja.md / <topic>.md の翻訳ペア。--help からリンク)
   REVIEW-BACKLOG.md            # レビュー指摘の backlog (R*-* ID 管理)
   decisions/                   # DR-NNNN-*.md (設計判断記録) + INDEX.md
   journal/                     # YYYY-MM-DD-<slug>.md (開発ジャーナル、経緯)

@@ -57,7 +57,7 @@ printf 'a\003b\000c\n' | hyoui run -- od -c    # binary data is not altered
 
 - A TUI that reads a pipe and still uses the keyboard (claude / fzf / less, ...) reads keys from `/dev/tty` (= hyoui's PTY), as when run directly. Keys from attach and `hyoui input` arrive there
 - Once a pipe is given to a program that reads stdin (`cat`, ...), `hyoui input` does not reach that program's stdin (the same as giving it a pipe when run directly)
-- `/dev/null` becomes the child's stdin like any other non-tty, and the child reads EOF right away; an interactive shell such as `bash -i` exits. To start a shell / REPL that you keep operating from outside, from a launcher without a terminal (an agent or a script), add `--pty-stdin` so the child's stdin is the PTY as well: `hyoui run --detached --pty-stdin -- bash -i`
+- `/dev/null` becomes the child's stdin like any other non-tty, and the child reads EOF right away; an interactive shell such as `bash -i` exits. To start a shell / REPL that you keep operating from outside, from a launcher without a terminal (an agent or a script), add `--pty-stdin` so the child's stdin is the PTY as well: `hyoui run --detached --pty-stdin -- bash -i` (see [the `--pty-stdin` guide](./manual/pty-stdin.md))
 - When stdin is a terminal, the child's stdin is the PTY (unchanged)
 - The attach client never forwards stdin to the child. It reads keys from stdin when stdin is a terminal, otherwise from `/dev/tty`; with neither, it relays output only and ends when the child exits
 - In a loop that shares stdin, such as `while read l; do hyoui run --detached -- x; done < list`, the child reads the rest of stdin (the same as running it directly). Add `</dev/null` to keep the rest unread
