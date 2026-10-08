@@ -5420,7 +5420,8 @@ fn usage_run() -> String {
                 passing the caller's stdin (DR-0042)。外から hyoui input /\n                                  \
                 attach で操作し続ける shell / REPL を、端末の無い起動元から\n                                  \
                 作る時に付ける (例: --detached --pty-stdin -- bash -i)。\n                                  \
-                stdin が端末なら付けなくても同じ\n    \
+                stdin が端末なら付けなくても同じ。詳しい説明:\n                                  \
+                https://github.com/kawaz/hyoui/blob/main/docs/manual/pty-stdin.md\n    \
             --session-id UUID             session id を起動側が決める (DR-0041)。小文字・ハイフン付きの\n                                  \
                 UUID 標準形 (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) だけを\n                                  \
                 受け付ける (大文字やハイフン無しはエラー、正規化しない)。\n                                  \
