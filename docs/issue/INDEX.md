@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-10-08 | bug | open | [run-detached-pty-stdin-holds-caller-pipes](./2026-10-08-bug-run-detached-pty-stdin-holds-caller-pipes.md) | run --detached --pty-stdin を $(...) 内で起動すると子が生きている間コマンド置換が返らない (呼び出し元 pipe を保持か、推測) |
 | 2026-10-07 | task | open | [remove-namespace-option-shim](./2026-10-07-task-remove-namespace-option-shim.md) | 廃止した namespace の option を受け付けて捨てる処理を 2026-11 に消す |
 | 2026-10-07 | bug | open | [upgrade-ack-lost-before-self-exec](./2026-10-07-bug-upgrade-ack-lost-before-self-exec.md) | hyoui upgrade で daemon が upgrade.ack を送り終える前に self-exec し、client が exit 1 になることがある |
 | 2026-10-06 | bug | open | [macos-ci-sigstop-not-observed-in-time](./2026-10-06-bug-macos-ci-sigstop-not-observed-in-time.md) | macOS CI で SIGSTOP した子の停止が約 1 秒以内に観測できず落ちた (真因未特定、待ち方を観測に変え次の失敗で原因が出るようにした) |
