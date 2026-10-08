@@ -203,6 +203,26 @@ impl Drop for Pty {
     }
 }
 
+/// `Pty::spawn(&["cat"], ..)` した子が exec を終えて cat として走るまで待つ (test 用)。
+///
+/// master に 1 行書き、PTY の echo と cat 自身の出力の 2 回が読めるまで block する。
+/// fork 直後 (= exec 前) の子に SIGSTOP を送ると、macOS では負荷が高い時に停止が
+/// 起きないまま子が走り続けることがある (実測、負荷下で `Pty::spawn` 直後は 150 回中
+/// 1〜4 回、exec 後に送れば 600 回中 0 回。hyoui を通さない素の fork + exec でも 1500 回中
+/// 10 回起きるので kernel 側の挙動)。子を止める test は先にこれで exec の完了を確かめる。
+#[cfg(test)]
+pub(crate) fn wait_cat_running(master: BorrowedFd<'_>) {
+    const PING: &[u8] = b"hyoui-ping";
+    nix::unistd::write(master, b"hyoui-ping\n").expect("write to pty master");
+    let mut acc = Vec::new();
+    let mut buf = [0u8; 256];
+    while acc.windows(PING.len()).filter(|w| *w == PING).count() < 2 {
+        let n = nix::unistd::read(master, &mut buf).expect("read from pty master");
+        assert!(n > 0, "cat が出力する前に PTY が閉じた");
+        acc.extend_from_slice(&buf[..n]);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------

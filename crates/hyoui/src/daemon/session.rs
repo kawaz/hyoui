@@ -14,7 +14,7 @@
 
 use std::os::fd::AsFd;
 use std::sync::atomic::Ordering;
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::{MutexGuard, TryLockError};
 use std::time::Instant;
 
 use nix::poll::{PollFd, PollTimeout};
@@ -155,25 +155,25 @@ impl UntilWatcher {
     }
 }
 
-/// R5-H6: SIGCHLD self-pipe ownership gate.
-///
-/// SIGCHLD disposition + the `SELFPIPE_WRITE_FD` global are process-wide;
-/// only one `Session::serve` at a time may own the SIGCHLD self-pipe.
-/// `Session::serve` `try_lock`s this mutex on entry: if acquired, it installs
-/// the SIGCHLD self-pipe and uses it to wake `poll(2)` on child state
-/// transitions (= STOP / CONT / exit). If `try_lock` fails (= another serve
-/// is already using it in the same process, e.g. concurrent test runs), the
-/// serve falls back to the legacy 500ms polling path. In that fallback the
-/// serve_loop caps its `poll(2)` timeout at 500ms (see `cap_poll_timeout`
-/// usage) and re-polls `ChildLifecycle` on every Timeout wake, so an idle
-/// child's STOP / exit is still detected within ~500ms instead of blocking
-/// forever — the only difference from the self-pipe path is detection latency
-/// (ms vs ~500ms), not correctness.
-///
-/// The guard is held inside `serve()` for the entire lifetime of the loop,
-/// and is dropped before `SelfPipe::drop` so that `SELFPIPE_WRITE_FD` is
-/// cleared before the next serve attempts to install its own self-pipe.
-static SIGCHLD_SELFPIPE_LOCK: Mutex<()> = Mutex::new(());
+// R5-H6: SIGCHLD self-pipe ownership gate (= `sys::signal::SELFPIPE_OWNER_LOCK`).
+//
+// SIGCHLD disposition + the `SELFPIPE_WRITE_FD` global are process-wide;
+// only one owner at a time may install the self-pipe.
+// `Session::serve` `try_lock`s this mutex on entry: if acquired, it installs
+// the SIGCHLD self-pipe and uses it to wake `poll(2)` on child state
+// transitions (= STOP / CONT / exit). If `try_lock` fails (= another owner
+// in the same process, e.g. a concurrent serve or a self-pipe test), the
+// serve falls back to the legacy 500ms polling path. In that fallback the
+// serve_loop caps its `poll(2)` timeout at 500ms (see `cap_poll_timeout`
+// usage) and re-polls `ChildLifecycle` on every Timeout wake, so an idle
+// child's STOP / exit is still detected within ~500ms instead of blocking
+// forever — the only difference from the self-pipe path is detection latency
+// (ms vs ~500ms), not correctness.
+//
+// The guard is held inside `serve()` for the entire lifetime of the loop,
+// and is dropped before `SelfPipe::drop` so that `SELFPIPE_WRITE_FD` is
+// cleared before the next serve attempts to install its own self-pipe.
+use crate::sys::signal::SELFPIPE_OWNER_LOCK as SIGCHLD_SELFPIPE_LOCK;
 
 /// RAII bundle: the owned `SelfPipe` plus the `MutexGuard` that proves we
 /// own the slot. Order matters in Drop: `pipe` drops first (clearing the
@@ -2562,6 +2562,7 @@ mod tests {
         use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 
         let spawned = Pty::spawn(&["cat"], 80, 24, None).expect("spawn cat");
+        crate::sys::pty::wait_cat_running(spawned.pty.master_fd());
         let child = spawned.child;
 
         // 子を SIGSTOP で停止させる (= ^Z 相当の停止状態を作る)。
@@ -2715,6 +2716,7 @@ mod tests {
 
         // cat: stdin blocking で確実に alive。
         let spawned = Pty::spawn(&["cat"], 80, 24, None).expect("spawn cat");
+        crate::sys::pty::wait_cat_running(spawned.pty.master_fd());
         let child = spawned.child;
 
         let mut lc = ChildLifecycle::default();
@@ -2779,6 +2781,7 @@ mod tests {
         use nix::sys::signal::Signal;
 
         let spawned = Pty::spawn(&["cat"], 80, 24, None).expect("spawn cat");
+        crate::sys::pty::wait_cat_running(spawned.pty.master_fd());
         let child = spawned.child;
         nix::sys::signal::kill(child, Signal::SIGSTOP).expect("SIGSTOP");
         assert_child_stopped(child);

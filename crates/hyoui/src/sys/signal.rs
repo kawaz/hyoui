@@ -29,6 +29,13 @@ pub(crate) static WINCH_MASTER_FD: AtomicI32 = AtomicI32::new(-1);
 /// Write end of the self-pipe. `-1` until [`install_self_pipe`] is called.
 static SELFPIPE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
+/// self-pipe の所有権。[`SELFPIPE_WRITE_FD`] は process に 1 つなので、同じ process で
+/// self-pipe を install する者はこの lock を持っている間だけ install する (= 後から
+/// install した者が前の者の write fd を上書きし、前の者の pipe に signal が届かなく
+/// なるのを防ぐ)。daemon の serve は `try_lock` で取り、取れなければ self-pipe 無しの
+/// polling で動く。
+pub(crate) static SELFPIPE_OWNER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ---------------------------------------------------------------------------
 // generic install helpers (SIG_IGN, SIG_DFL)
 // ---------------------------------------------------------------------------
@@ -345,6 +352,18 @@ mod tests {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// self-pipe を install する test 用。[`signal_test_guard`] に加えて
+    /// [`SELFPIPE_OWNER_LOCK`] を取り、同じ process で走る daemon serve (= 他 module の
+    /// test) と self-pipe を取り合わない。serve 実行中なら終わるまで待ち、test が持って
+    /// いる間に始まった serve は self-pipe 無しで動く。lock 順は常にこの順。
+    fn selfpipe_test_guard() -> (MutexGuard<'static, ()>, MutexGuard<'static, ()>) {
+        let module = signal_test_guard();
+        let owner = SELFPIPE_OWNER_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (module, owner)
+    }
+
     #[test]
     fn sig_ignore_sigpipe() {
         let _guard = signal_test_guard();
@@ -353,7 +372,7 @@ mod tests {
 
     #[test]
     fn selfpipe_roundtrip_via_raise() {
-        let _guard = signal_test_guard();
+        let _guard = selfpipe_test_guard();
         // mirrors ffi_wbtest.mbt: "sig_selfpipe_init and sig_drain: roundtrip via raise"
         let pipe = install_self_pipe().expect("init");
         register_self_pipe(Signal::SIGUSR1).expect("register");
@@ -383,7 +402,7 @@ mod tests {
     /// fallback in serve_loop.
     #[test]
     fn sigchld_received_when_child_state_changes() {
-        let _guard = signal_test_guard();
+        let _guard = selfpipe_test_guard();
 
         use crate::sys::pty::Pty;
         use nix::sys::wait::{WaitPidFlag, waitpid};
@@ -392,7 +411,8 @@ mod tests {
         register_self_pipe(Signal::SIGCHLD).expect("register SIGCHLD");
 
         // forkpty で子を生成。setsid 済の独立 process group に入る。
-        let spawned = Pty::spawn(&["/bin/sleep", "30"], 80, 24, None).expect("spawn sleep");
+        let spawned = Pty::spawn(&["cat"], 80, 24, None).expect("spawn cat");
+        crate::sys::pty::wait_cat_running(spawned.pty.master_fd());
         let child = spawned.child;
 
         // 子の生成自体では SIGCHLD は配信されない (exit/stop/cont のみ)。
