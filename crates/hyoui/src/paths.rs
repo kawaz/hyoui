@@ -233,6 +233,28 @@ impl Env {
         Ok(self.session_logs_dir()?.join(format!("{session_id}.log")))
     }
 
+    /// socket `socket` で動く session `session_id` の daemon のログ (DR-0037 段 2)。
+    ///
+    /// ログの置き場は socket に揃える (= 重複起動を断る name lock が socket と同じ dir の
+    /// `<socket の stem>.lock` なので、ログも同じ鍵にすれば socket と 1 対 1 になる)。
+    ///
+    /// - 既定の socket (`<state_root>/sessions/<id>.sock`) なら [`Env::session_log_path`]
+    ///   (`<state_root>/sessions/logs/<id>.log`)
+    /// - それ以外 (`--socket` で明示した socket) なら socket の隣の
+    ///   `socket.with_extension("log")` (= name lock の `with_extension("lock")` と同じ規則)
+    ///
+    /// 状態の root を決められない時も、明示した socket なら置き場は決まる。
+    #[must_use]
+    pub fn session_log_path_for(&self, session_id: &str, socket: &Path) -> PathBuf {
+        if let (Ok(sessions), Ok(default_log)) =
+            (self.sessions_dir(), self.session_log_path(session_id))
+            && socket == sessions.join(format!("{session_id}.sock"))
+        {
+            return default_log;
+        }
+        socket.with_extension("log")
+    }
+
     /// web の config の既定の置き場 (`<config_dir>/web`、DR-0038 決定 4)。
     #[must_use]
     pub fn web_config_dir(&self) -> Option<PathBuf> {
@@ -374,6 +396,31 @@ mod tests {
             ))
         );
         assert!(Env::default().session_log_path("x").is_err());
+    }
+
+    /// ログの置き場は socket に揃える: 既定の socket なら `sessions/logs/`、明示した socket
+    /// なら socket の隣 (name lock と同じ `with_extension`)。root が無くても明示 socket なら決まる。
+    #[test]
+    fn session_log_follows_the_socket() {
+        const ID: &str = "0f0e0d0c-0b0a-4908-8706-050403020100";
+        let e = env(&[("HYOUI_STATE_DIR", "/face"), ("HOME", "/h")]);
+        assert_eq!(
+            e.session_log_path_for(ID, Path::new(&format!("/face/sessions/{ID}.sock"))),
+            PathBuf::from(format!("/face/sessions/logs/{ID}.log"))
+        );
+        assert_eq!(
+            e.session_log_path_for(ID, Path::new("/elsewhere/mine.sock")),
+            PathBuf::from("/elsewhere/mine.log")
+        );
+        // 同じ id でも、root の sessions/ に置いた別名の socket は明示扱い。
+        assert_eq!(
+            e.session_log_path_for(ID, Path::new("/face/sessions/other.sock")),
+            PathBuf::from("/face/sessions/other.log")
+        );
+        assert_eq!(
+            Env::default().session_log_path_for(ID, Path::new("/x/s.sock")),
+            PathBuf::from("/x/s.log")
+        );
     }
 
     /// config は面で分けない: `HYOUI_STATE_DIR` を変えても config の置き場は同じ

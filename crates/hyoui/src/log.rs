@@ -1,14 +1,17 @@
 //! daemon のログ (DR-0037 段 2、E-1)。
 //!
 //! 起動後の daemon は、fd 2 と logger の書き先を session ごとのログファイル
-//! (`<状態の root>/sessions/logs/<session id>.log`、[`crate::paths::Env::session_log_path`])
-//! にする。serve loop はログを bounded channel に待たない送信 (`try_send`) で積むだけで、
+//! ([`crate::paths::Env::session_log_path_for`]: 既定の socket なら
+//! `<状態の root>/sessions/logs/<session id>.log`、明示した socket なら socket の隣) にする。serve loop はログを bounded channel に待たない送信 (`try_send`) で積むだけで、
 //! ファイルへの write は logger thread が行う (DR-0037 I-2)。channel が満杯なら捨てて件数を
 //! 数え、次に書けた時に件数を 1 行残す。
 //!
 //! logger を立てていない process (= ready 通知の前の daemon、test が `Session` を直接
 //! 動かす時) では [`emit`] は stderr にそのまま書く (= ready の前の失敗は呼び出し元の
 //! stderr に出る、DR-0037 裁定 Q3)。
+//!
+//! 1 ファイルの上限 ([`FILE_CAP_BYTES`]) が掛かるのは logger を通した行だけで、panic の文言
+//! など fd 2 に直接書かれる分は上限の外。
 
 use std::fs::File;
 use std::io::Write;
@@ -23,8 +26,13 @@ use std::time::Duration;
 /// logger の channel に積める行数 (DR-0037「標準エラーとログ」)。
 pub const CHANNEL_CAPACITY: usize = 1024;
 
-/// 1 つのログファイルに書く上限 (bytes)。超えたら印を 1 行書いて以後の行を捨てる。
+/// 1 つのログファイルに書く上限 (bytes)。超える行は書かず、印を 1 行書いて以後の行を
+/// 捨てる。印の分も上限の内に収める。
 pub const FILE_CAP_BYTES: u64 = 1024 * 1024;
+
+/// daemon の終了時に、logger が積まれた行を書き終えるのを待つ上限。fs が応答しない時も
+/// これを過ぎたら戻る (= 残りの行は失われる)。
+pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// logger に渡す 1 行。時刻は積んだ時点で取る (= logger の遅れで時刻がずれない)。
 #[derive(Debug)]
@@ -53,8 +61,11 @@ impl Sink {
     }
 }
 
-/// process に 1 つの送り口。[`install`] で入れ、[`Logger::shutdown`] で外す。
+/// process に 1 つの送り口。[`install`] で入れ、[`shutdown`] で外す。
 static SINK: Mutex<Option<Sink>> = Mutex::new(None);
+
+/// logger thread の終了の知らせ。[`install`] で入れ、[`shutdown`] が受ける。
+static DONE: Mutex<Option<Receiver<()>>> = Mutex::new(None);
 
 /// daemon のログを 1 行出す。logger があれば channel に積み、無ければ stderr に書く。
 pub fn emit(text: String) {
@@ -81,30 +92,102 @@ macro_rules! daemon_log {
     };
 }
 
-/// session のログファイルを開く (無ければ作る)。dir は mode 0700、file は 0600 で作り、
-/// 追記で開く。fd は CLOEXEC (= 子と upgrade の exec には fd 2 の複製だけが渡る)。
+/// session のログファイルを開く (無ければ作る)。
+///
+/// 置き場の dir は無ければ mode 0700 で作る。開く前に dir を、開いた後に file を確かめ、
+/// 次のどれかに当たれば開かずに (開いた fd は閉じて) エラーを返す。
+///
+/// - dir: symlink、dir でない、持ち主が自分 (euid) でない、mode が 0700 でない
+/// - file: path が symlink (`O_NOFOLLOW`)、普通のファイルでない (FIFO / socket / device。
+///   `O_NONBLOCK` で開くので、読み手の無い FIFO でも open で止まらない)、持ち主が自分で
+///   ない、group / other に権限がある
+///
+/// 新しく作る file は 0600。追記で開き、確かめた後に `O_NONBLOCK` を外す (= 書き込みは
+/// blocking)。fd は CLOEXEC (= 子と upgrade の exec には fd 2 の複製だけが渡る)。
 ///
 /// # Errors
 ///
-/// dir を作れない、file を開けない時。
+/// dir を作れない・確かめられない、file を開けない・確かめられない時。
 pub fn open_session_log(path: &Path) -> std::io::Result<File> {
-    if let Some(dir) = path.parent() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
-    }
-    std::fs::OpenOptions::new()
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    check_private_dir(dir)?;
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .open(path)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    check_private_file(&file, path)?;
+    clear_nonblock(&file)?;
+    Ok(file)
 }
 
-/// 立てた logger thread。[`Logger::shutdown`] で止める。
-#[derive(Debug)]
-pub struct Logger {
-    done: Receiver<()>,
+fn unusable(what: &Path, why: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("{}: {why}", what.display()),
+    )
+}
+
+/// ログの dir が「symlink でない dir、持ち主が自分、mode 0700」か。
+fn check_private_dir(dir: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() {
+        return Err(unusable(dir, "the log directory is a symlink"));
+    }
+    if !meta.is_dir() {
+        return Err(unusable(dir, "the log directory is not a directory"));
+    }
+    if meta.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(unusable(dir, "the log directory is owned by another user"));
+    }
+    if meta.mode() & 0o777 != 0o700 {
+        return Err(unusable(
+            dir,
+            &format!(
+                "the log directory has mode {:o} (want 700)",
+                meta.mode() & 0o777
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// 開いたログが「普通のファイル、持ち主が自分、group / other に権限が無い」か (fstat)。
+fn check_private_file(file: &File, path: &Path) -> std::io::Result<()> {
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(unusable(path, "the log is not a regular file"));
+    }
+    if meta.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(unusable(path, "the log is owned by another user"));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(unusable(
+            path,
+            &format!(
+                "the log has mode {:o} (group / other must have no access)",
+                meta.mode() & 0o777
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// `O_NONBLOCK` を外す (= 開く時だけ止まらないようにし、追記は blocking に戻す)。
+fn clear_nonblock(file: &File) -> std::io::Result<()> {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    let flags = fcntl(file, FcntlArg::F_GETFL).map_err(std::io::Error::from)?;
+    let flags = OFlag::from_bits_truncate(flags) & !OFlag::O_NONBLOCK;
+    fcntl(file, FcntlArg::F_SETFL(flags)).map_err(std::io::Error::from)?;
+    Ok(())
 }
 
 /// logger thread を立て、process の送り口にする。
@@ -115,7 +198,7 @@ pub struct Logger {
 /// # Errors
 ///
 /// thread を立てられない時 (= 送り口は入れない。[`emit`] は stderr に書き続ける)。
-pub fn install(file: File, path: Option<PathBuf>) -> std::io::Result<Logger> {
+pub fn install(file: File, path: Option<PathBuf>) -> std::io::Result<()> {
     let (tx, rx) = std::sync::mpsc::sync_channel(CHANNEL_CAPACITY);
     let (done_tx, done) = std::sync::mpsc::sync_channel(1);
     let dropped = Arc::new(AtomicU64::new(0));
@@ -126,26 +209,32 @@ pub fn install(file: File, path: Option<PathBuf>) -> std::io::Result<Logger> {
             run(rx, file, path.as_deref(), &dropped_in_thread);
             let _ = done_tx.send(());
         })?;
+    *DONE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(done);
     *SINK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Sink { tx, dropped });
-    Ok(Logger { done })
+    Ok(())
 }
 
-impl Logger {
-    /// 送り口を外し、logger が積まれた行を書き終えて終わるのを最大 `timeout` 待つ。
-    /// 期限内に終われば `true`。
-    ///
-    /// daemon が serve loop を抜けた後、process を終える前に呼ぶ (= 終わり際のログを
-    /// 書き切る)。fs が応答しない時も `timeout` で戻る。
-    pub fn shutdown(self, timeout: Duration) -> bool {
-        let sink = SINK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        drop(sink);
-        self.done.recv_timeout(timeout).is_ok()
-    }
+/// 送り口を外し、logger が積まれた行を書き終えて終わる (空のログの削除を含む) のを最大
+/// `timeout` 待つ。期限内に終われば `true`。logger が無ければ何もせず `true`。
+///
+/// daemon は serve を抜けた後、listener と name lock を手放す **前** に呼ぶ (= `hyoui kill
+/// --wait` が daemon の終わりを見届けた時には、ログは書き終わり、空のログは消えている)。
+/// 2 回目以降の呼び出しは何もしない。以後の [`emit`] は stderr (= fd 2) に直接書く。
+pub fn shutdown(timeout: Duration) -> bool {
+    let sink = SINK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    drop(sink);
+    let done = DONE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    done.is_none_or(|d| d.recv_timeout(timeout).is_ok())
 }
 
 /// logger thread の本体。送り口が全部外れるまで書き、最後に捨てた件数を残し、空なら
@@ -194,19 +283,23 @@ impl<W: Write> LogWriter<W> {
         }
     }
 
+    /// 上限の内に、この行と印の両方が収まる時だけ行を書く。収まらなければ印だけを書いて
+    /// (= 印の分は先に取ってあるので、合計は上限を超えない) 以後を捨てる。
     fn write_line(&mut self, unix_ms: u64, text: &str) {
         if self.capped {
             return;
         }
         let stamp = crate::time::format_unix_ms_iso8601(unix_ms);
         let line = format!("{stamp} {}\n", text.trim_end_matches('\n'));
-        if self.written + line.len() as u64 > self.cap {
+        let mark = format!(
+            "{stamp} hyoui: log: reached the size cap ({} bytes); further lines are dropped\n",
+            self.cap
+        );
+        if self.written + line.len() as u64 + mark.len() as u64 > self.cap {
             self.capped = true;
-            let mark = format!(
-                "{stamp} hyoui: log: reached the size cap ({} bytes); further lines are dropped\n",
-                self.cap
-            );
-            self.put(&mark);
+            if self.written + mark.len() as u64 <= self.cap {
+                self.put(&mark);
+            }
             return;
         }
         self.put(&line);
@@ -250,21 +343,30 @@ mod tests {
         );
     }
 
-    /// 上限を超える行は書かず、印を 1 度だけ書いて以後を捨てる。
+    /// 上限を超える行は書かず、印を 1 度だけ書いて以後を捨てる。印を含めても上限を超えない。
     #[test]
     fn size_cap_writes_one_mark_then_drops() {
+        // 1 行 = 20 (時刻) + 1 + 10 + 1 = 32 bytes、印 = 20 + 1 + 72 = 93 bytes 前後。
+        let cap = 32 * 2 + 100;
         let mut buf = Vec::new();
-        let mut w = LogWriter::new(&mut buf, 0, 40);
-        w.write_line(0, "0123456789"); // 31 bytes
-        w.write_line(0, "0123456789"); // 超える → 印
-        w.write_line(0, "0123456789"); // 捨てる
+        let mut w = LogWriter::new(&mut buf, 0, cap);
+        for _ in 0..5 {
+            w.write_line(0, "0123456789");
+        }
         let out = text(&buf);
-        assert_eq!(out.matches("0123456789").count(), 1, "{out}");
-        assert_eq!(
-            out.matches("reached the size cap (40 bytes)").count(),
-            1,
-            "{out}"
-        );
+        assert!(out.len() as u64 <= cap, "{} > {cap}: {out}", out.len());
+        assert_eq!(out.matches("reached the size cap").count(), 1, "{out}");
+        assert!(out.ends_with("further lines are dropped\n"), "{out}");
+        assert!(out.matches("0123456789").count() >= 1, "{out}");
+    }
+
+    /// 印すら入らない残りしか無い時は、印も書かない (= 上限を超えない)。
+    #[test]
+    fn no_room_even_for_the_mark_writes_nothing() {
+        let mut buf = Vec::new();
+        let mut w = LogWriter::new(&mut buf, 30, 40);
+        w.write_line(0, "x");
+        assert!(buf.is_empty(), "{}", text(&buf));
     }
 
     /// 既に上限まで書かれたファイル (= 同じ id の session の続き) には何も足さない。
@@ -362,5 +464,77 @@ mod tests {
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(path.parent().unwrap()), 0o700);
         assert_eq!(mode(&path), 0o600);
+    }
+
+    /// 読み手の無い FIFO は open で止まらず、普通のファイルでないとして断る。
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s.log");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        assert!(open_session_log(&path).is_err());
+        // 読み手が居る FIFO も、開けた後の fstat で断る。
+        let _reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let err = open_session_log(&path).expect_err("fifo with a reader");
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
+
+    /// symlink はたどらない (= 先のファイルに追記しない)。
+    #[test]
+    fn a_symlink_is_refused_and_its_target_is_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("other");
+        std::fs::write(&target, b"keep").unwrap();
+        let path = dir.path().join("s.log");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(open_session_log(&path).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+    }
+
+    /// group / other に権限のある既存ファイルは断る (mode は変えない)。
+    #[test]
+    fn a_file_readable_by_others_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s.log");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = open_session_log(&path).expect_err("0644");
+        assert!(err.to_string().contains("mode 644"), "{err}");
+    }
+
+    /// dir が symlink、または 0700 でなければ断る。
+    #[test]
+    fn a_symlinked_or_open_dir_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = dir.path().join("logs");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = open_session_log(&link.join("s.log")).expect_err("symlinked dir");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(!real.join("s.log").exists());
+
+        let open = dir.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = open_session_log(&open.join("s.log")).expect_err("0755 dir");
+        assert!(err.to_string().contains("mode 755"), "{err}");
+        assert!(!open.join("s.log").exists());
+    }
+
+    /// 開いた fd は blocking (= `O_NONBLOCK` は開く時だけ)。
+    #[test]
+    fn the_opened_log_is_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = open_session_log(&dir.path().join("s.log")).expect("open");
+        let flags = nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_GETFL).unwrap();
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
     }
 }

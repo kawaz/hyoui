@@ -761,6 +761,10 @@ impl Session {
             linger_for_late_attach(&listener, config, exit_code, &mut screen_state);
         }
 
+        // DR-0037 段 2: logger を止めてから listener と name lock を手放す。`hyoui kill --wait`
+        // が daemon の終わりを見届けた時には、ログは書き終わり、空のログは消えている
+        // (= 戻りは最大 `SHUTDOWN_TIMEOUT` 遅くなる)。logger の無い process では何もしない。
+        crate::log::shutdown(crate::log::SHUTDOWN_TIMEOUT);
         drop(listener);
 
         // DR-0001 軸 1/2 配線で install した SIGTSTP / SIGCONT / SIGTERM / SIGINT

@@ -5466,6 +5466,7 @@ fn usage_run() -> String {
         ENVIRONMENT:\n    \
             HYOUI_STATE_DIR        状態の root (= 面、DR-0041)。socket は <root>/sessions/<id>.sock\n                           \
                 起動後の daemon のログ (標準エラー) は <root>/sessions/logs/<id>.log\n                           \
+                (--socket を明示した時は socket の隣の <名前>.log)\n                           \
                 (空なら session の終了時に消す。起動失敗は呼び出し元の stderr に出る)\n    \
             XDG_STATE_HOME         HYOUI_STATE_DIR が無い時の root の親 ($XDG_STATE_HOME/hyoui、\n                           \
                 絶対パスの時だけ。無ければ $HOME/.local/state/hyoui)\n    \

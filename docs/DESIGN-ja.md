@@ -41,7 +41,7 @@ escape なし）に振る舞いつつ、**外側から監視・自動操作す�
 - socket 配置: `<状態の root>/sessions/<session>.sock` (DR-0041)。状態の root (= 面) は `$HYOUI_STATE_DIR` → `$XDG_STATE_HOME/hyoui` (絶対パスの時だけ) → `$HOME/.local/state/hyoui` で、どれも無ければ (`HOME` が相対パスの時も) エラー。`$XDG_RUNTIME_DIR` / `$TMPDIR` は参照しない。session id は小文字・ハイフン付きの UUID で、同じ id の socket が既にあれば bind / name lock の時点で起動を断る (生死は判定しない)。path が `sun_path` の上限に収まらない時は、dir の fd を基準に fork した子が `fchdir` して相対名で bind / connect する
 - session の一覧: `hyoui list` は面の全 session を出す。discovery は `sessions/` だけを見る。分類は `key=value` の tag (`run --tag`、daemon が status で返す) で、`list --tag` の絞り込みは指定した時だけ効く
 - dir mode 0700 / sock mode 0600（同 UID 信頼境界）
-- daemon のログ: 起動後の daemon は fd 2 を `<状態の root>/sessions/logs/<session>.log` に付け替え、内部のログは bounded channel 経由で logger thread が書く (満杯なら捨てて件数を残す)。付け替えは ready 通知の前で、それより前の起動失敗は呼び出し元の stderr に出る。空のログは session の終了時に消す ([[DR-0037]] 段 2)
+- daemon のログ: 起動後の daemon は fd 2 を socket に揃えた置き場 (既定の socket なら `<状態の root>/sessions/logs/<session>.log`、明示 socket なら socket の隣の `<stem>.log`。持ち主・mode・普通のファイルかを確かめて開く) に付け替え、内部のログは bounded channel 経由で logger thread が書く (満杯なら捨てて件数を残す)。付け替えは ready 通知の前で、それより前の起動失敗は呼び出し元の stderr に出る。空のログは session の終了時に消す ([[DR-0037]] 段 2)
 
 ## 2. アーキテクチャ
 

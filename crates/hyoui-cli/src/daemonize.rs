@@ -134,10 +134,14 @@ pub fn spawn_detached_daemon_and_wait_ready(
     // daemon は env `HYOUI_DAEMONIZE_INIT` を main entry 直後に parse → unset で
     // 孫 process には漏れない。pipe は ready 通知 (= daemon → parent の bind 完了
     // 通知、env では実装不可) のみ残置。
-    // DR-0037 段 2: 起動後の daemon のログの置き場。socket と同じ env から CLI 側で決めて
-    // 渡す (= daemon の env scrub の影響を受けない)。状態の root を決められない時
-    // (`--socket` 指定で root が無い) は None で、daemon はログを捨てる。
-    let log = session_log_path(&session_id).map(|p| p.to_string_lossy().into_owned());
+    // DR-0037 段 2: 起動後の daemon のログの置き場。socket に揃える (既定の socket なら
+    // `sessions/logs/<id>.log`、明示した socket なら socket の隣)。socket と同じ env から CLI
+    // 側で決めて渡す (= daemon の env scrub の影響を受けない)。
+    let log = Some(
+        session_log_path(&session_id, &sock)
+            .to_string_lossy()
+            .into_owned(),
+    );
     let init = DaemonizeInit {
         socket: sock.to_string_lossy().into_owned(),
         session: session_id.clone(),
@@ -325,8 +329,9 @@ struct DaemonizeInit {
     session: String,
     #[serde(rename = "ready_fd")]
     ready_fd: std::os::fd::RawFd,
-    /// DR-0037 段 2: 起動後の fd 2 と logger の書き先 (= `<状態の root>/sessions/logs/<id>.log`)。
-    /// None (= 置き場を決められない、または field の無い init JSON) なら fd 2 は /dev/null。
+    /// DR-0037 段 2: 起動後の fd 2 と logger の書き先 (= socket に揃えた置き場、
+    /// [`hyoui::paths::Env::session_log_path_for`])。None (= field の無い init JSON) なら fd 2 は
+    /// /dev/null。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     log: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -657,7 +662,7 @@ pub fn run_daemon_child() -> ExitCode {
     // **前** に行う: 親は ready を読むと exit するので、その時点で daemon が呼び出し元の
     // stderr を持っていなければ `$(hyoui run --detached ... 2>&1)` は親の exit で返る。
     // ここまでの失敗 (Session::start まで) は呼び出し元の stderr に出ている。
-    let logger = take_over_stderr(init.log.as_deref().map(Path::new));
+    take_over_stderr(init.log.as_deref().map(Path::new));
 
     // ready 通知: 親に 1 byte 書く。raw fd → OwnedFd 化は hyoui::sys 経由の
     // safe wrapper を使う (hyoui-cli は forbid(unsafe_code))。
@@ -667,28 +672,21 @@ pub fn run_daemon_child() -> ExitCode {
         // owned は scope 末で drop = close される。
     }
 
-    // session.serve() でブロック (= multi-attach accept + relay + finalize)
+    // session.serve() でブロック (= multi-attach accept + relay + finalize)。serve は listener と
+    // name lock を手放す前に logger を止める。ここでの shutdown は serve が途中で Err を返した
+    // 時の分 (= 止めてあれば何もしない)。
     let code = match session.serve() {
         Ok(_code) => ExitCode::SUCCESS,
         Err(_) => ExitCode::from(1),
     };
-    if let Some(logger) = logger {
-        logger.shutdown(LOGGER_SHUTDOWN_TIMEOUT);
-    }
+    hyoui::log::shutdown(hyoui::log::SHUTDOWN_TIMEOUT);
     code
 }
 
-/// daemon の終了時に、logger が積まれた行を書き終えるのを待つ上限。fs が応答しない時も
-/// これを過ぎたら daemon は終わる (= 残りの行は失われる)。
-const LOGGER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// session の daemon のログの置き場 (DR-0037 段 2)。状態の root を決められない時、session id
-/// が UUID の標準形でない時 (= path に混ぜない) は None。
-fn session_log_path(session_id: &str) -> Option<PathBuf> {
-    hyoui::cli::validate_session_id(session_id).ok()?;
-    hyoui::paths::Env::current()
-        .session_log_path(session_id)
-        .ok()
+/// socket `socket` で動く session の daemon のログの置き場 (DR-0037 段 2、
+/// [`hyoui::paths::Env::session_log_path_for`])。
+fn session_log_path(session_id: &str, socket: &Path) -> PathBuf {
+    hyoui::paths::Env::current().session_log_path_for(session_id, socket)
 }
 
 /// daemon の fd 2 を session のログファイルに付け替え、logger を立てる (DR-0037 段 2)。
@@ -697,15 +695,14 @@ fn session_log_path(session_id: &str) -> Option<PathBuf> {
 /// 止まり得る上、`$(hyoui run --detached ... 2>&1)` が daemon の終わりまで返らない)。ログを
 /// 開けない・置き場が無い時は、呼び出し元の stderr に原因を 1 行書いてから fd 2 を /dev/null
 /// にし、logger は立てない (= daemon のログは捨てる。ログのために起動を止めない)。
-fn take_over_stderr(log: Option<&Path>) -> Option<hyoui::log::Logger> {
+fn take_over_stderr(log: Option<&Path>) {
     let Some(path) = log else {
+        // init JSON に置き場が無い (= `log` を渡さない版の CLI から起動された)。
         eprintln!(
-            "hyoui: warning: daemon のログの置き場を決められないため (状態の root が無い)、\
-             起動後の daemon のログは捨てます。HYOUI_STATE_DIR か HOME を設定すると \
-             <状態の root>/sessions/logs/<id>.log に残ります"
+            "hyoui: warning: daemon のログの置き場が渡されていないため、起動後の daemon のログは捨てます"
         );
         stderr_to_devnull();
-        return None;
+        return;
     };
     let file = match hyoui::log::open_session_log(path) {
         Ok(f) => f,
@@ -715,26 +712,37 @@ fn take_over_stderr(log: Option<&Path>) -> Option<hyoui::log::Logger> {
                 path.display()
             );
             stderr_to_devnull();
-            return None;
+            return;
         }
     };
-    if let Err(e) = hyoui::sys::raw::redirect_stderr(file.as_fd()) {
+    // logger を先に立てる (= 立てられなければ、fd 2 がまだ呼び出し元の stderr のうちに原因を
+    // 出せる)。logger の無い daemon が fd 2 (ファイル) に直接書くと serve loop が fs を待つ
+    // (DR-0037 I-2) ので、その時は fd 2 を /dev/null にする。
+    let for_fd2 = match file.try_clone() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "hyoui: warning: daemon のログ {} の fd を複製できないため、起動後の daemon のログは捨てます: {e}",
+                path.display()
+            );
+            stderr_to_devnull();
+            return;
+        }
+    };
+    if let Err(e) = hyoui::log::install(file, Some(path.to_path_buf())) {
         eprintln!(
-            "hyoui: warning: daemon の標準エラーを {} に付け替えられないため、捨てます: {e}",
+            "hyoui: warning: logger thread を起動できないため、起動後の daemon のログは捨てます: {e}"
+        );
+        stderr_to_devnull();
+        return;
+    }
+    if let Err(e) = hyoui::sys::raw::redirect_stderr(for_fd2.as_fd()) {
+        // logger はログファイルに書き続ける。fd 2 (panic の文言等) だけを捨てる。
+        eprintln!(
+            "hyoui: warning: daemon の標準エラーを {} に付け替えられないため、/dev/null にします: {e}",
             path.display()
         );
         stderr_to_devnull();
-        return None;
-    }
-    match hyoui::log::install(file, Some(path.to_path_buf())) {
-        Ok(logger) => Some(logger),
-        Err(e) => {
-            // fd 2 はログファイルなので、logger 無しでも daemon のログ (stderr への直書き) は残る。
-            eprintln!(
-                "hyoui: warning: logger thread を起動できません ({e})、ログは fd 2 に直接書きます"
-            );
-            None
-        }
     }
 }
 
@@ -839,10 +847,8 @@ pub fn run_upgrade_resume_child() -> ExitCode {
 
     // DR-0037 段 2: 前の daemon の fd 2 (= session のログ) を引き継いでいるが、ログを開き直して
     // fd 2 と logger をそこに向ける (= 付け替える前の版からの upgrade でも呼び出し元の stderr を
-    // 手放す)。置き場を決められなければ引き継いだ fd 2 のまま。
-    let logger = session_log_path(&env.session_id)
-        .as_deref()
-        .and_then(|p| take_over_stderr(Some(p)));
+    // 手放す)。置き場は socket から決まる。開けなければ fd 2 は /dev/null になる。
+    take_over_stderr(Some(&session_log_path(&env.session_id, &env.socket)));
 
     // 継承 fd を OwnedFd 化。前 daemon が CLOEXEC を解いてから execve したので
     // kernel には有効な fd として残っている。
@@ -947,9 +953,7 @@ pub fn run_upgrade_resume_child() -> ExitCode {
             hyoui::daemon_log!(
                 "hyoui (upgrade-resume child): Session::from_upgrade_inherited failed: {e}"
             );
-            if let Some(logger) = logger {
-                logger.shutdown(LOGGER_SHUTDOWN_TIMEOUT);
-            }
+            hyoui::log::shutdown(hyoui::log::SHUTDOWN_TIMEOUT);
             return ExitCode::from(1);
         }
     };
@@ -970,9 +974,7 @@ pub fn run_upgrade_resume_child() -> ExitCode {
         Ok(_code) => ExitCode::SUCCESS,
         Err(_) => ExitCode::from(1),
     };
-    if let Some(logger) = logger {
-        logger.shutdown(LOGGER_SHUTDOWN_TIMEOUT);
-    }
+    hyoui::log::shutdown(hyoui::log::SHUTDOWN_TIMEOUT);
     code
 }
 

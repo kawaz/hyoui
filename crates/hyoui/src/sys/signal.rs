@@ -283,9 +283,28 @@ pub const CHILD_DEFAULT_SIGNALS: [libc::c_int; 6] = [
     libc::SIGPIPE,
 ];
 
+/// hyoui の handler ([`selfpipe_handler`] / [`sigwinch_handler`]) を張りうる signal。子は
+/// これらの handler を継承していれば既定に戻す (= exec が既定に戻すのを先に行う)。
+const OWN_HANDLER_SIGNALS: [libc::c_int; 9] = [
+    libc::SIGTERM,
+    libc::SIGINT,
+    libc::SIGHUP,
+    libc::SIGQUIT,
+    libc::SIGCHLD,
+    libc::SIGWINCH,
+    libc::SIGUSR1,
+    libc::SIGTSTP,
+    libc::SIGCONT,
+];
+
 /// fork した子が exec する直前に、[`CHILD_DEFAULT_SIGNALS`] を SIG_DFL に戻し、signal
 /// mask を空にする (DR-0043)。async-signal-safe (= `sigaction` / `sigemptyset` /
 /// `pthread_sigmask` のみ)。
+///
+/// 親 (daemon) から継承した hyoui の handler が張られた signal ([`OWN_HANDLER_SIGNALS`]
+/// のうち、今の handler が hyoui のもの) も既定に戻す。exec は handler を張った signal を
+/// 既定に戻すので exec 後の状態は変わらず、exec までの窓で届いた signal を無効化した
+/// handler に飲ませないためだけに行う。呼び出し元から引き継いだ無視 (SIGHUP 等) は触らない。
 ///
 /// 順序の契約: [`disarm_self_pipe_in_child`] の **後** に呼ぶ。fork の前に
 /// [`block_handled_signals`] で block した signal は、ここで mask を空にした時点で配送
@@ -301,6 +320,18 @@ pub fn reset_signals_for_exec() {
         libc::sigemptyset(&mut dfl.sa_mask);
         for sig in CHILD_DEFAULT_SIGNALS {
             libc::sigaction(sig, &dfl, std::ptr::null_mut());
+        }
+        let ours = [
+            selfpipe_handler as extern "C" fn(libc::c_int) as libc::sighandler_t,
+            sigwinch_handler as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        ];
+        for sig in OWN_HANDLER_SIGNALS {
+            let mut cur: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(sig, std::ptr::null(), &mut cur) == 0
+                && ours.contains(&cur.sa_sigaction)
+            {
+                libc::sigaction(sig, &dfl, std::ptr::null_mut());
+            }
         }
         let mut empty: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut empty);
@@ -508,7 +539,9 @@ print join(' ', @r), ' mask=', join(',', grep { $old->ismember($_) } 1..31), "\n
     #[test]
     fn spawned_child_starts_with_default_signals_and_empty_mask() {
         use std::io::Read;
-        let _guard = signal_test_guard();
+        // process 全体の sigaction を書き換えるので、同じ process で動く daemon serve (= 他
+        // module の test) とも排他する (= serve と共有する SELFPIPE_OWNER_LOCK も取る)。
+        let _guard = selfpipe_test_guard();
 
         // 呼び出し元の設定を作る: 6 つ + SIGHUP を無視、SIGTERM / SIGUSR2 を block。
         // 元の扱いは test の後で戻す (= process 全体の状態なので他 test に漏らさない)。
@@ -571,6 +604,53 @@ print join(' ', @r), ' mask=', join(',', grep { $old->ismember($_) } 1..31), "\n
             out.trim_end_matches(['\r', '\n']),
             "INT=DFL QUIT=DFL TSTP=DFL TTIN=DFL TTOU=DFL PIPE=DFL HUP=IGNORE mask=",
             "raw output={out:?}"
+        );
+    }
+
+    /// DR-0043 決定 4: 子は親から継承した hyoui の handler を exec の前に既定へ戻し、呼び出し
+    /// 元から引き継いだ無視 (SIGHUP) はそのままにする。
+    ///
+    /// fork した子で `disarm_self_pipe_in_child` → `reset_signals_for_exec` を呼び、扱いを
+    /// exit code で返す (= exec の前の窓の状態を直接見る)。
+    #[test]
+    fn reset_drops_inherited_own_handlers_but_keeps_inherited_ignores() {
+        let _guard = selfpipe_test_guard();
+        let ign = SigAction::new(
+            SigHandler::SigIgn,
+            nix::sys::signal::SaFlags::empty(),
+            SigSet::empty(),
+        );
+        // SAFETY: SIG_IGN は handler を持たない disposition。
+        let saved_hup = unsafe { nix::sys::signal::sigaction(Signal::SIGHUP, &ign) }.expect("ign");
+        register_self_pipe(Signal::SIGUSR1).expect("register");
+
+        // SAFETY: 子は sigaction の照会と `_exit` だけを行う (async-signal-safe)。
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            disarm_self_pipe_in_child();
+            reset_signals_for_exec();
+            // SAFETY: 照会のみ。
+            let code = unsafe {
+                let mut usr1: libc::sigaction = std::mem::zeroed();
+                let mut hup: libc::sigaction = std::mem::zeroed();
+                libc::sigaction(libc::SIGUSR1, std::ptr::null(), &mut usr1);
+                libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut hup);
+                i32::from(usr1.sa_sigaction != libc::SIG_DFL)
+                    | (i32::from(hup.sa_sigaction != libc::SIG_IGN) << 1)
+            };
+            // SAFETY: Rust の後始末を走らせずに終わる。
+            unsafe { libc::_exit(code) };
+        }
+        let status = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None);
+
+        let _ = install_default(Signal::SIGUSR1);
+        // SAFETY: 退避した元の disposition を戻すだけ。
+        let _ = unsafe { nix::sys::signal::sigaction(Signal::SIGHUP, &saved_hup) };
+        assert_eq!(
+            status.expect("waitpid"),
+            nix::sys::wait::WaitStatus::Exited(nix::unistd::Pid::from_raw(pid), 0),
+            "bit 0 = SIGUSR1 の hyoui handler が残った, bit 1 = SIGHUP の無視が消えた"
         );
     }
 

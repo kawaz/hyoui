@@ -89,18 +89,19 @@ findings の ID で対応を示す。
 
 | 項目 | 決定 |
 |---|---|
-| 置き場 | `<状態の root>/sessions/logs/<session id>.log` (`hyoui::paths::Env::session_log_path`)。web の `web/logs/<name>.log` と同じく、機能の dir の下の `logs/` に置く。`sessions/` 直下の socket / lock と分かれ、discovery (`sessions/*.sock`) と混ざらない。dir は 0700、file は 0600 で作り、追記で開く (fd は CLOEXEC) |
-| path を決める側 | `hyoui run` (CLI) が socket と同じ env から決め、`HYOUI_DAEMONIZE_INIT` の `log` で daemon に渡す (daemon の env scrub に左右されない)。session id が UUID の標準形でない時は path に混ぜず、置き場無しとして扱う |
+| 置き場 | socket に揃える (`hyoui::paths::Env::session_log_path_for`)。既定の socket (`<状態の root>/sessions/<id>.sock`) なら `<状態の root>/sessions/logs/<id>.log`、`--socket` で明示した socket なら socket の隣の `socket.with_extension("log")` (例: `/x/mine.sock` → `/x/mine.log`)。理由: 重複起動を断る name lock は socket と同じ dir の `socket.with_extension("lock")` にあるので、ログも同じ鍵にすれば socket と 1 対 1 になる (同じ UUID で `--socket` を変えた 2 つの session がログを共有しない)。既定の置き場は web の `web/logs/<name>.log` と同じく機能の dir の下の `logs/` で、discovery (`sessions/*.sock`) と混ざらない。明示した socket の dir は利用者が選んだ置き場として扱い、下の確認はそこでも行う |
+| path を決める側 | `hyoui run` (CLI) が socket から決め、`HYOUI_DAEMONIZE_INIT` の `log` で daemon に渡す (daemon の env scrub に左右されない)。upgrade で再開した daemon は引き継いだ socket から同じ規則で決める。どちらも置き場は必ず決まる (状態の root が無くても、明示 socket なら socket の隣) |
+| 開く時の確認 | dir は無ければ 0700 で作り、symlink でない dir・持ち主が自分 (euid)・mode 0700 を確かめる。file は `O_NOFOLLOW \| O_NONBLOCK` で開き (symlink をたどらない、読み手の無い FIFO でも open で止まらない)、`fstat` で普通のファイル・持ち主が自分・group / other に権限が無いことを確かめる。新しく作る file は 0600。確かめた後に `O_NONBLOCK` を外す (追記は blocking)。fd は CLOEXEC |
 | 付け替えの時点 | `Session::start` (socket の bind と子の spawn) が成功した後、ready 通知を書く **前**。親は ready を読むと exit するので、その時点で daemon は呼び出し元の stderr を持っていない (`$(hyoui run --detached ... 2>&1)` は親の exit で返る)。ready の前の失敗はすべて呼び出し元の stderr に出る |
-| 開けない・置き場が無い時 | 呼び出し元の stderr に原因を 1 行出し、fd 2 を `/dev/null` にして起動は続ける (ログのために起動を止めない)。どの場合も呼び出し元の stderr は手放す |
+| 開けない・確かめられない時 | 呼び出し元の stderr に原因を 1 行出し、fd 2 を `/dev/null` にして起動は続ける (ログのために起動を止めない)。どの場合も呼び出し元の stderr は手放し、確かめられなかったファイルには書かない。logger thread を立てられない時も fd 2 を `/dev/null` にする (logger の無い daemon が fd 2 のファイルに直接書くと、serve loop が fs を待つ) |
 | logger | daemon のログは `hyoui::log::emit` (`daemon_log!`) で bounded channel に `try_send` する (serve loop は待たない、I-2)。logger thread が時刻 (UTC の ISO 8601、秒精度) を付けて書く。logger の無い process (ready の前、test が `Session` を直接動かす時) では stderr に直接書く |
 | channel の大きさ | 1024 行 (`hyoui::log::CHANNEL_CAPACITY`)。daemon のログは警告と失敗の報告だけで、1 周に数行も出ない。1 行 200 bytes として最大 200 KiB 程度の滞留に収まる |
 | 満杯の時 | 捨てて件数を数え、logger が次の行を書く前と終了時に `hyoui: log: dropped N line(s) because the log queue was full` を 1 行書く |
-| 1 ファイルの上限 | 1 MiB (`hyoui::log::FILE_CAP_BYTES`)。超える行は書かず、印を 1 行書いて以後の行を捨てる。同じ id で起動し直した session は続きに追記し、上限は既存の大きさから数える |
-| 寿命 | 何も書かれなかったログは daemon の終了時に logger が消す (path が開いた file と同じ実体を指す時だけ)。書かれたログは session の終了後も残し、自動では消さない。daemon が終了処理を経ずに終わる (SIGKILL 等) と空のログが残る |
-| 終了時 | serve を抜けた後、logger が積まれた行を書き終えるのを最大 1 秒待つ (serve loop の外。fs が応答しない時もそれで daemon は終わり、残りの行は失われる) |
-| upgrade (DR-0028) | 新プロセスは同じ path を開き直して fd 2 と logger を向け直す。self-exec の時点で channel に残っていた行は失われる (exec の前に logger を止めない。upgrade 経路のログは失敗の報告だけで、失敗時は旧 serve が続くので logger も続く) |
-| fd 2 への直書き | panic の文言など `emit` を通らない stderr への出力も、fd 2 がログファイルなのでそこに入る (O_APPEND の 1 回の write 単位で logger の行と並ぶ) |
+| 1 ファイルの上限 | 1 MiB (`hyoui::log::FILE_CAP_BYTES`)。**上限が掛かるのは logger (channel) を通した行だけ** で、fd 2 に直接書かれる分 (下の「fd 2 への直書き」) は上限の外。行を書くのは、その行と「上限に達した」印の両方が残りに収まる時だけで、収まらなければ印だけを書いて以後の行を捨てる (印の分を先に取るので、logger の書く分を含めた大きさは 1 MiB を超えない)。同じ id で起動し直した session は続きに追記し、上限は logger の開始時のファイルの大きさから数える |
+| 寿命 | 何も書かれなかったログは logger の終了時に消す (path が開いた file と同じ実体を指す時だけ)。書かれたログは session の終了後も残し、自動では消さない。daemon が終了処理を経ずに終わる (SIGKILL 等) と空のログが残る |
+| 終了の順序 | serve を抜けた後、logger を止めて (積まれた行を書き終え、空のログを消すのを最大 1 秒待つ、`hyoui::log::SHUTDOWN_TIMEOUT`) から listener と name lock を手放す。`hyoui kill --wait` は name lock の解放で daemon の終わりを見届けるので、戻った時にはログは書き終わり、空のログは消えている (戻りは最大 1 秒遅くなる)。fs が応答しない時も 1 秒で次に進み、残りの行は失われる |
+| upgrade (DR-0028) | 新プロセスは必ず付け替えをやり直す (socket から決めた path を開き直して fd 2 と logger を向ける。開けなければ fd 2 は `/dev/null`)。self-exec の時点で channel に残っていた行は失われる (exec の前に logger を止めない。upgrade 経路のログは失敗の報告だけで、失敗時は旧 serve が続くので logger も続く) |
+| fd 2 への直書き | panic の文言など `emit` を通らない stderr への出力は、fd 2 がログファイルなのでそこに入る (O_APPEND の 1 回の write 単位で logger の行と並ぶ)。上限の外。serve loop から fd 2 に直接書く経路は無い (daemon のログは全部 `emit` を通り、logger が無い時の fd 2 は `/dev/null`)。logger を止めた後の終了処理 (socket の片付け等) のログは fd 2 に直接書くが、serve loop の外である |
 
 ## PTY 書き込み effect の完了と失敗
 
