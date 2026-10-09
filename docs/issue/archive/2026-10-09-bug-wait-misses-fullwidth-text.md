@@ -1,18 +1,18 @@
 ---
 title: hyoui wait が全角文字の連続に一致しない (全角セルの継続部分が空白として連結されている)
-status: open
+status: resolved
 category: bug
 created: 2026-10-09T11:00:00+09:00
-last_read: 2026-10-09T11:00:00+09:00
+last_read: 2026-10-09T13:00:00+09:00
 open_entered: 2026-10-09T11:00:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-09T13:00:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: daemon は継続 cell を空の cell として送り、wait はそれを空白で埋めていた。1 行の text 化を screen_text::row_text にまとめ、wait と screen dump の text の両方がそれを使う。input の wait: spec も同じく直った
 blocked_by:
 ---
 
