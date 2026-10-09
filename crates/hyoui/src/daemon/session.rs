@@ -49,7 +49,7 @@ use super::{ChildSuspendPolicy, DaemonConfig};
 use crate::daemon::broadcast::{
     ClientHandle, ClosingClient, MAX_CLIENTS_PER_DAEMON, advance_closing, broadcast_control,
     broadcast_master_bytes, closing_deadline, drain_closing, flush_clients, flush_until,
-    poll_writable, retire_client, send_control,
+    poll_writable, retire_client, send_control, write_closing,
 };
 
 /// R5-H7: send `sig` to the child's whole process group instead of only the
@@ -894,9 +894,8 @@ fn linger_for_late_attach(
 
         // 1 client でも attach 完了したら SessionExitNotify を送って break。
         if !clients.is_empty() {
-            // Task 25 race 対策: handshake.response を書き終えてから SessionExitNotify を
-            // 積む (= 順序を sequential に強制、CI macOS で client 側の
-            // `handshake.response decode failed` を観測した経緯)。
+            // handshake.response を書き終えてから SessionExitNotify を積む (= 応答と exit 通知を
+            // この順で、間を空けて client に届ける)。
             flush_until(
                 &clients,
                 Instant::now() + std::time::Duration::from_millis(500),
@@ -1016,13 +1015,12 @@ impl Drop for Session {
 /// DR-0013 §6 Phase A: DEC sync update 終了で `pending_redraws` を flush する。
 ///
 /// `screen_state.sync_in_progress()` が false に戻った瞬間、保留中の client_id に
-/// 対して `send_attach_redraw` 相当を実行する。enqueue 失敗時は当該 client_id を
-/// `overflow_ids` に積み、caller が drop する。
+/// 対して attach の最初の redraw を積む (queue の上限の判定はしない、
+/// `accept::send_initial_attach_redraw`)。
 fn flush_pending_redraws_if_sync_over(
     clients: &[ClientHandle],
     screen_state: &ScreenState,
     pending_redraws: &mut Vec<u64>,
-    overflow_ids: &mut Vec<u64>,
 ) {
     if screen_state.sync_in_progress() || pending_redraws.is_empty() {
         return;
@@ -1031,7 +1029,7 @@ fn flush_pending_redraws_if_sync_over(
     let ids: Vec<u64> = std::mem::take(pending_redraws);
     for id in ids {
         if let Some(ch) = clients.iter().find(|c| c.id == id) {
-            super::accept::send_attach_redraw(ch, screen_state, overflow_ids);
+            super::accept::send_initial_attach_redraw(ch, screen_state);
         }
         // client が既に居ない場合は黙って drop (= overflow 経路で先に切られた等)
     }
@@ -1132,18 +1130,18 @@ fn handle_suspend_signals(
                 let _ = kill_pgrp(child, Signal::SIGCONT);
             }
         } else if sig_i32 == Signal::SIGUSR1 as i32 {
-            // DR-0028 Phase 1: SIGUSR1 = 隠し upgrade trigger。record に痕跡を
-            // 残してから `RelayOutcome::UpgradeRequested` を返し、`Session::serve`
-            // 側で self-exec 経路に飛ぶ。**child は殺さない / socket は unlink
-            // しない** (= 新プロセスに fd を継承させる)。Phase 3 で正規
-            // `upgrade.request` protocol kind に置き換わる。
+            // DR-0028 Phase 1: SIGUSR1 = 隠し upgrade trigger。record に痕跡を残し、
+            // upgrade.request の受理と同じく upgrade 待ちの state を立てる。serve_loop は
+            // 次の周回の冒頭で、client に積んだ frame を書き終えてから (DR-0028 §4)
+            // `UpgradeRequested` を返し、`Session::serve` が self-exec 経路に飛ぶ。
+            // **child は殺さない / socket は unlink しない** (= 新プロセスに fd を継承させる)。
             state.record_registry.push_lifecycle(
                 super::record::LifecycleEvent::SessionTerminatedByCondition {
                     reason: "upgrade-request".to_string(),
                     ts_unix_ms: now_unix_ms(),
                 },
             );
-            return Some(RelayOutcome::UpgradeRequested);
+            state.set_upgrade_pending();
         } else if sig_i32 == Signal::SIGTERM as i32 || sig_i32 == Signal::SIGINT as i32 {
             // issue 2026-06-11 優先3: graceful shutdown。`--until` match と同じ経路
             // (= killpg(SIGTERM) → finalize escalation → SessionExitNotify → socket
@@ -1556,19 +1554,19 @@ fn serve_loop(
         &mut startup_overflow,
     );
     loop {
-        // DR-0037 段階 4: 前の周回までに積んだ frame を、書けるだけ書く (nonblocking)。
-        // 書き残しは下の poll で POLLOUT を待つ。周回の冒頭に置くのは、周回の途中の
-        // `continue` 経路でも書き込みを飛ばさないため。切断が決まった client も同じく
-        // 進め、書き終えた・失敗した・deadline を過ぎたものを close する。
+        // DR-0037 段階 4: 前の周回までに積んだ frame を書く (nonblocking、1 client あたり
+        // `WRITE_BUDGET_PER_PASS` まで)。書き残しは下の poll で POLLOUT を待つ。周回の冒頭に
+        // 置くのは、周回の途中の `continue` 経路でも書き込みを飛ばさないため。
         flush_clients(clients);
-        advance_closing(closing, Instant::now());
 
-        // DR-0028 §2 (Phase 3): upgrade.request 受理後は drain (= 同期 raw_data 経路の
-        // 既完了性) を trivially 満たす。残るのは client に積んだ frame (upgrade.ack を含む)
-        // を書き終えることで、exec は process ごと置き換え、client の socket は CLOEXEC で
-        // 閉じるので、書く前に exec すると ack が届かない (client は「recv error before ack」
-        // で失敗する)。全 client の送信 queue が空になる (または書き込みに失敗する) か、
-        // `UPGRADE_FLUSH_BUDGET` の期限で UpgradeRequested を返す (DR-0028 §4)。
+        // DR-0028 §2 (Phase 3): upgrade の要求 (upgrade.request の受理、または SIGUSR1) の後は
+        // drain (= 同期 raw_data 経路の既完了性) を trivially 満たす。残るのは client に積んだ
+        // frame (upgrade.ack を含む) を書き終えることで、exec は process ごと置き換え、client の
+        // socket は CLOEXEC で閉じるので、書く前に exec すると frame が届かない (client は
+        // 「recv error before ack」で失敗する)。attach 中の client と切断が決まった client
+        // (closing、detach.ack 等を積んでいる) の送信 queue が全部空になる (または書き込みに
+        // 失敗する) か、`UPGRADE_FLUSH_BUDGET` の期限で UpgradeRequested を返す (DR-0028 §4)。
+        // closing の各自の期限ではこの間 close しない (upgrade の期限で打ち切る)。
         //
         // Design rationale: この待ちの間は client への書き込みだけを行い、子の回収 (SIGCHLD /
         // waitpid)・master の読み取り・accept・client frame の処理はしない。子の exit を
@@ -1576,20 +1574,25 @@ fn serve_loop(
         // backlog の接続は新プロセスがそのまま引き継いで処理する。期限は最大 1 秒で、
         // upgrade という session の終わり際の 1 回だけ。
         if state.is_upgrade_pending() {
+            write_closing(closing);
             let deadline = *upgrade_flush_deadline
                 .get_or_insert_with(|| Instant::now() + UPGRADE_FLUSH_BUDGET);
-            if clients.iter().all(ClientHandle::send_settled) || Instant::now() >= deadline {
+            let settled = clients.iter().all(ClientHandle::send_settled) && closing.is_empty();
+            if settled || Instant::now() >= deadline {
                 return RelayOutcome::UpgradeRequested;
             }
             poll_writable(
                 clients
                     .iter()
                     .filter(|c| !c.send_settled())
-                    .map(|c| c.stream.as_fd()),
+                    .map(|c| c.stream.as_fd())
+                    .chain(closing.iter().map(ClosingClient::fd)),
                 deadline,
             );
             continue;
         }
+        // 切断が決まった client を進め、書き終えた・失敗した・期限を過ぎたものを close する。
+        advance_closing(closing, Instant::now());
 
         // 子 exit 検出後は drain budget を使い切った時点で serve_loop を抜ける
         // (= `deferred_exit` の doc 参照)。budget 内は poll に戻り、遅れて届く
@@ -1795,6 +1798,10 @@ fn serve_loop(
                     {
                         return outcome;
                     }
+                    // SIGUSR1 の upgrade: 子の回収をせずに upgrade 待ちへ進む (冒頭の分岐)。
+                    if state.is_upgrade_pending() {
+                        continue;
+                    }
                 }
                 observe_child_transition(
                     &mut lifecycle,
@@ -1856,12 +1863,7 @@ fn serve_loop(
                         closing,
                     );
                     // DR-0013 §6 Phase A: sync 終了で pending redraw を flush。
-                    flush_pending_redraws_if_sync_over(
-                        clients,
-                        screen_state,
-                        pending_redraws,
-                        &mut overflow_ids,
-                    );
+                    flush_pending_redraws_if_sync_over(clients, screen_state, pending_redraws);
                     // 後段の drop 処理 (overflow / dead) を共通化するため
                     let mut indices_to_drop: Vec<usize> = Vec::new();
                     for id in overflow_ids.drain(..) {
@@ -1909,12 +1911,7 @@ fn serve_loop(
             closing,
         );
         // DR-0013 §6 Phase A: sync 終了で pending redraw を flush。
-        flush_pending_redraws_if_sync_over(
-            clients,
-            screen_state,
-            pending_redraws,
-            &mut overflow_ids,
-        );
+        flush_pending_redraws_if_sync_over(clients, screen_state, pending_redraws);
 
         // R5-H6 + DR-0001 軸 1/2: SIGCHLD / SIGTSTP / SIGCONT wake-up handling.
         // Drain the self-pipe + dispatch each signal byte. SIGTSTP / SIGCONT が
@@ -1936,6 +1933,11 @@ fn serve_loop(
                     handle_suspend_signals(&drained, child, config, &lifecycle, state)
                 {
                     return outcome;
+                }
+                // SIGUSR1 の upgrade: 子の回収と、この周回の残りの処理をせずに upgrade 待ちへ
+                // 進む (冒頭の分岐)。
+                if state.is_upgrade_pending() {
+                    continue;
                 }
             }
             // 子 exit は即 return しない: 同一周回の listener / master / client frame
@@ -2310,7 +2312,8 @@ pub(super) enum RelayOutcome {
     ClientDetachedOrKilled,
     /// 回復不能な error (= protocol violation 等)。
     Error(Error),
-    /// DR-0028 Phase 1: 隠し SIGUSR1 経由で self-exec upgrade を要求された。
+    /// DR-0028: self-exec upgrade を要求された (upgrade.request の受理、または隠し SIGUSR1)。
+    /// serve_loop は client に積んだ frame を書き終えてから (期限 `UPGRADE_FLUSH_BUDGET`) 返す。
     /// `Session::serve` は本 outcome を受けたら `finalize_child` や socket unlink
     /// を **迂回** し、`daemon::upgrade::perform_self_exec` に fd 所有権を渡す
     /// (= 子 PID / 子 との親子関係 / listener bind をそのまま新プロセスへ引き継ぐ)。
@@ -5936,6 +5939,234 @@ mod tests {
             &path,
             OVER_LIMIT_BURST_LINES,
         ));
+    }
+
+    /// serve_loop を 1 回だけ回す helper。`Session::serve` を通さないので、upgrade の要求で
+    /// serve_loop が返っても self-exec しない。返った後は attach 中の client と closing を drop
+    /// する (= exec で client の socket が閉じるのと同じ)。戻り値は outcome の Debug 表記。
+    fn spawn_serve_loop_once(
+        cmd: Vec<String>,
+    ) -> (std::path::PathBuf, TempDir, std::thread::JoinHandle<String>) {
+        let dir = make_temp_socket_dir();
+        let sock_path = dir.path().join("test.sock");
+        let cfg = DaemonConfig::new("demo", sock_path.clone(), cmd);
+        let handle = std::thread::spawn(move || {
+            let session = Session::start(cfg).expect("start");
+            let inner = session.inner.as_ref().expect("session inner");
+            let config = &session.config;
+            let mut clients: Vec<ClientHandle> = Vec::new();
+            let mut closing: Vec<ClosingClient> = Vec::new();
+            let mut next_client_id = 0u64;
+            let mut state = SessionState::default();
+            let mut scrollback = Scrollback::new(config.scrollback_bytes);
+            let mut screen_state = ScreenState::new(config.rows, config.cols, 100);
+            let mut pending_redraws = Vec::new();
+            let outcome = serve_loop(
+                &inner.pty,
+                inner.child,
+                &inner.listener,
+                &mut clients,
+                &mut closing,
+                &mut next_client_id,
+                config,
+                &mut state,
+                &mut scrollback,
+                &mut screen_state,
+                &mut pending_redraws,
+                None,
+                None,
+            );
+            drop(clients);
+            drop(closing);
+            format!("{outcome:?}")
+            // session の drop が子を畳む
+        });
+        (sock_path, dir, handle)
+    }
+
+    /// 読み終えた bytes を frame 列に分け、raw_data の body を連結したものと control message の
+    /// 列を返す (末尾の途中までの frame は捨てる)。
+    fn split_frames(bytes: &[u8]) -> (Vec<u8>, Vec<ControlMessage>) {
+        let mut cur = std::io::Cursor::new(bytes);
+        let mut raw = Vec::new();
+        let mut controls = Vec::new();
+        while let Ok(f) = Frame::decode_from(&mut cur) {
+            match f.ty {
+                TYPE_RAW_DATA => raw.extend(f.body),
+                TYPE_CBOR_CONTROL => {
+                    if let Ok(m) = ControlMessage::decode_from(f.body.as_slice()) {
+                        controls.push(m);
+                    }
+                }
+                _ => {}
+            }
+        }
+        (raw, controls)
+    }
+
+    /// DR-0028 §4 / DR-0037 段階 4: `detach --target=all` で closing に移った client の送信
+    /// queue (読まずに溜めた子の出力 + detach.ack) も、upgrade の self-exec の前に送り切る。
+    ///
+    /// `x` は子の約 1 MB の出力を読まずに溜めてから `detach --target=all` を送る (x 自身も
+    /// closing に移り、queue の末尾に detach.ack が積まれる)。detach が処理されたことは、同じく
+    /// 切られた `u` の EOF で見る。続けて新しい client `c` が upgrade
+    /// を要求し、c が upgrade.ack を受け取ってから x が読み始める。serve_loop が返った後に
+    /// socket を閉じても、x には溜めた出力の最後と detach.ack が届いている。
+    /// closing を見ずに attach 中の client だけで送り切りを判定すると、c の ack を書いた時点で
+    /// 返り、x の queue は捨てられる。
+    #[test]
+    fn upgrade_delivers_the_queue_of_clients_closing_after_detach_all() {
+        let files = tempfile::tempdir().expect("tempdir");
+        let big = files.path().join("big.txt");
+        let mut text: String = (0..UNREAD_BURST_LINES)
+            .map(|i| format!("cat burst line {i:07} abcdefghijklmnopqrstuvwxyz\n"))
+            .collect();
+        text.push_str("CAT_BURST_END\n");
+        std::fs::write(&big, text).expect("write burst file");
+        let (sock_path, _dir, handle) = spawn_serve_loop_once(vec![
+            "/bin/cat".into(),
+            "-".into(),
+            big.to_string_lossy().into_owned(),
+            "-".into(),
+        ]);
+
+        let mut x = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut x);
+        let mut u = client_connect_with_retry(&sock_path);
+        let (_r, redraw) = do_client_handshake_keep_redraw(&mut u);
+        u.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set read timeout");
+        apply_stimulus(&mut u, &Stimulus::Input(b"\x04"));
+        read_relay_until(&mut u, &redraw, b"CAT_BURST_END");
+
+        send_control_frame(
+            &mut x,
+            ControlMessage::Detach(crate::protocol::messages::Detach {
+                target: crate::protocol::messages::DetachTarget::All,
+            }),
+        );
+        // detach.ack は要求元 (x) にだけ積まれる。u は切られて EOF を見る (= detach が処理された)。
+        while Frame::decode_from(&mut u).is_ok() {}
+
+        let mut c = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut c);
+        c.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set read timeout");
+        send_control_frame(
+            &mut c,
+            ControlMessage::UpgradeRequest(crate::protocol::messages::UpgradeRequest {
+                binary_path: None,
+            }),
+        );
+        loop {
+            if let Incoming::Control(ControlMessage::UpgradeAck(_)) =
+                read_incoming(&mut c, "upgrade.ack")
+            {
+                break;
+            }
+        }
+
+        let x_reader = std::thread::spawn(move || {
+            let _ = x.set_read_timeout(Some(Duration::from_secs(10)));
+            let mut all = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut x, &mut all);
+            all
+        });
+        let outcome = join_with_deadline(handle, Duration::from_secs(10), "serve_loop upgrade");
+        assert_eq!(outcome, "UpgradeRequested");
+        let got = join_with_deadline(x_reader, Duration::from_secs(15), "closing reader");
+        let (raw, controls) = split_frames(&got);
+        assert!(
+            raw.windows(13).any(|w| w == b"CAT_BURST_END"),
+            "the closing client's backlog must be delivered before the exec ({} bytes)",
+            got.len()
+        );
+        assert!(
+            controls
+                .iter()
+                .any(|m| matches!(m, ControlMessage::DetachAck(_))),
+            "detach.ack queued to the closing client must be delivered before the exec"
+        );
+    }
+
+    /// DR-0028 Phase 1 の隠し trigger (SIGUSR1) も、upgrade.request と同じ upgrade 待ちの state を
+    /// 立てる (= serve_loop が client に積んだ frame を書き終えてから UpgradeRequested を返す)。
+    /// SIGUSR1 を受けて即座に UpgradeRequested を返すと、送り切りを通らずに self-exec する。
+    #[test]
+    fn sigusr1_enters_the_same_upgrade_wait_as_upgrade_request() {
+        let state = SessionState::default();
+        let lifecycle = ChildLifecycle::default();
+        let config = DaemonConfig::new(
+            "t",
+            std::path::PathBuf::from("/tmp/t.sock"),
+            vec!["cmd".into()],
+        );
+        let outcome = handle_suspend_signals(
+            &[Signal::SIGUSR1 as i32 as u8],
+            Pid::from_raw(1),
+            &config,
+            &lifecycle,
+            &state,
+        );
+        assert!(
+            outcome.is_none(),
+            "SIGUSR1 must not return UpgradeRequested directly (it would skip the flush)"
+        );
+        assert!(state.is_upgrade_pending());
+    }
+
+    /// handshake の応答と attach の最初の redraw は 1 組: redraw が `client_buffer_bytes` より
+    /// 大きくても、新しい client は attach できる (応答を積んだ後の queue に上限の判定をすると、
+    /// 新しい client が attach 直後に overflow で切られる)。
+    #[test]
+    fn attach_succeeds_when_the_redraw_is_larger_than_the_client_buffer() {
+        const LIMIT: usize = 512;
+        let files = tempfile::tempdir().expect("tempdir");
+        let text_path = files.path().join("screen.txt");
+        let mut text: String = (0..30)
+            .map(|i| format!("redraw line {i:02} abcdefghijklmnopqrstuvwxyz0123456789\n"))
+            .collect();
+        text.push_str("REDRAW_READY\n");
+        std::fs::write(&text_path, text).expect("write screen file");
+        // `cat - FILE -`: 最初の client が attach してから (行頭の ^D で) 画面を埋めさせる。
+        let (sock_path, _dir, handle) = spawn_serve_thread_with_buffer(
+            vec![
+                "/bin/cat".into(),
+                "-".into(),
+                text_path.to_string_lossy().into_owned(),
+                "-".into(),
+            ],
+            LIMIT,
+        );
+
+        let mut first = client_connect_with_retry(&sock_path);
+        let (first_resp, redraw) = do_client_handshake_keep_redraw(&mut first);
+        first
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set read timeout");
+        apply_stimulus(&mut first, &Stimulus::Input(b"\x04"));
+        read_relay_until(&mut first, &redraw, b"REDRAW_READY");
+
+        let mut late = client_connect_with_retry(&sock_path);
+        let (late_resp, late_redraw) = do_client_handshake_keep_redraw(&mut late);
+        assert!(
+            late_redraw.len() > LIMIT,
+            "precondition: the redraw ({} bytes) exceeds client_buffer_bytes",
+            late_redraw.len()
+        );
+        assert!(late_redraw.windows(12).any(|w| w == b"REDRAW_READY"));
+        late.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set read timeout");
+        let (_elapsed, sr) = query_status(&mut late);
+        let ids: Vec<u64> = sr.clients.iter().map(|c| c.client_id).collect();
+        assert!(
+            ids.contains(&first_resp.client_id) && ids.contains(&late_resp.client_id),
+            "both clients stay attached: {ids:?}"
+        );
+
+        apply_stimulus(&mut late, &Stimulus::Input(b"\x04"));
+        let exit = join_with_deadline(handle, Duration::from_secs(10), "serve").expect("serve");
+        assert_eq!(exit, 0);
     }
 
     fn encode_frame(msg: &ControlMessage) -> Vec<u8> {

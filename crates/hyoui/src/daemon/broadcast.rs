@@ -1,5 +1,5 @@
-//! client ごとの送信 queue + broadcast helpers (DR-0009 Phase C で `session.rs` から分離、
-//! DR-0037 段階 4 で送信を serve loop 内の nonblocking write に移した)。
+//! client ごとの送信 queue と broadcast helpers。daemon から client への送信は、serve loop が
+//! 送信 queue を nonblocking で書いて行う (DR-0037「送信 queue」節)。
 //!
 //! ## 構成
 //!
@@ -22,14 +22,17 @@
 //! ## 送信の流れ (DR-0037 段階 4)
 //!
 //! client socket は O_NONBLOCK。enqueue は送信 queue に積むだけで socket に触らない。serve loop
-//! は周回の冒頭で全 client の queue を書けるだけ書き ([`flush_clients`])、書き残しがある client
-//! は `POLLOUT` を付けて poll する。書けない (`EAGAIN`) 時は次の周回に回すだけで、相手が
-//! 読まなくても loop は戻る。queue が上限を超えた client は切断する (backpressure)。
+//! は周回の冒頭で全 client の queue を 1 client あたり [`WRITE_BUDGET_PER_PASS`] まで書き
+//! ([`flush_clients`])、書き残しがある client は `POLLOUT` を付けて poll する。書けない
+//! (`EAGAIN`) 時と budget を使い切った時は次の周回に回すだけで、相手が読まなくても、相手が
+//! 速く読んで queue が大きくても、1 周の仕事は上限を持つ。queue が上限を超えた client は
+//! 切断する (backpressure)。
 //!
 //! 切断は socket の close だけで完結する。切断前に積んだ frame
 //! (失敗 ack・detach ack・backpressure error) を届けるため、切断が決まった client は
 //! [`ClosingClient`] として queue が空になるまで書き続け、空になった時点か deadline
-//! ([`CLOSE_FLUSH_TIMEOUT`]) で close する。
+//! ([`CLOSE_FLUSH_TIMEOUT`]) で close する。closing の数は [`MAX_CLOSING_CLIENTS`] までで、
+//! 超えた分は書き残しを捨ててその場で close する (fd を上限なく握らない)。
 //!
 //! ## payload sharing (R5-H9)
 //!
@@ -74,6 +77,27 @@ pub(super) const MAX_CLIENTS_PER_DAEMON: usize = 64;
 /// 畳み込むだけ (DR-0037 I-3)。
 pub(super) const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// 同時に保持する [`ClosingClient`] の上限。超えて切断する client は closing に入れず、
+/// 送信 queue の残りを捨ててその場で close する。
+///
+/// Design rationale: closing の client は各自 [`CLOSE_FLUSH_TIMEOUT`] まで fd を握る。切断と
+/// 再接続を繰り返す client が居ると、attach 中の client 数の上限 ([`MAX_CLIENTS_PER_DAEMON`])
+/// とは別に fd が積み上がり、EMFILE で accept と status が止まりうる。closing を attach 数の
+/// 上限に数える案は、多数の切断の直後に正規の attach まで断ることになるので採らない。上限を
+/// 超えた client が失うのは切断前に積んだ ack 等だけで、attach 中の client と新しい attach には
+/// 影響しない。値は attach 数の上限と同じにし、daemon が client のために持つ fd は
+/// attach 64 + closing 64 + handshake 中 16 までになる。
+pub(super) const MAX_CLOSING_CLIENTS: usize = MAX_CLIENTS_PER_DAEMON;
+
+/// serve loop の 1 周で 1 client の送信 queue に書く量の上限。
+///
+/// Design rationale: 書き込みは相手の送信 buffer が埋まれば `EAGAIN` で止まるが、相手が速く
+/// 読むと止まらず、上限の大きい queue (既定 8 MiB、設定次第でそれ以上) を 1 周で書き切ろうと
+/// して loop を占有する (DR-0037 I-4)。1 周で書く量を client あたり 64 KiB に切り、残りは
+/// 次の周回 (`POLLOUT` で即起きる) に回す。64 KiB は子 PTY の読み取り chunk (8 KiB) の 8 倍で、
+/// 読む client への中継が子の出力に追いつく。64 client でも 1 周の書き込みは 4 MiB まで。
+pub(super) const WRITE_BUDGET_PER_PASS: usize = 64 * 1024;
+
 /// broadcast payload の共有所有型 (R5-H9 zero-copy 化)。
 ///
 /// 1 frame の encode 済 bytes を `Arc::new` で wrap し、`Arc::clone` で
@@ -87,6 +111,8 @@ pub(super) enum WriteProgress {
     Drained,
     /// socket の送信 buffer が埋まった (`EAGAIN`)。残りは次に書ける時に書く。
     Blocked,
+    /// この回の書き込み量の上限 (budget) に達した。残りは次の周回で書く。
+    Paused,
     /// 書き込みが失敗した (相手が閉じた等)。queue は捨て、以後は積まない。
     Failed,
 }
@@ -129,12 +155,13 @@ impl SendQueue {
         self.queued_bytes = 0;
     }
 
-    /// queue の先頭から、`stream` に書けるだけ書く。`stream` は O_NONBLOCK の前提で、送信
-    /// buffer が埋まれば `EAGAIN` で戻る (相手の読み取りを待たない、DR-0037 I-1)。
-    pub(super) fn write_to(&mut self, mut stream: &UnixStream) -> WriteProgress {
+    /// queue の先頭から、`stream` に `budget` bytes まで書く。`stream` は O_NONBLOCK の前提で、
+    /// 送信 buffer が埋まれば `EAGAIN` で戻る (相手の読み取りを待たない、DR-0037 I-1)。
+    pub(super) fn write_to(&mut self, mut stream: &UnixStream, budget: usize) -> WriteProgress {
         if self.failed {
             return WriteProgress::Failed;
         }
+        let mut left = budget;
         while let Some(front) = self.frames.front() {
             let rest = &front[self.head_written..];
             if rest.is_empty() {
@@ -142,12 +169,16 @@ impl SendQueue {
                 self.head_written = 0;
                 continue;
             }
-            match stream.write(rest) {
+            if left == 0 {
+                return WriteProgress::Paused;
+            }
+            match stream.write(&rest[..rest.len().min(left)]) {
                 Ok(0) => {
                     self.fail();
                     return WriteProgress::Failed;
                 }
                 Ok(n) => {
+                    left -= n;
                     self.head_written += n;
                     self.queued_bytes -= n;
                     if self.head_written == front.len() {
@@ -241,9 +272,11 @@ impl ClientHandle {
         self.send.borrow().is_settled()
     }
 
-    /// 送信 queue を書けるだけ書く (nonblocking)。
+    /// 送信 queue を 1 周分 ([`WRITE_BUDGET_PER_PASS`]) まで書く (nonblocking)。
     pub(super) fn flush_send(&self) -> WriteProgress {
-        self.send.borrow_mut().write_to(&self.stream)
+        self.send
+            .borrow_mut()
+            .write_to(&self.stream, WRITE_BUDGET_PER_PASS)
     }
 
     /// 切断が決まった client を [`ClosingClient`] に移す。送信 queue に何も残っていなければ
@@ -302,6 +335,14 @@ impl ClosingClient {
 /// [`CLOSE_FLUSH_TIMEOUT`] まで書き続け、無ければその場で close する。
 pub(super) fn retire_client(closing: &mut Vec<ClosingClient>, ch: ClientHandle) {
     if let Some(c) = ch.into_closing(Instant::now() + CLOSE_FLUSH_TIMEOUT) {
+        admit_closing(closing, c);
+    }
+}
+
+/// `c` を closing に入れる。closing が [`MAX_CLOSING_CLIENTS`] に達していれば、入れずに
+/// その場で close する (書き残しは捨てる)。closing に入れる経路はすべてここを通す。
+pub(super) fn admit_closing(closing: &mut Vec<ClosingClient>, c: ClosingClient) {
+    if closing.len() < MAX_CLOSING_CLIENTS {
         closing.push(c);
     }
 }
@@ -354,6 +395,23 @@ pub(super) fn enqueue_for_client(ch: &ClientHandle, payload: SharedBytes) -> Enq
     }
     q.push(payload);
     EnqueueOutcome::Sent
+}
+
+/// attach の最初の redraw を、queue の上限の判定をせずに積む (書き込みに失敗した client
+/// には積まない)。
+///
+/// Design rationale: 上限の判定は「空の queue なら 1 frame は通す」で、大きい frame も
+/// 必ず前進させる。attach の時は handshake の応答 (と lock 中なら mode.change) を先に積むので、
+/// redraw を積む時点で queue は空でなく、`client_buffer_bytes` より大きい redraw で新しい
+/// client が attach 直後に切られる。handshake の応答と最初の redraw は attach の 1 組として
+/// 扱い、redraw は 1 回だけ判定を外す (応答の直後なので、読み遅れを検出する backpressure の
+/// 対象ではない)。redraw の大きさは画面の大きさで決まり、attach ごとに 1 回なので queue が
+/// 際限なく伸びることはない。
+pub(super) fn enqueue_ignoring_limit(ch: &ClientHandle, payload: SharedBytes) {
+    let mut q = ch.send.borrow_mut();
+    if !q.failed {
+        q.push(payload);
+    }
 }
 
 /// 1 client への enqueue 結果を評価し、overflow なら disconnect
@@ -625,7 +683,8 @@ pub(super) fn broadcast_bytes(clients: &mut [ClientHandle], payload: SharedBytes
     overflow_ids
 }
 
-/// 全 client の送信 queue を書けるだけ書く (nonblocking)。serve loop が周回の冒頭で呼ぶ。
+/// 全 client の送信 queue を 1 client あたり [`WRITE_BUDGET_PER_PASS`] まで書く
+/// (nonblocking)。serve loop が周回の冒頭で呼ぶ。
 ///
 /// 書き込みに失敗した client は queue を捨てるだけで、ここでは切断しない (相手の close は
 /// 受信側の EOF で検出して、受信済みの frame を処理してから切る。理由は
@@ -638,15 +697,26 @@ pub(super) fn flush_clients(clients: &[ClientHandle]) {
     }
 }
 
-/// 切断が決まった client を 1 段進める。queue を書けるだけ書き、書き終えた・書き込みに
-/// 失敗した・deadline を過ぎた client を close する (= `closing` から外して drop)。
+/// 切断が決まった client を 1 段進める。queue を 1 client あたり [`WRITE_BUDGET_PER_PASS`]
+/// まで書き、書き終えた・書き込みに失敗した・deadline を過ぎた client を close する
+/// (= `closing` から外して drop)。相手が閉じた socket は write が `EPIPE` で失敗するので、
+/// この呼び出しで close される (POLLHUP で起きた次の周回に close まで進む)。
 pub(super) fn advance_closing(closing: &mut Vec<ClosingClient>, now: Instant) {
-    closing.retain_mut(|c| {
-        if c.send.write_to(&c.stream) != WriteProgress::Blocked {
-            return false;
-        }
-        now < c.deadline
-    });
+    closing.retain_mut(|c| still_writing(c) && now < c.deadline);
+}
+
+/// 切断が決まった client の queue を書き進め、書き終えた・書き込みに失敗した client だけを
+/// close する (各自の deadline では close しない)。upgrade の self-exec の前に、closing の
+/// client に積んだ ack も送り切るために使う (deadline は upgrade 側の期限で打ち切る)。
+pub(super) fn write_closing(closing: &mut Vec<ClosingClient>) {
+    closing.retain_mut(still_writing);
+}
+
+fn still_writing(c: &mut ClosingClient) -> bool {
+    matches!(
+        c.send.write_to(&c.stream, WRITE_BUDGET_PER_PASS),
+        WriteProgress::Blocked | WriteProgress::Paused
+    )
 }
 
 /// `closing` の deadline のうち最も近いもの (= serve loop の poll timeout の上限)。
@@ -978,6 +1048,171 @@ mod tests {
         let mut all = Vec::new();
         std::io::Read::read_to_end(&mut peer, &mut all).expect("read to EOF");
         assert!(all.len() < FLUSH_TEST_PAYLOAD, "全部は届いていない");
+    }
+
+    /// 1 回の書き込みは budget で止まる: 相手の送信 buffer に空きがあっても、budget を
+    /// 書いたら `Paused` で戻り、残りは queue に残る (= 1 周の仕事の上限、DR-0037 I-4)。
+    #[test]
+    fn write_to_stops_at_the_budget_even_when_the_socket_has_room() {
+        let (ch, _peer) = make_test_client(9, 1 << 20, vec![]);
+        assert_eq!(
+            enqueue_for_client(&ch, Arc::new(vec![1u8; 1000])),
+            EnqueueOutcome::Sent
+        );
+        let progress = ch.send.borrow_mut().write_to(&ch.stream, 100);
+        assert_eq!(progress, WriteProgress::Paused);
+        assert_eq!(ch.queued_bytes(), 900, "budget の 100 bytes だけ書く");
+        let progress = ch.send.borrow_mut().write_to(&ch.stream, 1 << 20);
+        assert_eq!(progress, WriteProgress::Drained);
+        assert_eq!(ch.queued_bytes(), 0);
+    }
+
+    /// serve loop が 1 周で 1 client に書く量は `WRITE_BUDGET_PER_PASS` まで: 相手が読み続けて
+    /// いても、大きな queue を 1 回の `flush_send` で書き切らない。
+    #[test]
+    fn flush_send_writes_at_most_the_per_pass_budget_while_the_peer_reads() {
+        let (ch, mut peer) = make_test_client(10, 64 * 1024 * 1024, vec![]);
+        let reader = std::thread::spawn(move || {
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut total = 0usize;
+            while let Ok(n) = std::io::Read::read(&mut peer, &mut buf) {
+                if n == 0 {
+                    break;
+                }
+                total += n;
+            }
+            total
+        });
+        assert_eq!(
+            enqueue_for_client(&ch, Arc::new(vec![0u8; FLUSH_TEST_PAYLOAD])),
+            EnqueueOutcome::Sent
+        );
+        let mut passes = 0usize;
+        while !ch.send_settled() {
+            let before = ch.queued_bytes();
+            let progress = ch.flush_send();
+            let written = before - ch.queued_bytes();
+            assert!(
+                written <= WRITE_BUDGET_PER_PASS,
+                "1 回の flush_send で {written} bytes 書いた (上限 {WRITE_BUDGET_PER_PASS})"
+            );
+            assert_ne!(progress, WriteProgress::Failed);
+            if progress == WriteProgress::Blocked {
+                poll_writable(
+                    std::iter::once(ch.stream.as_fd()),
+                    Instant::now() + Duration::from_secs(10),
+                );
+            }
+            passes += 1;
+        }
+        assert!(
+            passes >= FLUSH_TEST_PAYLOAD / WRITE_BUDGET_PER_PASS,
+            "8 MiB を {passes} 回で書いた"
+        );
+        drop(ch);
+        assert_eq!(reader.join().expect("reader"), FLUSH_TEST_PAYLOAD);
+    }
+
+    /// 送信 queue に書き残しのある client を、切断と再接続を繰り返すように何度も closing に
+    /// 移しても、closing は `MAX_CLOSING_CLIENTS` を超えず、daemon 側が握る socket の fd も
+    /// それ以上に増えない。上限を超えた client はその場で close される (相手は EOF を見る)。
+    #[test]
+    fn closing_is_capped_and_the_excess_is_closed_immediately() {
+        fn open_fds() -> usize {
+            std::fs::read_dir("/dev/fd").expect("read /dev/fd").count()
+        }
+        // 相手は読まないので、送信 buffer を埋めた残りが queue に残る (= closing に入る)。
+        let payload: SharedBytes = Arc::new(vec![0u8; 1024 * 1024]);
+        let mut peers: Vec<UnixStream> = Vec::new();
+        let mut closing: Vec<ClosingClient> = Vec::new();
+        let baseline = open_fds();
+        let rounds = 3;
+        let per_round = MAX_CLOSING_CLIENTS / 2 + 4;
+        for round in 0..rounds {
+            for i in 0..per_round {
+                let (ch, peer) = make_test_client((round * per_round + i) as u64, 64 << 20, vec![]);
+                assert_eq!(
+                    enqueue_for_client(&ch, Arc::clone(&payload)),
+                    EnqueueOutcome::Sent
+                );
+                assert_eq!(ch.flush_send(), WriteProgress::Blocked);
+                retire_client(&mut closing, ch);
+                peers.push(peer);
+            }
+            assert!(
+                closing.len() <= MAX_CLOSING_CLIENTS,
+                "round {round}: {}",
+                closing.len()
+            );
+            let daemon_side = open_fds() - baseline - peers.len();
+            assert!(
+                daemon_side <= MAX_CLOSING_CLIENTS,
+                "round {round}: daemon 側の fd が {daemon_side} 本 (上限 {MAX_CLOSING_CLIENTS})"
+            );
+        }
+        assert_eq!(closing.len(), MAX_CLOSING_CLIENTS);
+        // 上限を超えた分 (後から来た client) はその場で close されている。
+        let excess = peers.len() - MAX_CLOSING_CLIENTS;
+        for peer in peers.iter_mut().rev().take(excess) {
+            let mut all = Vec::new();
+            std::io::Read::read_to_end(peer, &mut all).expect("closed peer reads to EOF");
+            assert!(all.len() < payload.len(), "書き残しは捨てられる");
+        }
+    }
+
+    /// closing の相手が close したら、期限を待たずに次の `advance_closing` で close される
+    /// (相手の close で write が EPIPE になる。poll は POLLHUP で起きる)。
+    #[test]
+    fn closing_client_whose_peer_closed_is_closed_without_waiting_for_the_deadline() {
+        let (ch, peer) = make_test_client(11, 64 << 20, vec![]);
+        assert_eq!(
+            enqueue_for_client(&ch, Arc::new(vec![0u8; FLUSH_TEST_PAYLOAD])),
+            EnqueueOutcome::Sent
+        );
+        assert_eq!(ch.flush_send(), WriteProgress::Blocked);
+        let mut closing = Vec::new();
+        closing.extend(ch.into_closing(Instant::now() + Duration::from_secs(30)));
+        drop(peer);
+        let mut fds = [nix::poll::PollFd::new(closing[0].fd(), PollFlags::POLLOUT)];
+        let _ = poll(&mut fds, nix::poll::PollTimeout::from(5000u16));
+        let revents = fds[0].revents().unwrap_or(PollFlags::empty());
+        assert!(
+            revents.intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLOUT),
+            "相手の close で poll が起きる: {revents:?}"
+        );
+        advance_closing(&mut closing, Instant::now());
+        assert!(
+            closing.is_empty(),
+            "相手が閉じた closing は期限を待たずに close される"
+        );
+    }
+
+    /// attach の最初の redraw は上限の判定をせずに積む (handshake の応答の後で queue が空で
+    /// なくても、上限より大きくても積む)。書き込みに失敗した client には積まない。
+    #[test]
+    fn enqueue_ignoring_limit_accepts_a_frame_over_the_limit_on_a_non_empty_queue() {
+        let (ch, _peer) = make_test_client(12, 100, vec![]);
+        assert_eq!(
+            enqueue_for_client(&ch, Arc::new(vec![0u8; 80])),
+            EnqueueOutcome::Sent
+        );
+        assert_eq!(
+            enqueue_for_client(&ch, Arc::new(vec![0u8; 500])),
+            EnqueueOutcome::Overflow,
+            "通常の enqueue は上限で断る"
+        );
+        enqueue_ignoring_limit(&ch, Arc::new(vec![0u8; 500]));
+        assert_eq!(ch.queued_bytes(), 580);
+
+        let (failed, peer) = make_test_client(13, 100, vec![]);
+        drop(peer);
+        assert_eq!(
+            enqueue_for_client(&failed, Arc::new(vec![0u8; 8])),
+            EnqueueOutcome::Sent
+        );
+        assert_eq!(failed.flush_send(), WriteProgress::Failed);
+        enqueue_ignoring_limit(&failed, Arc::new(vec![0u8; 500]));
+        assert_eq!(failed.queued_bytes(), 0, "失敗した queue には積まない");
     }
 
     /// 送信 queue が空の client は、切断時に closing に入らずその場で close される。

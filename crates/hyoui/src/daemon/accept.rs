@@ -41,8 +41,8 @@ use crate::sys::clock::now_unix_ms;
 
 use super::DaemonConfig;
 use super::broadcast::{
-    CLOSE_FLUSH_TIMEOUT, ClientHandle, ClosingClient, SharedBytes, broadcast_control,
-    enqueue_for_client, retire_client, send_control,
+    CLOSE_FLUSH_TIMEOUT, ClientHandle, ClosingClient, SharedBytes, admit_closing,
+    broadcast_control, enqueue_for_client, retire_client, send_control,
 };
 use super::lock::{SessionState, elevate_next_leader, should_assign_leader};
 use super::reducer::{self, DaemonState, translate};
@@ -466,7 +466,7 @@ pub(super) fn process_pending_handshakes(
                             // sync deferral)。sync 終了後に caller が flush する。
                             pending_redraws.push(new_id);
                         } else {
-                            send_attach_redraw(&accepted.handle, screen_state, overflow_ids);
+                            send_initial_attach_redraw(&accepted.handle, screen_state);
                         }
                         let new_mode = accepted.handle.mode;
                         clients.push(accepted.handle);
@@ -558,7 +558,9 @@ pub(super) fn process_pending_handshakes(
                     Err(rejected) => {
                         // 拒否: error を書き終えてから close する (closing へ)。
                         // socket の設定失敗等 (None) はそのまま close。
-                        closing.extend(rejected);
+                        if let Some(c) = rejected {
+                            admit_closing(closing, c);
+                        }
                     }
                 }
                 // remove したので i は変えない
@@ -594,22 +596,15 @@ pub(super) fn process_pending_handshakes(
 /// bytes を raw_data frame に詰めて enqueue する (= 通常 broadcast の生 byte
 /// 経路と同じ frame type)。enqueue が overflow だった場合は
 /// 当該 client_id を `overflow_ids` に積み、caller が drop する設計。
+/// attach 直後の最初の redraw は [`send_initial_attach_redraw`] を使う。
 pub(super) fn send_attach_redraw(
     ch: &ClientHandle,
     screen_state: &ScreenState,
     overflow_ids: &mut Vec<u64>,
 ) {
-    // pristine state なら `bytes` は空 Vec (= issue 2026-05-29-bug-attach-initial-
-    // clear-on-empty-session.md の対策、`build_attach_redraw` 参照)。frame 自体は
-    // 既存 client / test の「handshake 直後に必ず raw_data frame が 1 つ来る」契約を
-    // 維持するため empty payload で送る。client 側は empty payload を stdout に書いても
-    // 何も起きない (= 自然な no-op)、外側 shell の画面 history が clear されない。
-    let bytes = build_attach_redraw(screen_state);
-    let mut frame_bytes = Vec::new();
-    if Frame::raw_data(bytes).encode_to(&mut frame_bytes).is_err() {
+    let Some(payload) = attach_redraw_frame(screen_state) else {
         return;
-    }
-    let payload: SharedBytes = Arc::new(frame_bytes);
+    };
     match enqueue_for_client(ch, payload) {
         super::broadcast::EnqueueOutcome::Sent => {}
         // 書き込み失敗は disconnect の根拠にしない (= 理由は
@@ -618,6 +613,27 @@ pub(super) fn send_attach_redraw(
         super::broadcast::EnqueueOutcome::SendFailed => {}
         super::broadcast::EnqueueOutcome::Overflow => overflow_ids.push(ch.id),
     }
+}
+
+/// attach 直後 (handshake の応答の後、または DEC sync の終了まで保留した後) の最初の
+/// redraw を積む。handshake の応答と 1 組として扱い、queue の上限の判定は外す (理由は
+/// [`super::broadcast::enqueue_ignoring_limit`])。
+pub(super) fn send_initial_attach_redraw(ch: &ClientHandle, screen_state: &ScreenState) {
+    if let Some(payload) = attach_redraw_frame(screen_state) {
+        super::broadcast::enqueue_ignoring_limit(ch, payload);
+    }
+}
+
+fn attach_redraw_frame(screen_state: &ScreenState) -> Option<SharedBytes> {
+    // pristine state なら `bytes` は空 Vec (= issue 2026-05-29-bug-attach-initial-
+    // clear-on-empty-session.md の対策、`build_attach_redraw` 参照)。frame 自体は
+    // 既存 client / test の「handshake 直後に必ず raw_data frame が 1 つ来る」契約を
+    // 維持するため empty payload で送る。client 側は empty payload を stdout に書いても
+    // 何も起きない (= 自然な no-op)、外側 shell の画面 history が clear されない。
+    let bytes = build_attach_redraw(screen_state);
+    let mut frame_bytes = Vec::new();
+    Frame::raw_data(bytes).encode_to(&mut frame_bytes).ok()?;
+    Some(Arc::new(frame_bytes))
 }
 
 /// `OwnedFd` を `std::os::unix::net::UnixStream` に変換する。

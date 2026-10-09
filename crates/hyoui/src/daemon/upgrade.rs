@@ -9,9 +9,9 @@
 //! # trigger (Phase 1 隠し経路、Phase 2 でも共通)
 //!
 //! daemon serve_loop の self-pipe に `SIGUSR1` を register する。外部から
-//! `kill -USR1 <daemon-pid>` を送ると `handle_suspend_signals` が
-//! `RelayOutcome::UpgradeRequested` を返し、`Session::serve` が本 module の
-//! [`perform_self_exec`] を呼ぶ。正規 `upgrade.request` protocol kind の追加 +
+//! `kill -USR1 <daemon-pid>` を送ると `handle_suspend_signals` が upgrade 待ちの state を立て、
+//! serve_loop が client に積んだ frame を書き終えてから `RelayOutcome::UpgradeRequested` を
+//! 返し、`Session::serve` が本 module の [`perform_self_exec`] を呼ぶ。正規 `upgrade.request` protocol kind の追加 +
 //! `hyoui upgrade` subcommand は Phase 3。
 //!
 //! # 引き継ぐもの (Phase 2)
