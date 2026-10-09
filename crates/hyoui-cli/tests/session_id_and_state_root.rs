@@ -331,21 +331,29 @@ fn concurrent_runs_with_the_same_id_only_one_wins() {
         .into_iter()
         .map(|mut c| c.wait().expect("wait run").code())
         .collect();
+    let stderrs: Vec<String> = (0..6)
+        .map(|i| std::fs::read_to_string(errs.path().join(i.to_string())).unwrap_or_default())
+        .collect();
+    // 失敗した時に原因を辿れるよう、全 run の exit code と stderr を並べる。
+    let report = codes
+        .iter()
+        .zip(&stderrs)
+        .enumerate()
+        .map(|(i, (code, err))| format!("--- run {i}: exit {code:?}\n{err}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert_eq!(
         codes.iter().filter(|c| **c == Some(0)).count(),
         1,
-        "exactly one run wins: {codes:?}"
+        "exactly one run wins:\n{report}"
     );
     assert_eq!(
         codes.iter().filter(|c| **c == Some(1)).count(),
         5,
-        "{codes:?}"
+        "\n{report}"
     );
-    let losers_said_why = (0..6)
-        .map(|i| std::fs::read_to_string(errs.path().join(i.to_string())).unwrap_or_default())
-        .filter(|e| e.contains("既にある"))
-        .count();
-    assert_eq!(losers_said_why, 5);
+    let losers_said_why = stderrs.iter().filter(|e| e.contains("既にある")).count();
+    assert_eq!(losers_said_why, 5, "\n{report}");
     let (ids, _) = list_ids(root.path());
     assert_eq!(ids, [sid.as_str()]);
     kill_session(root.path(), &sid);

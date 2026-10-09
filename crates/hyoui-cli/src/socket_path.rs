@@ -17,7 +17,7 @@
 //! `$TMPDIR` / `$XDG_RUNTIME_DIR` は使わない。runtime dir はログインに紐づく寿命で、
 //! ログインを越えて動き続ける session と合わない (決定 6)。
 
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// hyoui が振る session id (= UUID の標準形、DR-0041 決定 2)。
@@ -94,7 +94,11 @@ pub fn resolve_with_env(
 fn ensure_sessions_dir(env: &EnvSnapshot) -> std::io::Result<PathBuf> {
     let root = env.env.state_root()?;
     if std::fs::symlink_metadata(&root).is_err() {
-        create_private_dir(&root)?;
+        match create_private_dir(&root) {
+            // 並行した run が先に作った (= 既にある root の mode は見ない)。
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            r => r?,
+        }
     }
     let sessions = root.join("sessions");
     ensure_socket_dir(&sessions, env.uid)?;
@@ -110,40 +114,57 @@ pub fn existing_sessions_dir() -> Option<PathBuf> {
 }
 
 /// `dir` を mode 0700 で作る (= 途中の dir も作る。mode を保証するのは末端だけ)。
+///
+/// 末端は mkdir の時点で 0700 にする (= umask 022 等で一旦 0755 の dir が見える瞬間を作らない。
+/// 作ってから chmod する 2 段だと、並行した run がその瞬間の dir を見て mode 違いで断る)。
+/// mkdir の mode は umask で bit が削られるだけなので 0700 を超えない。続く chmod は umask が
+/// 持ち主の bit まで削った時の補正。末端が既にあれば `AlreadyExists` を返す。
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::DirBuilder::new().mode(0o700).create(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
 /// `dir` を「mode 0700 + 所有者 = euid」で利用可能にする。
 ///
-/// - dir が存在しない → 新規作成し mode 0700 を設定
-/// - dir が既存 → 所有者と mode を verify、不一致なら error (= 攻撃面回避)
+/// - dir が存在しない → mode 0700 で作る
+/// - dir が既存 (= 前の run、または並行した run が先に作った) → 所有者と mode を verify、
+///   不一致なら error (= 攻撃面回避)
+///
+/// 有無を見てから作る 2 段にせず、先に作って `AlreadyExists` なら verify に回す (= 有無の
+/// 判定と作成の間に、並行した run が dir を作る隙間を作らない)。
 fn ensure_socket_dir(dir: &Path, expected_uid: u32) -> std::io::Result<()> {
-    match std::fs::metadata(dir) {
-        Ok(meta) => {
-            if !meta.is_dir() {
-                return Err(std::io::Error::other(format!(
-                    "socket dir {dir:?} exists but is not a directory"
-                )));
-            }
-            let mode = meta.permissions().mode() & 0o777;
-            if mode != 0o700 {
-                return Err(std::io::Error::other(format!(
-                    "socket dir {dir:?} has mode {mode:o}, expected 0700"
-                )));
-            }
-            if meta.uid() != expected_uid {
-                return Err(std::io::Error::other(format!(
-                    "socket dir {dir:?} owner uid={} mismatches euid={expected_uid}",
-                    meta.uid()
-                )));
-            }
-            Ok(())
+    match create_private_dir(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            verify_socket_dir(dir, expected_uid)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_private_dir(dir),
-        Err(e) => Err(e),
+        r => r,
     }
+}
+
+/// 既にある socket dir が「dir、mode 0700、所有者 = euid」か。
+fn verify_socket_dir(dir: &Path, expected_uid: u32) -> std::io::Result<()> {
+    let meta = std::fs::metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "socket dir {dir:?} exists but is not a directory"
+        )));
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        return Err(std::io::Error::other(format!(
+            "socket dir {dir:?} has mode {mode:o}, expected 0700"
+        )));
+    }
+    if meta.uid() != expected_uid {
+        return Err(std::io::Error::other(format!(
+            "socket dir {dir:?} owner uid={} mismatches euid={expected_uid}",
+            meta.uid()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -256,6 +277,7 @@ mod tests {
         let env = snapshot(&[("HYOUI_STATE_DIR", tmp.path())]);
         resolve_with_env(None, SID, &env).expect("an existing 0755 root is fine");
         assert_eq!(mode_of(tmp.path()), 0o755, "the root's mode is left alone");
+        resolve_with_env(None, SID, &env).expect("an existing 0700 sessions/ is reused");
 
         std::fs::set_permissions(
             tmp.path().join("sessions"),
