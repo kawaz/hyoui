@@ -18,6 +18,13 @@
 
 ## 裁定待ち
 
+### 👺SIG-Q2: 子を起動する時、SIGCHLD の無視も既定に戻すか
+
+SIG-Q1 で既定に戻す 6 つ (SIGINT / SIGQUIT / SIGTSTP / SIGTTIN / SIGTTOU / SIGPIPE) に SIGCHLD を足すか ([DR-0043](decisions/DR-0043-child-starts-with-default-signals.md))。呼び出し元が SIGCHLD を無視 (SIG_IGN) していると子に引き継がれ、子が自分の子を `wait` で回収できなくなる (POSIX: SIGCHLD が無視されている時、終わった子は zombie にならず wait は ECHILD)。tmux は子を起動する時に SIGCHLD も既定に戻している。統括推しは a (shell や make のように子を回収する子が、呼び出し元の事情で壊れる。既定に戻して困る子は無い)。
+
+- [ ] a: SIGCHLD も既定に戻す
+- [ ] b: 足さない (裁定どおり 6 つ)
+
 ### 👺NB-Q4: 固まった daemon の検出をどこまで入れるか
 
 DR-0037 「固まった daemon の検出」節の 3 層。統括推しは c (1 は list-prune で実装中、2 は原因究明に必須、3 は有界な占有の可視化で安い)。

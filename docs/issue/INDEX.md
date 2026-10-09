@@ -4,6 +4,9 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-10-09 | bug | open | [child-inherits-zero-core-limit](./2026-10-09-bug-child-inherits-zero-core-limit.md) | daemon が RLIMIT_CORE を hard 0 にしていて子が引き継ぐ (子は core を出せず、上げ直せない) |
+| 2026-10-09 | bug | open | [daemon-inherits-blocked-signal-mask](./2026-10-09-bug-daemon-inherits-blocked-signal-mask.md) | 呼び出し元で block された SIGTERM 等が daemon の mask に残り、kill -TERM <daemon> が効かない |
+| 2026-10-09 | task | open | [session-log-viewer-and-cleanup](./2026-10-09-task-session-log-viewer-and-cleanup.md) | session ごとの daemon ログを CLI から見る手段 (hyoui log) と、溜まったログの片付け |
 | 2026-10-09 | design | open | [client-partial-frame-buffer-unbounded](./2026-10-09-design-client-partial-frame-buffer-unbounded.md) | client ごとの受信途中 buffer に合計の上限が無い (DR-0037 段 1 の後、1 client 最大 16MiB) |
 | 2026-10-09 | bug | open | [wait-spec-errors-on-child-stop](./2026-10-09-bug-wait-spec-errors-on-child-stop.md) | hyoui input の wait: で待っている間に子が止まると「予期しない message」で失敗するはず (未確認) |
 | 2026-10-09 | bug | pending | [child-action-menu-closed-by-echoed-ctrl-z](./2026-10-09-bug-child-action-menu-closed-by-echoed-ctrl-z.md) | 子が ^Z をエコーする時 (cat 等)、^Z×2 で出た child action menu がキーを受け付けず子へ素通りする |
