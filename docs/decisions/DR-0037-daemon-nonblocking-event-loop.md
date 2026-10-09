@@ -1,6 +1,6 @@
 # DR-0037: daemon のイベントループは外部の応答を待たない
 
-- Status: Proposed (2026-09-29)。裁定待ち論点は末尾「裁定待ち」節
+- Status: Proposed (2026-09-29)。Q1 / Q2 / Q3 / Q8 と段階 1 の着手は裁定済み (2026-10-09、「裁定」節)。Q4〜Q7 は「裁定待ち」節
 - Date: 2026-09-29
 - Related: DR-0025 (reducer 化。単一 thread の `poll → translate → reduce → effect` loop と EffectResult feedback を本 DR が前提にする), DR-0014 (透過原則と検証主義。検出手段で介入をどこまで入れるかの判断軸), DR-0021 (PTY drain ack。PTY write の非同期化で ack の発行点を保つ必要がある), DR-0016 (record。writer thread と stop / abort の扱い), DR-0028 (graceful upgrade。state file 書き出しと fd 引き継ぎ), DR-0015 (fork daemon + attach client。daemon の stdio の出どころ)
 - Origin: `docs/issue/2026-09-29-daemon-must-never-hang.md` (kawaz 裁定 2026-09-29)。事実は `docs/findings/2026-09-29-daemon-blocking-points.md`
@@ -155,16 +155,22 @@ SIGKILL 後の reap (K-5): 現行は flag なしの `waitpid` で見届ける。
 | 標準エラーが読まれない pipe | cat |
 | SIGKILL 後も reap できない子 (注入点で再現) | — |
 
+## 裁定
+
+2026-10-09 kawaz 裁定:
+
+- **Q1 runtime**: A (`poll` + self-pipe の延長、全 fd nonblocking)。B (mio) は `poll(2)` の fd 走査コストが実測で問題になった時の置き換え先
+- **Q2 client 送信**: writer thread を廃止し、loop 内の nonblocking write + `POLLOUT` にする
+- **Q3 daemon のログ出力先**: 起動後の fd 2 と logger の書き先は、state dir 配下の session ごとのログファイル。起動失敗の報告は ready 通知の前は呼び出し元の stderr に出す
+- **Q8 表示名**: `no-response` (観測事実の名前。「止まっている可能性が高い」は help に推定として書く)
+- **段階 1 (client 受信の nonblocking 化)** は着手してよい
+
 ## 裁定待ち
 
-- **Q1 runtime**: A (`poll` + self-pipe の延長) と B (mio) のどちらにするか。推しは A (理由は runtime 節)
-- **Q2 client 送信**: writer thread を廃止して loop 内 nonblocking write にするか、writer thread を残して「Drop は join しない (detach + shutdown)」にするか。推しは廃止 (thread の生存管理と join がそもそも無くなる、backpressure の計算が loop 内の純粋 state になる)。残す案は変更範囲が小さい
-- **Q3 daemon のログ出力先**: 起動後の fd 2 と logger の書き先を、state dir 配下の session ごとのログファイルにするか、`/dev/null` にするか。起動失敗の報告は現行どおり ready 通知前は呼び出し元の stderr に出す
 - **Q4 reap できない子**: SIGKILL 後 deadline を過ぎても reap できない子を置いて daemon が終了するときの exit code (現行の `128 + 9` とするか、別の値で区別するか)
 - **Q5 検出**: 検出節の 3 層 (CLI 側の `no-response` 分類 / watchdog のログ / status の占有指標) のうちどこまで入れるか。CLI 側の分類は必須と考える
 - **Q6 固まった IO worker**: fs が応答せず worker が戻らない場合に、worker thread の上限を設けるか (上限到達で `record.start` を拒否する等)、record を aborted として表示するか
 - **Q7 PTY 書き込み effect の失敗意味論と後続 raw_data**: 「PTY 書き込み effect の完了と失敗」節の 5 点 (残余破棄、後続 effect の書かずに破棄、draining の deadline 200ms と超過時に client が ack でなく EOF を見ること) をこのまま確定してよいか。あわせて、同一 client の raw_data が前の effect の完了前に来たとき queue に積むか拒否するか。client 間の順序は DR-0022 の auto-lock が保証し、ここで決めるのは同一 client 内の扱い
-- **Q8 no-response の表示名**: CLI の表示状態を観測事実の名前 (`no-response`) にするか、issue 側で使っている `hung` を推定と明記した上で使うか
 
 ## Consequences
 
@@ -172,7 +178,7 @@ SIGKILL 後の reap (K-5): 現行は flag なしの `waitpid` で見届ける。
 
 - どの外部が止まっても SIGCHLD の回収と status 応答が続く。zombie の残留と「生きているが固まる」daemon が構造的に無くなる
 - client の受信・送信・handshake が純粋 state になり、socket を立てずに unit test できる範囲が増える
-- writer thread と handshake thread が無くなる (Q2 で廃止を選んだ場合)
+- writer thread と handshake thread が無くなる (Q2)
 
 コスト・リスク:
 

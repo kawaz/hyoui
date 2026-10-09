@@ -18,6 +18,8 @@ blocked_by:
 
 # 呼び出し元で無視 (SIG_IGN) されている signal が、daemon を経て子にそのまま引き継がれる ($(hyoui run --detached ...) の子が ^Z で止まらない)
 
+**裁定済み (2026-10-09、kawaz、SIG-Q1 = a)**: 子の exec の前に、SIGINT / SIGQUIT / SIGTSTP / SIGTTIN / SIGTTOU / SIGPIPE を既定 (SIG_DFL) に戻し、signal mask も空にする。DR-0042 の「hyoui は bash の位置に立つ」に揃える (対話の bash が前景の job に対してするのと同じ)。
+
 ## 観測 (2026-10-09、0.14.2)
 
 `I=$(hyoui run --detached -- cat)` で起動した子は、^Z も外からの `kill -TSTP` も効かず `S+` のままだった。`hyoui run --detached -- cat >file` の形で起動し直すと `kill -TSTP` で `T+` になる。プロセスの構造は DR-0017 のとおり (daemon が session leader、子は同じ session の別 pgrp)。
