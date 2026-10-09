@@ -366,7 +366,7 @@ hyoui holds only the vertical axis and leaves the horizontal flow alone.
 - The child's fd 0 is the PTY when the caller's fd 0 is a tty, and otherwise the caller's fd 0 itself (the same wiring a shell does when it starts `cmd | child`)
 - `run --pty-stdin` ignores the caller's fd 0 and makes the child's fd 0 the PTY too (for starting a shell / REPL that is driven from outside, from a launcher with no terminal)
 - Keys reach the PTY. Whether the child reads fd 0 or `/dev/tty`, `hyoui input` and keys from attach reach it
-- The child starts as the PTY's foreground job. It is exec'd with SIGINT / SIGQUIT / SIGTSTP / SIGTTIN / SIGTTOU / SIGPIPE at their default disposition and an empty signal mask (^C / ^Z work even when the caller ignored or blocked them via `$(...)` or `cmd &`; [[DR-0043]])
+- The child starts as the PTY's foreground job. It is exec'd with SIGINT / SIGQUIT / SIGTSTP / SIGTTIN / SIGTTOU / SIGPIPE at their default disposition and an empty signal mask (^C / ^Z work even when the caller ignored or blocked them via `$(...)` or `cmd &`; [[DR-0043]]). `RLIMIT_CORE` is also exec'd at the caller's value (the daemon lowers only its own soft limit to stop its own core dumps, and the child restores it before exec)
 
 ### 3.1.1 Attach handshake redraw restore ([[DR-0013]] §4 Phase A)
 

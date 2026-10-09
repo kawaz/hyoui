@@ -81,8 +81,7 @@
 ## 関連
 
 - [[R5-H11]] — `generate_lock_token` の `expect` を排除した経緯
-- [[R5-H12]] — core dump 抑止導入 (= `setrlimit(RLIMIT_CORE, 0)`、
-  `HYOUI_ALLOW_CORE=1` で opt-in)
+- [[R5-H12]] — core dump 抑止導入 (= `RLIMIT_CORE` の soft を 0、hard と子の上限は呼び出し元のまま (DR-0043 決定 5)、`HYOUI_ALLOW_CORE=1` で opt-in)
 - [[R5-H7]] — `killpg` 化により daemon 死亡 = 子孫プロセス全死亡
 - [[R5-SRE-C1]] — 構造化ログ基盤の整備 (panic stack を残すための前提)
 - `crates/hyoui/src/daemon/session.rs:148` — `HYOUI_ALLOW_CORE` parse

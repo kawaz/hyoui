@@ -336,12 +336,13 @@ impl Session {
         // secret を memory 上に常駐させる。`panic = "abort"` / SIGSEGV / SIGABRT
         // で core dump が `/cores/...` や `systemd-coredump` に書かれると、
         // 同 UID の他 process / 管理者に secret が leak する。
-        // soft/hard 両方を 0 に固定して恒久抑止する。
+        // soft を 0 にして抑止する (daemon は自分で soft を上げない)。hard は呼び出し元の
+        // まま残し、子は exec の前に soft を呼び出し元の値へ戻す (DR-0043 決定 5)。
         // `HYOUI_ALLOW_CORE=1` 指定時のみ skip して debug できる (= opt-out)。
         // 既存 path に core dump file が残っているケースは touch しない
         // (= これは「次の crash で書かれる」抑止)。
         if !core_dump_allowed_by_env() {
-            crate::sys::raw::setrlimit_core_zero()?;
+            crate::sys::raw::suppress_core_dump()?;
         }
         // socket を子の spawn より先に bind する: 同じ id の socket が既にある時は
         // (DR-0041 決定 3)、子を起こす前に起動を断る (= 起こしてから殺さない)。listener と
@@ -3358,18 +3359,25 @@ mod tests {
         assert!(!core_dump_allowed_value(Some("1\n")));
     }
 
-    /// R5-H12: `Session::start` 通過後は `RLIMIT_CORE` の soft/hard が両方 0 に
-    /// 固定される (= panic / SIGSEGV で core dump が書かれない)。
-    ///
-    /// 注意: 一度 hard を 0 に落とすと process 寿命中は二度と上げられない。
-    /// 本 test と他の `Session::start` を呼ぶ test (例:
-    /// `start_spawns_child_and_binds_socket`) は同一 process 内で並列実行され、
-    /// どれが先に走っても以降は永久に (0, 0) なので race 条件は無い
-    /// (= test 間でリセット不要)。
-    #[test]
-    fn session_start_sets_core_rlimit_to_zero() {
-        use crate::sys::raw::getrlimit_core;
+    /// `RLIMIT_CORE` を観測・変更する test を直列にする (= 片方が soft を上げる間に、もう
+    /// 片方が「start の後は soft 0」を読まない)。他の `Session::start` は soft を 0 にするだけ
+    /// なので、ここに入れなくても両 test の assert を崩さない。
+    static CORE_LIMIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// R5-H12: `Session::start` 通過後は daemon の `RLIMIT_CORE` の soft が 0 になり
+    /// (= panic / SIGSEGV で daemon の core dump が書かれない)、hard は呼び出し元の値の
+    /// まま残る (= 子が継承して上げ直せなくならない、DR-0043 決定 5)。
+    ///
+    /// 同じ process で `Session::start` を呼ぶ他の test と並列に走っても、hyoui が hard を
+    /// 変えることは無く、soft はどの start の後も 0 なので、どちらの assert も順序に依らない。
+    #[test]
+    fn session_start_lowers_only_the_core_soft_limit() {
+        use crate::sys::raw::{caller_core_limit, getrlimit_core};
+
+        let _guard = CORE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = getrlimit_core().expect("getrlimit before");
         let dir = make_temp_socket_dir();
         let sock = dir.path().join("core.sock");
         let cfg = DaemonConfig::new("core-test", sock, long_running_cmd());
@@ -3384,8 +3392,67 @@ mod tests {
             "RLIMIT_CORE soft must be 0 after Session::start"
         );
         assert_eq!(
-            rl.hard, 0,
-            "RLIMIT_CORE hard must be 0 after Session::start"
+            rl.hard, before.hard,
+            "RLIMIT_CORE hard must stay at the caller's value"
+        );
+        let saved = caller_core_limit().expect("Session::start saves the caller's limit");
+        assert_eq!(saved.hard, before.hard, "saved hard = the caller's hard");
+    }
+
+    /// DR-0043 決定 5: `Session::start` が起こした子は、daemon が下げる前の呼び出し元の
+    /// `RLIMIT_CORE` (soft / hard) で exec する。子の `sh` に `ulimit` を 1 行で報告させ、
+    /// 保存値を `ulimit` の表記 (512 byte 単位 / `unlimited`) にしたものと比べる。
+    ///
+    /// 呼び出し元の soft が 0 だと、子が soft を戻したかを区別できないので、まだ誰も
+    /// 保存していなければ (= この test が process で最初の `Session::start`。nextest は test
+    /// ごとに process を分ける) 先に soft を 1 MiB にしておく。`cargo test` で他の test が先に
+    /// 保存していた時は、その保存値で同じことを確かめる。test process の hard が 0 (= hard 0
+    /// の process の下で走らせた時) だと soft も上げられず、`core=0,0` の一致を見るだけになる。
+    #[test]
+    fn session_child_starts_with_the_caller_core_limit() {
+        use crate::sys::raw::caller_core_limit;
+        use std::io::Read;
+
+        let _guard = CORE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if caller_core_limit().is_none() {
+            crate::sys::raw::set_core_soft_limit_for_test(1024 * 1024).expect("raise core soft");
+        }
+        let dir = make_temp_socket_dir();
+        let sock = dir.path().join("core-child.sock");
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo \"core=$(ulimit -S -c),$(ulimit -H -c)\"".to_string(),
+        ];
+        let session = Session::start(DaemonConfig::new("core-child", sock, cmd)).expect("start");
+        let pid = session.child_pid();
+        let saved = caller_core_limit().expect("Session::start saves the caller's limit");
+        let master = session
+            .pty()
+            .master_fd()
+            .try_clone_to_owned()
+            .expect("dup master");
+        master.set_nonblocking(false).expect("blocking master");
+        let mut out = String::new();
+        // sh は 1 行出して exit。master EOF (PTY なので EIO) まで読む。
+        let _ = std::fs::File::from(master).read_to_string(&mut out);
+        drop(session);
+        cleanup_child(pid);
+
+        let to_ulimit = |v: u64| -> String {
+            if v == libc::RLIM_INFINITY {
+                "unlimited".to_string()
+            } else {
+                // sh の `ulimit -c` は 512 byte 単位 (POSIX)。
+                (v / 512).to_string()
+            }
+        };
+        let expected = format!("core={},{}", to_ulimit(saved.soft), to_ulimit(saved.hard));
+        assert!(
+            out.lines().any(|l| l.trim_end_matches('\r') == expected),
+            "child must report {expected:?}: raw output={out:?}"
         );
     }
 

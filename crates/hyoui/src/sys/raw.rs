@@ -28,11 +28,14 @@
 //!   `BorrowedFd::borrow_raw` / `OwnedFd::from_raw_fd` so the rest of the
 //!   crate never spells those operations directly.
 //!
-//! * [`setrlimit_core_zero`] / [`getrlimit_core`] — `setrlimit(RLIMIT_CORE)` /
-//!   `getrlimit(RLIMIT_CORE)`. R5-H12 で daemon の core dump 抑止に使う。
+//! * [`suppress_core_dump`] / [`getrlimit_core`] / [`caller_core_limit`] —
+//!   `setrlimit(RLIMIT_CORE)` / `getrlimit(RLIMIT_CORE)`. R5-H12 で daemon の core dump
+//!   抑止に使う。子は exec の前に呼び出し元の値へ戻す (DR-0043 決定 5)。
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use nix::errno::Errno;
 use nix::pty::{ForkptyResult, OpenptyResult, Winsize};
@@ -279,6 +282,10 @@ pub fn openpty_fork_anchor_exec(
             libc::signal(libc::SIGTTOU, libc::SIG_IGN);
             libc::tcsetpgrp(slave_raw, libc::getpid());
         }
+        // RLIMIT_CORE を呼び出し元の値に戻す (DR-0043 決定 5)。mask を空にする前に行う
+        // (= block 中に届いていた SIGQUIT 等が既定の動作で core を書く時、exec 後と同じ
+        // 上限で書く)。
+        restore_caller_core_limit_for_exec();
         // 前景の job として exec する: SIGINT / SIGQUIT / SIGTSTP / SIGTTIN / SIGTTOU /
         // SIGPIPE を既定に戻し、signal mask を空にする (DR-0043)。呼び出し元の mask には
         // 戻さない。foreground 化の後に行う (= 既定の SIGTTOU で tcsetpgrp が止まらない)。
@@ -428,8 +435,10 @@ pub fn forkpty_then_exec_legacy(
         }
         ForkptyResult::Child => {
             // 継承した self-pipe handler を無効化してから、signal の扱いを既定に戻して
-            // mask を空にする (= anchor 経路と同じ順序と内容、DR-0043)。
+            // mask を空にする。RLIMIT_CORE は mask を空にする前に呼び出し元の値へ戻す
+            // (= anchor 経路と同じ順序と内容、DR-0043)。
             super::signal::disarm_self_pipe_in_child();
+            restore_caller_core_limit_for_exec();
             super::signal::reset_signals_for_exec();
             // cwd 伝搬: 起動元 dir に chdir してから exec (= 透過性回復、本体は
             // openpty_fork_anchor_exec と同じ contract)。失敗時は exec を中止して
@@ -488,24 +497,103 @@ pub struct RlimitPair {
     pub hard: u64,
 }
 
-/// Force `RLIMIT_CORE` to `(0, 0)` so that `panic = "abort"` / SIGSEGV /
-/// SIGABRT do **not** produce a core dump.
+/// [`suppress_core_dump`] が初めて下げる前の `RLIMIT_CORE` (= 呼び出し元の値) を保存
+/// したか。子は exec の前にこの値へ戻す ([`restore_caller_core_limit_for_exec`])。
+///
+/// Design rationale: 値は引数でなく process 全体の static に持つ。RLIMIT_CORE 自体が
+/// process 全体の属性で、「hyoui が下げる前の値」も process に 1 つしかない。同じ process で
+/// `Session::start` を何度も呼ぶ経路 (test) で呼ぶたびに今の値を取ると、2 回目以降は
+/// hyoui 自身が下げた 0 を呼び出し元の値と取り違える。fork 後の子は lock を取れないので、
+/// 読み出しは atomic だけで行う (= 書き込みは fork 前に終わっている)。
+static CALLER_CORE_SAVED: AtomicBool = AtomicBool::new(false);
+/// 保存した呼び出し元の soft limit (`rlim_cur`)。[`CALLER_CORE_SAVED`] が true の時だけ有効。
+static CALLER_CORE_SOFT: AtomicU64 = AtomicU64::new(0);
+/// 保存した呼び出し元の hard limit (`rlim_max`)。[`CALLER_CORE_SAVED`] が true の時だけ有効。
+static CALLER_CORE_HARD: AtomicU64 = AtomicU64::new(0);
+/// [`suppress_core_dump`] の「読む → 保存 → 下げる」を並行呼び出し (test) の間で 1 つにする。
+static CORE_SUPPRESS_LOCK: Mutex<()> = Mutex::new(());
+
+/// `RLIMIT_CORE` の soft limit を 0 にして、`panic = "abort"` / SIGSEGV / SIGABRT で
+/// daemon の core dump が書かれないようにする。hard limit は呼び出し元のまま残す。
 ///
 /// R5-H12: daemon process memory に `lock_token` や `HYOUI_LOCK_TOKEN` 環境変数の
 /// plain-text 値が常駐するため、abort 時に `/cores/...` や `systemd-coredump` で
-/// 同 UID の他 process / 管理者にこれら secret が leak する。
-/// daemon 起動直後 (`Session::start`) に soft/hard 両方を 0 に固定して core dump
-/// 生成を恒久抑止する。
+/// 同 UID の他 process / 管理者にこれら secret が leak する。daemon は自分で soft を
+/// 上げないので、soft 0 だけで daemon の core は書かれない。hard まで 0 にすると、子が
+/// それを継承して上げ直せなくなる (DR-0043 決定 5)。
+///
+/// 初回の呼び出しで、下げる前の値を呼び出し元の値として保存する (2 回目以降は保存しない)。
+/// 子は exec の前に [`restore_caller_core_limit_for_exec`] でその値へ戻す。
 ///
 /// 既存 path に core dump file が落ちているケース (= 過去の crash の残骸) は
 /// 触らない — これは「次の crash で書かれる core dump」を抑止する操作。
-pub fn setrlimit_core_zero() -> Result<()> {
+pub fn suppress_core_dump() -> Result<()> {
+    let _guard = CORE_SUPPRESS_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let current = getrlimit_core()?;
+    if !CALLER_CORE_SAVED.load(Ordering::Acquire) {
+        CALLER_CORE_SOFT.store(current.soft, Ordering::Relaxed);
+        CALLER_CORE_HARD.store(current.hard, Ordering::Relaxed);
+        CALLER_CORE_SAVED.store(true, Ordering::Release);
+    }
     let rlim = libc::rlimit {
         rlim_cur: 0,
-        rlim_max: 0,
+        rlim_max: current.hard,
     };
     // SAFETY: `&rlim` outlives the syscall; `RLIMIT_CORE` is a valid constant.
     // `setrlimit` writes nothing through the pointer (read-only argument).
+    let r = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &rlim) };
+    if r == -1 {
+        return Err(Error::Errno(Errno::last()));
+    }
+    Ok(())
+}
+
+/// [`suppress_core_dump`] が保存した呼び出し元の `RLIMIT_CORE`。まだ下げていなければ
+/// (`HYOUI_ALLOW_CORE=1` の時を含む) `None`。
+pub fn caller_core_limit() -> Option<RlimitPair> {
+    CALLER_CORE_SAVED
+        .load(Ordering::Acquire)
+        .then(|| RlimitPair {
+            soft: CALLER_CORE_SOFT.load(Ordering::Relaxed),
+            hard: CALLER_CORE_HARD.load(Ordering::Relaxed),
+        })
+}
+
+/// fork した子が exec の前に、`RLIMIT_CORE` を [`suppress_core_dump`] が保存した呼び出し
+/// 元の値へ戻す (DR-0043 決定 5)。保存していなければ (= daemon が下げていない) 何もしない。
+///
+/// fork〜exec の区間で呼ぶので、atomic の読み出しと `setrlimit(2)` だけで行う (alloc も
+/// lock もしない)。`setrlimit` は POSIX の async-signal-safe 一覧には無いが、Linux (glibc /
+/// musl) と macOS の libc では syscall を 1 回呼ぶだけの wrapper で、状態を持たない。
+/// 失敗 (= 保存した hard を誰かが下げた) は無視する: 子は daemon の soft 0 のまま exec する
+/// (= 下げすぎる側に倒れ、上げすぎることは無い)。
+pub(crate) fn restore_caller_core_limit_for_exec() {
+    if !CALLER_CORE_SAVED.load(Ordering::Acquire) {
+        return;
+    }
+    let rlim = libc::rlimit {
+        rlim_cur: CALLER_CORE_SOFT.load(Ordering::Relaxed),
+        rlim_max: CALLER_CORE_HARD.load(Ordering::Relaxed),
+    };
+    // SAFETY: `&rlim` は syscall の間生きている。`setrlimit` は pointer から読むだけ。
+    unsafe {
+        libc::setrlimit(libc::RLIMIT_CORE, &rlim);
+    }
+}
+
+/// test 用: `RLIMIT_CORE` の soft を `soft` (hard を超えるなら hard) にする。呼び出し元が
+/// core を許している状態を test process の中に作る (= 既定の soft 0 のままだと、子が soft を
+/// 戻したかどうかが観測で区別できない)。
+#[cfg(test)]
+pub(crate) fn set_core_soft_limit_for_test(soft: u64) -> Result<()> {
+    let current = getrlimit_core()?;
+    let rlim = libc::rlimit {
+        rlim_cur: soft.min(current.hard),
+        rlim_max: current.hard,
+    };
+    // SAFETY: `&rlim` は syscall の間生きている。`setrlimit` は pointer から読むだけ。
     let r = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &rlim) };
     if r == -1 {
         return Err(Error::Errno(Errno::last()));
