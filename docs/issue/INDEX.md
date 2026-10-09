@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-10-09 | bug | open | [flood-frames-test-stalls-on-ubuntu](./2026-10-09-bug-flood-frames-test-stalls-on-ubuntu.md) | serve_admits_new_client_while_peer_floods_tiny_frames が ubuntu CI で落ちた (真因未調査、v0.16.2 のリリースを止めている) |
 | 2026-10-09 | bug | open | [cli-dies-silently-on-sigpipe-to-closed-session](./2026-10-09-bug-cli-dies-silently-on-sigpipe-to-closed-session.md) | 終わりかけの session に status / set / input を送ると、何も表示せず SIGPIPE で exit 141 になる |
 | 2026-10-09 | design | open | [child-state-check-starved-by-busy-client](./2026-10-09-design-child-state-check-starved-by-busy-client.md) | fd が毎周 Ready になる client が居る間、Timeout 時の子の状態確認が走らない (macOS で止まった子の復帰の検知が遅れる) |
 | 2026-10-09 | task | open | [session-log-viewer-and-cleanup](./2026-10-09-task-session-log-viewer-and-cleanup.md) | session ごとの daemon ログを CLI から見る手段 (hyoui log) と、溜まったログの片付け |
