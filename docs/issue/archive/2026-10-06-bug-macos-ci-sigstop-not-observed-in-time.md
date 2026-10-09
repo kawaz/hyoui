@@ -1,18 +1,18 @@
 ---
 title: macOS CI で SIGSTOP した子の停止が約 1 秒以内に観測できず notify_child_stopped_does_not_auto_resume_without_leader が落ちた (真因未特定)
-status: open
+status: resolved
 category: bug
 created: 2026-10-06T19:30:00+09:00
-last_read: 2026-10-06T19:30:00+09:00
+last_read: 2026-10-09T18:00:00+09:00
 open_entered: 2026-10-06T19:30:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-09T18:00:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: テストを exec の完了を待ってから SIGSTOP を送る形にした後、Release workflow の macOS ignored job が v0.14.2 / v0.14.3 / v0.15.0 / v0.15.1 と 4 回続けて通った
 blocked_by:
 ---
 
