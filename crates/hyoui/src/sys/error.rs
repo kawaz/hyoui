@@ -39,6 +39,16 @@ pub enum Error {
     /// stderr まで中継する用途で使う。
     #[error("{0}")]
     Remote(String),
+
+    /// daemon が接続を閉じた (= frame の区切りか途中で EOF、または接続の reset)。
+    ///
+    /// 応答を待つ client が受けるのは、session の子が終わって daemon が後始末に入った時
+    /// (= 接続を閉じてから socket を消すまでの間に繋いだ場合を含む)。利用者に要るのは
+    /// 「session が終わっている」ことなので、frame の decode の失敗とは分けて伝える。
+    #[error(
+        "daemon が接続を閉じました。session は既に終わっています (`hyoui list` で確かめてください)"
+    )]
+    ConnectionClosed,
 }
 
 /// `sys`-layer result alias.

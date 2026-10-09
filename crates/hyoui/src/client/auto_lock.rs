@@ -134,8 +134,13 @@ pub fn acquire_auto_lock(
             timeout_idle_ms: None,
             process_bound: true,
         });
-        if let Err(e) = conn.send_control(&req) {
-            return Err(AutoLockError::Io(format!("LockAcquire send 失敗: {e}")));
+        match conn.send_control(&req) {
+            Ok(()) => {}
+            // session が終わっている: 文言が原因と次の行動を持つので、送受信の段は前置しない。
+            Err(e @ crate::Error::ConnectionClosed) => {
+                return Err(AutoLockError::Io(e.to_string()));
+            }
+            Err(e) => return Err(AutoLockError::Io(format!("LockAcquire send 失敗: {e}"))),
         }
 
         // response 1 frame を待つ。期待外 broadcast (mode.change 等) は捨てて再受信。
@@ -179,6 +184,9 @@ pub fn acquire_auto_lock(
                     )));
                 }
                 Ok(_) => continue,
+                Err(e @ crate::Error::ConnectionClosed) => {
+                    return Err(AutoLockError::Io(e.to_string()));
+                }
                 Err(e) => return Err(AutoLockError::Io(format!("recv 失敗: {e}"))),
             }
         };

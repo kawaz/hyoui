@@ -40,6 +40,35 @@ impl Read for DeadlineReader<'_> {
     }
 }
 
+/// daemon から frame を読む時の [`FrameError`] を client の [`Error`] にする。
+///
+/// 接続が閉じた (= frame の区切りや途中の EOF、接続の reset) 時は [`Error::ConnectionClosed`]
+/// にする。応答を待つ client が受けるのは session が終わった時なので、frame の decode の
+/// 失敗 (= `decode_failed`、protocol 違反) と分けて伝える。
+fn frame_read_error(error: FrameError, decode_failed: &'static str) -> Error {
+    match error {
+        FrameError::Protocol(ProtocolError::UnexpectedEof(_)) => Error::ConnectionClosed,
+        FrameError::Io(io) if io.kind() == std::io::ErrorKind::ConnectionReset => {
+            Error::ConnectionClosed
+        }
+        FrameError::Io(io) => Error::Io(io),
+        FrameError::Protocol(_) => Error::Invalid(decode_failed),
+    }
+}
+
+/// daemon へ frame を書く時の I/O error を client の [`Error`] にする。
+///
+/// 相手が閉じた接続への書き込み (= EPIPE / reset) は [`Error::ConnectionClosed`] にする
+/// (= 読む側の [`frame_read_error`] と同じく、session が終わったことを伝える)。
+fn frame_write_io_error(io: std::io::Error) -> Error {
+    match io.kind() {
+        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset => {
+            Error::ConnectionClosed
+        }
+        _ => Error::Io(io),
+    }
+}
+
 /// 入力端末の read chunk の処理結果 (= `process_ctrlz_guard` の戻り値)。
 ///
 /// forward と suspend は排他ではない (= chunk 内の入力を子へ届けてから、その chunk の
@@ -674,7 +703,10 @@ impl ClientConnection {
             .map_err(|_| Error::Invalid("handshake.request encode failed"))?;
         Frame::cbor_control(body)
             .encode_to(&mut writer)
-            .map_err(|_| Error::Invalid("handshake.request frame send failed"))?;
+            .map_err(|e| match e {
+                FrameError::Io(io) => frame_write_io_error(io),
+                FrameError::Protocol(_) => Error::Invalid("handshake.request frame send failed"),
+            })?;
 
         let resp_frame = match deadline {
             Some(deadline) => Frame::decode_from(&mut DeadlineReader {
@@ -683,10 +715,7 @@ impl ClientConnection {
             }),
             None => Frame::decode_from(&mut reader),
         }
-        .map_err(|e| match e {
-            FrameError::Io(e) => Error::Io(e),
-            FrameError::Protocol(_) => Error::Invalid("handshake.response decode failed"),
-        })?;
+        .map_err(|e| frame_read_error(e, "handshake.response decode failed"))?;
         if resp_frame.ty != TYPE_CBOR_CONTROL {
             return Err(Error::Invalid("handshake response must be CBOR control"));
         }
@@ -1538,7 +1567,8 @@ impl ClientConnection {
     ///
     /// # Errors
     ///
-    /// frame decode 失敗 (= protocol violation or socket EOF) は [`Error::Invalid`]。
+    /// daemon が接続を閉じた (= socket EOF / reset) 時は [`Error::ConnectionClosed`]、
+    /// frame decode 失敗 (= protocol violation) は [`Error::Invalid`]。
     pub fn recv_frame(&mut self) -> Result<Frame, Error> {
         if let Some(frame) = self.pending_frames.pop_front() {
             return Ok(frame);
@@ -1550,10 +1580,7 @@ impl ClientConnection {
             }),
             None => Frame::decode_from(&mut self.reader),
         };
-        frame.map_err(|e| match e {
-            FrameError::Io(io) => Error::Io(io),
-            FrameError::Protocol(_) => Error::Invalid("frame decode failed"),
-        })
+        frame.map_err(|e| frame_read_error(e, "frame decode failed"))
     }
 
     /// reader 側 socket に read timeout を設定する。
@@ -1579,8 +1606,9 @@ impl ClientConnection {
     ///
     /// # Errors
     ///
-    /// frame decode 失敗 (= protocol violation or socket EOF) は [`Error::Invalid`]。
-    /// CBOR control body の decode 失敗も同上。
+    /// daemon が接続を閉じた (= socket EOF / reset) 時は [`Error::ConnectionClosed`]、
+    /// frame decode 失敗 (= protocol violation) と CBOR control body の decode 失敗は
+    /// [`Error::Invalid`]。
     pub fn recv_control(
         &mut self,
         mut buffer_raw_data: Option<&mut Vec<u8>>,
@@ -1633,6 +1661,7 @@ impl ClientConnection {
     /// # Errors
     ///
     /// * I/O / frame size 超過 → [`Error`]
+    /// * ack を待つ間に daemon が接続を閉じた → [`Error::ConnectionClosed`]
     /// * ack の `result == Error` (= daemon 側で master write が timeout / I/O error / partial)
     ///   → [`Error::Remote`] に daemon 側 error message を載せて返す
     /// * `RAW_ACK_TIMEOUT` 内に ack が来ない → [`Error::Invalid`]
@@ -1655,7 +1684,7 @@ impl ClientConnection {
             .map_err(|e| match e {
                 FrameError::Io(io) => {
                     self.poison();
-                    Error::Io(io)
+                    frame_write_io_error(io)
                 }
                 FrameError::Protocol(_) => {
                     self.poison();
@@ -1664,7 +1693,7 @@ impl ClientConnection {
             })?;
         if let Err(io) = self.writer.flush() {
             self.poison();
-            return Err(Error::Io(io));
+            return Err(frame_write_io_error(io));
         }
 
         // DR-0021: ack 待ち。socket-level の `read_timeout` を**変更しない**
@@ -1750,13 +1779,8 @@ impl ClientConnection {
             // readiness 観測後は blocking decode で 1 frame を必ず完走させる
             // (= partial-byte discard を踏まない)。socket の `read_timeout` は
             // None (= default) のままなので read(2) は EOF / 完了まで block する。
-            let frame = match Frame::decode_from(&mut self.reader) {
-                Ok(f) => f,
-                Err(FrameError::Io(io)) => return Err(Error::Io(io)),
-                Err(FrameError::Protocol(_)) => {
-                    return Err(Error::Invalid("frame decode failed while waiting raw_ack"));
-                }
-            };
+            let frame = Frame::decode_from(&mut self.reader)
+                .map_err(|e| frame_read_error(e, "frame decode failed while waiting raw_ack"))?;
             match frame.ty {
                 TYPE_RAW_ACK => {
                     let ack = RawAck::decode_from(frame.body.as_slice())
@@ -1806,10 +1830,10 @@ impl ClientConnection {
         Frame::cbor_control(body)
             .encode_to(&mut self.writer)
             .map_err(|e| match e {
-                FrameError::Io(io) => Error::Io(io),
+                FrameError::Io(io) => frame_write_io_error(io),
                 FrameError::Protocol(_) => Error::Invalid("control message frame protocol error"),
             })?;
-        self.writer.flush().map_err(Error::Io)?;
+        self.writer.flush().map_err(frame_write_io_error)?;
         Ok(())
     }
 }
@@ -3632,6 +3656,39 @@ mod tests {
 
     /// テスト用に socketpair で直結された ClientConnection を作る helper。
     /// 戻り値: (client connection, daemon 側 socket = テストから書く / 読む側)。
+    /// 応答を待つ間に daemon が接続を閉じたら、frame の区切りでも途中でも
+    /// `Error::ConnectionClosed` (= session が終わった) を返し、decode の失敗と言わない。
+    #[test]
+    fn recv_reports_connection_closed_when_the_daemon_closes() {
+        let (mut conn, daemon_sock) = make_pair_connection();
+        drop(daemon_sock);
+        assert!(
+            matches!(conn.recv_control(None), Err(Error::ConnectionClosed)),
+            "frame の区切りで閉じた"
+        );
+
+        let (mut conn, mut daemon_sock) = make_pair_connection();
+        // size header の途中 (2 / 4 byte) で閉じる。
+        daemon_sock.write_all(&[5, 0]).expect("partial header");
+        drop(daemon_sock);
+        assert!(
+            matches!(conn.recv_control(None), Err(Error::ConnectionClosed)),
+            "frame の途中で閉じた"
+        );
+    }
+
+    /// 閉じた接続への送信も `Error::ConnectionClosed` を返す (= EPIPE。Rust の runtime が
+    /// SIGPIPE を無視にしているので、test process は signal で死なずに EPIPE を受ける)。
+    #[test]
+    fn send_reports_connection_closed_when_the_daemon_has_closed() {
+        let (mut conn, daemon_sock) = make_pair_connection();
+        drop(daemon_sock);
+        let r = conn.send_control(&ControlMessage::StatusQuery(
+            crate::protocol::messages::StatusQuery {},
+        ));
+        assert!(matches!(r, Err(Error::ConnectionClosed)), "{r:?}");
+    }
+
     fn make_pair_connection() -> (ClientConnection, UnixStream) {
         let (client_sock, daemon_sock) = UnixStream::pair().expect("socketpair");
         let transport = UnixStreamTransport::new(client_sock);

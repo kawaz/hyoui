@@ -32,21 +32,14 @@ impl MockDaemon {
         caps: &[&str],
         script: impl FnOnce(&mut UnixStream) + Send + 'static,
     ) -> MockDaemon {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let socket = dir.path().join("mock.sock");
-        let listener = UnixListener::bind(&socket).expect("bind mock daemon");
         let caps: Vec<String> = caps.iter().map(|c| (*c).to_string()).collect();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept client");
-            stream
-                .set_read_timeout(Some(READ_TIMEOUT))
-                .expect("set read timeout");
-            let mode = match recv(&mut stream) {
+        Self::spawn_raw(move |stream| {
+            let mode = match recv(stream) {
                 ControlMessage::HandshakeRequest(req) => req.mode,
                 other => panic!("expected handshake.request, got {other:?}"),
             };
             send(
-                &mut stream,
+                stream,
                 &ControlMessage::HandshakeResponse(HandshakeResponse {
                     caps,
                     session_id: "mock-daemon".into(),
@@ -56,6 +49,20 @@ impl MockDaemon {
                     child_stopped: false,
                 }),
             );
+            script(stream);
+        })
+    }
+
+    /// 1 つの接続を受け、handshake を含めて `script` に任せる。`script` が戻ると接続を閉じる。
+    pub fn spawn_raw(script: impl FnOnce(&mut UnixStream) + Send + 'static) -> MockDaemon {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let socket = dir.path().join("mock.sock");
+        let listener = UnixListener::bind(&socket).expect("bind mock daemon");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            stream
+                .set_read_timeout(Some(READ_TIMEOUT))
+                .expect("set read timeout");
             script(&mut stream);
         });
         MockDaemon {

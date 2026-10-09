@@ -220,7 +220,14 @@ fn connect_with_retry(
 ///
 /// `socket_path` を渡すと `(socket: <path>)` を表示し、socket が存在しない場合は
 /// `hyoui list` で確認するよう促す。
-fn print_connect_failure(cmd: &str, socket_path: &std::path::Path, err: &dyn std::fmt::Display) {
+fn print_connect_failure(cmd: &str, socket_path: &std::path::Path, err: &hyoui::Error) {
+    // handshake の途中で daemon が接続を閉じた = session が終わりかけている (= 子が終わって
+    // daemon が後始末に入った後に繋いだ)。文言が原因と次の行動を持つので hint は足さない
+    // (= 下の「daemon process が応答していない」は事実と食い違う)。
+    if matches!(err, hyoui::Error::ConnectionClosed) {
+        eprintln!("hyoui: {cmd}: {err}");
+        return;
+    }
     let exists = socket_path.exists();
     eprintln!(
         "hyoui: {cmd}: connect 失敗: {err} (socket: {})",
@@ -236,6 +243,16 @@ fn print_connect_failure(cmd: &str, socket_path: &std::path::Path, err: &dyn std
             "       socket は存在するが connect できません。daemon process が応答していない可能性があります。"
         );
         eprintln!("       `hyoui list` / `hyoui status <session>` で状態を確認してください。");
+    }
+}
+
+/// 応答を待つ受信の失敗を出す。daemon が接続を閉じた (= session が終わった) 時は文言が
+/// 原因と次の行動を持つので、「recv 失敗」の段を前置しない。
+fn print_recv_failure(cmd: &str, err: &hyoui::Error) {
+    if matches!(err, hyoui::Error::ConnectionClosed) {
+        eprintln!("hyoui: {cmd}: {err}");
+    } else {
+        eprintln!("hyoui: {cmd}: recv 失敗: {err}");
     }
 }
 
@@ -2814,7 +2831,7 @@ fn status_command(cfg: StatusConfig) -> ExitCode {
         let msg = match conn.recv_control(None) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("hyoui: status: recv 失敗: {e}");
+                print_recv_failure("status", &e);
                 return ExitCode::from(1);
             }
         };
@@ -2888,7 +2905,7 @@ fn set_command(cfg: hyoui::cli::SetConfig) -> ExitCode {
         let msg = match conn.recv_control(None) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("hyoui: set: recv 失敗: {e}");
+                print_recv_failure("set", &e);
                 return ExitCode::from(1);
             }
         };
@@ -3358,7 +3375,7 @@ fn screen_dump_command(cfg: ScreenDumpConfig) -> ExitCode {
         let msg = match conn.recv_control(None) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("hyoui: screen dump: recv 失敗: {e}");
+                print_recv_failure("screen dump", &e);
                 return ExitCode::from(1);
             }
         };
@@ -3519,7 +3536,7 @@ fn screen_snapshot_command(cfg: ScreenSnapshotConfig) -> ExitCode {
         let msg = match conn.recv_control(None) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("hyoui: screen snapshot: recv 失敗: {e}");
+                print_recv_failure("screen snapshot", &e);
                 return ExitCode::from(1);
             }
         };
@@ -3870,7 +3887,7 @@ fn lock_acquire_command(cfg: LockAcquireConfig) -> ExitCode {
                 // mode.change / leader.notify 等は捨てて再受信
                 Ok(_) => continue,
                 Err(e) => {
-                    eprintln!("hyoui: lock acquire: recv 失敗: {e}");
+                    print_recv_failure("lock acquire", &e);
                     return ExitCode::from(1);
                 }
             }
@@ -4150,7 +4167,7 @@ fn lock_release_command(cmd_label: &str, cfg: LockReleaseConfig) -> ExitCode {
             // leader.notify 等は捨てる
             Ok(_) => continue,
             Err(e) => {
-                eprintln!("hyoui: {cmd_label}: recv 失敗: {e}");
+                print_recv_failure(cmd_label, &e);
                 drop(conn);
                 return ExitCode::from(1);
             }
@@ -4330,7 +4347,7 @@ fn record_start_command(cfg: RecordStartConfig) -> ExitCode {
         let msg = match conn.recv_control(None) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("hyoui: record start: recv 失敗: {e}");
+                print_recv_failure("record start", &e);
                 return ExitCode::from(1);
             }
         };
@@ -4462,7 +4479,7 @@ fn record_stop_wait_response(conn: &mut ClientConnection, label: &str) -> ExitCo
         let msg = match conn.recv_control(None) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("hyoui: {label}: recv 失敗: {e}");
+                print_recv_failure(label, &e);
                 return ExitCode::from(1);
             }
         };
@@ -4497,7 +4514,7 @@ fn wait_record_list_response(
         let msg = match conn.recv_control(None) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("hyoui: {label}: recv 失敗: {e}");
+                print_recv_failure(label, &e);
                 return Err(ExitCode::from(1));
             }
         };
