@@ -306,7 +306,7 @@ fn dump_screen_blocking(
             .map_err(|e| DaemonCallError::Internal(format!("recv: {e}")))?
         {
             ControlMessage::ScreenDumpResponse(resp) => return Ok(resp.payload),
-            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+            msg if msg.is_unsolicited_notification() => continue,
             ControlMessage::Error(e) => {
                 return Err(DaemonCallError::Internal(format!(
                     "daemon error: {:?} ({})",

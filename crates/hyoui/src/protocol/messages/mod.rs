@@ -194,9 +194,8 @@ pub enum ControlMessage {
     #[serde(rename = "session.exit.notify")]
     SessionExitNotify(SessionExitNotify),
 
-    /// `kind = "session.child.stopped.notify"` — daemon → leader、子 self-stop 通知
-    /// (DR-0015 §2.2、cap `child-state-v1` 要)。leader が follow / auto-resume policy
-    /// を発動する。
+    /// `kind = "session.child.stopped.notify"` — daemon → 全 rw client、子 self-stop 通知
+    /// (DR-0015 §2.2、cap `child-state-v1` 要)。attach 中の client が follow する。
     #[serde(rename = "session.child.stopped.notify")]
     SessionChildStoppedNotify(SessionChildStoppedNotify),
 
@@ -281,6 +280,30 @@ pub enum ControlMessageError {
 }
 
 impl ControlMessage {
+    /// daemon が要求と無関係に送ってくる通知か (= 応答を 1 つ待つ client が読み飛ばして
+    /// 次の frame を待ってよい message か)。
+    ///
+    /// 対象は次の 4 つ。どれも待っている応答とは無関係で、受けても応答は後から届く:
+    ///
+    /// - `mode.change` / `leader.notify`: 全 client に broadcast
+    /// - `session.child.stopped.notify`: 子の停止。`child-state-v1` を持つ全 rw client に
+    ///   broadcast (ro client には来ない)
+    /// - `upgrade.ack`: upgrade の開始。`upgrade-v1` を持つ全 client に broadcast。後で
+    ///   daemon が接続を閉じるので、待ちは次の受信の EOF で終わる (upgrade を要求した
+    ///   client 自身は、これを応答として先に照合する)
+    ///
+    /// `session.exit.notify` は含めない。子の終了後は daemon が接続を閉じて応答が来ない
+    /// ので、受けた側が「子が終了した」と扱う。
+    pub fn is_unsolicited_notification(&self) -> bool {
+        matches!(
+            self,
+            ControlMessage::ModeChange(_)
+                | ControlMessage::LeaderNotify(_)
+                | ControlMessage::SessionChildStoppedNotify(_)
+                | ControlMessage::UpgradeAck(_)
+        )
+    }
+
     /// CBOR encode して `w` に書き込む。
     ///
     /// # Errors

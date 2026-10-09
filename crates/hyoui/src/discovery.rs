@@ -420,7 +420,7 @@ pub fn query_status(socket_path: &Path) -> StatusQueryResult {
     loop {
         match conn.recv_control(None) {
             Ok(ControlMessage::StatusResponse(sr)) => return StatusQueryResult::Live(sr),
-            Ok(ControlMessage::ModeChange(_)) | Ok(ControlMessage::LeaderNotify(_)) => continue,
+            Ok(msg) if msg.is_unsolicited_notification() => continue,
             Ok(ControlMessage::Error(e)) => {
                 return StatusQueryResult::Error {
                     reason: format!("daemon error: {:?} ({})", e.code, e.message),

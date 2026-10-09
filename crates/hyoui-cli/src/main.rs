@@ -2829,7 +2829,7 @@ fn status_command(cfg: StatusConfig) -> ExitCode {
                 }
                 return ExitCode::SUCCESS;
             }
-            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+            msg if msg.is_unsolicited_notification() => continue,
             other => {
                 eprintln!("hyoui: status: unexpected response: {other:?}");
                 return ExitCode::from(1);
@@ -2904,8 +2904,16 @@ fn set_command(cfg: hyoui::cli::SetConfig) -> ExitCode {
                 );
                 return ExitCode::from(1);
             }
-            // broadcast 系 (mode.change / leader.notify) は無視して ack を待つ。
-            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+            // 非同期通知 (子の停止の通知を含む、rw の接続なので届く) は無視して ack を待つ。
+            msg if msg.is_unsolicited_notification() => continue,
+            // 子の終了後は daemon が接続を閉じるので ack は来ない。
+            ControlMessage::SessionExitNotify(n) => {
+                eprintln!(
+                    "hyoui: set: set.ack を待つ間に session の子が終了しました (exit status {})",
+                    n.exit_status
+                );
+                return ExitCode::from(1);
+            }
             other => {
                 eprintln!("hyoui: set: unexpected response: {other:?}");
                 return ExitCode::from(1);
@@ -3177,7 +3185,6 @@ fn tail_command(cfg: TailConfig) -> ExitCode {
                         eprintln!("hyoui: tail: stream ended ({reason_str})");
                         return exit_code;
                     }
-                    ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
                     _ => continue,
                 }
             }
@@ -3373,7 +3380,7 @@ fn screen_dump_command(cfg: ScreenDumpConfig) -> ExitCode {
                 }
                 return ExitCode::from(1);
             }
-            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+            msg if msg.is_unsolicited_notification() => continue,
             other => {
                 eprintln!("hyoui: screen dump: unexpected response: {other:?}");
                 return ExitCode::from(1);
@@ -3572,7 +3579,7 @@ fn screen_snapshot_command(cfg: ScreenSnapshotConfig) -> ExitCode {
                 }
                 return ExitCode::from(1);
             }
-            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+            msg if msg.is_unsolicited_notification() => continue,
             other => {
                 eprintln!("hyoui: screen snapshot: unexpected response: {other:?}");
                 return ExitCode::from(1);
@@ -4344,7 +4351,7 @@ fn record_start_command(cfg: RecordStartConfig) -> ExitCode {
                 print_record_cap_hint(&e.message);
                 return ExitCode::from(1);
             }
-            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+            msg if msg.is_unsolicited_notification() => continue,
             other => {
                 eprintln!("hyoui: record start: unexpected response: {other:?}");
                 return ExitCode::from(1);
@@ -4460,7 +4467,7 @@ fn record_stop_wait_response(conn: &mut ClientConnection, label: &str) -> ExitCo
             }
         };
         match msg {
-            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+            msg if msg.is_unsolicited_notification() => continue,
             ControlMessage::RecordStopResponse(resp) => {
                 println!("hyoui: {label}: stopped {} record(s)", resp.stopped);
                 return ExitCode::SUCCESS;
@@ -4504,7 +4511,7 @@ fn wait_record_list_response(
                 print_record_cap_hint(&e.message);
                 return Err(ExitCode::from(1));
             }
-            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+            msg if msg.is_unsolicited_notification() => continue,
             other => {
                 eprintln!("hyoui: {label}: unexpected response: {other:?}");
                 return Err(ExitCode::from(1));
