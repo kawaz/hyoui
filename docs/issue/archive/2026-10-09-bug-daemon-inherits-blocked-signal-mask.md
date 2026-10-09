@@ -1,18 +1,18 @@
 ---
 title: 呼び出し元で block された signal (SIGTERM 等) が daemon の mask に残り、kill -TERM <daemon> が効かない
-status: open
+status: resolved
 category: bug
 created: 2026-10-09T15:00:00+09:00
-last_read: 2026-10-09T15:00:00+09:00
+last_read: 2026-10-09T19:00:00+09:00
 open_entered: 2026-10-09T15:00:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-09T19:00:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: daemon は起動直後 (daemonize の子 / upgrade で再開した子) に、self-pipe の handler を張る signal の block を外す (DR-0043 決定 6)。web daemon の同じ形は web-daemon-inherits-blocked-signal-mask
 blocked_by:
 ---
 

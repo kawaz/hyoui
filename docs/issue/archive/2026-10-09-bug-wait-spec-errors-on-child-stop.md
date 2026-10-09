@@ -1,18 +1,18 @@
 ---
 title: hyoui input の wait: で待っている間に子が止まると「予期しない message」で失敗するはず (未確認)
-status: open
+status: resolved
 category: bug
 created: 2026-10-09T13:00:00+09:00
-last_read: 2026-10-09T13:00:00+09:00
+last_read: 2026-10-09T19:00:00+09:00
 open_entered: 2026-10-09T13:00:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-09T19:00:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: 実機で 4 種類とも約 1.1 秒で失敗することを確認。wait の snapshot 応答待ちで child.stopped.notify と upgrade.ack を読み飛ばし、exit.notify は専用の文言で終える。set の同じ形は set-errors-on-child-stop
 blocked_by:
 ---
 

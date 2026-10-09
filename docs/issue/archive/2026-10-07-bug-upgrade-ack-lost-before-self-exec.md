@@ -1,18 +1,18 @@
 ---
 title: hyoui upgrade で daemon が upgrade.ack を送り終える前に self-exec し、client が「recv error before ack」で exit 1 になることがある
-status: open
+status: resolved
 category: bug
 created: 2026-10-07T11:00:00+09:00
-last_read: 2026-10-07T11:00:00+09:00
+last_read: 2026-10-09T19:00:00+09:00
 open_entered: 2026-10-07T11:00:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-09T19:00:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: self-exec の前に writer が ack を書き終えるのを上限 1 秒で待つ (broadcast::wait_until_flushed、DR-0028 §4 に DR-0037 の例外として記載)。負荷下 200 回で修正前 9 回失敗、修正後 0 回
 blocked_by:
 ---
 

@@ -1,18 +1,18 @@
 ---
 title: daemon が core dump 抑止のため RLIMIT_CORE を hard 0 にしていて、子がそれを引き継ぐ (子は core を出せず、上げ直せない)
-status: open
+status: resolved
 category: bug
 created: 2026-10-09T15:00:00+09:00
-last_read: 2026-10-09T15:00:00+09:00
+last_read: 2026-10-09T19:00:00+09:00
 open_entered: 2026-10-09T15:00:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-09T19:00:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: R5-H12 の抑止は soft だけを 0 にし hard は残す。子は exec の前に呼び出し元の soft / hard へ戻す (DR-0043 決定 5)。手元は hard 0 の環境の下なので修正前後の差は CI の環境で確かめる
 blocked_by:
 ---
 
