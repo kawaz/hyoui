@@ -1,18 +1,18 @@
 ---
 title: 呼び出し元で無視 (SIG_IGN) されている signal が、daemon を経て子にそのまま引き継がれる ($(hyoui run --detached ...) の子が ^Z で止まらない)
-status: open
+status: resolved
 category: design
 created: 2026-10-09T11:00:00+09:00
-last_read: 2026-10-09T11:00:00+09:00
+last_read: 2026-10-09T17:00:00+09:00
 open_entered: 2026-10-09T11:00:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-09T17:00:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: DR-0043 として実装 (子の exec の前に 6 つの signal を既定に戻し mask を空にする、daemon が継承した自前 handler も既定に戻す)。SIGCHLD を足すかは SIG-Q2、daemon 自身の mask は daemon-inherits-blocked-signal-mask
 blocked_by:
 ---
 
