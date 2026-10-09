@@ -330,6 +330,16 @@ mod tests {
         String::from_utf8(buf.to_vec()).expect("utf8")
     }
 
+    /// ログの置き場として直接使う dir。tempdir の mode は umask で決まる (022 なら 0755)
+    /// ので、[`open_session_log`] の dir の検査 (0700) に通るよう明示的に 0700 にする。
+    fn private_tempdir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700");
+        dir
+    }
+
     /// 行は時刻 (UTC の ISO 8601) と本文で 1 行になる。末尾の改行は 1 つにまとめる。
     #[test]
     fn lines_are_stamped_and_newline_terminated() {
@@ -396,7 +406,7 @@ mod tests {
         assert_eq!(dropped.load(Ordering::Relaxed), 2);
         drop(sink);
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_tempdir();
         let path = dir.path().join("s.log");
         let file = open_session_log(&path).expect("open");
         run(rx, file, Some(&path), &dropped);
@@ -443,7 +453,7 @@ mod tests {
     /// path が別の実体に差し替わっていたら、空でも消さない。
     #[test]
     fn a_replaced_path_is_not_removed() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_tempdir();
         let path = dir.path().join("s.log");
         let file = open_session_log(&path).expect("open");
         std::fs::remove_file(&path).unwrap();
@@ -469,7 +479,7 @@ mod tests {
     /// 読み手の無い FIFO は open で止まらず、普通のファイルでないとして断る。
     #[test]
     fn a_fifo_is_refused_without_blocking() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_tempdir();
         let path = dir.path().join("s.log");
         nix::unistd::mkfifo(&path, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
         assert!(open_session_log(&path).is_err());
@@ -486,7 +496,7 @@ mod tests {
     /// symlink はたどらない (= 先のファイルに追記しない)。
     #[test]
     fn a_symlink_is_refused_and_its_target_is_untouched() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_tempdir();
         let target = dir.path().join("other");
         std::fs::write(&target, b"keep").unwrap();
         let path = dir.path().join("s.log");
@@ -499,7 +509,7 @@ mod tests {
     #[test]
     fn a_file_readable_by_others_is_refused() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_tempdir();
         let path = dir.path().join("s.log");
         std::fs::write(&path, b"").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -532,7 +542,7 @@ mod tests {
     /// 開いた fd は blocking (= `O_NONBLOCK` は開く時だけ)。
     #[test]
     fn the_opened_log_is_blocking() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_tempdir();
         let file = open_session_log(&dir.path().join("s.log")).expect("open");
         let flags = nix::fcntl::fcntl(&file, nix::fcntl::FcntlArg::F_GETFL).unwrap();
         assert_eq!(flags & libc::O_NONBLOCK, 0);
