@@ -1,18 +1,18 @@
 ---
 title: web daemon も呼び出し元で block された SIGTERM / SIGINT を mask に残すはず (未確認)
-status: open
+status: resolved
 category: bug
 created: 2026-10-09T19:00:00+09:00
-last_read: 2026-10-09T19:00:00+09:00
+last_read: 2026-10-09T20:00:00+09:00
 open_entered: 2026-10-09T19:00:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-09T20:00:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: 実機で kill -TERM が効かないことを確認。web daemon run / supervise は起動直後に SIGTERM / SIGINT の block を外す (DR-0043 決定 6)。修正後 50ms 以内に終了
 blocked_by:
 ---
 

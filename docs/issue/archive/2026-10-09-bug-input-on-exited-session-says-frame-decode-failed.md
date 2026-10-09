@@ -1,18 +1,18 @@
 ---
 title: 子がすぐ exit した session に input を送ると「auto-lock acquire 失敗: recv 失敗: frame decode failed」と出る (EOF の伝え方が分かりにくい)
-status: open
+status: resolved
 category: bug
 created: 2026-10-09T19:00:00+09:00
-last_read: 2026-10-09T19:00:00+09:00
+last_read: 2026-10-09T20:00:00+09:00
 open_entered: 2026-10-09T19:00:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-09T20:00:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: 接続の EOF / reset / EPIPE を Error::ConnectionClosed にし「daemon が接続を閉じました。session は既に終わっています」と出す。SIGPIPE で無表示の exit 141 になる経路は cli-dies-silently-on-sigpipe-to-closed-session
 blocked_by:
 ---
 

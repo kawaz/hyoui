@@ -1,18 +1,18 @@
 ---
 title: hyoui set の応答待ちで子が止まると unexpected response で失敗するはず (未確認)
-status: open
+status: resolved
 category: bug
 created: 2026-10-09T19:00:00+09:00
-last_read: 2026-10-09T19:00:00+09:00
+last_read: 2026-10-09T20:00:00+09:00
 open_entered: 2026-10-09T19:00:00+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-09T20:00:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: 実機で 60 回中 7 回の失敗を確認。読み飛ばす通知の判定を ControlMessage::is_unsolicited_notification にまとめ、set / status / screen / record / discovery / web の待ちで使う。修正後 60 回中 0 回
 blocked_by:
 ---
 

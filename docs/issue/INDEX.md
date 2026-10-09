@@ -4,9 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
-| 2026-10-09 | bug | open | [set-errors-on-child-stop](./2026-10-09-bug-set-errors-on-child-stop.md) | hyoui set の応答待ちで子が止まると unexpected response で失敗するはず (未確認) |
-| 2026-10-09 | bug | open | [web-daemon-inherits-blocked-signal-mask](./2026-10-09-bug-web-daemon-inherits-blocked-signal-mask.md) | web daemon も呼び出し元で block された SIGTERM / SIGINT を mask に残すはず (未確認) |
-| 2026-10-09 | bug | open | [input-on-exited-session-says-frame-decode-failed](./2026-10-09-bug-input-on-exited-session-says-frame-decode-failed.md) | 子がすぐ exit した session に input を送ると「auto-lock acquire 失敗: recv 失敗: frame decode failed」と出る (EOF の伝え方が分かりにくい) |
+| 2026-10-09 | bug | open | [cli-dies-silently-on-sigpipe-to-closed-session](./2026-10-09-bug-cli-dies-silently-on-sigpipe-to-closed-session.md) | 終わりかけの session に status / set / input を送ると、何も表示せず SIGPIPE で exit 141 になる |
 | 2026-10-09 | design | open | [child-state-check-starved-by-busy-client](./2026-10-09-design-child-state-check-starved-by-busy-client.md) | fd が毎周 Ready になる client が居る間、Timeout 時の子の状態確認が走らない (macOS で止まった子の復帰の検知が遅れる) |
 | 2026-10-09 | task | open | [session-log-viewer-and-cleanup](./2026-10-09-task-session-log-viewer-and-cleanup.md) | session ごとの daemon ログを CLI から見る手段 (hyoui log) と、溜まったログの片付け |
 | 2026-10-09 | design | open | [client-partial-frame-buffer-unbounded](./2026-10-09-design-client-partial-frame-buffer-unbounded.md) | client ごとの受信途中 buffer に合計の上限が無い (DR-0037 段 1 の後、1 client 最大 16MiB) |
