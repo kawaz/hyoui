@@ -444,6 +444,12 @@ fn parse_child_suspend(s: Option<&str>) -> hyoui::daemon::ChildSuspendPolicy {
 /// の argv は本関数では使わず env から init 情報 + その argv は `run --detached
 /// -- cmd args...` から cmd 部分を取得する。
 pub fn run_daemon_child() -> ExitCode {
+    // 呼び出し元が block していた signal のうち、serve が handler を張るもの (SIGTERM 等) の
+    // block を外す (DR-0043 決定 6)。thread を立てる前に行う (= logger 等の thread も同じ
+    // mask を引き継ぐ)。失敗しても起動は続ける (= 外せなかった signal が届かないだけ)。
+    if let Err(e) = hyoui::daemon::unblock_handled_signals() {
+        eprintln!("hyoui: warning: could not unblock the daemon's signals: {e}");
+    }
     // env から JSON init を取得 + unset (= 孫 process 漏れ防止)。
     let init_json = match std::env::var("HYOUI_DAEMONIZE_INIT") {
         Ok(s) => s,
@@ -819,6 +825,11 @@ pub fn run_upgrade_resume_child() -> ExitCode {
     use hyoui::daemon::upgrade;
     use nix::unistd::Pid;
 
+    // run_daemon_child と同じ (DR-0043 決定 6)。mask は exec をまたいで引き継がれるので、block
+    // を外す前の版の daemon から upgrade した時もここで外れる。
+    if let Err(e) = hyoui::daemon::unblock_handled_signals() {
+        eprintln!("hyoui: warning: could not unblock the daemon's signals: {e}");
+    }
     let env = match upgrade::read_upgrade_env() {
         Ok(e) => e,
         Err(msg) => {

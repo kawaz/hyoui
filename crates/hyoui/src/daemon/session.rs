@@ -18,7 +18,7 @@ use std::sync::{MutexGuard, TryLockError};
 use std::time::Instant;
 
 use nix::poll::{PollFd, PollTimeout};
-use nix::sys::signal::{Signal, kill};
+use nix::sys::signal::{SigSet, Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
@@ -184,17 +184,62 @@ struct SigchldOwner {
     _guard: MutexGuard<'static, ()>,
 }
 
+/// daemon の serve が self-pipe に handler を張る signal。[`acquire_sigchld_selfpipe`] が
+/// 張り、[`unblock_handled_signals`] が daemon の起動時に block を外す (= 2 つが同じ一覧を見る)。
+///
+/// - SIGCHLD: 子の状態変化 (exit / stop / continue) で poll を起こす (R5-H6)。これだけは
+///   必須で、張れなければ self-pipe を使わず 500ms の polling に落ちる
+/// - SIGTSTP: 握り潰す (= daemon を外部の TSTP で止めさせない、DR-0015 §2.3 で軸 2 廃止後の
+///   意図的挙動)
+/// - SIGCONT: stopped の子の invariant 回復 (DR-0001 軸 1/2 配線)
+/// - SIGTERM / SIGINT: graceful shutdown (killpg(SIGTERM) → finalize escalation →
+///   SessionExitNotify → socket unlink) に流す。handler が無いと daemon が即死し、子は SIGHUP の
+///   巻き添えで死に socket の残骸が残る (issue 2026-06-11 優先3)
+/// - SIGUSR1: 隠し upgrade trigger (`kill -USR1 <daemon-pid>` で self-exec、DR-0028 Phase 1)
+///
+/// SIGCHLD 以外は best-effort (= 張れなくても当該 signal が既定の挙動になるだけ)。
+const SELF_PIPE_SIGNALS: [Signal; 6] = [
+    Signal::SIGCHLD,
+    Signal::SIGTSTP,
+    Signal::SIGCONT,
+    Signal::SIGTERM,
+    Signal::SIGINT,
+    Signal::SIGUSR1,
+];
+
+/// daemon の起動時に、serve が handler を張る signal ([`SELF_PIPE_SIGNALS`]) の block を外す。
+///
+/// signal mask は fork と exec をまたいで引き継がれるので、block した呼び出し元 (perl の
+/// `sigprocmask`、block したまま exec する supervisor 等) から起動した daemon は、その mask の
+/// まま動く。SIGTERM が block されていると `kill -TERM <daemon>` が保留されたまま届かず、
+/// graceful shutdown が起きない。daemon は呼び出し元とは別の、自分で signal を受けて動く
+/// process なので、自分が受けると決めた signal は受けられる状態で始める。
+///
+/// 呼ぶのは daemon の process の起動直後 (daemonize の子 / upgrade で再開した子)、thread を
+/// 立てる前 (= 後から立てる thread も同じ mask を引き継ぐ)。外すのは一覧の signal だけで、
+/// それ以外の block (呼び出し元が SIGHUP 等を block していた) はそのまま残す。子は exec の前に
+/// mask を空にするので (DR-0043 決定 2)、ここで残した block は子に届かない。
+///
+/// # Errors
+///
+/// `pthread_sigmask` が失敗した場合 (= 引数は正しい set なので通常は起きない)。
+pub fn unblock_handled_signals() -> Result<(), Error> {
+    let mut set = SigSet::empty();
+    for sig in SELF_PIPE_SIGNALS {
+        set.add(sig);
+    }
+    nix::sys::signal::pthread_sigmask(nix::sys::signal::SigmaskHow::SIG_UNBLOCK, Some(&set), None)
+        .map_err(Error::Errno)
+}
+
 /// Attempt to acquire SIGCHLD self-pipe ownership for this serve. Returns
-/// `Some` on success (= SIGCHLD / SIGTSTP / SIGCONT will deliver into `pipe`),
+/// `Some` on success (= [`SELF_PIPE_SIGNALS`] will deliver into `pipe`),
 /// `None` if either the lock is taken by another concurrent serve in this
-/// process or the self-pipe / sigaction install fails. The `None` path is
+/// process or the self-pipe / SIGCHLD sigaction install fails. The `None` path is
 /// non-fatal — the caller falls back to the legacy 500ms polling.
 ///
-/// DR-0001 軸 1/2 配線: 同 self-pipe に **SIGTSTP / SIGCONT も register** する。
-/// signal handler は signum を 1 byte 書き、serve_loop が drain 時に signum で
-/// 分岐して `OnChildSuspend` / `OnParentSuspend` policy を発火させる。
-/// SIGTSTP と SIGCONT のハンドラ install に失敗しても fatal にせず best-effort で
-/// 進める (= 既存 SIGCHLD のみで動く既存挙動を維持)。
+/// signal handler は signum を 1 byte 書き、serve_loop が drain 時に signum で分岐する
+/// (各 signal の役割は [`SELF_PIPE_SIGNALS`])。
 fn acquire_sigchld_selfpipe() -> Option<SigchldOwner> {
     let guard = match SIGCHLD_SELFPIPE_LOCK.try_lock() {
         Ok(g) => g,
@@ -206,43 +251,30 @@ fn acquire_sigchld_selfpipe() -> Option<SigchldOwner> {
         // pipe drops here, clearing SELFPIPE_WRITE_FD; guard released too.
         return None;
     }
-    // SIGTSTP (= 握り潰し) + SIGCONT (= stopped child の invariant 回復) を同
-    // self-pipe に乗せる。SIGTSTP は handler 登録により kernel default の STOPPED を
-    // 抑止し、handle_suspend_signals が何もしない (= daemon を外部 TSTP で止めさせない、
-    // DR-0015 §2.3 で軸 2 廃止後の意図的挙動)。best-effort: install 失敗時は当該
-    // signal の挙動が default に戻るだけで、SIGCHLD 経路 (= 軸 1 既存配線) は維持される。
-    let _ = register_self_pipe(Signal::SIGTSTP);
-    let _ = register_self_pipe(Signal::SIGCONT);
-    // issue 2026-06-11 優先3: SIGTERM / SIGINT を同 self-pipe に乗せ、graceful
-    // shutdown 経路 (= `--until` match と同じ killpg(SIGTERM) → finalize escalation
-    // → SessionExitNotify → socket unlink) へ流す。handler 未登録だと daemon が即死し
-    // child は SIGHUP 巻き添え死 + socket 残骸になる。best-effort install。
-    let _ = register_self_pipe(Signal::SIGTERM);
-    let _ = register_self_pipe(Signal::SIGINT);
-    // DR-0028 Phase 1: SIGUSR1 = 隠し upgrade trigger。外部から `kill -USR1 <daemon-pid>`
-    // で `handle_suspend_signals` が `RelayOutcome::UpgradeRequested` を返し、
-    // `Session::serve` が self-exec 経路 (`daemon::upgrade::perform_self_exec`) に
-    // 分岐する。best-effort install (= 失敗しても既存 signal 経路は損なわない)。
-    let _ = register_self_pipe(Signal::SIGUSR1);
+    for sig in SELF_PIPE_SIGNALS {
+        if sig != Signal::SIGCHLD {
+            // best-effort: install 失敗時は当該 signal の挙動が default に戻るだけで、
+            // SIGCHLD 経路は維持される。
+            let _ = register_self_pipe(sig);
+        }
+    }
     Some(SigchldOwner {
         pipe,
         _guard: guard,
     })
 }
 
-/// `SigchldOwner` を drop した後に SIGTSTP / SIGCONT の disposition を default に
-/// 戻す helper。`SelfPipe` drop が `SELFPIPE_WRITE_FD` をクリアするので、handler
-/// が late delivery で stale fd を触ることはないが、`sigaction` が install された
-/// ままだと test 終了後にも process-wide で残留する。clean up を明示する。
+/// `SigchldOwner` を drop した後に、[`SELF_PIPE_SIGNALS`] のうち SIGCHLD 以外の
+/// disposition を default に戻す helper。`SelfPipe` drop が `SELFPIPE_WRITE_FD` をクリア
+/// するので、handler が late delivery で stale fd を触ることはないが、`sigaction` が install
+/// されたままだと test 終了後にも process-wide で残留する。clean up を明示する。SIGCHLD を
+/// 戻さない理由は呼び出し側 (`Session::serve` の後始末) のコメントを参照。
 fn release_suspend_signal_handlers() {
-    let _ = install_default(Signal::SIGTSTP);
-    let _ = install_default(Signal::SIGCONT);
-    // 優先3: graceful shutdown 用に install した SIGTERM / SIGINT も default に戻す。
-    let _ = install_default(Signal::SIGTERM);
-    let _ = install_default(Signal::SIGINT);
-    // DR-0028 Phase 1: SIGUSR1 も default 復帰させる (= 通常は register 失敗しても
-    // 副作用なしだが、self-pipe 由来 handler の残留を避けるため揃える)。
-    let _ = install_default(Signal::SIGUSR1);
+    for sig in SELF_PIPE_SIGNALS {
+        if sig != Signal::SIGCHLD {
+            let _ = install_default(sig);
+        }
+    }
 }
 use super::tail::{broadcast_tail_end_to_followers, tail_end_reason_from_outcome};
 

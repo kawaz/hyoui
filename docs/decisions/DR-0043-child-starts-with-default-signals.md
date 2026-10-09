@@ -1,9 +1,9 @@
 # DR-0043: 子は前景の job として、既定の signal の扱いと空の mask で exec する
 
-- Status: ✅ 実装済 (2026-10-09)。SIG-Q1 = a (kawaz 裁定 2026-10-09)。決定 5 (RLIMIT_CORE) も実装済
+- Status: ✅ 実装済 (2026-10-09)。SIG-Q1 = a (kawaz 裁定 2026-10-09)。決定 5 (RLIMIT_CORE) と決定 6 (daemon 自身の mask) も実装済
 - Date: 2026-10-09
 - Related: DR-0042 (hyoui は子に対して bash の位置に立つ), DR-0017 (session anchor: 子を daemon と同じ session の foreground pgrp にする), DR-0014 (介入 self-check と検証主義), DR-0005 (透過原則), DR-0015 (run = fork daemon + attach)
-- Origin: `docs/issue/2026-10-09-design-child-inherits-ignored-signals.md` (観測と SIG-Q1 の裁定)、`docs/issue/2026-10-09-bug-child-inherits-zero-core-limit.md` (決定 5)
+- Origin: `docs/issue/2026-10-09-design-child-inherits-ignored-signals.md` (観測と SIG-Q1 の裁定)、`docs/issue/2026-10-09-bug-child-inherits-zero-core-limit.md` (決定 5)、`docs/issue/2026-10-09-bug-daemon-inherits-blocked-signal-mask.md` (決定 6)
 
 ## Context
 
@@ -12,7 +12,7 @@
 - 対話の bash のコマンド置換 `$(...)` の中は、job control の signal (SIGTSTP / SIGTTIN / SIGTTOU) が無視になる。`I=$(hyoui run --detached -- cat)` で起動した子は ^Z も `kill -TSTP` も効かない
 - 非対話の shell で `cmd &` とすると SIGINT / SIGQUIT が無視になる。`sh -c 'hyoui run --detached -- cat &'` の子は SIGINT で終わらない
 - hyoui 自身も Rust の runtime が起動時に SIGPIPE を無視にする。呼び出し元が何も変えていなくても、子は SIGPIPE を無視した状態で始まる
-- 呼び出し元が block した signal は daemon の mask に残り、子の mask にも残る (SIGTERM を block した呼び出し元から起動すると、子は SIGTERM で終わらない)
+- 呼び出し元が block した signal は daemon の mask に残り、子の mask にも残る (SIGTERM を block した呼び出し元から起動すると、子は SIGTERM で終わらない。daemon 自身も `kill -TERM <daemon>` が保留されたまま届かず、graceful shutdown が起きない)
 
 daemon は R5-H12 (daemon のメモリにある lock_token 等の secret を core dump から漏らさない) のため `RLIMIT_CORE` を下げる。soft と hard を両方 0 にすると、子はそれを引き継ぎ、hard 0 は子の側で上げ直せない。直接実行した子は呼び出し元の上限で core を出せる (実測: launchd の既定は soft 0 / hard unlimited、hyoui の daemon が起こした子は hard 0)。
 
@@ -27,6 +27,7 @@ daemon は R5-H12 (daemon のメモリにある lock_token 等の secret を cor
 - **partial state を hyoui の裁量で破棄する介入か**: 該当しない。子の状態を読んで判定するものが無い
 - **新 protocol message / cap flag**: 無し
 - **既存 DR の未実装**: DR-0042 の対象範囲 (fd と制御端末) は実装済みで、本 DR とは独立
+- **決定 6 (daemon 自身の mask) は介入か**: 子への介入ではなく daemon 自身の手入れ。daemon が handler を張ると決めた signal (SIGTERM 等) を受けられる状態にするだけで、子が exec の時点で持つ状態は変えない (子は決定 2 で mask を空にする)
 - **決定 5 (RLIMIT_CORE) は新しい介入か**: 新しい介入ではない。子の `RLIMIT_CORE` を、daemon が自分のために下げる前の呼び出し元の値に戻す (= 直接実行と同じ上限で exec させる) 方向で、R5-H12 の介入が子に漏れていたのを daemon の内側に閉じる。daemon の保護 (soft 0) は変えない
 
 ## Decision
@@ -68,9 +69,17 @@ daemon は R5-H12 のため `Session::start` で `RLIMIT_CORE` の soft だけ�
 - 保存を初回に限る理由: 同じ process で `Session::start` を繰り返す経路 (test) で毎回保存すると、2 回目以降は hyoui 自身が下げた 0 を呼び出し元の値と取り違える
 - 子側は保存値を atomic で読み、`setrlimit` を 1 回呼ぶだけにする (fork〜exec の区間で alloc も lock もしない)。`setrlimit` は POSIX の async-signal-safe 一覧には無いが、Linux / macOS の libc では syscall 1 回の wrapper で状態を持たない。失敗 (保存した hard を誰かが下げた) は無視し、子は soft 0 のまま exec する (上げすぎる側には倒れない)
 
+### 6. daemon は自分が handler を張る signal の block を外して始める
+
+daemon の process は起動直後 (daemonize の子 `run_daemon_child`、upgrade で再開した子 `run_upgrade_resume_child`)、thread を立てる前に、serve が self-pipe の handler を張る signal (SIGCHLD / SIGTSTP / SIGCONT / SIGTERM / SIGINT / SIGUSR1、`daemon::session::SELF_PIPE_SIGNALS`) の block を外す (`unblock_handled_signals`)。handler を張る一覧と block を外す一覧は同じ定数を見る。
+
+- 外すのは一覧の signal だけで、mask を空にはしない: 一覧の外 (SIGHUP 等) を呼び出し元が block していても、daemon はそれを受けて何かする必要が無い。外して既定の動作 (終了) にすると、呼び出し元が block で避けていた終わり方を daemon に足すことになる
+- thread を立てる前に行う: 後から立てる logger / writer の thread も同じ mask を引き継ぐ (process 宛の signal は block していない thread のどれかに届く)
+- upgrade で再開した子でも行う: mask は exec をまたいで引き継がれるので、block を外す前の版の daemon から upgrade した時もここで外れる
+
 ## 責務外
 
-daemon 自身の signal の扱いと mask は本 DR の対象外 (子が exec の時点で持つ状態だけを扱う)。
+daemon 自身の signal の扱い (無視・handler) と、決定 6 の一覧の外の signal の mask は本 DR の対象外。
 
 ## Rejected alternatives
 
@@ -85,6 +94,7 @@ daemon 自身の signal の扱いと mask は本 DR の対象外 (子が exec �
 - `I=$(hyoui run --detached -- cat)` の子が ^Z / `kill -TSTP` で止まり、`sh -c 'hyoui run --detached -- cat &'` の子が SIGINT で終わる
 - 子は SIGPIPE が既定で始まる。読み手の去った pipe に書いた子は、端末で直接実行した時と同じく SIGPIPE で終わる
 - 呼び出し元が block していた SIGTERM 等は子の mask に残らない
+- SIGTERM 等を block した呼び出し元から起動した daemon も、`kill -TERM <daemon>` で graceful shutdown する
 - 子は呼び出し元の `RLIMIT_CORE` で始まり、直接実行と同じく core を出せる・`ulimit -c` で上げられる。daemon の core は soft 0 で書かれないまま
 
 ## 検証
@@ -92,6 +102,7 @@ daemon 自身の signal の扱いと mask は本 DR の対象外 (子が exec �
 - unit (legacy 経路): `sys::signal::tests::spawned_child_starts_with_default_signals_and_empty_mask`。test process で 6 つ + SIGHUP を無視、SIGTERM / SIGUSR2 を block してから `Pty::spawn` し、子の perl に `%SIG` と `sigprocmask` を報告させる
 - e2e (anchor 経路、daemon 経由): `crates/hyoui-cli/tests/child_signal_defaults.rs`。無視・block した呼び出し元と、何も変えていない呼び出し元 (SIGPIPE が既定になることを見る) の 2 セル
 - unit (継承した handler): `sys::signal::tests::reset_drops_inherited_own_handlers_but_keeps_inherited_ignores`。SIGUSR1 に self-pipe の handler、SIGHUP に無視を張って fork し、子で `disarm_self_pipe_in_child` → `reset_signals_for_exec` の後の扱いを見る (SIGUSR1 は既定、SIGHUP は無視のまま)
+- e2e (決定 6): `crates/hyoui-cli/tests/daemon_signal_mask.rs`。SIGTERM / SIGHUP を block した perl から `hyoui run --detached` で起動した daemon に `kill -TERM` を送り、ro で handshake した接続が期限内に EOF になる (= daemon が graceful shutdown で終わる)。修正を外した版では期限 (10 秒) まで EOF が来ない
 - unit (決定 5、legacy 経路): `daemon::session::tests::session_start_lowers_only_the_core_soft_limit` (daemon の soft 0、hard は呼び出し元のまま) と `session_child_starts_with_the_caller_core_limit` (子の `sh` の `ulimit -c` が保存値と一致)
 - e2e (決定 5、anchor 経路): `crates/hyoui-cli/tests/child_core_limit.rs`。呼び出し元の `sh` が soft を上げてから hyoui を exec し、子の `sh` の `ulimit -S -c` / `-H -c` が呼び出し元と一致する。呼び出し元の hard が 0 の環境では `core=0,0` の一致を見るだけになる
 - 実機: 対話の bash の `$(...)` から起動した子が `kill -TSTP` で `T+` になる、非対話 sh の `cmd &` から起動した子が SIGINT で終わる (本 DR の変更を外した 0.14.0 ではどちらも `S+` のまま)

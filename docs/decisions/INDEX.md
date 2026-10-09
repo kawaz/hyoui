@@ -59,7 +59,7 @@ Status 列は **ラベル + 最終判定日** だけを載せる。実装範囲�
 | [DR-0040](./DR-0040-daemon-own-cell-model-and-layer-composition.md) | ⬜ 未実装 | daemon の仮想スクリーンを vt100 から自前のセルモデル crate にし、rect 単位の層合成でオーバーレイを重ね、attach 出力は常に合成画面から作る (tmux 型) |
 | [DR-0041](./DR-0041-session-id-uuid-and-tags.md) | ✅ 実装済 (2026-10-07) | session id を UUID にし、namespace を廃止して tag (`key=value`、`run --tag` / `list --tag`) にし、socket を `hyoui/sessions/` にフラットに置く。面は状態の root を決める環境変数 1 つ (`HYOUI_STATE_DIR`) で決まる。廃止した namespace の option は 2026-11 まで受け付けて捨てる |
 | [DR-0042](./DR-0042-non-tty-stdin-is-the-childs-fd.md) | 🚧 Active (2026-10-06) | 非 tty の stdin は子の fd 0 にそのまま渡し、PTY は制御端末と出力にだけ使う (DR-0019 §5 を置き換え)。子の stdin も PTY にする指定は `run --pty-stdin`、attach は stdin を子に流さずキーは入力端末 (stdin か `/dev/tty`) から読む。配線に失敗したら起動・接続を拒否する |
-| [DR-0043](./DR-0043-child-starts-with-default-signals.md) | ✅ 実装済 (2026-10-09) | 子は前景の job として exec する: SIGINT / SIGQUIT / SIGTSTP / SIGTTIN / SIGTTOU / SIGPIPE を既定に戻し、signal mask を空にする (呼び出し元や hyoui 自身の無視・block を子に引き継がない)。一覧の外の無視は引き継ぐ。`RLIMIT_CORE` は呼び出し元の値で exec する (daemon は R5-H12 で soft だけを 0 にする) |
+| [DR-0043](./DR-0043-child-starts-with-default-signals.md) | ✅ 実装済 (2026-10-09) | 子は前景の job として exec する: SIGINT / SIGQUIT / SIGTSTP / SIGTTIN / SIGTTOU / SIGPIPE を既定に戻し、signal mask を空にする (呼び出し元や hyoui 自身の無視・block を子に引き継がない)。一覧の外の無視は引き継ぐ。`RLIMIT_CORE` は呼び出し元の値で exec する (daemon は R5-H12 で soft だけを 0 にする)。daemon 自身は handler を張る signal の block を外して始める |
 ## Archived
 
 後続の DR に置き換えられて退避した DR は [archive/INDEX.md](./archive/INDEX.md)。
