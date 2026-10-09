@@ -248,8 +248,23 @@ pub fn fetch_snapshot(
             ControlMessage::Error(ErrorMessage { code, message, .. }) => {
                 return Err(WaitOutcome::DaemonError(format!("[{code:?}] {message}")));
             }
-            // 非同期通知系は skip して次の frame を待つ。
-            ControlMessage::ModeChange(_) | ControlMessage::LeaderNotify(_) => continue,
+            // 非同期通知系は skip して次の frame を待つ。`hyoui input` の wait: spec は rw の
+            // 接続で待つので、ro の `hyoui wait` には来ない通知も届く: 子の停止
+            // (session.child.stopped.notify、rw client に broadcast) と upgrade の開始
+            // (upgrade.ack、upgrade-v1 を持つ全 client に broadcast)。どちらも画面の照合とは
+            // 無関係で、止まった子の画面も snapshot で読める。upgrade の後は daemon が接続を
+            // 閉じるので、次の受信待ちが「socket を閉じました」で終わる。
+            ControlMessage::ModeChange(_)
+            | ControlMessage::LeaderNotify(_)
+            | ControlMessage::SessionChildStoppedNotify(_)
+            | ControlMessage::UpgradeAck(_) => continue,
+            // 子の終了 (session.exit.notify) の後は daemon が接続を閉じ、snapshot の応答は来ない。
+            ControlMessage::SessionExitNotify(n) => {
+                return Err(WaitOutcome::IoError(format!(
+                    "子が終了しました (exit status {}、snapshot 応答待ち中に session.exit.notify を受信)",
+                    n.exit_status
+                )));
+            }
             other => {
                 return Err(WaitOutcome::DaemonError(format!(
                     "snapshot 応答待ち中に予期しない message を受信: {other:?}"
