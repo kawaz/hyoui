@@ -276,6 +276,12 @@ fn release_suspend_signal_handlers() {
         }
     }
 }
+/// upgrade の self-exec の前に、client の writer thread が積まれた frame (`upgrade.ack` 等) を
+/// 書き終えるのを待つ上限 (DR-0028 §4)。全 client で共有する 1 つの deadline で、読まない
+/// client が居ても upgrade はこれ以上遅れない。writer は client ごとに並行に書くので、読んで
+/// いる client の分は負荷下でもこの中で書き終わる。
+const UPGRADE_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
 use super::tail::{broadcast_tail_end_to_followers, tail_end_reason_from_outcome};
 
 /// daemon 1 つ分の起動済 session。
@@ -654,7 +660,12 @@ impl Session {
                     continue;
                 }
             };
-            // 通過 → self-exec 経路。sigchld_owner を先に drop し (= 新 process init
+            // 通過 → self-exec 経路。exec の前に、client に積んだ frame (upgrade.ack を
+            // 含む) を writer thread が書き終えるのを上限付きで待つ (DR-0028 §4)。exec は
+            // writer thread ごと process を置き換えるので、待たないと ack が届かず client が
+            // 「recv error before ack」で失敗する。
+            super::broadcast::wait_until_flushed(&clients, Instant::now() + UPGRADE_FLUSH_BUDGET);
+            // sigchld_owner を先に drop し (= 新 process init
             // 前に global SELFPIPE_WRITE_FD を必ずクリアする)、perform_self_exec へ。
             // 成功時は戻らず (execve)、失敗時は PerformSelfExecOutcome が返る。
             let taken = sigchld_owner.take();

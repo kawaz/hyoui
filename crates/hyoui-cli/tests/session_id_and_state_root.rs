@@ -700,13 +700,7 @@ fn tags_survive_a_daemon_upgrade() {
     let sid = run_tagged(root.path(), &["env=prod"]);
     let (before, _) = pids(root.path(), &sid);
     let out = output(in_root(root.path(), &["upgrade", &sid]));
-    // Design rationale: `hyoui upgrade` の client は、daemon が upgrade.ack を書き出す前に
-    // self-exec して接続が閉じると「recv error before ack」で失敗することがある (ack の
-    // broadcast は writer thread への enqueue だけで、exec の前に flush を待たない。tag とは
-    // 別の、upgrade 経路にある race)。この test が確かめるのは upgrade をまたいだ tag の
-    // 保持なので、その 1 種類の失敗だけは許し、他の失敗は落とす。
-    let ack_lost = text(&out.stderr).contains("recv error before ack");
-    assert!(out.status.success() || ack_lost, "{}", text(&out.stderr));
+    assert!(out.status.success(), "{}", text(&out.stderr));
     let out = output(in_root(root.path(), &["status", &sid, "--format=json"]));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("status json");
     assert_eq!(v["tags"], serde_json::json!({"env": "prod"}));

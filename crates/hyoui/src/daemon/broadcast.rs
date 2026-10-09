@@ -513,6 +513,35 @@ pub(super) fn writer_pump(
     }
 }
 
+/// 全 client の writer thread が、queue に積まれた frame を socket に書き終えるまで待つ
+/// (`deadline` まで)。書き終えた = `queued_bytes` が 0 ([`writer_pump`] は `write_all` が返って
+/// から減らす)。writer thread が終わっている client (= 書き込み失敗で抜けた) は、残りが
+/// 書かれることは無いので待たない。
+///
+/// 使うのは upgrade の self-exec の直前だけ (DR-0028 §4)。self-exec は writer thread ごと
+/// process を置き換え、client の socket は CLOEXEC で閉じるので、積んだだけで書かれていない
+/// `upgrade.ack` は client に届かない。
+///
+/// Design rationale: writer thread の進み具合は poll で待てる event にならない (`queued_bytes`
+/// は atomic で、書き終えても loop を起こさない) ので、上限付きの短い間隔の確認で待つ。
+/// serve loop の外で、session の終わり際に 1 回だけ待つ (DR-0037 の「loop は外部を待たない」の
+/// 例外として DR-0028 §4 に書く)。DR-0037 段階 4 で writer thread を廃して送信を loop 内の
+/// nonblocking write にした時は、この待ちも送信 queue が空になるまでの deadline 付きの state
+/// に置き換える。
+pub(super) fn wait_until_flushed(clients: &[ClientHandle], deadline: Instant) {
+    for ch in clients {
+        while ch.queued_bytes.load(Ordering::Acquire) > 0
+            && !ch
+                .writer_thread
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
 /// `Frame` の encode 済 bytes を全 client に enqueue。
 ///
 /// 戻り値: backpressure overflow / writer dead で disconnect すべき client の
@@ -833,5 +862,120 @@ mod tests {
         };
         // panic なしで drop できることだけ確認
         drop(ch);
+    }
+
+    /// [`wait_until_flushed`] の test 用: 本物の writer_pump を持つ client と、その相手側の
+    /// socket を作る。daemon 側は reader と writer_pump の sock が同じ端点の clone
+    /// (accept.rs と同形)。
+    fn flush_test_client(id: u64) -> (ClientHandle, std::os::unix::net::UnixStream) {
+        let (reader, peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let writer_sock = reader.try_clone().expect("clone writer");
+        let (tx, rx) = mpsc::channel::<SharedBytes>();
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let queued_for_pump = Arc::clone(&queued_bytes);
+        let writer_thread =
+            std::thread::spawn(move || writer_pump(rx, writer_sock, queued_for_pump));
+        let ch = ClientHandle {
+            id,
+            mode: Mode::Rw,
+            leader: false,
+            subscription: Subscription::Raw,
+            negotiated_caps: vec![],
+            writer_tx: tx,
+            queued_bytes,
+            buffer_limit: 64 * 1024 * 1024,
+            writer_thread: Some(writer_thread),
+            reader,
+            decoder: FrameDecoder::new(),
+            connected_at_unix_ms: 0,
+        };
+        (ch, peer)
+    }
+
+    /// socket buffer より十分大きい payload (= writer_pump の `write_all` が相手の読み取りを
+    /// 待って何度も block する大きさ)。
+    const FLUSH_TEST_PAYLOAD: usize = 8 * 1024 * 1024;
+
+    /// DR-0028 §4: 相手が読んでいれば、`wait_until_flushed` は writer が queue を書き終える
+    /// (`queued_bytes` が 0) まで戻らない。payload は相手が読み進めないと書き終わらない
+    /// 大きさなので、待たずに戻ると `queued_bytes` が残る。
+    #[test]
+    fn wait_until_flushed_returns_after_the_writer_wrote_the_queue() {
+        let (ch, mut peer) = flush_test_client(1);
+        let drain = std::thread::spawn(move || {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut total = 0usize;
+            while total < FLUSH_TEST_PAYLOAD {
+                match std::io::Read::read(&mut peer, &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => total += n,
+                }
+            }
+            total
+        });
+        assert!(matches!(
+            enqueue_for_client(&ch, Arc::new(vec![0u8; FLUSH_TEST_PAYLOAD])),
+            EnqueueOutcome::Sent
+        ));
+        wait_until_flushed(
+            std::slice::from_ref(&ch),
+            Instant::now() + std::time::Duration::from_secs(30),
+        );
+        assert_eq!(
+            ch.queued_bytes.load(Ordering::Acquire),
+            0,
+            "書き終える前に戻ってはいけない"
+        );
+        assert_eq!(drain.join().expect("drain"), FLUSH_TEST_PAYLOAD);
+    }
+
+    /// 相手が読まなければ、`wait_until_flushed` は deadline で諦めて戻る (= 読まない client が
+    /// upgrade を止めない)。
+    #[test]
+    fn wait_until_flushed_gives_up_at_the_deadline_when_the_peer_does_not_read() {
+        let (ch, _unread_peer) = flush_test_client(2);
+        assert!(matches!(
+            enqueue_for_client(&ch, Arc::new(vec![0u8; FLUSH_TEST_PAYLOAD])),
+            EnqueueOutcome::Sent
+        ));
+        let budget = std::time::Duration::from_millis(200);
+        let start = Instant::now();
+        wait_until_flushed(std::slice::from_ref(&ch), start + budget);
+        assert!(
+            start.elapsed() >= budget,
+            "deadline の前に戻った: {:?}",
+            start.elapsed()
+        );
+        assert!(
+            ch.queued_bytes.load(Ordering::Acquire) > 0,
+            "相手が読まないのに書き終わっている"
+        );
+        // Drop は send で止まった writer を bounded time で外す
+        // (client_handle_drop_unblocks_writer_stuck_in_send)。
+        drop(ch);
+    }
+
+    /// writer thread が書き込みに失敗して終わった client (= 相手が閉じた) は、残りが書かれる
+    /// ことは無いので待たない (= deadline まで待たずに戻る)。
+    #[test]
+    fn wait_until_flushed_does_not_wait_for_a_dead_writer() {
+        let (ch, peer) = flush_test_client(3);
+        drop(peer);
+        assert!(matches!(
+            enqueue_for_client(&ch, Arc::new(vec![0u8; FLUSH_TEST_PAYLOAD])),
+            EnqueueOutcome::Sent
+        ));
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        wait_until_flushed(std::slice::from_ref(&ch), deadline);
+        assert!(
+            Instant::now() < deadline,
+            "終わった writer を deadline まで待った"
+        );
+        assert!(
+            ch.writer_thread
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished),
+            "writer thread は書き込み失敗で終わっているはず"
+        );
     }
 }

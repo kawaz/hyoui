@@ -44,6 +44,7 @@ daemon がどの外部 (client / 子 / fs / 標準エラーの読み手) の振�
 
 - IO worker thread 自身が固まること。I-2 により loop には伝播しない。固まった worker の後始末 (thread の上限・record の abort 表示) は裁定待ち Q6
 - attach client 側プロセスの固まり。client は daemon と別プロセスで、DR-0029 で「覗き窓」と位置づけ済み
+- upgrade の self-exec の直前に、client の writer thread が `upgrade.ack` を書き終えるのを上限 1 秒で待つこと。serve loop を抜けた後の終わり際の 1 回で、DR-0028 §4 に例外として書く (段階 4 で送信 queue の deadline 付き state に置き換える)
 
 ## runtime の選択肢
 

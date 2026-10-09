@@ -356,12 +356,8 @@ fn an_upgraded_daemon_logs_next_to_an_explicit_socket_without_a_state_root() {
         DEADLINE,
     )
     .expect("hyoui upgrade");
-    // `tags_survive_a_daemon_upgrade` と同じく、ack が exec に先を越される race だけは許す。
     let err = String::from_utf8_lossy(&up.stderr);
-    assert!(
-        up.status.success() || err.contains("recv error before ack"),
-        "{err}"
-    );
+    assert!(up.status.success(), "{err}");
     kill_and_wait_with(rootless(), &socket_arg);
     let log = std::fs::read_to_string(alt.join("up.log")).expect("log next to the socket");
     assert!(log.contains("upgrade-resume ready"), "{log:?}");
