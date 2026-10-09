@@ -886,7 +886,7 @@ impl Supervisor {
 
         let pipe = hyoui::sys::install_self_pipe()
             .map_err(|error| std::io::Error::other(format!("could not arm signals: {error}")))?;
-        for signal in [Signal::SIGTERM, Signal::SIGINT] {
+        for signal in super::STOP_SIGNALS {
             hyoui::sys::register_self_pipe(signal).map_err(|error| {
                 std::io::Error::other(format!("could not arm {signal}: {error}"))
             })?;

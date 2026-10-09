@@ -17,7 +17,7 @@ use std::sync::{MutexGuard, TryLockError};
 use std::time::Instant;
 
 use nix::poll::{PollFd, PollTimeout};
-use nix::sys::signal::{SigSet, Signal, kill};
+use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
@@ -225,12 +225,7 @@ const SELF_PIPE_SIGNALS: [Signal; 6] = [
 ///
 /// `pthread_sigmask` が失敗した場合 (= 引数は正しい set なので通常は起きない)。
 pub fn unblock_handled_signals() -> Result<(), Error> {
-    let mut set = SigSet::empty();
-    for sig in SELF_PIPE_SIGNALS {
-        set.add(sig);
-    }
-    nix::sys::signal::pthread_sigmask(nix::sys::signal::SigmaskHow::SIG_UNBLOCK, Some(&set), None)
-        .map_err(Error::Errno)
+    crate::sys::unblock_signals(&SELF_PIPE_SIGNALS)
 }
 
 /// Attempt to acquire SIGCHLD self-pipe ownership for this serve. Returns

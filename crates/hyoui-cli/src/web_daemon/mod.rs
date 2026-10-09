@@ -19,10 +19,31 @@ use std::process::ExitCode;
 use hyoui::cli::{WebDaemonAddConfig, WebDaemonRunSource};
 use hyoui::config::WebConfig;
 use hyoui::paths::Env;
+use nix::sys::signal::Signal;
 use serde_json::{Value, json};
 
 use protocol::{ErrorBody, Request, Response, Target};
 use registry::{ListenConflict, Registry, Unit};
+
+/// web daemon (`run` / `supervise`) が止める合図として受ける signal。
+///
+/// `supervise` はこの一覧に self-pipe の handler を張る (`Supervisor::run`)。`run` は
+/// SIGINT で graceful shutdown し、SIGTERM (監督者が子を止める時に送る) は既定の動作で
+/// 終わる。
+pub(crate) const STOP_SIGNALS: [Signal; 2] = [Signal::SIGTERM, Signal::SIGINT];
+
+/// [`STOP_SIGNALS`] の block を外す (DR-0043 決定 6 を web daemon にも当てる)。
+///
+/// signal mask は fork と exec をまたいで引き継がれるので、SIGTERM を block した呼び出し元
+/// から手で起動した web daemon は `kill -TERM` が保留されたまま届かない (launchd からの
+/// 起動は mask が空なので起きない)。thread (tokio の runtime、監督者の accept / signal の
+/// thread) を立てる前に呼ぶ。一覧の外の block は残す。失敗しても起動は続ける (= 外せなかった
+/// signal が届かないだけ)。
+fn unblock_stop_signals() {
+    if let Err(error) = hyoui::sys::unblock_signals(&STOP_SIGNALS) {
+        eprintln!("hyoui: warning: could not unblock the web daemon's stop signals: {error}");
+    }
+}
 
 /// 監督者の生死。
 ///
@@ -903,6 +924,7 @@ pub fn remove_command(name: &str) -> ExitCode {
 /// OS の service manager に載るのはこれ 1 つで、unit ごとの plist は作らない
 /// (決定 6)。
 pub fn supervise_command() -> ExitCode {
+    unblock_stop_signals();
     let context = "web daemon supervise";
     let root = match registry::default_root() {
         Ok(root) => root,
@@ -1102,6 +1124,7 @@ pub fn version_command() -> ExitCode {
 /// `<unit>` は登録簿が指す config で起動する。監督者が子を exec するのと同じ
 /// 経路で、手元で 1 台だけ確かめる時にも使う (DR-0034 決定 3)。
 pub fn run_command(source: &WebDaemonRunSource) -> ExitCode {
+    unblock_stop_signals();
     let context = "web daemon run";
     let registry = match Registry::open() {
         Ok(registry) => registry,

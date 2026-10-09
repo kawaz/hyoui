@@ -76,6 +76,7 @@ daemon の process は起動直後 (daemonize の子 `run_daemon_child`、upgrad
 - 外すのは一覧の signal だけで、mask を空にはしない: 一覧の外 (SIGHUP 等) を呼び出し元が block していても、daemon はそれを受けて何かする必要が無い。外して既定の動作 (終了) にすると、呼び出し元が block で避けていた終わり方を daemon に足すことになる
 - thread を立てる前に行う: 後から立てる logger / writer の thread も同じ mask を引き継ぐ (process 宛の signal は block していない thread のどれかに届く)
 - upgrade で再開した子でも行う: mask は exec をまたいで引き継がれるので、block を外す前の版の daemon から upgrade した時もここで外れる
+- web daemon (`hyoui web daemon run` / `supervise`) も同じ扱いにする: 起動直後、thread (tokio の runtime、監督者の accept / signal の thread) を立てる前に、止める合図として受ける SIGTERM / SIGINT (`web_daemon::STOP_SIGNALS`) の block を外す。監督者はこの一覧に self-pipe の handler を張り、`run` は SIGINT で graceful shutdown し SIGTERM は既定の動作で終わる。launchd から起動した時は mask が空なので、効くのは手で起動した時
 
 ## 責務外
 
@@ -103,6 +104,7 @@ daemon 自身の signal の扱い (無視・handler) と、決定 6 の一覧の
 - e2e (anchor 経路、daemon 経由): `crates/hyoui-cli/tests/child_signal_defaults.rs`。無視・block した呼び出し元と、何も変えていない呼び出し元 (SIGPIPE が既定になることを見る) の 2 セル
 - unit (継承した handler): `sys::signal::tests::reset_drops_inherited_own_handlers_but_keeps_inherited_ignores`。SIGUSR1 に self-pipe の handler、SIGHUP に無視を張って fork し、子で `disarm_self_pipe_in_child` → `reset_signals_for_exec` の後の扱いを見る (SIGUSR1 は既定、SIGHUP は無視のまま)
 - e2e (決定 6): `crates/hyoui-cli/tests/daemon_signal_mask.rs`。SIGTERM / SIGHUP を block した perl から `hyoui run --detached` で起動した daemon に `kill -TERM` を送り、ro で handshake した接続が期限内に EOF になる (= daemon が graceful shutdown で終わる)。修正を外した版では期限 (10 秒) まで EOF が来ない
+- e2e (決定 6、web daemon): `crates/hyoui-cli/tests/web_daemon_signal_mask.rs`。SIGTERM / SIGINT / SIGHUP を block した perl から起動した `web daemon run` (listen し始めた後) と `supervise` (制御 socket に繋がった後) に `kill -TERM` を送り、期限内に終わる。修正を外した版では期限 (10 秒) まで終わらない
 - unit (決定 5、legacy 経路): `daemon::session::tests::session_start_lowers_only_the_core_soft_limit` (daemon の soft 0、hard は呼び出し元のまま) と `session_child_starts_with_the_caller_core_limit` (子の `sh` の `ulimit -c` が保存値と一致)
 - e2e (決定 5、anchor 経路): `crates/hyoui-cli/tests/child_core_limit.rs`。呼び出し元の `sh` が soft を上げてから hyoui を exec し、子の `sh` の `ulimit -S -c` / `-H -c` が呼び出し元と一致する。呼び出し元の hard が 0 の環境では `core=0,0` の一致を見るだけになる
 - 実機: 対話の bash の `$(...)` から起動した子が `kill -TSTP` で `T+` になる、非対話 sh の `cmd &` から起動した子が SIGINT で終わる (本 DR の変更を外した 0.14.0 ではどちらも `S+` のまま)

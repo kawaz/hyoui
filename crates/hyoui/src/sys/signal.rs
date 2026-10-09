@@ -67,6 +67,25 @@ pub fn install_default(signum: Signal) -> Result<()> {
     Ok(())
 }
 
+/// 呼んだ thread の signal mask から `signals` の block を外す (それ以外の block は残す)。
+///
+/// signal mask は fork と exec をまたいで引き継がれるので、block した呼び出し元から起動した
+/// daemon は、自分が受けると決めた signal (SIGTERM 等) が保留されたまま届かない。daemon が
+/// 起動直後、thread を立てる前に呼ぶ (= 後から立てる thread も同じ mask を引き継ぐ、
+/// DR-0043 決定 6)。
+///
+/// # Errors
+///
+/// `pthread_sigmask` が失敗した場合 (= 引数は正しい set なので通常は起きない)。
+pub fn unblock_signals(signals: &[Signal]) -> Result<()> {
+    let mut set = SigSet::empty();
+    for &sig in signals {
+        set.add(sig);
+    }
+    nix::sys::signal::pthread_sigmask(nix::sys::signal::SigmaskHow::SIG_UNBLOCK, Some(&set), None)
+        .map_err(Error::from)
+}
+
 /// Synchronously `raise(3)` `signum` on this process.
 pub fn raise(signum: Signal) -> Result<()> {
     nix::sys::signal::raise(signum).map_err(Error::from)
