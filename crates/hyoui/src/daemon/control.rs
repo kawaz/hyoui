@@ -1815,6 +1815,7 @@ mod tests {
             buffer_limit: 1 << 20,
             writer_thread: None,
             reader: b,
+            decoder: crate::protocol::FrameDecoder::new(),
             connected_at_unix_ms: 0,
         };
         (ch, rx)
@@ -2029,6 +2030,7 @@ mod tests {
             buffer_limit: 1 << 20,
             writer_thread: None,
             reader: b,
+            decoder: crate::protocol::FrameDecoder::new(),
             connected_at_unix_ms: 0,
         };
         (ch, rx)
@@ -2163,6 +2165,7 @@ mod tests {
             buffer_limit: 1 << 20,
             writer_thread: None,
             reader: b,
+            decoder: crate::protocol::FrameDecoder::new(),
             connected_at_unix_ms: 0,
         };
         (ch, rx)
@@ -2308,6 +2311,7 @@ mod tests {
             buffer_limit: 1 << 20,
             writer_thread: None,
             reader: b,
+            decoder: crate::protocol::FrameDecoder::new(),
             connected_at_unix_ms: 0,
         };
         (ch, rx)

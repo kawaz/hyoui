@@ -140,20 +140,12 @@ impl Frame {
         let mut size_buf = [0u8; 4];
         read_exact_eof(r, &mut size_buf, "size header")?;
         let size = u32::from_le_bytes(size_buf);
-
-        if (size as usize) > MAX_FRAME_SIZE {
-            return Err(ProtocolError::FrameTooLarge(size).into());
-        }
-        if size < 1 {
-            return Err(ProtocolError::FrameTooSmall(size).into());
-        }
+        check_size(size)?;
 
         let mut ty_buf = [0u8; 1];
         read_exact_eof(r, &mut ty_buf, "type byte")?;
         let ty = ty_buf[0];
-        if ty != TYPE_RAW_DATA && ty != TYPE_CBOR_CONTROL && ty != TYPE_RAW_ACK {
-            return Err(ProtocolError::UnknownType(ty).into());
-        }
+        check_type(ty)?;
 
         let body_len = (size - 1) as usize;
         let mut body = vec![0u8; body_len];
@@ -162,6 +154,126 @@ impl Frame {
         }
 
         Ok(Frame { ty, body })
+    }
+}
+
+/// size header の検証 ([`Frame::decode_from`] と [`FrameDecoder`] で共有)。
+fn check_size(size: u32) -> Result<(), ProtocolError> {
+    if (size as usize) > MAX_FRAME_SIZE {
+        return Err(ProtocolError::FrameTooLarge(size));
+    }
+    if size < 1 {
+        return Err(ProtocolError::FrameTooSmall(size));
+    }
+    Ok(())
+}
+
+/// type byte の検証 ([`Frame::decode_from`] と [`FrameDecoder`] で共有)。
+fn check_type(ty: u8) -> Result<(), ProtocolError> {
+    if ty != TYPE_RAW_DATA && ty != TYPE_CBOR_CONTROL && ty != TYPE_RAW_ACK {
+        return Err(ProtocolError::UnknownType(ty));
+    }
+    Ok(())
+}
+
+/// size header (4 byte) + type byte (1 byte)。
+const SIZE_HEADER_LEN: usize = 4;
+
+/// frame を取り出した後に decoder が持ち続けてよい capacity の下限側の上限。
+///
+/// frame を取り出した後の capacity は `max(RETAINED_CAPACITY, 2 * 未消費 bytes)` を
+/// 超えない ([`FrameDecoder::next_frame`])。大きな frame (最大 16 MiB) を 1 度受けた
+/// client が、続く小さな未消費分 (次の frame の header 1 byte 等) だけを残して止まって
+/// も、その capacity を接続中ずっと抱え続けないための上限。
+const RETAINED_CAPACITY: usize = 64 * 1024;
+
+/// 届いた bytes を順に受け取り、frame が揃った分だけ取り出す増分 decoder
+/// (DR-0037 段階 1、client 受信)。
+///
+/// [`Frame::decode_from`] は frame を読み切るまで `read_exact` で待つため、相手が
+/// frame の途中で止まると呼び出し側が戻らない。本 decoder は I/O を持たない純粋な
+/// state で、呼び出し側が `recv` で得た bytes を [`push`](Self::push) し、
+/// [`next_frame`](Self::next_frame) で揃った frame を 1 つずつ取り出す。
+///
+/// - size header が揃った時点で size を検証し、type byte が揃った時点で type を検証する
+///   (上限超過の size を宣言した frame の body を待たずに error にする)
+/// - error を返した後の状態は保証しない (呼び出し側は当該 peer を切る)
+/// - 受信途中の bytes は push された分だけ保持する (宣言 size の先行確保はしない)
+#[derive(Debug, Default)]
+pub struct FrameDecoder {
+    /// 受信済みで未消費の bytes は `buf[pos..]`。
+    buf: Vec<u8>,
+    /// 取り出し済み frame の末尾 (= 次の frame の先頭)。
+    pos: usize,
+}
+
+impl FrameDecoder {
+    /// 空の decoder を作る。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 受信した bytes を末尾に足す。
+    pub fn push(&mut self, bytes: &[u8]) {
+        // 取り出し済みの prefix はここでまとめて詰める (= frame を 1 つ取り出すたびに
+        // 詰めると、1 回の受信に小さい frame が多数入った時に memmove が frame 数に
+        // 比例して重なる)。
+        if self.pos > 0 {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// 揃った frame を 1 つ取り出す。揃っていなければ `Ok(None)`。
+    ///
+    /// # Errors
+    ///
+    /// * [`ProtocolError::FrameTooLarge`] — size が `MAX_FRAME_SIZE` を超える
+    /// * [`ProtocolError::FrameTooSmall`] — size が 0
+    /// * [`ProtocolError::UnknownType`] — 未知の type byte
+    pub fn next_frame(&mut self) -> Result<Option<Frame>, ProtocolError> {
+        let Some(total) = self.complete_frame_len()? else {
+            return Ok(None);
+        };
+        let start = self.pos;
+        let ty = self.buf[start + SIZE_HEADER_LEN];
+        let body = self.buf[start + SIZE_HEADER_LEN + 1..start + total].to_vec();
+        self.pos += total;
+        let remaining = self.buf.len() - self.pos;
+        if self.buf.capacity() > RETAINED_CAPACITY && self.buf.capacity() / 2 >= remaining {
+            // 確保が未消費分に対して過大なので、未消費分だけを新しい領域へ移す。移すのは
+            // capacity の半分以下で、移した後の capacity は未消費分ちょうどになるため、
+            // 続けて取り出しても移す量は毎回半分以下に減る (= 全量 memmove を繰り返さない)。
+            self.buf = self.buf[self.pos..].to_vec();
+            self.pos = 0;
+        } else if remaining == 0 {
+            self.buf.clear();
+            self.pos = 0;
+        }
+        Ok(Some(Frame { ty, body }))
+    }
+
+    /// 追加の受信なしで [`next_frame`](Self::next_frame) が `Ok(None)` 以外を返すか
+    /// (= 揃った frame か、検出済みの protocol error が buffer にある)。
+    pub fn is_ready(&self) -> bool {
+        !matches!(self.complete_frame_len(), Ok(None))
+    }
+
+    /// 先頭 frame が揃っていればその wire 上の長さ (header 込み) を返す。
+    fn complete_frame_len(&self) -> Result<Option<usize>, ProtocolError> {
+        let avail = &self.buf[self.pos..];
+        let Some(size_bytes) = avail.first_chunk::<SIZE_HEADER_LEN>() else {
+            return Ok(None);
+        };
+        let size = u32::from_le_bytes(*size_bytes);
+        check_size(size)?;
+        let Some(&ty) = avail.get(SIZE_HEADER_LEN) else {
+            return Ok(None);
+        };
+        check_type(ty)?;
+        let total = SIZE_HEADER_LEN + size as usize;
+        Ok((avail.len() >= total).then_some(total))
     }
 }
 
@@ -334,6 +446,269 @@ mod tests {
         let mut buf = Vec::new();
         f.encode_to(&mut buf).expect("encode");
         assert_eq!(buf, vec![0x03, 0x00, 0x00, 0x00, 0x00, b'h', b'i']);
+    }
+
+    // ---- FrameDecoder (DR-0037 段階 1) ----
+
+    fn encode_all(frames: &[Frame]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        for f in frames {
+            f.encode_to(&mut wire).expect("encode");
+        }
+        wire
+    }
+
+    /// decoder から揃った frame を全部取り出す (error は panic)。
+    fn drain_frames(dec: &mut FrameDecoder) -> Vec<Frame> {
+        let mut out = Vec::new();
+        while let Some(f) = dec.next_frame().expect("no protocol error") {
+            out.push(f);
+        }
+        out
+    }
+
+    /// 3 種の type と空 body / 1 byte body / 数百 byte body を混ぜた frame 列。
+    fn sample_frames() -> Vec<Frame> {
+        vec![
+            Frame::raw_data(Vec::new()),
+            Frame::cbor_control(vec![0xa1, 0x61, b'k', 0x01]),
+            Frame::raw_ack(vec![0xa0]),
+            Frame::raw_data((0..=255u8).cycle().take(300).collect()),
+            Frame::raw_data(vec![b'z']),
+        ]
+    }
+
+    /// wire を 2 箇所 (i, j) で 3 分割して届けるすべての組合せで、元の frame 列が
+    /// 順序どおり過不足なく取り出せる (= header 内・type byte・body 内・frame 境界の
+    /// どこで切れても組み立て直せる)。
+    #[test]
+    fn decoder_reassembles_across_every_split_pair() {
+        let frames = sample_frames();
+        let wire = encode_all(&frames);
+        for i in 0..=wire.len() {
+            for j in i..=wire.len() {
+                let mut dec = FrameDecoder::new();
+                let mut got = Vec::new();
+                for chunk in [&wire[..i], &wire[i..j], &wire[j..]] {
+                    dec.push(chunk);
+                    got.extend(drain_frames(&mut dec));
+                }
+                assert_eq!(got, frames, "split at ({i}, {j})");
+                assert!(!dec.is_ready(), "nothing left after ({i}, {j})");
+            }
+        }
+    }
+
+    /// 1 byte ずつ届けても、frame の最終 byte が届いた瞬間にだけ 1 frame 取り出せる。
+    #[test]
+    fn decoder_byte_by_byte_yields_frame_exactly_at_last_byte() {
+        let frames = sample_frames();
+        let wire = encode_all(&frames);
+        // 各 frame の終端 offset (exclusive)。
+        let mut ends = Vec::new();
+        let mut off = 0;
+        for f in &frames {
+            off += SIZE_HEADER_LEN + 1 + f.body.len();
+            ends.push(off);
+        }
+        let mut dec = FrameDecoder::new();
+        let mut got = Vec::new();
+        for (k, b) in wire.iter().enumerate() {
+            dec.push(std::slice::from_ref(b));
+            let ready = dec.is_ready();
+            assert_eq!(ready, ends.contains(&(k + 1)), "is_ready after byte {k}");
+            if let Some(f) = dec.next_frame().expect("no error") {
+                got.push(f);
+            }
+            assert!(dec.next_frame().expect("no error").is_none());
+        }
+        assert_eq!(got, frames);
+    }
+
+    /// 1 回の push に複数 frame + 次 frame の途中までが入った場合、揃った frame を
+    /// 1 つずつ取り出せ、途中の frame は残りが届いてから取り出せる。
+    #[test]
+    fn decoder_yields_multiple_frames_from_single_push_one_at_a_time() {
+        let frames = sample_frames();
+        let wire = encode_all(&frames);
+        // 最後の frame の 1 byte 手前まで。
+        let cut = wire.len() - 1;
+        let mut dec = FrameDecoder::new();
+        dec.push(&wire[..cut]);
+        for want in &frames[..frames.len() - 1] {
+            assert!(dec.is_ready());
+            assert_eq!(dec.next_frame().expect("ok").as_ref(), Some(want));
+        }
+        assert!(!dec.is_ready(), "last frame is still partial");
+        assert!(dec.next_frame().expect("ok").is_none());
+        dec.push(&wire[cut..]);
+        assert_eq!(
+            dec.next_frame().expect("ok").as_ref(),
+            frames.last(),
+            "completed by the remaining byte"
+        );
+    }
+
+    /// 上限超過の size は size header (4 byte) が揃った時点で error になる
+    /// (= body を待たない)。宣言 size の分の buffer を先行確保しない。
+    #[test]
+    fn decoder_rejects_oversized_size_without_waiting_for_body() {
+        let bogus = (MAX_FRAME_SIZE as u32) + 1;
+        let header = bogus.to_le_bytes();
+        let mut dec = FrameDecoder::new();
+        dec.push(&header[..3]);
+        assert!(!dec.is_ready());
+        assert!(dec.next_frame().expect("3 bytes: undecided").is_none());
+        dec.push(&header[3..]);
+        assert!(dec.is_ready(), "error is ready without more input");
+        match dec.next_frame() {
+            Err(ProtocolError::FrameTooLarge(n)) => assert_eq!(n, bogus),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// 上限ちょうどの size は受理され (= body 待ち)、宣言 size の先行確保もしない。
+    /// body を分割して届けると最大 frame も組み立てられる。
+    #[test]
+    fn decoder_accepts_max_size_frame_in_chunks_without_preallocating() {
+        let body = vec![0xCD; MAX_FRAME_SIZE - 1];
+        let wire = encode_all(&[Frame::raw_data(body.clone())]);
+        let mut dec = FrameDecoder::new();
+        dec.push(&wire[..SIZE_HEADER_LEN + 1]);
+        assert!(!dec.is_ready(), "max size is not an error, waits for body");
+        assert!(
+            dec.buf.capacity() < RETAINED_CAPACITY,
+            "must not reserve the declared size up front (capacity = {})",
+            dec.buf.capacity()
+        );
+        for chunk in wire[SIZE_HEADER_LEN + 1..].chunks(64 * 1024) {
+            assert!(dec.next_frame().expect("ok").is_none());
+            dec.push(chunk);
+        }
+        let f = dec.next_frame().expect("ok").expect("complete");
+        assert_eq!(f.ty, TYPE_RAW_DATA);
+        assert_eq!(f.body, body);
+        // 大きな frame を取り出した後は capacity を抱え続けない。
+        assert_eq!(dec.buf.capacity(), 0);
+    }
+
+    /// 大きな frame の直後に次の frame の header 1 byte だけが続いて止まっても、大きな
+    /// frame を取り出した時点で capacity が上限 (`max(RETAINED_CAPACITY, 2 * 未消費)`)
+    /// 以下に戻り、残りの 1 byte は保たれて次の frame を組み立てられる。
+    #[test]
+    fn decoder_releases_capacity_when_tiny_remainder_follows_large_frame() {
+        let big = Frame::raw_data(vec![0x5A; 4 * 1024 * 1024]);
+        let next = Frame::cbor_control(vec![0xa0]);
+        let next_wire = encode_all(std::slice::from_ref(&next));
+        let mut wire = encode_all(std::slice::from_ref(&big));
+        wire.push(next_wire[0]);
+
+        let mut dec = FrameDecoder::new();
+        for chunk in wire.chunks(64 * 1024) {
+            dec.push(chunk);
+        }
+        assert!(
+            dec.buf.capacity() > RETAINED_CAPACITY,
+            "前提: 大きく確保している"
+        );
+        assert_eq!(dec.next_frame().expect("ok"), Some(big));
+        assert!(
+            dec.buf.capacity() <= RETAINED_CAPACITY,
+            "capacity must drop with only 1 byte left (capacity = {})",
+            dec.buf.capacity()
+        );
+        assert!(!dec.is_ready());
+        dec.push(&next_wire[1..]);
+        assert_eq!(dec.next_frame().expect("ok"), Some(next));
+    }
+
+    /// 取り出した後の capacity は、未消費分が大きくても `max(RETAINED_CAPACITY,
+    /// 2 * 未消費)` を超えない (= 未消費分が半分以上を占める間は移さない)。
+    #[test]
+    fn decoder_capacity_bound_holds_with_large_remainder() {
+        let big = Frame::raw_data(vec![1; 2 * 1024 * 1024]);
+        let partial_next = Frame::raw_data(vec![2; 3 * 1024 * 1024]);
+        let partial_wire = encode_all(std::slice::from_ref(&partial_next));
+        let mut wire = encode_all(std::slice::from_ref(&big));
+        // 次の frame の 1 MiB 分だけ (残りはまだ届いていない)。
+        wire.extend_from_slice(&partial_wire[..1024 * 1024]);
+
+        let mut dec = FrameDecoder::new();
+        for chunk in wire.chunks(64 * 1024) {
+            dec.push(chunk);
+        }
+        assert_eq!(dec.next_frame().expect("ok"), Some(big));
+        let remaining = dec.buf.len() - dec.pos;
+        assert_eq!(remaining, 1024 * 1024);
+        assert!(
+            dec.buf.capacity() <= RETAINED_CAPACITY.max(2 * remaining),
+            "capacity {} exceeds bound for remaining {remaining}",
+            dec.buf.capacity()
+        );
+        for chunk in partial_wire[1024 * 1024..].chunks(64 * 1024) {
+            assert!(dec.next_frame().expect("ok").is_none());
+            dec.push(chunk);
+        }
+        assert_eq!(dec.next_frame().expect("ok"), Some(partial_next));
+        assert_eq!(dec.buf.capacity(), 0, "nothing left, nothing retained");
+    }
+
+    #[test]
+    fn decoder_rejects_zero_size() {
+        let mut dec = FrameDecoder::new();
+        dec.push(&0u32.to_le_bytes());
+        match dec.next_frame() {
+            Err(ProtocolError::FrameTooSmall(0)) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// 未知 type は type byte が揃った時点で error (= 宣言 body を待たない)。
+    #[test]
+    fn decoder_rejects_unknown_type_at_type_byte() {
+        let mut dec = FrameDecoder::new();
+        dec.push(&100u32.to_le_bytes());
+        assert!(!dec.is_ready());
+        dec.push(&[0x03]);
+        match dec.next_frame() {
+            Err(ProtocolError::UnknownType(0x03)) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// 壊れた frame の手前に揃っている正常 frame は、error より先に取り出せる
+    /// (= 「正常 frame を処理してから切断」の順序を decoder が崩さない)。
+    #[test]
+    fn decoder_yields_preceding_frames_before_corrupt_one() {
+        let good = sample_frames();
+        let mut wire = encode_all(&good);
+        wire.extend_from_slice(&1u32.to_le_bytes());
+        wire.push(0x7f); // 未知 type
+        let mut dec = FrameDecoder::new();
+        dec.push(&wire);
+        for want in &good {
+            assert_eq!(dec.next_frame().expect("ok").as_ref(), Some(want));
+        }
+        assert!(dec.is_ready(), "corrupt frame is ready as an error");
+        match dec.next_frame() {
+            Err(ProtocolError::UnknownType(0x7f)) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// decoder と blocking の `decode_from` は同じ wire から同じ frame 列を得る。
+    #[test]
+    fn decoder_agrees_with_decode_from() {
+        let frames = sample_frames();
+        let wire = encode_all(&frames);
+        let mut cur = Cursor::new(wire.clone());
+        let mut via_read = Vec::new();
+        for _ in 0..frames.len() {
+            via_read.push(Frame::decode_from(&mut cur).expect("decode"));
+        }
+        let mut dec = FrameDecoder::new();
+        dec.push(&wire);
+        assert_eq!(drain_frames(&mut dec), via_read);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # DR-0037: daemon のイベントループは外部の応答を待たない
 
-- Status: Proposed (2026-09-29)。Q1 / Q2 / Q3 / Q8 と段階 1 の着手は裁定済み (2026-10-09、「裁定」節)。Q4〜Q7 は「裁定待ち」節
+- Status: Proposed (2026-09-29) — 🟡 段階 1 実装済。Q1 / Q2 / Q3 / Q8 と段階 1 の着手は裁定済み (2026-10-09、「裁定」節)。Q4〜Q7 は「裁定待ち」節
 - Date: 2026-09-29
 - Related: DR-0025 (reducer 化。単一 thread の `poll → translate → reduce → effect` loop と EffectResult feedback を本 DR が前提にする), DR-0014 (透過原則と検証主義。検出手段で介入をどこまで入れるかの判断軸), DR-0021 (PTY drain ack。PTY write の非同期化で ack の発行点を保つ必要がある), DR-0016 (record。writer thread と stop / abort の扱い), DR-0028 (graceful upgrade。state file 書き出しと fd 引き継ぎ), DR-0015 (fork daemon + attach client。daemon の stdio の出どころ)
 - Origin: `docs/issue/2026-09-29-daemon-must-never-hang.md` (kawaz 裁定 2026-09-29)。事実は `docs/findings/2026-09-29-daemon-blocking-points.md`
@@ -70,7 +70,7 @@ findings の ID で対応を示す。
 
 | 対象 | 形 |
 |---|---|
-| client 受信 (C-1) | client ごとの受信 buffer + 増分 frame decoder (純粋関数: `feed(&[u8]) -> Vec<Frame>`) で読む。1 周で読むのは `recv` 1 回分まで。reader と writer は `try_clone` による同一 open file description なので、O_NONBLOCK を fd に付けると writer 側 (handshake response、writer thread の `write_all`) も nonblocking になり EAGAIN で部分送信・切断が起きる。送信が blocking のままの間は `recv(2)` の `MSG_DONTWAIT` (呼び出し単位の nonblocking。Linux / macOS の recv(2) にある) で読み、fd のフラグは変えない。送信も loop 内 nonblocking に移した段で fd ごと O_NONBLOCK にする |
+| client 受信 (C-1) | client ごとの増分 frame decoder (I/O を持たない純粋な state: 届いた bytes を `push` し、揃った frame を `next_frame` で 1 つずつ取り出す。`is_ready` は追加の受信なしで frame か protocol error を取り出せるか) で読む。1 周で読むのは `recv` 1 回分まで、処理するのは 1 client につき 1 frame まで (decoder に揃った frame が残っていれば recv せずにそれを処理する。残っている周回は poll で待たない)。reader と writer は `try_clone` による同一 open file description なので、O_NONBLOCK を fd に付けると writer 側 (handshake response、writer thread の `write_all`) も nonblocking になり EAGAIN で部分送信・切断が起きる。送信が blocking のままの間は `recv(2)` の `MSG_DONTWAIT` (呼び出し単位の nonblocking。Linux / macOS の recv(2) にある) で読み、fd のフラグは変えない。送信も loop 内 nonblocking に移した段で fd ごと O_NONBLOCK にする |
 | client 送信 (C-2, C-6, C-8, C-10) | client ごとの送信 queue を loop が持ち、O_NONBLOCK write + `POLLOUT` で流す。queue の byte 上限超過で切断 (現行 backpressure と同じ判定)。切断は socket close だけで完結し、join が無い。「ack を送り切ってから切る」は queue が空になった時点で close する deadline 付き state で表す。writer thread は廃止 (裁定待ち Q2) |
 | handshake (C-4, C-9) | worker thread をやめ、pending client の state (受信 buffer + deadline 5s) として loop 内で扱う。response も送信 queue に積む。mpsc の `try_recv` のための 50ms poll cap が不要になる |
 | accept (C-5) | listener を O_NONBLOCK にし、EAGAIN / ECONNABORTED は loop に戻る |
@@ -129,7 +129,7 @@ SIGKILL 後の reap (K-5): 現行は flag なしの `waitpid` で見届ける。
 
 実機で再現した経路と、影響が大きい経路から順に進める。段の間の依存は各段に書く (依存を書いていない段は前段と独立に入れられる)。
 
-1. **client 受信の増分 decoder 化** (C-1)。1 client で daemon を止められる経路で、実機再現済み。受信は `recv(MSG_DONTWAIT)` で行い、fd の O_NONBLOCK は付けない (reader と writer が同一 open file description を共有するため、付けると blocking 前提の writer thread と handshake response の `write_all` が EAGAIN で部分送信・切断になる)。handshake 後の client のみ対象にし、handshake の worker は残してよい
+1. **client 受信の増分 decoder 化** (C-1)。1 client で daemon を止められる経路で、実機再現済み。受信は `recv(MSG_DONTWAIT)` で行い、fd の O_NONBLOCK は付けない (reader と writer が同一 open file description を共有するため、付けると blocking 前提の writer thread と handshake response の `write_all` が EAGAIN で部分送信・切断になる)。handshake 後の client のみ対象にし、handshake の worker は残してよい。1 回の recv に複数 frame が入っても、処理するのは 1 周に 1 client につき 1 frame とし、残りは decoder に置いて次の周回で処理する (frame の間で client の drop (自分の detach、他 client の `detach --target=others`、backpressure 超過) と leader cascade を確定させてから次の frame に進むため。blocking で 1 周 1 frame ずつ読んでいた時と同じ順序になる)
 2. **標準エラーの付け替え + logger** (E-1)。起動した呼び出し元の stderr を daemon が持ち続けること自体をやめる
 3. **fs IO の worker 化** (F-1〜F-6)。record の join 撤去が中心
 4. **client 送信の loop 内 nonblocking 化と writer thread の廃止** (C-2, C-6, C-8, C-10)。client socket の fd に O_NONBLOCK を付けるのはこの段で、受信の `MSG_DONTWAIT` はこの段で通常の read に戻してよい。handshake response も送信 queue 経由に切り替える (blocking の `write_all` が同じ description に残らないように)。v0.9.55 の `ClientHandle::drop` の timed join + `shutdown(Write)` は、この段までの **暫定の上限** として残す。この段で writer thread ごと無くなり、Drop は close だけになる

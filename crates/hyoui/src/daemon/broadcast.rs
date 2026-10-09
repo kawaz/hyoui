@@ -39,7 +39,7 @@ use std::sync::mpsc::{self, Sender};
 use std::time::Instant;
 
 use crate::protocol::messages::{ErrorCode, ErrorMessage, RawAck, TailData};
-use crate::protocol::{ControlMessage, Frame, Mode};
+use crate::protocol::{ControlMessage, Frame, FrameDecoder, Mode};
 
 /// daemon が同時 attach を許す client 数上限 (= D6 集合 backpressure DoS 対策)。
 /// 超過した accept は即 socket close で reject。`client_buffer_bytes` が 8 MiB の
@@ -85,6 +85,10 @@ pub(super) struct ClientHandle {
     pub(super) writer_thread: Option<std::thread::JoinHandle<()>>,
     /// daemon が client → daemon を decode するときに使う socket reader。
     pub(super) reader: UnixStream,
+    /// `reader` から受信して、まだ frame として揃っていない bytes (DR-0037 段階 1)。
+    /// serve loop は `recv(MSG_DONTWAIT)` で届いた分だけここに足し、揃った frame を
+    /// 取り出して処理する (= 相手が frame の途中で止まっても loop は待たない)。
+    pub(super) decoder: FrameDecoder,
     /// この client が attach した時刻 (= unix epoch ミリ秒、DR-0020 §5)。
     /// `status` の client 一覧で「接続時刻」を表示する用途。
     pub(super) connected_at_unix_ms: u64,
@@ -550,6 +554,7 @@ mod tests {
             buffer_limit: 100,
             writer_thread: None,
             reader: b,
+            decoder: FrameDecoder::new(),
             connected_at_unix_ms: 0,
         };
 
@@ -598,6 +603,7 @@ mod tests {
             buffer_limit,
             writer_thread: None,
             reader,
+            decoder: FrameDecoder::new(),
             connected_at_unix_ms: 0,
         };
         (ch, rx, peer)
@@ -738,6 +744,7 @@ mod tests {
             buffer_limit: 1024,
             writer_thread: Some(writer_thread),
             reader,
+            decoder: FrameDecoder::new(),
             connected_at_unix_ms: 0,
         };
 
@@ -784,6 +791,7 @@ mod tests {
             buffer_limit: 1024,
             writer_thread: Some(writer_thread),
             reader,
+            decoder: FrameDecoder::new(),
             connected_at_unix_ms: 0,
         };
         let (done_tx, done_rx) = mpsc::channel();
@@ -820,6 +828,7 @@ mod tests {
             buffer_limit: 100,
             writer_thread: None,
             reader: b,
+            decoder: FrameDecoder::new(),
             connected_at_unix_ms: 0,
         };
         // panic なしで drop できることだけ確認

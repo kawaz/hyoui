@@ -34,8 +34,8 @@ use crate::protocol::messages::{
     SessionMode,
 };
 use crate::protocol::{
-    ControlMessage, Frame, HandshakeRequest, HandshakeResponse, MVP_CAPS, TYPE_CBOR_CONTROL,
-    Transport, UnixStreamTransport, intersect_caps,
+    ControlMessage, Frame, FrameDecoder, HandshakeRequest, HandshakeResponse, MVP_CAPS,
+    TYPE_CBOR_CONTROL, Transport, UnixStreamTransport, intersect_caps,
 };
 use crate::sys::UnixSock;
 use crate::sys::clock::now_unix_ms;
@@ -406,6 +406,7 @@ fn finalize_accepted_client(
             buffer_limit: config.client_buffer_bytes,
             writer_thread: Some(writer_thread),
             reader,
+            decoder: FrameDecoder::new(),
             connected_at_unix_ms: now_unix_ms(),
         },
         became_leader,
@@ -901,6 +902,7 @@ mod tests {
             buffer_limit: 1 << 20,
             writer_thread: None,
             reader: b,
+            decoder: crate::protocol::FrameDecoder::new(),
             connected_at_unix_ms: 0,
         }
     }

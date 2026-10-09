@@ -25,10 +25,10 @@ use nix::unistd::Pid;
 use crate::Error;
 // DR-0015: OnChildSuspend / OnParentSuspend は daemon 側で使わなくなった
 // (= client 側で policy 発動、daemon は新 message を中継するのみ)。
+use crate::protocol::ControlMessage;
 #[cfg_attr(not(test), allow(unused_imports))]
 use crate::protocol::Mode;
 use crate::protocol::messages::LeaderNotify;
-use crate::protocol::{ControlMessage, Frame};
 use crate::scrollback::Scrollback;
 use crate::sys::clock::now_unix_ms;
 use crate::sys::{
@@ -1266,6 +1266,47 @@ fn record_child_continued(state: &SessionState, child: Pid) {
 // だった)。新方針では `notify_child_stopped` を caller (= serve_loop) が直接呼ぶ。
 // transition::Stopped 以外 (Continued / Exited) は caller 側で処理する形に統一。
 
+/// client socket から 1 周に `recv` する上限 (DR-0037「1 周で読むのは recv 1 回分まで」)。
+const CLIENT_RECV_CHUNK: usize = 64 * 1024;
+
+/// 1 client から、この周回で処理する frame を高々 1 つ取り出す (DR-0037 段階 1)。
+///
+/// - decoder に揃った frame が残っていれば、socket は読まずにそれを返す
+/// - 残っていなければ、`readable` (= POLLIN / POLLHUP / POLLERR) の時だけ
+///   `recv(MSG_DONTWAIT)` を 1 回呼び、届いた分を decoder に足して 1 frame 取り出す
+/// - frame が揃わなければ `None` (= 相手が frame の途中で止まっていても待たない)
+/// - 相手の close (frame の途中かどうかを問わない)、recv の error、protocol error は
+///   `Some(FrameOrError::Error)` (= 呼び出し側が当該 client を切る)
+///
+/// Design rationale: 1 回の recv に複数 frame が入っても、処理するのは 1 周 1 frame に
+/// 留め、残りは decoder に置いて次の周回 (poll を待たずに回す) で処理する。blocking の
+/// `Frame::decode_from` で 1 周 1 frame ずつ読んでいた時と同じく、frame の間で client の
+/// drop (自分の detach / 他 client の `detach --target=others` / backpressure 超過) や
+/// leader cascade が確定してから次の frame に進む。1 周で全部処理すると、切断が決まった
+/// client の後続 frame まで処理する経路ができる。
+fn receive_client_frame(
+    ch: &mut ClientHandle,
+    readable: bool,
+    scratch: &mut [u8],
+) -> Option<FrameOrError> {
+    if !ch.decoder.is_ready() {
+        if !readable {
+            return None;
+        }
+        match crate::sys::socket::recv_nowait(&ch.reader, scratch) {
+            Ok(0) => return Some(FrameOrError::Error),
+            Ok(n) => ch.decoder.push(&scratch[..n]),
+            Err(Error::Errno(nix::errno::Errno::EAGAIN)) => return None,
+            Err(_) => return Some(FrameOrError::Error),
+        }
+    }
+    match ch.decoder.next_frame() {
+        Ok(Some(frame)) => Some(FrameOrError::Frame(frame)),
+        Ok(None) => None,
+        Err(_) => Some(FrameOrError::Error),
+    }
+}
+
 /// `current` を上限 `cap_ms` で頭打ちする。`current` が `NONE` (= 無限 block)
 /// または `cap_ms` より大きいときだけ `cap_ms` に縮める。それ以外 (= 既により
 /// 短い timeout) はそのまま返す。
@@ -1402,6 +1443,8 @@ fn serve_loop(
     // を完了すると `rx` に Ok/Err が流れる。本 vector は serve_loop が所有し、各
     // iteration で try_recv で完了したものを引き取って `clients` に integrate する。
     let mut pending_handshakes: Vec<PendingHandshake> = Vec::new();
+    // DR-0037 段階 1: client socket の recv 先 (全 client で共有、周回ごとに再利用)。
+    let mut client_recv_buf = vec![0u8; CLIENT_RECV_CHUNK];
     // R4-H14: 子の Stopped/Continued 追跡。loop 越しに状態を保持する。
     let mut lifecycle = ChildLifecycle::default();
     // R5-FB1: `run --until PATTERN` の sliding window matcher。chunk 境界を
@@ -1612,6 +1655,13 @@ fn serve_loop(
                 poll_timeout = cap_poll_timeout(poll_timeout, cap);
             }
         }
+        // DR-0037 段階 1: 受信済みで揃った frame を decoder に残している client が
+        // 居る周回は poll で待たない。残りの frame は socket から既に読み出していて
+        // POLLIN では起きないため、待つと次の外部イベントまで処理されない。
+        let buffered_frames = clients.iter().any(|c| c.decoder.is_ready());
+        if buffered_frames {
+            poll_timeout = cap_poll_timeout(poll_timeout, 0);
+        }
         // R4-C3: Timeout 経路では poll_fds の revents は使わないので、まず borrows を
         // 解いてから check_wait_timeouts / process_pending_handshakes を呼ぶ。
         // Ready 経路では revents を集めてから drop する (= 通常処理に進む)。
@@ -1625,13 +1675,17 @@ fn serve_loop(
                 } else {
                     PollFlags::empty()
                 };
-                let crev: Vec<PollFlags> = clients
+                // client id で持つ: 下の process_pending_handshakes が `--detach-others`
+                // で clients を減らすことがあり、poll 時点の index は読み込み時点の
+                // index と一致しない。
+                let crev: Vec<(u64, PollFlags)> = clients
                     .iter()
                     .enumerate()
-                    .map(|(i, _)| {
-                        poll_fds[client_base + i]
+                    .map(|(i, ch)| {
+                        let rev = poll_fds[client_base + i]
                             .revents()
-                            .unwrap_or(PollFlags::empty())
+                            .unwrap_or(PollFlags::empty());
+                        (ch.id, rev)
                     })
                     .collect();
                 let sig_ready = sigchld_idx
@@ -1700,47 +1754,54 @@ fn serve_loop(
                         record_child_continued(state, child);
                     }
                 }
-                process_pending_handshakes(
-                    &mut pending_handshakes,
-                    config,
-                    next_client_id,
-                    clients,
-                    state,
-                    &mut daemon_state,
-                    &mut overflow_ids,
-                    screen_state,
-                    pending_redraws,
-                );
-                // DR-0013 §6 Phase A: sync 終了で pending redraw を flush。
-                flush_pending_redraws_if_sync_over(
-                    clients,
-                    screen_state,
-                    pending_redraws,
-                    &mut overflow_ids,
-                );
-                // 後段の drop 処理 (overflow / dead) を共通化するため
-                let mut indices_to_drop: Vec<usize> = Vec::new();
-                for id in overflow_ids.drain(..) {
-                    if let Some(i) = clients.iter().position(|c| c.id == id) {
-                        indices_to_drop.push(i);
-                    }
-                }
-                indices_to_drop.sort_unstable();
-                indices_to_drop.dedup();
-                for idx in indices_to_drop.into_iter().rev() {
-                    let ch = clients.remove(idx);
-                    // DR-0016 §3: client-detached lifecycle event。
-                    state.record_registry.push_lifecycle(
-                        super::record::LifecycleEvent::ClientDetached {
-                            client_id: ch.id,
-                            ts_unix_ms: now_unix_ms(),
-                        },
+                // DR-0037 段階 1: fd に準備が無くても decoder に揃った frame がある。上の
+                // 子の状態確認だけ済ませ、revents 無しの周回として通常処理に進む (= 下の
+                // handshake 取り込み・「3. 各 client reader」・drop 処理は共通経路で行う)。
+                if buffered_frames {
+                    (PollFlags::empty(), PollFlags::empty(), Vec::new(), false)
+                } else {
+                    process_pending_handshakes(
+                        &mut pending_handshakes,
+                        config,
+                        next_client_id,
+                        clients,
+                        state,
+                        &mut daemon_state,
+                        &mut overflow_ids,
+                        screen_state,
+                        pending_redraws,
                     );
-                    // ClientHandle::Drop が writer_tx close + reader shutdown +
-                    // writer_thread join を一括実行 (R5-H18)。
-                    drop(ch);
+                    // DR-0013 §6 Phase A: sync 終了で pending redraw を flush。
+                    flush_pending_redraws_if_sync_over(
+                        clients,
+                        screen_state,
+                        pending_redraws,
+                        &mut overflow_ids,
+                    );
+                    // 後段の drop 処理 (overflow / dead) を共通化するため
+                    let mut indices_to_drop: Vec<usize> = Vec::new();
+                    for id in overflow_ids.drain(..) {
+                        if let Some(i) = clients.iter().position(|c| c.id == id) {
+                            indices_to_drop.push(i);
+                        }
+                    }
+                    indices_to_drop.sort_unstable();
+                    indices_to_drop.dedup();
+                    for idx in indices_to_drop.into_iter().rev() {
+                        let ch = clients.remove(idx);
+                        // DR-0016 §3: client-detached lifecycle event。
+                        state.record_registry.push_lifecycle(
+                            super::record::LifecycleEvent::ClientDetached {
+                                client_id: ch.id,
+                                ts_unix_ms: now_unix_ms(),
+                            },
+                        );
+                        // ClientHandle::Drop が writer_tx close + reader shutdown +
+                        // writer_thread join を一括実行 (R5-H18)。
+                        drop(ch);
+                    }
+                    continue;
                 }
-                continue;
             }
             Err(e) => {
                 drop(poll_fds);
@@ -1989,16 +2050,30 @@ fn serve_loop(
         // frame ハンドリングは state / 他 client への副作用 (= lock state 変化、
         // broadcast 等) を持つため、まず frame を取り出してから処理する。
         let mut frames_to_process: Vec<(usize, FrameOrError)> = Vec::new();
-        for (idx, revents) in client_revents.iter().enumerate() {
-            if !revents.contains(PollFlags::POLLIN)
-                && !revents.contains(PollFlags::POLLHUP)
-                && !revents.contains(PollFlags::POLLERR)
-            {
-                continue;
-            }
+        // poll 後に登録された client (= revents 無し) と、revents 無しで decoder に揃った
+        // frame を残している client も含め、現在の clients 全員を見る。
+        //
+        // poll から読み込みまでの間に clients は「途中の要素が抜ける (`--detach-others`)」
+        // 「末尾に足される (handshake 完了)」しか起きないので、現在の clients は poll 時点の
+        // 並び (= `client_revents`) の部分列 + 末尾の新規になる。poll 時点の並びを前から 1 回
+        // だけ走査し、抜けた client の分は読み飛ばして id を突き合わせる。末尾の新規 client
+        // は対応が無く (走査は末尾まで進むだけ) readable=false になる。
+        let mut revents_iter = client_revents.iter().peekable();
+        for idx in 0..clients.len() {
             let ch = &mut clients[idx];
-            match Frame::decode_from(&mut ch.reader) {
-                Ok(frame) => {
+            let mut readable = false;
+            while let Some(&&(id, revents)) = revents_iter.peek() {
+                revents_iter.next();
+                if id == ch.id {
+                    readable = revents.contains(PollFlags::POLLIN)
+                        || revents.contains(PollFlags::POLLHUP)
+                        || revents.contains(PollFlags::POLLERR);
+                    break;
+                }
+            }
+            match receive_client_frame(ch, readable, &mut client_recv_buf) {
+                None => {}
+                Some(FrameOrError::Frame(frame)) => {
                     // DR-0025 Phase 1b (translate 併走): frame 受信を写す (client id のみ、
                     // frame 実体は運ばない placeholder 主義)。kind 別の認可 / 処理は下の
                     // handle_client_frame が従来通り担う (= 挙動不変)。
@@ -2011,7 +2086,7 @@ fn serve_loop(
                     );
                     frames_to_process.push((idx, FrameOrError::Frame(frame)));
                 }
-                Err(_) => frames_to_process.push((idx, FrameOrError::Error)),
+                Some(FrameOrError::Error) => frames_to_process.push((idx, FrameOrError::Error)),
             }
         }
 
@@ -2265,7 +2340,7 @@ mod tests {
         Detach, DetachTarget, ErrorCode, Kill, LockResult, SessionMode, TailEndReason,
     };
     use crate::protocol::{
-        HandshakeRequest, HandshakeResponse, MVP_CAPS, TYPE_CBOR_CONTROL, TYPE_RAW_DATA,
+        Frame, HandshakeRequest, HandshakeResponse, MVP_CAPS, TYPE_CBOR_CONTROL, TYPE_RAW_DATA,
     };
     use std::io::Write;
     use std::os::fd::AsRawFd;
@@ -2667,6 +2742,7 @@ mod tests {
                 buffer_limit: 1 << 20,
                 writer_thread: None,
                 reader,
+                decoder: crate::protocol::FrameDecoder::new(),
                 connected_at_unix_ms: 0,
             });
             receivers.push(rx);
@@ -5049,6 +5125,691 @@ mod tests {
         .expect("send kill");
         good.flush().expect("flush");
         let _ = handle.join().expect("daemon thread");
+    }
+
+    // ---- DR-0037 段階 1 (C-1): frame の途中で止まる client ----
+
+    /// `s` から frame を 1 つ読み、control message なら decode して返す。
+    /// raw_data は body、raw_ack は結果を返す。
+    enum Incoming {
+        Control(ControlMessage),
+        Raw(Vec<u8>),
+        Ack(crate::protocol::RawAck),
+    }
+
+    fn read_incoming(s: &mut UnixStream, what: &str) -> Incoming {
+        let f = Frame::decode_from(s).unwrap_or_else(|e| {
+            panic!("{what}: no frame from daemon ({e}); serve loop is likely blocked")
+        });
+        match f.ty {
+            TYPE_CBOR_CONTROL => Incoming::Control(
+                ControlMessage::decode_from(f.body.as_slice()).expect("decode control"),
+            ),
+            TYPE_RAW_DATA => Incoming::Raw(f.body),
+            crate::protocol::TYPE_RAW_ACK => Incoming::Ack(
+                crate::protocol::RawAck::decode_from(f.body.as_slice()).expect("decode ack"),
+            ),
+            other => panic!("{what}: unexpected frame type {other}"),
+        }
+    }
+
+    fn send_control_frame(s: &mut UnixStream, msg: ControlMessage) {
+        Frame::cbor_control(msg.encode_to_vec().expect("encode"))
+            .encode_to(s)
+            .expect("send control");
+        s.flush().expect("flush");
+    }
+
+    /// status.query を送り、StatusResponse が来るまでの経過時間と response を返す。
+    /// 途中の通知 (leader.notify / mode.change) と raw_data は読み飛ばす。
+    fn query_status(s: &mut UnixStream) -> (Duration, crate::protocol::messages::StatusResponse) {
+        let start = std::time::Instant::now();
+        send_control_frame(
+            s,
+            ControlMessage::StatusQuery(crate::protocol::messages::StatusQuery {}),
+        );
+        loop {
+            if let Incoming::Control(ControlMessage::StatusResponse(sr)) =
+                read_incoming(s, "status.query")
+            {
+                return (start.elapsed(), sr);
+            }
+        }
+    }
+
+    /// raw_data で `input` を送り、ack (ok) と、子の出力中継で `marker` が届くことを
+    /// 確かめる。attach 時の redraw も含めて探す。
+    fn input_and_expect_relay(s: &mut UnixStream, redraw: &[u8], input: &[u8], marker: &[u8]) {
+        Frame::raw_data(input.to_vec())
+            .encode_to(s)
+            .expect("send raw_data");
+        s.flush().expect("flush");
+        let mut seen = redraw.to_vec();
+        let mut acked = false;
+        while !(acked && seen.windows(marker.len()).any(|w| w == marker)) {
+            match read_incoming(s, "input relay") {
+                Incoming::Ack(a) => {
+                    assert_eq!(
+                        a.result,
+                        crate::protocol::RawAckResult::Ok,
+                        "input must be written to the PTY: {a:?}"
+                    );
+                    acked = true;
+                }
+                Incoming::Raw(b) => seen.extend(b),
+                Incoming::Control(_) => {}
+            }
+        }
+    }
+
+    fn screen_buffer_kind(s: &mut UnixStream) -> crate::protocol::messages::ScreenBufferKind {
+        use crate::protocol::messages::{SnapshotComponent, StateSnapshotRequest};
+        send_control_frame(
+            s,
+            ControlMessage::StateSnapshotRequest(StateSnapshotRequest {
+                include: vec![SnapshotComponent::Buffer],
+                serial: Some(8),
+            }),
+        );
+        loop {
+            if let Incoming::Control(ControlMessage::StateSnapshotResponse(resp)) =
+                read_incoming(s, "state.snapshot")
+            {
+                return resp.buffer.expect("buffer requested");
+            }
+        }
+    }
+
+    fn screen_dump_contains(s: &mut UnixStream, marker: &[u8]) {
+        use crate::protocol::messages::{
+            ScreenDumpFormat as ProtoDumpFormat, ScreenDumpLayer as ProtoDumpLayer,
+            ScreenDumpRequest,
+        };
+        send_control_frame(
+            s,
+            ControlMessage::ScreenDumpRequest(ScreenDumpRequest {
+                format: ProtoDumpFormat::Ansi,
+                layer: ProtoDumpLayer::Visible,
+                rect: None,
+                serial: Some(7),
+            }),
+        );
+        loop {
+            if let Incoming::Control(ControlMessage::ScreenDumpResponse(resp)) =
+                read_incoming(s, "screen.dump")
+            {
+                assert!(
+                    resp.payload.windows(marker.len()).any(|w| w == marker),
+                    "screen dump should contain {:?}",
+                    String::from_utf8_lossy(marker)
+                );
+                return;
+            }
+        }
+    }
+
+    /// DR-0037 テストマトリクス「client が handshake 後に frame の途中で止まる」の 1 セル。
+    ///
+    /// 先に attach した `stuck` が frame の先頭 `partial` bytes だけ送って止まる。その
+    /// 間に別 client (`good`) の status / input / screen dump が応答し、子の出力が中継
+    /// され、子が exit すれば daemon が回収して serve を終える。
+    ///
+    /// 修正前は `stuck` の POLLIN で serve loop が `read_exact` に入って戻らず、`good` の
+    /// 読み込みが read timeout で落ちる (= 待ち時間でなく「応答が来ない」ことで失敗する)。
+    /// `stuck` を先に attach するのは、serve loop が client を attach 順に処理するため
+    /// (= 修正前の実装で確実に `stuck` の read に先に入る)。
+    fn assert_serve_responsive_while_peer_stalls_mid_frame(
+        cmd: Vec<String>,
+        partial: &[u8],
+        input: &[u8],
+        marker: &[u8],
+        exit_input: &[u8],
+        expected_exit: i32,
+        expected_buffer: crate::protocol::messages::ScreenBufferKind,
+    ) {
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(cmd);
+
+        let mut stuck = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut stuck);
+        let mut good = client_connect_with_retry(&sock_path);
+        let (_r, redraw) = do_client_handshake_keep_redraw(&mut good);
+        // 応答が来ない場合に test を無限に止めないための上限 (合否は下の 1 秒で見る)。
+        good.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+
+        stuck.write_all(partial).expect("send partial frame");
+        stuck.flush().expect("flush");
+
+        // DR-0037 の受け入れ基準: 別 client の status が 1 秒以内に応答する。
+        let (elapsed, sr) = query_status(&mut good);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "status must answer within 1s while a peer stalls mid-frame, took {elapsed:?}"
+        );
+        assert_eq!(
+            sr.clients.len(),
+            2,
+            "the stalled client stays attached (its partial frame is not a protocol error)"
+        );
+
+        input_and_expect_relay(&mut good, &redraw, input, marker);
+        screen_dump_contains(&mut good, marker);
+        // 子の category (TUI は alt screen、line-oriented / REPL は primary) の確認。
+        assert_eq!(screen_buffer_kind(&mut good), expected_buffer);
+
+        // 子の exit を daemon が回収して serve が返る (stuck は frame の途中のまま)。
+        Frame::raw_data(exit_input.to_vec())
+            .encode_to(&mut good)
+            .expect("send exit input");
+        good.flush().expect("flush");
+        let exit = join_with_deadline(
+            handle,
+            Duration::from_secs(10),
+            "serve with a client stalled mid-frame",
+        )
+        .expect("serve");
+        assert_eq!(exit, expected_exit);
+        drop(stuck);
+        drop(good);
+    }
+
+    /// cat (line-oriented)。size header の途中 (2 byte) で止まる。実機再現と同じ位置。
+    #[test]
+    fn serve_stays_responsive_while_peer_stalls_in_size_header_cat() {
+        let status = encode_frame(&ControlMessage::StatusQuery(
+            crate::protocol::messages::StatusQuery {},
+        ));
+        assert_serve_responsive_while_peer_stalls_mid_frame(
+            vec!["/bin/cat".into()],
+            &status[..2],
+            b"CAT_MARK\r",
+            b"CAT_MARK",
+            // 行頭の ^D で cat が EOF を受けて 0 で exit する。
+            b"\x04",
+            0,
+            crate::protocol::messages::ScreenBufferKind::Primary,
+        );
+    }
+
+    /// bash (interactive REPL)。header が揃い body の途中で止まる。marker は bash が
+    /// 評価した結果 (`$((6*7))` → 42) なので、端末 echo でなく子の出力の中継を見る。
+    #[test]
+    fn serve_stays_responsive_while_peer_stalls_in_body_bash() {
+        // 本物の raw_data frame の header (5 byte) + body の一部 (10 / 64 byte)。
+        let mut wire = Vec::new();
+        Frame::raw_data(vec![b'x'; 64])
+            .encode_to(&mut wire)
+            .expect("encode");
+        assert_serve_responsive_while_peer_stalls_mid_frame(
+            vec![
+                "/bin/bash".into(),
+                "--norc".into(),
+                "--noprofile".into(),
+                "-i".into(),
+            ],
+            &wire[..5 + 10],
+            b"echo BASH_MARK_$((6*7))\r",
+            b"BASH_MARK_42",
+            b"exit 7\r",
+            7,
+            crate::protocol::messages::ScreenBufferKind::Primary,
+        );
+    }
+
+    /// less (TUI alt screen)。size header (4 byte) だけ揃って type byte の手前で止まる。
+    /// 1 画面に収まらない file を表示し、`G` で末尾の marker まで送らせ、`q` で抜ける。
+    /// less は CI の runner (ubuntu-latest / macos-latest) の標準 image に含まれる。端末
+    /// 種別と利用者の less 設定に左右されないよう、`TERM` と `LESS*` を固定して起動する。
+    #[test]
+    fn serve_stays_responsive_while_peer_stalls_before_type_byte_less() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("pager.txt");
+        let mut text: String = (1..=200).map(|i| format!("line {i}\n")).collect();
+        text.push_str("LESS_MARK_END\n");
+        std::fs::write(&path, text).expect("write pager file");
+        let status = encode_frame(&ControlMessage::StatusQuery(
+            crate::protocol::messages::StatusQuery {},
+        ));
+        assert_serve_responsive_while_peer_stalls_mid_frame(
+            vec![
+                "/usr/bin/env".into(),
+                "TERM=xterm-256color".into(),
+                "LESS=".into(),
+                "LESSOPEN=".into(),
+                "LESSCLOSE=".into(),
+                "LESSHISTFILE=-".into(),
+                "less".into(),
+                path.to_string_lossy().into_owned(),
+            ],
+            &status[..4],
+            b"G",
+            b"LESS_MARK_END",
+            b"q",
+            0,
+            crate::protocol::messages::ScreenBufferKind::Alternate,
+        );
+    }
+
+    fn encode_frame(msg: &ControlMessage) -> Vec<u8> {
+        let mut wire = Vec::new();
+        Frame::cbor_control(msg.encode_to_vec().expect("encode"))
+            .encode_to(&mut wire)
+            .expect("encode frame");
+        wire
+    }
+
+    /// 途中で止まっていた frame は、残りが届けば 1 frame として処理される (= 受信途中の
+    /// bytes を捨てたり、届いた分だけで解釈したりしない)。別 client の操作を挟んで、
+    /// frame を 3 回に分けて届ける。
+    #[test]
+    fn serve_completes_frame_delivered_in_pieces_across_iterations() {
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut slow = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut slow);
+        let mut good = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut good);
+        for s in [&mut slow, &mut good] {
+            s.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+        }
+
+        let status = encode_frame(&ControlMessage::StatusQuery(
+            crate::protocol::messages::StatusQuery {},
+        ));
+        // header の途中 / body の途中 / 残り、の 3 分割。
+        let cuts = [2, 7, status.len()];
+        let mut prev = 0;
+        for (k, &cut) in cuts.iter().enumerate() {
+            slow.write_all(&status[prev..cut]).expect("send piece");
+            slow.flush().expect("flush");
+            prev = cut;
+            if k + 1 < cuts.len() {
+                // 途中の間も daemon は別 client に応答している。
+                let (_, sr) = query_status(&mut good);
+                assert_eq!(sr.clients.len(), 2);
+            }
+        }
+        // 最後の piece で揃った status.query に slow 自身が応答を受け取る。
+        loop {
+            if let Incoming::Control(ControlMessage::StatusResponse(sr)) =
+                read_incoming(&mut slow, "slow status.query")
+            {
+                assert_eq!(sr.clients.len(), 2);
+                break;
+            }
+        }
+
+        send_control_frame(
+            &mut good,
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            }),
+        );
+        let _ = join_with_deadline(handle, Duration::from_secs(10), "serve after kill");
+    }
+
+    /// `n` 個の status.query を 1 回の write で送り、`n` 個の StatusResponse を受け取る。
+    fn burst_status_queries(s: &mut UnixStream, n: usize, close_after: bool) {
+        let status = encode_frame(&ControlMessage::StatusQuery(
+            crate::protocol::messages::StatusQuery {},
+        ));
+        let wire: Vec<u8> = std::iter::repeat_n(status, n).flatten().collect();
+        s.write_all(&wire).expect("send burst");
+        s.flush().expect("flush");
+        if close_after {
+            s.shutdown(std::net::Shutdown::Write)
+                .expect("shutdown write");
+        }
+        let mut responses = 0;
+        while responses < n {
+            if let Incoming::Control(ControlMessage::StatusResponse(_)) =
+                read_incoming(s, "burst status.query")
+            {
+                responses += 1;
+            }
+        }
+    }
+
+    /// 1 回の write (= daemon 側では 1 回の recv) に複数 frame が入っても、全部処理
+    /// される。2 つ目以降は socket から読み出し済みで POLLIN が立たないため、decoder に
+    /// 残った frame を poll で待たずに処理する経路の検証 (子は無出力の sleep なので、
+    /// 他のイベントで loop が起きることはない)。続けて、送信直後に送信側を閉じても close
+    /// より前の frame は全部処理されてから切断される。
+    #[test]
+    fn serve_processes_every_frame_of_a_single_write() {
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut killer = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut killer);
+        let mut burst = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut burst);
+        burst
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+
+        burst_status_queries(&mut burst, 3, false);
+        burst_status_queries(&mut burst, 2, true);
+
+        send_control_frame(
+            &mut killer,
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            }),
+        );
+        let _ = join_with_deadline(handle, Duration::from_secs(10), "serve after kill");
+    }
+
+    /// 1 つの client が小さな frame を送り続けている最中 (= decoder に揃った frame が
+    /// 常に残り、poll を待たない周回が続く) でも、新しい client の handshake が取り込ま
+    /// れ、その client の status が 1 秒以内に応答する。
+    #[test]
+    fn serve_admits_new_client_while_peer_floods_tiny_frames() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut flood = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut flood);
+        let mut flood_rx = flood.try_clone().expect("clone flood");
+
+        // flood への応答を読み続けて数える (読まないと backpressure で切られる)。
+        // 最初の応答で「flood の処理が始まった」ことを通知する。
+        let answered = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let reader = {
+            let answered = Arc::clone(&answered);
+            std::thread::spawn(move || {
+                while let Ok(f) = Frame::decode_from(&mut flood_rx) {
+                    if f.ty == TYPE_CBOR_CONTROL
+                        && matches!(
+                            ControlMessage::decode_from(f.body.as_slice()),
+                            Ok(ControlMessage::StatusResponse(_))
+                        )
+                        && answered.fetch_add(1, Ordering::SeqCst) == 0
+                    {
+                        let _ = started_tx.send(());
+                    }
+                }
+            })
+        };
+        // 約 64KiB 分の最小級 frame を 1 回の write で送り続ける (= daemon の 1 回の recv に
+        // 数千 frame 入る)。止めるまで送る。
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = Arc::clone(&stop);
+            let status = encode_frame(&ControlMessage::StatusQuery(
+                crate::protocol::messages::StatusQuery {},
+            ));
+            let chunk: Vec<u8> = std::iter::repeat_n(status.as_slice(), 64 * 1024 / status.len())
+                .flatten()
+                .copied()
+                .collect();
+            std::thread::spawn(move || {
+                let mut chunks = 0usize;
+                while !stop.load(Ordering::SeqCst) {
+                    if flood.write_all(&chunk).is_err() {
+                        break;
+                    }
+                    chunks += 1;
+                }
+                chunks
+            })
+        };
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("flood must start being answered");
+
+        let before = answered.load(Ordering::SeqCst);
+        let mut newcomer = client_connect_with_retry(&sock_path);
+        newcomer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        let resp = do_client_handshake(&mut newcomer);
+        assert!(!resp.leader, "flood client is the leader");
+        let (elapsed, sr) = query_status(&mut newcomer);
+        let after = answered.load(Ordering::SeqCst);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "status must answer within 1s while a peer floods, took {elapsed:?}"
+        );
+        assert_eq!(sr.clients.len(), 2);
+        assert!(
+            !writer.is_finished(),
+            "flood must still be in progress during the newcomer's handshake"
+        );
+        assert!(
+            after > before,
+            "flood frames were being processed meanwhile ({before} -> {after})"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        send_control_frame(
+            &mut newcomer,
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            }),
+        );
+        let _ = join_with_deadline(handle, Duration::from_secs(10), "serve after kill");
+        let _ = join_with_deadline(writer, Duration::from_secs(10), "flood writer");
+        join_with_deadline(reader, Duration::from_secs(10), "flood reader");
+    }
+
+    /// decoder に揃った frame を poll を待たずに処理している最中 (= socket は空で、poll(0)
+    /// が Timeout を返す周回が続く) に、新しい client の handshake が取り込まれる。
+    ///
+    /// 観測: burst 側を `RwNoLeader` で attach し、新 client (Rw) を leader にする。新 client
+    /// の登録時に daemon が burst 側へ `leader.notify` を broadcast するので、burst 側の
+    /// 受信列で `leader.notify` の前に届いた ack の数 = 登録時点で処理済みだった burst frame
+    /// の数になる (daemon 側の順序なので、test 側の読み遅れに左右されない)。それが burst
+    /// 全体より少なければ、burst の処理中に登録された。
+    #[test]
+    fn serve_admits_new_client_while_buffered_frames_drain() {
+        use crate::protocol::messages::LeaderNotify;
+
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut burst = client_connect_with_retry(&sock_path);
+        let _ = handshake_as(&mut burst, Mode::RwNoLeader);
+        // burst 全体が 1 回の write で kernel に載り、daemon の 1 回の recv (64KiB) に
+        // まとめて入るように送信 buffer を広げる。
+        nix::sys::socket::setsockopt(&burst, nix::sys::socket::sockopt::SndBuf, &(512 * 1024))
+            .expect("SO_SNDBUF");
+        let mut burst_rx = burst.try_clone().expect("clone burst");
+
+        // 空の raw_data frame (5 byte) を 64KiB に収まるだけ。
+        let mut empty = Vec::new();
+        Frame::raw_data(Vec::new())
+            .encode_to(&mut empty)
+            .expect("encode");
+        let total = CLIENT_RECV_CHUNK / empty.len();
+        let wire: Vec<u8> = std::iter::repeat_n(empty.as_slice(), total)
+            .flatten()
+            .copied()
+            .collect();
+
+        // burst 側の受信: ack を数え、leader.notify の時点の ack 数を記録する。
+        let (first_ack_tx, first_ack_rx) = std::sync::mpsc::channel::<()>();
+        let reader = std::thread::spawn(move || {
+            let mut acks = 0usize;
+            let mut acks_before_notify = None;
+            while acks < total {
+                let Ok(f) = Frame::decode_from(&mut burst_rx) else {
+                    break;
+                };
+                if f.ty == crate::protocol::TYPE_RAW_ACK {
+                    acks += 1;
+                    if acks == 1 {
+                        let _ = first_ack_tx.send(());
+                    }
+                } else if f.ty == TYPE_CBOR_CONTROL
+                    && matches!(
+                        ControlMessage::decode_from(f.body.as_slice()),
+                        Ok(ControlMessage::LeaderNotify(LeaderNotify {
+                            client_id: Some(_)
+                        }))
+                    )
+                {
+                    acks_before_notify.get_or_insert(acks);
+                }
+            }
+            (acks, acks_before_notify)
+        });
+
+        burst.write_all(&wire).expect("send burst");
+        burst.flush().expect("flush");
+        first_ack_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("burst must start being processed");
+
+        let mut newcomer = client_connect_with_retry(&sock_path);
+        newcomer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        let resp = handshake_as(&mut newcomer, Mode::Rw);
+        assert!(resp.leader, "newcomer becomes the leader");
+
+        let (acks, acks_before_notify) =
+            join_with_deadline(reader, Duration::from_secs(10), "burst reader");
+        assert_eq!(acks, total, "every burst frame is processed");
+        // leader.notify が burst の全 ack より後なら None (= 処理し終えてから登録された)。
+        let k = acks_before_notify.unwrap_or(total);
+        assert!(
+            k < total,
+            "newcomer must be admitted while the burst drains (admitted after {k}/{total})"
+        );
+
+        send_control_frame(
+            &mut newcomer,
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            }),
+        );
+        let _ = join_with_deadline(handle, Duration::from_secs(10), "serve after kill");
+        drop(burst);
+    }
+
+    /// decoder に揃った frame を poll(0) の Timeout 周回で処理している間も、Timeout 時の
+    /// 子の状態確認 (stopped 中の復帰確認) が走る。
+    ///
+    /// macOS は子の continue で SIGCHLD を送らないので、stopped の latch を下ろす契機は
+    /// Timeout 周回の確認だけになる。burst (空 raw_data の列 + 末尾の status.query) の
+    /// 処理が始まってから子を SIGCONT し、burst 末尾の status が running を返すことを見る。
+    /// 末尾の status は burst の残りと同じ decoder 内にあり、通常の Timeout 周回を挟まずに
+    /// 処理されるため、burst 処理中に確認が走っていなければ stopped のまま返る (Linux は
+    /// continue でも SIGCHLD が来るので、この test は macOS でだけ差を検出する)。
+    #[test]
+    fn serve_observes_child_resume_while_buffered_frames_drain() {
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
+
+        let mut ctl = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut ctl);
+        ctl.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        let (_, sr) = query_status(&mut ctl);
+        let child = Pid::from_raw(sr.child_pid.expect("child alive") as i32);
+
+        nix::sys::signal::kill(child, Signal::SIGSTOP).expect("SIGSTOP");
+        assert_child_stopped(child);
+        // daemon が stopped を観測すると leader に通知が来る。status を連続で問い合わせて
+        // 待つと poll が毎周 Ready になり、self-pipe を持たない serve (同一 process で別の
+        // serve が self-pipe を持つ test 並走時) の Timeout 周回の確認が走らなくなるので、
+        // 通知を待つ。
+        loop {
+            if let Incoming::Control(ControlMessage::SessionChildStoppedNotify(_)) =
+                read_incoming(&mut ctl, "session.child-stopped notify")
+            {
+                break;
+            }
+        }
+        assert!(query_status(&mut ctl).1.child_stopped);
+
+        let mut burst = client_connect_with_retry(&sock_path);
+        let _ = handshake_as(&mut burst, Mode::RwNoLeader);
+        nix::sys::socket::setsockopt(&burst, nix::sys::socket::sockopt::SndBuf, &(512 * 1024))
+            .expect("SO_SNDBUF");
+        let mut burst_rx = burst.try_clone().expect("clone burst");
+        let status = encode_frame(&ControlMessage::StatusQuery(
+            crate::protocol::messages::StatusQuery {},
+        ));
+        let mut empty = Vec::new();
+        Frame::raw_data(Vec::new())
+            .encode_to(&mut empty)
+            .expect("encode");
+        let n = (CLIENT_RECV_CHUNK - status.len()) / empty.len();
+        let mut wire: Vec<u8> = std::iter::repeat_n(empty.as_slice(), n)
+            .flatten()
+            .copied()
+            .collect();
+        wire.extend_from_slice(&status);
+
+        let (first_ack_tx, first_ack_rx) = std::sync::mpsc::channel::<()>();
+        let reader = std::thread::spawn(move || {
+            let mut acks = 0usize;
+            loop {
+                let f = Frame::decode_from(&mut burst_rx).expect("burst frame");
+                if f.ty == crate::protocol::TYPE_RAW_ACK {
+                    acks += 1;
+                    if acks == 1 {
+                        let _ = first_ack_tx.send(());
+                    }
+                } else if f.ty == TYPE_CBOR_CONTROL
+                    && let Ok(ControlMessage::StatusResponse(sr)) =
+                        ControlMessage::decode_from(f.body.as_slice())
+                {
+                    return (acks, sr);
+                }
+            }
+        });
+
+        burst.write_all(&wire).expect("send burst");
+        burst.flush().expect("flush");
+        first_ack_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("burst must start being processed");
+        nix::sys::signal::kill(child, Signal::SIGCONT).expect("SIGCONT");
+
+        let (acks, sr) = join_with_deadline(reader, Duration::from_secs(10), "burst reader");
+        assert_eq!(acks, n, "status.query is the last frame of the burst");
+        assert!(
+            !sr.child_stopped,
+            "the resumed child must be observed while the burst drains"
+        );
+
+        send_control_frame(
+            &mut ctl,
+            ControlMessage::Kill(Kill {
+                signal: None,
+                wait: true,
+            }),
+        );
+        let _ = join_with_deadline(handle, Duration::from_secs(10), "serve after kill");
+        drop(burst);
+    }
+
+    /// `mode` で handshake し、attach 復元の redraw frame を読み捨てて response を返す。
+    fn handshake_as(stream: &mut UnixStream, mode: Mode) -> HandshakeResponse {
+        let req = ControlMessage::HandshakeRequest(HandshakeRequest {
+            caps: MVP_CAPS.iter().map(|s| s.to_string()).collect(),
+            mode,
+            exclusive: false,
+            detach_others: false,
+            token: None,
+        });
+        send_control_frame(stream, req);
+        let resp_frame = Frame::decode_from(stream).expect("decode response");
+        let resp =
+            match ControlMessage::decode_from(resp_frame.body.as_slice()).expect("decode cbor") {
+                ControlMessage::HandshakeResponse(r) => r,
+                other => panic!("unexpected: {other:?}"),
+            };
+        discard_attach_redraw(stream);
+        resp
     }
 
     /// R5-H2: `MAX_PENDING_HANDSHAKES` と `MAX_CLIENTS_PER_DAEMON` は **独立 cap**
