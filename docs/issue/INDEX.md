@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-10-09 | design | open | [client-partial-frame-buffer-unbounded](./2026-10-09-design-client-partial-frame-buffer-unbounded.md) | client ごとの受信途中 buffer に合計の上限が無い (DR-0037 段 1 の後、1 client 最大 16MiB) |
 | 2026-10-09 | bug | open | [wait-spec-errors-on-child-stop](./2026-10-09-bug-wait-spec-errors-on-child-stop.md) | hyoui input の wait: で待っている間に子が止まると「予期しない message」で失敗するはず (未確認) |
 | 2026-10-09 | bug | pending | [child-action-menu-closed-by-echoed-ctrl-z](./2026-10-09-bug-child-action-menu-closed-by-echoed-ctrl-z.md) | 子が ^Z をエコーする時 (cat 等)、^Z×2 で出た child action menu がキーを受け付けず子へ素通りする |
 | 2026-10-09 | design | open | [child-inherits-ignored-signals](./2026-10-09-design-child-inherits-ignored-signals.md) | 呼び出し元で無視されている signal が子に引き継がれる ($(hyoui run --detached ...) の子が ^Z で止まらない)。裁定済み (既定に戻す)、未実装 |
