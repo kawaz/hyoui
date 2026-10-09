@@ -33,6 +33,9 @@ pub mod config;
 pub mod scrollback;
 pub mod strip;
 
+// 画面の 1 行を text にする規則 (= wait の照合と screen dump の text 系 format で共有)。
+pub mod screen_text;
+
 // v0.1.0 wire protocol (DR-0008 確定版):
 //
 //   * Frame layout: [u32 LE size][u8 type][body]、wire 外枠は永久固定

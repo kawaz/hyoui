@@ -10,8 +10,9 @@
 //! - **空 cell skip**: 空白文字 (= contents == "" or " ") かつ attribute も default
 //!   なら出力しない (= sparse 表現)
 //! - **属性 bit pack**: bold / italic / underline / inverse を 1 byte に pack
-//! - **wide 継続 cell の skip**: 全角 cell の継続部分 (= `is_wide_continuation`) は
-//!   serialize しない (= 先頭 cell の `is_wide=true` が同行で 2 col 分占有する印)
+//! - **wide 継続 cell は文字無しで出す**: 全角 cell の継続部分 (= `is_wide_continuation`) は
+//!   text 空の cell として serialize する (= 継続かどうかの flag は持たない。先頭 cell の
+//!   `is_wide=true` が同行で 2 col 分占有する印)
 //!
 //! PoC §9 で「naive cell-level CBOR は 283 倍に膨張」と判明したため、圧縮戦略を
 //! 入れる前提。RLE は MVP では入れない (= §11 後段)。
@@ -35,6 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use super::redraw::buffer_mode_sequence;
 use super::state::{RowCellSnap, ScreenState};
+use crate::screen_text::{TextCell, row_text};
 
 /// `ScreenDumpRequest.format` の選択肢 (DR-0013 §9)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,8 +157,8 @@ pub(crate) enum BufferKind {
 ///
 /// 圧縮戦略:
 /// - 空 cell (= text 空 + attrs 0 + wide false + wide_continuation false) は出力しない
-/// - 全角の継続 cell (= wide_continuation) は出力しない (= 先頭 cell の wide=true が
-///   印になる)
+/// - 全角の継続 cell (= wide_continuation) は text 空の cell として出力する (= 継続の
+///   flag は持たず、先頭 cell の wide=true が印になる)
 ///
 /// 本 factory は visible viewport のみを serialize する。scrollback の include は
 /// Phase C 以降 (vt100 0.16 の API では公開 getter が限定的)。
@@ -469,31 +471,26 @@ fn write_color_sgr(out: &mut Vec<u8>, color: vt100::Color, base: u8, bright_base
 /// - `trim_trailing = false` (= `TextPlain` format): 行末空白を保持する
 ///   (= TUI 盤面の padding をそのまま温存)
 ///
-/// 全 row に共通: 空 cell は半角 space、wide 継続 cell は skip、改行で行分け。
+/// 1 行の text 化は `hyoui wait` の照合と同じ [`crate::screen_text::row_text`] に任せる
+/// (= 空 cell は半角 space、wide 継続 cell は出さない)。各行の後に改行を置く。
 fn build_plain_text_from_rows(rows: &[Vec<RowCellSnap>], trim_trailing: bool) -> Vec<u8> {
     let est_cols = rows.first().map(|r| r.len()).unwrap_or(0);
     let mut out = Vec::with_capacity(rows.len() * (est_cols + 1));
     for row in rows.iter() {
-        let mut line = String::with_capacity(est_cols);
-        for cell in row.iter() {
-            if cell.is_wide_continuation {
-                continue;
-            }
-            if cell.contents.is_empty() {
-                line.push(' ');
-            } else {
-                line.push_str(&cell.contents);
-            }
-        }
-        if trim_trailing {
-            let trimmed = line.trim_end_matches(' ');
-            out.extend_from_slice(trimmed.as_bytes());
-        } else {
-            out.extend_from_slice(line.as_bytes());
-        }
+        let line = row_text(row.iter().map(text_cell), trim_trailing);
+        out.extend_from_slice(line.as_bytes());
         out.push(b'\n');
     }
     out
+}
+
+/// screen state の cell を text 化の入力に写す。
+fn text_cell(cell: &RowCellSnap) -> TextCell<'_> {
+    if cell.is_wide_continuation {
+        TextCell::WideContinuation
+    } else {
+        TextCell::Cell(&cell.contents)
+    }
 }
 
 /// `build_screen_dump` の error。
@@ -676,6 +673,17 @@ mod tests {
         // 1 行目 = "あa" + 3 spaces + "\n"、2 行目 = 6 spaces + "\n"
         let expected = format!("あa{}\n{}\n", " ".repeat(3), " ".repeat(6));
         assert_eq!(text, expected);
+    }
+
+    /// `binary` (= 行末 trim) でも全角の継続 cell は空白にならず、連続した文字列で出る
+    /// (= `hyoui wait` の照合 text と同じ形)。
+    #[test]
+    fn dump_binary_joins_fullwidth_chars_without_gap() {
+        let mut s = ScreenState::new(2, 12, 0);
+        s.process("[x] 停止中".as_bytes());
+        let out = build_screen_dump(&mut s, ScreenDumpFormat::Binary, ScreenDumpLayer::Visible)
+            .expect("ok");
+        assert_eq!(std::str::from_utf8(&out).expect("utf8"), "[x] 停止中\n\n");
     }
 
     #[test]

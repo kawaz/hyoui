@@ -26,6 +26,7 @@ use hyoui::protocol::ControlMessage;
 use hyoui::protocol::messages::{
     ErrorMessage, SnapshotComponent, StateSnapshotRequest, StateSnapshotResponse,
 };
+use hyoui::screen_text::{TextCell, row_text};
 use hyoui::sys::poll::{PollFlags, PollOutcome, poll};
 use nix::poll::{PollFd, PollTimeout};
 use regex::Regex;
@@ -106,8 +107,7 @@ pub struct SnapshotCell {
     #[allow(dead_code)]
     #[serde(default, rename = "a")]
     pub attrs: u8,
-    /// 全角先頭 cell flag (= 本 module では未使用、forward-compat 用に保持)。
-    #[allow(dead_code)]
+    /// 全角先頭 cell flag (= 右隣の列はこの文字の継続 cell)。
     #[serde(default, rename = "w")]
     pub wide: bool,
 }
@@ -116,54 +116,46 @@ impl SnapshotCells {
     /// sparse cells を **行 join した text** に変換する (DR-0006 §9.1)。
     ///
     /// 仕様:
-    /// - 各 row を `cols` 個の半角空白で初期化
-    /// - sparse cell の `text` を該当 row の `c` 位置に書き込む
-    /// - row 単位で末尾空白を trim (= TUI が padding として書き込む空白に対する
-    ///   誤マッチを防ぐ、DR-0006 §9.1 step 3)
+    /// - sparse cells から rows × cols の grid を復元する (= 省略された cell は空 cell)
+    /// - 全角先頭 cell (`wide`) の右隣は継続 cell として扱う (= snapshot の cell は継続
+    ///   cell かどうかを持たず、daemon は継続 cell を文字の無い cell として送るので、
+    ///   先頭 cell の `wide` から位置を復元する)
+    /// - 1 行の text 化は `screen dump` の text 系 format と同じ
+    ///   [`hyoui::screen_text::row_text`] で行い、行末空白を trim する (= TUI が padding
+    ///   として書き込む空白に対する誤マッチを防ぐ、DR-0006 §9.1 step 3)
     /// - 行間は `\n` で結合 (= regex の `^` / `$` が行頭/行末に効く、step 4)
     /// - ANSI escape は構築過程で発生しない (= cell 単位で text を集めるので)
-    ///
-    /// 全角文字 (= 2 col 占有) は先頭 cell に文字列が入り、継続 cell は sparse
-    /// 表現上 skip される (= daemon 側 `build_screen_snapshot` の挙動)。結果の
-    /// text 上は「全角文字 + 半角空白 1 個」のように 1 cell + padding で並ぶが、
-    /// 末尾 trim で除去されるため実害は少ない。完全に layout を保ちたい用途は
-    /// 別 task で対応する。
     pub fn to_text(&self) -> String {
         let rows = self.rows as usize;
         let cols = self.cols as usize;
         if rows == 0 || cols == 0 {
             return String::new();
         }
-        // 行ごとに `cols` 個分の cell slot を String で持つ (= UTF-8 grapheme を
-        // そのまま入れたいので `Vec<char>` ではなく `Vec<String>`)。空 cell は
-        // 半角空白で埋める (= TUI が描いた padding と区別なく扱う)。
-        let mut grid: Vec<Vec<String>> = (0..rows)
-            .map(|_| (0..cols).map(|_| String::from(" ")).collect())
-            .collect();
+        let mut grid: Vec<Vec<TextCell<'_>>> = vec![vec![TextCell::Cell(""); cols]; rows];
         for cp in &self.cells {
             let r = cp.r as usize;
             let c = cp.c as usize;
             if r >= rows || c >= cols {
                 continue; // 範囲外は無視 (= defensive、daemon バグ対策)
             }
-            // text 空は空白扱い (= daemon 側で skip されているはずだが defensive)。
-            if cp.cell.text.is_empty() {
-                continue;
+            // daemon は継続 cell を「文字の無い cell」として送ってくる。直前の全角先頭
+            // cell が付けた継続の印を、その空 cell で消さない。
+            if !(cp.cell.text.is_empty() && grid[r][c] == TextCell::WideContinuation) {
+                grid[r][c] = TextCell::Cell(&cp.cell.text);
             }
-            grid[r][c] = cp.cell.text.clone();
-        }
-        let mut out = String::with_capacity(rows * (cols + 1));
-        for (i, row) in grid.iter().enumerate() {
-            let line: String = row.iter().fold(String::new(), |mut acc, s| {
-                acc.push_str(s);
-                acc
-            });
-            out.push_str(line.trim_end_matches(' '));
-            if i + 1 < rows {
-                out.push('\n');
+            // 継続 cell の印は空の位置にだけ付ける (= 同じ位置に後から届いた文字のある
+            // cell は通常の上書きと同じく後勝ちにする)。
+            if cp.cell.wide
+                && let Some(next) = grid[r].get_mut(c + 1)
+                && *next == TextCell::Cell("")
+            {
+                *next = TextCell::WideContinuation;
             }
         }
-        out
+        grid.into_iter()
+            .map(|row| row_text(row, true))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -551,6 +543,45 @@ mod tests {
         let text = s.to_text();
         // `(?u)` を付けなくても regex crate の default は Unicode-aware
         let re = Regex::new(r"確認").unwrap();
+        assert!(re.is_match(&text), "text={text:?}");
+    }
+
+    /// 全角文字は daemon の snapshot で「先頭 cell (wide=true) + 文字の無い継続 cell」に
+    /// なる (実 daemon の wire で観測)。継続 cell を空白で埋めず、`screen dump` の text と
+    /// 同じく連続した文字列にする (= `wait '停止中'` が一致する)。継続 cell が省かれて
+    /// 届いた場合 (2 行目) も同じ text になる。
+    #[test]
+    fn to_text_joins_fullwidth_chars_without_gap() {
+        let wide = |r: u16, c: u16, t: &str| SnapshotCellPos {
+            r,
+            c,
+            cell: SnapshotCell {
+                text: t.into(),
+                attrs: 0,
+                wide: true,
+            },
+        };
+        let s = SnapshotCells {
+            rows: 2,
+            cols: 10,
+            cells: vec![
+                cell(0, 0, "["),
+                cell(0, 1, "x"),
+                cell(0, 2, "]"),
+                wide(0, 4, "停"),
+                cell(0, 5, ""),
+                wide(0, 6, "止"),
+                cell(0, 7, ""),
+                wide(0, 8, "中"),
+                cell(0, 9, ""),
+                wide(1, 0, "全"),
+                cell(1, 3, "a"),
+            ],
+        };
+        let text = s.to_text();
+        // 1 行目の 3 列目は空 cell (= 半角空白)、2 行目の「全」の後の 2 列目は空 cell。
+        assert_eq!(text, "[x] 停止中\n全 a");
+        let re = Regex::new(r"停止中").unwrap();
         assert!(re.is_match(&text), "text={text:?}");
     }
 
