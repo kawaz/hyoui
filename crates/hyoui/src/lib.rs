@@ -69,6 +69,9 @@ pub mod paths;
 // 時刻の表記 (= unit 登録簿の `added_at` と web の認証期限が同じ形を出す)。
 pub mod time;
 
+// daemon のログ (DR-0037 段 2): 起動後の fd 2 と logger の書き先は session ごとのログファイル。
+pub mod log;
+
 /// Library version (matches `Cargo.toml`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

@@ -770,7 +770,7 @@ fn writer_thread_main(file: File, rx: crossbeam_channel::Receiver<SeqEvent>, cfg
     if matches!(cfg.format, RecordFormat::Jsonl)
         && let Err(e) = write_jsonl_header(&mut w, &cfg)
     {
-        eprintln!("hyoui-record-{}: header write failed: {e}", cfg.record_id);
+        crate::daemon_log!("hyoui-record-{}: header write failed: {e}", cfg.record_id);
         return;
     }
 
@@ -779,7 +779,7 @@ fn writer_thread_main(file: File, rx: crossbeam_channel::Receiver<SeqEvent>, cfg
         match rx.recv() {
             Ok(payload) => {
                 if let Err(e) = handle_one_event(&mut w, &cfg, payload) {
-                    eprintln!("hyoui-record-{}: event write failed: {e}", cfg.record_id);
+                    crate::daemon_log!("hyoui-record-{}: event write failed: {e}", cfg.record_id);
                     return;
                 }
                 // max-bytes / max-duration を post-check (= 過剰書き込みを 1 event だけ許容)。

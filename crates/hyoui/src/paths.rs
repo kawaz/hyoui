@@ -213,6 +213,26 @@ impl Env {
         Ok(self.state_root()?.join("sessions"))
     }
 
+    /// session の daemon のログの置き場 (`<state_root>/sessions/logs`、DR-0037 段 2)。
+    ///
+    /// web の `web/logs/<name>.log` と同じく、機能の dir の下の `logs/` に置く。
+    ///
+    /// # Errors
+    ///
+    /// [`Env::state_root`] と同じ。
+    pub fn session_logs_dir(&self) -> Result<PathBuf, StateRootError> {
+        Ok(self.sessions_dir()?.join("logs"))
+    }
+
+    /// session 1 つの daemon のログ (`<state_root>/sessions/logs/<session_id>.log`)。
+    ///
+    /// # Errors
+    ///
+    /// [`Env::state_root`] と同じ。
+    pub fn session_log_path(&self, session_id: &str) -> Result<PathBuf, StateRootError> {
+        Ok(self.session_logs_dir()?.join(format!("{session_id}.log")))
+    }
+
     /// web の config の既定の置き場 (`<config_dir>/web`、DR-0038 決定 4)。
     #[must_use]
     pub fn web_config_dir(&self) -> Option<PathBuf> {
@@ -337,6 +357,23 @@ mod tests {
         let e = env(&[("HYOUI_STATE_DIR", "/face"), ("HOME", "/h")]);
         assert_eq!(e.sessions_dir(), Ok(PathBuf::from("/face/sessions")));
         assert_eq!(e.web_state_dir(), Ok(PathBuf::from("/face/web")));
+    }
+
+    /// daemon のログは `sessions/logs/<id>.log` (web の `web/logs/` と同じ形、DR-0037 段 2)。
+    #[test]
+    fn session_logs_live_under_sessions_logs() {
+        let e = env(&[("HYOUI_STATE_DIR", "/face"), ("HOME", "/h")]);
+        assert_eq!(
+            e.session_logs_dir(),
+            Ok(PathBuf::from("/face/sessions/logs"))
+        );
+        assert_eq!(
+            e.session_log_path("0f0e0d0c-0b0a-4908-8706-050403020100"),
+            Ok(PathBuf::from(
+                "/face/sessions/logs/0f0e0d0c-0b0a-4908-8706-050403020100.log"
+            ))
+        );
+        assert!(Env::default().session_log_path("x").is_err());
     }
 
     /// config は面で分けない: `HYOUI_STATE_DIR` を変えても config の置き場は同じ

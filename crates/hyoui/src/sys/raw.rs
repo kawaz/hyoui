@@ -372,7 +372,7 @@ pub fn openpty_fork_anchor_exec(
 /// (= `raw.rs` の `#[ignore]` test 群)。
 ///
 /// サイレントではなく、呼び出し側 ([`super::pty::Pty::spawn`]) が **明示 warning を
-/// stderr に出した上で** 本 fallback を使う。
+/// daemon のログ (logger が無ければ stderr) に出した上で** 本 fallback を使う。
 ///
 /// `stdin` の契約は [`openpty_fork_anchor_exec`] と同じ (= 3 以上、違反は fork 前に
 /// [`Error::Invalid`])。
@@ -638,6 +638,25 @@ pub fn own_raw_fd(raw: RawFd) -> OwnedFd {
 pub(crate) fn borrow_raw_fd<'a>(raw: RawFd) -> BorrowedFd<'a> {
     // SAFETY: delegated to the caller's contract.
     unsafe { BorrowedFd::borrow_raw(raw) }
+}
+
+/// fd 2 (stderr) を `to` の複製に置き換える (DR-0037 段 2: 起動後の daemon の標準エラーを
+/// session のログファイルや `/dev/null` に付け替え、呼び出し元の stderr を手放す)。
+///
+/// `dup2(to, 2)` で作る fd 2 は CLOEXEC を持たない (= upgrade の self-exec 後も同じ書き先を
+/// 使う)。`to` は caller が所有したまま。fd 0 の [`redirect_stdin_to_devnull`] と同じ理由で
+/// libc::dup2 を直接呼ぶ。
+///
+/// # Errors
+///
+/// `dup2` が失敗した場合。
+pub fn redirect_stderr(to: BorrowedFd<'_>) -> Result<()> {
+    // SAFETY: libc::dup2 は raw fd を取る同期 syscall。`to` は borrow の間生きている。
+    let rc = unsafe { libc::dup2(to.as_raw_fd(), 2) };
+    if rc < 0 {
+        return Err(Error::from(Errno::last()));
+    }
+    Ok(())
 }
 
 /// Redirect `stdin` (= fd 0) to `/dev/null` (= daemon 化慣例の subset)。

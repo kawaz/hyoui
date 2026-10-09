@@ -387,7 +387,7 @@ pub fn perform_self_exec(
         scrollback: scrollback_bytes,
     };
     if let Err(e) = write_state_file(&state_path, &state) {
-        eprintln!(
+        crate::daemon_log!(
             "hyoui upgrade: state file write failed: {e} (path={}); aborting upgrade",
             state_path.display()
         );
@@ -404,7 +404,7 @@ pub fn perform_self_exec(
 
     // 2. CLOEXEC 解除 (= execve で新プロセスへ fd を継承させる)。
     if let Err(e) = clear_cloexec(&master_owned) {
-        eprintln!("hyoui upgrade: CLOEXEC clear on master fd failed: {e}");
+        crate::daemon_log!("hyoui upgrade: CLOEXEC clear on master fd failed: {e}");
         // Phase 3 fallback: fd を Pty / UnixSock として再構築して caller に返す
         // (= old serve_loop 継続)。ここではまだ execve に到達していないので、
         // master_owned は close されず新 Pty に譲る。listener 側も同様。
@@ -419,7 +419,7 @@ pub fn perform_self_exec(
         };
     }
     if let Err(e) = clear_cloexec(&listener_owned) {
-        eprintln!("hyoui upgrade: CLOEXEC clear on listener fd failed: {e}");
+        crate::daemon_log!("hyoui upgrade: CLOEXEC clear on listener fd failed: {e}");
         // master 側 CLOEXEC は復元してから再パッケージ。
         let _ = set_cloexec(&master_owned);
         let pty = Pty::from_master_fd(master_owned);
@@ -500,7 +500,7 @@ pub fn perform_self_exec(
     let exe_c = match CString::new(exe_path.as_os_str().as_bytes()) {
         Ok(c) => c,
         Err(_) => {
-            eprintln!(
+            crate::daemon_log!(
                 "hyoui upgrade: exe_path contained NUL: {}",
                 exe_path.display()
             );
@@ -528,17 +528,19 @@ pub fn perform_self_exec(
     match nix::unistd::execve(&exe_c, &argv, &envp) {
         Ok(_infallible) => unreachable!("execve returned Ok(Infallible)"),
         Err(e) => {
-            eprintln!(
+            crate::daemon_log!(
                 "hyoui upgrade: execve failed after pre-check: {e} (exe={}); restoring CLOEXEC + resuming old daemon",
                 exe_path.display()
             );
             // CLOEXEC 復元 (= 通常運用の defense-in-depth に戻す。失敗しても
             // fd は使えるので警告のみ)。
             if let Err(re) = set_cloexec(&master_owned) {
-                eprintln!("hyoui upgrade: CLOEXEC restore on master fd failed: {re} (continuing)");
+                crate::daemon_log!(
+                    "hyoui upgrade: CLOEXEC restore on master fd failed: {re} (continuing)"
+                );
             }
             if let Err(re) = set_cloexec(&listener_owned) {
-                eprintln!(
+                crate::daemon_log!(
                     "hyoui upgrade: CLOEXEC restore on listener fd failed: {re} (continuing)"
                 );
             }

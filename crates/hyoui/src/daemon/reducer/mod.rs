@@ -567,7 +567,7 @@ pub(in crate::daemon) fn handle_and_execute(
 /// release build で EffectResult feedback が round 上限を超えた時の fail-safe 通知。
 #[cfg(not(debug_assertions))]
 fn report_feedback_overflow(rounds: usize) {
-    eprintln!(
+    crate::daemon_log!(
         "[hyoui] effect feedback loop exceeded {rounds} rounds (max {MAX_FEEDBACK_ROUNDS}); \
          dropping remaining effects and continuing"
     );
@@ -576,10 +576,10 @@ fn report_feedback_overflow(rounds: usize) {
 /// release build で cross-domain queue が深度上限を超えた時の fail-safe 通知
 /// (DR-0025 §連鎖停止条件)。
 ///
-/// [stub] Phase 1b 後半で daemon の logging 経路へ差し替える。現状は stderr への 1 行出力に
-/// 留める (= debug build では [`drive`] が panic するためこの経路は通らない)。
+/// daemon のログ ([`crate::log`]) に 1 行出す (= debug build では [`drive`] が panic するため
+/// この経路は通らない)。
 fn report_cross_domain_overflow(queue_len: usize) {
-    eprintln!(
+    crate::daemon_log!(
         "[hyoui] cross-domain queue overflow (len={queue_len} > {MAX_CROSS_DOMAIN_DEPTH}); \
          dropping transaction and continuing"
     );

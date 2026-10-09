@@ -83,7 +83,7 @@ impl Pty {
     ///
     /// anchor 前提 (= caller が session leader かつ ctty 無し) を満たさない
     /// 呼び出し (= テストが直接呼ぶケース) では、`TIOCSCTTY` 失敗
-    /// (`Error::Precondition`) を検知して **明示 warning を stderr に出した上で**
+    /// (`Error::Precondition`) を検知して **明示 warning を daemon のログ ([`crate::log`]、logger が無ければ stderr) に出した上で**
     /// 旧 `forkpty` 構造に fallback する (= child が独立 session leader、^Z は
     /// 効かないがテストの大半は anchor と無関係なため実害なし)。詳細は DR-0017 §柱1。
     ///
@@ -141,7 +141,7 @@ impl Pty {
                 // setsid 済なのでここに来ない (= 来たら呼び出し経路が test など非
                 // daemonize)。サイレントにせず明示 warning を出してから legacy 構造で
                 // 起動する (= DR-0017 §柱1 が許容する fallback)。
-                eprintln!(
+                crate::daemon_log!(
                     "hyoui: warning: session anchor 化不可 (= 呼び出しプロセスが session leader でない / 既に controlling tty を持つ)。\
                      旧 forkpty 構造で child を起動します (= child が独立 session leader、^Z は効きません)。\
                      production の daemon は setsid 済のためこの経路には入りません (= テスト等の直接呼び出しのみ)。"

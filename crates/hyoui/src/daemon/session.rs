@@ -527,7 +527,7 @@ impl Session {
             let t0 = std::time::Instant::now();
             screen_state.process(&bytes);
             let feed_us = t0.elapsed().as_micros();
-            eprintln!(
+            crate::daemon_log!(
                 "hyoui: upgrade-resume scrollback re-feed: {n} bytes in {feed_us} µs \
                  (= vt100 parser reconstruction, DR-0028 Phase 2)"
             );
@@ -545,7 +545,7 @@ impl Session {
 
         // Issue #1 + user request: `--debug-dump=<path>` で子 PTY からの raw bytes を
         // append-only で file に書き出す。daemon process が直接 open / write し、
-        // failure 時は stderr に warn 1 行のみで dump を諦める (= session は止めない)。
+        // failure 時は daemon のログに warn 1 行だけ出して dump を諦める (= session は止めない)。
         let mut debug_dump_file: Option<std::fs::File> =
             config.debug_dump_path.as_ref().and_then(|p| {
                 match std::fs::OpenOptions::new()
@@ -555,7 +555,7 @@ impl Session {
                 {
                     Ok(f) => Some(f),
                     Err(e) => {
-                        eprintln!(
+                        crate::daemon_log!(
                             "hyoui: --debug-dump open 失敗 (= path: {p:?}): {e} (dump 無効化)"
                         );
                         None
@@ -608,7 +608,9 @@ impl Session {
                     // pre-check 失敗 → 旧続行 (§5.1)。lifecycle record に痕跡を
                     // 残し、upgrade_pending を解除してから outer loop で serve_loop 再起動。
                     // fd も socket も clients も scrollback も screen_state もそのまま。
-                    eprintln!("hyoui: upgrade pre-check failed, continuing old serve: {msg}");
+                    crate::daemon_log!(
+                        "hyoui: upgrade pre-check failed, continuing old serve: {msg}"
+                    );
                     state.record_registry.push_lifecycle(
                         super::record::LifecycleEvent::SessionTerminatedByCondition {
                             reason: format!("upgrade-precheck-failed: {msg}"),
@@ -637,7 +639,7 @@ impl Session {
                 super::upgrade::PerformSelfExecOutcome::PrepFailed(err) => {
                     // pty / listener は perform_self_exec 内で drop 済 (socket unlink 済)。
                     // session-fatal error として caller に戻す。
-                    eprintln!(
+                    crate::daemon_log!(
                         "hyoui: upgrade prep failed (state file write etc.); session ending: {err}"
                     );
                     return Err(err);
@@ -650,7 +652,7 @@ impl Session {
                 } => {
                     // §5.2 fallback: CLOEXEC 復元 + fd 再パッケージ済。旧 serve_loop に
                     // 再突入して session 継続。sigchld_owner も再取得。
-                    eprintln!(
+                    crate::daemon_log!(
                         "hyoui: upgrade execve failed (post-precheck), resuming old serve: {error}"
                     );
                     state.record_registry.push_lifecycle(
@@ -1965,7 +1967,9 @@ fn serve_loop(
                     if let Some(f) = debug_dump.as_mut() {
                         use std::io::Write as _;
                         if let Err(e) = f.write_all(&buf[..n]) {
-                            eprintln!("hyoui: --debug-dump write 失敗: {e} (以後 dump 中止)");
+                            crate::daemon_log!(
+                                "hyoui: --debug-dump write 失敗: {e} (以後 dump 中止)"
+                            );
                             debug_dump = None;
                         }
                     }

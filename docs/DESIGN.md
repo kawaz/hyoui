@@ -49,6 +49,7 @@ model is close to abduco / shpool.
 - Socket placement: `<state root>/sessions/<session>.sock` (DR-0041). The state root (the face) is `$HYOUI_STATE_DIR`, else `$XDG_STATE_HOME/hyoui` (only when absolute), else `$HOME/.local/state/hyoui`; with none of them (or a relative `HOME`) it is an error. `$XDG_RUNTIME_DIR` / `$TMPDIR` are not consulted. A session id is a lowercase, hyphenated UUID, and a run whose id already has a socket is refused when binding / taking the name lock (liveness is not judged). When the path does not fit the `sun_path` limit, a forked child `fchdir`s to an fd of the directory and binds / connects with the relative name
 - Session listing: `hyoui list` shows every session of the face. Discovery looks only at `sessions/`. Classification uses `key=value` tags (`run --tag`, returned by the daemon in status), and `list --tag` filters only when given
 - Directory mode 0700, socket mode 0600 (same-UID trust boundary)
+- Daemon log: after startup the daemon points fd 2 at `<state root>/sessions/logs/<session>.log`, and its internal log lines go through a bounded channel to a logger thread (when the channel is full, lines are dropped and the count is logged). The switch happens before the ready notification, so startup failures before it reach the caller's stderr. An empty log is removed when the session ends ([[DR-0037]] stage 2)
 
 ## 2. Architecture
 

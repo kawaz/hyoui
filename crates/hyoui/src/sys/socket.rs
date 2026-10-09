@@ -313,12 +313,12 @@ impl UnixSock {
         lock: Option<Flock<std::fs::File>>,
     ) -> Self {
         if let Err(e) = set_cloexec(&fd) {
-            eprintln!("hyoui: warning: CLOEXEC restore on inherited listener failed: {e}");
+            crate::daemon_log!("hyoui: warning: CLOEXEC restore on inherited listener failed: {e}");
         }
         let lock = match lock {
             Some(held) => {
                 if let Err(e) = set_cloexec(&*held) {
-                    eprintln!(
+                    crate::daemon_log!(
                         "hyoui: warning: CLOEXEC restore on inherited daemon lock failed: {e}"
                     );
                 }
@@ -329,7 +329,7 @@ impl UnixSock {
                 match lock_socket_dir(&path).and_then(|_dir_lock| acquire_name_lock(&lock_path)) {
                     Ok(held) => Some(held),
                     Err(e) => {
-                        eprintln!(
+                        crate::daemon_log!(
                             "hyoui: warning: daemon lock {} を取得できない ({e}); lock 無しで続行",
                             lock_path.display()
                         );

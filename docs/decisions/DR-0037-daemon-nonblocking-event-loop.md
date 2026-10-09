@@ -1,6 +1,6 @@
 # DR-0037: daemon のイベントループは外部の応答を待たない
 
-- Status: Proposed (2026-09-29) — 🟡 段階 1 実装済。Q1 / Q2 / Q3 / Q8 と段階 1 の着手は裁定済み (2026-10-09、「裁定」節)。Q4〜Q7 は「裁定待ち」節
+- Status: Proposed (2026-09-29) — 🟡 段階 1・2 実装済。Q1 / Q2 / Q3 / Q8 と段階 1 の着手は裁定済み (2026-10-09、「裁定」節)。段階 2 (標準エラーの付け替え + logger) は実装済み (2026-10-09、「標準エラーとログ」節)。Q4〜Q7 は「裁定待ち」節
 - Date: 2026-09-29
 - Related: DR-0025 (reducer 化。単一 thread の `poll → translate → reduce → effect` loop と EffectResult feedback を本 DR が前提にする), DR-0014 (透過原則と検証主義。検出手段で介入をどこまで入れるかの判断軸), DR-0021 (PTY drain ack。PTY write の非同期化で ack の発行点を保つ必要がある), DR-0016 (record。writer thread と stop / abort の扱い), DR-0028 (graceful upgrade。state file 書き出しと fd 引き継ぎ), DR-0015 (fork daemon + attach client。daemon の stdio の出どころ)
 - Origin: `docs/issue/2026-09-29-daemon-must-never-hang.md` (kawaz 裁定 2026-09-29)。事実は `docs/findings/2026-09-29-daemon-blocking-points.md`
@@ -80,8 +80,27 @@ findings の ID で対応を示す。
 | `--debug-dump` (F-1, F-2) | record と同じ IO worker に載せる |
 | upgrade (F-6) | 旧プロセス側: precheck (`metadata`)、state file 書き出し、準備失敗・execve 失敗からの復帰時の state file `remove_file`、prep 失敗時の socket `unlink` (`UnixSock::drop`) を worker で行い、完了イベントで次段 (exec / 旧 serve 継続 / 終了) に進む。exec 直前の CLOEXEC 操作と fd 付け替えは loop が行う (worker と fd を共有しない)。新プロセス側: resume の state file open / decode / `remove_file` は serve loop 開始前に走るので I-1 の対象外だが、固まると upgrade 後の daemon が serve を始めないため、deadline 付きの worker で読み、期限超過なら既存の env 最小 subset fallback で resume する |
 | 通常終了時の socket `unlink` | `UnixSock::drop` の unlink を worker に渡す (serve loop を抜けた後の shutdown state でも loop 外で待たない) |
-| 標準エラー (E-1) | ready 通知の後、fd 2 を daemon 専用の出力先に付け替え、ログは bounded channel 経由で logger thread が書く (満杯なら破棄して件数を数える)。付け替え先は裁定待ち Q3。継承した fd に O_NONBLOCK を付ける方法は、file description を共有する呼び出し元の端末や pipe の挙動まで変えるので採らない |
+| 標準エラー (E-1) | ready 通知の時点で、fd 2 を daemon 専用の出力先 (session ごとのログファイル、裁定 Q3) に付け替えておき、ログは bounded channel 経由で logger thread が書く (満杯なら破棄して件数を数える)。詳細は「標準エラーとログ」節。継承した fd に O_NONBLOCK を付ける方法は、file description を共有する呼び出し元の端末や pipe の挙動まで変えるので採らない |
 | shutdown (C-10, C-11, K-4) | 「drain 中」「finalize 中 (grace deadline)」「linger 中」を serve の state として loop 内で進める。sleep polling を置かない |
+
+## 標準エラーとログ (E-1、段階 2)
+
+裁定 Q3 (起動後の fd 2 と logger の書き先は state dir 配下の session ごとのログファイル、ready 通知の前の起動失敗は呼び出し元の stderr) を次の形で実装する。
+
+| 項目 | 決定 |
+|---|---|
+| 置き場 | `<状態の root>/sessions/logs/<session id>.log` (`hyoui::paths::Env::session_log_path`)。web の `web/logs/<name>.log` と同じく、機能の dir の下の `logs/` に置く。`sessions/` 直下の socket / lock と分かれ、discovery (`sessions/*.sock`) と混ざらない。dir は 0700、file は 0600 で作り、追記で開く (fd は CLOEXEC) |
+| path を決める側 | `hyoui run` (CLI) が socket と同じ env から決め、`HYOUI_DAEMONIZE_INIT` の `log` で daemon に渡す (daemon の env scrub に左右されない)。session id が UUID の標準形でない時は path に混ぜず、置き場無しとして扱う |
+| 付け替えの時点 | `Session::start` (socket の bind と子の spawn) が成功した後、ready 通知を書く **前**。親は ready を読むと exit するので、その時点で daemon は呼び出し元の stderr を持っていない (`$(hyoui run --detached ... 2>&1)` は親の exit で返る)。ready の前の失敗はすべて呼び出し元の stderr に出る |
+| 開けない・置き場が無い時 | 呼び出し元の stderr に原因を 1 行出し、fd 2 を `/dev/null` にして起動は続ける (ログのために起動を止めない)。どの場合も呼び出し元の stderr は手放す |
+| logger | daemon のログは `hyoui::log::emit` (`daemon_log!`) で bounded channel に `try_send` する (serve loop は待たない、I-2)。logger thread が時刻 (UTC の ISO 8601、秒精度) を付けて書く。logger の無い process (ready の前、test が `Session` を直接動かす時) では stderr に直接書く |
+| channel の大きさ | 1024 行 (`hyoui::log::CHANNEL_CAPACITY`)。daemon のログは警告と失敗の報告だけで、1 周に数行も出ない。1 行 200 bytes として最大 200 KiB 程度の滞留に収まる |
+| 満杯の時 | 捨てて件数を数え、logger が次の行を書く前と終了時に `hyoui: log: dropped N line(s) because the log queue was full` を 1 行書く |
+| 1 ファイルの上限 | 1 MiB (`hyoui::log::FILE_CAP_BYTES`)。超える行は書かず、印を 1 行書いて以後の行を捨てる。同じ id で起動し直した session は続きに追記し、上限は既存の大きさから数える |
+| 寿命 | 何も書かれなかったログは daemon の終了時に logger が消す (path が開いた file と同じ実体を指す時だけ)。書かれたログは session の終了後も残し、自動では消さない。daemon が終了処理を経ずに終わる (SIGKILL 等) と空のログが残る |
+| 終了時 | serve を抜けた後、logger が積まれた行を書き終えるのを最大 1 秒待つ (serve loop の外。fs が応答しない時もそれで daemon は終わり、残りの行は失われる) |
+| upgrade (DR-0028) | 新プロセスは同じ path を開き直して fd 2 と logger を向け直す。self-exec の時点で channel に残っていた行は失われる (exec の前に logger を止めない。upgrade 経路のログは失敗の報告だけで、失敗時は旧 serve が続くので logger も続く) |
+| fd 2 への直書き | panic の文言など `emit` を通らない stderr への出力も、fd 2 がログファイルなのでそこに入る (O_APPEND の 1 回の write 単位で logger の行と並ぶ) |
 
 ## PTY 書き込み effect の完了と失敗
 
@@ -130,7 +149,7 @@ SIGKILL 後の reap (K-5): 現行は flag なしの `waitpid` で見届ける。
 実機で再現した経路と、影響が大きい経路から順に進める。段の間の依存は各段に書く (依存を書いていない段は前段と独立に入れられる)。
 
 1. **client 受信の増分 decoder 化** (C-1)。1 client で daemon を止められる経路で、実機再現済み。受信は `recv(MSG_DONTWAIT)` で行い、fd の O_NONBLOCK は付けない (reader と writer が同一 open file description を共有するため、付けると blocking 前提の writer thread と handshake response の `write_all` が EAGAIN で部分送信・切断になる)。handshake 後の client のみ対象にし、handshake の worker は残してよい。1 回の recv に複数 frame が入っても、処理するのは 1 周に 1 client につき 1 frame とし、残りは decoder に置いて次の周回で処理する (frame の間で client の drop (自分の detach、他 client の `detach --target=others`、backpressure 超過) と leader cascade を確定させてから次の frame に進むため。blocking で 1 周 1 frame ずつ読んでいた時と同じ順序になる)
-2. **標準エラーの付け替え + logger** (E-1)。起動した呼び出し元の stderr を daemon が持ち続けること自体をやめる
+2. **標準エラーの付け替え + logger** (E-1)。起動した呼び出し元の stderr を daemon が持ち続けること自体をやめる。実装済み (2026-10-09、「標準エラーとログ」節)
 3. **fs IO の worker 化** (F-1〜F-6)。record の join 撤去が中心
 4. **client 送信の loop 内 nonblocking 化と writer thread の廃止** (C-2, C-6, C-8, C-10)。client socket の fd に O_NONBLOCK を付けるのはこの段で、受信の `MSG_DONTWAIT` はこの段で通常の read に戻してよい。handshake response も送信 queue 経由に切り替える (blocking の `write_all` が同じ description に残らないように)。v0.9.55 の `ClientHandle::drop` の timed join + `shutdown(Write)` は、この段までの **暫定の上限** として残す。この段で writer thread ごと無くなり、Drop は close だけになる
 5. **PTY 書き込みの非同期化** (P-2)。「PTY 書き込み effect の完了と失敗」節の意味論で入れる。失敗時の draining state が送信 queue を前提にするので段 4 に依存する
