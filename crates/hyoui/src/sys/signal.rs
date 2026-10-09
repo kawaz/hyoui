@@ -250,9 +250,10 @@ pub struct SavedMask(libc::sigset_t);
 /// `fork(2)` の **直前** に呼び、自前 handler を張る signal を block する。
 ///
 /// これで子は [`disarm_self_pipe_in_child`] を終えるまで signal を受け取らず、
-/// 「fork 済みだが disarm 前」の窓が閉じる。親・子とも用が済んだら
-/// [`restore_mask`] で戻すこと。**`execve` は signal mask を引き継ぐ**ため、
-/// 子側での復元は必須 (= 忘れると exec 後の子が SIGTERM を受け付けなくなる)。
+/// 「fork 済みだが disarm 前」の窓が閉じる。親は用が済んだら [`restore_mask`] で戻す。
+/// 子は disarm の後に [`reset_signals_for_exec`] で mask を空にする (= 呼び出し元の
+/// mask にも戻さない)。**`execve` は signal mask を引き継ぐ**ため、子側で mask を
+/// 外すのは必須 (= 忘れると exec 後の子が SIGTERM を受け付けなくなる)。
 pub fn block_handled_signals() -> SavedMask {
     // SAFETY: sigset_t の初期化・操作を libc の API のみで行う。
     unsafe {
@@ -264,6 +265,46 @@ pub fn block_handled_signals() -> SavedMask {
         let mut old: libc::sigset_t = std::mem::zeroed();
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
         SavedMask(old)
+    }
+}
+
+/// 子の exec の前に既定 (SIG_DFL) に戻す signal (DR-0043)。
+///
+/// 端末から起動された前景の job が既定の扱いで受け取る signal (キーボード由来の
+/// SIGINT / SIGQUIT / SIGTSTP、job control の SIGTTIN / SIGTTOU) と SIGPIPE。どれも
+/// 呼び出し元 (`$(...)` の中、非対話 shell の `cmd &`) や hyoui 自身 (Rust の runtime が
+/// SIGPIPE を無視にする) が無視に変えていることがあり、`execve` は無視の設定を引き継ぐ。
+pub const CHILD_DEFAULT_SIGNALS: [libc::c_int; 6] = [
+    libc::SIGINT,
+    libc::SIGQUIT,
+    libc::SIGTSTP,
+    libc::SIGTTIN,
+    libc::SIGTTOU,
+    libc::SIGPIPE,
+];
+
+/// fork した子が exec する直前に、[`CHILD_DEFAULT_SIGNALS`] を SIG_DFL に戻し、signal
+/// mask を空にする (DR-0043)。async-signal-safe (= `sigaction` / `sigemptyset` /
+/// `pthread_sigmask` のみ)。
+///
+/// 順序の契約: [`disarm_self_pipe_in_child`] の **後** に呼ぶ。fork の前に
+/// [`block_handled_signals`] で block した signal は、ここで mask を空にした時点で配送
+/// される。disarm の前に mask を空にすると、親から継承した handler が親の self-pipe に
+/// 書く窓ができる。扱いを既定に戻すのは mask を空にする **前** に行う (= block 中に
+/// 届いていた SIGINT / SIGTSTP 等は、exec 後と同じ既定の動作で受ける)。
+pub fn reset_signals_for_exec() {
+    // SAFETY: sigaction / sigemptyset / pthread_sigmask は async-signal-safe。`dfl` は
+    // 全 field を 0 にした上で `sa_sigaction = SIG_DFL` を入れた有効な sigaction。
+    unsafe {
+        let mut dfl: libc::sigaction = std::mem::zeroed();
+        dfl.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut dfl.sa_mask);
+        for sig in CHILD_DEFAULT_SIGNALS {
+            libc::sigaction(sig, &dfl, std::ptr::null_mut());
+        }
+        let mut empty: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut empty);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
     }
 }
 
@@ -449,6 +490,87 @@ mod tests {
         assert!(
             saw_sigchld,
             "self-pipe should observe SIGCHLD within 500ms of SIGSTOP"
+        );
+    }
+
+    /// 子に自分の signal の扱いと mask を 1 行で報告させる perl (= `/proc` の無い macOS
+    /// でも子の中から見える)。`%SIG` の未設定 (= 既定) は `DFL` と出す。
+    const SIGNAL_PROBE: &str = r#"use POSIX qw(:signal_h);
+my @r = map { my $h = $SIG{$_}; "$_=" . ((!defined $h || $h eq '' || $h eq 'DEFAULT') ? 'DFL' : $h) } qw(INT QUIT TSTP TTIN TTOU PIPE HUP);
+my $old = POSIX::SigSet->new; sigprocmask(SIG_BLOCK, POSIX::SigSet->new, $old);
+print join(' ', @r), ' mask=', join(',', grep { $old->ismember($_) } 1..31), "\n";"#;
+
+    /// DR-0043: 呼び出し元が無視・block していた signal は、子の exec の前に既定へ戻り、
+    /// mask は空になる。一覧の外 (SIGHUP) の無視は引き継ぐ。
+    ///
+    /// test process は session leader でないので `Pty::spawn` は legacy の forkpty 経路を
+    /// 通る。anchor 経路は hyoui-cli の `child_signal_defaults` が daemon 経由で見る。
+    #[test]
+    fn spawned_child_starts_with_default_signals_and_empty_mask() {
+        use std::io::Read;
+        let _guard = signal_test_guard();
+
+        // 呼び出し元の設定を作る: 6 つ + SIGHUP を無視、SIGTERM / SIGUSR2 を block。
+        // 元の扱いは test の後で戻す (= process 全体の状態なので他 test に漏らさない)。
+        let ignored = [
+            Signal::SIGINT,
+            Signal::SIGQUIT,
+            Signal::SIGTSTP,
+            Signal::SIGTTIN,
+            Signal::SIGTTOU,
+            Signal::SIGPIPE,
+            Signal::SIGHUP,
+        ];
+        let ign = SigAction::new(
+            SigHandler::SigIgn,
+            nix::sys::signal::SaFlags::empty(),
+            SigSet::empty(),
+        );
+        let saved: Vec<(Signal, SigAction)> = ignored
+            .iter()
+            // SAFETY: SIG_IGN は handler を持たない disposition。
+            .map(|&sig| {
+                (
+                    sig,
+                    unsafe { nix::sys::signal::sigaction(sig, &ign) }.expect("ignore"),
+                )
+            })
+            .collect();
+        let mut block = SigSet::empty();
+        block.add(Signal::SIGTERM);
+        block.add(Signal::SIGUSR2);
+        let mut old_mask = SigSet::empty();
+        nix::sys::signal::pthread_sigmask(
+            nix::sys::signal::SigmaskHow::SIG_BLOCK,
+            Some(&block),
+            Some(&mut old_mask),
+        )
+        .expect("block");
+
+        let spawned = crate::sys::pty::Pty::spawn(&["perl", "-e", SIGNAL_PROBE], 80, 24, None);
+
+        nix::sys::signal::pthread_sigmask(
+            nix::sys::signal::SigmaskHow::SIG_SETMASK,
+            Some(&old_mask),
+            None,
+        )
+        .expect("restore mask");
+        for (sig, action) in saved {
+            // SAFETY: 退避した元の disposition を戻すだけ。
+            unsafe { nix::sys::signal::sigaction(sig, &action) }.expect("restore");
+        }
+
+        let spawned = spawned.expect("spawn perl");
+        let child = spawned.child;
+        let mut master: std::fs::File = spawned.pty.into_master().into();
+        let mut out = String::new();
+        // perl は 1 行出して exit。master EOF (PTY なので EIO) まで読む。
+        let _ = master.read_to_string(&mut out);
+        let _ = nix::sys::wait::waitpid(child, None);
+        assert_eq!(
+            out.trim_end_matches(['\r', '\n']),
+            "INT=DFL QUIT=DFL TSTP=DFL TTIN=DFL TTOU=DFL PIPE=DFL HUP=IGNORE mask=",
+            "raw output={out:?}"
         );
     }
 

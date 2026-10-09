@@ -311,6 +311,7 @@ hyoui は縦の軸だけを握り、横の流れには手を出さない。
 - 子の fd 0 は、呼び出し元の fd 0 が tty なら PTY、tty でなければ呼び出し元の fd 0 そのもの (シェルが `cmd | child` を起動する時と同じ配線)
 - `run --pty-stdin` は、呼び出し元の fd 0 を使わず、子の fd 0 も PTY にする (外から操作し続ける shell / REPL を、端末の無い起動元から作る時)
 - キーは PTY に届く。子が fd 0 から読むか `/dev/tty` から読むかに関わらず、`hyoui input` と attach のキーは子に届く
+- 子は PTY の前景の job として始まる。SIGINT / SIGQUIT / SIGTSTP / SIGTTIN / SIGTTOU / SIGPIPE は既定の扱い、signal mask は空で exec する (呼び出し元が `$(...)` や `cmd &` で無視・block していても、^C / ^Z が効く。[[DR-0043]])
 
 ### 3.1.1 attach handshake の redraw 復元 ([[DR-0013]] §4 Phase A)
 

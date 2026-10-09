@@ -166,6 +166,13 @@ pub struct ForkedChild {
 /// `_exit(127)`** する (= 起点 dir が消えている等。誤った cwd (= `/`) で起動するより
 /// 明確に失敗させる)。`cwd = None` なら従来挙動 (= chdir せず daemon の cwd を継承)。
 ///
+/// # 子の signal (DR-0043)
+///
+/// child は exec の前に SIGINT / SIGQUIT / SIGTSTP / SIGTTIN / SIGTTOU / SIGPIPE を既定
+/// (SIG_DFL) に戻し、signal mask を空にする (= 対話の bash が前景の job を exec する時と
+/// 同じ)。呼び出し元が無視・block していた設定は daemon を経て子に届かない。一覧の外の
+/// 無視の設定 (SIGHUP 等) は `execve` の規定どおり子に引き継がれる。
+///
 /// # 子の stdin (DR-0042)
 ///
 /// `stdin = Some(fd)` の場合、child は fd 0 に `fd` を dup2 する (= 呼び出し元の非 tty
@@ -237,8 +244,8 @@ pub fn openpty_fork_anchor_exec(
     // SAFETY: `fork(2)`。child path では async-signal-safe な操作のみ
     // (setpgid / tcsetpgrp / dup2 / close / execvp / _exit)。alloc / lock /
     // Rust destructor を一切走らせない。argv ポインタ配列は fork 前に構築済。
-    // 継承 handler 対策: fork を signal block で囲み、子は disarm 後に mask を戻す
-    // (= `super::signal::disarm_self_pipe_in_child` の doc 参照)。
+    // 継承 handler 対策: fork を signal block で囲み、子は disarm 後に mask を空にする
+    // (= `super::signal::disarm_self_pipe_in_child` / `reset_signals_for_exec` の doc 参照)。
     let saved_mask = super::signal::block_handled_signals();
     let pid = unsafe { libc::fork() };
     if pid == -1 {
@@ -250,10 +257,10 @@ pub fn openpty_fork_anchor_exec(
 
     if pid == 0 {
         // ===== child path (async-signal-safe のみ) =====
-        // 継承した self-pipe handler を無効化してから mask を戻す (= この順序で
-        // ないと窓が残る)。`execve` は mask を引き継ぐので復元は必須。
+        // 継承した self-pipe handler を最初に無効化する。fork の前に block した signal
+        // は、下の `reset_signals_for_exec` で mask を空にするまで block のまま
+        // (= disarm より先に mask を外すと、継承 handler が親の self-pipe に書く窓が残る)。
         super::signal::disarm_self_pipe_in_child();
-        super::signal::restore_mask(&saved_mask);
         // SAFETY: 以下はすべて async-signal-safe な libc 直呼び。
         unsafe {
             // 同 session のまま新 pgrp の leader になる。
@@ -267,12 +274,17 @@ pub fn openpty_fork_anchor_exec(
             // SIGTTOU で **停止する** (= 既定 disposition は stop)。誰も SIGCONT
             // を送らないため子は exec に到達せず、daemon は永久に子出力を待つ。
             // 親側 (下記 parent path) が同じ理由で SIG_IGN してから呼ぶのと対称に、
-            // 子側でも一時 ignore する。exec 後の子に ignore を漏らさないよう
-            // (= execve は ignored disposition を引き継ぐ) 直後に旧 disposition へ
-            // 戻す。`signal` は async-signal-safe。
-            let old_ttou = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            // 子側でも一時 ignore する。ignore は直後の `reset_signals_for_exec` で
+            // 既定に戻る (= exec 後の子に漏らさない)。
+            libc::signal(libc::SIGTTOU, libc::SIG_IGN);
             libc::tcsetpgrp(slave_raw, libc::getpid());
-            libc::signal(libc::SIGTTOU, old_ttou);
+        }
+        // 前景の job として exec する: SIGINT / SIGQUIT / SIGTSTP / SIGTTIN / SIGTTOU /
+        // SIGPIPE を既定に戻し、signal mask を空にする (DR-0043)。呼び出し元の mask には
+        // 戻さない。foreground 化の後に行う (= 既定の SIGTTOU で tcsetpgrp が止まらない)。
+        super::signal::reset_signals_for_exec();
+        // SAFETY: 以下はすべて async-signal-safe な libc 直呼び。
+        unsafe {
             // slave を std fd 0/1/2 に複製。呼び出し元の stdin を渡す時は fd 0 だけ
             // それにする (DR-0042)。
             libc::dup2(if stdin_raw >= 0 { stdin_raw } else { slave_raw }, 0);
@@ -415,9 +427,10 @@ pub fn forkpty_then_exec_legacy(
             Ok(ForkedChild { child, master })
         }
         ForkptyResult::Child => {
-            // 継承した self-pipe handler を無効化してから mask を戻す。
+            // 継承した self-pipe handler を無効化してから、signal の扱いを既定に戻して
+            // mask を空にする (= anchor 経路と同じ順序と内容、DR-0043)。
             super::signal::disarm_self_pipe_in_child();
-            super::signal::restore_mask(&saved_mask);
+            super::signal::reset_signals_for_exec();
             // cwd 伝搬: 起動元 dir に chdir してから exec (= 透過性回復、本体は
             // openpty_fork_anchor_exec と同じ contract)。失敗時は exec を中止して
             // _exit(127)。
