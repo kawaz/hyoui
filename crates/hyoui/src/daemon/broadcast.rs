@@ -939,6 +939,19 @@ mod tests {
     /// socket buffer より十分大きい payload (= 相手が読み進めないと書き終わらない大きさ)。
     const FLUSH_TEST_PAYLOAD: usize = 8 * 1024 * 1024;
 
+    /// 送信 buffer が埋まるまで `flush_send` を繰り返す。1 回の flush は
+    /// `WRITE_BUDGET_PER_PASS` で区切られて `Paused` を返すので、送信 buffer が
+    /// budget より大きい環境 (Linux の socketpair) では 1 回では詰まらない。
+    /// macOS の socketpair は buffer が budget より小さく、1 回目で `Blocked` になる。
+    fn flush_until_not_paused(ch: &ClientHandle) -> WriteProgress {
+        loop {
+            match ch.flush_send() {
+                WriteProgress::Paused => continue,
+                other => return other,
+            }
+        }
+    }
+
     /// `ClientHandle` の socket は O_NONBLOCK で、相手が読まなくても `flush_send` は
     /// 送信 buffer が埋まった所で戻る (= serve loop が相手の読み取りを待たない、DR-0037 I-1)。
     #[test]
@@ -948,7 +961,7 @@ mod tests {
             enqueue_for_client(&ch, Arc::new(vec![0u8; FLUSH_TEST_PAYLOAD])),
             EnqueueOutcome::Sent
         );
-        assert_eq!(ch.flush_send(), WriteProgress::Blocked);
+        assert_eq!(flush_until_not_paused(&ch), WriteProgress::Blocked);
         let left = ch.queued_bytes();
         assert!(
             left > 0 && left < FLUSH_TEST_PAYLOAD,
@@ -1118,14 +1131,10 @@ mod tests {
     /// それ以上に増えない。上限を超えた client はその場で close される (相手は EOF を見る)。
     #[test]
     fn closing_is_capped_and_the_excess_is_closed_immediately() {
-        fn open_fds() -> usize {
-            std::fs::read_dir("/dev/fd").expect("read /dev/fd").count()
-        }
         // 相手は読まないので、送信 buffer を埋めた残りが queue に残る (= closing に入る)。
         let payload: SharedBytes = Arc::new(vec![0u8; 1024 * 1024]);
         let mut peers: Vec<UnixStream> = Vec::new();
         let mut closing: Vec<ClosingClient> = Vec::new();
-        let baseline = open_fds();
         let rounds = 3;
         let per_round = MAX_CLOSING_CLIENTS / 2 + 4;
         for round in 0..rounds {
@@ -1135,7 +1144,7 @@ mod tests {
                     enqueue_for_client(&ch, Arc::clone(&payload)),
                     EnqueueOutcome::Sent
                 );
-                assert_eq!(ch.flush_send(), WriteProgress::Blocked);
+                assert_eq!(flush_until_not_paused(&ch), WriteProgress::Blocked);
                 retire_client(&mut closing, ch);
                 peers.push(peer);
             }
@@ -1144,14 +1153,12 @@ mod tests {
                 "round {round}: {}",
                 closing.len()
             );
-            let daemon_side = open_fds() - baseline - peers.len();
-            assert!(
-                daemon_side <= MAX_CLOSING_CLIENTS,
-                "round {round}: daemon 側の fd が {daemon_side} 本 (上限 {MAX_CLOSING_CLIENTS})"
-            );
         }
         assert_eq!(closing.len(), MAX_CLOSING_CLIENTS);
-        // 上限を超えた分 (後から来た client) はその場で close されている。
+        // 上限を超えた分 (後から来た client) はその場で close されている。daemon 側の fd が
+        // 閉じたことは、相手側の read が EOF になること (= その socket を指す fd が全部閉じた)
+        // で確かめる。/dev/fd の本数は、同じプロセスで並行に走る他の test の fd も数えて
+        // しまうので使わない。
         let excess = peers.len() - MAX_CLOSING_CLIENTS;
         for peer in peers.iter_mut().rev().take(excess) {
             let mut all = Vec::new();
@@ -1169,7 +1176,7 @@ mod tests {
             enqueue_for_client(&ch, Arc::new(vec![0u8; FLUSH_TEST_PAYLOAD])),
             EnqueueOutcome::Sent
         );
-        assert_eq!(ch.flush_send(), WriteProgress::Blocked);
+        assert_eq!(flush_until_not_paused(&ch), WriteProgress::Blocked);
         let mut closing = Vec::new();
         closing.extend(ch.into_closing(Instant::now() + Duration::from_secs(30)));
         drop(peer);
