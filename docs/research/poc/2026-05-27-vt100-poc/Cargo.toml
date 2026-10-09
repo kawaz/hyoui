@@ -1,0 +1,16 @@
+[package]
+name = "poc-vt100"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.86"
+license = "MIT"
+authors = ["Yoshiaki Kawazu <kawazzz@gmail.com>"]
+publish = false
+description = "PoC: vt100 crate evaluation for hyoui DR-0013"
+
+[dependencies]
+vt100 = "0.16"
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+
+[dev-dependencies]
