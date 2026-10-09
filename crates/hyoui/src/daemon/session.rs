@@ -3464,10 +3464,15 @@ mod tests {
         }
         let dir = make_temp_socket_dir();
         let sock = dir.path().join("core-child.sock");
+        // sh の `ulimit -c` は単位が実装で違う (dash は POSIX の 512 byte、macOS の
+        // /bin/sh = bash は 1024 byte) ので、getrlimit の値を byte のまま出させる。
         let cmd = vec![
-            "sh".to_string(),
+            "python3".to_string(),
+            "-I".to_string(),
             "-c".to_string(),
-            "echo \"core=$(ulimit -S -c),$(ulimit -H -c)\"".to_string(),
+            "import resource; s, h = resource.getrlimit(resource.RLIMIT_CORE); \
+             print(f'core={s},{h}')"
+                .to_string(),
         ];
         let session = Session::start(DaemonConfig::new("core-child", sock, cmd)).expect("start");
         let pid = session.child_pid();
@@ -3484,18 +3489,37 @@ mod tests {
         drop(session);
         cleanup_child(pid);
 
-        let to_ulimit = |v: u64| -> String {
+        // python の resource.RLIM_INFINITY は C の RLIM_INFINITY をそのまま int にした値
+        // (macOS / Linux とも u64 の最大値か -1)。符号の違いを避けて byte のまま比べる。
+        let to_py = |v: u64| -> String {
             if v == libc::RLIM_INFINITY {
-                "unlimited".to_string()
+                "inf".to_string()
             } else {
-                // sh の `ulimit -c` は 512 byte 単位 (POSIX)。
-                (v / 512).to_string()
+                v.to_string()
             }
         };
-        let expected = format!("core={},{}", to_ulimit(saved.soft), to_ulimit(saved.hard));
+        let out = out
+            .lines()
+            .map(|l| {
+                let l = l.trim_end_matches('\r');
+                let Some(rest) = l.strip_prefix("core=") else {
+                    return l.to_string();
+                };
+                let norm = |x: &str| match x.parse::<i128>() {
+                    Ok(-1) => "inf".to_string(),
+                    Ok(n) if n == i128::from(libc::RLIM_INFINITY) => "inf".to_string(),
+                    _ => x.to_string(),
+                };
+                let mut it = rest.splitn(2, ',');
+                let (a, b) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
+                format!("core={},{}", norm(a), norm(b))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expected = format!("core={},{}", to_py(saved.soft), to_py(saved.hard));
         assert!(
-            out.lines().any(|l| l.trim_end_matches('\r') == expected),
-            "child must report {expected:?}: raw output={out:?}"
+            out.lines().any(|l| l == expected),
+            "child must report {expected:?}: output={out:?}"
         );
     }
 
