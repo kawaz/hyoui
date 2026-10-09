@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-10-09 | design | open | [child-state-check-starved-by-busy-client](./2026-10-09-design-child-state-check-starved-by-busy-client.md) | fd が毎周 Ready になる client が居る間、Timeout 時の子の状態確認が走らない (macOS で止まった子の復帰の検知が遅れる) |
 | 2026-10-09 | bug | open | [child-inherits-zero-core-limit](./2026-10-09-bug-child-inherits-zero-core-limit.md) | daemon が RLIMIT_CORE を hard 0 にしていて子が引き継ぐ (子は core を出せず、上げ直せない) |
 | 2026-10-09 | bug | open | [daemon-inherits-blocked-signal-mask](./2026-10-09-bug-daemon-inherits-blocked-signal-mask.md) | 呼び出し元で block された SIGTERM 等が daemon の mask に残り、kill -TERM <daemon> が効かない |
 | 2026-10-09 | task | open | [session-log-viewer-and-cleanup](./2026-10-09-task-session-log-viewer-and-cleanup.md) | session ごとの daemon ログを CLI から見る手段 (hyoui log) と、溜まったログの片付け |
