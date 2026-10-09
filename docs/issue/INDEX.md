@@ -4,6 +4,9 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-10-09 | bug | open | [child-action-menu-closed-by-echoed-ctrl-z](./2026-10-09-bug-child-action-menu-closed-by-echoed-ctrl-z.md) | 子が ^Z をエコーする時 (cat 等)、^Z×2 で出た child action menu がキーを受け付けず子へ素通りする |
+| 2026-10-09 | design | open | [child-inherits-ignored-signals](./2026-10-09-design-child-inherits-ignored-signals.md) | 呼び出し元で無視されている signal が子に引き継がれる ($(hyoui run --detached ...) の子が ^Z で止まらない)。SIG-Q1 で裁定待ち |
+| 2026-10-09 | bug | open | [wait-misses-fullwidth-text](./2026-10-09-bug-wait-misses-fullwidth-text.md) | hyoui wait が全角文字の連続に一致しない |
 | 2026-10-09 | bug | open | [serve-backpressure-test-hang](./2026-10-09-bug-serve-backpressure-test-hang.md) | serve_backpressure_disconnects_slow_client が負荷下で 150 回超に 1 回、kill 後の serve の終了待ちでハングする (真因未特定) |
 | 2026-10-08 | bug | open | [run-detached-pty-stdin-holds-caller-pipes](./2026-10-08-bug-run-detached-pty-stdin-holds-caller-pipes.md) | run --detached --pty-stdin を $(...) 内で起動すると子が生きている間コマンド置換が返らない (呼び出し元 pipe を保持か、推測) |
 | 2026-10-07 | task | open | [remove-namespace-option-shim](./2026-10-07-task-remove-namespace-option-shim.md) | 廃止した namespace の option を受け付けて捨てる処理を 2026-11 に消す |

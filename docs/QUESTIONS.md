@@ -18,6 +18,13 @@
 
 ## 裁定待ち
 
+### 👺SIG-Q1: 子を起動する時、呼び出し元で無視されている signal を既定に戻すか
+
+[issue](issue/2026-10-09-design-child-inherits-ignored-signals.md)。`I=$(hyoui run --detached -- cat)` で起動した子が ^Z で止まらない。bash の `$(...)` の中では SIGTSTP 等が無視の設定になり、hyoui はそれを子にそのまま渡すため。`cmd &` からの起動では ^C も効かなくなるはず。統括推しは a (DR-0042 で「hyoui は bash の位置に立つ」とした。対話の bash は前景の job を起動する時にこれらを既定に戻すので、端末 (PTY) を持つ子にはそれが「端末で起動した時と同じ」になる。tmux も同じ)。
+
+- [ ] a: 子の exec の前に、SIGINT / SIGQUIT / SIGTSTP / SIGTTIN / SIGTTOU / SIGPIPE を既定 (SIG_DFL) に戻し、signal mask も空にする
+- [ ] b: 今のまま (直接実行で `$(cmd)` とした時と同じく、呼び出し元の設定を引き継ぐ)
+
 ### 👺NB-Q1: DR-0037 (daemon イベントループ非同期化) の runtime
 
 [DR-0037](decisions/DR-0037-daemon-nonblocking-event-loop.md) 「runtime の選択肢」節。統括推しは a (DR-0025 の単一 thread 同期 loop をそのまま nonblocking 化するだけで不変条件を満たせ、依存を増やさない。fd は最大 70 本程度で poll(2) の O(n) は問題にならない)。
@@ -64,11 +71,12 @@ DR-0037 「固まった daemon の検出」節。観測できるのは「期限�
 
 ## 確認待ち
 
-### 👺DR32-C1: child action menu の実機確認 (v0.9.39 以降)
+### 👺DR32-C1: child action menu の実機確認 (0.14.2)
 
-- [ ] a: `~/.config/hyoui/config.toml` に `[session]` `on_child_suspend = "show_child_action_menu"` を書き、attach 中に ^Z×2 で子を止めると menu が出て各キー (d/z = 脱出、c・Esc/i/h/k = 子への操作、Esc = 起こして戻る) が効く
-- [ ] b: `[attach]` `ctrlz_x1_action = "select_on_demand"` で ^Z 単発 → 1 行プロンプト → ^Z/^C/Esc の 3 択が効く
-- [ ] c: 子を止めた状態で detach → 再 attach しても menu キーが効く
+b (select_on_demand の 1 行プロンプト) と c (子を止めたまま detach → 再 attach しても menu が効く) は、入れ子の hyoui で AI が確認済み (2026-10-09)。a は子が ^Z をエコーする時 (cat 等) に menu がキーを受け付けない不具合が見つかり、[issue](issue/2026-10-09-bug-child-action-menu-closed-by-echoed-ctrl-z.md) で直す。直した後に本物の端末で見てほしい点:
+
+- [ ] a: `on_child_suspend = "show_child_action_menu"` で、cat と vim のそれぞれを ^Z×2 で止めると menu が出て、各キー (d / z / c・Esc / i / h / k) が効く
+- [ ] b: menu で d した後や、1 行プロンプトで ^C した後に、menu / プロンプトの行が端末に残らない
 
 ### 👺LINK-C1: ターミナル内リンク (v0.9.40 以降) の実機確認
 
@@ -78,9 +86,3 @@ DR-0037 「固まった daemon の検出」節。観測できるのは「期限�
 - [ ] d: iPad: nvim 等 (mouse 有効 TUI) で focus 済み tap → カーソルがタップ位置へジャンプしない
 - [ ] e: iPad: focus 済み tap でキーボードが閉じる / パネル open 中の tap は close のみ
 - [ ] f: popup ブロック環境でリンクを開くと URL + コピーボタンのパネルが出る (Esc / × で閉じる)
-
-### 👺HANG-C1: v0.9.55 で stopped client を抱えた daemon が固まらないことの実機確認
-
-- [ ] a: 新版 (0.9.55 以降) で `hyoui run --detached -- <長く出力するコマンド>` を起動し `hyoui attach` して ^Z で attach client を止め、そのまま子が大量出力しても `hyoui list` で当該セッションが live のまま応答する (stale にならない)
-- [ ] b: その状態で子を終了させると daemon が exit し、`ps` に zombie が残らない
-- [ ] c: `hyoui web service restart` で gateway が 0.9.55 になっている (statusline / `hyoui web service status` の版で確認)

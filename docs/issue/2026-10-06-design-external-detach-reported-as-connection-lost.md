@@ -33,3 +33,7 @@ DR-0042 で、端末の無い起動元 (agent の Bash ツール等) から `hyo
 - 切られる側に理由を伝える経路: daemon が drop の前に通知 frame を送る (新 message になるなら CLAUDE.md の self-check で必然性を DR に書く) か、既存の frame で表せるか
 - 外から detach された時の exit code (自発 detach と同じ 0 か、区別できる別の値か)
 - backpressure での切断 (`BackpressureDisconnected`、今は同じ exit 9 で stderr だけ出し分け) との揃え方
+
+## 追記 (2026-10-09): 送信 queue の上限で切られた client でも同じ文言が出る
+
+HANG-C1 の確認 (0.14.2) で、^Z で止めた attach client を抱えたまま子が大量に出力すると、daemon は送信 queue の上限でその client を切る (status の clients から消える)。その後 client を `fg` すると、溜まっていた出力を流した後に「daemon との接続が失われました (daemon が終了した可能性があります)」を出して終わった。daemon は live のまま。`RunOutcome::BackpressureDisconnected` には別の文言があるのに、この経路ではそれが出ていない (切断の理由が client に届いていないか、判定に落ちていない)。
