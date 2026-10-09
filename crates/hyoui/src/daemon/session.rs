@@ -13,7 +13,6 @@
 //! R4-M1 (v0.1.4) で撤去済。`serve` で完全に置き換えられた。
 
 use std::os::fd::AsFd;
-use std::sync::atomic::Ordering;
 use std::sync::{MutexGuard, TryLockError};
 use std::time::Instant;
 
@@ -48,7 +47,9 @@ use super::reducer::{self, DaemonState, translate};
 use super::screen::ScreenState;
 use super::{ChildSuspendPolicy, DaemonConfig};
 use crate::daemon::broadcast::{
-    ClientHandle, MAX_CLIENTS_PER_DAEMON, broadcast_control, broadcast_master_bytes, send_control,
+    ClientHandle, ClosingClient, MAX_CLIENTS_PER_DAEMON, advance_closing, broadcast_control,
+    broadcast_master_bytes, closing_deadline, drain_closing, flush_clients, flush_until,
+    poll_writable, retire_client, send_control,
 };
 
 /// R5-H7: send `sig` to the child's whole process group instead of only the
@@ -276,10 +277,10 @@ fn release_suspend_signal_handlers() {
         }
     }
 }
-/// upgrade の self-exec の前に、client の writer thread が積まれた frame (`upgrade.ack` 等) を
-/// 書き終えるのを待つ上限 (DR-0028 §4)。全 client で共有する 1 つの deadline で、読まない
-/// client が居ても upgrade はこれ以上遅れない。writer は client ごとに並行に書くので、読んで
-/// いる client の分は負荷下でもこの中で書き終わる。
+/// upgrade の self-exec の前に、client の送信 queue に積まれた frame (`upgrade.ack` 等) を
+/// 書き終えるのを待つ上限 (DR-0028 §4、DR-0037 段階 4)。全 client で共有する 1 つの deadline
+/// で、読まない client が居ても upgrade はこれ以上遅れない。serve_loop が全 client に並行に
+/// nonblocking で書くので、読んでいる client の分は負荷下でもこの中で書き終わる。
 const UPGRADE_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
 
 use super::tail::{broadcast_tail_end_to_followers, tail_end_reason_from_outcome};
@@ -498,8 +499,8 @@ impl Session {
     /// 旧 `Session::run` (= Phase 8、1-client 限定) の上位互換であり、R4-M1 で
     /// 唯一の本流 entry point になった。複数 client を同時に accept、子 PTY 出力を
     /// 全 client にブロードキャスト、各 client 入力を子 PTY に集約する。各 client は
-    /// per-thread writer + bounded queue を持ち、queue 超過時はその client のみ
-    /// disconnect する (DR-0008 §8.2)。
+    /// byte 上限付きの送信 queue を持ち (serve loop が nonblocking で書く、DR-0037 段階 4)、
+    /// queue 超過時はその client のみ disconnect する (DR-0008 §8.2)。
     ///
     /// 終了条件:
     /// - 子 PTY が exit → 子 reap → exit code を返す
@@ -525,6 +526,9 @@ impl Session {
             .expect("Session::serve called twice or after consumption (bug)");
         let config = &self.config;
         let mut clients: Vec<ClientHandle> = Vec::new();
+        // 切断が決まり、送信 queue を書き終えてから close する client (DR-0037 段階 4)。
+        // upgrade の execve 失敗で serve_loop に再突入しても続きを書けるよう serve が持つ。
+        let mut closing: Vec<ClosingClient> = Vec::new();
         let mut next_client_id: u64 = 0;
         let mut state = SessionState::default();
         // DR-0019 Update: on-child-suspend policy は runtime 変更可能 (= `hyoui set`)。
@@ -615,6 +619,7 @@ impl Session {
                 child,
                 &listener,
                 &mut clients,
+                &mut closing,
                 &mut next_client_id,
                 config,
                 &mut state,
@@ -660,11 +665,9 @@ impl Session {
                     continue;
                 }
             };
-            // 通過 → self-exec 経路。exec の前に、client に積んだ frame (upgrade.ack を
-            // 含む) を writer thread が書き終えるのを上限付きで待つ (DR-0028 §4)。exec は
-            // writer thread ごと process を置き換えるので、待たないと ack が届かず client が
-            // 「recv error before ack」で失敗する。
-            super::broadcast::wait_until_flushed(&clients, Instant::now() + UPGRADE_FLUSH_BUDGET);
+            // 通過 → self-exec 経路。client に積んだ frame (upgrade.ack を含む) は、
+            // serve_loop が UpgradeRequested を返す前に書き終えている (= 送信 queue が空になるのを
+            // `UPGRADE_FLUSH_BUDGET` を上限に見届ける state、DR-0028 §4 / DR-0037 段階 4)。
             // sigchld_owner を先に drop し (= 新 process init
             // 前に global SELFPIPE_WRITE_FD を必ずクリアする)、perform_self_exec へ。
             // 成功時は戻らず (execve)、失敗時は PerformSelfExecOutcome が返る。
@@ -731,29 +734,18 @@ impl Session {
             broadcast_tail_end_to_followers(&clients, reason);
         }
 
-        // cleanup:
-        // 1. per-client で queued_bytes==0 を最大 200ms 待つ (= 1 client の hang
-        //    が他 client の drain budget を食い潰さないように、deadline を共有せず
-        //    client ごとに 200ms ずつ振る)
-        // 2. `clients.drain(..)` で各 `ClientHandle` を scope-exit させ、`Drop` impl
-        //    (R5-H18) が writer_tx close + reader shutdown + writer_thread join を
-        //    一括実行する
-        //
-        // ※ Drop だけだと残り frame を drain できないため、drain wait は明示的に
-        //   先行させる (= writer_pump が残 frame を全て write_all し終わるまで
-        //   200ms 待つ。timeout で抜けたら Drop の shutdown で強制終了)。
-        const DRAIN_BUDGET_PER_CLIENT: std::time::Duration = std::time::Duration::from_millis(200);
-        for ch in clients.iter() {
-            let deadline = std::time::Instant::now() + DRAIN_BUDGET_PER_CLIENT;
-            while ch.queued_bytes.load(Ordering::Acquire) > 0
-                && std::time::Instant::now() < deadline
-            {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        }
+        // cleanup (serve_loop を抜けた後の終了処理。loop 内の state 化は DR-0037 段階 6):
+        // 1. 子の最後の出力を含め、全 client の送信 queue を書き終えるまで最大
+        //    `DRAIN_BUDGET` 待つ (`poll(POLLOUT)` で待ち、client に並行に書く。読まない client が
+        //    居ても他の client の分は同じ時間内に書き終わり、全体も `DRAIN_BUDGET` で打ち切る)
+        // 2. session.exit.notify を積んで、同じく `DRAIN_BUDGET` まで書き終えるのを待つ
+        // 3. 残った client を closing に移し、closing 全体が close されるまで書く
+        //    (= 各自 `CLOSE_FLUSH_TIMEOUT` まで)
+        const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+        flush_until(&clients, Instant::now() + DRAIN_BUDGET);
 
         // DR-0015 §2.1: 子 PTY exit を契機に session.exit.notify を **全 attached
-        // client に cap-aware broadcast**。buffer drain (= 上の per-client wait) の
+        // client に cap-aware broadcast**。buffer drain (= 上の flush) の
         // 後で送ることで、子最後の出力 + exit notify が前後する order を保証する。
         // outcome から exit_status を組み立て、cap `session-exit-v1` を持つ client
         // にだけ届く (= 旧 client は skip、未対応 client への decode error 回避)。
@@ -771,26 +763,16 @@ impl Session {
             );
             // 送信後の overflow は client 切断扱いだが、ここは shutdown 直前なので無視。
 
-            // 終端 drain: SessionExitNotify を writer thread が flush し切るまで wait。
-            // これをしないと、enqueue 直後の `clients.clear()` で socket が閉じ、client が
-            // SessionExitNotify を読む前に EOF を観測する race が起きる。issue 2026-06-11
-            // 優先1 で client の socket EOF を `ConnectionLost` (= 非 0 exit) に分離した
-            // ため、この race が顕在化した (= 子の正常 exit code を返すべき場面で exit 9 が
-            // 漏れる)。
-            //
-            // budget は **per-client** で振る (= 先行の cleanup drain と同じ流儀、
-            // `DRAIN_BUDGET_PER_CLIENT`)。共有 deadline 方式だと先頭 client の hang が
-            // 後続 client の ExitNotify drain budget を食い潰し、複数 attach 時に
-            // 後続が ExitNotify を読めず exit 9 に漏れる。per-client なら 1 client の
-            // hang が他に波及しない。
-            for ch in clients.iter() {
-                let deadline = Instant::now() + DRAIN_BUDGET_PER_CLIENT;
-                while ch.queued_bytes.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-            }
+            // 終端 drain: SessionExitNotify を書き終えるまで待つ。これをしないと、直後の
+            // close で client が SessionExitNotify を読む前に EOF を観測する race が起きる
+            // (issue 2026-06-11 優先1 で client の socket EOF を `ConnectionLost` (= 非 0 exit)
+            // に分離したため、子の正常 exit code を返すべき場面で exit 9 が漏れる)。
+            flush_until(&clients, Instant::now() + DRAIN_BUDGET);
         }
-        clients.clear();
+        for ch in clients.drain(..) {
+            retire_client(&mut closing, ch);
+        }
+        drain_closing(&mut closing);
 
         // DR-0015 Task 22 (linger pattern): 子 exit 直後に socket を即 unlink すると、
         // run の親 attach (= exec attach pattern) が間に合わずに ENOENT で失敗する
@@ -869,11 +851,14 @@ fn linger_for_late_attach(
     let mut linger_daemon_state = super::reducer::DaemonState::default();
     let mut overflow_ids: Vec<u64> = Vec::new();
     let mut pending_redraws: Vec<u64> = Vec::new();
+    // handshake で拒否した接続 (error を書き終えてから close する)。
+    let mut closing: Vec<ClosingClient> = Vec::new();
 
     loop {
         if Instant::now() >= deadline {
             break;
         }
+        advance_closing(&mut closing, Instant::now());
 
         // poll: listener (= 新 attach) + pending handshake 完了通知 (= mpsc は fd-poll
         // できないので短い timeout で try_recv)
@@ -904,24 +889,18 @@ fn linger_for_late_attach(
             &mut overflow_ids,
             screen_state,
             &mut pending_redraws,
+            &mut closing,
         );
 
         // 1 client でも attach 完了したら SessionExitNotify を送って break。
         if !clients.is_empty() {
-            // Task 25 race 対策: process_pending_handshakes が handshake.response を
-            // enqueue した直後で、writer thread が flush する前に SessionExitNotify
-            // を続けて enqueue すると、CI macOS で client 側 decode タイミングが
-            // 不安定になる (= `handshake.response decode failed`)。
-            // handshake.response の queued_bytes が 0 になるまで wait してから
-            // SessionExitNotify を送る (= 順序を sequential に強制)。
-            let handshake_drain_deadline = Instant::now() + std::time::Duration::from_millis(500);
-            for ch in clients.iter() {
-                while ch.queued_bytes.load(std::sync::atomic::Ordering::Acquire) > 0
-                    && Instant::now() < handshake_drain_deadline
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-            }
+            // Task 25 race 対策: handshake.response を書き終えてから SessionExitNotify を
+            // 積む (= 順序を sequential に強制、CI macOS で client 側の
+            // `handshake.response decode failed` を観測した経緯)。
+            flush_until(
+                &clients,
+                Instant::now() + std::time::Duration::from_millis(500),
+            );
 
             let notify = ControlMessage::SessionExitNotify(SessionExitNotify {
                 exit_status,
@@ -932,20 +911,18 @@ fn linger_for_late_attach(
                 &notify,
                 "session-exit-v1",
             );
-            // 終端 drain: SessionExitNotify を send 完了するまで wait (= CI race 緩和、
-            // 旧 200ms → 1000ms)
-            let drain_deadline = Instant::now() + std::time::Duration::from_millis(1000);
-            for ch in clients.iter() {
-                while ch.queued_bytes.load(std::sync::atomic::Ordering::Acquire) > 0
-                    && Instant::now() < drain_deadline
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
+            // 終端 drain: SessionExitNotify を書き終えるまで待つ (= CI race 緩和、1000ms)
+            flush_until(
+                &clients,
+                Instant::now() + std::time::Duration::from_millis(1000),
+            );
+            for ch in clients.drain(..) {
+                retire_client(&mut closing, ch);
             }
-            clients.clear();
             break;
         }
     }
+    drain_closing(&mut closing);
 }
 
 /// R4-H4: `Session` の Drop は `start()` 後に `serve` を呼ばずに drop された
@@ -1322,8 +1299,8 @@ const CLIENT_RECV_CHUNK: usize = 64 * 1024;
 /// 1 client から、この周回で処理する frame を高々 1 つ取り出す (DR-0037 段階 1)。
 ///
 /// - decoder に揃った frame が残っていれば、socket は読まずにそれを返す
-/// - 残っていなければ、`readable` (= POLLIN / POLLHUP / POLLERR) の時だけ
-///   `recv(MSG_DONTWAIT)` を 1 回呼び、届いた分を decoder に足して 1 frame 取り出す
+/// - 残っていなければ、`readable` (= POLLIN / POLLHUP / POLLERR) の時だけ socket
+///   (O_NONBLOCK、DR-0037 段階 4) を 1 回 read し、届いた分を decoder に足して 1 frame 取り出す
 /// - frame が揃わなければ `None` (= 相手が frame の途中で止まっていても待たない)
 /// - 相手の close (frame の途中かどうかを問わない)、recv の error、protocol error は
 ///   `Some(FrameOrError::Error)` (= 呼び出し側が当該 client を切る)
@@ -1343,12 +1320,18 @@ fn receive_client_frame(
         if !readable {
             return None;
         }
-        match crate::sys::socket::recv_nowait(&ch.reader, scratch) {
-            Ok(0) => return Some(FrameOrError::Error),
-            Ok(n) => ch.decoder.push(&scratch[..n]),
-            Err(Error::Errno(nix::errno::Errno::EAGAIN)) => return None,
-            Err(_) => return Some(FrameOrError::Error),
+        let n = loop {
+            match std::io::Read::read(&mut &ch.stream, scratch) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return None,
+                Err(_) => return Some(FrameOrError::Error),
+            }
+        };
+        if n == 0 {
+            return Some(FrameOrError::Error);
         }
+        ch.decoder.push(&scratch[..n]);
     }
     match ch.decoder.next_frame() {
         Ok(Some(frame)) => Some(FrameOrError::Frame(frame)),
@@ -1478,6 +1461,7 @@ fn serve_loop(
     child: Pid,
     listener: &UnixSock,
     clients: &mut Vec<ClientHandle>,
+    closing: &mut Vec<ClosingClient>,
     next_client_id: &mut u64,
     config: &DaemonConfig,
     state: &mut SessionState,
@@ -1559,6 +1543,9 @@ fn serve_loop(
     // ここで先に消費しても後段の poll が StillAlive を返すだけで二重処理にはならない。
     // 取り出した stop の通知で切れた client は最初の周回の overflow 処理に回す。
     let mut startup_overflow: Vec<u64> = Vec::new();
+    // upgrade.request 受理後、送信 queue (upgrade.ack を含む) を書き終えるのを待つ期限
+    // (DR-0028 §4、DR-0037 段階 4)。受理した周回の次の周回冒頭で決める。
+    let mut upgrade_flush_deadline: Option<Instant> = None;
     observe_child_transition(
         &mut lifecycle,
         child,
@@ -1569,12 +1556,39 @@ fn serve_loop(
         &mut startup_overflow,
     );
     loop {
+        // DR-0037 段階 4: 前の周回までに積んだ frame を、書けるだけ書く (nonblocking)。
+        // 書き残しは下の poll で POLLOUT を待つ。周回の冒頭に置くのは、周回の途中の
+        // `continue` 経路でも書き込みを飛ばさないため。切断が決まった client も同じく
+        // 進め、書き終えた・失敗した・deadline を過ぎたものを close する。
+        flush_clients(clients);
+        advance_closing(closing, Instant::now());
+
         // DR-0028 §2 (Phase 3): upgrade.request 受理後は drain (= 同期 raw_data 経路の
-        // 既完了性) を trivially 満たすので次回 iteration 冒頭で UpgradeRequested を返す。
-        // handler が同一 iteration 内で set_upgrade_pending した直後は poll に戻る前に
-        // ここに来て即 return する (= 「ack 送信 → drain → exec」の順序保証)。
+        // 既完了性) を trivially 満たす。残るのは client に積んだ frame (upgrade.ack を含む)
+        // を書き終えることで、exec は process ごと置き換え、client の socket は CLOEXEC で
+        // 閉じるので、書く前に exec すると ack が届かない (client は「recv error before ack」
+        // で失敗する)。全 client の送信 queue が空になる (または書き込みに失敗する) か、
+        // `UPGRADE_FLUSH_BUDGET` の期限で UpgradeRequested を返す (DR-0028 §4)。
+        //
+        // Design rationale: この待ちの間は client への書き込みだけを行い、子の回収 (SIGCHLD /
+        // waitpid)・master の読み取り・accept・client frame の処理はしない。子の exit を
+        // ここで回収すると新プロセスが exit code を得られなくなり、master の出力と listen
+        // backlog の接続は新プロセスがそのまま引き継いで処理する。期限は最大 1 秒で、
+        // upgrade という session の終わり際の 1 回だけ。
         if state.is_upgrade_pending() {
-            return RelayOutcome::UpgradeRequested;
+            let deadline = *upgrade_flush_deadline
+                .get_or_insert_with(|| Instant::now() + UPGRADE_FLUSH_BUDGET);
+            if clients.iter().all(ClientHandle::send_settled) || Instant::now() >= deadline {
+                return RelayOutcome::UpgradeRequested;
+            }
+            poll_writable(
+                clients
+                    .iter()
+                    .filter(|c| !c.send_settled())
+                    .map(|c| c.stream.as_fd()),
+                deadline,
+            );
+            continue;
         }
 
         // 子 exit 検出後は drain budget を使い切った時点で serve_loop を抜ける
@@ -1616,8 +1630,9 @@ fn serve_loop(
         // poll fd 構築: listener + master + 各 client reader (+ SIGCHLD self-pipe)
         let listener_fd = listener.as_fd();
         let master_fd = pty.master_fd();
-        let mut poll_fds: Vec<PollFd> =
-            Vec::with_capacity(2 + clients.len() + usize::from(sigchld_pipe.is_some()));
+        let mut poll_fds: Vec<PollFd> = Vec::with_capacity(
+            2 + clients.len() + usize::from(sigchld_pipe.is_some()) + closing.len(),
+        );
         poll_fds.push(PollFd::new(listener_fd, PollFlags::POLLIN));
         // master を EOF / EIO まで読み切ったら poll 対象から **外す**。子は既に
         // 死んでおり新規出力は無い一方、master は POLLHUP が立ちっぱなしで
@@ -1631,8 +1646,14 @@ fn serve_loop(
         }
         // client slot の開始 index (= master を外した周回では 1 つ手前にずれる)。
         let client_base = poll_fds.len();
+        // 送信 queue に書き残しがある client は POLLOUT も待つ (DR-0037 段階 4)。
         for ch in clients.iter() {
-            poll_fds.push(PollFd::new(ch.reader.as_fd(), PollFlags::POLLIN));
+            let events = if ch.send_settled() {
+                PollFlags::POLLIN
+            } else {
+                PollFlags::POLLIN | PollFlags::POLLOUT
+            };
+            poll_fds.push(PollFd::new(ch.stream.as_fd(), events));
         }
         // R5-H6: SIGCHLD self-pipe slot is appended last so it does not shift
         // client indexing. Tracked separately by the `sigchld_idx` offset.
@@ -1643,6 +1664,11 @@ fn serve_loop(
         } else {
             None
         };
+        // 切断が決まった client は書き込みだけを待つ (受信は処理しない)。revents は見ず、
+        // 次の周回冒頭の `advance_closing` で書く。
+        for c in closing.iter() {
+            poll_fds.push(PollFd::new(c.fd(), PollFlags::POLLOUT));
+        }
 
         // backpressure overflow / writer dead で disconnect が必要な client_id を集める
         let mut overflow_ids: Vec<u64> = std::mem::take(&mut startup_overflow);
@@ -1704,6 +1730,13 @@ fn serve_loop(
                 let cap = u16::try_from(rem).unwrap_or(u16::MAX);
                 poll_timeout = cap_poll_timeout(poll_timeout, cap);
             }
+        }
+        // DR-0037 段階 4: 切断が決まった client の close 期限で起きる。
+        if let Some(deadline) = closing_deadline(closing) {
+            // 切り上げる (= 期限の直前に 0ms で起きて空回りしない)。
+            let rem = deadline.saturating_duration_since(Instant::now());
+            let cap = u16::try_from(rem.as_micros().div_ceil(1000)).unwrap_or(u16::MAX);
+            poll_timeout = cap_poll_timeout(poll_timeout, cap);
         }
         // DR-0037 段階 1: 受信済みで揃った frame を decoder に残している client が
         // 居る周回は poll で待たない。残りの frame は socket から既に読み出していて
@@ -1820,6 +1853,7 @@ fn serve_loop(
                         &mut overflow_ids,
                         screen_state,
                         pending_redraws,
+                        closing,
                     );
                     // DR-0013 §6 Phase A: sync 終了で pending redraw を flush。
                     flush_pending_redraws_if_sync_over(
@@ -1846,9 +1880,9 @@ fn serve_loop(
                                 ts_unix_ms: now_unix_ms(),
                             },
                         );
-                        // ClientHandle::Drop が writer_tx close + reader shutdown +
-                        // writer_thread join を一括実行 (R5-H18)。
-                        drop(ch);
+                        // 送信 queue の残り (backpressure error 等) を書き終えてから close
+                        // する (DR-0037 段階 4)。
+                        retire_client(closing, ch);
                     }
                     continue;
                 }
@@ -1872,6 +1906,7 @@ fn serve_loop(
             &mut overflow_ids,
             screen_state,
             pending_redraws,
+            closing,
         );
         // DR-0013 §6 Phase A: sync 終了で pending redraw を flush。
         flush_pending_redraws_if_sync_over(
@@ -2220,10 +2255,10 @@ fn serve_loop(
                 &mut daemon_state,
                 translate::client_detached(detached_id),
             ));
-            // ClientHandle::Drop が writer_tx close + reader shutdown +
-            // writer_thread join を一括実行 (R5-H18)。backpressure 超過時の
-            // writer_pump が write_all で block 中でも shutdown で即 error 化される。
-            drop(ch);
+            // 送信 queue の残り (失敗 ack・detach ack・backpressure error 等) を書き終えて
+            // から close する (DR-0037 段階 4、closing)。queue が空ならここで close。
+            // 相手が読まなくても serve_loop は待たない (close 期限は poll の timeout)。
+            retire_client(closing, ch);
             // DR-0016 §3: client-detached lifecycle event。lock auto-release が
             // 起きた場合は lock-released は別途 push しない (= explicit な
             // LockRelease 経路でないため、observer は client-detached + lock_holder
@@ -2755,19 +2790,14 @@ mod tests {
     /// 2026-07-24-bug-tstp-intercept-followups.md H3)。
     #[test]
     fn notify_child_stopped_broadcasts_to_all_rw_clients_excluding_ro() {
-        use crate::daemon::broadcast::Subscription;
         use crate::protocol::Mode;
         use std::os::unix::net::UnixStream;
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicUsize;
-        use std::sync::mpsc;
 
         // ClientHandle を 4 種類作る:
         // 0: leader rw + child-state-v1 → 受信すべし
         // 1: non-leader rw + child-state-v1 → 受信すべし (本 fix の主対象)
         // 2: ro + child-state-v1 → 受信しない (見に来ただけ)
         // 3: rw + cap 未対応 → 受信しない (protocol 上通知できない)
-        let mut receivers: Vec<mpsc::Receiver<crate::daemon::broadcast::SharedBytes>> = Vec::new();
         let mut peers: Vec<UnixStream> = Vec::new();
         let mut clients: Vec<ClientHandle> = Vec::new();
         for (id, mode, leader, caps) in [
@@ -2781,23 +2811,10 @@ mod tests {
             (2, Mode::Ro, false, vec!["child-state-v1".to_string()]),
             (3, Mode::Rw, false, vec![]),
         ] {
-            let (tx, rx) = mpsc::channel();
-            let (peer, reader) = UnixStream::pair().expect("pair");
-            clients.push(ClientHandle {
-                id,
-                mode,
-                leader,
-                subscription: Subscription::Raw,
-                negotiated_caps: caps,
-                writer_tx: tx,
-                queued_bytes: Arc::new(AtomicUsize::new(0)),
-                buffer_limit: 1 << 20,
-                writer_thread: None,
-                reader,
-                decoder: crate::protocol::FrameDecoder::new(),
-                connected_at_unix_ms: 0,
-            });
-            receivers.push(rx);
+            let (peer, stream) = UnixStream::pair().expect("pair");
+            clients.push(
+                ClientHandle::new(id, mode, leader, caps, stream, 1 << 20).expect("client handle"),
+            );
             peers.push(peer);
         }
 
@@ -2813,19 +2830,19 @@ mod tests {
 
         // rw + cap 保持者だけが受信する
         assert!(
-            receivers[0].try_recv().is_ok(),
+            clients[0].pop_queued_frame().is_some(),
             "leader rw + cap: 受信すべき"
         );
         assert!(
-            receivers[1].try_recv().is_ok(),
+            clients[1].pop_queued_frame().is_some(),
             "non-leader rw + cap: 受信すべき (本 fix の主対象)"
         );
         assert!(
-            receivers[2].try_recv().is_err(),
+            clients[2].pop_queued_frame().is_none(),
             "ro client: 受信すべきでない (見に来ただけ)"
         );
         assert!(
-            receivers[3].try_recv().is_err(),
+            clients[3].pop_queued_frame().is_none(),
             "cap 未対応 rw client: 受信すべきでない (protocol 上通知できない)"
         );
 
@@ -4569,10 +4586,10 @@ mod tests {
         // 注: 本 test では `他 client が動き続けること` までは検証せず、`slow が
         // 切断されること` だけ確認する。
 
-        // 子 yes の出力が daemon の broadcast loop を経て slow の writer queue に
-        // 積まれる。slow が socket を読まないと OS socket buffer (~64 KiB) が埋まる
-        // → writer_pump が write_all で block → queued_bytes 増加 → buffer_limit
-        // (4096 byte) 超過 → daemon が slow を切る (shutdown Both)。
+        // 子 yes の出力が daemon の broadcast loop を経て slow の送信 queue に
+        // 積まれる。slow が socket を読まないと OS socket buffer が埋まる
+        // → serve loop の write が EAGAIN で残る → queued_bytes 増加 → buffer_limit
+        // 超過 → daemon が slow を切る (socket close)。
         // よってここでは「しばらく読まずに放置」してから socket を drain、最後に EOF。
         // しばらく放置 → daemon が backpressure 検知して shutdown するはず
         std::thread::sleep(Duration::from_secs(1));
@@ -4638,8 +4655,8 @@ mod tests {
 
     /// 読まない client (= SIGSTOP された `hyoui attach` 相当) を抱えたまま子が大量出力
     /// して exit しても、daemon は当該 client を bounded time で切り、子を回収して
-    /// serve を終える (= writer_pump の send block で join が永久に返らず、子が zombie
-    /// のまま残る事象の回帰)。client socket は test 終了まで close も read もしない。
+    /// serve を終える (= 読まない client への送信で serve が戻らず、子が zombie のまま残る
+    /// 事象の回帰)。client socket は test 終了まで close も read もしない。
     #[test]
     #[ignore = "実 PTY + 子の大量出力を使うため `cargo test -- --ignored` で実行する"]
     fn serve_reaps_child_while_client_never_reads() {
@@ -5530,6 +5547,395 @@ mod tests {
             0,
             crate::protocol::messages::ScreenBufferKind::Alternate,
         );
+    }
+
+    // ---- DR-0037 段階 4 (C-2, C-6, C-8, C-10): 読まない client と送信 queue ----
+
+    /// 子に出力をさせる手段 (段階 4 のマトリクス用)。
+    enum Stimulus<'a> {
+        /// raw_data で子の入力に送る (ack は [`read_relay_until`] が確かめる)。
+        Input(&'a [u8]),
+        /// 子 (`less +F`) が追っている file に追記する。
+        Append(&'a std::path::Path, Vec<u8>),
+    }
+
+    fn apply_stimulus(s: &mut UnixStream, st: &Stimulus<'_>) {
+        match st {
+            Stimulus::Input(b) => {
+                Frame::raw_data(b.to_vec())
+                    .encode_to(s)
+                    .expect("send raw_data");
+                s.flush().expect("flush");
+            }
+            Stimulus::Append(path, data) => {
+                let f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .expect("open followed file");
+                f.write_all(data).expect("append followed file");
+            }
+        }
+    }
+
+    /// 子の出力の中継 (raw_data) に `marker` が現れるまで `s` を読む。`seen` は直前までに
+    /// 受け取った bytes (attach の redraw 等)。届いた ack は Ok であることを確かめる。
+    /// 戻り値はこの呼び出しで受け取った raw bytes 数。
+    fn read_relay_until(s: &mut UnixStream, seen: &[u8], marker: &[u8]) -> usize {
+        let mut window = seen.to_vec();
+        let mut total = 0usize;
+        loop {
+            if window.windows(marker.len()).any(|w| w == marker) {
+                return total;
+            }
+            // marker が chunk の境目を跨いでも見つかるよう、末尾 marker.len() - 1 bytes を残す。
+            let keep = marker.len().saturating_sub(1).min(window.len());
+            window.drain(..window.len() - keep);
+            match read_incoming(s, "relay") {
+                Incoming::Raw(b) => {
+                    total += b.len();
+                    window.extend(b);
+                }
+                Incoming::Ack(a) => assert_eq!(
+                    a.result,
+                    crate::protocol::RawAckResult::Ok,
+                    "input must be written to the PTY: {a:?}"
+                ),
+                Incoming::Control(_) => {}
+            }
+        }
+    }
+
+    /// 段階 4 のマトリクスの 1 category 分 (子の種類と、出力をさせる手段)。
+    struct UnreadCase<'a> {
+        cmd: Vec<String>,
+        /// 子が刺激を受け付けられる状態になった印 (`less +F` の follow 待ち等)。
+        ready_marker: Option<&'a [u8]>,
+        /// 大量出力をさせる刺激と、その出力の最後に出る印。
+        burst: Stimulus<'a>,
+        burst_marker: &'a [u8],
+        /// 切断の後に中継が続いていることを見る刺激と印。
+        probe: Stimulus<'a>,
+        probe_marker: &'a [u8],
+        /// 子を終わらせる入力 (順に送る) と exit code。
+        exit_inputs: Vec<&'a [u8]>,
+        expected_exit: i32,
+        expected_buffer: crate::protocol::messages::ScreenBufferKind,
+    }
+
+    fn spawn_serve_thread_with_buffer(
+        cmd: Vec<String>,
+        client_buffer_bytes: usize,
+    ) -> (
+        std::path::PathBuf,
+        TempDir,
+        std::thread::JoinHandle<Result<i32, Error>>,
+    ) {
+        let dir = make_temp_socket_dir();
+        let sock_path = dir.path().join("test.sock");
+        let mut cfg = DaemonConfig::new("demo", sock_path.clone(), cmd);
+        cfg.client_buffer_bytes = client_buffer_bytes;
+        let session = Session::start(cfg).expect("start");
+        let handle = std::thread::spawn(move || session.serve());
+        (sock_path, dir, handle)
+    }
+
+    /// `good` を通して子を終わらせ、daemon が回収して serve が返ることを確かめる。
+    fn exit_child_and_join(
+        good: &mut UnixStream,
+        case: &UnreadCase<'_>,
+        handle: std::thread::JoinHandle<Result<i32, Error>>,
+        what: &str,
+    ) {
+        for input in &case.exit_inputs {
+            Frame::raw_data(input.to_vec())
+                .encode_to(good)
+                .expect("send exit input");
+            good.flush().expect("flush");
+        }
+        let exit = join_with_deadline(handle, Duration::from_secs(10), what).expect("serve");
+        assert_eq!(exit, case.expected_exit);
+    }
+
+    /// 切られた client の socket は、daemon が書き終えた分を読み切ると EOF になる
+    /// (= 切断が socket の close で完結している)。読み切りを待つ上限は test を無限に
+    /// 止めないためのもの。
+    fn assert_closed_by_daemon(s: &mut UnixStream, what: &str) -> usize {
+        // macOS は相手が既に閉じた socket への SO_RCVTIMEO 設定を EINVAL で断る (= その時は
+        // read_to_end がすぐ EOF に着くので上限は要らない)。
+        let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+        let mut all = Vec::new();
+        std::io::Read::read_to_end(s, &mut all)
+            .unwrap_or_else(|e| panic!("{what}: daemon must close the socket (got {e})"));
+        all.len()
+    }
+
+    /// DR-0037 テストマトリクス「client が一切読まない (受信 buffer 満杯)」の 1 セル。
+    ///
+    /// 先に attach した 3 つの `stuck` は handshake の後に一切読まない。子に大量出力させる
+    /// と、`stuck` の socket buffer は埋まり、送信 queue に残りが溜まる (出力は socket
+    /// buffer より十分大きい)。その間も別 client (`good`) には子の出力が中継され、status が
+    /// 1 秒以内に応答する。`good` が `detach --target=others` で `stuck` を切った直後の
+    /// status も 1 秒以内に応答し、中継が続き、子の exit を daemon が回収する。
+    ///
+    /// 切断の時に読まない client への書き終わりを serve loop が待つ実装 (client ごとに
+    /// 500ms) だと、3 client を切る周回で serve loop が約 1.5 秒止まり、切断直後の status が
+    /// 1 秒を超える (v0.15.3 で実測 1.51 秒)。
+    fn assert_unread_clients_do_not_stall_the_relay(case: UnreadCase<'_>) {
+        let (_sid, sock_path, _dir, handle) = spawn_serve_thread(case.cmd.clone());
+
+        let mut stuck: Vec<UnixStream> = (0..3)
+            .map(|_| {
+                let mut s = client_connect_with_retry(&sock_path);
+                let _ = do_client_handshake(&mut s);
+                s
+            })
+            .collect();
+        let mut good = client_connect_with_retry(&sock_path);
+        let (_r, redraw) = do_client_handshake_keep_redraw(&mut good);
+        // 応答が来ない場合に test を無限に止めないための上限 (合否は下の 1 秒で見る)。
+        good.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set read timeout");
+
+        let mut seen = redraw;
+        if let Some(ready) = case.ready_marker {
+            read_relay_until(&mut good, &seen, ready);
+            seen = Vec::new();
+        }
+        apply_stimulus(&mut good, &case.burst);
+        let relayed = read_relay_until(&mut good, &seen, case.burst_marker);
+        assert!(
+            relayed >= 512 * 1024,
+            "the burst must exceed the socket buffers of the unread clients: {relayed} bytes"
+        );
+
+        let (elapsed, sr) = query_status(&mut good);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "status must answer within 1s while clients do not read, took {elapsed:?}"
+        );
+        assert_eq!(
+            sr.clients.len(),
+            4,
+            "unread clients under the limit stay attached"
+        );
+
+        send_control_frame(
+            &mut good,
+            ControlMessage::Detach(crate::protocol::messages::Detach {
+                target: crate::protocol::messages::DetachTarget::Others,
+            }),
+        );
+        loop {
+            if let Incoming::Control(ControlMessage::DetachAck(ack)) =
+                read_incoming(&mut good, "detach.ack")
+            {
+                assert_eq!(ack.dropped_count, 3);
+                break;
+            }
+        }
+        let (elapsed, sr) = query_status(&mut good);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "status must answer within 1s right after dropping unread clients, took {elapsed:?}"
+        );
+        assert_eq!(sr.clients.len(), 1, "only the requester remains");
+
+        apply_stimulus(&mut good, &case.probe);
+        read_relay_until(&mut good, &[], case.probe_marker);
+        assert_eq!(screen_buffer_kind(&mut good), case.expected_buffer);
+
+        for (i, s) in stuck.iter_mut().enumerate() {
+            assert_closed_by_daemon(s, &format!("stuck client {i}"));
+        }
+        exit_child_and_join(
+            &mut good,
+            &case,
+            handle,
+            "serve after dropping unread clients",
+        );
+    }
+
+    /// DR-0037 テストマトリクス「client が一切読まない」の backpressure 側の 1 セル。
+    ///
+    /// 送信 queue の上限 (`client_buffer_bytes`) を小さくし、読まない `stuck` と読む `good` を
+    /// attach して子に上限より十分大きい出力をさせる。上限を超えた `stuck` だけが切られ
+    /// (socket が close される)、`good` は全部受け取り、status が 1 秒以内に応答する。
+    fn assert_only_the_client_over_the_limit_is_cut(case: UnreadCase<'_>) {
+        const LIMIT: usize = 256 * 1024;
+        let (sock_path, _dir, handle) = spawn_serve_thread_with_buffer(case.cmd.clone(), LIMIT);
+
+        let mut stuck = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut stuck);
+        let mut good = client_connect_with_retry(&sock_path);
+        let (good_resp, redraw) = do_client_handshake_keep_redraw(&mut good);
+        good.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set read timeout");
+
+        let mut seen = redraw;
+        if let Some(ready) = case.ready_marker {
+            read_relay_until(&mut good, &seen, ready);
+            seen = Vec::new();
+        }
+        apply_stimulus(&mut good, &case.burst);
+        let relayed = read_relay_until(&mut good, &seen, case.burst_marker);
+
+        let (elapsed, sr) = query_status(&mut good);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "status must answer within 1s after the backpressure cut, took {elapsed:?}"
+        );
+        let ids: Vec<u64> = sr.clients.iter().map(|c| c.client_id).collect();
+        assert_eq!(
+            ids,
+            vec![good_resp.client_id],
+            "only the client over the limit is cut"
+        );
+
+        let got = assert_closed_by_daemon(&mut stuck, "client over the limit");
+        assert!(
+            got < relayed,
+            "the cut client must not have received the whole burst ({got} of {relayed} bytes)"
+        );
+
+        apply_stimulus(&mut good, &case.probe);
+        read_relay_until(&mut good, &[], case.probe_marker);
+        exit_child_and_join(&mut good, &case, handle, "serve after a backpressure cut");
+    }
+
+    /// cat (line-oriented)。`cat - BIG -` は最初の `-` (端末) の EOF (行頭の ^D) で BIG を
+    /// 出し、2 つ目の `-` で端末を読み続ける (端末の EOF は後続の read に残らない)。
+    fn cat_unread_case(dir: &std::path::Path, burst_lines: usize) -> UnreadCase<'static> {
+        let big = dir.join("big.txt");
+        let mut text: String = (0..burst_lines)
+            .map(|i| format!("cat burst line {i:07} abcdefghijklmnopqrstuvwxyz\n"))
+            .collect();
+        text.push_str("CAT_BURST_END\n");
+        std::fs::write(&big, text).expect("write burst file");
+        UnreadCase {
+            cmd: vec![
+                "/bin/cat".into(),
+                "-".into(),
+                big.to_string_lossy().into_owned(),
+                "-".into(),
+            ],
+            ready_marker: None,
+            burst: Stimulus::Input(b"\x04"),
+            burst_marker: b"CAT_BURST_END",
+            probe: Stimulus::Input(b"CAT_PROBE\r"),
+            probe_marker: b"CAT_PROBE",
+            exit_inputs: vec![b"\x04"],
+            expected_exit: 0,
+            expected_buffer: crate::protocol::messages::ScreenBufferKind::Primary,
+        }
+    }
+
+    /// bash (interactive REPL)。marker は bash が評価した結果 (`$((6*7))` → 42) なので、
+    /// 端末 echo でなく子の出力の中継を見る。
+    fn bash_unread_case(burst: &'static [u8]) -> UnreadCase<'static> {
+        UnreadCase {
+            cmd: vec![
+                "/bin/bash".into(),
+                "--norc".into(),
+                "--noprofile".into(),
+                "-i".into(),
+            ],
+            ready_marker: None,
+            burst: Stimulus::Input(burst),
+            burst_marker: b"BASH_BURST_42",
+            probe: Stimulus::Input(b"echo BASH_PROBE_$((6*7))\r"),
+            probe_marker: b"BASH_PROBE_42",
+            exit_inputs: vec![b"exit 7\r"],
+            expected_exit: 7,
+            expected_buffer: crate::protocol::messages::ScreenBufferKind::Primary,
+        }
+    }
+
+    /// less (TUI alt screen)。`less +F` は追っている file に追記された行を全部描く
+    /// (= TUI が大量に描画する場面)。^C で follow を抜け、`q` で終わる。端末種別と利用者の
+    /// less 設定に左右されないよう、`TERM` と `LESS*` を固定して起動する。
+    fn less_unread_case(path: &std::path::Path, burst_lines: usize) -> UnreadCase<'_> {
+        std::fs::write(path, "less first line\n").expect("write followed file");
+        let mut burst: Vec<u8> = (0..burst_lines)
+            .flat_map(|i| {
+                format!("less burst line {i:07} abcdefghijklmnopqrstuvwxyz\n").into_bytes()
+            })
+            .collect();
+        burst.extend_from_slice(b"LESS_BURST_END\n");
+        UnreadCase {
+            cmd: vec![
+                "/usr/bin/env".into(),
+                "TERM=xterm-256color".into(),
+                "LESS=".into(),
+                "LESSOPEN=".into(),
+                "LESSCLOSE=".into(),
+                "LESSHISTFILE=-".into(),
+                "less".into(),
+                "+F".into(),
+                path.to_string_lossy().into_owned(),
+            ],
+            ready_marker: Some(b"Waiting for data"),
+            burst: Stimulus::Append(path, burst),
+            burst_marker: b"LESS_BURST_END",
+            probe: Stimulus::Append(path, b"LESS_PROBE_LINE\n".to_vec()),
+            probe_marker: b"LESS_PROBE_LINE",
+            exit_inputs: vec![b"\x03", b"q"],
+            expected_exit: 0,
+            expected_buffer: crate::protocol::messages::ScreenBufferKind::Alternate,
+        }
+    }
+
+    /// 約 1 MB (= 20000 行 × 約 50 bytes)。
+    const UNREAD_BURST_LINES: usize = 20_000;
+    /// 約 2 MB。上限 (256 KiB) + socket buffer (Linux の既定で約 200 KiB) を十分超える。
+    const OVER_LIMIT_BURST_LINES: usize = 40_000;
+
+    #[test]
+    fn serve_keeps_relaying_while_clients_do_not_read_cat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_unread_clients_do_not_stall_the_relay(cat_unread_case(
+            dir.path(),
+            UNREAD_BURST_LINES,
+        ));
+    }
+
+    #[test]
+    fn serve_keeps_relaying_while_clients_do_not_read_bash() {
+        assert_unread_clients_do_not_stall_the_relay(bash_unread_case(
+            b"head -c 1000000 /dev/zero | tr '\\0' y; echo; echo BASH_BURST_$((6*7))\r",
+        ));
+    }
+
+    #[test]
+    fn serve_keeps_relaying_while_clients_do_not_read_less() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("follow.txt");
+        assert_unread_clients_do_not_stall_the_relay(less_unread_case(&path, UNREAD_BURST_LINES));
+    }
+
+    #[test]
+    fn serve_cuts_only_the_client_over_the_limit_cat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_only_the_client_over_the_limit_is_cut(cat_unread_case(
+            dir.path(),
+            OVER_LIMIT_BURST_LINES,
+        ));
+    }
+
+    #[test]
+    fn serve_cuts_only_the_client_over_the_limit_bash() {
+        assert_only_the_client_over_the_limit_is_cut(bash_unread_case(
+            b"head -c 2000000 /dev/zero | tr '\\0' y; echo; echo BASH_BURST_$((6*7))\r",
+        ));
+    }
+
+    #[test]
+    fn serve_cuts_only_the_client_over_the_limit_less() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("follow.txt");
+        assert_only_the_client_over_the_limit_is_cut(less_unread_case(
+            &path,
+            OVER_LIMIT_BURST_LINES,
+        ));
     }
 
     fn encode_frame(msg: &ControlMessage) -> Vec<u8> {

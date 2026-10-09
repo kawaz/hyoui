@@ -7,8 +7,8 @@
 //! - [`HandshakeStageOk`]: worker thread → main thread 間の中間結果 type alias
 //! - [`spawn_handshake_worker`]: 1 client accept + handshake 用 worker thread spawn
 //! - [`do_handshake_stage`]: worker 内で走る handshake frame 受信 + token 検証
-//! - [`finalize_accepted_client`]: main thread 側 leader 判定 + response 送信 +
-//!   `ClientHandle` 構築
+//! - [`finalize_accepted_client`]: main thread 側 leader 判定 + `ClientHandle` 構築 +
+//!   response を送信 queue に積む
 //! - [`process_pending_handshakes`]: serve_loop の各 iteration で完了 worker を取り込む
 //! - [`unix_stream_from_owned_fd`]: `OwnedFd` → `UnixStream` の意図明示 helper
 //! - [`HANDSHAKE_TIMEOUT`] / [`MAX_PENDING_HANDSHAKES`] const
@@ -25,7 +25,6 @@
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 use std::time::Instant;
 
 use crate::Error;
@@ -34,16 +33,16 @@ use crate::protocol::messages::{
     SessionMode,
 };
 use crate::protocol::{
-    ControlMessage, Frame, FrameDecoder, HandshakeRequest, HandshakeResponse, MVP_CAPS,
-    TYPE_CBOR_CONTROL, Transport, UnixStreamTransport, intersect_caps,
+    ControlMessage, Frame, HandshakeRequest, HandshakeResponse, MVP_CAPS, TYPE_CBOR_CONTROL,
+    intersect_caps,
 };
 use crate::sys::UnixSock;
 use crate::sys::clock::now_unix_ms;
 
 use super::DaemonConfig;
 use super::broadcast::{
-    ClientHandle, SharedBytes, Subscription, broadcast_control, enqueue_for_client, send_control,
-    writer_pump,
+    CLOSE_FLUSH_TIMEOUT, ClientHandle, ClosingClient, SharedBytes, broadcast_control,
+    enqueue_for_client, retire_client, send_control,
 };
 use super::lock::{SessionState, elevate_next_leader, should_assign_leader};
 use super::reducer::{self, DaemonState, translate};
@@ -101,11 +100,12 @@ pub(super) struct AcceptedClient {
 
 /// R4-C3: handshake worker thread が完了時に返す中間結果。
 ///
-/// 成功時は (reader, writer_main, req, intersect) を main thread (= serve_loop) に
-/// 渡し、main thread 側で leader 判定 + response 送信 + `ClientHandle` 構築を行う。
+/// 成功時は (stream, req, intersect) を main thread (= serve_loop) に渡し、main thread 側で
+/// leader 判定 + `ClientHandle` 構築 + response の enqueue を行う。worker は stream を手放した
+/// 後は socket に触らない。
 /// 失敗時 (= protocol error / token mismatch) は worker が socket に error frame を
 /// 送ってから socket を drop し、本構造体は `Err` で main thread に届く。
-pub(super) type HandshakeStageOk = (UnixStream, UnixStream, HandshakeRequest, Vec<String>);
+pub(super) type HandshakeStageOk = (UnixStream, HandshakeRequest, Vec<String>);
 
 /// R4-C3: pending handshake (= worker thread が走っている in-flight な handshake)。
 ///
@@ -129,9 +129,15 @@ pub(super) struct PendingHandshake {
 
 /// R4-C3: listener から 1 client を accept し、handshake を別 thread で進める。
 ///
-/// 戻り値の [`PendingHandshake`] の `rx` が `Ok((reader, writer, req, intersect))` を
-/// 通知してきたら、`finalize_accepted_client` で `ClientHandle` 構築 + response 送信
+/// 戻り値の [`PendingHandshake`] の `rx` が `Ok((stream, req, intersect))` を
+/// 通知してきたら、`finalize_accepted_client` で `ClientHandle` 構築 + response の enqueue
 /// + leader 判定をする。`Err` なら worker が既に error frame 送信済 → drop で完了。
+///
+/// Design rationale (DR-0037 段階 4): worker が error frame を書くのは blocking の
+/// `write_all` (write timeout 付き) のままにする。この socket は worker が単独で持ち、
+/// O_NONBLOCK にならず (O_NONBLOCK は `ClientHandle::new` が main thread で付ける)、失敗時は
+/// worker が drop する。serve loop の送信 queue と同じ open file description を blocking の
+/// write が共有することは無い。handshake の loop 内化 (段 6) で worker ごと無くなる。
 ///
 /// **同期 blocking 部分は `listener.accept()` のみ** (= kernel level)。handshake
 /// frame 受信は worker thread に切り出すため、悪意 client が serve_loop を止める
@@ -149,20 +155,17 @@ pub(super) fn spawn_handshake_worker(
     let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
     let _ = stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT));
 
-    let transport = UnixStreamTransport::new(stream);
-    let (mut reader, mut writer_main) = transport.split().map_err(Error::from)?;
-
+    let mut stream = stream;
     let expected_token = config.expected_token.clone();
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<HandshakeStageOk, Error>>(1);
 
     let worker = std::thread::Builder::new()
         .name("hyoui-handshake".into())
         .spawn(move || {
-            let result =
-                do_handshake_stage(&mut reader, &mut writer_main, expected_token.as_deref());
+            let result = do_handshake_stage(&mut stream, expected_token.as_deref());
             match result {
                 Ok((req, intersect)) => {
-                    let _ = tx.send(Ok((reader, writer_main, req, intersect)));
+                    let _ = tx.send(Ok((stream, req, intersect)));
                 }
                 Err(e) => {
                     // worker は error frame 送信済 (do_handshake_stage 内)。
@@ -186,11 +189,10 @@ pub(super) fn spawn_handshake_worker(
 /// 必要なので main thread に任せる)。
 /// 失敗時: 可能なら socket に error frame を送ってから `Err` を返す。
 fn do_handshake_stage(
-    reader: &mut UnixStream,
-    writer_main: &mut UnixStream,
+    stream: &mut UnixStream,
     expected_token: Option<&str>,
 ) -> Result<(HandshakeRequest, Vec<String>), Error> {
-    let frame = Frame::decode_from(reader)
+    let frame = Frame::decode_from(stream)
         .map_err(|_| Error::Invalid("failed to decode handshake frame"))?;
     if frame.ty != TYPE_CBOR_CONTROL {
         return Err(Error::Invalid("handshake frame must be CBOR control"));
@@ -217,7 +219,7 @@ fn do_handshake_stage(
         })
         .encode_to_vec()
         .map_err(|_| Error::Invalid("handshake length error encode failed"))?;
-        let _ = Frame::cbor_control(body).encode_to(writer_main);
+        let _ = Frame::cbor_control(body).encode_to(stream);
         return Err(Error::Invalid("handshake field length exceeds limit"));
     }
 
@@ -242,7 +244,7 @@ fn do_handshake_stage(
             })
             .encode_to_vec()
             .map_err(|_| Error::Invalid("auth error encode failed"))?;
-            let _ = Frame::cbor_control(body).encode_to(writer_main);
+            let _ = Frame::cbor_control(body).encode_to(stream);
             return Err(Error::Invalid("handshake token mismatch"));
         }
     }
@@ -276,14 +278,14 @@ fn validate_handshake_lengths(req: &HandshakeRequest) -> Result<(), &'static str
 
 /// R4-C3: handshake worker から届いた中間結果を `AcceptedClient` に整える。
 ///
-/// このタイミングで main thread の `clients` 列を見て leader 判定 + response を
-/// 送信する (= leader 判定の snapshot を「handshake 完了時点」に揃えるため、
+/// このタイミングで main thread の `clients` 列を見て leader 判定をし、response を
+/// 送信 queue に積む (= leader 判定の snapshot を「handshake 完了時点」に揃えるため、
 /// 並列 handshake 同士でも leader 重複は発生しない)。
 ///
-/// Response 送信後、socket の read/write timeout は **解除** (= None) する。
-/// serve_loop は poll 駆動なので blocking read は無いが、broadcast の write は
-/// blocking write で行う。handshake 用 5s timeout のままだと正常 attach 中の
-/// client への大量 broadcast で意図しない切断が起きうるため。
+/// `ClientHandle::new` が socket を O_NONBLOCK にする (DR-0037 段階 4)。response も拒否の
+/// error も送信 queue に積むだけで、socket への書き込みは serve loop が nonblocking で行う。
+/// 拒否した接続は `Err(Some(closing))` で返し、呼び出し側が closing に入れて error を
+/// 書き終えてから close する。`Err(None)` は socket の設定に失敗した等で、そのまま close する。
 fn finalize_accepted_client(
     stage: HandshakeStageOk,
     config: &DaemonConfig,
@@ -291,30 +293,32 @@ fn finalize_accepted_client(
     clients: &[ClientHandle],
     other_pending: usize,
     child_stopped: bool,
-) -> Result<AcceptedClient, Error> {
-    let (reader, mut writer_main, req, intersect) = stage;
+) -> Result<AcceptedClient, Option<ClosingClient>> {
+    let (stream, req, intersect) = stage;
 
-    // R4-C3: 通常運用 (= broadcast write を含む) は timeout 無しに戻す。
-    let _ = reader.set_read_timeout(None);
-    let _ = reader.set_write_timeout(None);
-    let _ = writer_main.set_read_timeout(None);
-    let _ = writer_main.set_write_timeout(None);
+    let mut handle = ClientHandle::new(
+        client_id,
+        req.mode,
+        false,
+        intersect.clone(),
+        stream,
+        config.client_buffer_bytes,
+    )
+    .map_err(|_| None)?;
 
-    // handshake 段の attach 拒否 helper (= error response を client に送って Err を
-    // 返す。process_pending_handshakes が drop で完了させ、client は push されない)。
-    let reject = |writer_main: &mut UnixStream, message: &str, why: &'static str| {
+    // handshake 段の attach 拒否 helper (= error response を送信 queue に積んで closing に
+    // 移す。process_pending_handshakes が closing に入れ、client は push されない)。
+    let reject = |handle: ClientHandle, message: &str| -> Option<ClosingClient> {
         use crate::protocol::messages::{ErrorCode, ErrorMessage};
-        let body = ControlMessage::Error(ErrorMessage {
-            code: ErrorCode::ModeNotAllowed,
-            message: message.into(),
-            details: None,
-        })
-        .encode_to_vec()
-        .map_err(|_| Error::Invalid("handshake reject encode failed"))?;
-        Frame::cbor_control(body)
-            .encode_to(writer_main)
-            .map_err(|_| Error::Invalid("handshake reject frame encode failed"))?;
-        Err::<(), Error>(Error::Invalid(why))
+        let _ = send_control(
+            &handle,
+            ControlMessage::Error(ErrorMessage {
+                code: ErrorCode::ModeNotAllowed,
+                message: message.into(),
+                details: None,
+            }),
+        );
+        handle.into_closing(Instant::now() + CLOSE_FLUSH_TIMEOUT)
     };
 
     // CLI-Q1 裁定 (2026-07-29): `attach --exclusive` / `--detach-others` は CLI の
@@ -327,12 +331,11 @@ fn finalize_accepted_client(
     // 操作なので Ro 観察者には許さない (= `Detach{Others/All}` の ensure_not_ro と
     // 同じ権限ゲートを handshake 経路にも適用)。
     if req.detach_others && matches!(req.mode, crate::protocol::Mode::Ro) {
-        reject(
-            &mut writer_main,
+        return Err(reject(
+            handle,
             "attach --detach-others denied: read-only client は他 client を奪取できません \
              (= rw / rw-no-leader で attach してください)。",
-            "attach --detach-others denied (ro client)",
-        )?;
+        ));
     }
 
     // DR-0020 §4 / docs/issue/2026-06-12: `--exclusive` (= 自分以外の rw client が
@@ -357,58 +360,33 @@ fn finalize_accepted_client(
             .iter()
             .any(|c| matches!(c.mode, Mode::Rw | Mode::RwNoLeader));
         if other_rw || other_pending > 0 {
-            reject(
-                &mut writer_main,
+            return Err(reject(
+                handle,
                 "attach --exclusive denied: 他に rw client が attach 中、\
                  または handshake 進行中の接続があります (= 占有要求を満たせない)。\
                  --detach-others で奪取するか、他 client が抜けてから再試行してください。",
-                "attach --exclusive denied (other rw client or pending handshake present)",
-            )?;
+            ));
         }
     }
 
     let became_leader = should_assign_leader(clients, req.mode);
+    handle.leader = became_leader;
 
     let response = HandshakeResponse {
-        caps: intersect.clone(),
+        caps: intersect,
         session_id: config.session_id.clone(),
         client_id,
         leader: became_leader,
         mode: req.mode,
         child_stopped,
     };
-
-    let body = ControlMessage::HandshakeResponse(response)
-        .encode_to_vec()
-        .map_err(|_| Error::Invalid("handshake.response encode failed"))?;
-    Frame::cbor_control(body)
-        .encode_to(&mut writer_main)
-        .map_err(|_| Error::Invalid("handshake.response frame encode failed"))?;
-
-    // writer thread を立ち上げ、broadcast 用 unbounded mpsc + atomic byte counter を作る。
-    // queue capacity は byte 単位の `enqueue_for_client` で厳密に enforce する。
-    let (tx, rx) = std::sync::mpsc::channel::<SharedBytes>();
-    let queued_bytes = Arc::new(AtomicUsize::new(0));
-    let queued_bytes_for_pump = Arc::clone(&queued_bytes);
-    let writer_thread =
-        std::thread::spawn(move || writer_pump(rx, writer_main, queued_bytes_for_pump));
-    let negotiated_caps = intersect;
+    // 空の queue に積む最初の frame なので overflow しない (= 失敗は encode error だけ)。
+    if !send_control(&handle, ControlMessage::HandshakeResponse(response)) {
+        return Err(None);
+    }
 
     Ok(AcceptedClient {
-        handle: ClientHandle {
-            id: client_id,
-            mode: req.mode,
-            leader: became_leader,
-            subscription: Subscription::Raw,
-            negotiated_caps,
-            writer_tx: tx,
-            queued_bytes,
-            buffer_limit: config.client_buffer_bytes,
-            writer_thread: Some(writer_thread),
-            reader,
-            decoder: FrameDecoder::new(),
-            connected_at_unix_ms: now_unix_ms(),
-        },
+        handle,
         became_leader,
         detach_others: req.detach_others,
     })
@@ -418,7 +396,8 @@ fn finalize_accepted_client(
 ///
 /// 各 entry に対し:
 /// - `try_recv` で完了通知が来ていれば、`Ok` なら `finalize_accepted_client` →
-///   `clients` に push + leader/mode.change broadcast。`Err` なら drop で完了。
+///   `clients` に push + leader/mode.change broadcast (拒否なら error を積んで `closing` へ)。
+///   `Err` なら drop で完了。
 /// - `started_at + HANDSHAKE_TIMEOUT` を超過していたら強制 drop (= 残った socket は
 ///   worker thread が `set_read_timeout` で抜け次第 close する)。
 ///
@@ -440,6 +419,7 @@ pub(super) fn process_pending_handshakes(
     overflow_ids: &mut Vec<u64>,
     screen_state: &ScreenState,
     pending_redraws: &mut Vec<u64>,
+    closing: &mut Vec<ClosingClient>,
 ) {
     // 完了 / 失敗 / timeout の 3 状態に分岐して 1 つずつ処理する。
     let mut i = 0;
@@ -448,7 +428,7 @@ pub(super) fn process_pending_handshakes(
         match pending_handshakes[i].rx.try_recv() {
             Ok(Ok(stage)) => {
                 let _entry = pending_handshakes.remove(i);
-                // finalize: leader 判定 + response 送信 + ClientHandle 構築。
+                // finalize: leader 判定 + ClientHandle 構築 + response の enqueue。
                 // exclusive 判定用に「自分以外の in-flight handshake 数」(= 自 entry を
                 // remove した後の残数) を渡す (= 同一周回で観測可能な pending の取りこぼし防止)。
                 let other_pending = pending_handshakes.len();
@@ -476,7 +456,7 @@ pub(super) fn process_pending_handshakes(
                             // accept した client に「現在 lock 中」を通知
                             let _ = send_control(&accepted.handle, ControlMessage::ModeChange(*mc));
                         }
-                        // DR-0013 §4 Phase A: handshake response 送信完了直後に
+                        // DR-0013 §4 Phase A: handshake response を積んだ直後に
                         // screen state からの redraw bytes を当該 client にだけ
                         // 送る。生 byte は raw_data frame (= TYPE_RAW_DATA) で送る
                         // ため、client 側は通常 attach フローでそのまま stdout に
@@ -547,7 +527,7 @@ pub(super) fn process_pending_handshakes(
                                     daemon_state,
                                     translate::client_detached(detached_id),
                                 ));
-                                drop(ch);
+                                retire_client(closing, ch);
                                 state.record_registry.push_lifecycle(
                                     super::record::LifecycleEvent::ClientDetached {
                                         client_id: detached_id,
@@ -575,8 +555,10 @@ pub(super) fn process_pending_handshakes(
                             );
                         }
                     }
-                    Err(_) => {
-                        // response 送信失敗等。drop で client は弾く。
+                    Err(rejected) => {
+                        // 拒否: error を書き終えてから close する (closing へ)。
+                        // socket の設定失敗等 (None) はそのまま close。
+                        closing.extend(rejected);
                     }
                 }
                 // remove したので i は変えない
@@ -610,7 +592,7 @@ pub(super) fn process_pending_handshakes(
 ///
 /// `build_attach_redraw` で alt mode prepend + `state_formatted` を組み立てた
 /// bytes を raw_data frame に詰めて enqueue する (= 通常 broadcast の生 byte
-/// 経路と同じ frame type)。enqueue が overflow / writer dead だった場合は
+/// 経路と同じ frame type)。enqueue が overflow だった場合は
 /// 当該 client_id を `overflow_ids` に積み、caller が drop する設計。
 pub(super) fn send_attach_redraw(
     ch: &ClientHandle,
@@ -630,10 +612,10 @@ pub(super) fn send_attach_redraw(
     let payload: SharedBytes = Arc::new(frame_bytes);
     match enqueue_for_client(ch, payload) {
         super::broadcast::EnqueueOutcome::Sent => {}
-        // writer 死は disconnect の根拠にしない (= 理由は
+        // 書き込み失敗は disconnect の根拠にしない (= 理由は
         // `broadcast::handle_enqueue_outcome` の同 arm 参照)。attach 直後に
-        // client が閉じていても、受信済み frame は reader EOF 経路で処理する。
-        super::broadcast::EnqueueOutcome::WriterDead => {}
+        // client が閉じていても、受信済み frame は受信側の EOF 経路で処理する。
+        super::broadcast::EnqueueOutcome::SendFailed => {}
         super::broadcast::EnqueueOutcome::Overflow => overflow_ids.push(ch.id),
     }
 }
@@ -712,15 +694,13 @@ mod tests {
 
     /// 完了済 stage を内包した `PendingHandshake` を組み立てる test helper。
     ///
-    /// daemon 側 socket (= stage に入れる reader / writer) と client 側 peer socket
-    /// を `UnixStream::pair` で作る。実物は同一 stream の split だが、機能的には
-    /// 独立 pair 2 本で等価 (= response はテストが保持する peer のバッファに溜まる)。
-    /// peer を返すのは drop による EPIPE を避けるため (= caller が生かしておく)。
-    fn make_completed_pending(req: HandshakeRequest) -> (PendingHandshake, UnixStream, UnixStream) {
-        let (daemon_reader, peer_w) = UnixStream::pair().expect("pair");
-        let (daemon_writer, peer_r) = UnixStream::pair().expect("pair");
+    /// daemon 側 socket (= stage に入れる stream) と client 側 peer socket を
+    /// `UnixStream::pair` で作る。peer を返すのは drop による EPIPE を避けるため
+    /// (= caller が生かしておく)。
+    fn make_completed_pending(req: HandshakeRequest) -> (PendingHandshake, UnixStream) {
+        let (daemon_stream, peer) = UnixStream::pair().expect("pair");
         let (tx, rx) = std::sync::mpsc::sync_channel::<Result<HandshakeStageOk, Error>>(1);
-        tx.send(Ok((daemon_reader, daemon_writer, req, Vec::new())))
+        tx.send(Ok((daemon_stream, req, Vec::new())))
             .expect("send stage");
         let worker = std::thread::spawn(|| {});
         (
@@ -729,8 +709,7 @@ mod tests {
                 started_at: Instant::now(),
                 _worker: worker,
             },
-            peer_w,
-            peer_r,
+            peer,
         )
     }
 
@@ -769,6 +748,7 @@ mod tests {
         let mut overflow_ids = Vec::new();
         let screen_state = ScreenState::new(24, 80, 100);
         let mut pending_redraws = Vec::new();
+        let mut closing = Vec::new();
         process_pending_handshakes(
             pending,
             &config,
@@ -779,6 +759,7 @@ mod tests {
             &mut overflow_ids,
             &screen_state,
             &mut pending_redraws,
+            &mut closing,
         );
         state
     }
@@ -794,17 +775,23 @@ mod tests {
             detach_others: false,
             token: None,
         };
-        let (pending, _peer_w, mut peer_r) = make_completed_pending(request);
+        let (pending, mut peer) = make_completed_pending(request);
         let stage = pending.rx.recv().expect("stage result").expect("stage");
         let config = DaemonConfig::new(
             "t",
             std::path::PathBuf::from("/tmp/t.sock"),
             vec!["cmd".into()],
         );
-        let accepted = finalize_accepted_client(stage, &config, 1, &[], 0, true)
-            .expect("finalize stopped handshake");
+        let Ok(accepted) = finalize_accepted_client(stage, &config, 1, &[], 0, true) else {
+            panic!("finalize stopped handshake");
+        };
+        // response は送信 queue に積まれる (DR-0037 段階 4)。serve loop の代わりに書き出す。
+        assert_eq!(
+            accepted.handle.flush_send(),
+            super::super::broadcast::WriteProgress::Drained
+        );
 
-        let frame = Frame::decode_from(&mut peer_r).expect("decode handshake response frame");
+        let frame = Frame::decode_from(&mut peer).expect("decode handshake response frame");
         let response =
             ControlMessage::decode_from(frame.body.as_slice()).expect("decode handshake response");
         match response {
@@ -830,7 +817,7 @@ mod tests {
         };
 
         // (a) in-flight pending が居る → exclusive は拒否され client は push されない。
-        let (excl, _pw, _pr) = make_completed_pending(req.clone());
+        let (excl, _peer) = make_completed_pending(req.clone());
         let (inflight, _tx_keep) = make_inflight_pending();
         let mut pending = vec![excl, inflight];
         let mut clients: Vec<ClientHandle> = Vec::new();
@@ -847,7 +834,7 @@ mod tests {
 
         // (b) 対照: pending が居なければ同じ exclusive 要求は成立する
         //     (= (a) の拒否理由が pending であることの裏取り)。
-        let (excl_alone, _pw2, _pr2) = make_completed_pending(req);
+        let (excl_alone, _peer2) = make_completed_pending(req);
         let mut pending = vec![excl_alone];
         let mut clients: Vec<ClientHandle> = Vec::new();
         let _ = run_process(&mut pending, &mut clients);
@@ -871,7 +858,7 @@ mod tests {
             detach_others: true,
             token: None,
         };
-        let (stealer, _pw, _pr) = make_completed_pending(req);
+        let (stealer, _peer) = make_completed_pending(req);
         let (inflight, _tx_keep) = make_inflight_pending();
         let mut pending = vec![stealer, inflight];
         let mut clients: Vec<ClientHandle> = Vec::new();
@@ -884,27 +871,12 @@ mod tests {
         );
     }
 
-    /// 確立済 client を直接組み立てる test helper (= writer thread 無しの素の mpsc)。
+    /// 確立済 client を直接組み立てる test helper。
     fn established_client(id: u64, mode: Mode) -> ClientHandle {
-        let (tx, _rx_keep) = std::sync::mpsc::channel::<SharedBytes>();
-        // _rx_keep を leak して channel を開いたままにする (= send_control が
-        // closed channel error にならないように。leak は test process 終了で回収)。
-        std::mem::forget(_rx_keep);
+        // 送信 queue は socket に書かないので、相手側は drop してよい。
         let (_a, b) = UnixStream::pair().expect("pair");
-        ClientHandle {
-            id,
-            mode,
-            leader: matches!(mode, Mode::Rw),
-            subscription: Subscription::Raw,
-            negotiated_caps: Vec::new(),
-            writer_tx: tx,
-            queued_bytes: Arc::new(AtomicUsize::new(0)),
-            buffer_limit: 1 << 20,
-            writer_thread: None,
-            reader: b,
-            decoder: crate::protocol::FrameDecoder::new(),
-            connected_at_unix_ms: 0,
-        }
+        ClientHandle::new(id, mode, matches!(mode, Mode::Rw), Vec::new(), b, 1 << 20)
+            .expect("client handle")
     }
 
     /// Fable review M2 regression: Ro 観察者の `--detach-others` は handshake 段で
@@ -918,7 +890,7 @@ mod tests {
             detach_others: true,
             token: None,
         };
-        let (ro_stealer, _pw, _pr) = make_completed_pending(req);
+        let (ro_stealer, _peer) = make_completed_pending(req);
         let mut pending = vec![ro_stealer];
         let mut clients = vec![established_client(10, Mode::Rw)];
         let _ = run_process(&mut pending, &mut clients);
@@ -944,7 +916,7 @@ mod tests {
             detach_others: true,
             token: None,
         };
-        let (combo, _pw, _pr) = make_completed_pending(req);
+        let (combo, _peer) = make_completed_pending(req);
         let mut pending = vec![combo];
         let mut clients = vec![established_client(10, Mode::Rw)];
         let _ = run_process(&mut pending, &mut clients);

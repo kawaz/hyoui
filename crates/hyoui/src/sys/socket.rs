@@ -478,67 +478,11 @@ pub fn bind_listener<P: AsRef<Path>>(path: P) -> Result<std::os::unix::net::Unix
     Ok(std::os::unix::net::UnixListener::from(fd))
 }
 
-/// socket から `recv(2)` を `MSG_DONTWAIT` 付きで 1 回呼ぶ。`Ok(0)` は相手の close。
-/// 読める bytes が無ければ `EAGAIN` を返す (EINTR は再試行する)。
-///
-/// Design rationale: nonblocking にするのはこの呼び出し 1 回だけで、fd の
-/// `O_NONBLOCK` は変えない (DR-0037 段階 1)。daemon の client socket は reader と
-/// writer が `try_clone` (= 同一 open file description) なので、fd に `O_NONBLOCK` を
-/// 付けると blocking 前提の writer thread と handshake response の `write_all` まで
-/// nonblocking になり、EAGAIN で部分送信・切断が起きる。`MSG_DONTWAIT` は Linux /
-/// macOS の recv(2) にある呼び出し単位の flag で、description の状態を変えない。
-pub fn recv_nowait<F: AsFd>(fd: &F, buf: &mut [u8]) -> Result<usize> {
-    let raw = fd.as_fd().as_raw_fd();
-    loop {
-        match socket::recv(raw, buf, socket::MsgFlags::MSG_DONTWAIT) {
-            Ok(n) => return Ok(n),
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(e) => return Err(Error::from(e)),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
-
-    /// `recv_nowait` は読める bytes が無ければ待たずに EAGAIN を返し、fd の
-    /// `O_NONBLOCK` を変えない (= 同じ description を共有する blocking writer に影響
-    /// しない)。データがあれば読め、相手の close は `Ok(0)`。
-    #[test]
-    fn recv_nowait_does_not_block_and_keeps_fd_blocking() {
-        let (a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
-        // writer 側の複製 (= daemon の reader / writer と同じ try_clone の関係)。
-        let a_writer = a.try_clone().expect("try_clone");
-        let flags_before = fcntl(&a, FcntlArg::F_GETFL).expect("getfl");
-        assert!(
-            !OFlag::from_bits_retain(flags_before).contains(OFlag::O_NONBLOCK),
-            "前提: socketpair は blocking"
-        );
-
-        let mut buf = [0u8; 16];
-        match recv_nowait(&a, &mut buf) {
-            Err(Error::Errno(nix::errno::Errno::EAGAIN)) => {}
-            other => panic!("expected EAGAIN on empty socket, got {other:?}"),
-        }
-        let flags_after = fcntl(&a, FcntlArg::F_GETFL).expect("getfl");
-        assert_eq!(flags_before, flags_after, "fd の status flag は変わらない");
-        assert!(
-            !OFlag::from_bits_retain(fcntl(&a_writer, FcntlArg::F_GETFL).expect("getfl"))
-                .contains(OFlag::O_NONBLOCK),
-            "複製した writer 側も blocking のまま"
-        );
-
-        use std::io::Write as _;
-        (&b).write_all(b"abc").expect("write");
-        assert_eq!(recv_nowait(&a, &mut buf).expect("recv"), 3);
-        assert_eq!(&buf[..3], b"abc");
-
-        drop(b);
-        assert_eq!(recv_nowait(&a, &mut buf).expect("recv after close"), 0);
-    }
 
     fn make_0700_dir() -> TempDir {
         let dir = TempDir::new().expect("tempdir");

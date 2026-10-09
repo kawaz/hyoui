@@ -27,7 +27,7 @@
 //! 本 module は `session.rs` の下記 item を経由して broadcast / state mutation
 //! を行う:
 //!
-//! - `send_control` / `broadcast_control`: writer queue 経由の 1 client / 全 client 送信
+//! - `send_control` / `broadcast_control`: 送信 queue 経由の 1 client / 全 client 送信
 //! - `handle_tail_request`: subscription セットアップ (= 本 module からは
 //!   cap check 後に呼ぶだけ)
 //! - [`super::lock`] の `generate_lock_token` / `SessionState`
@@ -493,7 +493,7 @@ fn handle_detach_target(
         DetachTarget::Others => {
             // 自分以外の全 client index を集める (= 自分は残す)。
             let others: Vec<usize> = (0..clients.len()).filter(|&i| i != idx).collect();
-            send_detach_ack_and_flush(&clients[idx], others.len() as u64);
+            send_detach_ack(&clients[idx], others.len() as u64);
             ClientFrameOutcome::DropClients {
                 indices: others,
                 cancel_pending: true,
@@ -502,7 +502,7 @@ fn handle_detach_target(
         DetachTarget::All => {
             // 自分含む全 client を drop。daemon は serve_loop を継続 (= 子 PTY 接続維持、
             // DR-0015 §2.3.1)。
-            send_detach_ack_and_flush(&clients[idx], clients.len() as u64);
+            send_detach_ack(&clients[idx], clients.len() as u64);
             ClientFrameOutcome::DropClients {
                 indices: (0..clients.len()).collect(),
                 cancel_pending: true,
@@ -511,27 +511,16 @@ fn handle_detach_target(
     }
 }
 
-/// `detach.ack` を要求元に enqueue し、writer thread が flush し切るまで bounded wait
-/// する (DR-0020 §4 / Fable Minor3)。
+/// `detach.ack` を要求元の送信 queue に積む (DR-0020 §4 / Fable Minor3)。
 ///
-/// drop は serve_loop 後段で `ClientHandle::Drop` が `shutdown(Both)` を呼ぶため、
-/// enqueue 直後に drop されると writer thread が ack を書く前に socket が閉じ、
-/// client が ack を読む前に EOF を観測する race が起きる (= `SessionExitNotify` の
-/// 終端 drain と同根、issue 2026-06-11)。同じ流儀の per-client bounded drain
-/// (= 200ms 上限) を ack 送信直後に行い、要求元が drop 対象 (= All) でも ack が
-/// 確実に socket に書かれてから drop されるようにする。
-fn send_detach_ack_and_flush(ch: &ClientHandle, dropped_count: u64) {
+/// 要求元が drop 対象 (= All) でも ack は届く: drop される client は serve_loop 後段で
+/// closing (DR-0037 段階 4) に移り、送信 queue を書き終えてから close される (相手が読まない
+/// 場合は `broadcast::CLOSE_FLUSH_TIMEOUT` で close)。ここで書き終わりを待たない。
+fn send_detach_ack(ch: &ClientHandle, dropped_count: u64) {
     let _ = send_control(
         ch,
         ControlMessage::DetachAck(crate::protocol::messages::DetachAck { dropped_count }),
     );
-    const ACK_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
-    let deadline = std::time::Instant::now() + ACK_DRAIN_BUDGET;
-    while ch.queued_bytes.load(std::sync::atomic::Ordering::Acquire) > 0
-        && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
 }
 
 /// `ControlMessage::Kill` を処理する。
@@ -1789,36 +1778,14 @@ mod tests {
 
     // ===== record stop / stop --all の ACK 回帰 (= hang bug の核心) =====
 
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::mpsc::Receiver;
-
-    use super::super::broadcast::{SharedBytes, Subscription};
-
-    /// `record-v1` cap を持つ test 用 `ClientHandle` を、writer thread 無しの素の
-    /// mpsc channel 付きで組み立てる。`send_control` の enqueue 先 (= rx) を test が
-    /// 直接 drain して daemon の応答 frame を覗ける。
-    fn record_test_client() -> (ClientHandle, Receiver<SharedBytes>) {
-        let (tx, rx) = std::sync::mpsc::channel::<SharedBytes>();
-        // ClientHandle は UnixStream (reader) を要求するがダミーで足りる。writer_tx は
-        // 素の mpsc で writer thread も spawn しないため、reader は Drop 以外で触られない
-        // (= 両端そのまま drop して問題ない)。
+    /// `record-v1` cap を持つ test 用 `ClientHandle` を組み立てる。`send_control` の
+    /// enqueue 先 (= 送信 queue) を test が `recv_control_from_queue` で直接取り出して
+    /// daemon の応答 frame を覗ける (socket には書かない)。
+    fn record_test_client() -> ClientHandle {
+        // 送信 queue は socket に書かないので、相手側は drop してよい。
         let (_a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
-        let ch = ClientHandle {
-            id: 1,
-            mode: Mode::Ro,
-            leader: false,
-            subscription: Subscription::Raw,
-            negotiated_caps: vec!["record-v1".into()],
-            writer_tx: tx,
-            queued_bytes: Arc::new(AtomicUsize::new(0)),
-            buffer_limit: 1 << 20,
-            writer_thread: None,
-            reader: b,
-            decoder: crate::protocol::FrameDecoder::new(),
-            connected_at_unix_ms: 0,
-        };
-        (ch, rx)
+        ClientHandle::new(1, Mode::Ro, false, vec!["record-v1".into()], b, 1 << 20)
+            .expect("client handle")
     }
 
     // ===== DR-0020 §4: handle_detach_target の target 別 drop 対象 =====
@@ -1850,11 +1817,11 @@ mod tests {
         use crate::protocol::messages::{Detach, DetachTarget};
 
         let make_clients = || {
-            let (c0, _r0) = record_test_client();
+            let c0 = record_test_client();
             // self (= idx 1) は rw (= Others/All の権限ゲートを通す、Fable M2)。
-            let (mut c1, _r1) = record_test_client();
+            let mut c1 = record_test_client();
             c1.mode = Mode::Rw;
-            let (c2, _r2) = record_test_client();
+            let c2 = record_test_client();
             vec![c0, c1, c2]
         };
         let self_idx = 1;
@@ -1901,8 +1868,8 @@ mod tests {
 
         for target in [DetachTarget::Others, DetachTarget::All] {
             // 全員 Ro (= record_test_client の default)。self_idx=0 が Ro で要求。
-            let (c0, r0) = record_test_client();
-            let (c1, _r1) = record_test_client();
+            let c0 = record_test_client();
+            let c1 = record_test_client();
             let mut clients = vec![c0, c1];
             let out = handle_detach_target(0, Detach { target }, &mut clients);
             assert!(
@@ -1910,7 +1877,7 @@ mod tests {
                 "ro client の {target:?} は Continue (= 誰も drop しない) になるべき"
             );
             // 要求元には ModeNotAllowed error が返る。
-            match recv_control_from_queue(&r0) {
+            match recv_control_from_queue(&clients[0]) {
                 ControlMessage::Error(e) => {
                     assert_eq!(e.code, crate::protocol::messages::ErrorCode::ModeNotAllowed);
                 }
@@ -1919,7 +1886,7 @@ mod tests {
         }
 
         // Myself は Ro でも許容 (= 自分が抜けるだけ)。
-        let (c0, _r0) = record_test_client();
+        let c0 = record_test_client();
         let mut clients = vec![c0];
         let out = handle_detach_target(
             0,
@@ -1933,9 +1900,9 @@ mod tests {
 
     /// queue に積まれた次の frame を decode して `ControlMessage` を返す。
     /// 何も積まれていなければ panic (= 「無音 return = hang」を test failure に変える)。
-    fn recv_control_from_queue(rx: &Receiver<SharedBytes>) -> ControlMessage {
-        let payload = rx
-            .try_recv()
+    fn recv_control_from_queue(ch: &ClientHandle) -> ControlMessage {
+        let payload = ch
+            .pop_queued_frame()
             .expect("daemon must enqueue a response (silent return = client hang)");
         let frame = Frame::decode_from(&mut payload.as_slice()).expect("decode frame");
         assert_eq!(frame.ty, TYPE_CBOR_CONTROL);
@@ -1969,12 +1936,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = SessionState::default();
         let id = start_record(&state, &dir.path().join("a.jsonl"));
-        let (mut ch, rx) = record_test_client();
+        let mut ch = record_test_client();
         let clients = std::slice::from_mut(&mut ch);
 
         handle_record_stop_request(0, RecordStopRequest { record_id: id }, clients, &state);
 
-        match recv_control_from_queue(&rx) {
+        match recv_control_from_queue(&clients[0]) {
             ControlMessage::RecordStopResponse(resp) => assert_eq!(resp.stopped, 1),
             other => panic!("expected RecordStopResponse {{ stopped: 1 }}, got {other:?}"),
         }
@@ -1987,12 +1954,12 @@ mod tests {
         let state = SessionState::default();
         start_record(&state, &dir.path().join("a.jsonl"));
         start_record(&state, &dir.path().join("b.jsonl"));
-        let (mut ch, rx) = record_test_client();
+        let mut ch = record_test_client();
         let clients = std::slice::from_mut(&mut ch);
 
         handle_record_stop_all_request(0, clients, &state);
 
-        match recv_control_from_queue(&rx) {
+        match recv_control_from_queue(&clients[0]) {
             ControlMessage::RecordStopResponse(resp) => assert_eq!(resp.stopped, 2),
             other => panic!("expected RecordStopResponse {{ stopped: 2 }}, got {other:?}"),
         }
@@ -2003,12 +1970,12 @@ mod tests {
     #[test]
     fn record_stop_nonexistent_id_sends_error_not_silent() {
         let state = SessionState::default();
-        let (mut ch, rx) = record_test_client();
+        let mut ch = record_test_client();
         let clients = std::slice::from_mut(&mut ch);
 
         handle_record_stop_request(0, RecordStopRequest { record_id: 999 }, clients, &state);
 
-        match recv_control_from_queue(&rx) {
+        match recv_control_from_queue(&clients[0]) {
             ControlMessage::Error(e) => assert_eq!(e.code, ErrorCode::RecordNotFound),
             other => panic!("expected Error {{ RecordNotFound }}, got {other:?}"),
         }
@@ -2016,24 +1983,10 @@ mod tests {
 
     /// `child-state-v1` cap を持つ test 用 `ClientHandle` を組み立てる
     /// (= `record_test_client` の cap 違い版、resume request 用)。
-    fn child_state_test_client() -> (ClientHandle, Receiver<SharedBytes>) {
-        let (tx, rx) = std::sync::mpsc::channel::<SharedBytes>();
+    fn child_state_test_client() -> ClientHandle {
         let (_a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
-        let ch = ClientHandle {
-            id: 1,
-            mode: Mode::Rw,
-            leader: true,
-            subscription: Subscription::Raw,
-            negotiated_caps: vec!["child-state-v1".into()],
-            writer_tx: tx,
-            queued_bytes: Arc::new(AtomicUsize::new(0)),
-            buffer_limit: 1 << 20,
-            writer_thread: None,
-            reader: b,
-            decoder: crate::protocol::FrameDecoder::new(),
-            connected_at_unix_ms: 0,
-        };
-        (ch, rx)
+        ClientHandle::new(1, Mode::Rw, true, vec!["child-state-v1".into()], b, 1 << 20)
+            .expect("client handle")
     }
 
     /// issue 2026-06-11: `session.child.resume.request` 受信時、daemon は SIGCONT
@@ -2042,7 +1995,7 @@ mod tests {
     #[test]
     fn resume_request_pushes_attach_redraw_before_sigcont() {
         let state = SessionState::default();
-        let (mut ch, rx) = child_state_test_client();
+        let mut ch = child_state_test_client();
         let clients = std::slice::from_mut(&mut ch);
 
         // 子が何か出力した state を作る (= pristine ではない → redraw 非空)。
@@ -2058,8 +2011,8 @@ mod tests {
         );
 
         // 最初に届く frame は raw_data の redraw bytes。
-        let payload = rx
-            .try_recv()
+        let payload = clients[0]
+            .pop_queued_frame()
             .expect("resume must enqueue an attach redraw raw_data frame");
         let frame = Frame::decode_from(&mut payload.as_slice()).expect("decode frame");
         assert_eq!(frame.ty, TYPE_RAW_DATA, "redraw must be a raw_data frame");
@@ -2081,7 +2034,7 @@ mod tests {
     #[test]
     fn resume_request_pushes_empty_redraw_for_pristine_state() {
         let state = SessionState::default();
-        let (mut ch, rx) = child_state_test_client();
+        let mut ch = child_state_test_client();
         let clients = std::slice::from_mut(&mut ch);
 
         let screen_state = ScreenState::new(24, 80, 100);
@@ -2093,8 +2046,8 @@ mod tests {
             "resume request must not drop a healthy client"
         );
 
-        let payload = rx
-            .try_recv()
+        let payload = clients[0]
+            .pop_queued_frame()
             .expect("resume must still enqueue a (possibly empty) raw_data frame");
         let frame = Frame::decode_from(&mut payload.as_slice()).expect("decode frame");
         assert_eq!(frame.ty, TYPE_RAW_DATA);
@@ -2146,29 +2099,9 @@ mod tests {
     // DR-0033: `leader.request` takeover
     // ──────────────────────────────────────────────────────────────────────
 
-    fn leader_test_client(
-        id: u64,
-        mode: Mode,
-        leader: bool,
-        caps: Vec<String>,
-    ) -> (ClientHandle, Receiver<SharedBytes>) {
-        let (tx, rx) = std::sync::mpsc::channel::<SharedBytes>();
+    fn leader_test_client(id: u64, mode: Mode, leader: bool, caps: Vec<String>) -> ClientHandle {
         let (_a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
-        let ch = ClientHandle {
-            id,
-            mode,
-            leader,
-            subscription: Subscription::Raw,
-            negotiated_caps: caps,
-            writer_tx: tx,
-            queued_bytes: Arc::new(AtomicUsize::new(0)),
-            buffer_limit: 1 << 20,
-            writer_thread: None,
-            reader: b,
-            decoder: crate::protocol::FrameDecoder::new(),
-            connected_at_unix_ms: 0,
-        };
-        (ch, rx)
+        ClientHandle::new(id, mode, leader, caps, b, 1 << 20).expect("client handle")
     }
 
     /// cap negotiation で leader-request-v1 が落ちた client は新 kind を送れず、
@@ -2176,13 +2109,13 @@ mod tests {
     #[test]
     fn leader_request_without_cap_is_rejected() {
         let daemon_state = DaemonState::default();
-        let (ch, rx) = leader_test_client(1, Mode::Rw, false, vec!["lock".into()]);
+        let ch = leader_test_client(1, Mode::Rw, false, vec!["lock".into()]);
         let mut clients = vec![ch];
 
         handle_leader_request(0, &mut clients, &daemon_state);
 
         assert!(!clients[0].leader, "cap 不足では leader state を変えない");
-        match recv_control_from_queue(&rx) {
+        match recv_control_from_queue(&clients[0]) {
             ControlMessage::Error(error) => {
                 assert_eq!(error.code, ErrorCode::UnsupportedCapability)
             }
@@ -2195,17 +2128,15 @@ mod tests {
     #[test]
     fn leader_request_from_ro_is_rejected() {
         let daemon_state = DaemonState::default();
-        let (leader, _leader_rx) =
-            leader_test_client(1, Mode::Rw, true, vec!["leader-request-v1".into()]);
-        let (observer, observer_rx) =
-            leader_test_client(2, Mode::Ro, false, vec!["leader-request-v1".into()]);
+        let leader = leader_test_client(1, Mode::Rw, true, vec!["leader-request-v1".into()]);
+        let observer = leader_test_client(2, Mode::Ro, false, vec!["leader-request-v1".into()]);
         let mut clients = vec![leader, observer];
 
         handle_leader_request(1, &mut clients, &daemon_state);
 
         assert!(clients[0].leader);
         assert!(!clients[1].leader);
-        match recv_control_from_queue(&observer_rx) {
+        match recv_control_from_queue(&clients[1]) {
             ControlMessage::Error(error) => assert_eq!(error.code, ErrorCode::ModeNotAllowed),
             other => panic!("expected ModeNotAllowed, got {other:?}"),
         }
@@ -2216,9 +2147,8 @@ mod tests {
     #[test]
     fn leader_request_from_rw_demotes_old_leader_and_broadcasts() {
         let daemon_state = DaemonState::default();
-        let (old, old_rx) = leader_test_client(1, Mode::Rw, true, vec!["leader-request-v1".into()]);
-        let (requester, requester_rx) =
-            leader_test_client(2, Mode::Rw, false, vec!["leader-request-v1".into()]);
+        let old = leader_test_client(1, Mode::Rw, true, vec!["leader-request-v1".into()]);
+        let requester = leader_test_client(2, Mode::Rw, false, vec!["leader-request-v1".into()]);
         let mut clients = vec![old, requester];
 
         handle_leader_request(1, &mut clients, &daemon_state);
@@ -2226,8 +2156,8 @@ mod tests {
         assert_eq!(clients[0].mode, Mode::Rw, "旧 leader の mode は Rw のまま");
         assert!(!clients[0].leader, "旧 leader は接続を維持して降格");
         assert!(clients[1].leader, "要求元が新 leader");
-        for rx in [&old_rx, &requester_rx] {
-            match recv_control_from_queue(rx) {
+        for ch in clients.iter() {
+            match recv_control_from_queue(ch) {
                 ControlMessage::LeaderNotify(notify) => {
                     assert_eq!(notify.client_id, Some(2));
                 }
@@ -2241,8 +2171,8 @@ mod tests {
     #[test]
     fn leader_request_from_rw_no_leader_transitions_to_rw_and_broadcasts() {
         let daemon_state = DaemonState::default();
-        let (old, old_rx) = leader_test_client(1, Mode::Rw, true, vec!["leader-request-v1".into()]);
-        let (requester, requester_rx) =
+        let old = leader_test_client(1, Mode::Rw, true, vec!["leader-request-v1".into()]);
+        let requester =
             leader_test_client(2, Mode::RwNoLeader, false, vec!["leader-request-v1".into()]);
         let mut clients = vec![old, requester];
 
@@ -2251,17 +2181,17 @@ mod tests {
         assert_eq!(clients[1].mode, Mode::Rw);
         assert!(clients[1].leader);
         assert!(!clients[0].leader);
-        match recv_control_from_queue(&requester_rx) {
+        match recv_control_from_queue(&clients[1]) {
             ControlMessage::ModeChange(change) => {
                 assert_eq!(change.client_mode, Some(Mode::Rw));
             }
             other => panic!("expected requester ModeChange first, got {other:?}"),
         }
-        match recv_control_from_queue(&requester_rx) {
+        match recv_control_from_queue(&clients[1]) {
             ControlMessage::LeaderNotify(notify) => assert_eq!(notify.client_id, Some(2)),
             other => panic!("expected requester LeaderNotify, got {other:?}"),
         }
-        match recv_control_from_queue(&old_rx) {
+        match recv_control_from_queue(&clients[0]) {
             ControlMessage::LeaderNotify(notify) => assert_eq!(notify.client_id, Some(2)),
             other => panic!("expected old leader LeaderNotify, got {other:?}"),
         }
@@ -2272,22 +2202,20 @@ mod tests {
     #[test]
     fn leader_request_by_current_leader_notifies_only_requester() {
         let daemon_state = DaemonState::default();
-        let (requester, requester_rx) =
-            leader_test_client(1, Mode::Rw, true, vec!["leader-request-v1".into()]);
-        let (other, other_rx) =
-            leader_test_client(2, Mode::Rw, false, vec!["leader-request-v1".into()]);
+        let requester = leader_test_client(1, Mode::Rw, true, vec!["leader-request-v1".into()]);
+        let other = leader_test_client(2, Mode::Rw, false, vec!["leader-request-v1".into()]);
         let mut clients = vec![requester, other];
 
         handle_leader_request(0, &mut clients, &daemon_state);
 
         assert!(clients[0].leader);
         assert!(!clients[1].leader);
-        match recv_control_from_queue(&requester_rx) {
+        match recv_control_from_queue(&clients[0]) {
             ControlMessage::LeaderNotify(notify) => assert_eq!(notify.client_id, Some(1)),
             other => panic!("expected requester LeaderNotify, got {other:?}"),
         }
         assert!(
-            other_rx.try_recv().is_err(),
+            clients[1].pop_queued_frame().is_none(),
             "状態不変の再要求を他 client へ broadcast しない"
         );
     }
@@ -2297,24 +2225,9 @@ mod tests {
     // ──────────────────────────────────────────────────────────────────────
 
     /// `set-v1` cap + `Rw` mode を持つ test 用 `ClientHandle`。
-    fn set_test_client(caps: Vec<String>, mode: Mode) -> (ClientHandle, Receiver<SharedBytes>) {
-        let (tx, rx) = std::sync::mpsc::channel::<SharedBytes>();
+    fn set_test_client(caps: Vec<String>, mode: Mode) -> ClientHandle {
         let (_a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
-        let ch = ClientHandle {
-            id: 5,
-            mode,
-            leader: false,
-            subscription: Subscription::Raw,
-            negotiated_caps: caps,
-            writer_tx: tx,
-            queued_bytes: Arc::new(AtomicUsize::new(0)),
-            buffer_limit: 1 << 20,
-            writer_thread: None,
-            reader: b,
-            decoder: crate::protocol::FrameDecoder::new(),
-            connected_at_unix_ms: 0,
-        };
-        (ch, rx)
+        ClientHandle::new(5, mode, false, caps, b, 1 << 20).expect("client handle")
     }
 
     fn set_req(value: &str) -> crate::protocol::messages::SetRequest {
@@ -2331,7 +2244,7 @@ mod tests {
         let state = SessionState::default();
         // default は Notify。
         assert_eq!(state.child_suspend_policy(), ChildSuspendPolicy::Notify);
-        let (mut ch, rx) = set_test_client(vec!["set-v1".into()], Mode::Rw);
+        let mut ch = set_test_client(vec!["set-v1".into()], Mode::Rw);
         let clients = std::slice::from_mut(&mut ch);
 
         let outcome = handle_set_request(0, set_req("auto-resume"), clients, &state);
@@ -2341,7 +2254,7 @@ mod tests {
         assert_eq!(state.child_suspend_policy(), ChildSuspendPolicy::AutoResume);
 
         // SetAck が返る。
-        match recv_control_from_queue(&rx) {
+        match recv_control_from_queue(&clients[0]) {
             ControlMessage::SetAck(ack) => {
                 assert_eq!(ack.key, "on-child-suspend");
                 assert_eq!(ack.value, "auto-resume");
@@ -2359,12 +2272,12 @@ mod tests {
         let path = dir.path().join("set.jsonl");
         let state = SessionState::default();
         let id = start_record(&state, &path);
-        let (mut ch, rx) = set_test_client(vec!["set-v1".into()], Mode::Rw);
+        let mut ch = set_test_client(vec!["set-v1".into()], Mode::Rw);
         let clients = std::slice::from_mut(&mut ch);
 
         handle_set_request(0, set_req("auto-resume"), clients, &state);
         // ack を drain (= enqueue 確認も兼ねる)。
-        let _ = recv_control_from_queue(&rx);
+        let _ = recv_control_from_queue(&clients[0]);
         state.record_registry.stop(id).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
@@ -2383,7 +2296,7 @@ mod tests {
     #[test]
     fn set_on_child_suspend_invalid_value_rejected() {
         let state = SessionState::default();
-        let (mut ch, rx) = set_test_client(vec!["set-v1".into()], Mode::Rw);
+        let mut ch = set_test_client(vec!["set-v1".into()], Mode::Rw);
         let clients = std::slice::from_mut(&mut ch);
 
         handle_set_request(0, set_req("bogus"), clients, &state);
@@ -2393,7 +2306,7 @@ mod tests {
             ChildSuspendPolicy::Notify,
             "invalid value must not mutate state"
         );
-        match recv_control_from_queue(&rx) {
+        match recv_control_from_queue(&clients[0]) {
             ControlMessage::Error(e) => assert_eq!(e.code, ErrorCode::SetInvalidValue),
             other => panic!("expected Error(SetInvalidValue), got {other:?}"),
         }
@@ -2403,7 +2316,7 @@ mod tests {
     #[test]
     fn set_unknown_key_rejected() {
         let state = SessionState::default();
-        let (mut ch, rx) = set_test_client(vec!["set-v1".into()], Mode::Rw);
+        let mut ch = set_test_client(vec!["set-v1".into()], Mode::Rw);
         let clients = std::slice::from_mut(&mut ch);
 
         handle_set_request(
@@ -2415,7 +2328,7 @@ mod tests {
             clients,
             &state,
         );
-        match recv_control_from_queue(&rx) {
+        match recv_control_from_queue(&clients[0]) {
             ControlMessage::Error(e) => assert_eq!(e.code, ErrorCode::SetInvalidKey),
             other => panic!("expected Error(SetInvalidKey), got {other:?}"),
         }
@@ -2425,12 +2338,12 @@ mod tests {
     #[test]
     fn set_without_cap_rejected() {
         let state = SessionState::default();
-        let (mut ch, rx) = set_test_client(vec!["data".into()], Mode::Rw);
+        let mut ch = set_test_client(vec!["data".into()], Mode::Rw);
         let clients = std::slice::from_mut(&mut ch);
 
         handle_set_request(0, set_req("auto-resume"), clients, &state);
         assert_eq!(state.child_suspend_policy(), ChildSuspendPolicy::Notify);
-        match recv_control_from_queue(&rx) {
+        match recv_control_from_queue(&clients[0]) {
             ControlMessage::Error(e) => assert_eq!(e.code, ErrorCode::UnsupportedCapability),
             other => panic!("expected Error(UnsupportedCapability), got {other:?}"),
         }
@@ -2441,7 +2354,7 @@ mod tests {
     #[test]
     fn set_rw_no_leader_mode_allowed() {
         let state = SessionState::default();
-        let (mut ch, rx) = set_test_client(vec!["set-v1".into()], Mode::RwNoLeader);
+        let mut ch = set_test_client(vec!["set-v1".into()], Mode::RwNoLeader);
         let clients = std::slice::from_mut(&mut ch);
 
         handle_set_request(0, set_req("auto-resume"), clients, &state);
@@ -2451,7 +2364,7 @@ mod tests {
             ChildSuspendPolicy::AutoResume,
             "RwNoLeader client must be able to change policy"
         );
-        match recv_control_from_queue(&rx) {
+        match recv_control_from_queue(&clients[0]) {
             ControlMessage::SetAck(ack) => {
                 assert_eq!(ack.key, "on-child-suspend");
                 assert_eq!(ack.value, "auto-resume");
@@ -2464,12 +2377,12 @@ mod tests {
     #[test]
     fn set_ro_mode_rejected() {
         let state = SessionState::default();
-        let (mut ch, rx) = set_test_client(vec!["set-v1".into()], Mode::Ro);
+        let mut ch = set_test_client(vec!["set-v1".into()], Mode::Ro);
         let clients = std::slice::from_mut(&mut ch);
 
         handle_set_request(0, set_req("auto-resume"), clients, &state);
         assert_eq!(state.child_suspend_policy(), ChildSuspendPolicy::Notify);
-        match recv_control_from_queue(&rx) {
+        match recv_control_from_queue(&clients[0]) {
             ControlMessage::Error(e) => assert_eq!(e.code, ErrorCode::ModeNotAllowed),
             other => panic!("expected Error(ModeNotAllowed), got {other:?}"),
         }

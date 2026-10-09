@@ -17,8 +17,6 @@ pub use unix::UnixStreamTransport;
 /// 1 connection 分の双方向 wire。
 ///
 /// `split` で「frame を読む側」と「frame を書く側」を別 owner に分離できる。
-/// MVP の daemon は per-client writer thread + main thread reader poll の構成で
-/// 使う。
 pub trait Transport: Send + 'static {
     /// 読む側 (frame の `decode_from` に渡す)。
     type Reader: Read + Send + 'static;
