@@ -176,6 +176,8 @@ daemon は失敗 ack (= `master.*` 系 Error) を `send_raw_ack` で enqueue し
 
 これにより `master.*` 系失敗 ack が client に到達することを保証する。
 
+DR-0037 段階 4 で writer thread を廃止した後は、この保証を closing で保つ: 切断が決まった client は送信 queue (失敗 ack を含む) を serve loop が nonblocking で書き終えてから close し、相手が読まなければ 500ms (`broadcast::CLOSE_FLUSH_TIMEOUT`) で close する (DR-0037「送信 queue」節)。上の Drop の手順は無くなり、`ClientHandle` の drop は close だけになった。
+
 ## Rejected alternatives
 
 ### 暗黙の `wait-idle` を自動挿入

@@ -1,6 +1,6 @@
 # DR-0037: daemon のイベントループは外部の応答を待たない
 
-- Status: Proposed (2026-09-29) — 🟡 段階 1・2 実装済。Q1 / Q2 / Q3 / Q8 と段階 1 の着手は裁定済み (2026-10-09、「裁定」節)。段階 2 (標準エラーの付け替え + logger) は実装済み (2026-10-09、「標準エラーとログ」節)。Q4〜Q7 は「裁定待ち」節
+- Status: Proposed (2026-09-29) — 🟡 段階 1・2・4 実装済。Q1 / Q2 / Q3 / Q8 と段階 1 の着手は裁定済み (2026-10-09、「裁定」節)。段階 2 (標準エラーの付け替え + logger) は実装済み (2026-10-09、「標準エラーとログ」節)。段階 4 (client 送信の loop 内 nonblocking 化と writer thread の廃止) は実装済み (2026-10-09、「送信 queue」節)。Q4〜Q7 は「裁定待ち」節
 - Date: 2026-09-29
 - Related: DR-0025 (reducer 化。単一 thread の `poll → translate → reduce → effect` loop と EffectResult feedback を本 DR が前提にする), DR-0014 (透過原則と検証主義。検出手段で介入をどこまで入れるかの判断軸), DR-0021 (PTY drain ack。PTY write の非同期化で ack の発行点を保つ必要がある), DR-0016 (record。writer thread と stop / abort の扱い), DR-0028 (graceful upgrade。state file 書き出しと fd 引き継ぎ), DR-0015 (fork daemon + attach client。daemon の stdio の出どころ)
 - Origin: `docs/issue/2026-09-29-daemon-must-never-hang.md` (kawaz 裁定 2026-09-29)。事実は `docs/findings/2026-09-29-daemon-blocking-points.md`
@@ -44,7 +44,7 @@ daemon がどの外部 (client / 子 / fs / 標準エラーの読み手) の振�
 
 - IO worker thread 自身が固まること。I-2 により loop には伝播しない。固まった worker の後始末 (thread の上限・record の abort 表示) は裁定待ち Q6
 - attach client 側プロセスの固まり。client は daemon と別プロセスで、DR-0029 で「覗き窓」と位置づけ済み
-- upgrade の self-exec の直前に、client の writer thread が `upgrade.ack` を書き終えるのを上限 1 秒で待つこと。serve loop を抜けた後の終わり際の 1 回で、DR-0028 §4 に例外として書く (段階 4 で送信 queue の deadline 付き state に置き換える)
+- upgrade.request を受理した後、self-exec の前に送信 queue (`upgrade.ack` を含む) が空になるのを上限 1 秒で見届ける間、子の回収・accept・status 応答を止めること。exec で新プロセスに引き継ぐためで、session の終わり際の 1 回だけ (「送信 queue」節、DR-0028 §4)
 
 ## runtime の選択肢
 
@@ -71,8 +71,8 @@ findings の ID で対応を示す。
 
 | 対象 | 形 |
 |---|---|
-| client 受信 (C-1) | client ごとの増分 frame decoder (I/O を持たない純粋な state: 届いた bytes を `push` し、揃った frame を `next_frame` で 1 つずつ取り出す。`is_ready` は追加の受信なしで frame か protocol error を取り出せるか) で読む。1 周で読むのは `recv` 1 回分まで、処理するのは 1 client につき 1 frame まで (decoder に揃った frame が残っていれば recv せずにそれを処理する。残っている周回は poll で待たない)。reader と writer は `try_clone` による同一 open file description なので、O_NONBLOCK を fd に付けると writer 側 (handshake response、writer thread の `write_all`) も nonblocking になり EAGAIN で部分送信・切断が起きる。送信が blocking のままの間は `recv(2)` の `MSG_DONTWAIT` (呼び出し単位の nonblocking。Linux / macOS の recv(2) にある) で読み、fd のフラグは変えない。送信も loop 内 nonblocking に移した段で fd ごと O_NONBLOCK にする |
-| client 送信 (C-2, C-6, C-8, C-10) | client ごとの送信 queue を loop が持ち、O_NONBLOCK write + `POLLOUT` で流す。queue の byte 上限超過で切断 (現行 backpressure と同じ判定)。切断は socket close だけで完結し、join が無い。「ack を送り切ってから切る」は queue が空になった時点で close する deadline 付き state で表す。writer thread は廃止 (裁定待ち Q2) |
+| client 受信 (C-1) | client ごとの増分 frame decoder (I/O を持たない純粋な state: 届いた bytes を `push` し、揃った frame を `next_frame` で 1 つずつ取り出す。`is_ready` は追加の受信なしで frame か protocol error を取り出せるか) で読む。1 周で読むのは `recv` 1 回分まで、処理するのは 1 client につき 1 frame まで (decoder に揃った frame が残っていれば recv せずにそれを処理する。残っている周回は poll で待たない)。fd は O_NONBLOCK (段階 4 で送信も loop 内 nonblocking にしたので、送信と受信が同じ fd を使う) で、受信は通常の read。送信が blocking だった段階 1〜3 は、O_NONBLOCK を付けると同じ open file description の blocking な送信が EAGAIN で部分送信になるため、`recv(2)` の `MSG_DONTWAIT` で読んでいた |
+| client 送信 (C-2, C-6, C-8, C-10) | client ごとの送信 queue を loop が持ち、O_NONBLOCK write + `POLLOUT` で流す。queue の byte 上限超過で切断 (現行 backpressure と同じ判定)。切断は socket close だけで完結し、join が無い。「ack を送り切ってから切る」は queue が空になった時点で close する deadline 付き state で表す。writer thread は廃止 (裁定 Q2)。段階 4 で実装、決めた値は「送信 queue」節 |
 | handshake (C-4, C-9) | worker thread をやめ、pending client の state (受信 buffer + deadline 5s) として loop 内で扱う。response も送信 queue に積む。mpsc の `try_recv` のための 50ms poll cap が不要になる |
 | accept (C-5) | listener を O_NONBLOCK にし、EAGAIN / ECONNABORTED は loop に戻る |
 | PTY 書き込み (P-2) | `Effect::TtyWrite` を master の送信 queue に effect 単位 (EffectId 付き) で積み、`POLLOUT` で流す。失敗意味論は下の「PTY 書き込み effect の完了と失敗」で effect 単位に定める |
@@ -104,6 +104,26 @@ findings の ID で対応を示す。
 | upgrade (DR-0028) | 新プロセスは必ず付け替えをやり直す (socket から決めた path を開き直して fd 2 と logger を向ける。開けなければ fd 2 は `/dev/null`)。self-exec の時点で channel に残っていた行は失われる (exec の前に logger を止めない。upgrade 経路のログは失敗の報告だけで、失敗時は旧 serve が続くので logger も続く) |
 | fd 2 への直書き | panic の文言など `emit` を通らない stderr への出力は、fd 2 がログファイルなのでそこに入る (O_APPEND の 1 回の write 単位で logger の行と並ぶ)。上限の外。serve loop から fd 2 に直接書く経路は無い (daemon のログは全部 `emit` を通り、logger が無い時の fd 2 は `/dev/null`)。logger を止めた後の終了処理 (socket の片付け等) のログは fd 2 に直接書くが、serve loop の外である |
 
+## 送信 queue (C-2, C-6, C-8, C-10、段階 4)
+
+裁定 Q2 (writer thread を廃止し、loop 内の nonblocking write + `POLLOUT` にする) を次の形で実装する。
+
+| 項目 | 決定 |
+|---|---|
+| queue | client ごとの送信 queue (`broadcast::SendQueue`)。frame (`Arc<Vec<u8>>`) の列と、先頭 frame の書き終えた位置を持つ。上限判定に使う byte 数は socket にまだ書いていない分 (kernel の socket buffer に入った分は数えない) |
+| 上限 | 判定は今までと同じ: queue に残りがあり、積むと `client_buffer_bytes` を超えるなら切断する (空の queue なら 1 frame は通す)。切る前に `backpressure.disconnect` を上限を超えて 1 つ積む |
+| socket | handshake を終えた client の socket を `ClientHandle::new` で O_NONBLOCK にする。受信と送信が同じ fd を使い、受信は通常の read (EAGAIN は「今は読めない」) |
+| 書く時点 | serve loop の周回の冒頭で、全 client の queue を書けるだけ書く (EAGAIN で止める)。書き残しのある client は poll で `POLLOUT` も待つ。冒頭に置くのは、周回の途中の `continue` 経路でも書き込みを飛ばさないため |
+| 書き込みの失敗 | queue を捨て、以後は積まない (enqueue は `SendFailed`)。切断の根拠にはしない (相手の close は受信側の EOF で検出し、受信済みの frame を処理してから切る) |
+| 切断 | socket の close だけで完結する (join・blocking write は無い)。切断前に積んだ frame (失敗 ack・detach ack・backpressure error) を届けるため、切断が決まった client は closing (`ClosingClient`) に移し、queue が空になった時点・書き込みに失敗した時点・期限のいずれかで close する。closing の client は書き込みだけを待ち (`POLLOUT`)、受信は処理しない。queue が空なら closing に入れずにその場で close する |
+| closing の期限 | 500ms (`broadcast::CLOSE_FLUSH_TIMEOUT`)。短い ack は socket buffer に空きがあれば即書ける。期限は poll の timeout に畳む (I-3)。期限を過ぎると client は ack でなく EOF を見る (読まない client) |
+| detach ack | 要求元の queue に積むだけで、書き終わりを待たない。`detach --target=all` で要求元も切る時は closing で書き終えてから close する |
+| handshake response / 拒否 | main thread の finalize が `ClientHandle` を作ってから queue に積む。拒否 (`--exclusive` / ro の `--detach-others`) は error を積んで closing に移す |
+| handshake worker の error | worker が handshake の失敗 (長さ超過・token 不一致) で書く error frame は blocking の `write_all` (write timeout 5s) のまま。この socket は worker が単独で持ち、O_NONBLOCK にならず (O_NONBLOCK は main thread の `ClientHandle::new` が付ける)、失敗時は worker が drop するので、送信 queue と同じ description を blocking の write が共有することは無い。worker ごと無くすのは段階 6 |
+| upgrade | upgrade.request を受理した次の周回から、全 client の queue が空になる (または書き込みに失敗して捨てた) のを 1 秒の期限 (`UPGRADE_FLUSH_BUDGET`) まで見届けてから `UpgradeRequested` を返す (DR-0028 §4)。待つ間は client への nonblocking write と `poll(POLLOUT)` だけを行い、子の回収・master の読み取り・accept・client frame の処理はしない (子の exit をここで回収すると新プロセスが exit code を得られなくなる。master の出力と listen backlog は新プロセスが引き継ぐ) |
+| serve を抜けた後 | 子の exit 通知を送り切ってから close する終了処理と linger は、`poll(POLLOUT)` で待つ `flush_until` (全 client で 1 つの期限) と `drain_closing` (closing の各自の期限) で書く。全 client に並行に書くので、待ちは client 数倍にならない。loop の state にするのは段階 6 (shutdown の state 化) |
+| 内部可変 | enqueue は client 列を共有参照で走査しながら行う (broadcast / control handler / reducer の execute)。queue だけを `RefCell` にする (serve loop は単一 thread、borrow は enqueue / write の関数内で閉じる) |
+
 ## PTY 書き込み effect の完了と失敗
 
 DR-0021 の ack 意味論 (全 byte が master に書けた時だけ `Ok`、IdleTimeout / I/O error / partial は `Error` ack を送ってから当該 client を切断) と、DR-0025 の effect 単位の結果 (`EffectId`、`written_len` / `requested_len`) を、非同期化後も effect 単位で保つ。
@@ -112,7 +132,7 @@ DR-0021 の ack 意味論 (全 byte が master に書けた時だけ `Ok`、Idle
 2. **無進捗 deadline 超過**: 先頭 effect が deadline (現行 `MASTER_WRITE_IDLE_TIMEOUT_MS` = 500ms を「最後に進捗した時刻から」で計る) に達したら、その effect の **残余 byte を破棄** し、`written_len` (書けた prefix) と IdleTimeout を feedback する。書けた prefix は取り消せない (子の line discipline に届いている) ので、record と ack の `written_len` にそのまま載せる
 3. **I/O error / POLLHUP**: 2 と同じく残余を破棄し、error を feedback する
 4. **後続 effect**: 失敗した effect と同じ client から既に queue に積まれている後続の TtyWrite は、**書かずに破棄** し、それぞれ未書込の `Error` ack 相当として扱う (DR-0021 は失敗後に切断するので、後続 bytes を子に届けると「失敗した spec の後ろに後続 spec が続く」順序の嘘になる)。他 client の effect は影響を受けず続行する
-5. **切断の境界**: 失敗時は `Error` ack を当該 client の送信 queue に積み、client を「送信 queue が空になったら close」する draining state にする。draining の deadline (現行の detach ack と同じ 200ms を初期値とする) を過ぎたら queue の残りを捨てて close する。この場合 client は ack を受け取れず EOF を観測する (client が読まない場合の現行 `ClientHandle::drop` と同じ結果)。draining 中の client からの受信は処理しない
+5. **切断の境界**: 失敗時は `Error` ack を当該 client の送信 queue に積み、client を「送信 queue が空になったら close」する draining state にする。draining の deadline (200ms を初期値とする。段階 4 の closing (「送信 queue」節) の期限は 500ms で、draining を closing で表すならどちらに揃えるかを Q7 と合わせて決める) を過ぎたら queue の残りを捨てて close する。この場合 client は ack を受け取れず EOF を観測する (client が読まない場合の closing の期限切れと同じ結果)。draining 中の client からの受信は処理しない
 
 同一 client の raw_data が、前の effect の完了前に届いた場合に queue に積むか拒否するかは裁定待ち Q7。DR-0021 の client は ack を同期で待ってから次を送るので、正規 client では起きず、起きるのは ack を待たない外部 client の場合に限る。
 
@@ -153,7 +173,7 @@ SIGKILL 後の reap (K-5): 現行は flag なしの `waitpid` で見届ける。
 1. **client 受信の増分 decoder 化** (C-1)。1 client で daemon を止められる経路で、実機再現済み。受信は `recv(MSG_DONTWAIT)` で行い、fd の O_NONBLOCK は付けない (reader と writer が同一 open file description を共有するため、付けると blocking 前提の writer thread と handshake response の `write_all` が EAGAIN で部分送信・切断になる)。handshake 後の client のみ対象にし、handshake の worker は残してよい。1 回の recv に複数 frame が入っても、処理するのは 1 周に 1 client につき 1 frame とし、残りは decoder に置いて次の周回で処理する (frame の間で client の drop (自分の detach、他 client の `detach --target=others`、backpressure 超過) と leader cascade を確定させてから次の frame に進むため。blocking で 1 周 1 frame ずつ読んでいた時と同じ順序になる)
 2. **標準エラーの付け替え + logger** (E-1)。起動した呼び出し元の stderr を daemon が持ち続けること自体をやめる。実装済み (2026-10-09、「標準エラーとログ」節)
 3. **fs IO の worker 化** (F-1〜F-6)。record の join 撤去が中心
-4. **client 送信の loop 内 nonblocking 化と writer thread の廃止** (C-2, C-6, C-8, C-10)。client socket の fd に O_NONBLOCK を付けるのはこの段で、受信の `MSG_DONTWAIT` はこの段で通常の read に戻してよい。handshake response も送信 queue 経由に切り替える (blocking の `write_all` が同じ description に残らないように)。v0.9.55 の `ClientHandle::drop` の timed join + `shutdown(Write)` は、この段までの **暫定の上限** として残す。この段で writer thread ごと無くなり、Drop は close だけになる
+4. **client 送信の loop 内 nonblocking 化と writer thread の廃止** (C-2, C-6, C-8, C-10)。client socket の fd に O_NONBLOCK を付けるのはこの段で、受信の `MSG_DONTWAIT` はこの段で通常の read に戻してよい。handshake response も送信 queue 経由に切り替える (blocking の `write_all` が同じ description に残らないように)。writer thread と `ClientHandle::drop` の timed join + `shutdown(Write)` が無くなり、Drop は close だけになる。実装済み (2026-10-09、「送信 queue」節)
 5. **PTY 書き込みの非同期化** (P-2)。「PTY 書き込み effect の完了と失敗」節の意味論で入れる。失敗時の draining state が送信 queue を前提にするので段 4 に依存する
 6. **handshake の loop 内化、accept の nonblocking 化、sleep の deadline 化、shutdown の state 化** (C-4, C-5, C-9, C-11, P-3, K-4, K-5)。handshake の loop 内化は段 4 の送信 queue に依存する。listener の O_NONBLOCK は accept した socket に継承されない前提 (Linux accept(2)) と継承される実装 (BSD 系) の両方で、段 4 以降なら問題にならない
 7. **検出手段** (CLI 側の `no-response` 分類は 1 と並行してよい。watchdog と status の占有指標は 4 以降)
@@ -164,17 +184,17 @@ SIGKILL 後の reap (K-5): 現行は flag なしの `waitpid` で見届ける。
 
 各セルで「別 client の `hyoui status` が 1 秒以内に応答する」「子の exit 後に daemon が回収して終了する」の 2 点を確認する。
 
-| 条件 | 子の種類 (DR-0014 の 3 category) |
-|---|---|
-| client が handshake 後に frame の途中で止まる | vim / cat / bash |
-| client が一切読まない (受信 buffer 満杯) | vim / cat / bash |
-| client を SIGSTOP | vim / cat / bash |
-| 子が大量出力しつつ exit | cat (`yes \| head -c 100M` 相当) / bash |
-| 子が SIGSTOP 中に大きな raw_data を受ける | cat / bash |
-| `--debug-dump` 先が読み手の止まった FIFO | cat |
-| record の出力先への書き込みが進まない (FIFO を使えない create_new の制約があるため、worker に注入点を設けて再現する) | cat |
-| 標準エラーが読まれない pipe | cat |
-| SIGKILL 後も reap できない子 (注入点で再現) | — |
+| 条件 | 子の種類 (DR-0014 の 3 category) | 確かめている test (実装済みの段) |
+|---|---|---|
+| client が handshake 後に frame の途中で止まる | vim / cat / bash | 段階 1: `serve_stays_responsive_while_peer_stalls_*` (less / cat / bash) |
+| client が一切読まない (受信 buffer 満杯) | vim / cat / bash | 段階 4: `serve_keeps_relaying_while_clients_do_not_read_*` (読まない 3 client を抱えて子が約 1 MB 出力、別 client への中継と status、`detach --target=others` で切った直後の status)、`serve_cuts_only_the_client_over_the_limit_*` (上限 256 KiB で読まない client だけが切られる)。どちらも less +F / cat / bash。e2e `upgrade_ack_reaches_the_requester_while_another_client_does_not_read` (読まない client が居ても upgrade.ack が届く) |
+| client を SIGSTOP | vim / cat / bash | 段階 4: 実機 (attach を ^Z で止めて子に大量出力させる、vim / cat / python) |
+| 子が大量出力しつつ exit | cat (`yes \| head -c 100M` 相当) / bash | 段階 4 の範囲 (読まない client を抱えた終了処理): `serve_reaps_child_while_client_never_reads` (ignored、sh が約 4 MB 出して exit 7) |
+| 子が SIGSTOP 中に大きな raw_data を受ける | cat / bash | — |
+| `--debug-dump` 先が読み手の止まった FIFO | cat | — |
+| record の出力先への書き込みが進まない (FIFO を使えない create_new の制約があるため、worker に注入点を設けて再現する) | cat | — |
+| 標準エラーが読まれない pipe | cat | 段階 2: e2e `merged_capture_returns_when_the_parent_exits` ほか `daemon_stderr_log.rs` (daemon は ready の後に呼び出し元の stderr を持たない) |
+| SIGKILL 後も reap できない子 (注入点で再現) | — | — |
 
 ## 裁定
 

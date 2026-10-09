@@ -98,8 +98,9 @@ self-check「kernel 標準機能の再発明をしない」の順方向: kernel 
 - attach client 側は「upgrade 起因の切断」を受けたら再接続 retry (短い backoff、上限
   数秒) して再 attach する。再 attach 時の画面復元は既存の attach 時 screen 転送
   (DR-0013) がそのまま働く
-- **exec の前に、client に積んだ frame を書き終えるまで待つ (上限 1 秒)**: daemon は `upgrade.ack` を各 client の writer thread の queue に積むだけなので、そのまま exec すると writer thread ごと process が置き換わり、client の socket は CLOEXEC で閉じて、まだ書かれていない ack が届かない (client は「recv error before ack」で exit 1 になる。upgrade 自体は成功している)。そこで precheck を通って exec に進む直前に、全 client の writer が queue を書き終える (`queued_bytes` が 0、writer は `write_all` が返ってから減らす) か、writer thread が終わっている (= 書き込み失敗で抜けた) のを待つ (`broadcast::wait_until_flushed`)。上限は全 client で共有する 1 つの deadline (1 秒) で、読まない client が居ても upgrade はそれ以上遅れない。実測 (macOS、CPU 10 コアに busy loop 20 本、`hyoui upgrade` 200 回): 待たない版は 9 回 ack を失い、待つ版は 0 回
-  - DR-0037 の不変条件 (serve loop は外部の応答を待たない) の例外として扱う: 待つのは serve loop を抜けた後、upgrade という session の終わり際の 1 回だけで、上限がある。writer thread の進み具合は poll で待てる event にならないので、1ms 間隔の確認で待つ。DR-0037 段階 4 で writer thread を廃して送信を loop 内の nonblocking write にした時に、送信 queue が空になるまでの deadline 付きの state に置き換える
+- **exec の前に、client に積んだ frame を書き終えるまで待つ (上限 1 秒)**: daemon は `upgrade.ack` を各 client の送信 queue に積むだけなので、そのまま exec すると process が置き換わり、client の socket は CLOEXEC で閉じて、まだ書かれていない ack が届かない (client は「recv error before ack」で exit 1 になる。upgrade 自体は成功している)。そこで serve loop は upgrade.request を受理した次の周回から、全 client の送信 queue が空になる (または書き込みに失敗して捨てた) のを見届けてから `UpgradeRequested` を返し、precheck を通れば exec に進む。上限は全 client で共有する 1 つの deadline (1 秒、`UPGRADE_FLUSH_BUDGET`) で、読まない client が居ても upgrade はそれ以上遅れない。実測 (macOS、CPU 10 コアに busy loop 20 本、`hyoui upgrade` 200 回): 待たない版は 9 回 ack を失い、待つ版は 0 回
+  - 待つのは serve loop の中の deadline 付きの state で (DR-0037 段階 4)、client への nonblocking write と `poll(POLLOUT)` だけを行い、期限を poll の timeout に畳む。間隔の固定された確認はしない
+  - 待つ間は子の回収 (SIGCHLD / waitpid)・master の読み取り・accept・client frame の処理をしない。子の exit をここで回収すると新プロセスが exit code を得られなくなり、master の出力と listen backlog の接続は新プロセスがそのまま引き継いで処理する。待つのは upgrade という session の終わり際の 1 回だけで、上限がある
 - 接続維持したままの seamless upgrade (fd を client socket ごと引き継ぐ) は**不採用**:
   wire protocol 自体が breaking する期間に版跨ぎ接続を維持しても、直後の frame で
   非互換が露呈する。切断 → 新版 client で再接続の方が誠実 (issue 起票時の kawaz 判断
