@@ -18,6 +18,13 @@
 
 ## 裁定待ち
 
+### 👺CLI-R: CLI 全体の整理 (18 点)
+
+[issue](issue/2026-10-14-design-cli-restructure.md) §3 の CLI-R1〜R18。各項の選択肢・推し・悪い面は issue 側に書いてある。統括は R13 だけ補足: (i) の URL は tag 付き (`blob/v<version>/docs/MANUAL.md#environment`) にして手元の版とずれないようにする。
+
+- [ ] 全部 issue の推しどおり
+- [ ] 個別に回答する (下に `R<n>: <選択肢>` を書く)
+
 ### 👺NB-Q4: 固まった daemon の検出をどこまで入れるか
 
 DR-0037 「固まった daemon の検出」節の 3 層。統括推しは c (1 は list-prune で実装中、2 は原因究明に必須、3 は有界な占有の可視化で安い)。
