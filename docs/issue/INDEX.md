@@ -8,7 +8,6 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 | 2026-10-14 | task | open | [salvaged-patches-adoption](./2026-10-14-task-salvaged-patches-adoption.md) | 旧構成から回収した patch 2 件 (poll_until refactor / attach marker 再現 test) の採否。置き場は artifacts の salvage-old-bare-20261010/ |
 | 2026-10-14 | request | open | [session-labels](./2026-10-14-request-session-labels.md) | session への複数 label 付与。核心は DR-0041 の tag で実装済み、実行中の追加/削除・kill の絞り込み等の残りの要否を kawaz 裁定 |
 | 2026-10-14 | bug | open | [suspend-resume-multidraw-claude-tui](./2026-10-14-bug-suspend-resume-multidraw-claude-tui.md) | hyoui run -- claude で Ctrl+Z → fg を繰り返すと banner が多重描画。DR-0029 で再現経路が消えた見込み、現版で再現確認して出なければ close |
-| 2026-10-09 | bug | open | [flood-frames-test-stalls-on-ubuntu](./2026-10-09-bug-flood-frames-test-stalls-on-ubuntu.md) | serve_admits_new_client_while_peer_floods_tiny_frames が ubuntu CI で落ちた (真因未調査、v0.16.2 のリリースを止めている) |
 | 2026-10-09 | bug | open | [cli-dies-silently-on-sigpipe-to-closed-session](./2026-10-09-bug-cli-dies-silently-on-sigpipe-to-closed-session.md) | 終わりかけの session に status / set / input を送ると、何も表示せず SIGPIPE で exit 141 になる |
 | 2026-10-09 | design | open | [child-state-check-starved-by-busy-client](./2026-10-09-design-child-state-check-starved-by-busy-client.md) | fd が毎周 Ready になる client が居る間、Timeout 時の子の状態確認が走らない (macOS で止まった子の復帰の検知が遅れる) |
 | 2026-10-09 | task | open | [session-log-viewer-and-cleanup](./2026-10-09-task-session-log-viewer-and-cleanup.md) | session ごとの daemon ログを CLI から見る手段 (hyoui log) と、溜まったログの片付け |

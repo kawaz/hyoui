@@ -6380,10 +6380,19 @@ mod tests {
     /// 1 つの client が小さな frame を送り続けている最中 (= decoder に揃った frame が
     /// 常に残り、poll を待たない周回が続く) でも、新しい client の handshake が取り込ま
     /// れ、その client の status が 1 秒以内に応答する。
+    ///
+    /// 観測: 「その間も flood の frame が処理されている」は、flood が受け取る
+    /// StatusResponse の client 一覧で数える。新 client は status.query と detach を 1 回の
+    /// write で送るので、daemon は新 client の登録から「status に応答した次の周回」まで
+    /// その client を一覧に載せる。一覧に新 client が載った flood への応答の数 = その間に
+    /// daemon が処理した flood の frame の数になる (daemon 側の順序なので、test 側の
+    /// reader thread がいつ読むかに左右されない。1 core では新 client の往復の間に reader
+    /// thread が走らないことがある)。
     #[test]
     fn serve_admits_new_client_while_peer_floods_tiny_frames() {
+        use crate::protocol::messages::{Detach, DetachTarget, StatusQuery};
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let (_sid, sock_path, _dir, handle) = spawn_serve_thread(long_running_cmd());
 
@@ -6391,26 +6400,32 @@ mod tests {
         let _ = do_client_handshake(&mut flood);
         let mut flood_rx = flood.try_clone().expect("clone flood");
 
-        // flood への応答を読み続けて数える (読まないと backpressure で切られる)。
-        // 最初の応答で「flood の処理が始まった」ことを通知する。
-        let answered = Arc::new(AtomicUsize::new(0));
+        // flood への応答を読み続ける (読まないと backpressure で切られる)。応答ごとに
+        // client 一覧に載った client id を数え、接続が閉じたら返す。最初の応答で
+        // 「flood の処理が始まった」ことを通知する。
         let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
-        let reader = {
-            let answered = Arc::clone(&answered);
-            std::thread::spawn(move || {
-                while let Ok(f) = Frame::decode_from(&mut flood_rx) {
-                    if f.ty == TYPE_CBOR_CONTROL
-                        && matches!(
-                            ControlMessage::decode_from(f.body.as_slice()),
-                            Ok(ControlMessage::StatusResponse(_))
-                        )
-                        && answered.fetch_add(1, Ordering::SeqCst) == 0
-                    {
+        let reader = std::thread::spawn(move || {
+            let mut listed: std::collections::HashMap<u64, usize> =
+                std::collections::HashMap::new();
+            let mut answered = 0usize;
+            while let Ok(f) = Frame::decode_from(&mut flood_rx) {
+                if f.ty != TYPE_CBOR_CONTROL {
+                    continue;
+                }
+                if let Ok(ControlMessage::StatusResponse(sr)) =
+                    ControlMessage::decode_from(f.body.as_slice())
+                {
+                    for c in &sr.clients {
+                        *listed.entry(c.client_id).or_default() += 1;
+                    }
+                    answered += 1;
+                    if answered == 1 {
                         let _ = started_tx.send(());
                     }
                 }
-            })
-        };
+            }
+            listed
+        });
         // 約 64KiB 分の最小級 frame を 1 回の write で送り続ける (= daemon の 1 回の recv に
         // 数千 frame 入る)。止めるまで送る。
         let stop = Arc::new(AtomicBool::new(false));
@@ -6438,15 +6453,29 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("flood must start being answered");
 
-        let before = answered.load(Ordering::SeqCst);
         let mut newcomer = client_connect_with_retry(&sock_path);
         newcomer
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("set read timeout");
         let resp = do_client_handshake(&mut newcomer);
         assert!(!resp.leader, "flood client is the leader");
-        let (elapsed, sr) = query_status(&mut newcomer);
-        let after = answered.load(Ordering::SeqCst);
+        let wire: Vec<u8> = [
+            encode_frame(&ControlMessage::StatusQuery(StatusQuery {})),
+            encode_frame(&ControlMessage::Detach(Detach {
+                target: DetachTarget::Myself,
+            })),
+        ]
+        .concat();
+        let sent = std::time::Instant::now();
+        newcomer.write_all(&wire).expect("send status + detach");
+        let sr = loop {
+            if let Incoming::Control(ControlMessage::StatusResponse(sr)) =
+                read_incoming(&mut newcomer, "status.query")
+            {
+                break sr;
+            }
+        };
+        let elapsed = sent.elapsed();
         assert!(
             elapsed < Duration::from_secs(1),
             "status must answer within 1s while a peer floods, took {elapsed:?}"
@@ -6456,22 +6485,26 @@ mod tests {
             !writer.is_finished(),
             "flood must still be in progress during the newcomer's handshake"
         );
-        assert!(
-            after > before,
-            "flood frames were being processed meanwhile ({before} -> {after})"
-        );
 
         stop.store(true, Ordering::SeqCst);
+        let _ = join_with_deadline(writer, Duration::from_secs(10), "flood writer");
+        let mut killer = client_connect_with_retry(&sock_path);
+        let _ = do_client_handshake(&mut killer);
         send_control_frame(
-            &mut newcomer,
+            &mut killer,
             ControlMessage::Kill(Kill {
                 signal: None,
                 wait: true,
             }),
         );
         let _ = join_with_deadline(handle, Duration::from_secs(10), "serve after kill");
-        let _ = join_with_deadline(writer, Duration::from_secs(10), "flood writer");
-        join_with_deadline(reader, Duration::from_secs(10), "flood reader");
+        let listed = join_with_deadline(reader, Duration::from_secs(10), "flood reader");
+        let meanwhile = listed.get(&resp.client_id).copied().unwrap_or(0);
+        assert!(
+            meanwhile > 0,
+            "flood frames were being processed while the newcomer was attached \
+             ({meanwhile} flood responses listed the newcomer)"
+        );
     }
 
     /// decoder に揃った frame を poll を待たずに処理している最中 (= socket は空で、poll(0)
