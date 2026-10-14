@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-10-14 | design | open | [cli-restructure](./2026-10-14-design-cli-restructure.md) | CLI 全体の整理の素材 (現状の採取 + 引数なし / 語彙 / 群 / set と tag / env 集約 / help 節構成 / 補完 / DR-0006 の観点別対照表)。裁定点 CLI-R1〜R18 を kawaz 裁定 |
 | 2026-10-14 | task | open | [dr0042-failure-path-experiments](./2026-10-14-task-dr0042-failure-path-experiments.md) | DR-0042 の失敗経路 1〜3 を実際に失敗させて確かめる (removal check で未検証、進め方は kawaz 判断) |
 | 2026-10-14 | bug | open | [daemon-inherits-ignored-sigchld-linux](./2026-10-14-bug-daemon-inherits-ignored-sigchld-linux.md) | daemon が呼び出し元の SIGCHLD 無視を引き継ぐと Linux で早期終了した子が自動回収され exit 0 を報告しうる。未検証、Linux 版で確認 |
 | 2026-10-14 | task | open | [salvaged-patches-adoption](./2026-10-14-task-salvaged-patches-adoption.md) | 旧構成から回収した patch 2 件 (poll_until refactor / attach marker 再現 test) の採否。置き場は artifacts の salvage-old-bare-20261010/ |
