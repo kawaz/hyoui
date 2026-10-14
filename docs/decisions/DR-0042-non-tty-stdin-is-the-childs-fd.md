@@ -1,6 +1,6 @@
 # DR-0042: 非 tty の stdin は子の fd 0 にそのまま渡し、PTY は制御端末と出力にだけ使う
 
-- Status: ✅ 実装済 (2026-10-06)。決定 1〜5 は裁定済み (STDIN-Q1 の α / β / γ とも a、kawaz 2026-10-06)。決定 6 (失敗時は起動・接続を拒否する) はレビュー指摘を受けた統括の方針 (2026-10-06)。e2e は `crates/hyoui-cli/tests/stdin_pipe_through.rs`。`--detached` 時の呼び出し元 stdout / stderr の扱いは issue `2026-10-08-bug-run-detached-pty-stdin-holds-caller-pipes` で未決
+- Status: ✅ 実装済 (2026-10-06)。決定 1〜5 は裁定済み (STDIN-Q1 の α / β / γ とも a、kawaz 2026-10-06)。決定 6 (失敗時は起動・接続を拒否する) はレビュー指摘を受けた統括の方針 (2026-10-06)。e2e は `crates/hyoui-cli/tests/stdin_pipe_through.rs`。daemon の stdout / stderr の扱い (ready 前に fd 2 を session log へ付け替える) は DR-0037 Q3 が正本
 - Date: 2026-10-06
 - Supersedes (部分): DR-0019 §5 (pipe-through: 非 tty stdin の EOF で EOT を送る、`--stdin-eof`、2026-10-05 の注記と「Update: `--detached` でも非 tty stdin を子に届ける」)
 - Related: DR-0005 (透過原則), DR-0014 (介入 self-check と検証主義), DR-0015 (run = fork daemon + exec attach), DR-0017 (session anchor: daemon が制御端末を持ち、子を同 session の foreground にする), DR-0028 (upgrade の self-exec と継承 fd), DR-0029 (attach は覗き窓、Ctrl+Z ガード), DR-0016 (record の `in` event), DR-0039 決定 1 (gateway からログイン shell を作る)

@@ -1,18 +1,18 @@
 ---
 title: run --detached --pty-stdin を $(...) 内で起動すると子が生きている間コマンド置換が返らない
-status: open
+status: resolved
 category: bug
 created: 2026-10-08T19:00:44+09:00
-last_read:
+last_read: 2026-10-14T12:00:00+09:00
 open_entered: 2026-10-08T19:00:44+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-14T12:00:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: 観測は正しい。v0.14.0 を隔離 build して再現し、lsof で daemon の stderr (fd 2) が呼び出し元の pipe を握っていたことを確認 (daemon stdout は /dev/null、子は pipe を持たない)。0.16.4 では DR-0037 Q3 / 段階 2 (2026-10-09) で ready 前に fd 2 を session log へ付け替えるため、--pty-stdin 有無 × sleep/bash -i/true × $(…)/pipe/file の 18 セルすべて子の生存中に返る。stdout/stderr の扱いは DR-0037 Q3 が仕様
 blocked_by:
 origin: claude-ccmsg (ccmsg v1)
 ---

@@ -14,7 +14,6 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 | 2026-10-09 | design | open | [client-partial-frame-buffer-unbounded](./2026-10-09-design-client-partial-frame-buffer-unbounded.md) | client ごとの受信途中 buffer に合計の上限が無い (DR-0037 段 1 の後、1 client 最大 16MiB) |
 | 2026-10-09 | bug | pending | [child-action-menu-closed-by-echoed-ctrl-z](./2026-10-09-bug-child-action-menu-closed-by-echoed-ctrl-z.md) | 子が ^Z をエコーする時 (cat 等)、^Z×2 で出た child action menu がキーを受け付けず子へ素通りする |
 | 2026-10-09 | bug | open | [serve-backpressure-test-hang](./2026-10-09-bug-serve-backpressure-test-hang.md) | serve_backpressure_disconnects_slow_client が負荷下で 150 回超に 1 回、kill 後の serve の終了待ちでハングする (真因未特定) |
-| 2026-10-08 | bug | open | [run-detached-pty-stdin-holds-caller-pipes](./2026-10-08-bug-run-detached-pty-stdin-holds-caller-pipes.md) | run --detached --pty-stdin を $(...) 内で起動すると子が生きている間コマンド置換が返らない (呼び出し元 pipe を保持か、推測) |
 | 2026-10-07 | task | open | [remove-namespace-option-shim](./2026-10-07-task-remove-namespace-option-shim.md) | 廃止した namespace の option を受け付けて捨てる処理を 2026-11 に消す |
 | 2026-10-06 | design | open | [external-detach-reported-as-connection-lost](./2026-10-06-design-external-detach-reported-as-connection-lost.md) | 外から `hyoui detach` された attach client が「接続が失われました」で exit 9 になり、daemon の消滅と区別できない (DR-0042 の端末なし attach で主な終わり方になる) |
 | 2026-10-06 | design | open | [daemon-unaware-of-unlinked-socket](./2026-10-06-design-daemon-unaware-of-unlinked-socket.md) | session の socket file が消えても daemon は気付かず、誰も到達できないまま子と一緒に残り続ける (テストの残骸 49 個で観測) |
