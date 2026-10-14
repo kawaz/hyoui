@@ -18,13 +18,6 @@
 
 ## 裁定待ち
 
-### 👺SIG-Q2: 子を起動する時、SIGCHLD の無視も既定に戻すか
-
-SIG-Q1 で既定に戻す 6 つ (SIGINT / SIGQUIT / SIGTSTP / SIGTTIN / SIGTTOU / SIGPIPE) に SIGCHLD を足すか ([DR-0043](decisions/DR-0043-child-starts-with-default-signals.md))。呼び出し元が SIGCHLD を無視 (SIG_IGN) していると子に引き継がれ、子が自分の子を `wait` で回収できなくなる (POSIX: SIGCHLD が無視されている時、終わった子は zombie にならず wait は ECHILD)。tmux は子を起動する時に SIGCHLD も既定に戻している。統括推しは a (shell や make のように子を回収する子が、呼び出し元の事情で壊れる。既定に戻して困る子は無い)。
-
-- [ ] a: SIGCHLD も既定に戻す
-- [ ] b: 足さない (裁定どおり 6 つ)
-
 ### 👺NB-Q4: 固まった daemon の検出をどこまで入れるか
 
 DR-0037 「固まった daemon の検出」節の 3 層。統括推しは c (1 は list-prune で実装中、2 は原因究明に必須、3 は有界な占有の可視化で安い)。
@@ -32,13 +25,6 @@ DR-0037 「固まった daemon の検出」節の 3 層。統括推しは c (1 �
 - [ ] a: 1 (CLI 側の stale / hung / live 分類) のみ
 - [ ] b: 1 + 2 (daemon 内 watchdog がループ停滞をログ)
 - [ ] c: 1 + 2 + 3 (status に直近 1 周の最大所要時間と最終周回からの経過も載せる)
-
-### 👺NB-Q7: reap できない子を置いて daemon が終わる時の exit code
-
-[DR-0037](decisions/DR-0037-daemon-nonblocking-event-loop.md) Q4。SIGKILL を送っても deadline までに reap できない子 (D state 等) を置いて daemon が終了する時、exit code を何にするか。統括推しは b (`128 + 9` は「子が SIGKILL で死んだ」と読めるが、実際には死を見届けていない。区別できないと、子が残っていることに気づけない)。
-
-- [ ] a: 現行どおり `128 + 9`
-- [ ] b: 別の値で区別する (値は実装時に、既存の exit code と重ならないものを選ぶ)
 
 ### 👺NB-Q8: fs が応答せず戻らない IO worker の扱い
 

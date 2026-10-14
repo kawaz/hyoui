@@ -1,6 +1,6 @@
 # DR-0037: daemon のイベントループは外部の応答を待たない
 
-- Status: Proposed (2026-09-29) — 🟡 段階 1・2・4 実装済。Q1 / Q2 / Q3 / Q8 と段階 1 の着手は裁定済み (2026-10-09、「裁定」節)。段階 2 (標準エラーの付け替え + logger) は実装済み (2026-10-09、「標準エラーとログ」節)。段階 4 (client 送信の loop 内 nonblocking 化と writer thread の廃止) は実装済み (2026-10-09、「送信 queue」節)。Q4〜Q7 は「裁定待ち」節
+- Status: Proposed (2026-09-29) — 🟡 段階 1・2・4 実装済。Q1 / Q2 / Q3 / Q8 と段階 1 の着手は裁定済み (2026-10-09、「裁定」節)。段階 2 (標準エラーの付け替え + logger) は実装済み (2026-10-09、「標準エラーとログ」節)。段階 4 (client 送信の loop 内 nonblocking 化と writer thread の廃止) は実装済み (2026-10-09、「送信 queue」節)。Q4 (reap できない子の exit code) は裁定済み (2026-10-14、「裁定」節)、K-5 (SIGKILL 後の reap の期限) は実装済み (2026-10-14、「kernel 同期 API の扱い」節)。Q5〜Q7 は「裁定待ち」節
 - Date: 2026-09-29
 - Related: DR-0025 (reducer 化。単一 thread の `poll → translate → reduce → effect` loop と EffectResult feedback を本 DR が前提にする), DR-0014 (透過原則と検証主義。検出手段で介入をどこまで入れるかの判断軸), DR-0021 (PTY drain ack。PTY write の非同期化で ack の発行点を保つ必要がある), DR-0016 (record。writer thread と stop / abort の扱い), DR-0028 (graceful upgrade。state file 書き出しと fd 引き継ぎ), DR-0015 (fork daemon + attach client。daemon の stdio の出どころ)
 - Origin: `docs/issue/2026-09-29-daemon-must-never-hang.md` (kawaz 裁定 2026-09-29)。事実は `docs/findings/2026-09-29-daemon-blocking-points.md`
@@ -153,7 +153,19 @@ I-1 の 3 に当たるもの。各 API について、serve loop で呼んでよ
 | `/dev/urandom` の open + 16 bytes read (lock token 生成、lock.acquire 時) | lock.acquire | random(4) (Linux): urandom の read は初期化後 block しない。macOS random(4): urandom は random と同じで block しない。open は devfs の character device。I-1 の kernel 同期 API として扱い、`getrandom(2)` / `getentropy(3)` に置き換えられるならそちらを使う (path open を無くせる) |
 | `tcsetpgrp` | forkpty 後、exec 前の子プロセス内だけ (`sys/raw.rs`) | serve loop からは呼ばない。子側で呼ぶため loop の不変条件の対象外 |
 
-SIGKILL 後の reap (K-5): 現行は flag なしの `waitpid` で見届ける。D state の子に対しては戻らない。I-1 に合わせ、SIGKILL 後も WNOHANG + deadline で確認し、deadline を過ぎたら reap せずに daemon を終了する (daemon が消えると子は init / launchd に引き取られて回収される)。この場合の exit code の扱いは裁定待ち Q4。
+SIGKILL 後の reap (K-5): flag なしの `waitpid` は D state の子に対して戻らないので、I-1 に合わせ、SIGKILL 後も WNOHANG + deadline で確認し、deadline を過ぎたら reap せずに daemon を終了する (daemon が消えると子は init / launchd に引き取られて回収される)。実装は `finalize_child` の SIGKILL 昇格後の `reap_after_kill` で、deadline は 2 秒 (`FINALIZE_KILL_DEADLINE`。SIGKILL 後の reap は通常数 ms、大きな address space の後始末で数百 ms かかる分の余裕。SIGTERM の grace 5 秒と合わせても `hyoui kill --wait` の既定 timeout 10 秒に収まる)。確認は SIGTERM の grace (K-4) と同じ 20ms 間隔の polling で、serve loop を抜けた後の終了処理で行う (loop 内の state 化は段階 6)。
+
+deadline を過ぎて reap せずに終わる時の exit code は **125** (裁定 Q4、定数 `EXIT_CHILD_UNREAPED`)。`session.exit.notify` の `exit_status` として client に届き、`hyoui run` / `attach` の exit code になる (daemon process 自身の exit status は serve が正常に戻れば 0 のままで、子の exit code を載せない)。値は、実装が使っている次の exit code と重ならないものを選んだ (2026-10-14 時点の grep):
+
+| exit code | 出どころ |
+|---|---|
+| 子の exit code (0〜255) | `session.exit.notify` の `exit_status` を `hyoui run` / `attach` がそのまま返す。signal 死は `128 + signum` (`finalize_child`、130 / 137 / 143 等。Linux の realtime signal まで含めると 129〜192) |
+| 127 | 子が exec / chdir に失敗した時の `_exit(127)` (`sys/raw.rs` の anchor 経路と legacy 経路) |
+| 143 / 0 | `finalize_child` が reap 済み (ECHILD) を見た時の代わりの値 (SIGTERM で終わらせた経路は 143、子が自分で終わった経路は 0) |
+| 1 / 2 / 3 / 4 | hyoui 自身の失敗 (1 = 一般、2 = usage・parse、3 = `kill --wait` の timeout と `wait` の daemon error、4 = `set` で daemon が `set-v1` を持たない)。`ExitCode::from(1)` 138 箇所、`(2)` 34 箇所、`(3)` 3 箇所、`(4)` 1 箇所 |
+| 9 | `hyoui run` / `attach` が daemon との接続を予期せず失った (`EXIT_CONNECTION_LOST`) |
+
+125 は shell の 126 (実行できない) / 127 (見つからない) と signal 死の `128 + signum` の手前で、GNU coreutils の `env` / `timeout` / `nice` 等や `docker run` が「ラッパー自身の失敗で、コマンドの終了状態を報告できない」に使う値でもあり、「子の終了を見届けられなかった」と意味が近い。exit code は u8 なので、子が自分で 125 で終わった場合とは exit code だけでは区別できない (どの値を選んでも子の exit code の空間と重なる)。daemon はこの時、子の pid をログに 1 行書く。
 
 ## 固まった daemon の検出
 
@@ -197,7 +209,7 @@ SIGKILL 後の reap (K-5): 現行は flag なしの `waitpid` で見届ける。
 | `--debug-dump` 先が読み手の止まった FIFO | cat | — |
 | record の出力先への書き込みが進まない (FIFO を使えない create_new の制約があるため、worker に注入点を設けて再現する) | cat | — |
 | 標準エラーが読まれない pipe | cat | 段階 2: e2e `merged_capture_returns_when_the_parent_exits` ほか `daemon_stderr_log.rs` (daemon は ready の後に呼び出し元の stderr を持たない) |
-| SIGKILL 後も reap できない子 (注入点で再現) | — | — |
+| SIGKILL 後も reap できない子 (注入点で再現) | — | K-5: unit `reap_after_kill_gives_up_with_its_own_exit_code_past_the_deadline` (`waitpid(WNOHANG)` の代わりに常に「まだ生きている」を返す注入点で期限を超えさせ、`EXIT_CHILD_UNREAPED` (≠ `128 + 9`) が返る)、`reap_after_kill_reports_the_kill_when_reaped_in_time` (期限内に reap できれば `128 + 9`)、`reap_after_kill_reaps_a_real_killed_child` (実際の子を SIGKILL して `waitpid(WNOHANG)` の経路で `128 + 9`)。serve の応答性は終了処理の段なので対象外 (loop を抜けた後) |
 
 ## 裁定
 
@@ -209,9 +221,12 @@ SIGKILL 後の reap (K-5): 現行は flag なしの `waitpid` で見届ける。
 - **Q8 表示名**: `no-response` (観測事実の名前。「止まっている可能性が高い」は help に推定として書く)
 - **段階 1 (client 受信の nonblocking 化)** は着手してよい
 
+2026-10-14 kawaz 裁定:
+
+- **Q4 reap できない子の exit code**: `128 + 9` と区別できる別の値にする (`128 + 9` は「子が SIGKILL で死んだ」と読めるが、実際には死を見届けていない。区別できないと子が残っていることに気づけない)。値は既存の exit code と重ならない 125 (「kernel 同期 API の扱い」節)
+
 ## 裁定待ち
 
-- **Q4 reap できない子**: SIGKILL 後 deadline を過ぎても reap できない子を置いて daemon が終了するときの exit code (現行の `128 + 9` とするか、別の値で区別するか)
 - **Q5 検出**: 検出節の 3 層 (CLI 側の `no-response` 分類 / watchdog のログ / status の占有指標) のうちどこまで入れるか。CLI 側の分類は必須と考える
 - **Q6 固まった IO worker**: fs が応答せず worker が戻らない場合に、worker thread の上限を設けるか (上限到達で `record.start` を拒否する等)、record を aborted として表示するか
 - **Q7 PTY 書き込み effect の失敗意味論と後続 raw_data**: 「PTY 書き込み effect の完了と失敗」節の 5 点 (残余破棄、後続 effect の書かずに破棄、draining の deadline 200ms と超過時に client が ack でなく EOF を見ること) をこのまま確定してよいか。あわせて、同一 client の raw_data が前の effect の完了前に来たとき queue に積むか拒否するか。client 間の順序は DR-0022 の auto-lock が保証し、ここで決めるのは同一 client 内の扱い

@@ -1,6 +1,6 @@
 # DR-0043: 子は前景の job として、既定の signal の扱いと空の mask で exec する
 
-- Status: ✅ 実装済 (2026-10-09)。SIG-Q1 = a (kawaz 裁定 2026-10-09)。決定 5 (RLIMIT_CORE) と決定 6 (daemon 自身の mask) も実装済
+- Status: ✅ 実装済 (2026-10-09)。SIG-Q1 = a (kawaz 裁定 2026-10-09)。SIG-Q2 = a (kawaz 裁定 2026-10-14、SIGCHLD を決定 1 に含める)。決定 5 (RLIMIT_CORE) と決定 6 (daemon 自身の mask) も実装済
 - Date: 2026-10-09
 - Related: DR-0042 (hyoui は子に対して bash の位置に立つ), DR-0017 (session anchor: 子を daemon と同じ session の foreground pgrp にする), DR-0014 (介入 self-check と検証主義), DR-0005 (透過原則), DR-0015 (run = fork daemon + attach)
 - Origin: `docs/issue/2026-10-09-design-child-inherits-ignored-signals.md` (観測と SIG-Q1 の裁定)、`docs/issue/2026-10-09-bug-child-inherits-zero-core-limit.md` (決定 5)、`docs/issue/2026-10-09-bug-daemon-inherits-blocked-signal-mask.md` (決定 6)
@@ -22,7 +22,7 @@ daemon は R5-H12 (daemon のメモリにある lock_token 等の secret を cor
 
 - **既存 DR で justify されているか**: DR-0042 で「hyoui は子に対して bash の位置に立ち、bash と同じように配線する」と決めた。本 DR はその配線の対象を signal の扱いと mask に広げる。spawn の構造 (DR-0017) は変えない
 - **必然か**: 透過の基準を「端末で起動された時と同じ」に置く。子は PTY を制御端末に持つ対話のプロセスとして起動されるので、端末から起動された前景の job と同じ signal の扱いで始まるのが透過になる。今のままだと ^Z / ^C が効かない、`kill -TERM` で終わらない、の実害が出ている。直接実行で `$(cmd)` とした時に cmd が無視を引き継ぐのは、cmd が端末の前景の job ではないからで、hyoui の子とは立場が違う
-- **最小介入か**: 戻すのは、端末の前景の job が既定で受け取る signal (SIGINT / SIGQUIT / SIGTSTP / SIGTTIN / SIGTTOU) と、hyoui 自身が無視にする SIGPIPE の 6 つと mask だけ。一覧の外の無視 (`nohup` の SIGHUP 等) は `execve` の規定どおり子に引き継ぐ (決定 3)
+- **最小介入か**: 戻すのは、端末の前景の job が既定で受け取る signal (SIGINT / SIGQUIT / SIGTSTP / SIGTTIN / SIGTTOU) と、hyoui 自身が無視にする SIGPIPE と、無視されていると子が自分の子を回収できなくなる SIGCHLD の 7 つと mask だけ。一覧の外の無視 (`nohup` の SIGHUP 等) は `execve` の規定どおり子に引き継ぐ (決定 3)
 - **kernel / PTY / shell の再発明でないか**: signal の配送と既定の動作 (停止・終了) は kernel のもの。hyoui は exec の前に扱いを既定にするだけで、signal を中継・合成しない
 - **partial state を hyoui の裁量で破棄する介入か**: 該当しない。子の状態を読んで判定するものが無い
 - **新 protocol message / cap flag**: 無し
@@ -32,9 +32,11 @@ daemon は R5-H12 (daemon のメモリにある lock_token 等の secret を cor
 
 ## Decision
 
-### 1. 6 つの signal を既定に戻す
+### 1. 7 つの signal を既定に戻す
 
-子は exec の前に SIGINT / SIGQUIT / SIGTSTP / SIGTTIN / SIGTTOU / SIGPIPE の扱いを既定 (SIG_DFL) にする。anchor 経路 (`openpty_fork_anchor_exec`) とテスト用の legacy 経路 (`forkpty_then_exec_legacy`) の両方で行う。
+子は exec の前に SIGINT / SIGQUIT / SIGTSTP / SIGTTIN / SIGTTOU / SIGPIPE / SIGCHLD の扱いを既定 (SIG_DFL) にする。anchor 経路 (`openpty_fork_anchor_exec`) とテスト用の legacy 経路 (`forkpty_then_exec_legacy`) の両方で行う。
+
+SIGCHLD を含める理由: 呼び出し元が SIGCHLD を無視にしていると子に引き継がれ、子が自分の子を `wait` で回収できなくなる (POSIX `wait` / `sigaction` (XSH): SIGCHLD が SIG_IGN の時、終わった子は zombie にならず、`wait` は全ての子が終わるまで待ってから ECHILD で失敗する)。shell や make のように子を回収するプログラムが、呼び出し元の事情で壊れる。実測 (2026-10-14): Linux (python:3-slim、kernel 7.0) では、SIGCHLD を無視にした呼び出し元から exec した python の `waitpid` が ECHILD になる。macOS (Darwin 25.5) では exec をまたいで引き継いだ無視は扱いとしては無視のまま見えるが回収は効き、同じ process の中で無視にした時だけ ECHILD になる。OS で効き方が違っても、扱いを既定に戻せばどちらでも回収できる。perl は起動時に無視の SIGCHLD を既定に戻す ("Can't ignore signal CHLD, forcing to default") ので、perl の子だけは呼び出し元の設定に関わらず回収できる。tmux も pane の子の exec の前に SIGCHLD を既定に戻す (`proc_clear_signals`)。既定に戻して困る子は無い (SIGCHLD の既定の動作は無視と同じく何もしないことで、違いは終わった子が zombie として回収を待つことだけ)。
 
 ### 2. signal mask を空にする
 
@@ -50,7 +52,7 @@ fork から exec までの子の手順は次の順にする。どれも async-si
 
 1. 親から継承した self-pipe の handler を無効にする (`disarm_self_pipe_in_child`)。fork の前に `block_handled_signals` で block した signal は、まだ block のまま
 2. (anchor 経路のみ) `setpgid(0, 0)` で新しい pgrp になり、SIGTTOU を一時的に無視して `tcsetpgrp` で自分を foreground にする
-3. `RLIMIT_CORE` を呼び出し元の値に戻し (決定 5、`restore_caller_core_limit_for_exec`)、6 つの signal と、親から継承した hyoui の handler (self-pipe / SIGWINCH の handler) が張られた signal を既定に戻してから、mask を空にする (`reset_signals_for_exec`)
+3. `RLIMIT_CORE` を呼び出し元の値に戻し (決定 5、`restore_caller_core_limit_for_exec`)、7 つの signal と、親から継承した hyoui の handler (self-pipe / SIGWINCH の handler) が張られた signal を既定に戻してから、mask を空にする (`reset_signals_for_exec`)
 4. fd の dup2、chdir、exec
 
 理由:
@@ -94,14 +96,15 @@ daemon 自身の signal の扱い (無視・handler) と、決定 6 の一覧の
 
 - `I=$(hyoui run --detached -- cat)` の子が ^Z / `kill -TSTP` で止まり、`sh -c 'hyoui run --detached -- cat &'` の子が SIGINT で終わる
 - 子は SIGPIPE が既定で始まる。読み手の去った pipe に書いた子は、端末で直接実行した時と同じく SIGPIPE で終わる
+- 呼び出し元が SIGCHLD を無視していても、子 (shell / make 等) は自分の子を `wait` で回収して exit code を得られる
 - 呼び出し元が block していた SIGTERM 等は子の mask に残らない
 - SIGTERM 等を block した呼び出し元から起動した daemon も、`kill -TERM <daemon>` で graceful shutdown する
 - 子は呼び出し元の `RLIMIT_CORE` で始まり、直接実行と同じく core を出せる・`ulimit -c` で上げられる。daemon の core は soft 0 で書かれないまま
 
 ## 検証
 
-- unit (legacy 経路): `sys::signal::tests::spawned_child_starts_with_default_signals_and_empty_mask`。test process で 6 つ + SIGHUP を無視、SIGTERM / SIGUSR2 を block してから `Pty::spawn` し、子の perl に `%SIG` と `sigprocmask` を報告させる
-- e2e (anchor 経路、daemon 経由): `crates/hyoui-cli/tests/child_signal_defaults.rs`。無視・block した呼び出し元と、何も変えていない呼び出し元 (SIGPIPE が既定になることを見る) の 2 セル
+- unit (legacy 経路): `sys::signal::tests::spawned_child_starts_with_default_signals_and_empty_mask`。test process で SIGCHLD を除く 6 つ + SIGHUP を無視、SIGTERM / SIGUSR2 を block してから `Pty::spawn` し、子の perl に `%SIG` と `sigprocmask` を報告させる。SIGCHLD は test process 全体で無視にすると、その間に終わった他の test の子が自動で回収されて他の test の `waitpid` が ECHILD になるので、別 process の e2e で見る (戻す一覧は両経路で同じ定数 `CHILD_DEFAULT_SIGNALS`)
+- e2e (anchor 経路、daemon 経由): `crates/hyoui-cli/tests/child_signal_defaults.rs`。7 つ + SIGHUP を無視・SIGTERM / SIGUSR2 を block した呼び出し元と、何も変えていない呼び出し元 (SIGPIPE が既定になることを見る) の 2 セルを perl の子で見る。SIGCHLD は perl が起動時に既定へ戻してしまうので、別セル `child_resets_sigchld_ignored_by_the_caller` で python の子に扱いと、自分の子を `waitpid` で回収した exit code を報告させる (`CHLD=DFL reap=7`)。本 DR の SIGCHLD を外した版では macOS で `CHLD=IGNORE reap=7` になり fail する (macOS は引き継いだ無視で回収が効くので、扱いの報告で見分ける)
 - unit (継承した handler): `sys::signal::tests::reset_drops_inherited_own_handlers_but_keeps_inherited_ignores`。SIGUSR1 に self-pipe の handler、SIGHUP に無視を張って fork し、子で `disarm_self_pipe_in_child` → `reset_signals_for_exec` の後の扱いを見る (SIGUSR1 は既定、SIGHUP は無視のまま)
 - e2e (決定 6): `crates/hyoui-cli/tests/daemon_signal_mask.rs`。SIGTERM / SIGHUP を block した perl から `hyoui run --detached` で起動した daemon に `kill -TERM` を送り、ro で handshake した接続が期限内に EOF になる (= daemon が graceful shutdown で終わる)。修正を外した版では期限 (10 秒) まで EOF が来ない
 - e2e (決定 6、web daemon): `crates/hyoui-cli/tests/web_daemon_signal_mask.rs`。SIGTERM / SIGINT / SIGHUP を block した perl から起動した `web daemon run` (listen し始めた後) と `supervise` (制御 socket に繋がった後) に `kill -TERM` を送り、期限内に終わる。修正を外した版では期限 (10 秒) まで終わらない
@@ -111,7 +114,7 @@ daemon 自身の signal の扱い (無視・handler) と、決定 6 の一覧の
 
 ### 3 category のマトリクス (DR-0014、実機 2026-10-09、macOS)
 
-呼び出し元は 6 つの signal を無視にして hyoui を exec する (perl で `$SIG{...}='IGNORE'` してから `hyoui run --detached --pty-stdin -- <app>`、`$(...)` / `cmd &` の代わり)。前景の ^Z は `hyoui input <id> key:C-z` (PTY の line discipline か app 自身が SIGTSTP にする)、外からの signal は子の pid への `kill`。値は 2 秒以内に観測した `ps -o stat` (`gone` は終わった)。0.14.0 は本 DR の変更を含まない版。
+呼び出し元は SIGCHLD を除く 6 つの signal を無視にして hyoui を exec する (perl で `$SIG{...}='IGNORE'` してから `hyoui run --detached --pty-stdin -- <app>`、`$(...)` / `cmd &` の代わり)。前景の ^Z は `hyoui input <id> key:C-z` (PTY の line discipline か app 自身が SIGTSTP にする)、外からの signal は子の pid への `kill`。値は 2 秒以内に観測した `ps -o stat` (`gone` は終わった)。0.14.0 は本 DR の変更を含まない版。
 
 | app (category) | 期待 | 0.14.0: ^Z / kill -TSTP / kill -INT | 本 DR: ^Z / kill -TSTP / kill -INT |
 |---|---|---|---|
