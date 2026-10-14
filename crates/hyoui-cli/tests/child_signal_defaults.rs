@@ -1,10 +1,11 @@
 //! DR-0043 e2e: daemon (anchor 経路) が起こした子は、SIGINT / SIGQUIT / SIGTSTP / SIGTTIN /
-//! SIGTTOU / SIGPIPE が既定 (SIG_DFL) で、signal mask が空の状態で始まる。呼び出し元が無視・
-//! block していた設定も、hyoui 自身 (Rust の runtime が SIGPIPE を無視にする) の設定も子に
-//! 届かない。一覧の外 (SIGHUP) の無視は直接実行と同じく引き継ぐ。
+//! SIGTTOU / SIGPIPE / SIGCHLD が既定 (SIG_DFL) で、signal mask が空の状態で始まる。呼び出し元
+//! が無視・block していた設定も、hyoui 自身 (Rust の runtime が SIGPIPE を無視にする) の設定も
+//! 子に届かない。一覧の外 (SIGHUP) の無視は直接実行と同じく引き継ぐ。
 //!
 //! 子は perl で、自分の `%SIG` と `sigprocmask` を 1 行にして FIFO に書く (= `/proc` の無い
-//! macOS でも子の中から見える)。FIFO は test 側が子の起動前に O_RDWR で開いて持つので、子の
+//! macOS でも子の中から見える)。SIGCHLD だけは python で見る (perl は起動時に、無視になって
+//! いる SIGCHLD を既定に戻してしまう)。FIFO は test 側が子の起動前に O_RDWR で開いて持つので、子の
 //! open は読み手待ちで止まらず、`poll` の期限で「報告が来なかった」を判定できる。
 
 mod common;
@@ -28,17 +29,35 @@ open(my $f, '>', $ARGV[0]) or die "open: $!";
 print $f join(' ', @r), ' mask=', join(',', grep { $old->ismember($_) } 1..31), "\n";
 close $f;"#;
 
-/// 呼び出し元の役: 6 つ + SIGHUP を無視にし、SIGTERM / SIGUSR2 を block して `@ARGV` を exec
+/// 子に SIGCHLD の扱いと、自分の子 (`_exit(7)`) を `waitpid` で回収した結果を `sys.argv[1]`
+/// (FIFO) へ 1 行で報告させる python。python は起動時に SIGCHLD を触らないので、引き継いだ扱い
+/// がそのまま見える。SIGCHLD が無視のままだと、Linux では終わった子が zombie にならず
+/// `waitpid` が ECHILD になる (macOS は exec をまたいで引き継いだ無視では回収が効くので、
+/// 扱いの報告で見分ける)。
+const CHLD_PROBE: &str = r#"import os, signal, sys
+h = signal.getsignal(signal.SIGCHLD)
+name = {signal.SIG_DFL: 'DFL', signal.SIG_IGN: 'IGNORE'}.get(h, 'HANDLER')
+pid = os.fork()
+if pid == 0:
+    os._exit(7)
+try:
+    reap = os.WEXITSTATUS(os.waitpid(pid, 0)[1])
+except ChildProcessError:
+    reap = 'ECHILD'
+with open(sys.argv[1], 'w') as f:
+    f.write(f'CHLD={name} reap={reap}\n')"#;
+
+/// 呼び出し元の役: 7 つ + SIGHUP を無視にし、SIGTERM / SIGUSR2 を block して `@ARGV` を exec
 /// する perl (= `$(...)` の中や非対話 shell の `cmd &` から起動された hyoui を作る)。
 const IGNORING_CALLER: &str = r#"use POSIX qw(:signal_h);
-$SIG{$_} = 'IGNORE' for qw(INT QUIT TSTP TTIN TTOU PIPE HUP);
+$SIG{$_} = 'IGNORE' for qw(INT QUIT TSTP TTIN TTOU PIPE CHLD HUP);
 sigprocmask(SIG_BLOCK, POSIX::SigSet->new(SIGTERM, SIGUSR2)) or die "sigprocmask: $!";
 exec { $ARGV[0] } @ARGV or die "exec: $!";"#;
 
-/// 呼び出し元の役: 7 つを既定にし、mask を空にして `@ARGV` を exec する perl (= test を
-/// 走らせる環境の設定に依らず、何も変えていない呼び出し元を作る)。
+/// 呼び出し元の役: 7 つ + SIGHUP を既定にし、mask を空にして `@ARGV` を exec する perl (=
+/// test を走らせる環境の設定に依らず、何も変えていない呼び出し元を作る)。
 const DEFAULT_CALLER: &str = r#"use POSIX qw(:signal_h);
-$SIG{$_} = 'DEFAULT' for qw(INT QUIT TSTP TTIN TTOU PIPE HUP);
+$SIG{$_} = 'DEFAULT' for qw(INT QUIT TSTP TTIN TTOU PIPE CHLD HUP);
 sigprocmask(SIG_SETMASK, POSIX::SigSet->new) or die "sigprocmask: $!";
 exec { $ARGV[0] } @ARGV or die "exec: $!";"#;
 
@@ -66,24 +85,14 @@ impl Cell {
         Self { dir, fifo }
     }
 
-    /// `[caller...] hyoui run --detached --pty-stdin -- perl -e PROBE <fifo>` を実行し、
+    /// `[caller...] hyoui run --detached --pty-stdin -- [probe...] <fifo>` を実行し、
     /// `hyoui run` の終了 (= ready 通知後の親の exit) を待つ。
-    fn run_detached(&self, caller: &[&str]) {
+    fn run_detached(&self, caller: &[&str], probe: &[&str]) {
         let fifo = self.dir.path().join("report.fifo");
         let mut argv: Vec<String> = caller.iter().map(|s| (*s).to_string()).collect();
         argv.push(hyoui_bin().display().to_string());
-        argv.extend(
-            [
-                "run",
-                "--detached",
-                "--pty-stdin",
-                "--",
-                "perl",
-                "-e",
-                PROBE,
-            ]
-            .map(str::to_string),
-        );
+        argv.extend(["run", "--detached", "--pty-stdin", "--"].map(str::to_string));
+        argv.extend(probe.iter().map(|s| (*s).to_string()));
         argv.push(fifo.display().to_string());
         let out = common::pty::capture_with_deadline(
             Command::new(&argv[0])
@@ -122,12 +131,13 @@ impl Cell {
     }
 }
 
-/// 呼び出し元が 6 つを無視し、SIGTERM / SIGUSR2 を block していても、子は既定の扱いと空の
-/// mask で始まる。SIGHUP (一覧の外) の無視は引き継ぐ。
+/// 呼び出し元が 7 つを無視し、SIGTERM / SIGUSR2 を block していても、子は既定の扱いと空の
+/// mask で始まる。SIGHUP (一覧の外) の無視は引き継ぐ。SIGCHLD は下の
+/// `child_resets_sigchld_ignored_by_the_caller` で見る。
 #[test]
 fn child_resets_signals_ignored_and_blocked_by_the_caller() {
     let cell = Cell::new("ignoring");
-    cell.run_detached(&["perl", "-e", IGNORING_CALLER]);
+    cell.run_detached(&["perl", "-e", IGNORING_CALLER], &["perl", "-e", PROBE]);
     assert_eq!(
         cell.report().as_deref(),
         Some("INT=DFL QUIT=DFL TSTP=DFL TTIN=DFL TTOU=DFL PIPE=DFL HUP=IGNORE mask=")
@@ -139,9 +149,21 @@ fn child_resets_signals_ignored_and_blocked_by_the_caller() {
 #[test]
 fn child_does_not_inherit_hyoui_own_sigpipe_ignore() {
     let cell = Cell::new("plain");
-    cell.run_detached(&["perl", "-e", DEFAULT_CALLER]);
+    cell.run_detached(&["perl", "-e", DEFAULT_CALLER], &["perl", "-e", PROBE]);
     assert_eq!(
         cell.report().as_deref(),
         Some("INT=DFL QUIT=DFL TSTP=DFL TTIN=DFL TTOU=DFL PIPE=DFL HUP=DFL mask=")
     );
+}
+
+/// 呼び出し元が SIGCHLD を無視していても、子は SIGCHLD が既定で始まり、自分の子を `waitpid`
+/// で回収して exit code を得られる (SIG-Q2)。
+#[test]
+fn child_resets_sigchld_ignored_by_the_caller() {
+    let cell = Cell::new("chld");
+    cell.run_detached(
+        &["perl", "-e", IGNORING_CALLER],
+        &["python3", "-I", "-c", CHLD_PROBE],
+    );
+    assert_eq!(cell.report().as_deref(), Some("CHLD=DFL reap=7"));
 }

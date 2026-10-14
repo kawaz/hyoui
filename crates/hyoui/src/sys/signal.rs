@@ -290,16 +290,19 @@ pub fn block_handled_signals() -> SavedMask {
 /// 子の exec の前に既定 (SIG_DFL) に戻す signal (DR-0043)。
 ///
 /// 端末から起動された前景の job が既定の扱いで受け取る signal (キーボード由来の
-/// SIGINT / SIGQUIT / SIGTSTP、job control の SIGTTIN / SIGTTOU) と SIGPIPE。どれも
-/// 呼び出し元 (`$(...)` の中、非対話 shell の `cmd &`) や hyoui 自身 (Rust の runtime が
-/// SIGPIPE を無視にする) が無視に変えていることがあり、`execve` は無視の設定を引き継ぐ。
-pub const CHILD_DEFAULT_SIGNALS: [libc::c_int; 6] = [
+/// SIGINT / SIGQUIT / SIGTSTP、job control の SIGTTIN / SIGTTOU) と SIGPIPE、SIGCHLD。
+/// どれも呼び出し元 (`$(...)` の中、非対話 shell の `cmd &`) や hyoui 自身 (Rust の
+/// runtime が SIGPIPE を無視にする) が無視に変えていることがあり、`execve` は無視の設定を
+/// 引き継ぐ。SIGCHLD が無視のままだと、子は自分の子を `wait` で回収できない (終わった子が
+/// zombie にならず、`wait` は ECHILD になる)。
+pub const CHILD_DEFAULT_SIGNALS: [libc::c_int; 7] = [
     libc::SIGINT,
     libc::SIGQUIT,
     libc::SIGTSTP,
     libc::SIGTTIN,
     libc::SIGTTOU,
     libc::SIGPIPE,
+    libc::SIGCHLD,
 ];
 
 /// hyoui の handler ([`selfpipe_handler`] / [`sigwinch_handler`]) を張りうる signal。子は
@@ -562,7 +565,10 @@ print join(' ', @r), ' mask=', join(',', grep { $old->ismember($_) } 1..31), "\n
         // module の test) とも排他する (= serve と共有する SELFPIPE_OWNER_LOCK も取る)。
         let _guard = selfpipe_test_guard();
 
-        // 呼び出し元の設定を作る: 6 つ + SIGHUP を無視、SIGTERM / SIGUSR2 を block。
+        // 呼び出し元の設定を作る: SIGCHLD を除く 6 つ + SIGHUP を無視、SIGTERM / SIGUSR2 を
+        // block。SIGCHLD は test process 全体で無視にすると、その間に終わった他の test の子が
+        // 自動で回収されて他の test の `waitpid` が ECHILD になるので、別 process の e2e
+        // (hyoui-cli の `child_signal_defaults`) で見る。
         // 元の扱いは test の後で戻す (= process 全体の状態なので他 test に漏らさない)。
         let ignored = [
             Signal::SIGINT,

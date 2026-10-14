@@ -5490,6 +5490,8 @@ fn usage_run() -> String {
             exit code が適用される。\n    \
             <子の exit code>      子 PTY が exit した (= SessionExitNotify)。\n                          \
                 signal 死は 128+signum (= 130=SIGINT, 137=SIGKILL, 143=SIGTERM)\n    \
+            125                   子に SIGKILL を送っても期限内に終了を見届けられなかった\n                          \
+                (= uninterruptible sleep 等。子は回収されずに残っている可能性がある)\n    \
             0                     自分から離脱した (= 入力端末の EOF / Ctrl+Z の detach 設定 等。\n                          \
                 子は daemon 配下に残る)。Ctrl+Z 単発は suspend なので終了しない\n    \
             9                     daemon との接続が予期せず失われた (= daemon 消滅の疑い)\n    \
@@ -5546,6 +5548,8 @@ fn usage_attach() -> String {
         EXIT STATUS:\n    \
             <子の exit code>      子 PTY が exit した (= SessionExitNotify)。\n                          \
                 signal 死は 128+signum (= 130=SIGINT, 137=SIGKILL, 143=SIGTERM)\n    \
+            125                   子に SIGKILL を送っても期限内に終了を見届けられなかった\n                          \
+                (= uninterruptible sleep 等。子は回収されずに残っている可能性がある)\n    \
             0                     自分から離脱した (= 入力端末の EOF / Ctrl+Z の detach 設定 等。\n                          \
                 子は daemon 配下に残る)。Ctrl+Z 単発は suspend なので終了しない\n    \
             9                     daemon との接続が予期せず失われた (= daemon 消滅の疑い)\n    \

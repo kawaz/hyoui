@@ -171,7 +171,7 @@ pub struct ForkedChild {
 ///
 /// # 子の signal (DR-0043)
 ///
-/// child は exec の前に SIGINT / SIGQUIT / SIGTSTP / SIGTTIN / SIGTTOU / SIGPIPE を既定
+/// child は exec の前に SIGINT / SIGQUIT / SIGTSTP / SIGTTIN / SIGTTOU / SIGPIPE / SIGCHLD を既定
 /// (SIG_DFL) に戻し、signal mask を空にする (= 対話の bash が前景の job を exec する時と
 /// 同じ)。呼び出し元が無視・block していた設定は daemon を経て子に届かない。一覧の外の
 /// 無視の設定 (SIGHUP 等) は `execve` の規定どおり子に引き継がれる。
@@ -287,7 +287,7 @@ pub fn openpty_fork_anchor_exec(
         // 上限で書く)。
         restore_caller_core_limit_for_exec();
         // 前景の job として exec する: SIGINT / SIGQUIT / SIGTSTP / SIGTTIN / SIGTTOU /
-        // SIGPIPE を既定に戻し、signal mask を空にする (DR-0043)。呼び出し元の mask には
+        // SIGPIPE / SIGCHLD を既定に戻し、signal mask を空にする (DR-0043)。呼び出し元の mask には
         // 戻さない。foreground 化の後に行う (= 既定の SIGTTOU で tcsetpgrp が止まらない)。
         super::signal::reset_signals_for_exec();
         // SAFETY: 以下はすべて async-signal-safe な libc 直呼び。

@@ -793,7 +793,7 @@ impl Session {
         // シーケンス完了後**まで遅延させるのが要点 (= issue 2026-06-11 優先3 後退修正)。
         //
         // 早すぎる SIG_DFL 復帰は危険: SIGTERM/SIGINT 経路の shutdown は
-        // killpg(SIGTERM) → finalize_child の escalation (最長 ~6s) → SessionExitNotify
+        // killpg(SIGTERM) → finalize_child の escalation (最長 ~7s) → SessionExitNotify
         // broadcast → drain → socket unlink と続く。この間に 2 発目の SIGTERM が来た時
         // (= OS shutdown は TERM → 猶予 → 再 TERM が普通)、handler を既に SIG_DFL に
         // 戻していると daemon が即死し、escalation も socket unlink もすっ飛ぶ
@@ -2327,6 +2327,27 @@ pub(super) enum RelayOutcome {
 /// graceful shutdown に十分で、daemon が「見届け中」に占有される時間としても許容範囲。
 const FINALIZE_TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// SIGKILL に昇格してから子の終了を見届けるまでの期限 (DR-0037 K-5)。
+///
+/// 値の根拠: SIGKILL は catch / ignore できず、通常は数 ms で reap できる。大きな address
+/// space の後始末で数百 ms かかることがあるので余裕を見て 2s。これを超えるのは D state 等で
+/// kernel が子を終わらせられない時で、待ち続けても戻らない。[`FINALIZE_TERM_GRACE`] と
+/// 合わせても `hyoui kill --wait` の既定 timeout (10s) に収まる。
+const FINALIZE_KILL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// SIGKILL を送っても [`FINALIZE_KILL_DEADLINE`] までに reap できなかった子を置いて daemon が
+/// 終わる時の exit code (DR-0037 Q4)。`session.exit.notify` の `exit_status` として client
+/// (`hyoui run` / `attach` の exit code) に届く。
+///
+/// Design rationale: 125 は、子の exit code の慣習 (signal 死の `128 + signum`、shell の
+/// 126 = 実行できない / 127 = 見つからない、hyoui の子が exec / chdir の失敗で使う 127) とも、
+/// hyoui 自身の exit code (1 / 2 / 3 / 4 / 9) とも重ならない。GNU coreutils の `env` /
+/// `timeout` / `nice` 等や `docker run` が「ラッパー自身の失敗で、コマンドの終了状態を報告
+/// できない」に使う値で、「子の終了を見届けられなかった」と意味が近い。子が自分で 125 で
+/// 終わった場合とは exit code だけでは区別できない (exit code が u8 である以上、どの値も
+/// 子の exit code の空間と重なる)。
+const EXIT_CHILD_UNREAPED: i32 = 125;
+
 /// 子 PTY を reap して exit code を返す。**必ず有限時間で返る** (= 孤児 daemon 防止)。
 ///
 /// outcome に応じて:
@@ -2334,7 +2355,8 @@ const FINALIZE_TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(
 /// - `ChildExited(None)`: exit 検知だが code 未取得 → waitpid で確認
 /// - `ClientDetachedOrKilled`: 子はまだ生きている可能性 → SIGCONT+SIGTERM →
 ///   [`FINALIZE_TERM_GRACE`] まで `waitpid(WNOHANG)` polling → 超過したら SIGKILL
-///   昇格 → blocking reap (= SIGKILL 後は必ず即 reap できる)
+///   昇格 → [`FINALIZE_KILL_DEADLINE`] まで同じく polling → 超過したら reap せずに
+///   [`EXIT_CHILD_UNREAPED`] を返す ([`reap_after_kill`])
 ///
 /// SIGCONT 併送は shell の job control 慣行 (= stopped な子に TERM を送っても
 /// pending のまま配送されないため、起こしてから効かせる)。
@@ -2349,7 +2371,7 @@ fn finalize_child(child: Pid, outcome: &RelayOutcome) -> Result<i32, Error> {
 
     // ChildExited (= 子は既に死んでいる、reap だけ) は blocking reap で即返る。
     if matches!(outcome, RelayOutcome::ChildExited(_)) {
-        return reap_blocking(child, outcome);
+        return reap_blocking(child);
     }
 
     // client 都合の終了 (= legacy wait:true kill / --until)。子に SIGCONT+SIGTERM を
@@ -2359,46 +2381,71 @@ fn finalize_child(child: Pid, outcome: &RelayOutcome) -> Result<i32, Error> {
     let _ = kill_pgrp(child, Signal::SIGCONT);
     let _ = kill_pgrp(child, Signal::SIGTERM);
 
-    let deadline = Instant::now() + FINALIZE_TERM_GRACE;
+    let try_reap = move || waitpid(child, Some(WaitPidFlag::WNOHANG));
+    if let Some(code) = reap_until(Instant::now() + FINALIZE_TERM_GRACE, try_reap)? {
+        return Ok(code);
+    }
+    // grace 超過 = 子が SIGTERM を ignore。SIGKILL に昇格して見届ける。
+    let _ = kill_pgrp(child, Signal::SIGKILL);
+    reap_after_kill(child, Instant::now() + FINALIZE_KILL_DEADLINE, try_reap)
+}
+
+/// `deadline` まで `try_reap` (= `waitpid(WNOHANG)`) を呼び続けて子の終了を見届ける。
+/// 見届けたら exit code (signal 死は `128 + signum`) を、`deadline` を過ぎたら `None` を返す。
+/// loop の外 (serve_loop を抜けた後の終了処理) で使う polling で、loop 内の state 化は
+/// DR-0037 段階 6。
+fn reap_until(
+    deadline: Instant,
+    mut try_reap: impl FnMut() -> nix::Result<WaitStatus>,
+) -> Result<Option<i32>, Error> {
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
     loop {
-        let timed_out = match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::Exited(_, code)) => return Ok(code),
-            Ok(WaitStatus::Signaled(_, sig, _)) => return Ok(128 + (sig as i32)),
+        match try_reap() {
+            Ok(WaitStatus::Exited(_, code)) => return Ok(Some(code)),
+            Ok(WaitStatus::Signaled(_, sig, _)) => return Ok(Some(128 + (sig as i32))),
             // StillAlive / stopped / continued の中間状態は deadline 判定して継続 polling。
-            Ok(_) => Instant::now() >= deadline,
+            Ok(_) => {}
             Err(nix::errno::Errno::EINTR) => continue,
             // 既に reap 済 (= SIGCHLD ハンドラが拾った等)。SIGTERM kill の慣行 code。
-            Err(nix::errno::Errno::ECHILD) => return Ok(143),
+            Err(nix::errno::Errno::ECHILD) => return Ok(Some(143)),
             Err(e) => return Err(Error::from(e)),
-        };
-        if timed_out {
-            // grace 超過 = 子が SIGTERM を ignore。SIGKILL 昇格して blocking で
-            // 見届ける (= SIGKILL は catch 不能、D-state 以外は即死するので有限)。
-            let _ = kill_pgrp(child, Signal::SIGKILL);
-            return reap_blocking(child, outcome);
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
         }
         std::thread::sleep(POLL_INTERVAL);
     }
 }
 
-/// 子を blocking で reap し切る。`finalize_child` の ChildExited 経路と SIGKILL
-/// 昇格後の見届けで使う。
-fn reap_blocking(child: Pid, outcome: &RelayOutcome) -> Result<i32, Error> {
+/// SIGKILL 昇格後の見届け (DR-0037 K-5)。`deadline` を過ぎても reap できない子 (D state 等)
+/// は回収せずに [`EXIT_CHILD_UNREAPED`] を返す。daemon はそのまま終了し、子は init / launchd
+/// に引き取られて回収される (blocking の `waitpid` で待つと、戻らない子に daemon が道連れに
+/// なる)。
+fn reap_after_kill(
+    child: Pid,
+    deadline: Instant,
+    try_reap: impl FnMut() -> nix::Result<WaitStatus>,
+) -> Result<i32, Error> {
+    if let Some(code) = reap_until(deadline, try_reap)? {
+        return Ok(code);
+    }
+    crate::daemon_log!(
+        "hyoui: SIGKILL を送った子 (pid {child}) を期限内に回収できなかった \
+         (uninterruptible sleep 等)。回収せずに終了する (exit code {EXIT_CHILD_UNREAPED})"
+    );
+    Ok(EXIT_CHILD_UNREAPED)
+}
+
+/// 子を blocking で reap し切る。`finalize_child` の ChildExited 経路で使う。
+fn reap_blocking(child: Pid) -> Result<i32, Error> {
     loop {
         match waitpid(child, Some(WaitPidFlag::empty())) {
             Ok(WaitStatus::Exited(_, code)) => return Ok(code),
             Ok(WaitStatus::Signaled(_, sig, _)) => return Ok(128 + (sig as i32)),
             Ok(_) => continue,
             Err(nix::errno::Errno::EINTR) => continue,
-            Err(nix::errno::Errno::ECHILD) => {
-                // 既に reap 済 (= SIGCHLD ハンドラが拾った等)。outcome に応じて
-                // 0 / 143 (= SIGTERM kill) を返す。
-                return Ok(match outcome {
-                    RelayOutcome::ChildExited(_) => 0,
-                    _ => 143,
-                });
-            }
+            // 既に reap 済 (= SIGCHLD ハンドラが拾った等)。子は自分で終わっている。
+            Err(nix::errno::Errno::ECHILD) => return Ok(0),
             Err(e) => return Err(Error::from(e)),
         }
     }
@@ -2432,6 +2479,60 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    /// DR-0037 K-5 / Q4: SIGKILL 後も期限まで reap できない子 (D state 等) は、回収せずに
+    /// `EXIT_CHILD_UNREAPED` を返す。D state は再現できないので、`waitpid(WNOHANG)` の代わりに
+    /// 常に「まだ生きている」を返す注入点で期限超過を作る。
+    #[test]
+    fn reap_after_kill_gives_up_with_its_own_exit_code_past_the_deadline() {
+        let mut calls = 0;
+        let code = reap_after_kill(
+            Pid::this(),
+            Instant::now() + Duration::from_millis(50),
+            || {
+                calls += 1;
+                Ok(WaitStatus::StillAlive)
+            },
+        )
+        .expect("reap_after_kill");
+        assert_eq!(code, EXIT_CHILD_UNREAPED);
+        assert_ne!(code, 128 + Signal::SIGKILL as i32);
+        assert!(calls > 1, "期限まで確認を繰り返すはず: calls={calls}");
+    }
+
+    /// 期限内に reap できれば、SIGKILL で終わった子の exit code (`128 + 9`) をそのまま返す。
+    #[test]
+    fn reap_after_kill_reports_the_kill_when_reaped_in_time() {
+        let mut polls = 0;
+        let code = reap_after_kill(
+            Pid::this(),
+            Instant::now() + Duration::from_secs(10),
+            || {
+                polls += 1;
+                Ok(if polls < 3 {
+                    WaitStatus::StillAlive
+                } else {
+                    WaitStatus::Signaled(Pid::this(), Signal::SIGKILL, false)
+                })
+            },
+        )
+        .expect("reap_after_kill");
+        assert_eq!(code, 128 + Signal::SIGKILL as i32);
+    }
+
+    /// 実際の子でも、SIGKILL 後の見届けは期限内に reap して `128 + 9` を返す (= 注入点を
+    /// 外した `waitpid(WNOHANG)` の経路)。
+    #[test]
+    fn reap_after_kill_reaps_a_real_killed_child() {
+        let spawned = crate::sys::pty::Pty::spawn(&["sleep", "30"], 80, 24, None).expect("spawn");
+        let child = spawned.child;
+        nix::sys::signal::kill(child, Signal::SIGKILL).expect("SIGKILL");
+        let code = reap_after_kill(child, Instant::now() + FINALIZE_KILL_DEADLINE, move || {
+            waitpid(child, Some(WaitPidFlag::WNOHANG))
+        })
+        .expect("reap_after_kill");
+        assert_eq!(code, 128 + Signal::SIGKILL as i32);
+    }
 
     /// `kill_pgrp` は「child が process group leader でない」場合に
     /// **pgrp 送信をしない** (= 自プロセスグループを巻き添えにしない)。
