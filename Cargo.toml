@@ -4,7 +4,7 @@ members = ["crates/hyoui", "crates/hyoui-cli", "crates/hyoui-web"]
 exclude = ["docs/research/poc/2026-05-27-vt100-poc"]
 
 [workspace.package]
-version = "0.16.3"
+version = "0.16.4"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
