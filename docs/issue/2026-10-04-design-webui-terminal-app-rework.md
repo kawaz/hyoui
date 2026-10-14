@@ -3,7 +3,7 @@ title: web UI をブラウザ上のターミナルアプリとして作り直す
 status: open
 category: design
 created: 2026-10-04T00:30:00+09:00
-last_read: 2026-10-04T00:30:00+09:00
+last_read: 2026-10-14T12:00:00+09:00
 open_entered: 2026-10-04T00:30:00+09:00
 wip_entered:
 blocked_entered:
@@ -173,3 +173,80 @@ Window
   - `hyoui.` は予約 key として利用者に付けさせない (v0.14.0 で実装)
   - レイアウトは端末ごとで他の端末に出ない。export / import は今は考えない
   - localStorage の名前空間は scope ごと。selector を正規化した hash (key を並べ替える、空のリストを落とす、OR のリストを並べ替える) を使う。統括案: URL に任意の `view=<名前>` があればそれを名前空間に使う (selector の形を変えてもレイアウトを引き継げる)
+
+## 議論の続き (2026-10-07、kawaz との議論、途中)
+
+### 「タブ」と決めつけない: custom dashboard
+
+kawaz「ターミナルマルチプレキサみたいにしたいというのは、あくまでこの tag でグルーピングして、このコンポーネントにこのリストを使う、みたいなのをカスタムダッシュボードを定義するみたいに好きにできるとか。設計は難しいかもしれないけど」。タブ・タブグループは見せ方の 1 つで、固定の構造にしない。
+
+統括の整理 (未裁定): 定義の部品を最小に絞り、汎用の UI フレームワークに膨らませない。
+
+```
+view = {
+  query:    tag の条件 (どの session を集めるか)
+  group_by: tag の key (何でまとめるか、0〜2 段)
+  as:       見せ方 (リスト / タブ / 分割 / 単独 pane)
+  new_tags: この view で新しく作る session に付ける tag
+}
+```
+
+- 既定の terminal multiplexer 風 UI もこの定義で書く (`group_by: [webui.tabgroup, webui.tab]`)。既定 UI 自体をこの定義で作っておけば、後から定義の編集画面を足すだけでカスタムが効く
+- 最初に作るのは「既定の multiplexer 風 UI」と「ccmsg の embed」の 2 つだけ。3 つ目の使い方が出てから一般化を広げる
+
+### 定義は呼び出し側が URL で渡す (kawaz 案、合意)
+
+kawaz「アプリが定義をクエリで与えるとかどうですかね? クエリで与えるのはその embed コンポーネントで扱うセッションリストと構造で、配置は localStorage みたいな」。hyoui web は view の定義を保存しない。素の hyoui web は hyoui 自身の既定の定義で開く。
+
+統括の補足 (未裁定):
+
+- 定義は `?` でなく `#` (fragment) に載せる (サーバに送られず、proxy や access log に残らず、長くても URL の制限に当たりにくい)
+- 埋め込める origin を gateway の設定で明示する (`frame-ancestors`)。どのサイトからでも埋め込めると別サイトから操作させられる
+- URL から起動するコマンドは指定させない (kawaz も同意: command は hyoui 側の設定。CSRF 対策)。URL で渡せるのは tag と cwd まで、作るのは利用者の操作の時だけ
+
+### ccmsg の具体例 (kawaz、2026-10-07)
+
+- claude の session には `claude.session_id=UUID` / `claude.project_dir=PATH` / `claude.config_dir=PATH` を付ける (後付けでもよい)
+- ccmsg は session を選ぶと Files / Timeline / Terminal のメニューがあり、今の Terminal は選んだ claude の session だけを見せる。これを、hyoui web を iframe で埋め込んだ画面にしたい (上にタブ `[claude] [+]`、下に xterm の領域。またはタブの代わりに左に HyouiSessionTree、右に PanesContainer)
+- 扱う session の scope: `?sessions=<JSON>&embed=true`。ccmsg なら `[{ids:[], tags:["claude.session_id=UUID", "claude.project_dir=PATH", "ccmsg.project_dir=PATH"]}]` (選んだ session、または同じディレクトリの別 UUID の session も)
+- 新規ターミナル: `new={cwd:"${claude.project_dir}", tags:["ccmsg.project_dir=${claude.project_dir}", "ccmsg.session_id=${claude.session_id}", "tab_name=${tab_name}"]}`
+- 試しの UI (kawaz、タブも分割も無しで):
+
+  ```
+  HyouiSessionList(
+    selectors,
+    sections: [
+      { name: "claude", session_name: "pid=${hyoui.pid} ${hyoui.session_id}", selectors: [{tags: ["claude.session_id"]}] },
+      { name: "others", session_name: "pid=${hyoui.pid}", selectors: [{notIn: [{tags: ["claude.session_id"]}]}] },
+    ]
+  )
+  ```
+
+  サイドバーに `claude` / `others` の節で session を並べ、選んだら右にターミナル。サイドバーの下半分に HyouiLayoutList (localStorage の分割レイアウト): default の空のレイアウトがあり、選ぶと右に空の pane。pane は左右・上下に分割でき、session をドラッグ等で pane に紐付け / 外す。新しいレイアウトで新規 shell、特定の pane で分割して新規 shell も
+- 「タブは実はレイアウトをタブ的存在として見直して良い。タブとして表示するコンポーネントを置いてもよいし、レイアウトリストとして存在するなら見た目がタブである必要は無い」(kawaz)
+- kawaz の発言は「claude 関係なしだと」で途切れたまま (続きは未聴取)
+
+## 現在地 (2026-10-14 まとめ、議論は途中)
+
+決まったこと:
+
+- daemon は tag を解釈しない。構造専用の仕組みは daemon にも gateway にも持たず、front が session の tag から導く
+- server が持つのは session (pane は UI 側、端末ごと)。1 つの session は構造上 1 か所にしか所属しない (UI 側で参照を発明するのは可)
+- tag の値は名前 (index にしない)
+- view の定義は呼び出し側が URL で渡す。レイアウト (配置) は端末ごとの localStorage で、他の端末には出ない
+- selector は `{ids?, tags?, in?, notIn?}` の OR の配列。空のリストは条件なし
+- `${key}` は選択中の session の tag から展開し、無ければ定義のデフォルト値、それも無ければ空文字
+- `hyoui.` は予約 key (利用者は付けられない、実装済み)。`hyoui.pid` 等を読み取り専用で template と selector に使う
+- localStorage の名前空間は scope ごと (selector を正規化した hash)
+- 新規 session の command は hyoui 側の設定 (URL では指定しない)
+
+決まっていないこと:
+
+1. **tag を起動後に変える手段を持つか** (汎用の `hyoui set --tag` と daemon への tag 更新要求)。a: 持つ (session の移動を端末間で共有できる、claude の hook から後付けできる) / b: 持たない (移動は端末ごとの localStorage の上書き)。kawaz の「daemon 側では何も考えない」はどちらとも両立する (a でも daemon は kv を保存するだけ)。後付けの tag (`claude.session_id` 等) を使うなら a が要る
+2. view の定義の形 (上の `view = {query, group_by, as, new_tags}` の統括案で進めてよいか)
+3. 定義を `#` に載せるか、`view=<名前>` で名前空間を上書きできるようにするか (統括案)
+4. 空のタブ・タブグループ、タブの名前・並び順を残すか (残さない = session が抜けたら消える、で割り切るか)
+5. iframe での cookie と localStorage の partition (同じ登録ドメインの下なら通る見込み、実機未確認)
+6. 「claude 関係なしだと」の続き (kawaz の想定する、claude と関係ない使い方)
+
+DR-0039 の決定 4 / 5 (構造は gateway の file で共有) は、この方向で組み直す必要がある。議論がまとまったら DR-0039 を書き直す (まだ書き直していない)。

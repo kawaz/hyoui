@@ -44,6 +44,17 @@ DR-0037 Q7。「PTY 書き込み effect の完了と失敗」節の 5 点 (書�
 
 ## 確認待ち
 
+### 👺EXP-C1: DR-0042 の失敗経路 1〜3 の実験の進め方
+
+[issue](issue/2026-10-14-task-dr0042-failure-path-experiments.md)。fd の上限を絞って失敗を起こす実験が removal check に止められている。
+
+- [ ] a: kawaz がプロンプトから `!` で打つ (issue のコマンド)
+- [ ] b: AI が `sh -c` を使わない形で打つことを了承する
+
+### 👺DR39-C1: web UI の作り直し (DR-0039) の議論の続き
+
+[issue](issue/2026-10-04-design-webui-terminal-app-rework.md) の「現在地」節に、決まったことと決まっていない 6 点をまとめた。続きの議論をする時に見てほしい。特に「tag を起動後に変える手段を持つか」と「claude 関係なしだと」の続き。
+
 ### 👺LINK-C1: ターミナル内リンク (v0.9.40 以降) の実機確認
 
 - [ ] a: デスクトップで Claude Code 応答内の markdown リンクをクリック → 新規タブで開く (確認ダイアログなし)

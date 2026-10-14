@@ -4,6 +4,7 @@ active な issue の一覧。close 済みは archive/ にあり、ここには�
 
 | date | category | status | slug | 概要 |
 |---|---|---|---|---|
+| 2026-10-14 | task | open | [dr0042-failure-path-experiments](./2026-10-14-task-dr0042-failure-path-experiments.md) | DR-0042 の失敗経路 1〜3 を実際に失敗させて確かめる (removal check で未検証、進め方は kawaz 判断) |
 | 2026-10-14 | bug | open | [daemon-inherits-ignored-sigchld-linux](./2026-10-14-bug-daemon-inherits-ignored-sigchld-linux.md) | daemon が呼び出し元の SIGCHLD 無視を引き継ぐと Linux で早期終了した子が自動回収され exit 0 を報告しうる。未検証、Linux 版で確認 |
 | 2026-10-14 | task | open | [salvaged-patches-adoption](./2026-10-14-task-salvaged-patches-adoption.md) | 旧構成から回収した patch 2 件 (poll_until refactor / attach marker 再現 test) の採否。置き場は artifacts の salvage-old-bare-20261010/ |
 | 2026-10-14 | request | open | [session-labels](./2026-10-14-request-session-labels.md) | session への複数 label 付与。核心は DR-0041 の tag で実装済み、実行中の追加/削除・kill の絞り込み等の残りの要否を kawaz 裁定 |
